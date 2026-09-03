@@ -274,6 +274,23 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * the time it throws, so this does the equivalent at the adapter
      * layer instead of just letting the exception propagate and throwing
      * away an otherwise-successful batch.
+     *
+     * <p>Issue #439: {@link NanocachedException.PartialConnectionFailedRaw}
+     * gets the same "don't discard the already-resolved data" treatment,
+     * but not the same bounded, repeat-until-resolved loop as the
+     * wrong-node case — a stale ring view is something retrying can be
+     * expected to fix on a subsequent attempt, but by the time this method
+     * sees a {@code PartialConnectionFailedRaw} the SDK has already tried
+     * the failing chunk twice (its own original attempt plus one internal
+     * reconnect-and-retry, see {@code applyReconnecting} in {@code
+     * NanocachedClient}) and failed both times, so there is no reason to
+     * expect a third or fourth attempt to behave differently. This method
+     * therefore makes exactly one direct follow-up call for the remainder
+     * named by {@code unresolvedIndices} — not another trip through the
+     * {@code for} loop above, and not gated by {@link
+     * #MAX_BULK_WRONG_NODE_RETRIES} — and either merges its result and
+     * returns, or lets it propagate unchanged so a genuine failure is
+     * never silently reported as a set of misses.
      */
     private byte[][] getManyBytesResolvingWrongNode(byte[][] wireKeys) {
         byte[][] result = new byte[wireKeys.length][];
@@ -302,6 +319,22 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 }
                 positions = nextPositions;
                 pending = nextPending;
+            } catch (NanocachedException.PartialConnectionFailedRaw partial) {
+                for (int i = 0; i < positions.length; i++) {
+                    result[positions[i]] = partial.partialValues[i];
+                }
+                int[] unresolved = partial.unresolvedIndices;
+                int[] nextPositions = new int[unresolved.length];
+                byte[][] nextPending = new byte[unresolved.length][];
+                for (int i = 0; i < unresolved.length; i++) {
+                    nextPositions[i] = positions[unresolved[i]];
+                    nextPending[i] = pending[unresolved[i]];
+                }
+                byte[][] retryValues = namespace.getManyBytes(nextPending);
+                for (int i = 0; i < nextPositions.length; i++) {
+                    result[nextPositions[i]] = retryValues[i];
+                }
+                return result;
             }
         }
     }
@@ -689,6 +722,22 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * attempt (the ring simply hadn't caught up yet) is a harmless
      * duplicate write of the exact same value/TTL this call was already
      * going to make.
+     *
+     * <p>Issue #439: {@link NanocachedException.PartialConnectionFailedSetRaw}
+     * gets a narrower retry than the wrong-node branch above, not the
+     * "resend the whole group" treatment — a connection failure mid-batch
+     * only reaches here after the SDK has already retried the failing
+     * chunk once internally (original attempt plus one reconnect-and-retry,
+     * see {@code applyReconnecting} in {@code NanocachedClient}), so a
+     * further bounded loop isn't expected to help. Unlike the get side,
+     * {@code succeededIndices} names what's already DONE rather than
+     * what's outstanding (a successful {@code setManyBytes} has no
+     * positional array of its own to splice an answer into — see the
+     * exception's own doc), so this builds the complement — the positions
+     * NOT yet confirmed stored — and makes exactly one direct follow-up
+     * {@code setManyBytes} call for just that remainder (safe to retry
+     * for the same idempotency reason as the whole-group resend above),
+     * letting a genuine second failure propagate unchanged.
      */
     private void setManyBytesResolvingWrongNode(byte[][] keys, byte[][] values, long ttlSeconds) {
         for (int attempt = 0; ; attempt++) {
@@ -699,6 +748,32 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 if (attempt >= MAX_BULK_WRONG_NODE_RETRIES) {
                     throw error;
                 }
+            } catch (NanocachedException.PartialConnectionFailedSetRaw partial) {
+                boolean[] isSucceeded = new boolean[keys.length];
+                for (int index : partial.succeededIndices) {
+                    isSucceeded[index] = true;
+                }
+                int remainingCount = 0;
+                for (boolean succeeded : isSucceeded) {
+                    if (!succeeded) {
+                        remainingCount++;
+                    }
+                }
+                if (remainingCount == 0) {
+                    return;
+                }
+                byte[][] remainingKeys = new byte[remainingCount][];
+                byte[][] remainingValues = new byte[remainingCount][];
+                int j = 0;
+                for (int i = 0; i < keys.length; i++) {
+                    if (!isSucceeded[i]) {
+                        remainingKeys[j] = keys[i];
+                        remainingValues[j] = values[i];
+                        j++;
+                    }
+                }
+                namespace.setManyBytes(remainingKeys, remainingValues, ttlSeconds);
+                return;
             }
         }
     }

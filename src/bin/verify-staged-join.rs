@@ -26,8 +26,17 @@
 //! to a fixed node.
 //!
 //! Scenarios: `1-to-2`, `2-to-3`, `1-to-3-waiting` (two nodes join at
-//! once; the second must wait behind the first). Pass `--scenario <name>`
-//! to run one, or omit it to run all three in sequence.
+//! once; the second must wait behind the first), and `3-to-2-decommission`
+//! (issue #448: SIGTERM one of three members and check its entries were
+//! handed to their post-leave owners before it exited). Pass
+//! `--scenario <name>` to run one, or omit it to run all four in sequence.
+//!
+//! Issue #448: CI runs this harness (`staged-join-e2e` in ci.yaml) — it is
+//! the only place the real discovery and node binaries meet. Their unit
+//! tests each mock the other side, so a wire-format change that lands on
+//! only one side (or only in the mocks) stays green there; issue #441 (an
+//! `M` frame the node could no longer parse) sat on main that way until
+//! this harness was run by hand.
 //!
 //! This binary has no dependency on the node/discovery implementations
 //! (the binaries share no modules by design — see size-derived migration timeout and
@@ -57,6 +66,18 @@ use tokio::time::{sleep, timeout};
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Issue #448: how long `3-to-2-decommission` gives the SIGTERMed node to
+/// exit — the node's own default `--drain-timeout` (25s) plus slack, so a
+/// drain that runs out its whole budget still counts as an exit, and only
+/// a node that never exits at all (the exact hang a second-signal override
+/// exists for) fails the scenario.
+const DECOMMISSION_EXIT_TIMEOUT: Duration = Duration::from_secs(45);
+/// Issue #448: after a leave, a surviving node keeps answering `W` for a
+/// key it only owns post-leave until its next heartbeat ack carries the
+/// new roster, and the entrant may still be receiving handoffs. The
+/// post-leave check retries a `W`/miss until this elapses; one that
+/// persists past it is the failure being looked for.
+const RING_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Issue #329: bounds every single connect/read/write this harness makes
 /// against discovery or a node over its own raw sockets (`connect_timed`,
@@ -179,7 +200,8 @@ fn usage() -> String {
     "\
 Usage: verify-staged-join [options]
 
-  --scenario <name>   1-to-2 | 2-to-3 | 1-to-3-waiting (default: run all three)
+  --scenario <name>   1-to-2 | 2-to-3 | 1-to-3-waiting | 3-to-2-decommission
+                       (default: run all four)
   --keys <n>          keys seeded before each scenario (default 500)
   --value-size <n>    bytes per value (default 64)
   --concurrency <n>   concurrent workload connections (default 8)
@@ -222,7 +244,7 @@ async fn main() -> std::process::ExitCode {
 
     let scenarios: Vec<&str> = match args.scenario.as_deref() {
         Some(name) => vec![name],
-        None => vec!["1-to-2", "2-to-3", "1-to-3-waiting"],
+        None => vec!["1-to-2", "2-to-3", "1-to-3-waiting", "3-to-2-decommission"],
     };
 
     let mut base_port = args.base_port;
@@ -240,6 +262,9 @@ async fn main() -> std::process::ExitCode {
             }
             "1-to-3-waiting" => {
                 run_waiting_join(&discovery_bin, &node_bin, &log_dir, &args, base_port).await
+            }
+            "3-to-2-decommission" => {
+                run_decommission(&discovery_bin, &node_bin, &log_dir, &args, base_port).await
             }
             other => {
                 eprintln!("unknown scenario: {other}\n\n{}", usage());
@@ -278,9 +303,52 @@ fn sibling_binary(name: &str) -> Result<PathBuf, String> {
 /// scenario failure or early return never leaves orphaned discovery/node
 /// processes behind.
 struct Process {
-    #[allow(dead_code)]
     child: Child,
     addr: String,
+}
+
+impl Process {
+    /// Issue #448: sends SIGTERM, the signal a real orchestrator (ECS
+    /// stopTimeout, a Kubernetes preStop) sends first — what starts a
+    /// clustered node's decommission drain. Via `kill(1)` rather than a
+    /// libc binding: this harness is dependency-free by design.
+    async fn terminate(&self) -> io::Result<()> {
+        let pid = self
+            .child
+            .id()
+            .ok_or_else(|| io::Error::other(format!("{} already exited", self.addr)))?;
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .await?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "kill -TERM {pid} ({}) failed: {status}",
+                self.addr
+            )));
+        }
+        Ok(())
+    }
+
+    /// Waits for the process to exit on its own within `limit`, failing on
+    /// a non-zero status (a decommission that ended in an error path) or
+    /// on a process that is still running when `limit` elapses.
+    async fn wait_exit(&mut self, limit: Duration) -> io::Result<()> {
+        let status = timeout(limit, self.child.wait()).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{} still running {limit:?} after SIGTERM", self.addr),
+            )
+        })??;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "{} exited with {status} after SIGTERM",
+                self.addr
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Where each spawned process's stdout/stderr goes — not discarded, since
@@ -1395,6 +1463,145 @@ async fn run_simple_join(
     let (join_started_at, join_duration) = result?;
     stats.report(join_started_at, &[join_started_at + join_duration]);
 
+    Ok(())
+}
+
+/// Issue #448: the decommission counterpart of `run_simple_join`. Three
+/// members, seed every key to its owners, SIGTERM one member, then check
+/// two things end to end over the wire: discovery drops it from `L` and
+/// the process exits within its drain budget, and afterwards *every*
+/// owner the post-leave ring names for *every* seeded key answers `G`
+/// with a hit — i.e. the copies the leaving node held were handed to
+/// their new owners (`U` handoff frames, issue #124) before it went away.
+/// With the default R=2, each key the leaver owned has exactly one
+/// surviving copy plus one entrant that only the handoff can have filled,
+/// so a silently skipped handoff shows up as a miss on the entrant.
+async fn run_decommission(
+    discovery_bin: &Path,
+    node_bin: &Path,
+    log_dir: &Path,
+    args: &Args,
+    base_port: u16,
+) -> io::Result<()> {
+    const INITIAL_NODES: usize = 3;
+
+    let discovery = spawn_discovery(discovery_bin, log_dir, base_port)?;
+    wait_until_connectable(&discovery.addr).await?;
+
+    let mut nodes = Vec::new();
+    for offset in 0..INITIAL_NODES {
+        let node = spawn_node(
+            node_bin,
+            log_dir,
+            base_port + 1 + offset as u16,
+            &discovery.addr,
+        )?;
+        wait_until_connectable(&node.addr).await?;
+        nodes.push(node);
+    }
+
+    let (roster_before, replication) = wait_for_all_joined(&discovery.addr, INITIAL_NODES).await?;
+    seed_keys(&roster_before, replication, args.keys, args.value_size).await?;
+    println!(
+        "  seeded {} keys across {} node(s) (R={replication})",
+        args.keys,
+        roster_before.len()
+    );
+
+    let mut leaving = nodes.pop().expect("INITIAL_NODES > 0");
+    let leaving_name = roster_before
+        .iter()
+        .find(|(_, addr)| *addr == leaving.addr)
+        .map(|(name, _)| name.clone())
+        .ok_or_else(|| io::Error::other(format!("{} missing from L", leaving.addr)))?;
+
+    let started = Instant::now();
+    leaving.terminate().await?;
+
+    let (roster_after, replication_after) =
+        wait_for_roster_without(&discovery.addr, &leaving_name).await?;
+    println!(
+        "  node {leaving_name} left L in {:?} ({} member(s) remain)",
+        started.elapsed(),
+        roster_after.len()
+    );
+    if roster_after.len() != INITIAL_NODES - 1 {
+        return Err(io::Error::other(format!(
+            "expected {} members after the leave, L lists {}",
+            INITIAL_NODES - 1,
+            roster_after.len()
+        )));
+    }
+
+    leaving.wait_exit(DECOMMISSION_EXIT_TIMEOUT).await?;
+    println!("  node {leaving_name} exited in {:?}", started.elapsed());
+
+    verify_owners_hold_every_key(&roster_after, replication_after, args.keys).await
+}
+
+/// Polls discovery's `L` until `name` is no longer listed, returning the
+/// roster and replication factor at that moment — the moment the
+/// leaver's `V` was accepted.
+async fn wait_for_roster_without(discovery_addr: &str, name: &str) -> io::Result<(Roster, usize)> {
+    timeout(JOIN_TIMEOUT, async {
+        loop {
+            if let Ok((roster, replication)) = fetch_joined(discovery_addr).await
+                && !roster.iter().any(|(member, _)| member == name)
+            {
+                return (roster, replication);
+            }
+
+            sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{name} never disappeared from L"),
+        )
+    })
+}
+
+/// Checks that every owner `roster` names for every seeded key answers
+/// `G` with a hit. A `W` or a miss is retried until `RING_SETTLE_TIMEOUT`
+/// (see that constant); one that outlives it fails with the owner and key
+/// named, so a dropped handoff is attributable from the output alone.
+async fn verify_owners_hold_every_key(
+    roster: &Roster,
+    replication: usize,
+    keys: usize,
+) -> io::Result<()> {
+    let ring = Ring::new(roster);
+    let mut conns: HashMap<String, (TcpStream, BytesMut)> = HashMap::new();
+    let deadline = Instant::now() + RING_SETTLE_TIMEOUT;
+    let mut copies = 0usize;
+
+    for index in 0..keys {
+        let (namespace, key) = verify_key(index);
+
+        for (name, addr) in ring.owners(namespace, key.as_bytes(), replication) {
+            copies += 1;
+            loop {
+                let (stream, buf) = get_or_connect(&mut conns, &addr).await?;
+                let reply = get(stream, buf, namespace, key.as_bytes()).await?;
+                let what = match reply {
+                    GetReply::Hit => break,
+                    GetReply::Miss => "a miss",
+                    GetReply::WrongNode => "W",
+                };
+                if Instant::now() >= deadline {
+                    return Err(io::Error::other(format!(
+                        "{name} ({addr}) still answers {what} for {key} {RING_SETTLE_TIMEOUT:?} \
+                         after the leave — its copy was never handed over"
+                    )));
+                }
+                sleep(POLL_INTERVAL).await;
+            }
+        }
+    }
+
+    println!("  post-leave check: every owner holds all {keys} keys ({copies} owner copies)");
     Ok(())
 }
 
