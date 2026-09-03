@@ -83,6 +83,10 @@ final class MockNode implements AutoCloseable {
     /** As {@link #forceWrongNodeCountsForGet}, but for {@code o}'s {@link
      * #multiSet} ({@code putAll}'s issue #415 regression tests). */
     final Map<ByteBuffer, AtomicInteger> forceWrongNodeCountsForSet = new ConcurrentHashMap<>();
+    private final AtomicInteger multiGetOkCountdown = new AtomicInteger(0);
+    private final AtomicInteger multiGetDropRemaining = new AtomicInteger(0);
+    private final AtomicInteger multiSetOkCountdown = new AtomicInteger(0);
+    private final AtomicInteger multiSetDropRemaining = new AtomicInteger(0);
     /** Milliseconds every single-key {@code d} (delete) sleeps before
      * answering — 0 (the default) is no delay. Used to prove {@code
      * removeAll(Set)} fans its deletes out concurrently rather than one
@@ -321,6 +325,9 @@ final class MockNode implements AutoCloseable {
             keyLengths[i] = Integer.parseInt(parts[3 + i]);
         }
         multiGetCount.incrementAndGet();
+        if (takeDrop(multiGetOkCountdown, multiGetDropRemaining)) {
+            throw new IOException("nanocached-test: forced connection drop (issue #439)");
+        }
         byte[][] values = new byte[n][];
         boolean[] wrongNode = new boolean[n];
         for (int i = 0; i < n; i++) {
@@ -371,6 +378,9 @@ final class MockNode implements AutoCloseable {
         int trailing = parts.length - (3 + 2 * n) - (tagged ? 1 : 0);
         long ttlSeconds = trailing > 0 ? Long.parseLong(parts[3 + 2 * n]) : 0;
         multiSetCount.incrementAndGet();
+        if (takeDrop(multiSetOkCountdown, multiSetDropRemaining)) {
+            throw new IOException("nanocached-test: forced connection drop (issue #439)");
+        }
         boolean[] wrongNode = new boolean[n];
         for (int i = 0; i < n; i++) {
             byte[] key = in.readNBytes(keyLengths[i]);
@@ -453,6 +463,36 @@ final class MockNode implements AutoCloseable {
     private static boolean forceWrongNode(Map<ByteBuffer, AtomicInteger> counts, byte[] key) {
         AtomicInteger remaining = counts.get(ByteBuffer.wrap(key));
         return remaining != null && remaining.getAndUpdate(count -> count > 0 ? count - 1 : count) > 0;
+    }
+
+    /** Issue #439: simulates a connection dying mid-batch (as opposed to the
+     * #415 forced-W fault above, which simulates a stale routing table) —
+     * after {@code okCount} more m requests are answered normally, the next
+     * {@code dropCount} m requests each abort the connection (no reply
+     * written at all, exactly like a dead socket) instead of being
+     * processed; every m request once both budgets are exhausted is
+     * answered normally again. */
+    void armMultiGetDrop(int okCount, int dropCount) {
+        multiGetOkCountdown.set(okCount);
+        multiGetDropRemaining.set(dropCount);
+    }
+
+    /** As {@link #armMultiGetDrop}, for {@code o} (multi-set). */
+    void armMultiSetDrop(int okCount, int dropCount) {
+        multiSetOkCountdown.set(okCount);
+        multiSetDropRemaining.set(dropCount);
+    }
+
+    private boolean takeDrop(AtomicInteger okCountdown, AtomicInteger dropRemaining) {
+        if (okCountdown.get() > 0) {
+            okCountdown.decrementAndGet();
+            return false;
+        }
+        while (true) {
+            int pending = dropRemaining.get();
+            if (pending <= 0) return false;
+            if (dropRemaining.compareAndSet(pending, pending - 1)) return true;
+        }
     }
 
     /** Same algorithm as {@code NanocachedClient.contentDigest} —
