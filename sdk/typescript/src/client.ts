@@ -1731,8 +1731,13 @@ export class NanocachedClient {
     if (keys.length === 0) {
       throw new RangeError("nanocached: setMany/setManyBytes requires at least one key");
     }
-    if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
-      throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
+    // Tenth-pass follow-up (2026-09-04): `isSafeInteger`, matching `set`/
+    // `cas` and `encodeMultiSet` — `Number.isInteger(2 ** 53)` is true, so
+    // the old check let an unsafe TTL through to the encoder, which only
+    // rejected it *after* the node-list refresh and connection setup below
+    // had run, breaking the "rejected before any I/O" invariant.
+    if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 0) {
+      throw new RangeError(`nanocached: ttlSeconds must be a non-negative safe integer, got ${ttlSeconds}`);
     }
     // Eager, up-front, before any network I/O — see
     // getManyBytesInNamespace's own doc comment for why.

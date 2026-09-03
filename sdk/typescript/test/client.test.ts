@@ -2323,6 +2323,31 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
     }
   });
 
+  it("setMany rejects a ttlSeconds beyond Number.MAX_SAFE_INTEGER before any I/O", async () => {
+    // Tenth-pass follow-up (2026-09-04): `set`/`cas` got this check in
+    // PR #440 but `setManyInNamespace` kept `Number.isInteger`, which
+    // accepts 2 ** 53 and 1e21 — the encoder still rejected them, but only
+    // after the node-list refresh and connection setup had already run.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await assert.rejects(client.setMany({ k: "v" }, 1e21), RangeError);
+        await assert.rejects(client.setMany({ k: "v" }, 2 ** 53), RangeError);
+        await assert.rejects(client.setManyBytes({ k: Buffer.from("v") }, 2 ** 53), RangeError);
+        assert.equal(node.store.has("k"), false);
+
+        // The boundary itself is accepted and reaches the wire.
+        await client.setMany({ k: "v" }, Number.MAX_SAFE_INTEGER);
+        assert.equal(await client.get("k"), "v");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("setMany then getMany round trips a shared TTL across the whole batch", async () => {
     const node = await startMockNode();
     try {
