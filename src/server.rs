@@ -937,8 +937,14 @@ pub(crate) async fn run(
                     // give the task a brief window to notice the signal
                     // above and return on its own — it still needs to run
                     // `send_leave` for a clean membership departure rather
-                    // than lingering until the peer's liveness timeout —
-                    // then abort it outright so it can't block
+                    // than lingering until the peer's liveness timeout.
+                    // The window is enough because every network await in
+                    // `run_decommission`'s handoff path is raced against
+                    // this same signal (see `shutdown_requested`), so the
+                    // task reaches `send_leave` within milliseconds of it;
+                    // only `send_leave` itself against an unresponsive
+                    // discovery can outlast the window, and then there is
+                    // nothing left worth waiting for. Then abort it outright so it can't block
                     // `cache_task.await` below regardless (a raw abort
                     // drops its `NodeContext` clone, including the
                     // `request_tx` that `cache_task` is waiting to see
@@ -4943,6 +4949,17 @@ fn classify_decommission_key(
     DecommissionKeyOutcome::Owned
 }
 
+/// Resolves once `shutdown_rx` reads `true`, including when it already
+/// does. Never resolves if the sender is gone: a bare `changed()` on a
+/// dropped sender resolves immediately, which in the `select!`s of
+/// `run_decommission` would turn "no override will ever come" into
+/// "override now" and abandon a perfectly healthy handoff.
+async fn shutdown_requested(shutdown_rx: &mut watch::Receiver<bool>) {
+    if shutdown_rx.wait_for(|requested| *requested).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn run_decommission(
     node_context: NodeContext,
     discovery_addrs: Vec<String>,
@@ -5036,9 +5053,31 @@ async fn run_decommission(
     }
 
     // 2. Roster with addresses.
-    let roster = match fetch_roster_for_leave(&node_context, &discovery_addrs).await {
-        Ok(roster) => roster,
-        Err(error) => {
+    // Tenth-pass follow-up (2026-09-04): every await below that can sit
+    // in network I/O for up to `OUTBOUND_IO_TIMEOUT` — this roster fetch,
+    // and the connect/handoff pair per attempt in the transfer loop — is
+    // raced against the override signal. `run`'s
+    // `DECOMMISSION_OVERRIDE_GRACE` (2s) is far shorter than those I/O
+    // bounds, so without the race an override landing mid-I/O would abort
+    // this task before `send_leave` ever ran — membership left dangling
+    // until the peer's liveness timeout, the very thing the override
+    // path's clean-leave promise exists to avoid.
+    let fetched = tokio::select! {
+        biased;
+        _ = shutdown_requested(&mut shutdown_rx) => None,
+        result = fetch_roster_for_leave(&node_context, &discovery_addrs) => Some(result),
+    };
+    let roster = match fetched {
+        None => {
+            eprintln!(
+                "WARN decommission: shutdown override while fetching the roster; leaving \
+                 without a handoff"
+            );
+            send_leave(&node_context, &discovery_addrs).await;
+            return;
+        }
+        Some(Ok(roster)) => roster,
+        Some(Err(error)) => {
             eprintln!(
                 "WARN decommission: fetching the roster failed ({error}); leaving without a \
                  handoff"
@@ -5159,25 +5198,50 @@ async fn run_decommission(
         };
 
         let mut delivered = false;
+        let mut overridden = false;
         for attempt in 0..KEY_TRANSFER_ATTEMPTS {
             let mut connected = streams.contains_key(addr);
             if !connected {
-                match connect_and_authenticate(&node_context, addr, AuthPeer::Node).await {
-                    Ok(stream) => {
+                // See the roster fetch above for why this (and the
+                // handoff send below) is raced against the override.
+                let outcome = tokio::select! {
+                    biased;
+                    _ = shutdown_requested(&mut shutdown_rx) => None,
+                    result = connect_and_authenticate(&node_context, addr, AuthPeer::Node) => {
+                        Some(result)
+                    }
+                };
+                match outcome {
+                    None => {
+                        overridden = true;
+                        break;
+                    }
+                    Some(Ok(stream)) => {
                         streams.insert(addr.clone(), stream);
                         connected = true;
                     }
-                    Err(error) => {
+                    Some(Err(error)) => {
                         eprintln!("WARN decommission: connecting to {addr} failed: {error}");
                     }
                 }
             }
             if connected && let Some(stream) = streams.get_mut(addr) {
-                match send_handoff_set(stream, &key, &value, ttl, false, entrant_token).await {
-                    Ok(()) => {
+                let outcome = tokio::select! {
+                    biased;
+                    _ = shutdown_requested(&mut shutdown_rx) => None,
+                    result = send_handoff_set(stream, &key, &value, ttl, false, entrant_token) => {
+                        Some(result)
+                    }
+                };
+                match outcome {
+                    None => {
+                        overridden = true;
+                        break;
+                    }
+                    Some(Ok(())) => {
                         delivered = true;
                     }
-                    Err(error) => {
+                    Some(Err(error)) => {
                         eprintln!("WARN decommission: transfer to {addr} failed: {error}");
                         streams.remove(addr);
                     }
@@ -5199,6 +5263,19 @@ async fn run_decommission(
                     _ = shutdown_rx.changed() => {}
                 }
             }
+        }
+        if overridden {
+            // Same accounting as the top-of-loop check: this key and every
+            // still-owned one after it are left behind.
+            println!(
+                "INFO decommission: second shutdown signal received mid-handoff — stopping \
+                 early"
+            );
+            left_behind += std::iter::once(key)
+                .chain(keys_iter)
+                .filter(|key| before_ring.is_owner(key, &self_name, replication))
+                .count();
+            break;
         }
         if delivered {
             sent += 1;
@@ -5229,14 +5306,18 @@ async fn run_decommission(
     // too — membership is already given up by this point (`send_leave`
     // above), so there's nothing left for a second signal to do but cut
     // this grace window short.
+    // `shutdown_requested` rather than `changed()`: the races above mark
+    // the flipped value as seen, after which `changed()` would never fire
+    // again and an already-overridden run would sit out this whole window.
     tokio::select! {
-        _ = sleep(grace) => {}
-        _ = shutdown_rx.changed() => {
+        biased;
+        _ = shutdown_requested(&mut shutdown_rx) => {
             println!(
                 "INFO decommission: second shutdown signal received during the forwarding \
                  window — closing it early"
             );
         }
+        _ = sleep(grace) => {}
     }
 }
 
@@ -11052,6 +11133,102 @@ mod tests {
             "no key should have been attempted once already overridden"
         );
         // Membership is still given up cleanly even when overridden.
+        assert_eq!(*left.lock().unwrap(), vec!["leaver".to_string()]);
+
+        discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_decommission_overridden_mid_transfer_abandons_the_stalled_peer_and_still_leaves() {
+        // Tenth-pass follow-up (2026-09-04): the transfer loop's own I/O
+        // (`connect_and_authenticate`, `send_handoff_set`) is bounded by
+        // `OUTBOUND_IO_TIMEOUT` (10s), far past `run`'s 2s
+        // `DECOMMISSION_OVERRIDE_GRACE`. Unless those awaits are raced
+        // against the override signal, the abort lands while the task is
+        // still stuck in them and `send_leave` never runs. Reproduced
+        // with an entrant that accepts the connection and then never
+        // answers the auth handshake: the override arrives mid-connect,
+        // and the run must still return promptly *and* leave (`V`).
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        for index in 0..20u8 {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key(format!("key-{index}").as_bytes()),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let peer_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((connection, _)) = peer_listener.accept().await else {
+                    return;
+                };
+                // Hold it open, never read or write: the leaver's auth
+                // handshake stalls until its own I/O timeout.
+                held.push(connection);
+            }
+        });
+
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let (left, discovery_task) =
+            spawn_mock_discovery(discovery_listener, peer_addr.clone(), None);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: discovery_addr.clone(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx,
+        };
+
+        let started = Instant::now();
+        let decommission = tokio::spawn(run_decommission(
+            node_context.clone(),
+            vec![discovery_addr.clone()],
+            Duration::from_secs(120),
+        ));
+        // Let it get as far as the stalled handshake, then override.
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            left.lock().unwrap().is_empty(),
+            "the leaver must still be mid-handoff (stalled on the peer) when the override lands"
+        );
+        shutdown_tx.send_replace(true);
+
+        tokio::time::timeout(Duration::from_secs(3), decommission)
+            .await
+            .expect(
+                "run_decommission must return promptly after an override even while stuck in \
+                 peer I/O, not sit out OUTBOUND_IO_TIMEOUT",
+            )
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "expected a return within the override grace, got {:?}",
+            started.elapsed()
+        );
+        // Membership is still given up cleanly.
         assert_eq!(*left.lock().unwrap(), vec!["leaver".to_string()]);
 
         discovery_task.abort();
