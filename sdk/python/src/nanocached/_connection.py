@@ -18,6 +18,7 @@ order their frames actually hit the wire.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -28,6 +29,24 @@ from ._errors import ConnectionLostError, NanocachedError, NotNumericError, Retr
 # headroom, so a claimed length beyond it is definitely a corrupt or
 # malicious frame, never just a legitimately large value.
 _MAX_VALUE_LENGTH = 2 * 1024 * 1024
+
+# An `I` response's <value> body (issue #129) is decimal ASCII text
+# holding the server's own i64 counter — the same grammar and range as
+# the request's own <delta> field (see client.py's _check_delta). Unlike
+# <value-length>/<ttl-seconds> above, this SDK used to hand the raw bytes
+# straight to Connection.incr()'s caller, which called plain int() on
+# them with no guard: a malformed body (a desynced/corrupted reply, or a
+# buggy proxy in front of the server) raised a bare ValueError instead of
+# this SDK's own NanocachedError, which _with_wrong_node_retry's
+# (WrongNodeError, ConnectionError, OSError) catch doesn't recognize (the
+# Go SDK hits the same failure mode and wraps it as ErrProtocol —
+# parseIncrValue in sdk/go/client.go). Bounding the digit count up front
+# keeps int() cheap and side-steps CPython's own int<->str conversion
+# digit limit (PEP 3101 / bpo-issue 3.11's default 4300-digit guard)
+# entirely, rather than relying on it.
+_MAX_I64 = 2**63 - 1
+_MIN_I64 = -(2**63)
+_INCR_VALUE_RE = re.compile(rb"-?[0-9]{1,19}")
 
 # Bounds the sum of every hit's declared length across one multi-get
 # (`M`) reply (issue #207, follow-up to #179's Java fix, PR #201). Each
@@ -378,7 +397,11 @@ class Connection:
         entry has no expiry), ``None`` on a miss (matching get()'s own
         miss convention), and raises ``NotNumericError`` when the stored
         value isn't INCR's counter grammar or applying ``delta`` would
-        overflow."""
+        overflow. ``new_value``'s own decimal-ASCII-i64 grammar is
+        already validated by ``_read_one_response`` before this returns
+        — a malformed body raises ``NanocachedError`` there (poisoning
+        this connection like any other malformed response) rather than a
+        bare ``ValueError`` escaping from a later ``int()`` call."""
         marker, payload = await self._request(lambda tag: _encode_incr(key, delta, tag, namespace))
         if marker == b"I":
             assert payload is not None
@@ -853,6 +876,14 @@ class Connection:
                     raise NanocachedError("nanocached: invalid ttl in incr response")
             tag = self._parse_tag(fields[2 if has_ttl else 1]) if self._tagged else None
             value = await self._reader.readexactly(length)
+            # See _INCR_VALUE_RE's own doc comment: the body must be
+            # INCR's own decimal-ASCII-i64 grammar, checked here — where
+            # every other malformed piece of this same response (its
+            # header, its length, its ttl) already is — rather than left
+            # for Connection.incr()'s caller to discover via a bare int()
+            # call.
+            if not _INCR_VALUE_RE.fullmatch(value) or not (_MIN_I64 <= int(value) <= _MAX_I64):
+                raise NanocachedError("nanocached: invalid incr value in response")
             return marker, (value, ttl_seconds), tag
 
         if marker == b"M":

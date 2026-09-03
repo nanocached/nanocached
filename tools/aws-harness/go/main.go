@@ -42,6 +42,25 @@ func main() {
 // deferred functions, so exiting directly from inside this function
 // would skip the drain.
 func run() int {
+	// Checked before connecting (and before any deferred cleanup exists,
+	// so os.Exit here is safe — see run()'s own doc comment on why it
+	// normally avoids os.Exit): an invalid invocation should fail loudly
+	// with a usage message, not silently connect and then either panic on
+	// a missing os.Args index or (worse) treat a discarded strconv.Atoi
+	// parse error as count 0 — which then makes every loop below a no-op,
+	// reporting a false "success" as if 0 iterations were the intended
+	// count.
+	if len(os.Args) != 4 {
+		fmt.Fprintln(os.Stderr, "usage: nanotest <write|read> <label> <count>")
+		os.Exit(1)
+	}
+	cmd, label := os.Args[1], os.Args[2]
+	count, err := strconv.Atoi(os.Args[3])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "usage: nanotest <write|read> <label> <count>: invalid count %q: %v\n", os.Args[3], err)
+		os.Exit(1)
+	}
+
 	client, err := nanocached.Connect(nanocached.Config{
 		Addresses: parseAddresses(os.Getenv("NANOTEST_ADDRESSES")),
 	})
@@ -50,9 +69,6 @@ func run() int {
 		return 1
 	}
 	defer client.Close()
-
-	cmd, label := os.Args[1], os.Args[2]
-	count, _ := strconv.Atoi(os.Args[3])
 
 	switch cmd {
 	case "write":

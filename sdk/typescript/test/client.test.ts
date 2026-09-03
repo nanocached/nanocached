@@ -165,6 +165,31 @@ describe("NanocachedClient against a single node", () => {
     }
   });
 
+  it("rejects a ttlSeconds beyond Number.MAX_SAFE_INTEGER before any I/O", async () => {
+    // Regression: Number.isInteger(1e21) is true but `${1e21}` serializes
+    // as "1e+21" — a non-decimal TTL field the server's parser can't read,
+    // which would close the connection with no reply and take every other
+    // in-flight pipelined request on it down too. Must be rejected
+    // synchronously by the SDK before anything is written.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await assert.rejects(client.set("k", "v", 1e21), RangeError);
+        // Rejected before any I/O — the key was never written.
+        assert.equal(node.store.has("k"), false);
+
+        // Still usable afterward — none of the above touched the wire.
+        await client.set("k", "v");
+        assert.equal(await client.get("k"), "v");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("pipelines concurrent requests on one connection", async () => {
     const node = await startMockNode();
     try {

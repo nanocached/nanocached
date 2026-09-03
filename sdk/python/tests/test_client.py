@@ -142,6 +142,43 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_ttl_seconds_beyond_the_servers_u64_ceiling_is_rejected_before_any_io(self):
+        # Audit follow-up: unlike JS, Python ints are unbounded, so a
+        # huge ttl_seconds (e.g. a units bug computing seconds from
+        # milliseconds) used to sail past the old `>= 0` check straight
+        # onto the wire. The server parses the wire TTL field as a usize
+        # then narrows it with u64::try_from (src/command.rs's
+        # parse_length + every TTL call site) — on the 64-bit hosts this
+        # server runs on, one past u64::MAX overflows parse_length's own
+        # checked_mul/checked_add, so the server rejects the frame with
+        # no reply, poisoning the shared, pipelined connection exactly
+        # like an empty key or an out-of-range delta.
+        too_large = 2**64
+        client = await self.connect()
+        try:
+            with self.assertRaises(ValueError):
+                await client.set("k", "v", ttl_seconds=too_large)
+            with self.assertRaises(ValueError):
+                await client.set_many({"k": "v"}, ttl_seconds=too_large)
+            with self.assertRaises(ValueError):
+                await client.put_if_absent("k", "v", ttl_seconds=too_large)
+            # Rejected before any I/O — nothing was ever written.
+            self.assertNotIn(b"k", self.node.store)
+
+            # Still usable afterward — none of the above touched the wire.
+            await client.set("k", "v")
+            self.assertEqual(await client.get("k"), "v")
+        finally:
+            await client.close()
+
+    async def test_ttl_seconds_at_the_servers_u64_ceiling_is_accepted(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "v", ttl_seconds=2**64 - 1)
+            self.assertEqual(await client.get("k"), "v")
+        finally:
+            await client.close()
+
     async def test_empty_key_is_rejected_before_touching_the_connection(self):
         # An empty key would serialize to a frame the server rejects with
         # no reply (ParseError::EmptyKey, src/command.rs), closing the
@@ -712,6 +749,57 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
 
                 # The poisoned connection redials transparently on next use.
                 self.assertIsNone(await client.get("k"))
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_a_non_numeric_incr_value_body_raises_a_protocol_error(self):
+        # Audit follow-up to issue #129: Connection.incr()'s `I` response
+        # <value> body used to be handed straight to int() by client.py's
+        # _incr_write with no guard — a malformed body (a desynced/
+        # corrupted reply, or a buggy proxy in front of the server)
+        # raised a bare ValueError instead of this SDK's own
+        # NanocachedError, which _with_wrong_node_retry's (WrongNodeError,
+        # ConnectionError, OSError) catch doesn't recognize (the Go SDK
+        # hits the same failure mode and wraps it as ErrProtocol —
+        # parseIncrValue in sdk/go/client.go). Now validated where every
+        # other malformed piece of this same response already is
+        # (_read_one_response), poisoning the connection like any other
+        # malformed response.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("counter", "10")
+                node.answer_malformed_incr_value_once(b"not-a-number")
+                with self.assertRaisesRegex(NanocachedError, "invalid incr value"):
+                    await client.incr("counter")
+
+                # The poisoned connection redials transparently on next use.
+                self.assertEqual(await client.get("counter"), "11")
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_an_out_of_range_incr_value_body_raises_a_protocol_error(self):
+        # Same as the non-numeric case above, but for a value that IS
+        # decimal digits yet doesn't fit the server's own i64 counter
+        # range — one past int64::MAX, one digit shy of overflowing
+        # CPython's int() outright.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("counter", "10")
+                node.answer_malformed_incr_value_once(b"9223372036854775808")  # 2**63
+                with self.assertRaisesRegex(NanocachedError, "invalid incr value"):
+                    await client.incr("counter")
+
+                self.assertEqual(await client.get("counter"), "11")
                 self.assertEqual(node.connection_count, 2)
             finally:
                 await client.close()
