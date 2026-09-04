@@ -220,6 +220,22 @@ the node-side connection count is the proxy count — not the fleet size —
 with bounded per-client and per-backend in-flight windows providing
 fairness and backpressure.</p>
 
+<p>One documented limit of &ldquo;looks like a single node&rdquo;: the
+proxy enqueues every request on its backend connection in the order the
+client sent it, but a request the proxy has to <em>retry</em> (a
+stale-view <code>W</code> after a roster refresh, a replica fallback) is
+re-enqueued afterwards, outside that order. A client that pipelines a
+<code>G</code> for a key and, without awaiting its reply, an
+<code>S</code> for the same key on the same connection can &mdash; if
+the <code>G</code> lands on a stale view during a ring change &mdash;
+receive the value its own <code>S</code> just wrote. That is the same
+outcome an SDK&rsquo;s own <code>W</code> retry produces in
+cluster-direct mode and is not a consistency violation (the write was
+already on the wire when the read was answered), so it is left as is
+rather than serialising same-key requests per connection. A client
+that needs the read to strictly precede the write awaits the
+<code>G</code> reply before sending the <code>S</code>.</p>
+
 <h2>Design decisions</h2>
 <p>The main choices, in summary:</p>
 <div class="table-wrap">

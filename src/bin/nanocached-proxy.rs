@@ -36,7 +36,24 @@
 //!   key: it answers `A` with the node identity (`On`/`OnT`), so every
 //!   existing SDK in single-address mode — and any bare protocol client
 //!   — works against it unchanged. Cluster-internal frames (`M`/`X`)
-//!   are rejected: the proxy is not a member.
+//!   are rejected: the proxy is not a member. One documented gap in
+//!   "looks like a single node" (issue #463): the *initial* backend
+//!   enqueue of every request happens in the client's request order,
+//!   but a retry (a `W` refresh-and-retry, a replica fallback) is
+//!   re-enqueued later and so runs outside that order. A client that
+//!   pipelines `G k` immediately followed by `S k` on one connection —
+//!   without waiting for the `G`'s reply — can therefore, when the `G`
+//!   hits a stale-view `W` during a ring change, receive the value its
+//!   own `S` just wrote. This is not a linearizability violation (the
+//!   `S` was on the wire before the `G` was answered) and is exactly
+//!   what an SDK's own `W` retry or a retry-capable client re-issuing
+//!   after `R` would observe in cluster-direct mode; closing it would
+//!   mean serialising same-key requests per client connection (each
+//!   waiting for the previous same-key reply, `c`/`F` waiting for all
+//!   of them), which was judged not worth the pipelining cost for a
+//!   pattern — read-then-overwrite of one key without awaiting the
+//!   read — that no SDK or adapter emits. Clients that need the read
+//!   to strictly precede the write must await the `G` reply first.
 //!
 //! - **Multiplexing (#110, implemented here).** Response tags +
 //!   pipelining are the multiplexing primitive: one shared per-node
@@ -3018,7 +3035,10 @@ fn soften(
 /// returns the receiver the writer will await in FIFO order. Retry
 /// paths re-enqueue *after* initial dispatch and so run outside the
 /// ordering guarantee; they only ever fire when a node already refused
-/// or dropped the ordered attempt.
+/// or dropped the ordered attempt. The client-visible consequence (a
+/// pipelined same-key `G` retried after `W` can observe the client's
+/// own later `S`) is a documented limitation — see the module docs and
+/// issue #463 for why it is left as is.
 async fn dispatch_request(
     context: Arc<ProxyContext>,
     request: Request,
