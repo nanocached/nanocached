@@ -613,7 +613,7 @@ function parseTtlSeconds(field: string): number {
 // Returns `undefined` rather than throwing so each call site can attach
 // its own error message (and, for peekMultiFrameLength, keep its
 // never-throws contract).
-function parseStrictInteger(field: string): number | undefined {
+export function parseStrictInteger(field: string): number | undefined {
   if (!TAG_PATTERN.test(field)) return undefined;
   const value = Number(field);
   return Number.isSafeInteger(value) ? value : undefined;
