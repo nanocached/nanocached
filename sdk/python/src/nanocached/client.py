@@ -267,6 +267,27 @@ def _warn(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+def _dedupe_discovered_nodes(nodes: Sequence[DiscoveredNode]) -> list[DiscoveredNode]:
+    """Drops repeated node names from discovery's raw list, first
+    occurrence winning — the same stance HashRing.__init__ takes (issue
+    #360, mirroring src/hash_ring.rs's HashRing::new from #328), carried
+    into the connection layer (issue #461, mirroring Go's
+    dedupeDiscoveredNodes from #389). Without this, _open_cluster and
+    _refresh_node_list dial every listed occurrence of a duplicated name
+    and then write each dial's outcome into self._members keyed by that
+    name — the last write wins, silently leaking any live connection an
+    earlier occurrence already installed (never closed, invisible to the
+    no-longer-listed close sweep, and never counted in stats())."""
+    seen: set[str] = set()
+    deduped: list[DiscoveredNode] = []
+    for node in nodes:
+        if node.name in seen:
+            continue
+        seen.add(node.name)
+        deduped.append(node)
+    return deduped
+
+
 def _to_bytes(value: str | bytes) -> bytes:
     return value.encode("utf-8") if isinstance(value, str) else bytes(value)
 
@@ -718,6 +739,8 @@ class NanocachedClient:
         connect() failing. Only a cluster with *no* reachable node fails
         connect(), with the last dial error."""
 
+        nodes = _dedupe_discovered_nodes(identified.nodes)
+
         async def dial(node):
             node_host, node_port = split_host_port(node.address)
             try:
@@ -728,7 +751,7 @@ class NanocachedClient:
                 return node, error
             return node, target
 
-        outcomes = await asyncio.gather(*(dial(node) for node in identified.nodes))
+        outcomes = await asyncio.gather(*(dial(node) for node in nodes))
 
         # A non-node answer is a configuration error, not a liveness one:
         # checked across every outcome first so the sockets this same
@@ -767,7 +790,7 @@ class NanocachedClient:
             assert last_error is not None
             raise last_error
 
-        self._ring = HashRing([node.name for node in identified.nodes])
+        self._ring = HashRing([node.name for node in nodes])
         self._replication = identified.replication
 
     async def _connect_to_proxy(self, proxies: list[DiscoveredNode]) -> None:
@@ -2671,7 +2694,8 @@ class NanocachedClient:
         if cluster is None:
             return
 
-        by_name = {node.name: node for node in cluster.nodes}
+        nodes = _dedupe_discovered_nodes(cluster.nodes)
+        by_name = {node.name: node for node in nodes}
 
         for name in list(self._members):
             if name not in by_name:
@@ -2681,7 +2705,7 @@ class NanocachedClient:
                 del self._members[name]
 
         new_nodes = []
-        for node in cluster.nodes:
+        for node in nodes:
             existing = self._members.get(node.name)
             if existing is not None:
                 existing.address = node.address

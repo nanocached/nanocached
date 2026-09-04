@@ -2164,6 +2164,74 @@ class NanocachedClientTest {
         }
     }
 
+    // ── 重複ノード名の重複排除 (issue #461) ──────────────────────────
+
+    @Test
+    void aDuplicatedDiscoveryEntryIsDeduplicatedOnInitialConnect() throws Exception {
+        // Regression for issue #461 (mirrors Go's #389 fix, which built
+        // on HashRing's own #360 dedupe): a discovery roster listing the
+        // same node name twice used to be dialed twice, and
+        // openCluster's members.put(node.name(), ...) write for the
+        // name's second occurrence silently overwrote the first —
+        // leaking that connection (never closed, invisible to stats()
+        // and the no-longer-listed close sweep). Discovery here hands
+        // back NAMES.get(0) twice; the ring and member map must end up
+        // with only the deduplicated names, and the node must be dialed
+        // once.
+        try (MockNode nodeA = new MockNode(); MockNode nodeB = new MockNode()) {
+            try (MockDiscovery discovery = new MockDiscovery(
+                    List.of(new DiscoveredNode(NAMES.get(0), nodeA.address()),
+                            new DiscoveredNode(NAMES.get(0), nodeA.address()),
+                            new DiscoveredNode(NAMES.get(1), nodeB.address())),
+                    2)) {
+                try (NanocachedClient client = connect("127.0.0.1", discovery.port())) {
+                    Field membersField = NanocachedClient.class.getDeclaredField("members");
+                    membersField.setAccessible(true);
+                    Map<?, ?> members = (Map<?, ?>) membersField.get(client);
+                    assertEquals(Set.of(NAMES.get(0), NAMES.get(1)), members.keySet());
+                    assertEquals(1, nodeA.connectionCount.get());
+
+                    Field ringField = NanocachedClient.class.getDeclaredField("ring");
+                    ringField.setAccessible(true);
+                    HashRing ring = (HashRing) ringField.get(client);
+                    for (int replicas = 1; replicas <= 2; replicas++) {
+                        List<String> owners = ring.owners("some-key".getBytes(StandardCharsets.UTF_8), replicas);
+                        assertEquals(owners.size(), new java.util.HashSet<>(owners).size(), owners.toString());
+                        assertTrue(owners.size() <= 2);
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void aDuplicatedDiscoveryEntryIsDeduplicatedOnRefresh() throws Exception {
+        // Same regression as above, but for refreshNodeList's own dial
+        // loop: a repeated name in the refreshed roster must not replace
+        // a member's live connection with a second, redundant dial of
+        // the same node.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String name = NAMES.get(0);
+                Connection before = memberConnectionOf(client, name);
+
+                MockNode node = cluster.nodes().get(name);
+                cluster.discovery().nodes = List.of(
+                        new DiscoveredNode(name, node.address()),
+                        new DiscoveredNode(name, node.address()),
+                        new DiscoveredNode(NAMES.get(1), cluster.nodes().get(NAMES.get(1)).address()));
+
+                Method refreshNodeList = NanocachedClient.class.getDeclaredMethod("refreshNodeList");
+                refreshNodeList.setAccessible(true);
+                refreshNodeList.invoke(client);
+
+                Connection after = memberConnectionOf(client, name);
+                assertSame(before, after,
+                        "a repeated node name replaced the live connection (leaking it) instead of being deduped");
+            }
+        }
+    }
+
     // ── クラスタでのバッチ get/set (issue #151) ─────────────────────
 
     @Test

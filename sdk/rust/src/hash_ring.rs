@@ -29,6 +29,8 @@
 //!   alone would pile every namespace's common singleton keys (e.g.
 //!   `config`) onto the same nodes.
 
+use std::collections::HashSet;
+
 use crate::error::{Error, Result};
 
 pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
@@ -83,7 +85,21 @@ pub struct HashRing {
 }
 
 impl HashRing {
+    /// Issue #461 (mirrors the server's `HashRing::new` dedupe from issue
+    /// #328): a name repeated in `nodes` would otherwise score
+    /// independently for each of its slots in `owners`'s bounded
+    /// top-`replicas` insertion, letting a duplicated node occupy more
+    /// than one replica slot and inflating its effective share of the
+    /// ring. Deduplicating here — keeping the first occurrence, so
+    /// construction order is otherwise unaffected — matches the node's
+    /// own behavior exactly, so this SDK's placement decisions never
+    /// diverge from the server's when discovery hands back a duplicate.
     pub fn new(nodes: Vec<String>) -> Self {
+        let mut seen = HashSet::with_capacity(nodes.len());
+        let nodes: Vec<String> = nodes
+            .into_iter()
+            .filter(|node| seen.insert(node.clone()))
+            .collect();
         let node_hashes = nodes.iter().map(|node| fnv1a(node.as_bytes())).collect();
         Self { nodes, node_hashes }
     }
@@ -325,6 +341,41 @@ mod tests {
                 .filter(|node| *node != "node-d")
                 .collect();
             assert_eq!(before.owners(b"", key.as_bytes(), 3), new_order);
+        }
+    }
+
+    #[test]
+    fn duplicate_node_names_are_deduplicated() {
+        // Regression (issue #461, mirrors src/hash_ring.rs's
+        // HashRing::new dedupe from issue #328, and the same fix in the
+        // Go and Python SDKs from issue #360): before this fix, a name
+        // repeated in the constructor's node list scored independently
+        // for each of its slots, so `owners` could return the same node
+        // name more than once in the top-`replicas` set — inflating its
+        // effective share of the ring.
+        let with_dupes = ring(&["a", "b", "b", "b", "c", "d"]);
+
+        for replicas in 0..=5 {
+            let owners = with_dupes.owners(b"", b"some-key", replicas);
+            let mut sorted = owners.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                owners.len(),
+                "replicas={replicas} owners={owners:?}"
+            );
+        }
+
+        // Construction order is otherwise unaffected: the first
+        // occurrence of a repeated name is kept in place.
+        let deduped = ring(&["a", "b", "c", "d"]);
+        for i in 0..200 {
+            let key = format!("key-{i}");
+            assert_eq!(
+                with_dupes.owners(b"", key.as_bytes(), 4),
+                deduped.owners(b"", key.as_bytes(), 4)
+            );
         }
     }
 }

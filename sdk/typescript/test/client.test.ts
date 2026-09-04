@@ -5130,6 +5130,94 @@ describe("NanocachedClient tolerant bootstrap (issue #67)", () => {
   });
 });
 
+describe("NanocachedClient dedupes discovery's duplicated node names (issue #461)", () => {
+  // #461: issue #360's writeup claimed this SDK was "structurally immune"
+  // to a discovery roster listing the same node name more than once,
+  // because `members` is a name-keyed Map. That claim was wrong: connect()
+  // dialed every *raw* occurrence of a duplicated name (a wasted, racy
+  // double-dial of the same node), and the ring was built straight from
+  // that raw, undeduped list — inflating the duplicated name's effective
+  // share of the ring exactly like issue #328/#360 (server/Python/Go).
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  it("connect() dials a duplicated name once, and the ring/members are deduped", async () => {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    try {
+      const discovery = await startMockDiscovery([
+        { name: names[0], address: nodeA.address },
+        { name: names[0], address: nodeA.address },
+        { name: names[1], address: nodeB.address },
+      ]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          // Only one connection to nodeA, despite discovery listing its
+          // name twice — the second occurrence must not be dialed at all.
+          assert.equal(nodeA.connectionCount(), 1);
+          assert.equal(nodeB.connectionCount(), 1);
+
+          const members: Map<string, unknown> = (client as any).target.members;
+          assert.deepEqual(new Set(members.keys()), new Set(names));
+
+          const ring = (client as any).target.ring;
+          for (let replicas = 0; replicas <= 3; replicas++) {
+            const owners: string[] = ring.owners(Buffer.from("some-key"), replicas);
+            assert.equal(new Set(owners).size, owners.length, `replicas=${replicas}: duplicate in ${owners}`);
+          }
+        } finally {
+          client.close();
+        }
+      } finally {
+        await discovery.close();
+      }
+    } finally {
+      await Promise.all([nodeA.close(), nodeB.close()]);
+    }
+  });
+
+  it("refresh keeps the live connection when discovery repeats a node name", async () => {
+    // Mirrors Go's TestRefreshKeepsTheLiveConnectionWhenDiscoveryRepeatsANodeName
+    // (issue #389): before this fix, a duplicated *newly discovered* name's
+    // second occurrence in refreshNodeList's `newNodes` construction would
+    // get dialed and installed too, silently overwriting (orphaning,
+    // leaking) whichever connection — old or freshly dialed — the first
+    // occurrence had just installed.
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    try {
+      const discovery = await startMockDiscovery([{ name: names[0], address: nodeA.address }]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          const before = (client as any).target.members.get(names[0]).connection;
+          assert.ok(before !== null);
+
+          // Discovery now hands back the same (already-live) node name
+          // twice, alongside a brand-new second node.
+          discovery.setNodes([
+            { name: names[0], address: nodeA.address },
+            { name: names[0], address: nodeA.address },
+            { name: names[1], address: nodeB.address },
+          ]);
+          await (client as any).refreshNodeList();
+
+          const after = (client as any).target.members.get(names[0]).connection;
+          assert.equal(before, after, "a repeated node name replaced the live connection instead of being deduped");
+          assert.equal(nodeA.connectionCount(), 1, "the already-live node was redialed");
+
+          const members: Map<string, unknown> = (client as any).target.members;
+          assert.deepEqual(new Set(members.keys()), new Set(names));
+        } finally {
+          client.close();
+        }
+      } finally {
+        await discovery.close();
+      }
+    } finally {
+      await Promise.all([nodeA.close(), nodeB.close()]);
+    }
+  });
+});
+
 describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () => {
   it("round-trips get/getBytes/set/delete through a namespace handle", async () => {
     const node = await startMockNode();

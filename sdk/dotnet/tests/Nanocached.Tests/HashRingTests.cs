@@ -154,6 +154,33 @@ public class HashRingTests
     }
 
     [Fact]
+    public void DuplicateNodeNamesAreDeduplicated()
+    {
+        // Regression (issue #461, mirrors src/hash_ring.rs's HashRing::new
+        // dedupe from issue #328 and the Go/Python SDKs' fix, issue #360):
+        // before this fix, a name repeated in the constructor's node list
+        // scored independently for each of its slots in Owners' bounded
+        // top-`replicas` insertion, so Owners could return the same node
+        // name more than once — inflating its effective share of the ring.
+        var ring = new HashRing(new[] { "a", "b", "b", "b", "c", "d" });
+        byte[] key = Bytes("some-key");
+        for (int replicas = 0; replicas <= 5; replicas++)
+        {
+            IReadOnlyList<string> owners = ring.Owners(key, replicas);
+            Assert.Equal(owners.Distinct().Count(), owners.Count);
+        }
+
+        // Construction order is otherwise unaffected: the first
+        // occurrence of a repeated name is kept in place.
+        var deduped = new HashRing(new[] { "a", "b", "c", "d" });
+        for (int i = 0; i < 200; i++)
+        {
+            byte[] k = Bytes($"key-{i}");
+            Assert.Equal(deduped.Owners(k, 4), ring.Owners(k, 4));
+        }
+    }
+
+    [Fact]
     public void SpreadsKeysEvenly()
     {
         var ring = new HashRing(Nodes);

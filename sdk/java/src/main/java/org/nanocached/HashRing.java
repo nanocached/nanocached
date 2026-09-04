@@ -3,8 +3,10 @@ package org.nanocached;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.PriorityQueue;
+import java.util.Set;
 
 /**
  * Rendezvous (highest-random-weight) hashing over a fixed node list (the client-side
@@ -52,11 +54,28 @@ public final class HashRing {
     private final List<String> nodes;
     private final long[] nodeHashes;
 
+    /**
+     * Issue #461 (mirrors src/hash_ring.rs's {@code HashRing::new} dedupe,
+     * issue #328, and the Python/Go SDK fixes for the same, issues #360
+     * and #389): deduplicates {@code nodes}, keeping the first occurrence
+     * so construction order is otherwise unaffected. A repeated name
+     * would otherwise score independently for each of its slots in
+     * {@link #owners}'s bounded top-{@code replicas} insertion, occupying
+     * more than one place in the returned set and inflating its
+     * effective share of the ring.
+     */
     public HashRing(List<String> nodes) {
-        this.nodes = List.copyOf(nodes);
-        this.nodeHashes = new long[nodes.size()];
-        for (int i = 0; i < nodes.size(); i++) {
-            this.nodeHashes[i] = fnv1a(nodes.get(i).getBytes(StandardCharsets.UTF_8));
+        Set<String> seen = new HashSet<>(nodes.size());
+        List<String> deduped = new ArrayList<>(nodes.size());
+        for (String node : nodes) {
+            if (seen.add(node)) {
+                deduped.add(node);
+            }
+        }
+        this.nodes = List.copyOf(deduped);
+        this.nodeHashes = new long[this.nodes.size()];
+        for (int i = 0; i < this.nodes.size(); i++) {
+            this.nodeHashes[i] = fnv1a(this.nodes.get(i).getBytes(StandardCharsets.UTF_8));
         }
     }
 
