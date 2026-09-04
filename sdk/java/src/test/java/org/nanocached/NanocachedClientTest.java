@@ -3368,9 +3368,23 @@ class NanocachedClientTest {
                     // dies), so accept in a loop and track every socket.
                     List<java.net.Socket> acceptedSockets =
                             java.util.Collections.synchronizedList(new ArrayList<>());
+                    // Issue #130: once the test starts tearing down, a
+                    // connection accept() hands back *after* the close loop
+                    // below ran would otherwise stay open until the SDK's
+                    // own identify read timeout — so from then on the
+                    // acceptor closes whatever it accepts itself.
+                    java.util.concurrent.atomic.AtomicBoolean tearingDown =
+                            new java.util.concurrent.atomic.AtomicBoolean(false);
                     Thread acceptor = new Thread(() -> {
                         try {
-                            while (true) acceptedSockets.add(silent.accept());
+                            while (true) {
+                                java.net.Socket accepted = silent.accept();
+                                if (tearingDown.get()) {
+                                    accepted.close();
+                                    continue;
+                                }
+                                acceptedSockets.add(accepted);
+                            }
                         } catch (java.io.IOException ignored) {
                             // Server socket closed.
                         }
@@ -3412,11 +3426,19 @@ class NanocachedClientTest {
                     // Unblock the refresher so it finishes inside this
                     // test: stop further redials first, then kill the
                     // in-flight connections.
+                    tearingDown.set(true);
                     silent.close();
                     synchronized (acceptedSockets) {
                         for (java.net.Socket socket : acceptedSockets) socket.close();
                     }
-                    refresher.join(5_000);
+                    // Issue #130 (reproduced 1-in-25 on Linux): this join
+                    // used to be 5s — exactly Identify's CONNECT_TIMEOUT_MS
+                    // read timeout — so a connection the close loop missed
+                    // left the refresher alive at the very moment the
+                    // assertion ran. The budget now comfortably covers one
+                    // full identify timeout, and the acceptor above closes
+                    // late arrivals so that path is not normally taken.
+                    refresher.join(20_000);
                     assertFalse(refresher.isAlive(), "refresher did not finish");
                 }
             }
