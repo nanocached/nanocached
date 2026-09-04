@@ -23,7 +23,7 @@ import { FIRE_AND_FORGET_TUNING, HEDGE_READ_TUNING, KEEPALIVE_TUNING, MAX_BATCH_
 import { REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
 import { MAX_REQUEST_BYTES, MULTI_GET_TUNING } from "../src/protocol.js";
 import { maxMultiGetDecompressedBytes, setMaxMultiGetDecompressedBytesForTest } from "../src/compression.js";
-import { startMockDiscovery, startMockNode, unusedPort, type MockNode } from "./mockServers.js";
+import { startMockDiscovery, startMockNode, unreachablePort, unusedPort, type MockNode } from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -562,7 +562,7 @@ describe("NanocachedClient discovery addresses", () => {
   it("connects through the second address when the first is unreachable", async () => {
     const node = await startMockNode();
     const discovery = await startMockDiscovery([{ name: names[0], address: node.address }]);
-    const deadPort = await unusedPort();
+    const deadPort = unreachablePort();
     try {
       const client = await NanocachedClient.connect({
         addresses: [
@@ -629,7 +629,7 @@ describe("NanocachedClient discovery addresses", () => {
 
   it("warns when multiple addresses resolve to a single pinned node", async () => {
     const node = await startMockNode();
-    const deadPort = await unusedPort();
+    const deadPort = unreachablePort();
     const warn = mock.method(console, "warn", () => {});
     try {
       const client = await NanocachedClient.connect({
@@ -4553,7 +4553,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
   it("counts a swallowed refresh failure for an unreachable discovery seed", async () => {
     const node = await startMockNode();
     const discovery = await startMockDiscovery([{ name: names[0], address: node.address }]);
-    const deadPort = await unusedPort();
+    const deadPort = unreachablePort();
     try {
       const client = await NanocachedClient.connect({
         addresses: [
@@ -5619,7 +5619,7 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
 
   it("fails over to the reachable proxy when the other one is down", async () => {
     const live = await startMockNode();
-    const deadPort = await unusedPort();
+    const deadPort = unreachablePort();
     const discovery = await startMockDiscovery([]);
     discovery.setProxies([
       { name: "proxy-dead", address: `127.0.0.1:${deadPort}` },
@@ -5667,7 +5667,7 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
   });
 
   it("rejects connect with the dial error when every registered proxy is unreachable", async () => {
-    const [deadPortA, deadPortB] = await Promise.all([unusedPort(), unusedPort()]);
+    const [deadPortA, deadPortB] = [unreachablePort(), unreachablePort()];
     const discovery = await startMockDiscovery([]);
     discovery.setProxies([
       { name: "proxy-a", address: `127.0.0.1:${deadPortA}` },
@@ -5902,7 +5902,7 @@ describe("NanocachedClient refreshNodeList dials new nodes concurrently (issue #
     const bootNode = await startMockNode();
     const discovery = await startMockDiscovery([{ name: "boot", address: bootNode.address }]);
     const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
-    const deadPort = await unusedPort();
+    const deadPort = unreachablePort();
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
       try {

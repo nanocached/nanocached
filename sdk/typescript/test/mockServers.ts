@@ -196,10 +196,31 @@ export interface MockDiscovery extends MockServerBase {
 
 /** A port with nothing listening on it — bound once to reserve a real
  * ephemeral port, then released. */
+/** Binds and releases an ephemeral port — for a test that needs a port
+ * it will itself listen on *later* (a node that comes back). Not for
+ * "this address is unreachable" tests: the released port is in the same
+ * ephemeral range every mock server picks from (`listen(0)`), so a
+ * concurrent test can land a live mock on it — use `unreachablePort()` there. */
 export async function unusedPort(): Promise<number> {
   const server = createServer();
   const port = await listen(server);
   await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  return port;
+}
+
+/** A loopback port nothing will ever listen on, for "the node/proxy is
+ * unreachable" tests. `unusedPort()` raced the mock servers other tests
+ * start concurrently: CI once saw a "dead" proxy address answer as a live
+ * mock node ("no longer identifies as a proxy", PR #459's
+ * typescript-client job). Privileged ports 1-6 are never bound by
+ * anything in this suite (every mock listens on 0) and are not bindable by
+ * the non-root user CI and dev machines run as, so a dial to them fails
+ * with ECONNREFUSED every time. Cycles through six so a test asking for
+ * two dead ports gets two distinct ones. */
+let nextDeadPort = 1;
+export function unreachablePort(): number {
+  const port = nextDeadPort;
+  nextDeadPort = (nextDeadPort % 6) + 1;
   return port;
 }
 
