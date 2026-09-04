@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
@@ -385,8 +386,8 @@ internal static class Identify
         // `N <count> <r>\n` (client-side replication) — the replication factor rides along.
         string[] fields = header[2..].Split(' ');
         if (fields.Length != 2
-            || !int.TryParse(fields[0], out int count)
-            || !int.TryParse(fields[1], out int replication))
+            || !int.TryParse(fields[0], NumberStyles.None, CultureInfo.InvariantCulture, out int count)
+            || !int.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out int replication))
         {
             throw new NanocachedException("nanocached: invalid node-list header in discovery response");
         }
@@ -408,8 +409,8 @@ internal static class Identify
         {
             string[] lengths = (await ReadLineAsync(stream, cancel).ConfigureAwait(false)).Split(' ');
             if (lengths.Length != 2
-                || !int.TryParse(lengths[0], out int nameLength)
-                || !int.TryParse(lengths[1], out int addrLength)
+                || !int.TryParse(lengths[0], NumberStyles.None, CultureInfo.InvariantCulture, out int nameLength)
+                || !int.TryParse(lengths[1], NumberStyles.None, CultureInfo.InvariantCulture, out int addrLength)
                 || nameLength < 0
                 || addrLength < 0)
             {
@@ -463,7 +464,7 @@ internal static class Identify
                 $"nanocached: unexpected response from discovery server: {header}");
         }
 
-        if (!int.TryParse(header[2..], out int count) || count < 0 || count > MaxNodeCount)
+        if (!int.TryParse(header[2..], NumberStyles.None, CultureInfo.InvariantCulture, out int count) || count < 0 || count > MaxNodeCount)
         {
             throw new NanocachedException("nanocached: invalid proxy count in discovery response");
         }
@@ -476,8 +477,8 @@ internal static class Identify
         {
             string[] lengths = (await ReadLineAsync(stream, cancel).ConfigureAwait(false)).Split(' ');
             if (lengths.Length != 2
-                || !int.TryParse(lengths[0], out int nameLength)
-                || !int.TryParse(lengths[1], out int addrLength)
+                || !int.TryParse(lengths[0], NumberStyles.None, CultureInfo.InvariantCulture, out int nameLength)
+                || !int.TryParse(lengths[1], NumberStyles.None, CultureInfo.InvariantCulture, out int addrLength)
                 || nameLength < 0
                 || addrLength < 0)
             {
@@ -528,7 +529,7 @@ internal static class Identify
         // socket layer instead of a NanocachedException.
         int separator = address.LastIndexOf(':');
         if (separator == -1
-            || !int.TryParse(address[(separator + 1)..], out int port)
+            || !int.TryParse(address[(separator + 1)..], NumberStyles.None, CultureInfo.InvariantCulture, out int port)
             || port is < 0 or > 65535)
         {
             throw new NanocachedException(

@@ -348,6 +348,32 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task AnIncrBodyWithASignOrWhitespaceIsRejectedAsAProtocolError()
+    {
+        // Tenth-pass follow-up (2026-09-04): every wire integer is parsed
+        // with NumberStyles.None (the incr body: AllowLeadingSign, for a
+        // negative counter) and the invariant culture, matching the
+        // encode side and the node's own digits-only grammar. The default
+        // int/long.TryParse accepted a leading `+`, surrounding whitespace
+        // and thousands-free but culture-dependent forms.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("n", "1");
+        Assert.Equal(2L, await client.IncrAsync("n", 1));
+
+        node.AnswerIncrBodyOnce("+3");
+        await Assert.ThrowsAsync<ConnectionLostException>(() => client.IncrAsync("n", 1));
+
+        node.AnswerIncrBodyOnce(" 4");
+        await Assert.ThrowsAsync<ConnectionLostException>(() => client.IncrAsync("n", 1));
+
+        // A plain negative body is still a number.
+        node.AnswerIncrBodyOnce("-5");
+        Assert.Equal(-5L, await client.IncrAsync("n", 1));
+    }
+
+    [Fact]
     public async Task AMismatchedResponseKindPoisonsTheConnection()
     {
         // A well-formed response of the wrong kind (`S` answering a G)
