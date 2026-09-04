@@ -1199,12 +1199,95 @@ fn hex_nibble_field(byte: u8) -> io::Result<u8> {
     }
 }
 
+/// Per-connection state for `parse_request`'s header-`\n` scan, carried
+/// across calls the same way the node's `MigrateProgress` carries its
+/// resumable scans (`src/command.rs`). Without this, a header trickling
+/// in one small `read()` at a time made `handle_client`'s parse loop
+/// re-scan the whole buffered prefix for `\n` on every call — quadratic
+/// in the header length, and reachable pre-auth. `header_end`, once
+/// found, is reused outright; otherwise `header_scanned_to` records how
+/// far the scan already confirmed there is no `\n`, so the next call
+/// only examines newly arrived bytes.
+///
+/// Valid only while `input`'s front is unchanged: `parse_request` resets
+/// this on every outcome other than `Incomplete` (a full parse consumes
+/// the front via `split_to`; an error tears the connection down), never
+/// on `Incomplete` alone, and the caller must not otherwise mutate
+/// `input`'s front while reusing the same state.
+#[derive(Debug, Default)]
+struct RequestScanState {
+    header_end: Option<usize>,
+    header_scanned_to: usize,
+}
+
+/// Finds the header-terminating `\n`, resuming `scan`'s prior progress
+/// instead of re-scanning bytes already confirmed `\n`-free.
+fn find_header_end(input: &[u8], scan: &mut RequestScanState) -> Option<usize> {
+    if let Some(end) = scan.header_end
+        && input.len() > end
+    {
+        return Some(end);
+    }
+    // Shouldn't happen (see the invariant above), but fall through to a
+    // fresh scan rather than trust a now out-of-range `header_end`.
+    let start = scan.header_scanned_to.min(input.len());
+    #[cfg(test)]
+    LF_SCAN_BYTES.with(|scanned| scanned.set(scanned.get() + (input.len() - start)));
+    match input[start..].iter().position(|byte| *byte == b'\n') {
+        Some(relative) => {
+            let end = start + relative;
+            scan.header_end = Some(end);
+            Some(end)
+        }
+        None => {
+            scan.header_scanned_to = input.len();
+            None
+        }
+    }
+}
+
+// Total bytes ever handed to `find_header_end`'s `\n` scan on the current
+// thread — a proxy for "did the header scan go quadratic" that a unit
+// test can check without relying on wall-clock timing (flaky under CI
+// load). Reset with `reset_lf_scan_counter` at the start of a test.
+#[cfg(test)]
+thread_local! {
+    static LF_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_lf_scan_counter() {
+    LF_SCAN_BYTES.with(|scanned| scanned.set(0));
+}
+
+#[cfg(test)]
+fn lf_scan_bytes() -> usize {
+    LF_SCAN_BYTES.with(|scanned| scanned.get())
+}
+
 /// Parses one frame from the front of `input` (untouched on
 /// `Incomplete`), mirroring the node's own grammar for the client-facing
 /// commands. `M`/`X` and anything unknown error — the proxy is not a
-/// cluster member (see the module docs).
-fn parse_request(input: &mut BytesMut, tagged: bool) -> io::Result<ParseOutcome> {
-    let Some(header_end) = input.iter().position(|byte| *byte == b'\n') else {
+/// cluster member (see the module docs). `scan` carries the header `\n`
+/// scan's progress across calls — see `RequestScanState`.
+fn parse_request(
+    input: &mut BytesMut,
+    tagged: bool,
+    scan: &mut RequestScanState,
+) -> io::Result<ParseOutcome> {
+    let result = parse_request_body(input, tagged, scan);
+    if !matches!(result, Ok(ParseOutcome::Incomplete)) {
+        *scan = RequestScanState::default();
+    }
+    result
+}
+
+fn parse_request_body(
+    input: &mut BytesMut,
+    tagged: bool,
+    scan: &mut RequestScanState,
+) -> io::Result<ParseOutcome> {
+    let Some(header_end) = find_header_end(input, scan) else {
         if input.len() > MAX_REQUEST_SIZE {
             return Err(invalid("header exceeds the request-size limit"));
         }
@@ -4305,11 +4388,12 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
     // so it can be passed to `dispatch_request` by value.
     let mut retry_capable = false;
     let mut drain = context.drain.clone();
+    let mut scan = RequestScanState::default();
 
     let result: io::Result<()> = 'connection: loop {
         // Parse everything already buffered before reading more.
         loop {
-            match parse_request(&mut buf, tagged) {
+            match parse_request(&mut buf, tagged, &mut scan) {
                 Ok(ParseOutcome::Incomplete) => break,
                 Ok(ParseOutcome::Auth {
                     secret,
@@ -4984,6 +5068,85 @@ mod tests {
             "the body must be sliced from the original frame, not recopied"
         );
         assert_eq!(&body[..], b"keyvalue");
+    }
+
+    #[test]
+    fn parse_request_trickled_multi_field_header_matches_one_shot_parse() {
+        // A multi-field header (key-len, value-len, ttl, tag) trickled in
+        // one byte at a time, then a body trickled the same way —
+        // regression coverage for caching the header's `\n` scan
+        // (`RequestScanState`): before that, every call re-scanned the
+        // whole buffered prefix for `\n`.
+        let frame = b"S 4 5 10 9\nnameAlice";
+        let mut expected_input = BytesMut::from(&frame[..]);
+        let expected =
+            parse_request(&mut expected_input, true, &mut RequestScanState::default()).unwrap();
+
+        let mut input = BytesMut::new();
+        let mut scan = RequestScanState::default();
+        let mut parsed = None;
+
+        for (index, byte) in frame.iter().enumerate() {
+            input.extend_from_slice(&[*byte]);
+            match parse_request(&mut input, true, &mut scan) {
+                Ok(ParseOutcome::Incomplete) => {}
+                Ok(result) => {
+                    parsed = Some(result);
+                    break;
+                }
+                other => panic!("unexpected {other:?} at byte {index}"),
+            }
+        }
+
+        assert_eq!(parsed, Some(expected));
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parse_request_header_scan_never_rescans_already_buffered_bytes() {
+        // Same trickle as above, but asserting the *cost* rather than
+        // just the outcome: the header `\n` scan's total bytes-examined
+        // count (a `#[cfg(test)]`-only instrument, since wall-clock
+        // timing assertions are flaky under CI load) must grow by
+        // exactly one per newly buffered header byte and then stop
+        // growing once the header is found — never by the whole buffered
+        // prefix on every call, which is what made this quadratic in the
+        // header length.
+        reset_lf_scan_counter();
+
+        let frame = b"S 4 5 10 9\nnameAlice";
+        let header_len = 11; // `"S 4 5 10 9\n"`, `\n` included
+
+        let mut input = BytesMut::new();
+        let mut scan = RequestScanState::default();
+        let mut parsed = None;
+
+        for (index, byte) in frame.iter().enumerate() {
+            input.extend_from_slice(&[*byte]);
+            match parse_request(&mut input, true, &mut scan) {
+                Ok(ParseOutcome::Incomplete) => {
+                    assert_eq!(
+                        lf_scan_bytes(),
+                        (index + 1).min(header_len),
+                        "at byte {index}: the header scan should examine only \
+                         newly buffered bytes, and none at all once the \
+                         header's `\\n` is already cached"
+                    );
+                }
+                Ok(result) => {
+                    parsed = Some(result);
+                    break;
+                }
+                other => panic!("unexpected {other:?} at byte {index}"),
+            }
+        }
+
+        assert!(parsed.is_some());
+        assert_eq!(
+            lf_scan_bytes(),
+            header_len,
+            "the body's bytes should never reach the header scan"
+        );
     }
 
     // ── arg parsing ──────────────────────────────────────────────────

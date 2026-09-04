@@ -530,12 +530,49 @@ pub fn parse_resumable(
 /// and `joined_count` guard against (a different frame at the front is
 /// vanishingly unlikely to match both, and `input.len() >= cursor` is
 /// re-checked before any recorded span is trusted).
+///
+/// Also carries the top-level header line's own `\n` scan progress
+/// (`line_end`/`line_scanned_to`) — same idea, one level up: without it,
+/// a header line trickling in one small `read()` at a time (or a long
+/// header followed by a body trickling in afterwards) made
+/// `parse_with_mode` re-scan the whole buffered prefix for `\n` on every
+/// call, quadratic in the header length and reachable pre-auth. Once
+/// `line_end` is found it's reused outright, with no further scanning,
+/// until `parse_resumable` resets this on any non-`Incomplete` result.
 #[derive(Debug, Default)]
 pub struct MigrateProgress {
     header_end: usize,
     joined_count: usize,
     cursor: usize,
     entry_spans: Vec<(usize, usize, usize, usize)>,
+    line_end: Option<usize>,
+    line_scanned_to: usize,
+}
+
+/// Finds the top-level header line's terminating `\n`, resuming
+/// `progress`'s prior scan instead of re-examining bytes already
+/// confirmed `\n`-free (or re-scanning at all once `line_end` is known).
+fn find_header_line_end(input: &[u8], progress: &mut MigrateProgress) -> Option<usize> {
+    if let Some(end) = progress.line_end
+        && input.len() > end
+    {
+        return Some(end);
+    }
+    // Shouldn't happen given `parse_resumable`'s reset-on-consume
+    // invariant, but fall through to a fresh scan rather than trust a
+    // now out-of-range `line_end`.
+    let start = progress.line_scanned_to.min(input.len());
+    match find_lf(&input[start..]) {
+        Some(relative) => {
+            let end = start + relative;
+            progress.line_end = Some(end);
+            Some(end)
+        }
+        None => {
+            progress.line_scanned_to = input.len();
+            None
+        }
+    }
 }
 
 fn parse_with_mode(
@@ -543,7 +580,7 @@ fn parse_with_mode(
     tagged: bool,
     progress: &mut MigrateProgress,
 ) -> Result<(Command, Option<u32>), ParseError> {
-    let header_end = find_lf(&input[..]).ok_or(ParseError::Incomplete)?;
+    let header_end = find_header_line_end(&input[..], progress).ok_or(ParseError::Incomplete)?;
     let header = &input[..header_end];
 
     let mut parts = header.split(|byte| *byte == b' ');
@@ -1484,6 +1521,11 @@ fn parse_migrate(
         joined_count,
         cursor,
         entry_spans: Vec::new(),
+        // The top-level header line is this same `header_end` — keep it
+        // cached so a still-trickling roster doesn't also re-trigger the
+        // header-line scan on the next attempt.
+        line_end: Some(header_end),
+        line_scanned_to: progress.line_scanned_to,
     };
 
     let scanned = scan_joined_entries(input, cursor, joined_count, &mut entry_spans);
@@ -1631,7 +1673,30 @@ fn hex_nibble(byte: u8) -> Result<u8, ParseError> {
 }
 
 fn find_lf(input: &[u8]) -> Option<usize> {
+    #[cfg(test)]
+    LF_SCAN_BYTES.with(|scanned| scanned.set(scanned.get() + input.len()));
+
     input.iter().position(|byte| *byte == b'\n')
+}
+
+// Total bytes ever handed to `find_lf` on the current thread — a proxy
+// for "did the header scan go quadratic" that a unit test can check
+// without relying on wall-clock timing (flaky under CI load; see the
+// SDK's other timing-sensitive test history). Reset with
+// `reset_lf_scan_counter` at the start of a test.
+#[cfg(test)]
+thread_local! {
+    static LF_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_lf_scan_counter() {
+    LF_SCAN_BYTES.with(|scanned| scanned.set(0));
+}
+
+#[cfg(test)]
+fn lf_scan_bytes() -> usize {
+    LF_SCAN_BYTES.with(|scanned| scanned.get())
 }
 
 fn parse_length(input: &[u8]) -> Result<usize, ParseError> {
@@ -2199,6 +2264,7 @@ mod tests {
             joined_count: 2,
             cursor: 1_000_000,
             entry_spans: vec![(0, 0, 0, 0)],
+            ..MigrateProgress::default()
         };
         let mut input = buf(
             b"M 6 14 5 2 2 5\ntok-bnode-b127.0.0.1:8357tok-j6 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358",
@@ -2207,6 +2273,83 @@ mod tests {
         let (command, _) = parse_resumable(&mut input, false, &mut progress).unwrap();
 
         assert!(matches!(command, Command::Migrate { joined, .. } if joined.len() == 2));
+    }
+
+    #[test]
+    fn parse_resumable_trickled_multi_field_header_matches_one_shot_parse() {
+        // A multi-field header (key-len, value-len, ttl, tag) trickled in
+        // one byte at a time, then a body trickled the same way —
+        // regression coverage for caching the top-level header's `\n`
+        // scan (`MigrateProgress::line_end`/`line_scanned_to`): before
+        // that, every call re-scanned the whole buffered prefix for `\n`.
+        let frame = b"S 4 5 10 9\nnameAlice";
+        let mut expected_input = BytesMut::from(&frame[..]);
+        let expected = parse_tagged(&mut expected_input).unwrap();
+
+        let mut input = BytesMut::new();
+        let mut progress = MigrateProgress::default();
+        let mut parsed = None;
+
+        for (index, byte) in frame.iter().enumerate() {
+            input.extend_from_slice(&[*byte]);
+            match parse_resumable(&mut input, true, &mut progress) {
+                Err(ParseError::Incomplete) => {}
+                Ok(result) => {
+                    parsed = Some(result);
+                    break;
+                }
+                other => panic!("unexpected {other:?} at byte {index}"),
+            }
+        }
+
+        assert_eq!(parsed, Some(expected));
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parse_resumable_header_scan_never_rescans_already_buffered_bytes() {
+        // Same trickle as above, but asserting the *cost* rather than
+        // just the outcome: `find_lf`'s total bytes-examined count (a
+        // `#[cfg(test)]`-only instrument, since wall-clock timing
+        // assertions are flaky under CI load) must grow by exactly one
+        // per newly buffered header byte and then stop growing once the
+        // header is found — never by the whole buffered prefix on every
+        // call, which is what made this quadratic in the header length.
+        reset_lf_scan_counter();
+
+        let frame = b"S 4 5 10 9\nnameAlice";
+        let header_len = 11; // `"S 4 5 10 9\n"`, `\n` included
+
+        let mut input = BytesMut::new();
+        let mut progress = MigrateProgress::default();
+        let mut parsed = None;
+
+        for (index, byte) in frame.iter().enumerate() {
+            input.extend_from_slice(&[*byte]);
+            match parse_resumable(&mut input, true, &mut progress) {
+                Err(ParseError::Incomplete) => {
+                    assert_eq!(
+                        lf_scan_bytes(),
+                        (index + 1).min(header_len),
+                        "at byte {index}: find_lf should examine only newly \
+                         buffered bytes, and none at all once the header's \
+                         `\\n` is already cached"
+                    );
+                }
+                Ok(result) => {
+                    parsed = Some(result);
+                    break;
+                }
+                other => panic!("unexpected {other:?} at byte {index}"),
+            }
+        }
+
+        assert!(parsed.is_some());
+        assert_eq!(
+            lf_scan_bytes(),
+            header_len,
+            "the body's bytes should never reach find_lf"
+        );
     }
 
     #[test]
