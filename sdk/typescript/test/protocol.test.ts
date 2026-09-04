@@ -14,6 +14,8 @@ import {
   encodeSet,
   MAX_REQUEST_BYTES,
   MULTI_GET_TUNING,
+  parseCounterValue,
+  parseStrictInteger,
   peekMultiFrameLength,
   tryParseResponse,
 } from "../src/protocol.js";
@@ -517,6 +519,20 @@ describe("tryParseResponse", () => {
     assert.throws(() => tryParseResponse(Buffer.from("V -1\n")), /invalid value length/);
   });
 
+  it("throws on a value length that isn't strict decimal digits (issue #462)", () => {
+    // Regression: bare `Number(fields[0])` accepts a leading `+`, leading/
+    // trailing whitespace, and scientific notation — none of these are
+    // legal decimal-digits-only wire integers, and must poison the
+    // connection the same as any other malformed length.
+    assert.throws(() => tryParseResponse(Buffer.from("V +5\nhello")), /invalid value length/);
+    // A trailing space would instead split into a second (empty) field and
+    // trip the field-count check, not the length grammar itself — use a
+    // tab, which the digits-only grammar rejects without splitting.
+    assert.throws(() => tryParseResponse(Buffer.from("V 5\t\nhello")), /invalid value length/);
+    assert.throws(() => tryParseResponse(Buffer.from("V 1e2\n")), /invalid value length/);
+    assert.throws(() => tryParseResponse(Buffer.from("V 1_000\n")), /invalid value length/);
+  });
+
   it("keeps waiting for a `V` header's newline while it could still be legal", () => {
     // The longest legal header is "V " + digits of MAX_VALUE_LENGTH (7
     // digits) + "\n" = 10 bytes; one byte short of that, still unterminated,
@@ -588,6 +604,11 @@ describe("tryParseResponse — INCR's `I` response (issue #129)", () => {
     assert.throws(() => tryParseResponse(Buffer.from("I x\n")), /invalid value length/);
   });
 
+  it("throws on a value length that isn't strict decimal digits (issue #462)", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("I +2\n42")), /invalid value length/);
+    assert.throws(() => tryParseResponse(Buffer.from("I 1e2\n")), /invalid value length/);
+  });
+
   it("throws on a non-decimal ttl field", () => {
     assert.throws(() => tryParseResponse(Buffer.from("I 2 abc\n42")), /invalid ttl/);
   });
@@ -602,6 +623,60 @@ describe("tryParseResponse — INCR's `I` response (issue #129)", () => {
     assert.throws(() => tryParseResponse(Buffer.from(`I 2 ${hugeButFinite}\n42`)), /invalid ttl/);
     const overflowsToInfinity = "9".repeat(400);
     assert.throws(() => tryParseResponse(Buffer.from(`I 2 ${overflowsToInfinity}\n42`)), /invalid ttl/);
+  });
+});
+
+describe("parseStrictInteger / parseCounterValue (issue #462)", () => {
+  it("parseStrictInteger accepts only ASCII-digits-only fields, within safe-integer range", () => {
+    const cases: Array<[string, number | undefined]> = [
+      ["5", 5],
+      ["0", 0],
+      ["007", 7], // leading zeros are legal (matches the server's own parse_length grammar)
+      ["", undefined],
+      ["+5", undefined],
+      ["-5", undefined],
+      [" 5", undefined],
+      ["5 ", undefined],
+      ["1_000", undefined],
+      ["1e2", undefined],
+      ["5.0", undefined],
+      ["abc", undefined],
+      ["9".repeat(30), undefined], // finite double, but past Number.MAX_SAFE_INTEGER
+      ["9".repeat(400), undefined], // overflows to Infinity
+    ];
+    for (const [input, expected] of cases) {
+      assert.equal(parseStrictInteger(input), expected, `parseStrictInteger(${JSON.stringify(input)})`);
+    }
+  });
+
+  it("parseCounterValue accepts an optional single leading '-', rejecting '+', whitespace, and non-digits", () => {
+    const cases: Array<[string, number | undefined]> = [
+      ["5", 5],
+      ["0", 0],
+      ["007", 7], // leading zeros are legal, same grammar as parseStrictInteger
+      ["-5", -5],
+      ["-0", -0],
+      ["", undefined],
+      ["+5", undefined], // unlike a length/tag, INCR's grammar never allows a leading '+'
+      [" 5", undefined],
+      ["5 ", undefined],
+      ["--5", undefined],
+      ["5-", undefined],
+      ["1_000", undefined],
+      ["1e2", undefined],
+      ["5.0", undefined],
+      ["abc", undefined],
+    ];
+    for (const [input, expected] of cases) {
+      assert.equal(parseCounterValue(input), expected, `parseCounterValue(${JSON.stringify(input)})`);
+    }
+  });
+
+  it("parseCounterValue, unlike parseStrictInteger, doesn't reject on magnitude — that's CounterOutOfRangeError's job downstream", () => {
+    // A counter legitimately exceeds Number.MAX_SAFE_INTEGER (int64's own
+    // range goes well past it) — the wire-grammar check must not conflate
+    // "too big to represent exactly" with "not a counter at all".
+    assert.equal(parseCounterValue("9".repeat(19)), Number("9".repeat(19)));
   });
 });
 

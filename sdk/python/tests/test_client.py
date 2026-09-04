@@ -629,6 +629,29 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_a_plus_prefixed_value_length_poisons_the_connection(self):
+        # Regression for issue #462: a `V <length>` field bare int()
+        # would silently accept (a leading '+', here `V +5\n`) must be
+        # rejected exactly like the non-numeric `V x\n` case above — the
+        # wire grammar is digits-only ASCII, strictly narrower than
+        # Python's own int() literal grammar (which also tolerates
+        # surrounding whitespace and '_' digit-group separators).
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                node.answer_plus_prefixed_length_once()
+                with self.assertRaises(NanocachedError):
+                    await client.get("k")
+
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
     async def test_an_unterminated_value_header_poisons_the_connection_promptly(self):
         # Regression for issue #8 follow-up: readuntil()'s
         # LimitOverrunError (a ValueError subclass — neither
@@ -1329,6 +1352,42 @@ class TlsOptionTests(unittest.TestCase):
 
         with self.assertRaises(OSError):
             _build_ssl_context(True, "/no/such/ca.pem")
+
+
+class StrictUintParsingTests(unittest.TestCase):
+    """Issue #462: every integer field this SDK parses off the wire
+    (lengths, counts, ttls, tags) must accept ASCII digits only —
+    equivalent to ``^[0-9]+$`` — never a bare Python int() literal's
+    looser grammar (a leading '+', surrounding whitespace, or '_' as a
+    digit-group separator). _parse_strict_uint is the shared helper
+    every one of those call sites routes through (see its own doc
+    comment in _connection.py); _identify.py imports the same function
+    for its own discovery-response integer fields."""
+
+    def test_accepts_plain_digit_strings(self):
+        from nanocached._connection import _parse_strict_uint
+
+        for field, expected in [(b"5", 5), (b"007", 7), (b"0", 0), (b"123456789", 123456789)]:
+            with self.subTest(field=field):
+                self.assertEqual(_parse_strict_uint(field), expected)
+
+    def test_rejects_everything_bare_int_would_wrongly_accept(self):
+        from nanocached._connection import _parse_strict_uint
+
+        for field in [b"+5", b" 5", b"5 ", b"1_000", b"1e2", b"-5", b"", b" ", b"5\n", b"0x5", b"5.0"]:
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    _parse_strict_uint(field)
+
+    def test_identify_module_reuses_the_same_helper(self):
+        # Not a separate reimplementation with its own (possibly
+        # drifted) grammar — _identify.py's discovery-response integer
+        # fields (node/proxy counts, name/addr lengths) share this exact
+        # function.
+        from nanocached._connection import _parse_strict_uint
+        from nanocached._identify import _parse_strict_uint as identify_parse_strict_uint
+
+        self.assertIs(_parse_strict_uint, identify_parse_strict_uint)
 
 
 class TtlEncodingTests(unittest.TestCase):

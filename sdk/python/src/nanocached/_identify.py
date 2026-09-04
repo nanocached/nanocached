@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TypeVar
 
+from ._connection import _parse_strict_uint
 from ._errors import AuthenticationError, DiscoveryBusyError, NanocachedError
 
 # Sent as the `A` secret when the caller didn't configure one: a server
@@ -360,11 +361,14 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
     if len(fields) != 2:
         raise NanocachedError("nanocached: invalid node-list header in discovery response")
     try:
-        count, replication = int(fields[0]), int(fields[1])
+        count, replication = _parse_strict_uint(fields[0]), _parse_strict_uint(fields[1])
     except ValueError as error:
-        # Non-numeric fields must surface as NanocachedError, not a raw
-        # ValueError — client.py's _SWALLOWABLE_ERRORS contract ("try next
-        # address silently", "refresh swallows failures") only covers
+        # Non-numeric fields (issue #462: including a leading '+',
+        # whitespace, or '_' — the digits-only grammar _parse_strict_uint
+        # enforces, since bare int() would silently accept all three)
+        # must surface as NanocachedError, not a raw ValueError —
+        # client.py's _SWALLOWABLE_ERRORS contract ("try next address
+        # silently", "refresh swallows failures") only covers
         # NanocachedError/ConnectionError/OSError.
         raise NanocachedError("nanocached: invalid node-list header in discovery response") from error
     if replication < 1:
@@ -388,7 +392,7 @@ async def _read_proxy_list(reader: asyncio.StreamReader) -> list[DiscoveredNode]
     if len(fields) != 1:
         raise NanocachedError("nanocached: invalid proxy-list header in discovery response")
     try:
-        count = int(fields[0])
+        count = _parse_strict_uint(fields[0])
     except ValueError as error:
         raise NanocachedError("nanocached: invalid proxy-list header in discovery response") from error
     if count < 0 or count > _MAX_NODE_COUNT:
@@ -429,7 +433,7 @@ async def _read_entries(
         if len(lengths) != 2:
             raise NanocachedError(f"nanocached: invalid {kind} entry header in discovery response")
         try:
-            name_length, addr_length = int(lengths[0]), int(lengths[1])
+            name_length, addr_length = _parse_strict_uint(lengths[0]), _parse_strict_uint(lengths[1])
         except ValueError as error:
             raise NanocachedError(
                 f"nanocached: invalid {kind} entry header in discovery response"

@@ -61,6 +61,17 @@ export interface MockNode extends MockServerBase {
   dropAfterCasOnce(): void;
   /** Queue a one-off garbage `V` header for the next G request. */
   answerMalformedValueOnce(): void;
+  /** Queue a one-off `V <len>` header for the next G request whose length
+   * field carries a leading `+` (issue #462) — well-formed enough that a
+   * pre-fix bare `Number()` parse would have accepted it as a legitimate
+   * length instead of the desync signal it actually is. */
+  answerPlusSignValueLengthOnce(): void;
+  /** Queue a one-off `I <len>` reply for the next `i` request whose
+   * counter body carries a leading `+` (issue #462) instead of the real
+   * incremented value — same "well-formed enough to fool a bare `Number()`
+   * parse" shape as answerPlusSignValueLengthOnce, but for INCR's counter
+   * grammar (which never allows a leading `+`, unlike a length or a tag). */
+  answerMalformedIncrValueOnce(): void;
   /** Queue a one-off `V` reply for the next G request whose header is
    * never terminated by an LF — streams chunks of non-newline bytes
    * (until the socket is destroyed, or a large safety cap is hit)
@@ -341,6 +352,8 @@ export async function startMockNode(
   let wrongTagReplies = 0;
   let swallowedGets = 0;
   let malformedValueReplies = 0;
+  let plusSignValueLengthReplies = 0;
+  let malformedIncrValueReplies = 0;
   let unterminatedValueReplies = 0;
   let unterminatedBytesSent = 0;
   let storedToGetReplies = 0;
@@ -486,6 +499,16 @@ export async function startMockNode(
               if (malformedValueReplies > 0) {
                 malformedValueReplies--;
                 socket.write("V x\n");
+                return;
+              }
+
+              if (plusSignValueLengthReplies > 0) {
+                plusSignValueLengthReplies--;
+                // "V +5\n" — a leading `+` on the length field (issue
+                // #462): a pre-fix bare `Number("+5")` parse would have
+                // accepted this as length 5 and gone on to read 5 body
+                // bytes, instead of rejecting the malformed grammar.
+                socket.write("V +5\nhello");
                 return;
               }
 
@@ -792,6 +815,17 @@ export async function startMockNode(
               break;
             }
 
+            if (malformedIncrValueReplies > 0) {
+              malformedIncrValueReplies--;
+              // "I 2\n+5" — a leading `+` on the counter body (issue
+              // #462): INCR's own grammar never allows one (unlike a
+              // length or a tag), so a pre-fix bare `Number("+5")` parse
+              // would have accepted this as counter value 5 instead of
+              // rejecting the malformed grammar.
+              socket.write(`I 2${tag}\n+5`);
+              break;
+            }
+
             const targetStore = storeFor(namespace);
             const existing = targetStore.get(key);
             if (existing === undefined) {
@@ -1048,6 +1082,12 @@ export async function startMockNode(
     },
     answerMalformedValueOnce: () => {
       malformedValueReplies++;
+    },
+    answerPlusSignValueLengthOnce: () => {
+      plusSignValueLengthReplies++;
+    },
+    answerMalformedIncrValueOnce: () => {
+      malformedIncrValueReplies++;
     },
     answerUnterminatedValueOnce: () => {
       unterminatedValueReplies++;

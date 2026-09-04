@@ -48,6 +48,32 @@ _MAX_I64 = 2**63 - 1
 _MIN_I64 = -(2**63)
 _INCR_VALUE_RE = re.compile(rb"-?[0-9]{1,19}")
 
+# Every OTHER integer field this SDK parses off the wire — lengths,
+# counts, ttls, response tags — is never signed, unlike _INCR_VALUE_RE's
+# <value> body above, but needs the same digits-only-ASCII grammar
+# (issue #462): Python's bare int() is far looser than the wire actually
+# allows, silently accepting a leading '+', surrounding whitespace, and
+# '_' as a digit-group separator (int("1_000") == 1000, int(" 5 ") == 5,
+# int("+5") == 5). Leading zeros ARE allowed, matching the server's own
+# byte-by-byte parse_length (src/command.rs), which imposes no
+# leading-zero restriction. _identify.py imports this too — its own
+# discovery-response integer fields (counts, name/addr lengths) are the
+# same grammar, just parsed from a different reply.
+_STRICT_UINT_RE = re.compile(rb"[0-9]+")
+
+
+def _parse_strict_uint(field: bytes) -> int:
+    """Drop-in replacement for a bare ``int(field)`` call parsing one
+    non-negative wire integer field: raises ``ValueError`` — exactly
+    what ``int()`` itself would raise on genuinely non-numeric input, so
+    every existing ``except ValueError`` call site needs no other change
+    — when `field` doesn't match the digits-only grammar above, instead
+    of silently accepting int()'s looser one."""
+    if not _STRICT_UINT_RE.fullmatch(field):
+        raise ValueError(f"invalid strict uint literal: {field!r}")
+    return int(field)
+
+
 # Bounds the sum of every hit's declared length across one multi-get
 # (`M`) reply (issue #207, follow-up to #179's Java fix, PR #201). Each
 # individual length is already capped at _MAX_VALUE_LENGTH above, but
@@ -829,7 +855,7 @@ class Connection:
             if len(fields) != (2 if self._tagged else 1):
                 raise NanocachedError("nanocached: invalid value header in response")
             try:
-                length = int(fields[0])
+                length = _parse_strict_uint(fields[0])
             except ValueError:
                 length = -1
             # A non-numeric, negative, or absurd length (the server caps
@@ -860,7 +886,7 @@ class Connection:
             if len(fields) not in (min_fields, min_fields + 1):
                 raise NanocachedError("nanocached: invalid incr header in response")
             try:
-                length = int(fields[0])
+                length = _parse_strict_uint(fields[0])
             except ValueError:
                 length = -1
             if length < 0 or length > _MAX_VALUE_LENGTH:
@@ -869,7 +895,7 @@ class Connection:
             ttl_seconds: int | None = None
             if has_ttl:
                 try:
-                    ttl_seconds = int(fields[1])
+                    ttl_seconds = _parse_strict_uint(fields[1])
                 except ValueError:
                     raise NanocachedError("nanocached: invalid ttl in incr response") from None
                 if ttl_seconds < 0:
@@ -903,7 +929,7 @@ class Connection:
             if len(fields) < 1:
                 raise NanocachedError("nanocached: invalid multi-get header in response")
             try:
-                count = int(fields[0])
+                count = _parse_strict_uint(fields[0])
             except ValueError:
                 count = -1
             if count < 0:
@@ -929,7 +955,7 @@ class Connection:
                     entries.append(WRONG_NODE)
                 else:
                     try:
-                        length = int(token)
+                        length = _parse_strict_uint(token)
                     except ValueError:
                         length = -1
                     if length < 0 or length > _MAX_VALUE_LENGTH:
@@ -960,7 +986,7 @@ class Connection:
             if len(fields) < 1:
                 raise NanocachedError("nanocached: invalid multi-set header in response")
             try:
-                count = int(fields[0])
+                count = _parse_strict_uint(fields[0])
             except ValueError:
                 count = -1
             if count < 0:
@@ -1010,7 +1036,7 @@ class Connection:
     @staticmethod
     def _parse_tag(field: bytes) -> int:
         try:
-            tag = int(field)
+            tag = _parse_strict_uint(field)
         except ValueError:
             tag = -1
         if tag < 0 or tag > _MAX_TAG:

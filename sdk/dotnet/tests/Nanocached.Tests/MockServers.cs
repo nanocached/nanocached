@@ -215,8 +215,16 @@ public sealed class MockNode : IDisposable
     /// previous request.</summary>
     public void SwallowGetOnce() => Interlocked.Increment(ref _swallowedGets);
 
-    /// <summary>Queue a one-off garbage V header for the next G request.</summary>
-    public void AnswerMalformedValueOnce() => Interlocked.Increment(ref _malformedValueReplies);
+    /// <summary>Queue a one-off garbage V header for the next G request —
+    /// <paramref name="body"/> replaces the length field verbatim (default
+    /// a plain non-digit "x"; issue #462's strict-parse tests pass a
+    /// specific rejected form like "+5" or " 5" instead).</summary>
+    public void AnswerMalformedValueOnce(string body = "x")
+    {
+        _malformedValueBody = body;
+        Interlocked.Increment(ref _malformedValueReplies);
+    }
+    private volatile string _malformedValueBody = "x";
 
     /// <summary>Answer the next incr with this exact body instead of the
     /// real new value — for the strict-parse tests (a `+` sign or
@@ -477,7 +485,7 @@ public sealed class MockNode : IDisposable
                         }
                         if (TakeMalformedValue())
                         {
-                            await Wire.WriteAsync(stream, "V x\n");
+                            await Wire.WriteAsync(stream, $"V {_malformedValueBody}\n");
                             break;
                         }
                         if (TakeOne(ref _storedToGetReplies))
@@ -611,7 +619,7 @@ public sealed class MockNode : IDisposable
                         }
                         if (TakeMalformedValue())
                         {
-                            await Wire.WriteAsync(stream, "V x\n");
+                            await Wire.WriteAsync(stream, $"V {_malformedValueBody}\n");
                             break;
                         }
                         if (TakeOne(ref _storedToGetReplies))

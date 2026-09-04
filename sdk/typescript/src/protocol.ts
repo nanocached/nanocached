@@ -619,6 +619,24 @@ export function parseStrictInteger(field: string): number | undefined {
   return Number.isSafeInteger(value) ? value : undefined;
 }
 
+// INCR/DECR's counter-body grammar (issue #462) — decimal ASCII digits
+// with an optional single leading `-` (never `+`), 1-19 digits (an int64
+// never needs more), matching the Python SDK's own `_INCR_VALUE_RE`
+// (_connection.py) and .NET's `TryParseWireCounter` (Connection.cs),
+// which likewise rejects a leading `+` before parsing. Deliberately
+// doesn't reject on magnitude the way parseStrictInteger does: unlike a
+// length or a tag, a counter legitimately exceeds
+// `Number.MAX_SAFE_INTEGER` (Connection.incr's own doc comment) — that's
+// `CounterOutOfRangeError`'s job (client.ts), a distinct failure from
+// this wire-grammar check. Returns `undefined` rather than throwing so
+// the caller can poison the connection with its own message, same as
+// parseStrictInteger's call sites.
+const COUNTER_PATTERN = /^-?[0-9]{1,19}$/;
+
+export function parseCounterValue(field: string): number | undefined {
+  return COUNTER_PATTERN.test(field) ? Number(field) : undefined;
+}
+
 interface MultiHeader {
   count: number;
   tokens: string[];
@@ -779,10 +797,13 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
         throw new NanocachedError("nanocached: invalid value header in response");
       }
 
-      const length = Number(fields[0]);
+      // Strict decimal-digits-only (issue #462), same as parseStrictInteger's
+      // other call sites — bare `Number(fields[0])` would accept "+5", " 5",
+      // and "1e2" as if they were legitimate lengths.
+      const length = parseStrictInteger(fields[0]);
       // Lengths beyond the server's own 1 MiB request cap are protocol
       // garbage — reject before buffering toward them (issue #12).
-      if (!Number.isInteger(length) || length < 0 || length > MAX_VALUE_LENGTH) {
+      if (length === undefined || length > MAX_VALUE_LENGTH) {
         throw new NanocachedError("nanocached: invalid value length in response");
       }
 
@@ -819,8 +840,9 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
         throw new NanocachedError("nanocached: invalid incremented-value header in response");
       }
 
-      const length = Number(fields[0]);
-      if (!Number.isInteger(length) || length < 0 || length > MAX_VALUE_LENGTH) {
+      // Strict decimal-digits-only (issue #462) — see MARKER_VALUE above.
+      const length = parseStrictInteger(fields[0]);
+      if (length === undefined || length > MAX_VALUE_LENGTH) {
         throw new NanocachedError("nanocached: invalid value length in response");
       }
 

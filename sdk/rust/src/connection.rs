@@ -1224,6 +1224,46 @@ async fn drain_pending(shared: &Shared, first_error: Option<Error>) {
     }
 }
 
+/// True for a non-empty ASCII-digits-only field (`^[0-9]+$`) — the wire
+/// grammar every plain integer field this SDK reads off the wire (a
+/// length, a count, a ttl, a tag, a port, ...) must match (issue #462).
+/// Rust's `FromStr` impls for the unsigned/signed integer types already
+/// reject `_`, internal whitespace, and exponents on their own, but they
+/// accept a leading `+` that this wire grammar does not — so every such
+/// field is checked against this predicate (via [`parse_strict`]) before
+/// ever reaching `.parse()`, rather than relying on that stdlib leniency
+/// to happen to line up with the grammar. Leading zeros (`"007"`) ARE
+/// allowed, matching the server's own `parse_length` grammar
+/// (`src/command.rs`, repo root), which loops byte-by-byte over ASCII
+/// digits with no such restriction.
+fn is_strict_digits(field: &str) -> bool {
+    !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// [`is_strict_digits`]'s one exception: the INCR/DECR counter body (the
+/// decimal value the `I` response echoes back) additionally allows
+/// exactly one leading `-` (never `+`), mirroring the request's own
+/// `delta` field grammar. Reference precedent: Python's
+/// `_INCR_VALUE_RE = re.compile(rb"-?[0-9]{1,19}")`
+/// (`sdk/python/src/nanocached/_connection.py`) and .NET's
+/// `TryParseWireCounter`, which explicitly rejects a leading `+` before
+/// parsing (`sdk/dotnet/src/Nanocached/Connection.cs`).
+fn is_strict_counter(field: &str) -> bool {
+    is_strict_digits(field.strip_prefix('-').unwrap_or(field))
+}
+
+/// Parses `field` as `T`, first rejecting anything that doesn't match
+/// [`is_strict_digits`] — the single point of truth every non-counter
+/// integer field on the wire is routed through, so `.parse()`'s own
+/// leniency (a leading `+`) never becomes this SDK's leniency.
+pub(crate) fn parse_strict<T: std::str::FromStr>(field: &str) -> Option<T> {
+    if is_strict_digits(field) {
+        field.parse().ok()
+    } else {
+        None
+    }
+}
+
 /// A marker byte, its value bytes (`V`/`I` only), its TTL in seconds
 /// (`I` only, issue #129, when the entry has one), and — on a tagged
 /// connection (echoed response tags) — the tag it echoed, straight off the wire
@@ -1275,9 +1315,7 @@ async fn read_one_response(
             // limit, so a claimed length beyond MAX_VALUE_LENGTH is a
             // corrupt or malicious frame (issue #12); reject before
             // allocating.
-            let length: usize = length_field
-                .parse()
-                .ok()
+            let length: usize = parse_strict(length_field)
                 .filter(|length| *length <= MAX_VALUE_LENGTH)
                 .ok_or_else(|| {
                     Error::Protocol("nanocached: invalid value length in response".to_string())
@@ -1325,15 +1363,13 @@ async fn read_one_response(
                     }
                 }
             };
-            let length: usize = length_field
-                .parse()
-                .ok()
+            let length: usize = parse_strict(length_field)
                 .filter(|length| *length <= MAX_VALUE_LENGTH)
                 .ok_or_else(|| {
                     Error::Protocol("nanocached: invalid value length in response".to_string())
                 })?;
             let ttl_seconds = match ttl_field {
-                Some(field) => Some(field.parse::<u64>().map_err(|_| {
+                Some(field) => Some(parse_strict::<u64>(field).ok_or_else(|| {
                     Error::Protocol("nanocached: invalid ttl in incr response".to_string())
                 })?),
                 None => None,
@@ -1375,15 +1411,12 @@ async fn read_one_response(
             let header = read_line(read_half).await?;
             let header = header.trim();
             let mut fields = header.split(' ').filter(|field| !field.is_empty());
-            let count: usize = fields
-                .next()
-                .and_then(|field| field.parse().ok())
-                .ok_or_else(|| {
-                    Error::Protocol(format!(
-                        "nanocached: invalid multi-{} header in response",
-                        if marker == b'M' { "get" } else { "set" }
-                    ))
-                })?;
+            let count: usize = fields.next().and_then(parse_strict).ok_or_else(|| {
+                Error::Protocol(format!(
+                    "nanocached: invalid multi-{} header in response",
+                    if marker == b'M' { "get" } else { "set" }
+                ))
+            })?;
             let rest: Vec<&str> = fields.collect();
             // `count` is untrusted (a buggy or hostile node picks it): every
             // other length field in this crate is bounded, so bound this one
@@ -1426,9 +1459,7 @@ async fn read_one_response(
                         "-" => entries.push(MultiEntry::Miss),
                         "W" => entries.push(MultiEntry::WrongNode),
                         length_field => {
-                            let length: usize = length_field
-                                .parse()
-                                .ok()
+                            let length: usize = parse_strict(length_field)
                                 .filter(|length| *length <= MAX_VALUE_LENGTH)
                                 .ok_or_else(|| {
                                     Error::Protocol(
@@ -1479,9 +1510,8 @@ async fn read_one_response(
 /// Parses a response's echoed tag (echoed response tags): a `u32` in decimal,
 /// matching the wire width the client itself claims tags from.
 fn parse_tag(field: &str) -> Result<u32> {
-    field
-        .parse()
-        .map_err(|_| Error::Protocol("nanocached: invalid response tag".to_string()))
+    parse_strict(field)
+        .ok_or_else(|| Error::Protocol("nanocached: invalid response tag".to_string()))
 }
 
 /// Converts `request`'s raw `(marker, value)` into the higher-level kind
@@ -1502,8 +1532,13 @@ impl TryFrom<RawResponse> for ResponseKind {
             b'M' | b'O' => Ok(ResponseKind::Multi(entries.unwrap_or_default())),
             b'I' => {
                 let text = value.unwrap_or_default();
+                // The counter body is the one field allowed a leading `-`
+                // (issue #462, `is_strict_counter`'s own doc comment) — every
+                // other integer field on the wire goes through
+                // `parse_strict`/`is_strict_digits` instead.
                 let counter = std::str::from_utf8(&text)
                     .ok()
+                    .filter(|text| is_strict_counter(text))
                     .and_then(|text| text.parse::<i64>().ok())
                     .ok_or_else(|| {
                         Error::Protocol("nanocached: invalid incr value in response".to_string())
@@ -1546,6 +1581,80 @@ pub(crate) async fn read_line<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -
 mod tests {
     use super::*;
 
+    // ── strict wire-integer grammar (issue #462) ────────────────────
+
+    #[test]
+    fn is_strict_digits_accepts_only_ascii_digits_only_and_non_empty() {
+        for (field, expected) in [
+            ("5", true),
+            ("0", true),
+            ("007", true),
+            ("+5", false),
+            (" 5", false),
+            ("5 ", false),
+            ("1_000", false),
+            ("1e2", false),
+            ("-5", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                is_strict_digits(field),
+                expected,
+                "is_strict_digits({field:?}) should be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_strict_counter_additionally_allows_exactly_one_leading_minus() {
+        for (field, expected) in [
+            ("5", true),
+            ("0", true),
+            ("007", true),
+            ("-5", true),
+            ("-007", true),
+            ("+5", false),
+            (" 5", false),
+            ("5 ", false),
+            ("1_000", false),
+            ("1e2", false),
+            ("--5", false),
+            ("-", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                is_strict_counter(field),
+                expected,
+                "is_strict_counter({field:?}) should be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_strict_rejects_non_digit_grammar_and_accepts_leading_zeros() {
+        assert_eq!(parse_strict::<u64>("5"), Some(5));
+        assert_eq!(parse_strict::<u64>("007"), Some(7));
+        assert_eq!(parse_strict::<u64>("0"), Some(0));
+        assert_eq!(parse_strict::<u64>("+5"), None);
+        assert_eq!(parse_strict::<u64>(" 5"), None);
+        assert_eq!(parse_strict::<u64>("5 "), None);
+        assert_eq!(parse_strict::<u64>("1_000"), None);
+        assert_eq!(parse_strict::<u64>("1e2"), None);
+        assert_eq!(parse_strict::<u64>("-5"), None);
+        assert_eq!(parse_strict::<u64>(""), None);
+    }
+
+    #[test]
+    fn parse_strict_still_enforces_the_target_type_range() {
+        // The digits-only grammar check is layered on top of, not instead
+        // of, `FromStr`'s own overflow rejection — a field that is all
+        // digits but too big for the target type must still fail.
+        assert_eq!(parse_strict::<u16>("65535"), Some(65535));
+        assert_eq!(parse_strict::<u16>("65536"), None);
+        assert_eq!(parse_strict::<u8>("255"), Some(255));
+        assert_eq!(parse_strict::<u8>("256"), None);
+    }
+
     /// Feeds `wire` to `read_one_response` over a real socket pair (the
     /// function is generic only over `tagged`, not the stream, so a
     /// concrete `Stream::Plain` is the only way to drive it) and returns
@@ -1576,6 +1685,70 @@ mod tests {
 
     /// A bound large enough not to interfere, for tests unconcerned with it.
     const UNBOUNDED_MULTI_GET: usize = usize::MAX;
+
+    #[tokio::test]
+    async fn a_value_length_with_a_leading_plus_is_a_protocol_error_not_silently_accepted() {
+        // Issue #462: `str::parse::<usize>()` alone would accept a leading
+        // `+` here, unlike the server's own `^[0-9]+$` length grammar
+        // (`parse_length` in `src/command.rs`). A reply that violates the
+        // grammar must be rejected as a protocol error, which — one layer
+        // up, in `read_loop` — poisons the connection rather than being
+        // coerced or silently accepted.
+        let result = read_one_from_bytes(b"V +5\nhello", false, UNBOUNDED_MULTI_GET).await;
+        assert!(
+            matches!(result, Err(Error::Protocol(ref message)) if message.contains("invalid value length")),
+            "a value length with a leading '+' must be a protocol error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_value_length_poisons_the_connection_for_later_requests() {
+        // Issue #462, connection-level: once `read_one_response` rejects a
+        // reply's wire grammar, `read_loop` treats that exactly like any
+        // other malformed frame — `mark_closed` before `drain_pending`
+        // (see `read_loop`'s own doc comment) — so a request on the same
+        // `Connection` *after* the malformed one must also fail, not
+        // silently keep using a desynced stream.
+        use tokio::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Don't bother parsing the request frame — any bytes at all
+            // trigger this canned, wire-grammar-violating reply (a
+            // leading `+`, issue #462).
+            let mut buf = [0u8; 64];
+            let _ = socket.read(&mut buf).await;
+            socket.write_all(b"V +5\nhello").await.unwrap();
+            // Hold the socket open so the second request (which never
+            // gets an actual answer) can't race an early close.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let connection = Connection::new(
+            Stream::Plain(client),
+            "127.0.0.1:0".to_string(),
+            false,
+            Arc::new(AtomicU64::new(0)),
+            Duration::from_millis(200),
+        );
+
+        let first = connection.get(b"", b"key").await;
+        assert!(
+            matches!(first, Err(Error::Protocol(ref message)) if message.contains("invalid value length")),
+            "a malformed value length must be a protocol error, got {first:?}"
+        );
+
+        let second = connection.get(b"", b"key2").await;
+        assert!(
+            matches!(second, Err(Error::ConnectionLost(_))),
+            "a request after a malformed reply must see the connection already closed \
+             (poisoned), got {second:?}"
+        );
+
+        server.abort();
+    }
 
     #[tokio::test]
     async fn multi_get_header_with_an_overflowing_count_is_a_protocol_error_not_a_panic() {

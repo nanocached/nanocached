@@ -1386,6 +1386,25 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aPlusPrefixedValueLengthPoisonsTheConnectionAndRetriesTransparently() throws Exception {
+        // Issue #462: the wire's integer grammar is ASCII digits only
+        // (see src/command.rs's parse_length) — a leading '+' is protocol
+        // garbage even though Integer.parseInt alone would silently
+        // accept it. Same shape as
+        // aMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently:
+        // connection-classified, so the built-in redial-and-retry-once
+        // makes the SAME call succeed.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                node.answerValueLengthOnce("+5");
+                assertEquals(Optional.of("v"), client.get("k"));
+                assertEquals(2, node.connectionCount.get());
+            }
+        }
+    }
+
+    @Test
     void aMismatchedResponseKindPoisonsTheConnection() throws Exception {
         // A well-formed response of the wrong kind (`S` answering a G)
         // means the request/response streams are off by one; reusing the
@@ -3804,6 +3823,100 @@ class NanocachedClientTest {
                     assertTrue(wrongNode.get() instanceof NanocachedException.WrongNode);
                 } finally {
                     pool.shutdown();
+                }
+            } finally {
+                connection.close();
+            }
+        }
+    }
+
+    // ── 整数フィールドのグラマー検査 (issue #462) ────────────────────
+    // Every integer field the SDK parses off the wire must accept ASCII
+    // digits only (^[0-9]+$) — src/command.rs's parse_length loops
+    // byte-by-byte over ASCII digits with no leading-zero restriction but
+    // no leading '+' either. Integer.parseInt/Long.parseLong alone would
+    // silently accept a leading '+', which the wire grammar never
+    // permits.
+
+    @Test
+    void isDigitsOnlyAcceptsOnlyTheWireIntegerGrammar() {
+        // Connection.isDigitsOnly is package-private — callable directly,
+        // no reflection needed, since this test is in the same package.
+        Map<String, Boolean> cases = new java.util.LinkedHashMap<>();
+        cases.put("5", true);
+        cases.put("007", true); // leading zeros are allowed — matches parse_length
+        cases.put("0", true);
+        cases.put("", false);
+        cases.put("+5", false);
+        cases.put(" 5", false);
+        cases.put("5 ", false);
+        cases.put("1_000", false);
+        cases.put("1e2", false);
+        cases.put("-5", false);
+        for (Map.Entry<String, Boolean> testCase : cases.entrySet()) {
+            assertEquals(testCase.getValue(), Connection.isDigitsOnly(testCase.getKey()),
+                    "isDigitsOnly(\"" + testCase.getKey() + "\")");
+        }
+    }
+
+    @Test
+    void parseNonNegativeIntAcceptsOnlyTheWireIntegerGrammar() {
+        Map<String, Integer> cases = new java.util.LinkedHashMap<>();
+        cases.put("5", 5);
+        cases.put("007", 7); // leading zeros are allowed — matches parse_length
+        cases.put("0", 0);
+        cases.put("", -1);
+        cases.put("+5", -1); // Integer.parseInt("+5") alone would accept this
+        cases.put(" 5", -1);
+        cases.put("5 ", -1);
+        cases.put("1_000", -1);
+        cases.put("1e2", -1);
+        cases.put("-5", -1);
+        for (Map.Entry<String, Integer> testCase : cases.entrySet()) {
+            assertEquals(testCase.getValue(), Connection.parseNonNegativeInt(testCase.getKey()),
+                    "parseNonNegativeInt(\"" + testCase.getKey() + "\")");
+        }
+    }
+
+    /** Table-driven coverage for the counter helper (INCR's `I` response
+     * body, {@code Connection.parseCounterValue}) — the one place a
+     * leading '-' is allowed, unlike every other wire-derived integer
+     * field, but a leading '+' is still rejected (Integer/Long's parsers
+     * would otherwise silently accept it). Exercised directly against a
+     * real Connection over a loopback socket pair, mirroring
+     * incrRequestFrameBytesAndUntaggedResponseDecoding above; a rejected
+     * body must poison the connection (subsequent use throws
+     * ConnectionFailed) rather than silently coercing. */
+    @Test
+    void parseCounterValueAcceptsALeadingMinusButRejectsEverythingElseNonDigit() throws Exception {
+        try (java.net.ServerSocket server = new java.net.ServerSocket(0);
+                java.net.Socket clientSocket = new java.net.Socket("127.0.0.1", server.getLocalPort());
+                java.net.Socket serverSocket = server.accept()) {
+            Connection connection = new Connection(clientSocket, false, () -> {});
+            try {
+                Method parseCounterValue = Connection.class.getDeclaredMethod("parseCounterValue", byte[].class);
+                parseCounterValue.setAccessible(true);
+
+                Map<String, Long> accepted = new java.util.LinkedHashMap<>();
+                accepted.put("5", 5L);
+                accepted.put("007", 7L); // leading zeros allowed, matches parse_length
+                accepted.put("0", 0L);
+                accepted.put("-5", -5L); // the one exception: counters may go negative
+                for (Map.Entry<String, Long> testCase : accepted.entrySet()) {
+                    byte[] body = testCase.getKey().getBytes(StandardCharsets.US_ASCII);
+                    assertEquals(testCase.getValue(), parseCounterValue.invoke(connection, (Object) body),
+                            "parseCounterValue(\"" + testCase.getKey() + "\")");
+                }
+
+                List<String> rejected =
+                        List.of("+5", " 5", "5 ", "1_000", "1e2", "");
+                for (String testCase : rejected) {
+                    byte[] body = testCase.getBytes(StandardCharsets.US_ASCII);
+                    InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
+                            () -> parseCounterValue.invoke(connection, (Object) body),
+                            "parseCounterValue(\"" + testCase + "\") should reject");
+                    assertTrue(thrown.getCause() instanceof NanocachedException.ConnectionFailed,
+                            "expected ConnectionFailed, got " + thrown.getCause());
                 }
             } finally {
                 connection.close();

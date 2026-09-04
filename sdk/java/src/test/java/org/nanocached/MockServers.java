@@ -100,6 +100,12 @@ final class MockServers {
          * the previous request. */
         private final AtomicInteger swallowedGets = new AtomicInteger();
         private final AtomicInteger malformedValueReplies = new AtomicInteger();
+        /** Queues a one-off G reply whose `V` length field is the given
+         * literal text instead of the real value length — issue #462
+         * regression coverage for the wire's digits-only integer grammar
+         * (e.g. a leading '+', which Integer.parseInt alone would accept). */
+        private final java.util.concurrent.atomic.AtomicReference<String> customValueLengthField =
+                new java.util.concurrent.atomic.AtomicReference<>();
         private final AtomicInteger storedToGetReplies = new AtomicInteger();
         /** Queues a one-off G reply whose `V` header never terminates with
          * '\n' — regression coverage for the unbounded readLine() growth
@@ -274,6 +280,13 @@ final class MockServers {
         /** Queue a one-off garbage `V` header for the next G request. */
         void answerMalformedValueOnce() {
             malformedValueReplies.incrementAndGet();
+        }
+
+        /** Queue a one-off G reply whose `V` length field is {@code
+         * lengthField} verbatim (e.g. {@code "+5"}) instead of the real
+         * value length — issue #462. */
+        void answerValueLengthOnce(String lengthField) {
+            customValueLengthField.set(lengthField);
         }
 
         /** Reply {@code S} to the next G — a well-formed frame of the
@@ -542,6 +555,13 @@ final class MockServers {
                             }
                             if (malformedValueReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
                                 out.write("V x\n".getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            String customLength = customValueLengthField.getAndSet(null);
+                            if (customLength != null) {
+                                out.write(("V " + customLength + tagSuffix + "\n")
+                                        .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }

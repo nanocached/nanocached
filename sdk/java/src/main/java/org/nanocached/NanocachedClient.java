@@ -4344,22 +4344,20 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** {@code null} on anything {@link Integer#parseInt} would reject —
-     * every SDK exception must extend {@link NanocachedException}, so a
-     * raw {@link NumberFormatException} must never escape a discovery
-     * response's port field. Out-of-range ports are rejected here too:
-     * {@code new InetSocketAddress(host, port)} in {@code Identify.open}
-     * throws a raw {@link IllegalArgumentException} outside 0-65535,
-     * which the get/set/delete reconnect path does not catch. Mirrors
-     * .NET's {@code int.TryParse} handling at the same spot
-     * (Identify.SplitHostPort). */
+    /** {@code null} on anything {@link Connection#parseNonNegativeInt}
+     * would reject — every SDK exception must extend {@link
+     * NanocachedException}, so a raw {@link NumberFormatException} must
+     * never escape a discovery response's port field, and (issue #462) a
+     * leading {@code '+'} — which {@link Integer#parseInt} alone would
+     * silently accept — must be rejected too. Out-of-range ports are
+     * rejected here too: {@code new InetSocketAddress(host, port)} in
+     * {@code Identify.open} throws a raw {@link IllegalArgumentException}
+     * outside 0-65535, which the get/set/delete reconnect path does not
+     * catch. Mirrors .NET's {@code int.TryParse} handling at the same
+     * spot (Identify.SplitHostPort). */
     private static Integer parsePort(String text) {
-        try {
-            int port = Integer.parseInt(text);
-            return port < 0 || port > 65535 ? null : port;
-        } catch (NumberFormatException malformed) {
-            return null;
-        }
+        int port = Connection.parseNonNegativeInt(text);
+        return port < 0 || port > 65535 ? null : port;
     }
 
     private Connection openNodeConnection(String address) throws IOException {
