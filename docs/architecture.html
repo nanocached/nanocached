@@ -236,6 +236,23 @@ rather than serialising same-key requests per connection. A client
 that needs the read to strictly precede the write awaits the
 <code>G</code> reply before sending the <code>S</code>.</p>
 
+<h2>Known limits</h2>
+<p><strong>A ring change stalls a node for a few tens of milliseconds
+per million keys.</strong> Re-replication, a staged handoff, and a
+decommission each begin by taking a snapshot of every live key the node
+holds, and that walk runs on the node&rsquo;s single cache task, so
+requests that arrive during it wait. Measured in release builds at about
+25&nbsp;ms per million live keys (5&nbsp;ms at 200k, 52&nbsp;ms at 2M);
+at the default <code>--max-memory</code> of 256&nbsp;MiB a node holds on
+the order of 2&ndash;3M small entries, so one membership change costs a
+single pause of a few tens of milliseconds &mdash; the same order as the
+expiry sweep&rsquo;s own periodic refill, and only on membership
+changes, never on the request path. Bounding it would need an ordered
+per-namespace key index that every write maintains; that standing cost
+on the hot path was judged not worth removing a rare, bounded pause.
+Size the node count so a single node&rsquo;s keyspace stays in the low
+millions if even that pause matters to you.</p>
+
 <h2>Design decisions</h2>
 <p>The main choices, in summary:</p>
 <div class="table-wrap">
