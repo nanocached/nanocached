@@ -44,7 +44,14 @@ import weakref
 from django.core.cache.backends.base import DEFAULT_TIMEOUT, BaseCache
 from django.core.exceptions import ImproperlyConfigured
 
-from nanocached import CompressionIncompatibleError, NanocachedClient
+from nanocached import (
+    CompressionIncompatibleError,
+    NanocachedClient,
+    PartialConnectionLostError,
+    PartialSetConnectionLostError,
+    PartialWrongNodeError,
+    WrongNodeError,
+)
 
 # OPTIONS.NAMESPACE default — every key this backend touches lives under
 # this namespace unless the CACHES entry overrides it (issue #105).
@@ -158,6 +165,72 @@ async def _delete_all(handle, cache_keys: list) -> None:
     for result in results:
         if isinstance(result, BaseException):
             raise result
+
+
+async def _get_many_bytes_resolved(handle, cache_keys: list) -> dict:
+    """``get_many_bytes``, but retrying a mid-batch partial failure's
+    still-unresolved remainder once instead of discarding an otherwise-
+    successful batch (issue #439, mirroring cache-manager's
+    ``mgetResolved`` and jcache's ``getManyBytesResolvingWrongNode``
+    — see ``adapters/cache-manager/src/store.ts`` and
+    ``adapters/jcache/.../NanocachedCache.java``).
+
+    ``PartialWrongNodeError`` (a ring reconfiguration left some keys
+    still wrong-node after the SDK's own one bounded refresh-and-retry)
+    and ``PartialConnectionLostError`` (a later chunk's connection
+    failure after an earlier one already resolved, single-node/proxy
+    mode only) both carry ``partial_values`` for what DID resolve —
+    without this, either would propagate straight out of ``get_many``
+    and throw away every value the batch DID manage to fetch. This
+    retries exactly the keys still missing from ``partial_values`` once
+    and merges the result; a second failure of either kind propagates
+    unchanged rather than being silently swallowed into a false miss.
+
+    A *plain* ``WrongNodeError`` (single-node/proxy mode's immediate
+    ``W``, with nothing yet resolved) is deliberately not caught here:
+    there is no ring to retry against in that mode, so a retry couldn't
+    behave any differently — it propagates exactly as before."""
+    try:
+        return await handle.get_many_bytes(cache_keys)
+    except (PartialWrongNodeError, PartialConnectionLostError) as error:
+        resolved = error.partial_values
+        remaining = [key for key in cache_keys if key not in resolved]
+        if not remaining:
+            return resolved
+        retried = await handle.get_many_bytes(remaining)  # a second failure propagates as-is
+        merged = dict(resolved)
+        merged.update(retried)
+        return merged
+
+
+async def _set_many_resolved(handle, payload: dict, ttl_seconds: int) -> None:
+    """``set_many``, but retrying a mid-batch partial failure's
+    remainder once instead of failing an otherwise-successful batch
+    outright (issue #439, mirroring cache-manager's ``msetResolved`` and
+    jcache's ``setManyBytesResolvingWrongNode``).
+
+    A plain ``WrongNodeError`` (a ring reconfiguration left some keys'
+    primaries still wrong-node after the SDK's own one bounded
+    refresh-and-retry) carries no partial payload worth attaching —
+    ``set_many`` has no value to report back beyond which keys landed —
+    so this resends the WHOLE batch once; safe, since every per-key
+    write is idempotent, so re-storing an already-landed key is just a
+    harmless duplicate of the same value/TTL. ``PartialSetConnectionLostError``
+    (a later chunk's connection failure after an earlier one already
+    stored its keys, single-node/proxy mode only) DOES carry
+    ``partial_keys`` for what's already confirmed stored, so this
+    resends only the remainder. Either way, a second failure propagates
+    unchanged rather than being silently swallowed."""
+    try:
+        await handle.set_many(payload, ttl_seconds=ttl_seconds)
+    except PartialSetConnectionLostError as error:
+        stored = error.partial_keys
+        remaining = {key: value for key, value in payload.items() if key not in stored}
+        if not remaining:
+            return
+        await handle.set_many(remaining, ttl_seconds=ttl_seconds)  # a second failure propagates as-is
+    except WrongNodeError:
+        await handle.set_many(payload, ttl_seconds=ttl_seconds)  # no partial payload — resend the whole batch
 
 
 def _split_host_port(address: str) -> tuple[str, int]:
@@ -540,10 +613,16 @@ class NanocachedCache(BaseCache):
         # SDK's get_many_bytes — vs. a get() per key. cache_keys maps
         # the namespaced wire key back to the caller's original key,
         # since get_many_bytes echoes back whatever keys it was given.
+        # Issue #439: a mid-batch partial failure (PartialWrongNodeError/
+        # PartialConnectionLostError) is retried once for its remainder
+        # by _get_many_bytes_resolved instead of propagating raw and
+        # discarding an otherwise-successful batch — see that helper's
+        # docstring, and the parity note in adapters/cache-manager's
+        # mgetResolved / adapters/jcache's getManyBytesResolvingWrongNode.
         cache_keys = {self.make_and_validate_key(key, version=version): key for key in keys}
         if not cache_keys:
             return {}
-        raw = self._run(lambda handle: handle.get_many_bytes(list(cache_keys)))
+        raw = self._run(lambda handle: _get_many_bytes_resolved(handle, list(cache_keys)))
         # Issue #332: decoded per key, not as one dict comprehension —
         # _decode_value's pickle.loads can raise on a single corrupt or
         # cross-version-incompatible entry (UnpicklingError, EOFError,
@@ -570,6 +649,13 @@ class NanocachedCache(BaseCache):
         # uses) since a failure here raises instead of being collected
         # per-key. wire_ttl is resolved once for the whole call, matching
         # set_many's own single-timeout signature.
+        # Issue #439: a mid-batch partial failure (WrongNodeError/
+        # PartialSetConnectionLostError) is retried once — the whole
+        # batch, or just its still-unstored remainder — by
+        # _set_many_resolved instead of propagating raw and failing an
+        # otherwise-successful batch outright; see that helper's
+        # docstring, and the parity note in adapters/cache-manager's
+        # msetResolved / adapters/jcache's setManyBytesResolvingWrongNode.
         if not data:
             return []
         wire_ttl = self.get_backend_timeout(timeout)
@@ -577,7 +663,7 @@ class NanocachedCache(BaseCache):
             self.delete_many(data.keys(), version=version)
             return []
         payload = {self.make_and_validate_key(key, version=version): _encode_value(value) for key, value in data.items()}
-        self._run(lambda handle: handle.set_many(payload, ttl_seconds=wire_ttl))
+        self._run(lambda handle: _set_many_resolved(handle, payload, wire_ttl))
         return []
 
     def delete_many(self, keys, version=None):
