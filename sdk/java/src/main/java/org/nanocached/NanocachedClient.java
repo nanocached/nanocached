@@ -1004,8 +1004,33 @@ public final class NanocachedClient implements AutoCloseable {
      * so this doesn't leak a socket for a node this client will now never
      * adopt.
      */
+    /**
+     * Drops repeated node names from discovery's raw list, first
+     * occurrence winning — the same stance {@link HashRing}'s constructor
+     * takes (issues #328/#360), carried into the connection layer (issue
+     * #461, mirroring Go's {@code dedupeDiscoveredNodes} from issue
+     * #389). Without this, {@link #openCluster} and {@link
+     * #refreshNodeList} would dial every listed occurrence of a
+     * duplicated name and then write each dial's outcome into {@code
+     * members} keyed by that name — the last write wins, silently
+     * leaking any live connection an earlier occurrence already
+     * installed (never closed, invisible to the no-longer-listed close
+     * sweep and to {@link #stats}). Deduping before dialing also avoids
+     * a wasteful, racy double-dial of the same node.
+     */
+    private static List<DiscoveredNode> dedupeDiscoveredNodes(List<DiscoveredNode> nodes) {
+        Set<String> seen = new HashSet<>(nodes.size());
+        List<DiscoveredNode> deduped = new ArrayList<>(nodes.size());
+        for (DiscoveredNode node : nodes) {
+            if (seen.add(node.name())) {
+                deduped.add(node);
+            }
+        }
+        return deduped;
+    }
+
     private void openCluster(Identify.ClusterTarget cluster) {
-        List<DiscoveredNode> nodes = cluster.nodes();
+        List<DiscoveredNode> nodes = dedupeDiscoveredNodes(cluster.nodes());
 
         ExecutorService dialers = Executors.newFixedThreadPool(
                 Math.max(1, Math.min(nodes.size(), MAX_BOOTSTRAP_DIALER_THREADS)), runnable -> {
@@ -4444,10 +4469,18 @@ public final class NanocachedClient implements AutoCloseable {
         // new node — would stall all traffic for the whole dial phase.
         // Under the lock we only reconcile the member map and collect
         // which nodes still need a connection.
+        // Deduped once, up front (issue #461): cluster.nodes() can list a
+        // name more than once, and members isn't updated with this
+        // refresh's new nodes until the dial loop below completes, so
+        // without this a duplicated name would pass the `existing ==
+        // null` check twice and get dialed and installed twice — the
+        // second install silently leaking the first's connection (see
+        // dedupeDiscoveredNodes's doc).
+        List<DiscoveredNode> discovered = dedupeDiscoveredNodes(cluster.nodes());
         List<DiscoveredNode> toOpen = new ArrayList<>();
         synchronized (stateLock) {
             Map<String, DiscoveredNode> byName = new LinkedHashMap<>();
-            for (DiscoveredNode node : cluster.nodes()) byName.put(node.name(), node);
+            for (DiscoveredNode node : discovered) byName.put(node.name(), node);
 
             members.entrySet().removeIf(entry -> {
                 if (!byName.containsKey(entry.getKey())) {
@@ -4469,7 +4502,7 @@ public final class NanocachedClient implements AutoCloseable {
                 return false;
             });
 
-            for (DiscoveredNode node : cluster.nodes()) {
+            for (DiscoveredNode node : discovered) {
                 Member existing = members.get(node.name());
                 if (existing != null) {
                     existing.address = node.address();

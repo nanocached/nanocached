@@ -2579,6 +2579,70 @@ async fn discovery_node_list_exceeding_the_aggregate_cap_is_rejected() {
     discovery.stop();
 }
 
+#[tokio::test]
+async fn a_duplicated_discovery_node_name_is_deduplicated() {
+    // Regression (issue #461, mirrors the Go SDK's dedupeDiscoveredNodes
+    // test from issue #389): a discovery server listing the same node
+    // name twice used to make connect() dial that node's address twice
+    // — wasted work — and install it via `HashMap::insert` twice, the
+    // second occurrence silently overwriting (and leaking, since nothing
+    // else referenced it) the first's live Connection. Deduping the raw
+    // discovery list before dialing fixes both.
+    let dup_node = MockNode::start().await;
+    let other_node = MockNode::start().await;
+    let dup_name = "dup-node".to_string();
+    let other_name = "other-node".to_string();
+
+    let discovery = MockDiscovery::start(
+        vec![
+            (dup_name.clone(), dup_node.address()),
+            (dup_name.clone(), dup_node.address()),
+            (other_name.clone(), other_node.address()),
+        ],
+        2,
+    )
+    .await;
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    // (b) Exactly the deduped set of names is installed as members — not
+    // three entries, and no leaked/overwritten connection for the
+    // duplicated name.
+    let mut names = client.member_names().await;
+    names.sort_unstable();
+    assert_eq!(names, vec![dup_name.clone(), other_name.clone()]);
+
+    // (c) The duplicated name's address was dialed exactly once during
+    // bootstrap, not once per occurrence in discovery's list.
+    assert_eq!(dup_node.state.connections.load(Ordering::SeqCst), 1);
+
+    // (a) Owners never repeat a name, across every replica count,
+    // whether or not it exceeds the (deduped) cluster size.
+    let ring = HashRing::new(names.clone());
+    for replicas in 0..=4 {
+        let owners = ring.owners(b"", b"some-key", replicas);
+        let mut sorted = owners.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            owners.len(),
+            "replicas={replicas} owners={owners:?}"
+        );
+    }
+
+    // The client still works normally against the deduped membership.
+    client.set("k", "v", 0).await.unwrap();
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+
+    client.close().await;
+    discovery.stop();
+    dup_node.stop();
+    other_node.stop();
+}
+
 // ── バッチ get/set (issue #151) ──────────────────────────────────
 
 #[tokio::test]

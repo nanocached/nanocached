@@ -4600,4 +4600,88 @@ public class TolerantBootstrapTests
         Assert.True(GetCooldowns(client).Contains(badAddress), "its reconnect cooldown must be armed");
         Assert.Equal(before + 1, client.Stats().RefreshFailures);
     }
+
+    [Fact]
+    public async Task ConnectDedupesADuplicatedDiscoveredNodeName()
+    {
+        // Regression (issue #461): the .NET SDK never got the dedupe the
+        // server (src/hash_ring.rs) and the Python/Go SDKs already have
+        // (issues #328/#360), nor the Go SDK's connection-layer fix
+        // (dedupeDiscoveredNodes, issue #389). Before this fix, a
+        // duplicated name in discovery's roster got dialed and installed
+        // into _members twice — the second `_members[node.Name] = ...`
+        // write silently overwrote (leaked, never closed) the first — and
+        // the raw roster fed straight into `new HashRing(...)` let the
+        // duplicated name occupy more than one replica slot.
+        using var nodeA = new MockNode();
+        using var nodeB = new MockNode();
+        using var discovery = new MockDiscovery(new[]
+        {
+            (Names[0], nodeA.Address),
+            (Names[0], nodeA.Address),
+            (Names[1], nodeB.Address),
+        });
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", discovery.Port) },
+        });
+
+        // Only one connection was ever made for the duplicated name.
+        Assert.Equal(1, nodeA.ConnectionCount);
+
+        // The member map holds exactly the deduped set of names.
+        FieldInfo membersField = typeof(NanocachedClient)
+            .GetField("_members", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var members = (System.Collections.IDictionary)membersField.GetValue(client)!;
+        Assert.Equal(2, members.Count);
+        Assert.True(HasMember(client, Names[0]));
+        Assert.True(HasMember(client, Names[1]));
+
+        // The ring's owners never repeat a name, for every replica count.
+        FieldInfo ringField = typeof(NanocachedClient)
+            .GetField("_ring", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var ring = (HashRing)ringField.GetValue(client)!;
+        for (int replicas = 0; replicas <= 3; replicas++)
+        {
+            IReadOnlyList<string> owners = ring.Owners(Bytes("some-key"), replicas);
+            Assert.Equal(owners.Distinct().Count(), owners.Count);
+        }
+    }
+
+    [Fact]
+    public async Task RefreshDedupesADuplicatedDiscoveredNodeNameAndDoesNotThrow()
+    {
+        // Regression (issue #461): before this fix,
+        // `cluster.Nodes.ToDictionary(node => node.Name)` in
+        // RefreshNodeListAsync threw ArgumentException on a duplicated
+        // name — an unhandled crash out of what is supposed to be a
+        // best-effort, silent refresh reached from every get/set/delete
+        // via MaybeRefreshAsync. Separately, the live connection for an
+        // existing member must survive a refresh where discovery repeats
+        // its name (mirrors the Go SDK's
+        // TestRefreshKeepsTheLiveConnectionWhenDiscoveryRepeatsANodeName).
+        string name = Names[0];
+        using Cluster cluster = StartCluster(new HashSet<string>());
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+        });
+
+        Connection? before = GetMemberConnection(client, name);
+        Assert.NotNull(before);
+
+        // Discovery hands back the same node twice (a transient duplicate).
+        cluster.Discovery.SetNodes(new[]
+        {
+            (name, cluster.Nodes[name].Address),
+            (name, cluster.Nodes[name].Address),
+            (Names[1], cluster.Nodes[Names[1]].Address),
+        });
+
+        await ForceRefreshAsync(client); // must not throw
+
+        Connection? after = GetMemberConnection(client, name);
+        Assert.Same(before, after);
+    }
 }

@@ -32,9 +32,31 @@ public sealed class HashRing
     private readonly string[] _nodes;
     private readonly ulong[] _nodeHashes;
 
+    /// <summary>
+    /// Builds the ring over <paramref name="nodes"/>, deduplicating
+    /// repeated names first-occurrence-wins (issue #461, mirroring the
+    /// server's <c>HashRing::new</c> dedupe (issue #328, src/hash_ring.rs)
+    /// and the Go/Python SDKs' own fix, issue #360). Without
+    /// this, a name repeated in <paramref name="nodes"/> would score
+    /// independently for each of its slots in
+    /// <see cref="Owners(ReadOnlySpan{byte}, int)"/>'s
+    /// bounded top-<c>replicas</c> insertion, letting a duplicated node
+    /// occupy more than one replica slot and inflating its effective
+    /// share of the ring. Construction order is otherwise unaffected.
+    /// </summary>
     public HashRing(IReadOnlyList<string> nodes)
     {
-        _nodes = nodes.ToArray();
+        var seen = new HashSet<string>(nodes.Count);
+        var deduped = new List<string>(nodes.Count);
+        foreach (string node in nodes)
+        {
+            if (seen.Add(node))
+            {
+                deduped.Add(node);
+            }
+        }
+
+        _nodes = deduped.ToArray();
         _nodeHashes = _nodes.Select(node => Fnv1a(Encoding.UTF8.GetBytes(node))).ToArray();
     }
 

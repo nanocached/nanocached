@@ -172,6 +172,30 @@ describe("HashRing", () => {
     }
   });
 
+  it("dedupes repeated node names, first occurrence winning (issue #461)", () => {
+    // Regression for issue #461: before this fix, a name repeated in the
+    // constructor's node list scored independently for each of its slots
+    // in owners()'s bounded top-`replicas` insertion, so a duplicated node
+    // could occupy more than one place in the returned set — inflating its
+    // effective share of the ring.
+    const ring = new HashRing(["a", "b", "b", "b", "c", "d"]);
+    const key = Buffer.from("some-key");
+
+    for (let replicas = 0; replicas <= 5; replicas++) {
+      const owners = ring.owners(key, replicas);
+      assert.equal(new Set(owners).size, owners.length, `replicas=${replicas}: duplicate in ${owners}`);
+    }
+
+    // Construction order is otherwise unaffected: the first occurrence of
+    // a repeated name is kept in place, so ranking matches a ring built
+    // from the already-deduped list exactly.
+    const deduped = new HashRing(["a", "b", "c", "d"]);
+    for (let i = 0; i < 200; i++) {
+      const k = Buffer.from(`key-${i}`);
+      assert.deepEqual(ring.owners(k, 4), deduped.owners(k, 4));
+    }
+  });
+
   it("spreads each replica rank evenly too", () => {
     const ring = new HashRing(nodes);
     const secondCounts = new Map<string, number>(nodes.map((node) => [node, 0]));

@@ -491,6 +491,30 @@ async function dialClusterNode(
   return { node, kind: "ok", socket: identified.socket, tagged: identified.tagged };
 }
 
+/** Drops repeated node names from discovery's raw list, first occurrence
+ * winning (issue #461) — mirrors Go's `dedupeDiscoveredNodes` (issue #389)
+ * and the same stance `HashRing`'s constructor takes (issues #328/#360).
+ * `HashRing` dedupes on its own now too (defense in depth), but that alone
+ * isn't enough here: before this fix, `connect()`'s bootstrap dialed every
+ * *raw* occurrence of a duplicated name concurrently (a wasted, racy
+ * double-dial of the same node) and `refreshNodeList`'s `newNodes`
+ * construction could do the same for a newly-discovered duplicated name —
+ * and in both places, installing the second dial's outcome into the
+ * `members`/`ClusterMember` map via `members.set(name, ...)` silently
+ * overwrote (orphaned) the first dial's connection, never closing it.
+ * Deduping the discovered-node list itself, once, before any of that,
+ * closes both holes at the source. */
+function dedupeDiscoveredNodes(nodes: readonly DiscoveredNode[]): DiscoveredNode[] {
+  const seen = new Set<string>();
+  const deduped: DiscoveredNode[] = [];
+  for (const node of nodes) {
+    if (seen.has(node.name)) continue;
+    seen.add(node.name);
+    deduped.push(node);
+  }
+  return deduped;
+}
+
 /** The forwarding operations `NanocachedNamespace` delegates to — bound
  * closures over one `NanocachedClient` instance and one namespace, built by
  * `NanocachedClient.namespace()`. Kept as a plain object of closures
@@ -807,6 +831,12 @@ export class NanocachedClient {
         continue;
       }
 
+      // Deduped once, up front (issue #461) — see dedupeDiscoveredNodes.
+      // Every use of the discovered node list below (the dial round, the
+      // members map, the addresses this client remembers, and the ring)
+      // reads from this deduped list, never the raw `identified.nodes`.
+      const nodes = dedupeDiscoveredNodes(identified.nodes);
+
       // Dials every node discovery listed, concurrently (issue #67). A
       // node that can't be reached — typically one that just died and
       // discovery hasn't evicted yet — is tolerated: it's installed as a
@@ -820,7 +850,7 @@ export class NanocachedClient {
       // the same node list either way. Only a cluster with *no* reachable
       // node at all fails connect(), with the last dial error.
       const outcomes = await Promise.all(
-        identified.nodes.map((node) => dialClusterNode(node, options.authSecret, options.tls, ca)),
+        nodes.map((node) => dialClusterNode(node, options.authSecret, options.tls, ca)),
       );
 
       const hard = outcomes.find((outcome) => outcome.kind === "hard");
@@ -861,12 +891,16 @@ export class NanocachedClient {
       const client = new NanocachedClient(
         {
           kind: "cluster",
-          ring: new HashRing(identified.nodes.map((node) => node.name)),
+          // Built from the members map's own keys, not `nodes` (issue
+          // #461) — matching refreshNodeList's already-correct pattern
+          // below; either would be fine here since `nodes` is already
+          // deduped, but this keeps the two call sites in lockstep.
+          ring: new HashRing([...members.keys()]),
           members,
           replication: identified.replication,
         },
         key,
-        identified.nodes.map((node) => node.address),
+        nodes.map((node) => node.address),
         addresses,
         options.authSecret,
         options.tls,
@@ -2856,8 +2890,18 @@ export class NanocachedClient {
       return;
     }
 
+    // Deduped once, up front (issue #461) — see dedupeDiscoveredNodes.
+    // Before this fix, a duplicated *newly discovered* name could still
+    // reach `newNodes` twice below (both occurrences fail the `members.get`
+    // check, since neither is installed yet), get dialed twice, and have
+    // the second `members.set(node.name, ...)` silently overwrite (orphan)
+    // the first dial's connection — never closed, invisible to close() and
+    // stats(). Every use of the discovered node list for the rest of this
+    // method reads from this deduped list.
+    const nodes = dedupeDiscoveredNodes(identified.nodes);
+
     // Reconciled by name (node identity decoupled from address), not address — see `Target`.
-    const nodeByName = new Map<string, DiscoveredNode>(identified.nodes.map((node) => [node.name, node]));
+    const nodeByName = new Map<string, DiscoveredNode>(nodes.map((node) => [node.name, node]));
     const members = new Map<string, ClusterMember>(currentMembers);
 
     for (const [name, member] of currentMembers) {
@@ -2874,7 +2918,7 @@ export class NanocachedClient {
     }
 
     const newNodes: DiscoveredNode[] = [];
-    for (const node of identified.nodes) {
+    for (const node of nodes) {
       const existing = members.get(node.name);
       if (existing) {
         // Same name means the same node process (names are per-process
@@ -2976,7 +3020,7 @@ export class NanocachedClient {
       members,
       replication: identified.replication,
     };
-    this.nodeUrls = identified.nodes.filter((node) => members.has(node.name)).map((node) => node.address);
+    this.nodeUrls = nodes.filter((node) => members.has(node.name)).map((node) => node.address);
     this.lastNodeListFetch = Date.now();
   }
 

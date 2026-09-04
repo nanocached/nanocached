@@ -170,6 +170,33 @@ class HashRingTest {
         }
     }
 
+    // Regression for issue #461 (mirrors src/hash_ring.rs's HashRing::new
+    // dedupe from issue #328, and the Python/Go SDK fixes for the same,
+    // issues #360/#389): before this fix, a name repeated in the
+    // constructor's node list scored independently for each of its
+    // slots, so owners() could return the same node name more than once
+    // in the top-`replicas` set — inflating its effective share of the
+    // ring.
+    @Test
+    void duplicateNodeNamesAreDeduplicated() {
+        HashRing ring = new HashRing(List.of("a", "b", "b", "b", "c", "d"));
+        byte[] key = bytes("some-key");
+
+        for (int replicas = 0; replicas <= 5; replicas++) {
+            List<String> owners = ring.owners(key, replicas);
+            assertEquals(owners.size(), new java.util.HashSet<>(owners).size(),
+                    "replicas=" + replicas + " owners=" + owners);
+        }
+
+        // Construction order is otherwise unaffected: the first
+        // occurrence of a repeated name is kept in place.
+        HashRing deduped = new HashRing(List.of("a", "b", "c", "d"));
+        for (int i = 0; i < 200; i++) {
+            byte[] k = bytes("key-" + i);
+            assertEquals(deduped.owners(k, 4), ring.owners(k, 4), "key-" + i);
+        }
+    }
+
     @Test
     void spreadsKeysEvenly() {
         HashRing ring = new HashRing(NODES);

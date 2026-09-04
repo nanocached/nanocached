@@ -659,7 +659,8 @@ public sealed class NanocachedClient : IDisposable
             }
         }
 
-        var outcomes = await Task.WhenAll(cluster.Nodes.Select(DialNodeAsync)).ConfigureAwait(false);
+        List<DiscoveredNode> nodes = DedupeDiscoveredNodes(cluster.Nodes);
+        var outcomes = await Task.WhenAll(nodes.Select(DialNodeAsync)).ConfigureAwait(false);
 
         Exception? lastError = null;
         Exception? fatal = null;
@@ -695,8 +696,34 @@ public sealed class NanocachedClient : IDisposable
             ExceptionDispatchInfo.Capture(lastError!).Throw();
         }
 
-        _ring = new HashRing(cluster.Nodes.Select(node => node.Name).ToList());
+        _ring = new HashRing(nodes.Select(node => node.Name).ToList());
         _replication = cluster.Replication;
+    }
+
+    /// <summary>Drops repeated node names from discovery's raw list,
+    /// first occurrence winning (issue #461, mirroring the Go SDK's
+    /// <c>dedupeDiscoveredNodes</c> from issue #389). Without this, a
+    /// duplicated name in the roster gets dialed and installed into
+    /// <see cref="_members"/> twice: the second
+    /// <c>_members[node.Name] = ...</c> write silently overwrites the
+    /// first, leaking its connection (never closed, invisible to
+    /// <see cref="Close"/> and <see cref="Stats"/>) — and dialing it
+    /// twice in the first place is wasted, racy work. Called once, up
+    /// front, by both <see cref="OpenClusterAsync"/> and
+    /// <see cref="RefreshNodeListAsync"/> so every use of the roster
+    /// downstream already sees unique names.</summary>
+    private static List<DiscoveredNode> DedupeDiscoveredNodes(IReadOnlyList<DiscoveredNode> nodes)
+    {
+        var seen = new HashSet<string>(nodes.Count);
+        var deduped = new List<DiscoveredNode>(nodes.Count);
+        foreach (DiscoveredNode node in nodes)
+        {
+            if (seen.Add(node.Name))
+            {
+                deduped.Add(node);
+            }
+        }
+        return deduped;
     }
 
     /// <summary>SDK proxy mode (issue #122): connects to exactly one of
@@ -3486,10 +3513,20 @@ public sealed class NanocachedClient : IDisposable
         _lastFetch = DateTime.UtcNow;
         if (cluster is null) return;
 
+        // Dedupe first (issue #461): a duplicated name in cluster.Nodes
+        // would otherwise crash ToDictionary below with an
+        // ArgumentException (this is meant to be a best-effort, silent
+        // refresh — every get/set/delete calls in via MaybeRefreshAsync,
+        // so that exception would propagate out of ordinary operations),
+        // and would separately let a brand-new duplicated name be queued
+        // into toOpen twice, whose second dial-and-install overwrites
+        // (leaks) the first.
+        List<DiscoveredNode> nodes = DedupeDiscoveredNodes(cluster.Nodes);
+
         var toOpen = new List<DiscoveredNode>();
         lock (_stateLock)
         {
-            var byName = cluster.Nodes.ToDictionary(node => node.Name);
+            var byName = nodes.ToDictionary(node => node.Name);
 
             foreach (string name in _members.Keys.Where(name => !byName.ContainsKey(name)).ToList())
             {
@@ -3505,7 +3542,7 @@ public sealed class NanocachedClient : IDisposable
                 _reconnectCooldowns.TryRemove(departed.Address, out _);
             }
 
-            foreach (DiscoveredNode node in cluster.Nodes)
+            foreach (DiscoveredNode node in nodes)
             {
                 if (_members.TryGetValue(node.Name, out Member? existing))
                 {

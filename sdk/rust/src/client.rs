@@ -947,6 +947,24 @@ async fn connect_via_proxy(
     }))
 }
 
+/// Issue #461 (mirrors the Go SDK's `dedupeDiscoveredNodes`, issue
+/// #389): drops repeated node names from discovery's raw list, first
+/// occurrence winning — the same stance `HashRing::new` takes
+/// (issue #461/#328), carried into this bootstrap's dial step.
+/// Without this, a duplicated name in `nodes` gets dialed once per
+/// occurrence (wasted connect work against the same node) and each
+/// dial's outcome is installed into `members` via `HashMap::insert`,
+/// which silently overwrites the earlier occurrence's entry — leaking
+/// its `Connection` (never closed, since nothing but the overwritten
+/// map slot referenced it) rather than merely being redundant.
+fn dedupe_discovered_nodes(nodes: Vec<DiscoveredNode>) -> Vec<DiscoveredNode> {
+    let mut seen = std::collections::HashSet::with_capacity(nodes.len());
+    nodes
+        .into_iter()
+        .filter(|node| seen.insert(node.name.clone()))
+        .collect()
+}
+
 /// Proxy mode (issue #122): tries `proxies` in random order — see
 /// `shuffled_indices` for why this crate rolls its own tiny shuffle
 /// rather than pulling in `rand` — and dials the first entry that
@@ -1153,6 +1171,11 @@ impl NanocachedClient {
                         )));
                             continue;
                         }
+
+                        // Issue #461: drop repeated node names before
+                        // dialing anything, first occurrence winning — see
+                        // `dedupe_discovered_nodes`.
+                        let nodes = dedupe_discovered_nodes(nodes);
 
                         // Dials every listed node concurrently (issue #67):
                         // `join_all` polls every dial together instead of one
@@ -1501,6 +1524,21 @@ impl NanocachedClient {
     #[doc(hidden)]
     pub async fn reconnect_cooldowns_len(&self) -> usize {
         self.inner.reconnect_cooldowns.lock().await.len()
+    }
+
+    /// The member names currently installed for a cluster target — empty
+    /// for `Target::Single`. Public-but-hidden purely as a test hook
+    /// (issue #461) to confirm a duplicated discovery-listed node name
+    /// collapses to exactly one membership entry (rather than the second
+    /// occurrence's dial silently overwriting the first's live
+    /// `Connection` via `HashMap::insert`, leaking it) after `connect()`.
+    #[doc(hidden)]
+    pub async fn member_names(&self) -> Vec<String> {
+        let state = self.inner.state.lock().await;
+        match &state.target {
+            Target::Cluster { members, .. } => members.keys().cloned().collect(),
+            Target::Single { .. } => Vec::new(),
+        }
     }
 
     pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<String>> {

@@ -93,9 +93,27 @@ export class HashRing {
   private readonly nodes: readonly string[];
   private readonly nodeHashes: readonly bigint[];
 
+  /**
+   * Issue #461 (mirrors src/hash_ring.rs's `HashRing::new` dedupe from
+   * issue #328, and the Python/Go SDKs' own copies, issues #360/#389):
+   * deduplicates `nodes`, keeping the first occurrence, so construction
+   * order is otherwise unaffected. A repeated name would otherwise score
+   * independently for each of its slots in `owners()`'s bounded
+   * top-`replicas` insertion, occupying more than one place in the
+   * returned set and inflating its effective share of the ring. Callers
+   * (client.ts) already pass a deduped node list — this is defense in
+   * depth for the constructor accepting a plain array.
+   */
   constructor(nodes: readonly string[]) {
-    this.nodes = nodes;
-    this.nodeHashes = nodes.map((node) => fnv1a(Buffer.from(node, "utf8")));
+    const seen = new Set<string>();
+    const deduped: string[] = [];
+    for (const node of nodes) {
+      if (seen.has(node)) continue;
+      seen.add(node);
+      deduped.push(node);
+    }
+    this.nodes = deduped;
+    this.nodeHashes = deduped.map((node) => fnv1a(Buffer.from(node, "utf8")));
   }
 
   /** The key's owners: the `replicas` highest-scoring nodes, primary

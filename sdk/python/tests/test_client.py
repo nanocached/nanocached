@@ -2619,6 +2619,71 @@ class ClusterTests(unittest.IsolatedAsyncioTestCase):
             for _, node in nodes:
                 await node.close()
 
+    async def test_a_duplicated_discovery_entry_is_deduplicated_on_initial_connect(self):
+        # Regression for issue #461 (mirrors Go's #389 fix, which built on
+        # HashRing's own #360 dedupe): a discovery roster listing the same
+        # node name twice used to be dialed twice, and _open_cluster's
+        # self._members[node.name] = ... write for the name's second
+        # occurrence silently overwrote the first — leaking that
+        # connection (never closed, invisible to Stats() and the
+        # no-longer-listed close sweep). Discovery here hands back
+        # NAMES[0] twice; the ring and member map must end up with only
+        # the deduplicated names, and the node must be dialed once.
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        discovery = await MockDiscovery(
+            [
+                (NAMES[0], node_a.address),
+                (NAMES[0], node_a.address),
+                (NAMES[1], node_b.address),
+            ]
+        ).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                self.assertEqual(set(client._members), {NAMES[0], NAMES[1]})
+                self.assertEqual(node_a.connection_count, 1)
+                for replicas in range(1, 3):
+                    owners = client._ring.owners(b"some-key", replicas)
+                    self.assertEqual(len(owners), len(set(owners)), owners)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await node_a.close()
+            await node_b.close()
+
+    async def test_a_duplicated_discovery_entry_is_deduplicated_on_refresh(self):
+        # Same regression as the initial-connect test above, but for
+        # _refresh_node_list's own dial loop: a repeated name in the
+        # refreshed roster must not replace a member's live connection
+        # with a second, redundant dial of the same node.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                name, node = nodes[0]
+                before = client._members[name].connection
+                discovery.nodes = [
+                    (nodes[0][0], nodes[0][1].address),
+                    (nodes[0][0], nodes[0][1].address),
+                    (nodes[1][0], nodes[1][1].address),
+                ]
+                await client._maybe_refresh(force=True)
+                after = client._members[name].connection
+                self.assertIs(
+                    before,
+                    after,
+                    "a repeated node name replaced the live connection (leaking it) "
+                    "instead of being deduped",
+                )
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for _, node in nodes:
+                await node.close()
+
 
 class ReplicationTests(unittest.IsolatedAsyncioTestCase):
     async def start_cluster(self):
