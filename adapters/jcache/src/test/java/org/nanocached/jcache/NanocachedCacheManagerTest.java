@@ -141,6 +141,34 @@ class NanocachedCacheManagerTest {
     }
 
     @Test
+    void aLateUnregisterFromAClosedCacheDoesNotEvictADifferentCacheCreatedUnderTheSameName() {
+        // A key-only regression: NanocachedCache#close() flips its own
+        // `closed` flag, deregisters its statistics MBean, and only then
+        // calls manager.unregister(name, this). Between the flag flip and
+        // that call, something else may free the name and a fresh cache
+        // may take it over — e.g. a concurrent destroyCache(name) racing
+        // with this cache's own close(). Once the name is free, the new
+        // cache is a legitimate, live registration; the original cache's
+        // late unregister() call must not evict it. Reproduced
+        // deterministically here rather than with real threads: A is
+        // removed (destroyCache, as a stand-in for the race) and B takes
+        // its name, then A's already-in-flight unregister call is made to
+        // arrive late, after B is registered.
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        javax.cache.Cache<String, String> a = manager.createCache("race", config);
+        NanocachedCache<?, ?> cacheA = (NanocachedCache<?, ?>) a;
+
+        manager.destroyCache("race");
+        javax.cache.Cache<String, String> b = manager.createCache("race", config);
+
+        ((NanocachedCacheManager) manager).unregister("race", cacheA);
+
+        assertTrue((Object) manager.getCache("race") == b, "the live cache B must still be registered under \"race\"");
+        assertFalse(((NanocachedCache<?, ?>) b).isClosed(), "B must not have been closed by A's late unregister");
+    }
+
+    @Test
     void rejectsStoreByReference() {
         MutableConfiguration<String, String> config = new MutableConfiguration<>();
         config.setTypes(String.class, String.class);

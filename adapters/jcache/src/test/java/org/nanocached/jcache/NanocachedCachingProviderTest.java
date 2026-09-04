@@ -193,6 +193,46 @@ class NanocachedCachingProviderTest {
     }
 
     @Test
+    void aLateForgetFromAClosedManagerDoesNotEvictADifferentManagerRegisteredUnderTheSameKey() {
+        // A key-only regression at the provider level: NanocachedCacheManager
+        // #close() flips its own `closed` flag, then runs cleanup that
+        // includes real network I/O (closing the client) before finally
+        // calling provider.forget(uri, classLoader, this). Between the flag
+        // flip and that call, another thread may already have noticed
+        // isClosed() and installed a fresh manager under the same (uri,
+        // classLoader) key (see getCacheManager's compute() above, which
+        // replaces a closed entry by identity, not by removing it first).
+        // The original manager's late forget() call must not evict that
+        // fresh, live manager. Reproduced deterministically: `first` is
+        // closed for real (which correctly forgets itself), `second` takes
+        // over the key, and then `first`'s already-in-flight forget call is
+        // made to arrive late, after `second` is registered.
+        NanocachedCachingProvider provider = new NanocachedCachingProvider();
+        try {
+            URI uri = URI.create("test:late-forget");
+            ClassLoader classLoader = getClass().getClassLoader();
+            NanocachedCacheManager first =
+                    (NanocachedCacheManager) provider.getCacheManager(uri, classLoader, propertiesFor(node));
+            first.close();
+
+            NanocachedCacheManager second =
+                    (NanocachedCacheManager) provider.getCacheManager(uri, classLoader, propertiesFor(node));
+            assertNotSame(first, second);
+            assertTrue(!second.isClosed());
+
+            provider.forget(uri, classLoader, first);
+
+            assertSame(
+                    second,
+                    provider.getCacheManager(uri, classLoader, propertiesFor(node)),
+                    "the live manager must still be registered under the key");
+            assertTrue(!second.isClosed(), "the live manager must not have been closed by first's late forget");
+        } finally {
+            provider.close();
+        }
+    }
+
+    @Test
     void theBareNoArgGetCacheManagerUsesEmptyDefaultPropertiesAndSoHasNoAddresses() {
         // This adapter only reads connection settings from the Properties
         // passed explicitly to getCacheManager(uri, classLoader,

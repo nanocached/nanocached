@@ -175,9 +175,19 @@ public final class NanocachedCacheManager implements CacheManager {
     /** Called by {@link NanocachedCache#close()} when a cache is closed
      * directly rather than via {@link #destroyCache} — deregisters it
      * without touching its data (closing a {@code Cache} handle must not
-     * delete what it holds; only {@link #destroyCache} does that). */
-    void unregister(String cacheName) {
-        caches.remove(cacheName);
+     * delete what it holds; only {@link #destroyCache} does that).
+     *
+     * <p>Removal is identity-checked ({@code caches.remove(name, cache)},
+     * not {@code caches.remove(name)}): {@code close()} flips its {@code
+     * closed} flag and performs its own cleanup (deregistering the
+     * statistics MBean) before this call reaches the registry, leaving a
+     * window in which another thread may already have created a new
+     * cache under the same name (permitted, since the old one already
+     * reports {@code isClosed() == true}). A key-only removal here would
+     * evict that new, live cache instead of the stale one this call
+     * actually means to remove. */
+    void unregister(String cacheName, NanocachedCache<?, ?> cache) {
+        caches.remove(cacheName, cache);
     }
 
     @Override
@@ -205,7 +215,7 @@ public final class NanocachedCacheManager implements CacheManager {
             caches.clear();
             snapshot.forEach(NanocachedCache::markClosed);
             client.close();
-            provider.forget(uri, classLoader);
+            provider.forget(uri, classLoader, this);
         }
     }
 
