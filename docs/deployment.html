@@ -622,6 +622,17 @@ the name on their first try and were healthy inside a minute. A
 service launched across two subnets is placed across both zones by
 default; <code>describe-tasks</code> shows
 <code>availabilityZone</code> per task if you want to see it.</p>
+<p>The stuck task is not the node holding on to a stale answer. Against
+a local DNS server that answered NXDOMAIN and then published the record,
+both the Alpine image and a glibc build re-query the name on every
+5&nbsp;s retry and join on the first retry after the record appears
+(issue #174). What keeps a Fargate task stuck for minutes is most likely
+a negative-cache entry in the VPC resolver its ENI talks to — the other
+zone's task used a different resolver, and the replacement task started
+after the entry had expired. Such a task recovers by itself once the
+cache expires; a longer node <code>startPeriod</code> stops ECS from
+replacing it in the meantime, at the cost of slower replacement of a
+task that is genuinely broken.</p>
 
 <h3>Autoscaling</h3>
 <pre><code>aws application-autoscaling register-scalable-target --service-namespace ecs \
