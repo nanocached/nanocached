@@ -977,7 +977,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     public void close() {
         if (closed.compareAndSet(false, true)) {
             unregisterStatisticsMBean();
-            manager.unregister(name);
+            manager.unregister(name, this);
         }
     }
 

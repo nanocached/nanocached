@@ -73,9 +73,11 @@ public final class NanocachedCachingProvider implements CachingProvider {
         if (winner[0] != created) {
             // Lost the race to another thread's connect for the same
             // key: close the raw client directly, not created.close() —
-            // that would also call provider.forget(uri, classLoader) on
-            // the shared key and evict the winner this thread must not
-            // touch.
+            // that would also call provider.forget(uri, classLoader,
+            // created) on the shared key. forget() is identity-checked,
+            // so it would be a harmless no-op here (created never won
+            // the key), but calling it would be misleading — this thread
+            // isn't the owner of whatever manager now sits at that key.
             client.close();
         }
         return winner[0];
@@ -202,9 +204,19 @@ public final class NanocachedCachingProvider implements CachingProvider {
 
     /** Called by {@link NanocachedCacheManager#close()} so a manager
      * closed directly (rather than via this provider) still drops out of
-     * the identity map instead of being handed out again as if live. */
-    void forget(URI uri, ClassLoader classLoader) {
-        managers.remove(new ManagerKey(uri, classLoader));
+     * the identity map instead of being handed out again as if live.
+     *
+     * <p>Removal is identity-checked ({@code managers.remove(key,
+     * manager)}, not {@code managers.remove(key)}): the caller's {@code
+     * close()} sets its {@code closed} flag and runs its own cleanup
+     * (closing the client, closing every cache) before this call reaches
+     * the registry. In that window another thread may already have
+     * dialed and installed a new manager under the same key (permitted,
+     * since the old one already reports {@code isClosed() == true}). A
+     * key-only removal here would evict that new, live manager instead
+     * of the stale one this call actually means to remove. */
+    void forget(URI uri, ClassLoader classLoader, NanocachedCacheManager manager) {
+        managers.remove(new ManagerKey(uri, classLoader), manager);
     }
 
     @Override
