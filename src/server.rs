@@ -449,6 +449,58 @@ struct ConnectionConfig {
 /// consumer frees up — see `MAX_PENDING_FORWARD_WAITERS`.
 static PENDING_FORWARD_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
+/// Tenth-pass follow-up (2026-09-04): forward targets whose last forward
+/// failed permanently (every attempt exhausted), keyed by address, with
+/// when that happened. While an entry is younger than
+/// `FORWARD_FAIL_FAST_WINDOW`, later forwards to the same target make a
+/// single attempt instead of `KEY_TRANSFER_ATTEMPTS`: `forward_with_retries`
+/// holds the target's connection for its whole retry sequence (so
+/// same-key forwards can't reorder), which means every forward queued
+/// behind one against an unreachable target would otherwise each burn
+/// the full `KEY_TRANSFER_ATTEMPTS` x `FORWARD_TIMEOUT` before the next
+/// got its turn. A success clears the entry, so a target that comes back
+/// gets its full retry budget again from the next forward on. Bounded by
+/// the number of distinct targets (joiners and leave entrants), and
+/// pruned of expired entries on every insert.
+static RECENT_FORWARD_FAILURES: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::OnceLock::new();
+const FORWARD_FAIL_FAST_WINDOW: Duration = Duration::from_secs(30);
+
+fn recent_forward_failures() -> &'static Mutex<HashMap<String, Instant>> {
+    RECENT_FORWARD_FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// How many attempts the next forward to `addr` gets — see
+/// `RECENT_FORWARD_FAILURES`.
+fn forward_attempts_for(addr: &str) -> u32 {
+    let failed_recently = recent_forward_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(addr)
+        .is_some_and(|failed_at| failed_at.elapsed() < FORWARD_FAIL_FAST_WINDOW);
+    if failed_recently {
+        1
+    } else {
+        KEY_TRANSFER_ATTEMPTS
+    }
+}
+
+fn record_forward_failure(addr: &str) {
+    let now = Instant::now();
+    let mut failures = recent_forward_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    failures.retain(|_, failed_at| now.duration_since(*failed_at) < FORWARD_FAIL_FAST_WINDOW);
+    failures.insert(addr.to_string(), now);
+}
+
+fn clear_forward_failure(addr: &str) {
+    recent_forward_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(addr);
+}
+
 /// Hands a per-write forward (`forward_with_retries`, wrapping a `Set`/
 /// `Delete`/`Clear` racing a migration or decommission drain) to `run`'s
 /// dedicated `forward_tx` consumer loop via `try_send` — never `.await`,
@@ -6868,21 +6920,30 @@ async fn forward_on_locked_connection(
 /// still finite in practice, bounded by how many forwards to the same
 /// target are outstanding at once (`FORWARD_CHANNEL_CAPACITY` +
 /// `MAX_PENDING_FORWARD_WAITERS`) times each one's own worst case
-/// (`KEY_TRANSFER_ATTEMPTS` x `FORWARD_TIMEOUT`).
+/// (`KEY_TRANSFER_ATTEMPTS` x `FORWARD_TIMEOUT`) — and, tenth-pass
+/// follow-up (2026-09-04), that worst case only applies to the *first*
+/// forward to hit an unreachable target: once one has failed permanently,
+/// the ones queued behind it make a single attempt each until the target
+/// answers again (`RECENT_FORWARD_FAILURES`), so a dead target drains its
+/// queue at one `FORWARD_TIMEOUT` per forward, not three.
 async fn forward_with_retries(
     node_context: NodeContext,
     target: ForwardTarget,
     write: OwnedForwardedWrite,
 ) {
     let mut connection = target.connection.lock().await;
+    let attempts = forward_attempts_for(&target.addr);
 
-    for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
+    for attempt in 1..=attempts {
         match write.attempt(&node_context, &target, &mut connection).await {
-            Ok(()) => return,
+            Ok(()) => {
+                clear_forward_failure(&target.addr);
+                return;
+            }
             Err(error) => {
                 eprintln!(
                     "WARN failed to forward a concurrent {} for a migrating key to {} \
-                     (attempt {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}",
+                     (attempt {attempt}/{attempts}): {error}",
                     write.kind(),
                     target.addr
                 );
@@ -6890,9 +6951,10 @@ async fn forward_with_retries(
         }
     }
 
+    record_forward_failure(&target.addr);
     eprintln!(
         "WARN permanently failed to forward a concurrent {} for a migrating key to {} after \
-         {KEY_TRANSFER_ATTEMPTS} attempts",
+         {attempts} attempt(s)",
         write.kind(),
         target.addr
     );
@@ -7686,6 +7748,85 @@ mod tests {
         .await;
 
         joining_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forwards_queued_behind_a_permanently_failed_one_try_once_until_the_target_answers() {
+        // Tenth-pass follow-up (2026-09-04): `forward_with_retries` holds
+        // the target's connection for its whole retry sequence (ordering,
+        // see the test below), so against an unreachable target every
+        // queued forward used to burn all `KEY_TRANSFER_ATTEMPTS` before
+        // the next one got the lock. After one forward has failed
+        // permanently, the ones behind it get a single attempt each until
+        // a forward succeeds again. A peer that accepts and immediately
+        // closes makes every attempt fail fast and countable.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_for_task = Arc::clone(&accepts);
+        let peer_task = tokio::spawn(async move {
+            loop {
+                let Ok((connection, _)) = listener.accept().await else {
+                    return;
+                };
+                accepts_for_task.fetch_add(1, Ordering::SeqCst);
+                drop(connection);
+            }
+        });
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+        let connection = Arc::new(AsyncMutex::new(None));
+        let target = || ForwardTarget {
+            addr: addr.clone(),
+            connection: Arc::clone(&connection),
+            token: "tok-target".to_string(),
+        };
+        let write = || OwnedForwardedWrite::Set {
+            key: key(b"name"),
+            value: Bytes::from_static(b"v"),
+            ttl: None,
+        };
+
+        forward_with_retries(node_context.clone(), target(), write()).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            KEY_TRANSFER_ATTEMPTS as usize,
+            "the first forward gets its full retry budget"
+        );
+
+        forward_with_retries(node_context.clone(), target(), write()).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            KEY_TRANSFER_ATTEMPTS as usize + 1,
+            "a forward queued behind a permanent failure tries once"
+        );
+
+        // A success clears the marker: the next failure gets the full
+        // budget again. Simulated by clearing directly — a real success
+        // needs a peer that speaks the auth handshake, which the
+        // ordering test below already covers.
+        clear_forward_failure(&addr);
+        forward_with_retries(node_context, target(), write()).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2 * KEY_TRANSFER_ATTEMPTS as usize + 1,
+            "after the marker clears, the full budget is back"
+        );
+
+        peer_task.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
