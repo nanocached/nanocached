@@ -2,6 +2,7 @@ import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
 import { ConnectionLostError } from "./connection.js";
 import { NanocachedError } from "./errors.js";
+import { parseStrictInteger } from "./protocol.js";
 import { CONNECT_DEADLINE_MS, connectSocket } from "./socket.js";
 
 export interface IdentifyOptions {
@@ -271,14 +272,16 @@ function parseEntries(buf: Buffer, offset: number, count: number): { entries: Di
       throw new NanocachedError("nanocached: invalid entry header in discovery response");
     }
 
-    const nameLength = Number(lengths[0]);
-    const addrLength = Number(lengths[1]);
+    // Tenth-pass follow-up (2026-09-04): `parseStrictInteger` (digits only,
+    // safe-integer range) rather than bare `Number()` + `isInteger`, which
+    // accepted `+1`, ` 1`, `1e2` and precision-losing digit strings —
+    // the same strictness protocol.ts already applies to every node frame.
+    const nameLength = parseStrictInteger(lengths[0]);
+    const addrLength = parseStrictInteger(lengths[1]);
     if (
-      !Number.isInteger(nameLength) ||
-      nameLength < 0 ||
+      nameLength === undefined ||
       nameLength > MAX_NODE_FIELD_LENGTH ||
-      !Number.isInteger(addrLength) ||
-      addrLength < 0 ||
+      addrLength === undefined ||
       addrLength > MAX_NODE_FIELD_LENGTH
     ) {
       throw new NanocachedError("nanocached: invalid entry lengths in discovery response");
@@ -330,13 +333,13 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
     throw new NanocachedError("nanocached: invalid node-list header in discovery response");
   }
 
-  const count = Number(header[0]);
-  if (!Number.isInteger(count) || count < 0 || count > MAX_NODE_COUNT) {
+  const count = parseStrictInteger(header[0]);
+  if (count === undefined || count > MAX_NODE_COUNT) {
     throw new NanocachedError("nanocached: invalid node count in discovery response");
   }
 
-  const replication = Number(header[1]);
-  if (!Number.isInteger(replication) || replication < 1) {
+  const replication = parseStrictInteger(header[1]);
+  if (replication === undefined || replication < 1) {
     throw new NanocachedError("nanocached: invalid replication factor in discovery response");
   }
 
@@ -372,8 +375,8 @@ function tryParseProxyList(buf: Buffer): DiscoveredNode[] | null {
     throw new NanocachedError(`nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`);
   }
 
-  const count = Number(buf.subarray(2, headerEnd).toString("ascii"));
-  if (!Number.isInteger(count) || count < 0 || count > MAX_NODE_COUNT) {
+  const count = parseStrictInteger(buf.subarray(2, headerEnd).toString("ascii"));
+  if (count === undefined || count > MAX_NODE_COUNT) {
     throw new NanocachedError("nanocached: invalid proxy count in discovery response");
   }
 

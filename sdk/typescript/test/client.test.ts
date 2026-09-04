@@ -795,6 +795,56 @@ describe("NanocachedClient reconnect-on-use", () => {
     }
   });
 
+  it("rejects a discovery node list whose count is not a plain decimal integer", async () => {
+    // Tenth-pass follow-up (2026-09-04): identify.ts parsed the `N` header
+    // and entry lengths with bare Number() + Number.isInteger, which
+    // accepts "+1", " 1" and "1e0" — protocol.ts's parseStrictInteger
+    // (digits only, safe-integer range) now applies here too.
+    const { createServer } = await import("node:net");
+    const sockets = new Set<import("node:net").Socket>();
+    // (" 1" is already caught earlier by the header's field-count check.)
+    for (const badCount of ["+1", "1e0"]) {
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("error", () => {});
+        let buffer = "";
+        socket.on("data", (chunk: Buffer) => {
+          buffer += chunk.toString("latin1");
+          for (;;) {
+            const lf = buffer.indexOf("\n");
+            if (lf === -1) return;
+            const parts = buffer.slice(0, lf).split(" ");
+            if (parts[0] === "A") {
+              const secretLength = Number(parts[1]);
+              if (buffer.length < lf + 1 + secretLength) return;
+              buffer = buffer.slice(lf + 1 + secretLength);
+              socket.write(parts[2] === "T" ? "OdT\n" : "Od\n");
+            } else if (parts[0] === "L") {
+              buffer = buffer.slice(lf + 1);
+              socket.write(`N ${badCount} 1\n`);
+            } else {
+              buffer = buffer.slice(lf + 1);
+            }
+          }
+        });
+      });
+      const port = await new Promise<number>((resolve) => {
+        server.listen(0, "127.0.0.1", () => resolve((server.address() as { port: number }).port));
+      });
+      try {
+        const { connectAndIdentify } = await import("../src/identify.js");
+        await assert.rejects(
+          connectAndIdentify({ host: "127.0.0.1", port, connectDeadlineMs: 2000 }),
+          /invalid node count in discovery response/,
+        );
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        sockets.clear();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  });
+
   it("shares one deadline budget across the dial and the handshake read, instead of a fresh one for each", async () => {
     // Regression (issue #47 audit item 3): the dial and the ack read used
     // to each get their own independent deadlineMs-long timer, so a dial
