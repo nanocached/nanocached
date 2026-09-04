@@ -218,6 +218,12 @@ public sealed class MockNode : IDisposable
     /// <summary>Queue a one-off garbage V header for the next G request.</summary>
     public void AnswerMalformedValueOnce() => Interlocked.Increment(ref _malformedValueReplies);
 
+    /// <summary>Answer the next incr with this exact body instead of the
+    /// real new value — for the strict-parse tests (a `+` sign or
+    /// whitespace the node never emits).</summary>
+    public void AnswerIncrBodyOnce(string body) => _rawIncrBody = body;
+    private volatile string? _rawIncrBody;
+
     /// <summary>Reply <c>S</c> to the next G — a well-formed frame of the
     /// wrong kind, as a desynced (off-by-one) stream would produce.</summary>
     public void AnswerStoredToGetOnce() => Interlocked.Increment(ref _storedToGetReplies);
@@ -734,6 +740,11 @@ public sealed class MockNode : IDisposable
                         // TTL is unaffected by an increment — only reported.
                         long ttlSeconds = _ttls.TryGetValue(storeKey, out long ttl) ? ttl : 0;
                         string ttlField = ttlSeconds > 0 ? $" {ttlSeconds}" : "";
+                        string? rawBody = Interlocked.Exchange(ref _rawIncrBody, null);
+                        if (rawBody is not null)
+                        {
+                            updatedBytes = Encoding.ASCII.GetBytes(rawBody);
+                        }
                         await Wire.WriteAsync(stream, $"I {updatedBytes.Length}{ttlField}{tag}\n");
                         await stream.WriteAsync(updatedBytes);
                         break;

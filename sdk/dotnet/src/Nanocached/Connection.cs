@@ -380,7 +380,7 @@ internal sealed class Connection
         switch (marker)
         {
             case (byte)'I':
-                if (!long.TryParse(Encoding.ASCII.GetString(value!), out long newValue))
+                if (!TryParseWireCounter(Encoding.ASCII.GetString(value!), out long newValue))
                 {
                     throw new ConnectionLostException("nanocached: invalid incr value in response");
                 }
@@ -1028,7 +1028,7 @@ internal sealed class Connection
                 // connection is desynced mid-frame and must be poisoned,
                 // and the error must be connection-classified so the
                 // redial/retry layer handles it (issue #8).
-                if (!int.TryParse(fields[0], out int length) || length < 0 || length > MaxValueLength)
+                if (!int.TryParse(fields[0], NumberStyles.None, CultureInfo.InvariantCulture, out int length) || length < 0 || length > MaxValueLength)
                 {
                     throw new ConnectionLostException("nanocached: invalid value length in response");
                 }
@@ -1056,7 +1056,7 @@ internal sealed class Connection
                     throw new ConnectionLostException("nanocached: invalid incr header in response");
                 }
 
-                if (!int.TryParse(fields[0], out int length) || length < 0 || length > MaxValueLength)
+                if (!int.TryParse(fields[0], NumberStyles.None, CultureInfo.InvariantCulture, out int length) || length < 0 || length > MaxValueLength)
                 {
                     throw new ConnectionLostException("nanocached: invalid value length in response");
                 }
@@ -1064,7 +1064,7 @@ internal sealed class Connection
                 long ttlSeconds = 0;
                 if (fields.Length == ttlFields)
                 {
-                    if (!long.TryParse(fields[1], out ttlSeconds) || ttlSeconds < 0)
+                    if (!long.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out ttlSeconds) || ttlSeconds < 0)
                     {
                         throw new ConnectionLostException("nanocached: invalid ttl in incr response");
                     }
@@ -1119,7 +1119,7 @@ internal sealed class Connection
             case (byte)'M':
             {
                 string[] fields = (await ReadLineAsync().ConfigureAwait(false)).Split(' ');
-                if (fields.Length < 1 || !int.TryParse(fields[0], out int count) || count < 0)
+                if (fields.Length < 1 || !int.TryParse(fields[0], NumberStyles.None, CultureInfo.InvariantCulture, out int count) || count < 0)
                 {
                     throw new ConnectionLostException("nanocached: invalid multi-get header in response");
                 }
@@ -1147,7 +1147,7 @@ internal sealed class Connection
                     }
                     else
                     {
-                        if (!int.TryParse(token, out int length) || length < 0 || length > MaxValueLength)
+                        if (!int.TryParse(token, NumberStyles.None, CultureInfo.InvariantCulture, out int length) || length < 0 || length > MaxValueLength)
                         {
                             throw new ConnectionLostException(
                                 "nanocached: invalid multi-get result length in response");
@@ -1185,7 +1185,7 @@ internal sealed class Connection
             case (byte)'O':
             {
                 string[] fields = (await ReadLineAsync().ConfigureAwait(false)).Split(' ');
-                if (fields.Length < 1 || !int.TryParse(fields[0], out int count) || count < 0)
+                if (fields.Length < 1 || !int.TryParse(fields[0], NumberStyles.None, CultureInfo.InvariantCulture, out int count) || count < 0)
                 {
                     throw new ConnectionLostException("nanocached: invalid multi-set header in response");
                 }
@@ -1223,9 +1223,25 @@ internal sealed class Connection
         }
     }
 
+    /// <summary>Tenth-pass follow-up (2026-09-04): the node's counter body
+    /// is an optional <c>-</c> followed by digits — never a <c>+</c>, never
+    /// whitespace — and every other wire integer is digits only, so all of
+    /// them are parsed with <see cref="NumberStyles.None"/> and the
+    /// invariant culture (matching the encode side); this is the one
+    /// place a sign is allowed, and only the minus.</summary>
+    private static bool TryParseWireCounter(string body, out long value)
+    {
+        value = 0;
+        if (body.Length == 0 || body[0] == '+')
+        {
+            return false;
+        }
+        return long.TryParse(body, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out value);
+    }
+
     private static uint ParseTag(string field)
     {
-        if (!uint.TryParse(field, out uint tag))
+        if (!uint.TryParse(field, NumberStyles.None, CultureInfo.InvariantCulture, out uint tag))
         {
             throw new ConnectionLostException("nanocached: invalid response tag");
         }
