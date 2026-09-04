@@ -9,9 +9,26 @@ foreach (var part in Environment.GetEnvironmentVariable("NANOTEST_ADDRESSES")!.S
     options.Addresses.Add((part[..idx], int.Parse(part[(idx + 1)..])));
 }
 
+// Checked before connecting: an invalid invocation should fail loudly
+// with a usage message, not crash with an IndexOutOfRangeException on a
+// missing argument or an uncaught FormatException / a non-positive count
+// that silently makes every loop below a no-op, reporting a false
+// "success" as if 0 iterations were intended.
+if (args.Length != 3)
+{
+    Console.Error.WriteLine("usage: nanotest <write|read> <label> <count>");
+    Environment.Exit(1);
+    return;
+}
+
 var cmd = args[0];
 var label = args[1];
-var count = int.Parse(args[2]);
+if (!int.TryParse(args[2], out var count) || count <= 0)
+{
+    Console.Error.WriteLine($"usage: nanotest <write|read> <label> <count>: invalid count '{args[2]}'");
+    Environment.Exit(1);
+    return;
+}
 
 var exitCode = 0;
 

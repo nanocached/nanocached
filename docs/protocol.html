@@ -70,7 +70,9 @@ echoes the capability as <code>OnT</code>/<code>OdT</code>.</div>
 S &lt;key-length&gt; &lt;value-length&gt; &lt;ttl-seconds&gt;\n&lt;key&gt;&lt;value&gt;</code></pre>
 <p>Responds <code>S\n</code>. Without a TTL the entry lives until
 evicted (LRU under the memory bound) or deleted; with one it also
-expires <code>&lt;ttl-seconds&gt;</code> after the write.</p>
+expires <code>&lt;ttl-seconds&gt;</code> after the write — a literal
+<code>0</code> is a TTL that has already elapsed, so the entry expires
+immediately (the next access sees a miss).</p>
 
 <h2 id="d">D — delete</h2>
 <pre><code>D &lt;key-length&gt;\n&lt;key&gt;</code></pre>
@@ -193,9 +195,10 @@ length-prefixed — its own shape identifies it):</p>
 the same "nothing here to act on" status <code>G</code>/<code>D</code>
 already use for a miss — <code>k</code> introduces no new response
 marker. <code>&lt;ttl-seconds&gt;</code> means exactly what it means for
-<code>S</code> (omitted/0 = no expiry); unlike <code>INCR</code>, the new
-value is supplied whole by the caller, so there is no old TTL to
-preserve.</p>
+<code>S</code> — omitted = no expiry, a literal <code>0</code> is a TTL
+that has already elapsed and the entry expires immediately; unlike
+<code>INCR</code>, the new value is supplied whole by the caller, so
+there is no old TTL to preserve.</p>
 <pre><code>x &lt;namespace-length&gt; &lt;key-length&gt; &lt;cond&gt; [&lt;tag&gt;]\n&lt;namespace&gt;&lt;key&gt;</code></pre>
 <p>Removes the key only if <code>&lt;cond&gt;</code> holds — this is the
 two-argument <code>remove(key, old)</code>. <code>&lt;cond&gt;</code> here
@@ -261,12 +264,15 @@ the whole frame, but <code>W</code> never does — a <code>&lt;key-length&gt;</c
 being wrong for one key out of a thousand doesn't invalidate the other
 999.</p>
 <pre><code>o &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; &lt;value-length-1&gt; ... &lt;key-length-n&gt; &lt;value-length-n&gt; [&lt;ttl-seconds&gt;]\n&lt;namespace&gt;&lt;key-1&gt;&lt;value-1&gt;...&lt;key-n&gt;&lt;value-n&gt;</code></pre>
-<p>Sets <code>n</code> keys the same way. <strong>One
-<code>&lt;ttl-seconds&gt;</code> for the whole batch, not per key</strong> —
-every real caller of a batched set (Django's <code>set_many</code>,
-cache-manager's <code>mset</code>) already passes one TTL per call, so a
-per-key TTL field would complicate the frame for no consumer that
-exists. Replies:</p>
+<p>Sets <code>n</code> keys the same way, and
+<code>&lt;ttl-seconds&gt;</code> means exactly what it means for
+<code>S</code> — omitted = no expiry, a literal <code>0</code> is a TTL
+that has already elapsed and every key in the batch expires
+immediately. <strong>One <code>&lt;ttl-seconds&gt;</code> for the whole
+batch, not per key</strong> — every real caller of a batched set
+(Django's <code>set_many</code>, cache-manager's <code>mset</code>)
+already passes one TTL per call, so a per-key TTL field would
+complicate the frame for no consumer that exists. Replies:</p>
 <pre><code>O &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt;\n</code></pre>
 <p>No body — a set has no value to echo back, unlike <code>m</code>'s
 hits. Each <code>&lt;result-i&gt;</code> is <code>S</code> (stored) or

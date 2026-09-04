@@ -41,11 +41,21 @@ const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 /// (issue #329).
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Runs a single network operation (`connect`/`read_line`/`read_exact`/
-/// `write_all`) bounded by `IO_TIMEOUT`, panicking with a clear message on
-/// either a timeout or an I/O error rather than hanging or propagating a
-/// bare `io::Error` up through `.expect()`. `what` names the operation for
-/// the panic message.
+/// Bounds every reply line this benchmark reads (the `S`/`N`/`V <len>`/
+/// `M <n> ...`/`O <n> ...` headers). `timed()` already bounds these reads
+/// in time; this bounds them in size too, so a peer that never sends a
+/// `\n` — or a legitimate but huge `M`/`O` header for a large `--batch` —
+/// can't make the line buffer grow without limit. Sized generously since
+/// an `M`/`O` header holds one token per key in the batch. Mirrors
+/// `src/server.rs`'s `read_line_capped` (bound: `MAX_ROSTER_LINE_LEN`)
+/// and `src/bin/verify-staged-join.rs`'s `MAX_LINE_BYTES`.
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Runs a single network operation (`connect`/`read_line_capped`/
+/// `read_exact`/`write_all`) bounded by `IO_TIMEOUT`, panicking with a
+/// clear message on either a timeout or an I/O error rather than hanging
+/// or propagating a bare `io::Error` up through `.expect()`. `what` names
+/// the operation for the panic message.
 async fn timed<F, T>(future: F, what: &str) -> T
 where
     F: std::future::Future<Output = std::io::Result<T>>,
@@ -53,6 +63,53 @@ where
     match timeout(IO_TIMEOUT, future).await {
         Ok(result) => result.unwrap_or_else(|e| panic!("{what}: {e}")),
         Err(_) => panic!("{what} timed out after {IO_TIMEOUT:?}"),
+    }
+}
+
+/// Reads one `\n`-terminated line, same shape as
+/// `AsyncBufReadExt::read_line`, but errors out instead of buffering
+/// without limit if `MAX_LINE_BYTES` is exceeded before a newline
+/// appears. Mirrors `src/server.rs`'s `read_line_capped`: grows the
+/// buffer only up to what `fill_buf` already has ready, so it never reads
+/// (and discards) bytes past the line it's after.
+async fn read_line_capped<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> std::io::Result<String> {
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let (consumed, done, too_long) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                (0, true, false) // EOF before newline
+            } else if let Some(pos) = available.iter().position(|&byte| byte == b'\n') {
+                let take = pos + 1; // include the newline
+                if line.len() + take > MAX_LINE_BYTES {
+                    (0, true, true)
+                } else {
+                    line.extend_from_slice(&available[..take]);
+                    (take, true, false)
+                }
+            } else if line.len() + available.len() > MAX_LINE_BYTES {
+                (0, true, true)
+            } else {
+                let take = available.len();
+                line.extend_from_slice(available);
+                (take, false, false)
+            }
+        };
+        reader.consume(consumed);
+        if too_long {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("reply line exceeded the {MAX_LINE_BYTES}-byte cap without a newline"),
+            ));
+        }
+        if done {
+            return String::from_utf8(line).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "reply line was not valid UTF-8",
+                )
+            });
+        }
     }
 }
 
@@ -99,8 +156,7 @@ async fn authenticate(stream: &mut TcpStream) {
     timed(stream.write_all(&frame), "write auth frame").await;
 
     let mut reader = BufReader::new(&mut *stream);
-    let mut line = String::new();
-    timed(reader.read_line(&mut line), "read auth reply").await;
+    let line = timed(read_line_capped(&mut reader), "read auth reply").await;
     assert!(line.starts_with("On"), "auth rejected: {}", line.trim_end());
 }
 
@@ -146,8 +202,7 @@ fn encode_multi_set(keys: &[Vec<u8>], value: &[u8]) -> Vec<u8> {
 
 /// Reads one `S` reply (bare `S\n`) and asserts it succeeded.
 async fn read_set_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) {
-    let mut line = String::new();
-    timed(reader.read_line(&mut line), "read reply header").await;
+    let line = timed(read_line_capped(reader), "read reply header").await;
     assert_eq!(line.trim_end(), "S", "unexpected reply to S: {line:?}");
 }
 
@@ -155,8 +210,7 @@ async fn read_set_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) {
 /// many of the `n` entries were `S` (stored) — used only to sanity-check
 /// the batch against what was requested.
 async fn read_multi_ack_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> (usize, usize) {
-    let mut line = String::new();
-    timed(reader.read_line(&mut line), "read reply header").await;
+    let line = timed(read_line_capped(reader), "read reply header").await;
     let line = line.trim_end();
     let mut fields = line.split(' ');
     assert_eq!(fields.next(), Some("O"), "unexpected reply to o: {line:?}");
@@ -178,8 +232,7 @@ async fn read_multi_ack_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> (us
 /// value bytes — the benchmark only needs the round trip's timing and a
 /// byte count, not the payload itself.
 async fn read_get_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mut R) -> bool {
-    let mut line = String::new();
-    timed(reader.read_line(&mut line), "read reply header").await;
+    let line = timed(read_line_capped(reader), "read reply header").await;
     let line = line.trim_end();
 
     if let Some(length) = line.strip_prefix("V ") {
@@ -204,8 +257,7 @@ async fn read_get_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mut 
 async fn read_multi_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> (usize, usize) {
-    let mut line = String::new();
-    timed(reader.read_line(&mut line), "read reply header").await;
+    let line = timed(read_line_capped(reader), "read reply header").await;
     let line = line.trim_end();
     let mut fields = line.split(' ');
     assert_eq!(fields.next(), Some("M"), "unexpected reply to m: {line:?}");
@@ -264,8 +316,7 @@ async fn preload(args: &[String]) {
     for index in 0..keyspace {
         let frame = encode_set(&key_bytes(index), &value);
         timed(reader.get_mut().write_all(&frame), "write set").await;
-        let mut line = String::new();
-        timed(reader.read_line(&mut line), "read set reply").await;
+        let line = timed(read_line_capped(&mut reader), "read set reply").await;
         assert_eq!(line.trim_end(), "S", "set failed for key {index}");
     }
 

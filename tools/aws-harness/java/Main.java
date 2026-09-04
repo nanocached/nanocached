@@ -15,9 +15,18 @@ public final class Main {
         }
         NanocachedClient.Options options = NanocachedClient.builder().addresses(addresses);
 
+        // Checked before connecting: an invalid invocation should fail
+        // loudly with a usage message, not crash with an
+        // ArrayIndexOutOfBoundsException on a missing argument or (worse)
+        // an uncaught NumberFormatException / a non-positive count that
+        // silently makes every loop below a no-op, reporting a false
+        // "success" as if 0 iterations were intended.
+        if (args.length != 3) {
+            usage();
+        }
         String cmd = args[0];
         String label = args[1];
-        int count = Integer.parseInt(args[2]);
+        int count = parseCount(args[2]);
 
         int exitCode = 0;
 
@@ -50,6 +59,26 @@ public final class Main {
 
         if (exitCode != 0) {
             System.exit(exitCode);
+        }
+    }
+
+    private static void usage() {
+        System.err.println("usage: java Main <write|read> <label> <count>");
+        System.exit(1);
+    }
+
+    private static int parseCount(String raw) {
+        try {
+            int count = Integer.parseInt(raw);
+            if (count <= 0) {
+                throw new NumberFormatException("count must be positive");
+            }
+            return count;
+        } catch (NumberFormatException e) {
+            System.err.println(
+                    "usage: java Main <write|read> <label> <count>: invalid count '" + raw + "'");
+            System.exit(1);
+            throw new AssertionError("unreachable");
         }
     }
 }
