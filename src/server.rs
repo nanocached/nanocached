@@ -207,6 +207,14 @@ const READ_CHUNK_SIZE: usize = 1024;
 /// joining node (reconnecting between tries) before giving up on the
 /// whole migration. See `run_migration`'s own doc comment.
 const KEY_TRANSFER_ATTEMPTS: u32 = 3;
+/// Bound on `wait_for_migration_slot_to_clear`'s poll for a still-
+/// transferring handoff to actually unwind and drop its slot after `X`
+/// sets `abort_requested` — see that function's own doc comment. Sized
+/// with headroom over the worst case `run_migration` can still be blocked
+/// before it next checks `abort_requested`: `KEY_TRANSFER_ATTEMPTS` (3)
+/// reconnect/send attempts for one key, each up to `OUTBOUND_IO_TIMEOUT`
+/// (10s).
+const MIGRATION_ABANDON_DRAIN_WAIT: Duration = Duration::from_secs(45);
 /// Issue #7: `handle_connection`'s read buffer grows (via `reserve`) to fit
 /// whatever request it's mid-receiving, up to `MAX_REQUEST_SIZE`, but never
 /// shrinks back on its own — a connection that ever sent one large request
@@ -450,8 +458,9 @@ struct ConnectionConfig {
 static PENDING_FORWARD_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Tenth-pass follow-up (2026-09-04): forward targets whose last forward
-/// failed permanently (every attempt exhausted), keyed by address, with
-/// when that happened. While an entry is younger than
+/// failed permanently (every attempt exhausted), keyed by `(address,
+/// token)` — see below for why the token is part of the key — with when
+/// that happened. While an entry is younger than
 /// `FORWARD_FAIL_FAST_WINDOW`, later forwards to the same target make a
 /// single attempt instead of `KEY_TRANSFER_ATTEMPTS`: `forward_with_retries`
 /// holds the target's connection for its whole retry sequence (so
@@ -462,21 +471,32 @@ static PENDING_FORWARD_WAITERS: AtomicUsize = AtomicUsize::new(0);
 /// gets its full retry budget again from the next forward on. Bounded by
 /// the number of distinct targets (joiners and leave entrants), and
 /// pruned of expired entries on every insert.
-static RECENT_FORWARD_FAILURES: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
+///
+/// Issue (migration-generation-guard, LOW): keying by address alone used
+/// to let a node that restarted on the same address within
+/// `FORWARD_FAIL_FAST_WINDOW` inherit its predecessor's failure marker —
+/// the fresh process would get a single fail-fast attempt instead of its
+/// own full `KEY_TRANSFER_ATTEMPTS` budget, even though it's a different
+/// incarnation entirely and may well be reachable now. `ForwardTarget::
+/// token` (the target's membership token, unique per process
+/// incarnation — see that field's own doc comment) tells the two apart:
+/// a restart always registers with a new token, so keying on both means a
+/// new incarnation always starts with a clean slate.
+static RECENT_FORWARD_FAILURES: std::sync::OnceLock<Mutex<HashMap<(String, String), Instant>>> =
     std::sync::OnceLock::new();
 const FORWARD_FAIL_FAST_WINDOW: Duration = Duration::from_secs(30);
 
-fn recent_forward_failures() -> &'static Mutex<HashMap<String, Instant>> {
+fn recent_forward_failures() -> &'static Mutex<HashMap<(String, String), Instant>> {
     RECENT_FORWARD_FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// How many attempts the next forward to `addr` gets — see
+/// How many attempts the next forward to `(addr, token)` gets — see
 /// `RECENT_FORWARD_FAILURES`.
-fn forward_attempts_for(addr: &str) -> u32 {
+fn forward_attempts_for(addr: &str, token: &str) -> u32 {
     let failed_recently = recent_forward_failures()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(addr)
+        .get(&(addr.to_string(), token.to_string()))
         .is_some_and(|failed_at| failed_at.elapsed() < FORWARD_FAIL_FAST_WINDOW);
     if failed_recently {
         1
@@ -485,20 +505,20 @@ fn forward_attempts_for(addr: &str) -> u32 {
     }
 }
 
-fn record_forward_failure(addr: &str) {
+fn record_forward_failure(addr: &str, token: &str) {
     let now = Instant::now();
     let mut failures = recent_forward_failures()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     failures.retain(|_, failed_at| now.duration_since(*failed_at) < FORWARD_FAIL_FAST_WINDOW);
-    failures.insert(addr.to_string(), now);
+    failures.insert((addr.to_string(), token.to_string()), now);
 }
 
-fn clear_forward_failure(addr: &str) {
+fn clear_forward_failure(addr: &str, token: &str) {
     recent_forward_failures()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(addr);
+        .remove(&(addr.to_string(), token.to_string()));
 }
 
 /// Hands a per-write forward (`forward_with_retries`, wrapping a `Set`/
@@ -2047,6 +2067,7 @@ async fn handle_connection(
                     joining_token.clone(),
                     Arc::clone(&after_ring),
                     replication,
+                    generation,
                     &joined,
                     &node_context.known_ring,
                 ) {
@@ -2172,15 +2193,27 @@ async fn handle_connection(
                 // a different `joining_name` (already finished, or this
                 // cancel arrived late) — `run_migration` alone decides
                 // whether to actually stop.
-                if let Some(restore) = abandon_migration(&node_context, &joining_name) {
-                    eprintln!(
-                        "WARN join of {joining_name} abandoned by discovery after this node's \
-                         handoff completed; restoring {} dead copies",
-                        restore.len()
-                    );
-                    for key in &restore {
-                        unmark_migrated(&node_context.request_tx, key).await;
+                match abandon_migration(&node_context, &joining_name) {
+                    AbandonOutcome::Completed(restore) => {
+                        eprintln!(
+                            "WARN join of {joining_name} abandoned by discovery after this \
+                             node's handoff completed; restoring {} dead copies",
+                            restore.len()
+                        );
+                        for key in &restore {
+                            unmark_migrated(&node_context.request_tx, key).await;
+                        }
                     }
+                    // Still transferring: wait for `run_migration`'s own
+                    // unwind to actually clear the slot before acking —
+                    // see `wait_for_migration_slot_to_clear`'s doc
+                    // comment for why acking immediately here would let
+                    // discovery race a same-name retry (a fast rejoin)
+                    // into a slot that isn't free yet.
+                    AbandonOutcome::Aborting => {
+                        wait_for_migration_slot_to_clear(&node_context, &joining_name).await;
+                    }
+                    AbandonOutcome::NoMatch => {}
                 }
 
                 write_response(&mut stream, &Response::MigrationCancelled.encode()).await?;
@@ -3911,6 +3944,21 @@ struct ActiveMigration {
     /// started this handoff — membership in the joining node's copy set
     /// is "in the key's top-R", not "is the key's owner".
     replication: usize,
+    /// The join generation this handoff's own `M` carried
+    /// (`Command::Migrate::generation`) — `None` for a legacy sender that
+    /// never parsed one (an old, not-yet-upgraded discovery process; see
+    /// that field's own doc comment on the rolling-upgrade rationale).
+    /// `MigrationGuard::new` compares this against an incoming `M`'s own
+    /// `generation` to tell a discovery *retry* of this exact handoff
+    /// (same name, same generation — a lost `A` ack) from a *new* join
+    /// for the same `joining_name` that supersedes it (same name,
+    /// different generation — a crash + fast restart of the joining node
+    /// under the same identity racing this handoff's own slot). Without
+    /// this, the second case was indistinguishable from the first: the
+    /// new `M` was answered with a stale `DuplicateAcked`/`Conflict` for
+    /// a handoff to a joining-node instance that no longer exists, and
+    /// the join stalled until `migration_timeout_for` reaped it.
+    generation: Option<u64>,
     /// `None` while this node's own transfer is running; `Some(when)`
     /// once it finished successfully. Issue #3: discovery only publishes
     /// the joiner after EVERY ready node reports `C`, so this node must
@@ -4104,22 +4152,36 @@ impl MigrationGuard {
     /// forwarding window), corrupting `migration_target_for` and `X`/`C`
     /// matching for whichever migration loses the slot.
     ///
-    /// A second `M` for the same `joining_name` — a discovery retry after
-    /// a lost ack (`send_migrate_with_retry`) — is the expected way to
-    /// hit an occupied slot, and is handled idempotently: once the
-    /// original `M`'s handler has stamped `acked_entries` (see
+    /// A second `M` for the same `joining_name` *and* the same
+    /// `generation` — a discovery retry after a lost ack
+    /// (`send_migrate_with_retry`) — is the expected way to hit an
+    /// occupied slot, and is handled idempotently: once the original
+    /// `M`'s handler has stamped `acked_entries` (see
     /// `MigrationGuard::ack`), the retry gets back
     /// `MigrationOutcome::DuplicateAcked` carrying the same entry count
     /// the first ack reported, so the caller can resend the same `A
     /// <entries>` ack instead of starting a second migration or
     /// rejecting a retry that's really just a replay. In the brief
-    /// window before that stamp lands, and for an `M` naming a
-    /// genuinely different `joining_name` while one is already active
-    /// (shouldn't happen given discovery's single-join-at-a-time
-    /// invariant, but handled the same defensive way regardless of
-    /// cause), this returns `MigrationOutcome::Conflict` so the caller
-    /// rejects with `R\n` — for the same-name case, the next retry will
-    /// find `acked_entries` stamped.
+    /// window before that stamp lands, this returns
+    /// `MigrationOutcome::Conflict` so the caller rejects with `R\n` —
+    /// the next retry will find `acked_entries` stamped. A `None` on
+    /// either side (a legacy peer that never parsed/sent a `generation`)
+    /// is treated as a match, preserving this same-name-is-enough
+    /// behavior for a rolling upgrade — see `Command::Migrate::
+    /// generation`'s own doc comment.
+    ///
+    /// A same-`joining_name` `M` carrying a *different* generation is a
+    /// genuinely new join for that name superseding the one already
+    /// occupying the slot (a crash + fast restart of the joining node
+    /// under the same identity — see this struct's own `generation`
+    /// field doc comment). Still transferring, it's handled the same as
+    /// a different `joining_name` while one is active: `abort_requested`
+    /// is set (so the stale transfer unwinds instead of racing the new
+    /// one to completion) and this returns `MigrationOutcome::Conflict`.
+    /// Already completed (forwarding grace or not), it falls into the
+    /// same issue #62/#93 supersede logic below that a genuinely
+    /// different `joining_name` does — whether its marks are restored or
+    /// kept depends on `joined`, exactly as for a different name.
     ///
     /// Reuses `migration_target_for`'s lazy-expiry check first: a slot
     /// left by a prior handoff that finished *and* whose forwarding grace
@@ -4146,6 +4208,7 @@ impl MigrationGuard {
         joining_token: String,
         after_ring: Arc<HashRing>,
         replication: usize,
+        generation: Option<u64>,
         joined: &[(String, String)],
         known_ring: &KnownRing,
     ) -> MigrationOutcome {
@@ -4166,10 +4229,19 @@ impl MigrationGuard {
         // new `ActiveMigration` below, before this can be printed.
         let mut abandoned_msg: Option<(String, usize, String)> = None;
         if let Some(existing) = guard.as_ref() {
-            if existing.joining_name == joining_name {
-                // Same-name retry: re-ack idempotently once the original
-                // `M` has computed what to ack, otherwise ask the caller
-                // to reject — the next retry will find it stamped.
+            let same_name = existing.joining_name == joining_name;
+            // `None` on either side (a legacy peer) can't disagree — see
+            // this fn's own doc comment on the rolling-upgrade rationale.
+            let same_generation = match (existing.generation, generation) {
+                (Some(existing_generation), Some(generation)) => existing_generation == generation,
+                _ => true,
+            };
+
+            if same_name && same_generation {
+                // Same-name, same-generation retry: re-ack idempotently
+                // once the original `M` has computed what to ack,
+                // otherwise ask the caller to reject — the next retry
+                // will find it stamped.
                 return match existing.acked_entries {
                     Some(acked_entries) => MigrationOutcome::DuplicateAcked(acked_entries),
                     None => MigrationOutcome::Conflict,
@@ -4177,28 +4249,54 @@ impl MigrationGuard {
             }
 
             if existing.completed_at.is_none() {
+                // Still transferring, and this `M` is not a retry of the
+                // exact same handoff — either a genuinely different
+                // `joining_name`, or the same name at a new generation
+                // superseding the one running here. Either way the slot
+                // can't be handed over synchronously (only
+                // `run_migration`'s own unwind can safely drop it
+                // mid-transfer): ask it to stop and reject this `M`,
+                // trusting the caller (discovery, on `X`'s `abandon_
+                // migration` path) to wait for the slot to actually
+                // clear before it lets a same-name retry land — see
+                // `wait_for_migration_slot_to_clear`.
+                if same_name {
+                    existing.abort_requested.store(true, Ordering::SeqCst);
+                }
                 let conflicting_joining_name = existing.joining_name.clone();
+                let conflicting_generation = existing.generation;
                 // Dropped before logging (unlike the lock this replaced,
                 // which held it across the `eprintln!`) since `slot` is
                 // also locked by `migration_target_for` on every GET/SET
                 // — a backpressured stderr shouldn't stall the hot path.
                 drop(guard);
-                eprintln!(
-                    "WARN ignoring M for {joining_name}: a migration to \
-                     {conflicting_joining_name} is already active"
-                );
+                if same_name {
+                    eprintln!(
+                        "WARN M for {joining_name} (generation {generation:?}) supersedes a \
+                         still-transferring handoff for the same name at generation \
+                         {conflicting_generation:?}; requesting it stop and rejecting this M \
+                         until the slot clears"
+                    );
+                } else {
+                    eprintln!(
+                        "WARN ignoring M for {joining_name}: a migration to \
+                         {conflicting_joining_name} is already active"
+                    );
+                }
                 return MigrationOutcome::Conflict;
             }
 
             // Issue #62: a completed handoff (forwarding or not) doesn't
-            // block the next join. Discovery serializes joins, so a new
-            // `M` for a different joiner means the previous join has been
-            // decided — and `joined` says which way: the previous joiner
-            // listed there completed (its dead copies here are really
-            // dead), otherwise it was abandoned and those copies are
-            // live again. Rejecting here instead is what made discovery
-            // abandon back-to-back joins for a whole forwarding window,
-            // and sweeping those marks regardless is what lost the keys.
+            // block the next join — whether the slot's previous occupant
+            // was a different `joining_name`, or the same name at an
+            // older generation. Discovery serializes joins, so a new `M`
+            // here means the previous join has been decided — and
+            // `joined` says which way: the previous joiner listed there
+            // completed (its dead copies here are really dead), otherwise
+            // it was abandoned and those copies are live again. Rejecting
+            // here instead is what made discovery abandon back-to-back
+            // joins for a whole forwarding window, and sweeping those
+            // marks regardless is what lost the keys.
             let previous_confirmed = existing.confirmed
                 || joined
                     .iter()
@@ -4225,6 +4323,7 @@ impl MigrationGuard {
             joining_token,
             after_ring,
             replication,
+            generation,
             completed_at: None,
             forwarding_grace: Duration::ZERO,
             acked_entries: None,
@@ -6150,6 +6249,28 @@ async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
     }
 }
 
+/// What `abandon_migration` found for `joining_name` in `active_migration`.
+enum AbandonOutcome {
+    /// No matching handoff — a safe no-op: already finished and cleared
+    /// its slot, this cancel is for some other join, or nothing was ever
+    /// active.
+    NoMatch,
+    /// Matched a handoff that had already completed its own share
+    /// (forwarding grace or not, issue #3/#62): the slot was taken
+    /// immediately, along with reverting `known_ring` (issue #93) — these
+    /// are its dead copies to restore.
+    Completed(Vec<Key>),
+    /// Matched a handoff still transferring: `abort_requested` was set,
+    /// but the slot can't be handed back synchronously here — only
+    /// `run_migration`'s own unwind, noticing the flag, can safely drop
+    /// it mid-transfer. The caller should wait for that unwind to
+    /// actually finish (`wait_for_migration_slot_to_clear`) before
+    /// treating this cancel as done — see that function's own doc
+    /// comment for why acking `X` before the slot is really free is
+    /// unsafe (issue: migration-generation-guard).
+    Aborting,
+}
+
 /// Handles an incoming `X` (discovery abandoning a join) against this
 /// node's migration slot. Always requests abort on a matching in-flight
 /// handoff (whether or not it has completed), so a still-running transfer
@@ -6163,10 +6284,8 @@ async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
 /// `known_ring` flip to the post-join topology is reverted (issue #93) —
 /// but only if `known_ring` still holds *this* handoff's post-join ring,
 /// so a newer membership update (e.g. a heartbeat that adopted a fresh
-/// roster once the grace lapsed) is never clobbered. Returns the dead
-/// copies to restore (their async `unmark_migrated` is left to the
-/// caller); `None` when there was nothing completed to abandon.
-fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> Option<Vec<Key>> {
+/// roster once the grace lapsed) is never clobbered.
+fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> AbandonOutcome {
     let taken = {
         let mut slot = node_context
             .active_migration
@@ -6180,13 +6299,16 @@ fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> Option<V
                 } else {
                     // Still transferring: `run_migration` will notice the
                     // abort and roll back its own marks; it hasn't flipped
-                    // `known_ring` yet, so there is nothing to revert.
-                    None
+                    // `known_ring` yet, so there is nothing to revert —
+                    // but the slot is also not free yet, so the caller
+                    // must wait rather than ack immediately.
+                    return AbandonOutcome::Aborting;
                 }
             }
-            _ => None,
+            _ => return AbandonOutcome::NoMatch,
         }
-    }?;
+    };
+    let taken = taken.expect("the matched arm above always took a `Some` slot");
 
     {
         let mut guard = node_context
@@ -6201,7 +6323,62 @@ fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> Option<V
         }
     }
 
-    Some(taken.marked_keys)
+    AbandonOutcome::Completed(taken.marked_keys)
+}
+
+/// Issue (migration-generation-guard): after `abandon_migration` sets
+/// `abort_requested` on a still-transferring handoff (`AbandonOutcome::
+/// Aborting`) rather than taking the slot itself — only `run_migration`'s
+/// own unwind can safely do that mid-transfer — waits for that unwind to
+/// actually finish and drop its `MigrationGuard` (clearing the slot, or
+/// leaving it occupied by a different `joining_name` that raced in) before
+/// this node acks `X` with `MigrationCancelled`.
+///
+/// Without this wait, discovery's `abandon_current_join` proceeds straight
+/// to `try_begin_next_join` the moment the `MigrationCancelled` ack lands.
+/// If the very next join reuses this same `joining_name` (a crash + fast
+/// restart of the joining node under the same identity), its `M` can
+/// arrive here before `run_migration`'s unwind has actually cleared the
+/// slot. `MigrationGuard::new`'s generation check (see its own doc
+/// comment) correctly tells this apart from a same-generation retry and
+/// rejects it — but that rejection can bounce for longer than discovery's
+/// `send_migrate_with_retry` covers: `MIGRATE_SEND_ATTEMPTS` (3, in
+/// `src/bin/nanocached-discovery.rs`) retries back-to-back with no delay
+/// between them, nowhere close to the worst-case time `run_migration` can
+/// still be blocked inside one stuck send — up to `KEY_TRANSFER_ATTEMPTS`
+/// (3) × `OUTBOUND_IO_TIMEOUT` (10s) — before it even re-checks `abort_requested`.
+/// So instead of hoping the retries outlast that window, this wait closes
+/// it at the source: the slot is actually free before discovery is ever
+/// told the cancel is done.
+///
+/// Bounded, never indefinite (this codebase's rule for every wait on
+/// another task) — a handoff that ignores `abort_requested` (stuck on an
+/// unresponsive peer past even its own retries) must not hang this `X`
+/// connection forever. Past the bound this logs and acks anyway, leaving
+/// the same race `MigrationGuard::new`'s `Conflict` path already handles
+/// safely for a caller that retries beyond it.
+async fn wait_for_migration_slot_to_clear(node_context: &NodeContext, joining_name: &str) {
+    let deadline = Instant::now() + MIGRATION_ABANDON_DRAIN_WAIT;
+    loop {
+        let still_present = node_context
+            .active_migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|active| active.joining_name == joining_name);
+        if !still_present {
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "WARN abandon of {joining_name}: the handoff was still unwinding after {}s; \
+                 acking the cancel anyway",
+                MIGRATION_ABANDON_DRAIN_WAIT.as_secs()
+            );
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Staged node join's active-deletion background task: every `SWEEP_INTERVAL`,
@@ -6932,12 +7109,12 @@ async fn forward_with_retries(
     write: OwnedForwardedWrite,
 ) {
     let mut connection = target.connection.lock().await;
-    let attempts = forward_attempts_for(&target.addr);
+    let attempts = forward_attempts_for(&target.addr, &target.token);
 
     for attempt in 1..=attempts {
         match write.attempt(&node_context, &target, &mut connection).await {
             Ok(()) => {
-                clear_forward_failure(&target.addr);
+                clear_forward_failure(&target.addr, &target.token);
                 return;
             }
             Err(error) => {
@@ -6951,7 +7128,7 @@ async fn forward_with_retries(
         }
     }
 
-    record_forward_failure(&target.addr);
+    record_forward_failure(&target.addr, &target.token);
     eprintln!(
         "WARN permanently failed to forward a concurrent {} for a migrating key to {} after \
          {attempts} attempt(s)",
@@ -7760,6 +7937,14 @@ mod tests {
         // permanently, the ones behind it get a single attempt each until
         // a forward succeeds again. A peer that accepts and immediately
         // closes makes every attempt fail fast and countable.
+        //
+        // Issue (migration-generation-guard, LOW): `RECENT_FORWARD_FAILURES`
+        // is keyed by `(addr, token)`, not `addr` alone — this test also
+        // covers that a *different* token at the very same address (a
+        // node that restarted on the same address, registering with a
+        // fresh membership token) is a distinct target and gets its own
+        // full retry budget rather than inheriting the marker left by the
+        // address's previous incarnation.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let accepts = Arc::new(AtomicUsize::new(0));
@@ -7814,15 +7999,30 @@ mod tests {
             "a forward queued behind a permanent failure tries once"
         );
 
+        // A different token at the same address is a different target —
+        // its own process incarnation, not the one that just failed — so
+        // it must not inherit the marker and gets the full budget.
+        let restarted_target = ForwardTarget {
+            addr: addr.clone(),
+            connection: Arc::clone(&connection),
+            token: "tok-target-restarted".to_string(),
+        };
+        forward_with_retries(node_context.clone(), restarted_target, write()).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2 * KEY_TRANSFER_ATTEMPTS as usize + 1,
+            "a different token at the same address gets its own full retry budget"
+        );
+
         // A success clears the marker: the next failure gets the full
         // budget again. Simulated by clearing directly — a real success
         // needs a peer that speaks the auth handshake, which the
         // ordering test below already covers.
-        clear_forward_failure(&addr);
+        clear_forward_failure(&addr, "tok-target");
         forward_with_retries(node_context, target(), write()).await;
         assert_eq!(
             accepts.load(Ordering::SeqCst),
-            2 * KEY_TRANSFER_ATTEMPTS as usize + 1,
+            3 * KEY_TRANSFER_ATTEMPTS as usize + 1,
             "after the marker clears, the full budget is back"
         );
 
@@ -8016,6 +8216,7 @@ mod tests {
                 joining_token: "tok-joiner-0".to_string(),
                 after_ring,
                 replication: 2,
+                generation: None,
                 completed_at: None,
                 forwarding_grace: Duration::from_secs(60),
                 acked_entries: None,
@@ -8155,6 +8356,7 @@ mod tests {
                 joining_token: "tok-joiner-0".to_string(),
                 after_ring,
                 replication: 2,
+                generation: None,
                 completed_at: None,
                 forwarding_grace: Duration::from_secs(60),
                 acked_entries: None,
@@ -9485,6 +9687,7 @@ mod tests {
                 joining_token: "tok-joiner-0".to_string(),
                 after_ring,
                 replication: 2,
+                generation: None,
                 completed_at: None,
                 forwarding_grace: Duration::ZERO,
                 acked_entries: Some(0),
@@ -9743,6 +9946,7 @@ mod tests {
             "tok-joiner-0".to_string(),
             Arc::clone(&after_ring),
             2,
+            None,
             &joined,
             &node_context.known_ring,
         )
@@ -10158,6 +10362,7 @@ mod tests {
                 joining_token: "tok-joiner-0".to_string(),
                 after_ring,
                 replication: 2,
+                generation: None,
                 completed_at: None,
                 forwarding_grace: Duration::from_secs(60),
                 acked_entries: None,
@@ -10277,6 +10482,7 @@ mod tests {
                 joining_token: "tok-joiner-0".to_string(),
                 after_ring,
                 replication: 2,
+                generation: None,
                 completed_at: None,
                 forwarding_grace: Duration::from_secs(60),
                 acked_entries: None,
@@ -10554,6 +10760,7 @@ mod tests {
                             "joiner-0".to_string(),
                         ])),
                         replication: 2,
+                        generation: None,
                         completed_at: None,
                         forwarding_grace: Duration::from_secs(60),
                         acked_entries: None,
@@ -11459,6 +11666,7 @@ mod tests {
                     joining_token: "tok-phantom".to_string(),
                     after_ring: Arc::new(HashRing::new(vec!["leaver".to_string()])),
                     replication: 1,
+                    generation: None,
                     completed_at: None,
                     forwarding_grace: Duration::from_secs(60),
                     acked_entries: None,
@@ -12032,6 +12240,7 @@ mod tests {
             "tok-joiner-0".to_string(),
             Arc::clone(&after_ring),
             2,
+            None,
             &joined,
             &node_context.known_ring,
         )
@@ -12319,6 +12528,7 @@ mod tests {
             "tok-joiner-w".to_string(),
             Arc::clone(&after_ring),
             replication,
+            None,
             &joined,
             &node_context.known_ring,
         )
@@ -12428,6 +12638,7 @@ mod tests {
                 joining_token: "tok-joiner-0".to_string(),
                 after_ring: Arc::clone(&after_ring),
                 replication: 2,
+                generation: None,
                 completed_at: Some(Instant::now()),
                 forwarding_grace: forwarding_grace(0),
                 acked_entries: Some(0),
@@ -12465,8 +12676,10 @@ mod tests {
         // locally — the join isn't visible to clients yet.
         assert!(!wrong_node(&node_context, &key(b"key-3")));
 
-        let restored = abandon_migration(&node_context, "joiner-0")
-            .expect("a completed handoff must hand back its dead copies to restore");
+        let AbandonOutcome::Completed(restored) = abandon_migration(&node_context, "joiner-0")
+        else {
+            panic!("a completed handoff must hand back its dead copies to restore");
+        };
         assert_eq!(restored, vec![key(b"key-3")]);
 
         // The slot is gone and known_ring is back to the pre-join snapshot.
@@ -12501,7 +12714,10 @@ mod tests {
         });
         *node_context.known_ring.lock().unwrap() = Some(Arc::clone(&newer));
 
-        let restored = abandon_migration(&node_context, "joiner-0").unwrap();
+        let AbandonOutcome::Completed(restored) = abandon_migration(&node_context, "joiner-0")
+        else {
+            panic!("a completed handoff must hand back its dead copies to restore");
+        };
         assert_eq!(restored, vec![key(b"key-3")]);
         assert!(
             Arc::ptr_eq(
@@ -12523,7 +12739,10 @@ mod tests {
             slot.as_mut().unwrap().completed_at = None;
         }
 
-        assert!(abandon_migration(&node_context, "joiner-0").is_none());
+        assert!(matches!(
+            abandon_migration(&node_context, "joiner-0"),
+            AbandonOutcome::Aborting
+        ));
         // The slot survives (run_migration's guard still owns it) with abort
         // requested, and known_ring is left exactly as it was.
         let slot = node_context.active_migration.lock().unwrap();
@@ -12568,6 +12787,7 @@ mod tests {
                 "joiner-1".to_string(),
             ])),
             2,
+            None,
             &joined,
             &node_context.known_ring,
         );
@@ -12702,6 +12922,7 @@ mod tests {
                 "joiner-0".to_string(),
             ])),
             replication: 2,
+            generation: None,
             completed_at: Some(Instant::now() - forwarding_grace(0) - Duration::from_secs(1)),
             forwarding_grace: forwarding_grace(0),
             acked_entries: Some(0),
@@ -12736,6 +12957,7 @@ mod tests {
                 "joiner-0".to_string(),
             ])),
             replication: 2,
+            generation: None,
             completed_at: Some(Instant::now() - forwarding_grace(0) - Duration::from_secs(1)),
             forwarding_grace: forwarding_grace(0),
             acked_entries: Some(0),
@@ -12759,6 +12981,7 @@ mod tests {
             "tok-joiner-1".to_string(),
             after_ring,
             2,
+            None,
             &[],
             &known_ring,
         );
@@ -12784,6 +13007,7 @@ mod tests {
                 "joiner-0".to_string(),
             ])),
             replication: 2,
+            generation: None,
             completed_at: None,
             forwarding_grace: Duration::ZERO,
             acked_entries: Some(0),
@@ -12807,6 +13031,7 @@ mod tests {
             "tok-joiner-1".to_string(),
             after_ring,
             2,
+            None,
             &[],
             &known_ring,
         );
@@ -12819,6 +13044,290 @@ mod tests {
             slot.lock().unwrap().as_ref().unwrap().joining_name,
             "joiner-0",
             "the original migration must be left untouched"
+        );
+    }
+
+    // ── migration-generation-guard: `M`'s generation vs. same-name retries ──
+
+    #[test]
+    fn migration_guard_new_answers_a_same_generation_retry_with_duplicate_acked() {
+        // A discovery retry of the exact same handoff (lost `A` ack): same
+        // `joining_name` *and* the same `generation` — must re-ack
+        // idempotently, not be treated as a supersede.
+        let slot = Arc::new(Mutex::new(Some(ActiveMigration {
+            joining_name: "joiner-0".to_string(),
+            joining_addr: "127.0.0.1:9".to_string(),
+            joining_token: "tok-joiner-0".to_string(),
+            after_ring: Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "joiner-0".to_string(),
+            ])),
+            replication: 2,
+            generation: Some(7),
+            completed_at: None,
+            forwarding_grace: Duration::ZERO,
+            acked_entries: Some(42),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            marked_keys: Vec::new(),
+            confirmed: false,
+            pre_completion_ring: None,
+            pending_clears: PendingClears::default(),
+            forward_connection: Arc::new(AsyncMutex::new(None)),
+        })));
+
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let outcome = MigrationGuard::new(
+            Arc::clone(&slot),
+            "joiner-0".to_string(),
+            "127.0.0.1:9".to_string(),
+            "tok-joiner-0".to_string(),
+            after_ring,
+            2,
+            Some(7),
+            &[],
+            &known_ring,
+        );
+
+        assert!(
+            matches!(outcome, MigrationOutcome::DuplicateAcked(42)),
+            "a retry of the same handoff at the same generation must re-ack idempotently"
+        );
+        assert!(
+            !slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .abort_requested
+                .load(Ordering::SeqCst),
+            "a benign retry must not abort the handoff"
+        );
+    }
+
+    #[test]
+    fn migration_guard_new_supersedes_a_still_transferring_handoff_at_a_new_generation() {
+        // Same `joining_name`, but the incoming `M` carries a different
+        // generation: a crash + fast restart of the joining node under the
+        // same identity, racing the still-running handoff for the old
+        // instance. The stale handoff can't be handed the slot
+        // synchronously (only its own `run_migration` unwind can safely
+        // drop it mid-transfer), so this must reject with `Conflict` while
+        // also flagging the stale handoff to stop.
+        let slot = Arc::new(Mutex::new(Some(ActiveMigration {
+            joining_name: "joiner-0".to_string(),
+            joining_addr: "127.0.0.1:9".to_string(),
+            joining_token: "tok-joiner-0".to_string(),
+            after_ring: Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "joiner-0".to_string(),
+            ])),
+            replication: 2,
+            generation: Some(1),
+            completed_at: None,
+            forwarding_grace: Duration::ZERO,
+            acked_entries: Some(0),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            marked_keys: Vec::new(),
+            confirmed: false,
+            pre_completion_ring: None,
+            pending_clears: PendingClears::default(),
+            forward_connection: Arc::new(AsyncMutex::new(None)),
+        })));
+
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let outcome = MigrationGuard::new(
+            Arc::clone(&slot),
+            "joiner-0".to_string(),
+            "127.0.0.1:11".to_string(),
+            "tok-joiner-0-v2".to_string(),
+            after_ring,
+            2,
+            Some(2),
+            &[],
+            &known_ring,
+        );
+
+        assert!(
+            matches!(outcome, MigrationOutcome::Conflict),
+            "a still-transferring handoff at an old generation must not be clobbered \
+             synchronously"
+        );
+        let existing = slot.lock().unwrap();
+        let active = existing
+            .as_ref()
+            .expect("the stale handoff's slot must be left in place for its own unwind");
+        assert_eq!(
+            active.generation,
+            Some(1),
+            "the stale handoff itself must be untouched, not overwritten"
+        );
+        assert!(
+            active.abort_requested.load(Ordering::SeqCst),
+            "the superseded handoff must be told to stop"
+        );
+    }
+
+    #[test]
+    fn migration_guard_new_treats_a_completed_handoff_at_a_new_generation_like_a_different_joiner_supersede()
+     {
+        // Same scenario as `migration_guard_new_reverts_known_ring_for_an_
+        // implicitly_abandoned_handoff`, but the previous handoff is
+        // superseded by the *same* `joining_name` at a new generation
+        // instead of a genuinely different name. Once the old handoff has
+        // completed (forwarding grace or not), this must fall into the
+        // exact same issue #62/#93 supersede logic a different name does:
+        // `joined` says whether it was confirmed, and if not, its marks
+        // come back and `known_ring` reverts.
+        let before_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "other-node".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "other-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let pre_completion_ring = Arc::new(Membership {
+            ring: Arc::clone(&before_ring),
+            replication: 2,
+        });
+        let known_ring: KnownRing = Arc::new(Mutex::new(Some(Arc::new(Membership {
+            ring: Arc::clone(&after_ring),
+            replication: 2,
+        }))));
+        let slot = Arc::new(Mutex::new(Some(ActiveMigration {
+            joining_name: "joiner-0".to_string(),
+            joining_addr: "127.0.0.1:9".to_string(),
+            joining_token: "tok-joiner-0".to_string(),
+            after_ring: Arc::clone(&after_ring),
+            replication: 2,
+            generation: Some(1),
+            completed_at: Some(Instant::now()),
+            forwarding_grace: forwarding_grace(0),
+            acked_entries: Some(0),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            marked_keys: vec![key(b"key-3")],
+            confirmed: false,
+            pre_completion_ring: Some(Arc::clone(&pre_completion_ring)),
+            pending_clears: PendingClears::default(),
+            forward_connection: Arc::new(AsyncMutex::new(None)),
+        })));
+
+        // `M` for joiner-0 again at generation 2 (a fresh join after a
+        // crash + fast restart); the roster doesn't list joiner-0, so its
+        // previous, completed-but-unconfirmed instance was abandoned.
+        let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
+        let outcome = MigrationGuard::new(
+            Arc::clone(&slot),
+            "joiner-0".to_string(),
+            "127.0.0.1:11".to_string(),
+            "tok-joiner-0-v2".to_string(),
+            Arc::clone(&after_ring),
+            2,
+            Some(2),
+            &joined,
+            &known_ring,
+        );
+
+        let _guard = match outcome {
+            MigrationOutcome::New { restore, guard } => {
+                assert_eq!(
+                    restore,
+                    vec![key(b"key-3")],
+                    "the old instance's dead copies must come back"
+                );
+                guard
+            }
+            _ => panic!(
+                "a completed handoff superseded by a new generation must accept the new join"
+            ),
+        };
+
+        assert!(
+            Arc::ptr_eq(
+                known_ring.lock().unwrap().as_ref().unwrap(),
+                &pre_completion_ring,
+            ),
+            "known_ring must revert to the pre-join snapshot, exactly like a different-joiner \
+             supersede"
+        );
+        assert_eq!(
+            slot.lock().unwrap().as_ref().unwrap().generation,
+            Some(2),
+            "the slot must now track the new handoff's own generation"
+        );
+    }
+
+    #[test]
+    fn migration_guard_new_treats_a_legacy_generation_as_matching_any_generation() {
+        // Rolling upgrade: the handoff already occupying this slot was
+        // started by an `M` with no `generation` field (an old discovery
+        // process, or a pre-#421(c) peer) — `existing.generation` is
+        // `None`. A retry of that same handoff from a since-upgraded
+        // discovery process now carries a `generation`. Neither side can
+        // tell from generation info alone whether this is really the same
+        // handoff, so `None` must not be treated as "definitely
+        // different" — same-name is still enough, matching the
+        // pre-generation-check behavior this fn had before.
+        let slot = Arc::new(Mutex::new(Some(ActiveMigration {
+            joining_name: "joiner-0".to_string(),
+            joining_addr: "127.0.0.1:9".to_string(),
+            joining_token: "tok-joiner-0".to_string(),
+            after_ring: Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "joiner-0".to_string(),
+            ])),
+            replication: 2,
+            generation: None,
+            completed_at: None,
+            forwarding_grace: Duration::ZERO,
+            acked_entries: Some(99),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            marked_keys: Vec::new(),
+            confirmed: false,
+            pre_completion_ring: None,
+            pending_clears: PendingClears::default(),
+            forward_connection: Arc::new(AsyncMutex::new(None)),
+        })));
+
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let outcome = MigrationGuard::new(
+            Arc::clone(&slot),
+            "joiner-0".to_string(),
+            "127.0.0.1:9".to_string(),
+            "tok-joiner-0".to_string(),
+            after_ring,
+            2,
+            Some(5),
+            &[],
+            &known_ring,
+        );
+
+        assert!(
+            matches!(outcome, MigrationOutcome::DuplicateAcked(99)),
+            "a legacy (generation-less) existing handoff must still match a same-name retry"
+        );
+        assert!(
+            !slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .abort_requested
+                .load(Ordering::SeqCst),
+            "a benign retry must not abort the handoff"
         );
     }
 
@@ -13375,6 +13884,7 @@ mod tests {
                 "joiner-0".to_string(),
             ])),
             replication: 2,
+            generation: None,
             completed_at: Some(Instant::now()),
             forwarding_grace: forwarding_grace(0),
             acked_entries: Some(0),
@@ -13405,6 +13915,7 @@ mod tests {
                 "joiner-1".to_string(),
             ])),
             2,
+            None,
             joined,
             known_ring,
         )
@@ -14274,6 +14785,7 @@ mod tests {
                 "joiner-0".to_string(),
             ])),
             replication: 2,
+            generation: None,
             completed_at,
             forwarding_grace: forwarding_grace(0),
             acked_entries: Some(0),
