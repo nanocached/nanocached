@@ -675,10 +675,29 @@ fn next_connection_id() -> u64 {
 /// rather than anything threaded through `CurrentJoin`, since every new
 /// `PendingJoin` needs exactly one value, unique for the life of the
 /// process.
-static NEXT_JOIN_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_JOIN_GENERATION: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
 
+/// Tenth-pass follow-up (2026-09-04): seeded from the wall clock (unix
+/// microseconds, `| 1` so it is never 0) on first use rather than starting
+/// at 1. A generation only proves anything against a stale `C` if it is
+/// never reissued, and a process-local counter restarting at 1 would
+/// reissue every generation a previous incarnation of this discovery
+/// handed out — a `C` sent for a join that incarnation started could then
+/// match a fresh `PendingJoin` of the same name by number as well as by
+/// name. Still only monotonic within one process; HA replicas (which never
+/// talk to each other) each seed independently, and the wall clock makes
+/// two replicas' ranges overlap only if they start within the same
+/// microsecond and run the same number of joins.
 fn next_join_generation() -> u64 {
-    NEXT_JOIN_GENERATION.fetch_add(1, Ordering::Relaxed)
+    NEXT_JOIN_GENERATION
+        .get_or_init(|| {
+            let micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since_epoch| u64::try_from(since_epoch.as_micros()).unwrap_or(u64::MAX))
+                .unwrap_or(1);
+            AtomicU64::new(micros | 1)
+        })
+        .fetch_add(1, Ordering::Relaxed)
 }
 
 /// The node registry (`nodes`, keyed by name — node identity decoupled
@@ -9546,8 +9565,8 @@ mod tests {
         // `NEXT_JOIN_GENERATION` is one process-wide counter shared by
         // every test in this binary (they run concurrently), so this
         // join's generation is merely SOME value `next_join_generation`
-        // handed out — never 0 (`NEXT_JOIN_GENERATION` starts at 1 and
-        // only increments).
+        // handed out — never 0 (`NEXT_JOIN_GENERATION` is seeded odd
+        // and only increments).
         assert!(generation > 0);
 
         // Body: `<token><joining_name><joining_addr><joining_token><roster>`
