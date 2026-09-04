@@ -93,17 +93,24 @@ type mockNode struct {
 	wrongNodeLeft    atomic.Int32
 	setWrongNodeLeft atomic.Int32 // like wrongNodeLeft, but only consumed by S (for isolating a repair write's failure from an unrelated G)
 	malformedLeft    atomic.Int32
-	storedToGetLeft  atomic.Int32
-	wrongTagLeft     atomic.Int32 // echoed response tags: echo the wrong tag on the next G on a tagged connection
-	swallowLeft      atomic.Int32 // echoed response tags: swallow the next G entirely (no reply)
-	busyLeft         atomic.Int32 // issue #334: answer the next G with an untagged `B` instead of its real reply, with the request already pending
-	lastSetTTL       atomic.Value // string: the TTL field of the last S, or "none"
-	setDelay         atomic.Int64 // nanoseconds; sleep this long before every S reply
-	getDelay         atomic.Int64 // nanoseconds; sleep this long before every G reply
-	conns            sync.Map     // net.Conn -> struct{}
-	silent           atomic.Bool  // once true, every G/S/D is read but never answered
-	failClearLeft    atomic.Int32 // issue #106: fail the next N c/F requests (read, then drop the connection with no reply)
-	clearCount       atomic.Int32 // issue #106: how many c/F requests this node has received, failed or not
+	// plusPrefixedLengthLeft is malformedLeft's sibling for issue #462:
+	// answer the next G with a `+`-prefixed value length ("V +5\n")
+	// instead of malformedLeft's non-numeric "V x\n" — exercising the
+	// wire integer grammar's rejection of a leading `+`, which
+	// strconv.Atoi/ParseInt would have silently accepted before
+	// parseStrictInt existed.
+	plusPrefixedLengthLeft atomic.Int32
+	storedToGetLeft        atomic.Int32
+	wrongTagLeft           atomic.Int32 // echoed response tags: echo the wrong tag on the next G on a tagged connection
+	swallowLeft            atomic.Int32 // echoed response tags: swallow the next G entirely (no reply)
+	busyLeft               atomic.Int32 // issue #334: answer the next G with an untagged `B` instead of its real reply, with the request already pending
+	lastSetTTL             atomic.Value // string: the TTL field of the last S, or "none"
+	setDelay               atomic.Int64 // nanoseconds; sleep this long before every S reply
+	getDelay               atomic.Int64 // nanoseconds; sleep this long before every G reply
+	conns                  sync.Map     // net.Conn -> struct{}
+	silent                 atomic.Bool  // once true, every G/S/D is read but never answered
+	failClearLeft          atomic.Int32 // issue #106: fail the next N c/F requests (read, then drop the connection with no reply)
+	clearCount             atomic.Int32 // issue #106: how many c/F requests this node has received, failed or not
 	// retryableLeft is issue #125's "answer the next N data requests with
 	// R" knob — consumed by any of G/g/S/s/D/d/c/F, tagged correctly like
 	// every other reply.
@@ -557,6 +564,12 @@ func (m *mockNode) serve(conn net.Conn) {
 			}
 			if m.takeOne(&m.malformedLeft) {
 				if _, err := conn.Write([]byte("V x\n")); err != nil {
+					return
+				}
+				continue
+			}
+			if m.takeOne(&m.plusPrefixedLengthLeft) {
+				if _, err := conn.Write([]byte("V +5\n")); err != nil {
 					return
 				}
 				continue
@@ -2619,6 +2632,62 @@ func TestAMalformedFrameSurfacesAsErrProtocolNotErrConnectionLost(t *testing.T) 
 		t.Fatal(err)
 	}
 	node.malformedLeft.Add(2) // one for the original connection, one for the redial
+	_, _, err = client.Get("k")
+	if !errors.Is(err, ErrProtocol) {
+		t.Fatalf("err = %v, want ErrProtocol", err)
+	}
+	if errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("err = %v, must not also be ErrConnectionLost", err)
+	}
+}
+
+// TestAPlusPrefixedValueLengthPoisonsTheConnectionAndRetriesTransparently
+// is issue #462's counterpart to
+// TestAMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently
+// above, using a `V +5\n` reply instead of `V x\n`: a leading `+` used to
+// parse cleanly through strconv.Atoi (it is valid ParseInt syntax), so
+// before parseStrictInt this reply would have been silently accepted as
+// length 5 instead of rejected — it must be classified as malformed
+// exactly like a non-numeric length, poisoning the connection and being
+// transparently retried away by applyReconnecting's redial-and-retry.
+func TestAPlusPrefixedValueLengthPoisonsTheConnectionAndRetriesTransparently(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	node.plusPrefixedLengthLeft.Add(1)
+	value, ok, err := client.Get("k")
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get = %q, %v, %v", value, ok, err)
+	}
+	if node.connectionCount.Load() != 2 {
+		t.Fatalf("connections = %d", node.connectionCount.Load())
+	}
+}
+
+// TestAPlusPrefixedValueLengthSurfacesAsErrProtocol is issue #462's
+// counterpart to TestAMalformedFrameSurfacesAsErrProtocolNotErrConnectionLost
+// above: exhausting the single redial-and-retry with two `V +5\n` replies
+// must surface ErrProtocol, not ErrConnectionLost, the same as any other
+// malformed frame.
+func TestAPlusPrefixedValueLengthSurfacesAsErrProtocol(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	node.plusPrefixedLengthLeft.Add(2) // one for the original connection, one for the redial
 	_, _, err = client.Get("k")
 	if !errors.Is(err, ErrProtocol) {
 		t.Fatalf("err = %v, want ErrProtocol", err)

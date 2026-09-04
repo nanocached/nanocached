@@ -362,15 +362,55 @@ public class NanocachedClientTests
         await client.SetAsync("n", "1");
         Assert.Equal(2L, await client.IncrAsync("n", 1));
 
-        node.AnswerIncrBodyOnce("+3");
-        await Assert.ThrowsAsync<ConnectionLostException>(() => client.IncrAsync("n", 1));
+        // issue #462: every rejected shape a wire integer must reject —
+        // leading '+', leading/trailing whitespace, '_' digit grouping,
+        // an exponent, and the empty body.
+        foreach (string body in new[] { "+3", " 4", "4 ", "1_000", "1e2", "" })
+        {
+            node.AnswerIncrBodyOnce(body);
+            await Assert.ThrowsAsync<ConnectionLostException>(() => client.IncrAsync("n", 1));
+        }
 
-        node.AnswerIncrBodyOnce(" 4");
-        await Assert.ThrowsAsync<ConnectionLostException>(() => client.IncrAsync("n", 1));
-
-        // A plain negative body is still a number.
+        // A plain negative body is still a number, and leading zeros are
+        // allowed (the node's own grammar imposes no such restriction).
         node.AnswerIncrBodyOnce("-5");
         Assert.Equal(-5L, await client.IncrAsync("n", 1));
+
+        node.AnswerIncrBodyOnce("007");
+        Assert.Equal(7L, await client.IncrAsync("n", 1));
+    }
+
+    [Fact]
+    public async Task AWireLengthWithALeadingPlusSignOrOtherNonDigitsPoisonsTheConnection()
+    {
+        // issue #462: the V length field (and every other non-counter
+        // wire integer, all parsed the same way) must reject a leading
+        // '+', leading/trailing whitespace, '_' digit grouping, and an
+        // exponent — never silently coerce "+5" into 5 — poisoning the
+        // connection exactly like the generic-garbage case
+        // AMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently
+        // above, so the built-in redial-and-retry-once heals it.
+        //
+        // " 5" and "5 " are the important cases here: ReadLineAsync used
+        // to call a blanket .Trim() on the whole response header line,
+        // which silently absorbed leading/trailing whitespace padding a
+        // malicious server put around the line's first/last field before
+        // Split(' ') and int.TryParse(NumberStyles.None) ever saw it —
+        // e.g. "V 5 \n" parsed as a clean length of 5 instead of being
+        // rejected. ReadLineAsync now strips only the one mandatory
+        // delimiter space right after the marker, never more, so this
+        // padding reaches Split/TryParse intact and is rejected exactly
+        // like any other non-digit byte.
+        foreach (string body in new[] { "+5", " 5", "5 ", "1_000", "1e2", "" })
+        {
+            using var node = new MockNode();
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+            await client.SetAsync("k", "v");
+            node.AnswerMalformedValueOnce(body);
+            Assert.Equal("v", await client.GetAsync("k"));
+            Assert.Equal(2, node.ConnectionCount);
+        }
     }
 
     [Fact]

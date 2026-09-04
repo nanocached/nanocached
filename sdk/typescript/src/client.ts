@@ -15,6 +15,7 @@ import {
   multiGetEntryCost,
   multiSetEntryCost,
   MULTI_FRAME_HEADER_SLACK,
+  parseStrictInteger,
   type CasCondition,
   type MultiAckEntry,
   type MultiEntry,
@@ -303,7 +304,12 @@ function splitHostPort(address: string): { host: string; port: number } {
   }
 
   const host = address.slice(0, separator);
-  const port = Number(address.slice(separator + 1));
+  // Strict decimal-digits-only (issue #462) — `address` is discovery-
+  // response-derived (every call site passes a `node.address`/
+  // `proxy.address` off the wire), so its port substring must reject the
+  // same "+80"/" 80"/"8e1" desync signals every other wire integer field
+  // does rather than let bare `Number()` coerce them.
+  const port = parseStrictInteger(address.slice(separator + 1));
   // Must be a valid TCP port (0-65535, matching the Python SDK's
   // split_host_port) — a bogus value like "999999" or "-1" would
   // otherwise reach net.connect/tls.connect and throw a synchronous
@@ -314,7 +320,7 @@ function splitHostPort(address: string): { host: string; port: number } {
   // caller". Throwing NanocachedError here instead keeps this a
   // by-design swallow, exactly like every other malformed-address case
   // above.
-  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+  if (port === undefined || port > 65535) {
     throw new NanocachedError(`nanocached: invalid node address from discovery server: ${address}`);
   }
 

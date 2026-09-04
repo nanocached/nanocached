@@ -313,16 +313,29 @@ final class Connection {
      * {@link #readResponse}'s own malformed-length checks (this one runs
      * on the caller's thread rather than the reader thread, so — unlike
      * those — it must poison explicitly rather than rely on {@link
-     * #readLoop}'s catch). */
+     * #readLoop}'s catch). A leading {@code '-'} is the one exception to
+     * {@link #isDigitsOnly}'s grammar allowed here — INCR/DECR deltas (and
+     * so counter values) can go negative, unlike every other wire-derived
+     * integer field — but a leading {@code '+'} is still rejected: {@link
+     * Long#parseLong} would otherwise accept it (issue #462), and the
+     * wire grammar never permits it even here. Mirrors .NET's
+     * {@code TryParseWireCounter}'s explicit {@code body[0] == '+'}
+     * check. */
     private long parseCounterValue(byte[] value) {
-        try {
-            return Long.parseLong(new String(value, StandardCharsets.US_ASCII));
-        } catch (NumberFormatException malformed) {
-            NanocachedException error = new NanocachedException.ConnectionFailed(
-                    "nanocached: invalid INCR value in response (connection desynced)", null);
-            poison(error);
-            throw error;
+        String text = new String(value, StandardCharsets.US_ASCII);
+        boolean negative = text.startsWith("-");
+        String digits = negative ? text.substring(1) : text;
+        if (isDigitsOnly(digits)) {
+            try {
+                return Long.parseLong(text);
+            } catch (NumberFormatException overflow) {
+                // fall through to poison below
+            }
         }
+        NanocachedException error = new NanocachedException.ConnectionFailed(
+                "nanocached: invalid INCR value in response (connection desynced)", null);
+        poison(error);
+        throw error;
     }
 
     // Compare-and-set (issue #141): `k`/`x` — same always-namespaced
@@ -421,15 +434,57 @@ final class Connection {
         return error;
     }
 
+    /** True iff every character of {@code field} is an ASCII digit and
+     * the string is non-empty — the wire's own integer grammar (issue
+     * #462; see {@code src/command.rs}'s {@code parse_length}, which
+     * loops byte-by-byte over ASCII digits with no leading-zero
+     * restriction but no leading {@code '+'} either). {@link
+     * Integer#parseInt}/{@link Long#parseLong} are looser than this grammar
+     * — both accept an optional leading {@code '+'} — so every
+     * wire-derived integer field (except the one exception, {@link
+     * #parseCounterValue}'s leading {@code '-'}) must pass this check
+     * before being handed to them. Package-private: shared with {@link
+     * Identify} and {@link NanocachedClient}, both in this package. */
+    static boolean isDigitsOnly(String field) {
+        if (field.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < field.length(); i++) {
+            char c = field.charAt(i);
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** Parses a decimal field as {@code readResponse}'s length/count
-     * fields do throughout: a non-numeric or negative field is protocol
-     * garbage, reported here as -1 so every caller's existing {@code < 0}
-     * bounds check catches it uniformly. */
-    private static int parseNonNegativeInt(String field) {
+     * fields do throughout: a field that isn't {@link #isDigitsOnly} (in
+     * particular one carrying a leading {@code '+'}, which {@link
+     * Integer#parseInt} would otherwise silently accept — issue #462) or
+     * that overflows an {@code int} is protocol garbage, reported here as
+     * -1 so every caller's existing {@code < 0} bounds check catches it
+     * uniformly. Package-private: shared with {@link Identify}. */
+    static int parseNonNegativeInt(String field) {
+        if (!isDigitsOnly(field)) {
+            return -1;
+        }
         try {
-            int value = Integer.parseInt(field);
-            return value < 0 ? -1 : value;
-        } catch (NumberFormatException malformed) {
+            return Integer.parseInt(field);
+        } catch (NumberFormatException overflow) {
+            return -1;
+        }
+    }
+
+    /** {@link #parseNonNegativeInt}, but for a {@code long}-sized field
+     * (the {@code I} response's optional TTL — issue #462). */
+    private static long parseNonNegativeLong(String field) {
+        if (!isDigitsOnly(field)) {
+            return -1;
+        }
+        try {
+            return Long.parseLong(field);
+        } catch (NumberFormatException overflow) {
             return -1;
         }
     }
@@ -920,16 +975,12 @@ final class Connection {
                     throw new NanocachedException.ConnectionFailed(
                             "nanocached: invalid value header in response", null);
                 }
-                // A non-numeric, negative, or absurd length is protocol
-                // garbage: the connection is desynced mid-frame and must
-                // be poisoned, and the error must be connection-classified
-                // so the redial/retry layer handles it (issue #8).
-                int length;
-                try {
-                    length = Integer.parseInt(fields[0]);
-                } catch (NumberFormatException malformed) {
-                    length = -1;
-                }
+                // A non-numeric (issue #462: including a leading '+'),
+                // negative, or absurd length is protocol garbage: the
+                // connection is desynced mid-frame and must be poisoned,
+                // and the error must be connection-classified so the
+                // redial/retry layer handles it (issue #8).
+                int length = parseNonNegativeInt(fields[0]);
                 if (length < 0 || length > MAX_VALUE_LENGTH) {
                     throw new NanocachedException.ConnectionFailed(
                             "nanocached: invalid value length in response", null);
@@ -952,27 +1003,22 @@ final class Connection {
                     throw new NanocachedException.ConnectionFailed(
                             "nanocached: invalid incr value header in response", null);
                 }
-                int length;
-                try {
-                    length = Integer.parseInt(fields[0]);
-                } catch (NumberFormatException malformed) {
-                    length = -1;
-                }
+                int length = parseNonNegativeInt(fields[0]);
                 if (length < 0 || length > MAX_VALUE_LENGTH) {
                     throw new NanocachedException.ConnectionFailed(
                             "nanocached: invalid value length in response", null);
                 }
                 Long ttlSeconds = null;
                 if (fields.length == fieldsWithTtl) {
-                    try {
-                        ttlSeconds = Long.parseLong(fields[1]);
-                    } catch (NumberFormatException malformed) {
-                        ttlSeconds = null;
-                    }
-                    if (ttlSeconds == null || ttlSeconds < 0) {
+                    // long-sized, so it can't route through
+                    // parseNonNegativeInt — same digits-only grammar
+                    // (issue #462) via parseNonNegativeLong instead.
+                    long parsedTtl = parseNonNegativeLong(fields[1]);
+                    if (parsedTtl < 0) {
                         throw new NanocachedException.ConnectionFailed(
                                 "nanocached: invalid ttl in response", null);
                     }
+                    ttlSeconds = parsedTtl;
                 }
                 int tag = tagged ? parseTag(fields[fields.length - 1]) : -1;
                 return new Response(marker, readExactly(length), tag, ttlSeconds, null);
@@ -1099,10 +1145,16 @@ final class Connection {
 
     /** Parses a tag field (echoed response tags) as unsigned decimal text, matching
      * the wire's u32 width — see {@link #claimTag}/{@link #tagSuffix}. A
-     * non-numeric or out-of-range field is protocol garbage: the
-     * connection is desynced and must be poisoned, connection-classified
-     * so the redial/retry layer handles it. */
+     * non-numeric (issue #462: including a leading {@code '+'}, which
+     * {@link Integer#parseUnsignedInt} would otherwise silently accept —
+     * confirmed by inspection, not just javadoc) or out-of-range field is
+     * protocol garbage: the connection is desynced and must be poisoned,
+     * connection-classified so the redial/retry layer handles it. */
     private static int parseTag(String field) {
+        if (!isDigitsOnly(field)) {
+            throw new NanocachedException.ConnectionFailed(
+                    "nanocached: invalid response tag", null);
+        }
         try {
             return Integer.parseUnsignedInt(field);
         } catch (NumberFormatException malformed) {

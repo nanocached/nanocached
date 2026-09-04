@@ -153,6 +153,7 @@ class MockNode:
         self._wrong_tag_replies = 0
         self._swallowed_gets = 0
         self._malformed_value_replies = 0
+        self._plus_prefixed_length_replies = 0
         self._unterminated_value_replies = 0
         self.unterminated_value_bytes_sent = 0
         self._stored_to_get_replies = 0
@@ -215,6 +216,15 @@ class MockNode:
 
     def answer_malformed_value_once(self) -> None:
         self._malformed_value_replies += 1
+
+    def answer_plus_prefixed_length_once(self) -> None:
+        """Reply `V +5\\nhello` to the next G — a length field bare
+        int() would silently accept (a leading '+') but the wire's
+        digits-only grammar (issue #462) rejects, unlike
+        answer_malformed_value_once's `x`, which even bare int() already
+        rejected. Proves the strict-grammar check runs, not just the
+        pre-existing non-numeric/negative guard."""
+        self._plus_prefixed_length_replies += 1
 
     def answer_unterminated_value_once(self) -> None:
         """Reply `V` to the next G, then stream chunks of non-newline
@@ -495,6 +505,11 @@ class MockNode:
                     if self._malformed_value_replies > 0:
                         self._malformed_value_replies -= 1
                         writer.write(b"V x\n")
+                        await writer.drain()
+                        continue
+                    if self._plus_prefixed_length_replies > 0:
+                        self._plus_prefixed_length_replies -= 1
+                        writer.write(b"V +5\nhello")
                         await writer.drain()
                         continue
                     if self._unterminated_value_replies > 0:

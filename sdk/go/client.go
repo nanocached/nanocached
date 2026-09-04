@@ -1950,7 +1950,7 @@ func (c *Client) incr(namespace, key []byte, delta int64) (value int64, ok bool,
 // server's own response violated its own wire contract; wrapped as
 // ErrProtocol exactly like any other malformed frame.
 func parseIncrValue(raw []byte) (int64, error) {
-	value, err := strconv.ParseInt(string(raw), 10, 64)
+	value, err := parseCounterValue(string(raw))
 	if err != nil {
 		return 0, protocolError(fmt.Sprintf("invalid incr value in response: %q", raw))
 	}

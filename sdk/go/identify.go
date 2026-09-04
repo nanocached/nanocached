@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -388,11 +387,11 @@ func readNodeList(reader *bufio.Reader) ([]discoveredNode, int, error) {
 	if len(fields) != 2 {
 		return nil, 0, fmt.Errorf("nanocached: invalid node-list header in discovery response")
 	}
-	count, err := strconv.Atoi(fields[0])
+	count, err := parseStrictInt(fields[0])
 	if err != nil || count < 0 || count > maxNodeCount {
 		return nil, 0, fmt.Errorf("nanocached: invalid node count in discovery response")
 	}
-	replication, err := strconv.Atoi(fields[1])
+	replication, err := parseStrictInt(fields[1])
 	if err != nil || replication < 1 {
 		return nil, 0, fmt.Errorf("nanocached: invalid replication factor in discovery response")
 	}
@@ -425,7 +424,7 @@ func readProxyList(reader *bufio.Reader) ([]discoveredNode, error) {
 		return nil, fmt.Errorf("nanocached: unexpected response from discovery server: %s", header)
 	}
 
-	count, err := strconv.Atoi(rest)
+	count, err := parseStrictInt(rest)
 	if err != nil || count < 0 || count > maxNodeCount {
 		return nil, fmt.Errorf("nanocached: invalid proxy count in discovery response")
 	}
@@ -453,8 +452,8 @@ func readListEntries(reader *bufio.Reader, count int) ([]discoveredNode, error) 
 		if len(lengths) != 2 {
 			return nil, fmt.Errorf("nanocached: invalid node entry header in discovery response")
 		}
-		nameLength, err1 := strconv.Atoi(lengths[0])
-		addrLength, err2 := strconv.Atoi(lengths[1])
+		nameLength, err1 := parseStrictInt(lengths[0])
+		addrLength, err2 := parseStrictInt(lengths[1])
 		if err1 != nil || err2 != nil || nameLength < 0 || addrLength < 0 ||
 			nameLength > maxNodeFieldLength || addrLength > maxNodeFieldLength {
 			return nil, fmt.Errorf("nanocached: invalid node entry lengths in discovery response")

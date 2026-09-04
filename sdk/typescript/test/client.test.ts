@@ -1083,6 +1083,57 @@ describe("NanocachedClient reconnect-on-use", () => {
     }
   });
 
+  it("a value length with a leading '+' poisons the connection and the next request redials (issue #462)", async () => {
+    // Regression for issue #462: a `V <len>` header whose length carries a
+    // leading `+` used to parse fine (`Number("+5")` === 5) instead of
+    // being rejected as the malformed grammar it is — same poison-and-
+    // redial contract as any other malformed value length.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "v");
+        node.answerPlusSignValueLengthOnce();
+        await assert.rejects(client.get("k"), /invalid value length/);
+
+        // The poisoned connection is replaced lazily; no stray bytes leak
+        // into this response.
+        assert.equal(await client.get("k"), "v");
+        assert.equal(node.connectionCount(), 2);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("an incr counter body with a leading '+' poisons the connection and the next request redials (issue #462)", async () => {
+    // Regression for issue #462: INCR's counter body grammar never allows
+    // a leading `+` (unlike a length or a tag) — a body like "+5" used to
+    // parse fine via bare `Number("+5")` instead of poisoning the
+    // connection the way every other malformed response piece already
+    // does.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        node.answerMalformedIncrValueOnce();
+        await assert.rejects(client.incr("k", 1), /invalid incr value/);
+
+        // The poisoned connection is replaced lazily; the next request
+        // transparently redials.
+        await client.set("k", "v");
+        assert.equal(await client.get("k"), "v");
+        assert.equal(node.connectionCount(), 2);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("a refresh finishing after close() installs no new connections", async () => {
     // Regression for issue #10: close() must win against an in-flight
     // node-list refresh — a freshly dialed socket installed afterwards

@@ -295,17 +295,12 @@ final class Identify {
         if (fields.length != 2) {
             throw new NanocachedException("nanocached: invalid node-list header in discovery response");
         }
-        int count;
-        int replication;
-        try {
-            count = Integer.parseInt(fields[0]);
-            replication = Integer.parseInt(fields[1]);
-        } catch (NumberFormatException malformed) {
-            // Every SDK exception must extend NanocachedException — never
-            // let a raw parse failure escape (issue tracked alongside the
-            // NanocachedClient port-parse fix).
-            throw new NanocachedException("nanocached: invalid node-list header in discovery response");
-        }
+        // Connection.parseNonNegativeInt enforces the wire's digits-only
+        // integer grammar (issue #462: no leading '+', among other
+        // things) and reports every failure — including overflow — as -1
+        // uniformly, so a single bounds check below catches all of them.
+        int count = Connection.parseNonNegativeInt(fields[0]);
+        int replication = Connection.parseNonNegativeInt(fields[1]);
         if (count < 0 || count > MAX_NODE_COUNT) {
             throw new NanocachedException("nanocached: invalid node count in discovery response");
         }
@@ -333,12 +328,7 @@ final class Identify {
                     "nanocached: unexpected response from discovery server: " + header);
         }
 
-        int count;
-        try {
-            count = Integer.parseInt(header.substring(2));
-        } catch (NumberFormatException malformed) {
-            throw new NanocachedException("nanocached: invalid proxy-list header in discovery response");
-        }
+        int count = Connection.parseNonNegativeInt(header.substring(2));
         if (count < 0 || count > MAX_NODE_COUNT) {
             throw new NanocachedException("nanocached: invalid proxy count in discovery response");
         }
@@ -361,14 +351,8 @@ final class Identify {
             if (lengths.length != 2) {
                 throw new NanocachedException("nanocached: invalid node entry header in discovery response");
             }
-            int nameLength;
-            int addrLength;
-            try {
-                nameLength = Integer.parseInt(lengths[0]);
-                addrLength = Integer.parseInt(lengths[1]);
-            } catch (NumberFormatException malformed) {
-                throw new NanocachedException("nanocached: invalid node entry header in discovery response");
-            }
+            int nameLength = Connection.parseNonNegativeInt(lengths[0]);
+            int addrLength = Connection.parseNonNegativeInt(lengths[1]);
             if (nameLength < 0 || addrLength < 0) {
                 throw new NanocachedException("nanocached: invalid node entry header in discovery response");
             }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -916,7 +917,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		}
 		// Lengths beyond the server's own 1 MiB request cap are protocol
 		// garbage — reject before allocating.
-		length, err := strconv.Atoi(fields[0])
+		length, err := parseStrictInt(fields[0])
 		if err != nil || length < 0 || length > maxValueLength {
 			return 0, nil, 0, 0, nil, protocolError("invalid value length in response")
 		}
@@ -954,7 +955,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		if len(fields) < minFields || len(fields) > maxFields {
 			return 0, nil, 0, 0, nil, protocolError("invalid incr header in response")
 		}
-		length, err := strconv.Atoi(fields[0])
+		length, err := parseStrictInt(fields[0])
 		if err != nil || length < 0 || length > maxValueLength {
 			return 0, nil, 0, 0, nil, protocolError("invalid incr value length in response")
 		}
@@ -962,7 +963,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		hasTTL := len(trailing) == maxFields-1
 		responseTTL := int64(-1)
 		if hasTTL {
-			responseTTL, err = strconv.ParseInt(trailing[0], 10, 64)
+			responseTTL, err = parseStrictInt64(trailing[0])
 			if err != nil || responseTTL < 0 {
 				return 0, nil, 0, 0, nil, protocolError("invalid incr ttl in response")
 			}
@@ -1002,7 +1003,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		if len(fields) < 1 {
 			return 0, nil, 0, 0, nil, protocolError("invalid multi-get header in response")
 		}
-		count, err := strconv.Atoi(fields[0])
+		count, err := parseStrictInt(fields[0])
 		if err != nil || count < 0 {
 			return 0, nil, 0, 0, nil, protocolError("invalid multi-get count in response")
 		}
@@ -1037,7 +1038,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 			case "W":
 				results[i] = multiEntry{wrongNode: true}
 			default:
-				length, err := strconv.Atoi(token)
+				length, err := parseStrictInt(token)
 				if err != nil || length < 0 || length > maxValueLength {
 					return 0, nil, 0, 0, nil, protocolError("invalid multi-get result length in response")
 				}
@@ -1078,7 +1079,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		if len(fields) < 1 {
 			return 0, nil, 0, 0, nil, protocolError("invalid multi-set header in response")
 		}
-		count, err := strconv.Atoi(fields[0])
+		count, err := parseStrictInt(fields[0])
 		if err != nil || count < 0 {
 			return 0, nil, 0, 0, nil, protocolError("invalid multi-set count in response")
 		}
@@ -1147,10 +1148,79 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 	}
 }
 
+// parseStrictUint parses s as an unsigned base-10 integer using the wire
+// protocol's own grammar for every non-negative integer field it sends
+// — length prefixes, item counts, response tags, TTLs: ASCII digits
+// only, matching ^[0-9]+$ exactly (issue #462), rejecting a leading `+`,
+// leading/trailing whitespace, `_` digit-group separators, an exponent,
+// or a leading `-`. Leading zeros ("007") ARE allowed — the server's own
+// grammar (src/command.rs's parse_length) loops byte-by-byte over ASCII
+// digits with no leading-zero restriction, so this has to match.
+// strconv.ParseUint(s, 10, bitSize) already refuses every one of the
+// above on its own: unlike strconv.Atoi/ParseInt, ParseUint never
+// strips or accepts a sign character at all (only ParseInt does that,
+// then delegates to the same digit-only loop) — confirmed empirically
+// (ParseUint("+5", 10, 64) errors), not just assumed from the doc
+// comment. So this is a deliberate, documented pass-through kept as one
+// named function so every call site states its intent instead of each
+// one re-deriving that ParseUint alone is already strict enough.
+func parseStrictUint(s string, bitSize int) (uint64, error) {
+	return strconv.ParseUint(s, 10, bitSize)
+}
+
+// parseStrictInt is parseStrictUint for callers that want a plain int
+// (slice lengths, item counts) instead of picking a wire bit width —
+// same digits-only grammar, with an ErrRange failure for anything that
+// wouldn't fit in an int, mirroring strconv.Atoi's own overflow
+// contract.
+func parseStrictInt(s string) (int, error) {
+	v, err := parseStrictUint(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	if v > math.MaxInt {
+		return 0, strconv.ErrRange
+	}
+	return int(v), nil
+}
+
+// parseStrictInt64 is parseStrictInt for the one field carried as int64
+// rather than int — the `I` response's TTL — same digits-only grammar
+// and overflow contract, bounded to int64 instead.
+func parseStrictInt64(s string) (int64, error) {
+	v, err := parseStrictUint(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	if v > math.MaxInt64 {
+		return 0, strconv.ErrRange
+	}
+	return int64(v), nil
+}
+
+// parseCounterValue parses an `I` response's <value> body — decimal
+// ASCII int64 with an optional single leading `-` (never `+`) — the one
+// field in the whole wire protocol allowed to be negative, since it's
+// the same grammar the request's own <delta> field uses
+// (appendIncrFrame). Matches Python's
+// `_INCR_VALUE_RE = re.compile(rb"-?[0-9]{1,19}")` and .NET's
+// TryParseWireCounter/ParseTag split (issue #462). strconv.ParseInt
+// alone isn't strict enough here either: unlike parseStrictUint's
+// callers, this field does need ParseInt's minus-sign handling, but
+// ParseInt also accepts a leading `+` that this grammar must still
+// reject — so that's checked explicitly before delegating to ParseInt
+// for the actual sign/digit/range parsing.
+func parseCounterValue(s string) (int64, error) {
+	if strings.HasPrefix(s, "+") {
+		return 0, strconv.ErrSyntax
+	}
+	return strconv.ParseInt(s, 10, 64)
+}
+
 // parseTag parses a response's echoed response tags echoed tag — a u32
 // written in decimal — matching protocol.ts's parseTag.
 func parseTag(field string) (uint32, error) {
-	tag, err := strconv.ParseUint(field, 10, 32)
+	tag, err := parseStrictUint(field, 32)
 	if err != nil {
 		return 0, protocolError("invalid response tag")
 	}

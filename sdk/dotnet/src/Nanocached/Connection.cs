@@ -1101,7 +1101,12 @@ internal sealed class Connection
                     throw new ConnectionLostException(
                         "nanocached: response is missing its tag (connection desynced)");
                 }
-                uint tag = ParseTag(await ReadLineAsync().ConfigureAwait(false));
+                // The single mandatory delimiter space was already
+                // consumed and validated above — nothing left for
+                // ReadLineAsync to strip, so any further leading
+                // whitespace here is itself an attack and must reach
+                // ParseTag's NumberStyles.None check intact (issue #462).
+                uint tag = ParseTag(await ReadLineAsync(stripLeadingSpace: false).ConfigureAwait(false));
                 return (marker, null, 0, tag, null);
             }
             case (byte)'B':
@@ -1281,14 +1286,35 @@ internal sealed class Connection
         }
     }
 
-    /// <summary>Reads up to (and consuming) the next '\n'.</summary>
-    private async Task<string> ReadLineAsync()
+    /// <summary>Reads up to (and consuming) the next '\n'. Every header
+    /// line the wire sends carries exactly one mandatory space right
+    /// after the marker byte — the field delimiter, not part of any
+    /// field's value — so <paramref name="stripLeadingSpace"/> (true by
+    /// default) strips exactly that one leading space, never more.
+    /// Issue #462: a blanket <c>.Trim()</c> here used to strip ANY amount
+    /// of leading/trailing whitespace from the whole line, which silently
+    /// absorbed a malicious server's extra padding around the first or
+    /// last field on the line — the one place NumberStyles.None's
+    /// leading/trailing-whitespace rejection could never see it, since
+    /// the whitespace was gone before Split(' ') ever ran. Now only the
+    /// single mandatory delimiter is ever removed; any other stray
+    /// whitespace stays in the string and reaches Split/TryParse, which
+    /// then reject it exactly like any other non-digit byte would.
+    /// Callers that have already consumed and validated that single
+    /// delimiter space themselves (the bare-marker tagged-response path)
+    /// pass <paramref name="stripLeadingSpace"/> as false, since there is
+    /// no delimiter left in the line for this method to strip.</summary>
+    private async Task<string> ReadLineAsync(bool stripLeadingSpace = true)
     {
         var line = new StringBuilder();
         while (true)
         {
             byte b = await ReadByteAsync().ConfigureAwait(false);
-            if (b == (byte)'\n') return line.ToString().Trim();
+            if (b == (byte)'\n')
+            {
+                string result = line.ToString();
+                return stripLeadingSpace && result.StartsWith(' ') ? result[1..] : result;
+            }
             if (line.Length >= MaxHeaderLineLength)
             {
                 throw new ConnectionLostException("nanocached: response header line too long");

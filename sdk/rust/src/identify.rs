@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
 
-use crate::connection::read_line;
+use crate::connection::{parse_strict, read_line};
 use crate::error::{Error, Result};
 
 // A server with no secret accepts any non-empty secret; one that
@@ -566,8 +566,8 @@ async fn read_node_list(stream: &mut BufReader<Stream>) -> Result<Identified> {
     let mut fields = rest.split(' ');
     let (count, replication) = match (fields.next(), fields.next(), fields.next()) {
         (Some(count), Some(replication), None) => (
-            count.parse::<usize>().map_err(bad_header)?,
-            replication.parse::<usize>().map_err(bad_header)?,
+            parse_strict::<usize>(count).ok_or_else(|| bad_header(()))?,
+            parse_strict::<usize>(replication).ok_or_else(|| bad_header(()))?,
         ),
         _ => return Err(bad_header(())),
     };
@@ -588,8 +588,8 @@ async fn read_node_list(stream: &mut BufReader<Stream>) -> Result<Identified> {
         let mut lengths = entry.split(' ');
         let (name_length, addr_length) = match (lengths.next(), lengths.next(), lengths.next()) {
             (Some(name), Some(addr), None) => (
-                name.parse::<usize>().map_err(bad_header)?,
-                addr.parse::<usize>().map_err(bad_header)?,
+                parse_strict::<usize>(name).ok_or_else(|| bad_header(()))?,
+                parse_strict::<usize>(addr).ok_or_else(|| bad_header(()))?,
             ),
             _ => return Err(bad_header(())),
         };
@@ -639,7 +639,7 @@ async fn read_proxy_list(stream: &mut BufReader<Stream>) -> Result<Identified> {
             "nanocached: unexpected response from discovery server: {header}"
         )));
     };
-    let count: usize = count.parse().map_err(bad_header)?;
+    let count: usize = parse_strict(count).ok_or_else(|| bad_header(()))?;
     if count > MAX_NODE_COUNT {
         return Err(bad_header(()));
     }
@@ -652,8 +652,8 @@ async fn read_proxy_list(stream: &mut BufReader<Stream>) -> Result<Identified> {
         let mut lengths = entry.split(' ');
         let (name_length, addr_length) = match (lengths.next(), lengths.next(), lengths.next()) {
             (Some(name), Some(addr), None) => (
-                name.parse::<usize>().map_err(bad_header)?,
-                addr.parse::<usize>().map_err(bad_header)?,
+                parse_strict::<usize>(name).ok_or_else(|| bad_header(()))?,
+                parse_strict::<usize>(addr).ok_or_else(|| bad_header(()))?,
             ),
             _ => return Err(bad_header(())),
         };
@@ -699,7 +699,7 @@ pub(crate) fn split_host_port(address: &str) -> Result<(String, u16)> {
             "nanocached: invalid node address from discovery server: {address}"
         )));
     };
-    let port: u16 = port.parse().map_err(|_| {
+    let port: u16 = parse_strict(port).ok_or_else(|| {
         Error::Protocol(format!(
             "nanocached: invalid node address from discovery server: {address}"
         ))
