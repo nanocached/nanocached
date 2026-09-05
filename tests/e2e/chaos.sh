@@ -57,7 +57,7 @@ for r in $(seq 1 $ROUNDS); do
       T "leaver $n exited rc=$rc after $(( $(date +%s)-t0 ))s"
       [ "$rc" = 0 ] || { T "FAIL: leaver $n exit code $rc"; fail=1; }
       wait_members ${#live[@]} $D 60 || { T "FAIL: membership after decommission of $n"; fail=1; }
-      docker logs $n > "$L/$n.log" 2>&1; docker rm $n >/dev/null
+      docker logs -t $n > "$L/$n.log" 2>&1; docker rm $n >/dev/null
       ;;
     kill)
       # Kill the newest node (a join just completed, so the oldest ones hold
@@ -88,7 +88,7 @@ for f in "$L"/"$P"-n*.log; do [ -f "$f" ] && { echo "== $(basename "$f")"; grep 
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { T "FAIL: untouched-range verify not clean"; fail=1; }
 echo "$load" | grep -q '"corrupt": 0' || { T "FAIL: load saw corrupt reads"; fail=1; }
 echo "$load" | grep -q '"miss": 0' || { T "FAIL: load saw misses"; fail=1; }
-for c in $(docker ps -aq --filter name=$P-); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); ip=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $c); echo "$n $ip" >> "$L/ipmap.txt"; [ -f "$L/$n.log" ] || docker logs $c > "$L/$n.log" 2>&1; done
+for c in $(docker ps -aq --filter name=$P-); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); ip=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $c); echo "$n $ip" >> "$L/ipmap.txt"; [ -f "$L/$n.log" ] || docker logs -t $c > "$L/$n.log" 2>&1; done
 echo "=== logs in $L"; cat "$L/ipmap.txt"
 cleanup
 if [ $fail = 0 ]; then T "DONE (PASS)"; else T "DONE (FAIL)"; exit 1; fi
