@@ -90,15 +90,18 @@ public sealed class DiscoveryBusyException : NanocachedException
 public class ConnectionLostException : NanocachedException
 {
     /// <summary>
-    /// issue #225 — internal only: true when this specific failure happened
-    /// before, or while, the request frame was being written to the socket
-    /// (Connection's <c>IsClosed</c> pre-write checks, or a
-    /// <c>WriteAsync</c>/<c>FlushAsync</c> failure) — the idle-FIN case,
-    /// where the connection was already dead and the peer never received so
-    /// much as a partial frame. False (the default, used by every other
-    /// throw site — a lost reply after a fully-written frame, a request
-    /// timeout, a stream desync) means the request may already have reached
-    /// the peer and possibly been applied. <see cref="NanocachedClient"/>
+    /// issue #225 / #484 — internal only: true when this SDK can prove no
+    /// complete request frame reached the peer — the connection was
+    /// already closed before the frame was written (Connection's
+    /// <c>IsClosed</c> pre-write checks), or <c>WriteAsync</c> itself failed
+    /// while the connection was still this SDK's own (a failed write leaves
+    /// at most a truncated frame, which the server never executes). False
+    /// (the default, used by every other throw site — a lost reply after a
+    /// fully-written frame, a <c>FlushAsync</c> failure after the write
+    /// completed, a request timeout, a stream desync, or a write that
+    /// failed because a concurrent <c>Close</c> disposed the stream under
+    /// it) means the request may already have reached the peer and possibly
+    /// been applied. <see cref="NanocachedClient"/>
     /// uses this to decide whether replaying a non-idempotent request
     /// (Incr/CAS/RemoveIfMatches) after a redial is safe: true is exactly
     /// as safe as retrying an idempotent Get/Set/Delete; false is not — see

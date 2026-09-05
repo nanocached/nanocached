@@ -787,13 +787,28 @@ final class Connection {
                 } catch (IOException error) {
                     // The stream state after a failed write is unknown —
                     // poison the connection so the client redials lazily.
-                    // notSent stays false (issue #225): out.write may have
-                    // handed some or all of this frame's bytes to the OS
-                    // send buffer before failing, so a non-idempotent
-                    // caller must NOT treat this as "never sent" and
-                    // replay it.
+                    //
+                    // Issue #225 / #484: is THIS attempt "not sent", i.e.
+                    // safe for applyReconnectingNonIdempotent to replay
+                    // after a redial? Yes when the write itself failed
+                    // while the connection was still ours: a failed
+                    // write/flush leaves at most a truncated frame on
+                    // the wire, and the server never executes an
+                    // incomplete request. The one way a write can fail
+                    // with the whole frame already handed to the kernel
+                    // is the request-timeout watchdog closing the socket
+                    // under us (it does so without the monitor, to unwedge
+                    // exactly this write — see watchdogLoop); timedOutError
+                    // is set before that close, so its presence means
+                    // "ambiguous". poison() itself must keep the plain
+                    // (notSent=false) error: it drains every slot still
+                    // pending, and the ones ahead of this frame were
+                    // fully sent.
+                    boolean notSent = timedOutError == null;
                     poison(new NanocachedException.ConnectionFailed(
                             "nanocached: connection failed: " + error.getMessage(), error));
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: connection failed: " + error.getMessage(), error, notSent);
                 }
             }
 

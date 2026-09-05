@@ -305,6 +305,18 @@ raises `ConnectionLostError` (a `ConnectionError` subclass) instead of
 silently retrying — see incr/decr's own caveat above, which applies here
 identically.
 
+**What "never sent" means (issue #484).** A non-idempotent request is
+replayed after a redial only when this SDK can prove no complete frame
+reached the server. Every nanocached SDK applies the same rule — the
+connection was already closed before the frame was written, or the
+write itself failed while the connection was still the SDK's own (a
+failed write leaves at most a truncated frame, which the server never
+executes) — but this runtime buffers writes in user space and flushes
+them in the background, so a failed write does not bound what was
+delivered: here only the closed-before-write case counts, and every
+failure after the frame was handed to the socket is ambiguous and is
+never replayed.
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to

@@ -814,6 +814,10 @@ internal sealed class Connection
         var tcs = new TaskCompletionSource<(byte Marker, byte[]? Value, long TtlSeconds, List<MultiEntry>? Entries)>(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
+        // issue #484: flips once WriteAsync has returned — from then on
+        // every byte of the frame has been handed to the socket, so a
+        // later failure can no longer be reported as "not sent".
+        bool frameWritten = false;
         await _writeGate.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -841,6 +845,7 @@ internal sealed class Connection
                 ArmDeadline();
             }
             await _stream.WriteAsync(frame).ConfigureAwait(false);
+            frameWritten = true;
             await _stream.FlushAsync().ConfigureAwait(false);
         }
         catch (Exception error) when (error is IOException or ObjectDisposedException)
@@ -848,26 +853,36 @@ internal sealed class Connection
             // The stream state after a failed write is unknown — poison
             // the connection so the client redials lazily.
             //
-            // issue #225: WriteAsync/FlushAsync failing outright (rather
-            // than completing) is the idle-FIN signature — the peer had
-            // already closed the connection, so the OS rejects the write
-            // before any of this frame reaches it (the same distinction
-            // Java's poison()/Go's applyReconnecting comment call out).
-            // requestNotSent: true tells NanocachedClient's non-idempotent
-            // retry guard (Incr/CAS/RemoveIfMatches) this specific attempt
-            // is safe to replay after a redial. A genuine partial write
-            // (some bytes reached the peer, then the socket died) can't be
-            // told apart from this from here — .NET's Stream.WriteAsync
-            // itself loops until every byte is either written or an error
-            // is raised, so in practice a mid-frame partial write and a
-            // clean pre-write rejection both surface as this same
-            // exception; we still treat it as not-sent, matching this
-            // SDK's own "if the write path cannot distinguish reliably,
-            // treat WriteAsync completing as possibly applied" rule — this
-            // catch only runs when WriteAsync/FlushAsync did NOT complete.
+            // issue #225 / #484: this attempt is "not sent" — safe for
+            // NanocachedClient's non-idempotent retry guard
+            // (Incr/CAS/RemoveIfMatches) to replay after a redial — only
+            // when this SDK can prove no complete frame reached the peer:
+            //
+            //   * WriteAsync itself failed (frameWritten is still false)
+            //     while the connection was still ours (IsClosed false). A
+            //     write that fails leaves at most a truncated frame on the
+            //     wire, and the server never executes an incomplete
+            //     request — so this covers the idle-FIN rejection and a
+            //     genuine mid-frame failure alike.
+            //
+            // It is NOT "not sent" when:
+            //
+            //   * WriteAsync completed and only FlushAsync failed — every
+            //     byte was handed to the socket, so the peer may have the
+            //     whole frame.
+            //   * IsClosed is already true — CloseWithReason (the read
+            //     loop noticing a FIN, the request-timeout watchdog, an
+            //     explicit Close) does not take _writeGate, so it can
+            //     dispose the stream while this WriteAsync is in flight.
+            //     The resulting IOException/ObjectDisposedException says
+            //     nothing about how much of the frame had already gone
+            //     out, so it must stay ambiguous. (A close that happened
+            //     between the pre-write checks and WriteAsync is also
+            //     classified ambiguous — conservative, never unsafe.)
+            bool requestNotSent = !frameWritten && !IsClosed;
             Close();
             throw new ConnectionLostException(
-                $"nanocached: connection failed: {error.Message}", error, requestNotSent: true);
+                $"nanocached: connection failed: {error.Message}", error, requestNotSent);
         }
         finally
         {

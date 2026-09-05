@@ -422,6 +422,19 @@ reply was lost, the primary may already have applied the operation, and
 these methods throw `ConnectionLostException` instead of guessing —
 read the key back to find out which happened.
 
+**What "never sent" means (issue #484).** A non-idempotent request is
+replayed after a redial only when this SDK can prove no complete frame
+reached the server: the connection was already closed before the frame
+was written, or the write call itself failed while the connection was
+still the SDK's own — a failed write leaves at most a truncated frame on
+the wire, and the server never executes an incomplete request. Anything
+after the frame was handed over in full (no reply, a request timeout, a
+desynced reply, a close by another request's failure or by the timeout
+watchdog while the write was in progress) is ambiguous and is never
+replayed. Every SDK applies this same rule; the Node and asyncio SDKs,
+whose runtimes buffer writes in user space and flush them in the
+background, can only ever prove the first case.
+
 `ConnectAsync` itself tolerates a node that discovery still lists but
 that can't be reached — typically one that just died and hasn't been
 evicted yet (a window of seconds): the node is kept in the ring without a
