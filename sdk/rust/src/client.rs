@@ -8,9 +8,10 @@
 //! replica never fails a write), reads ask the primary and fall over to
 //! the next owner only when the holder is unreachable. Dead connections
 //! are redialed lazily on use (with one transparent retry — a Rust
-//! socket only learns of a peer FIN on I/O, and every operation is
-//! idempotent), and an opt-in keep-alive can hold connections open
-//! across the server's 60s idle timeout.
+//! socket only learns of a peer FIN on I/O; the retry is skipped for the
+//! non-idempotent counter and compare-and-set operations once the request
+//! may have been sent, see issue #225), and an opt-in keep-alive can hold
+//! connections open across the server's 60s idle timeout.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1643,9 +1644,10 @@ impl NanocachedClient {
     /// Read repair: probes the remaining owners of `(namespace, key)` —
     /// every owner but the primary, which the normal read path already
     /// probed and got a clean miss from — in rank order, for a value. The
-    /// first one that has it wins: its value is returned, and — detached,
-    /// not awaited, no tracking — that same value repairs the true primary
-    /// in the background with `READ_REPAIR_TTL`. Every failure along the
+    /// first one that has it wins: its value is returned, and that same
+    /// value repairs the true primary in the background (bounded by, and
+    /// drained through, the fire-and-forget replica permits — see below)
+    /// with `READ_REPAIR_TTL`. Every failure along the
     /// way (connection lost, WrongNode, another miss) is swallowed;
     /// nothing here may turn an already-accepted miss into an error. A
     /// failed repair write is counted in `stats().read_repair_failures`.

@@ -328,8 +328,8 @@ class Connection:
         # successfully or exhausts the budget into RetryableError — lets
         # the owning client maintain a `transient_retries` counter (see
         # ClientStats) without this module knowing anything about client
-        # stats itself. None off a connection nobody wants to count for
-        # (there is none today, but mirrors on_close's own optionality).
+        # stats itself. Optional only to mirror on_close: every current
+        # caller passes a callback.
         self._on_transient_retry = on_transient_retry
         # Serializes "enqueue the pending slot, then write the frame" —
         # not the whole round trip — across concurrent callers, so queue
@@ -1017,7 +1017,7 @@ class Connection:
             # other than LF here means the server tagged a response on an
             # untagged connection (or some other desync), and every later
             # response would be misaligned too. Mirrors the TypeScript
-            # SDK's protocol.ts (tryParseResponse) (issue: audit finding,
+            # SDK's protocol.ts (tryParseResponse) (audit finding,
             # unverified trailing byte on the untagged fast path).
             if trailer != b"\n":
                 raise NanocachedError(

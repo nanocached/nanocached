@@ -272,7 +272,7 @@ function parseEntries(buf: Buffer, offset: number, count: number): { entries: Di
       throw new NanocachedError("nanocached: invalid entry header in discovery response");
     }
 
-    // Tenth-pass follow-up (2026-09-04): `parseStrictInteger` (digits only,
+    // `parseStrictInteger` (digits only,
     // safe-integer range) rather than bare `Number()` + `isInteger`, which
     // accepted `+1`, ` 1`, `1e2` and precision-losing digit strings —
     // the same strictness protocol.ts already applies to every node frame.

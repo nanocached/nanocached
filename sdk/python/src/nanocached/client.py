@@ -541,7 +541,7 @@ class NanocachedClient:
         self._refresh_failures = 0
         self._transient_retries = 0
 
-    # ── 接続 ──────────────────────────────────────────────────────
+    # ── Connecting ──────────────────────────────────────────────────────
 
     @classmethod
     async def connect(
@@ -910,7 +910,7 @@ class NanocachedClient:
             return identified
         return []
 
-    # ── 公開 API ───────────────────────────────────────────────────
+    # ── Public API ───────────────────────────────────────────────────
 
     @property
     def replication(self) -> int:
@@ -2166,7 +2166,7 @@ class NanocachedClient:
         if connections:
             await asyncio.gather(*(c.wait_closed() for c in connections), return_exceptions=True)
 
-    # ── ルーティングと複製 ─────────────────────────────────────────
+    # ── Routing and replication ─────────────────────────────────────────
 
     async def _before_operation(self) -> None:
         if self._closed:
@@ -2554,7 +2554,7 @@ class NanocachedClient:
             raise replica_bug if replica_bug is not None else primary_error
         return result
 
-    # ── 遅延再接続(issue #1)────────────────────────────────────────
+    # ── Lazy redial (issue #1)────────────────────────────────────────
 
     async def _single_connection(self) -> Connection:
         assert self._single is not None and self._single_address is not None
@@ -2676,7 +2676,7 @@ class NanocachedClient:
             raise AlreadyClosedError()
         return self._new_connection(identified.reader, identified.writer, identified.tagged)
 
-    # ── ノードリスト更新 ────────────────────────────────────────────
+    # ── Node-list refresh ────────────────────────────────────────────
 
     async def _maybe_refresh(self, force: bool = False) -> None:
         if self._ring is None:

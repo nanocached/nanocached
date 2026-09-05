@@ -422,14 +422,16 @@ function nextChunkEnd(namespace: Uint8Array, count: number, start: number, entry
   return end;
 }
 
-// Tracks, per connect() target (not per instance — there's no `close()` yet
-// to hook into), how many live sockets are still open for it. Purely a
-// programming-error guard: catches "connect() called again for the same
-// target before the previous one was ever released" without affecting
-// behavior — connecting again still works, this only warns. Cleared via
-// each socket's own native "close" event, so it needs no cooperation from
-// a public close() method; whatever eventually destroys these sockets
-// (including a future close()) already fires that event.
+// Tracks, per connect() target (not per instance), how many live sockets
+// are still open for it. Purely a programming-error guard: catches
+// "connect() called again for the same target before the previous one was
+// ever released" without affecting behavior — connecting again still
+// works, this only warns. Cleared via each socket's own native "close"
+// event, so every path that destroys a socket (close(), a redial replacing
+// a dead connection, a remote FIN) releases it. That event is emitted a
+// tick after `destroy()`, which is why `close()` below awaits it
+// (`Connection.whenClosed`) before resolving — otherwise a
+// close-then-reconnect sequence would trip this guard (issue #478).
 const openTargets = new Map<string, number>();
 
 function trackOpenTarget(key: string, sockets: Array<Socket | TLSSocket>): void {
@@ -1047,9 +1049,11 @@ export class NanocachedClient {
   /** Resolves only after every in-flight background replica write has
    * finished and the connections are torn down (fire-and-forget replica writes as
    * amended by issue #47 item 3 — the drain contract every SDK now
-   * shares). Callers that don't await keep the old fire-and-forget
-   * behavior: `closed` flips synchronously, and teardown still happens
-   * once the drain settles. */
+   * shares). "Torn down" means the sockets' `"close"` events have fired,
+   * so once this resolves a fresh `connect()` to the same address is
+   * clean (issue #478). Callers that don't await keep the old
+   * fire-and-forget behavior: `closed` flips synchronously, and teardown
+   * still happens once the drain settles. */
   async close(): Promise<void> {
     // Still idempotent (not an error, matching how socket.destroy() itself
     // behaves on an already-destroyed socket) — but a second close() is
@@ -1085,18 +1089,26 @@ export class NanocachedClient {
     while (this.hedgedReads.size > 0) {
       await Promise.allSettled([...this.hedgedReads]);
     }
-    this.teardownConnections();
+    await Promise.all(this.teardownConnections().map((connection) => connection.whenClosed()));
   }
 
-  private teardownConnections(): void {
+  /** Destroys every connection this client holds and returns them, so the
+   * caller can wait for their sockets to actually close. */
+  private teardownConnections(): Connection[] {
     // Both "single" and "proxy" (issue #122) targets are one bare
     // `connection` — only "cluster" has a member map to fan out over.
     if (this.target.kind !== "cluster") {
       this.target.connection.close();
-      return;
+      return [this.target.connection];
     }
 
-    for (const member of this.target.members.values()) member.connection?.close();
+    const closed: Connection[] = [];
+    for (const member of this.target.members.values()) {
+      if (member.connection === undefined || member.connection === null) continue;
+      member.connection.close();
+      closed.push(member.connection);
+    }
+    return closed;
   }
 
   /** How many nodes hold each key (client-side replication) — discovery's replication
@@ -1771,7 +1783,7 @@ export class NanocachedClient {
     if (keys.length === 0) {
       throw new RangeError("nanocached: setMany/setManyBytes requires at least one key");
     }
-    // Tenth-pass follow-up (2026-09-04): `isSafeInteger`, matching `set`/
+    // `isSafeInteger`, matching `set`/
     // `cas` and `encodeMultiSet` — `Number.isInteger(2 ** 53)` is true, so
     // the old check let an unsafe TTL through to the encoder, which only
     // rejected it *after* the node-list refresh and connection setup below

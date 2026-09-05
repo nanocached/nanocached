@@ -83,7 +83,7 @@ export function decompressValue(value: Buffer): Buffer {
   // connection's shared, reused read buffer at parse time. `body` is a
   // view onto that already-independent memory, not onto anything the
   // connection can later overwrite, so returning the view directly is
-  // safe (issue: audit finding, redundant copy on the uncompressed path).
+  // safe (audit finding, redundant copy on the uncompressed path).
   if (marker === MARKER_RAW) return body;
 
   if (marker === MARKER_DEFLATE) {

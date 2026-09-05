@@ -79,7 +79,7 @@ await client.set("greeting", "hello", 60);       // TTL seconds; omit = no expir
 const value = await client.get("greeting");      // string | null
 const existed = await client.delete("greeting"); // boolean
 
-client.close();</code></pre>
+await client.close();</code></pre>
 
 <h2 id="python">Python</h2>
 <pre><code>pip install nanocached</code></pre>
@@ -135,7 +135,7 @@ client.set("greeting", "hello", 60).await?;            // TTL seconds; 0 = no ex
 let value: Option&lt;String&gt; = client.get("greeting").await?;
 let existed: bool = client.delete("greeting").await?;
 
-client.close();</code></pre>
+client.close().await;</code></pre>
 
 <h2 id="dotnet">.NET</h2>
 <pre><code>dotnet add package Nanocached</code></pre>

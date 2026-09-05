@@ -344,10 +344,11 @@ client = await NanocachedClient.connect(
 
 Closes the narrow window after a primary restart where a replica still
 holds a key its (fresh) primary doesn't, at the cost of extra reads only
-on the misses that hit that window. The repair write carries a fixed 60-second TTL — the wire protocol's `G` response never returns the original one to preserve, and no TTL at all would immortalize already-expired keys — and,
-unlike fire-and-forget replica writes, is uncapped and not drained on
-`close()`: this only fires on an already-rare clean miss, and losing one
-costs nothing beyond staying in the window for one more read.
+on the misses that hit that window. The repair write carries a fixed 60-second TTL — the wire protocol's `G` response never returns the original one to preserve, and no TTL at all would immortalize already-expired keys — and, like a
+fire-and-forget replica write, is capped (the two share one in-flight
+budget) and drained by `close()`. Past the cap the repair for that miss
+is simply skipped: it only fires on an already-rare clean miss, and
+losing one costs nothing beyond staying in the window for one more read.
 
 ## Hedged reads
 

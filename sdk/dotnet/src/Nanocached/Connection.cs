@@ -1228,7 +1228,7 @@ internal sealed class Connection
         }
     }
 
-    /// <summary>Tenth-pass follow-up (2026-09-04): the node's counter body
+    /// <summary>The node's counter body
     /// is an optional <c>-</c> followed by digits — never a <c>+</c>, never
     /// whitespace — and every other wire integer is digits only, so all of
     /// them are parsed with <see cref="NumberStyles.None"/> and the

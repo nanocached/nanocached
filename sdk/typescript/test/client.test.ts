@@ -321,6 +321,33 @@ describe("NanocachedClient against a single node", () => {
       await node.close();
     }
   });
+
+  it("does not warn when connect() follows an awaited close() to the same address (issue #478)", async () => {
+    // close() must not resolve before the socket's "close" event has
+    // released the open-target bookkeeping; otherwise the documented
+    // `await client.close()` then `connect()` sequence trips the guard.
+    const node = await startMockNode();
+    const warn = mock.method(console, "warn", () => {});
+    try {
+      const first = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      await first.set("k", "v");
+      await first.close();
+      const second = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const messages = warn.mock.calls.map((call) => String(call.arguments[0]));
+        assert.deepEqual(
+          messages.filter((message) => message.includes("was close() forgotten?")),
+          [],
+          `unexpected forgotten-close warning: ${JSON.stringify(messages)}`,
+        );
+      } finally {
+        await second.close();
+      }
+    } finally {
+      warn.mock.restore();
+      await node.close();
+    }
+  });
 });
 
 describe("NanocachedClient value compression (value compression)", () => {
