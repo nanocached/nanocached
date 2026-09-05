@@ -59,8 +59,9 @@ then pick the shape that matches how you run things.</p>
   across two zones, grown by the node service's desired count, with a
   drain through SIGTERM on the way down.</li>
   <li><a href="deployment-eks.html">Cluster on EKS (multi-AZ)</a> — the
-  same cluster as Kubernetes manifests: an eksctl cluster, a
-  Deployment per role, HPA on the node metrics, the same drain.</li>
+  same cluster as Kubernetes manifests: an eksctl cluster from one
+  config file, a Deployment per role, grown by the node Deployment's
+  replica count, the same drain.</li>
 </ul>
 
 </main>
