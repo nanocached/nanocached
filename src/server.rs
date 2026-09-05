@@ -1899,6 +1899,7 @@ fn route_clear(node_context: &NodeContext, scope: &ClearScope) -> ClearRoute {
         addr: active.joining_addr.clone(),
         connection: Arc::clone(&active.forward_connection),
         token: active.joining_token.clone(),
+        revoked: Arc::clone(&active.forward_revoked),
     })
 }
 
@@ -3648,6 +3649,9 @@ fn adopt_membership(
         // released to the sweep at confirmation, so taking it is exactly
         // what the grace expiring would have done.
         if joiner_evicted && let Some(taken) = slot.take() {
+            // Issue #474: forwards already queued for the evicted joiner
+            // must not land on whoever gets its address next.
+            taken.forward_revoked.store(true, Ordering::SeqCst);
             evicted_msg = Some(taken.joining_name);
         }
         pending
@@ -4047,6 +4051,12 @@ struct ActiveMigration {
     /// node, so it must start with no connection rather than possibly
     /// reusing one dialed to whatever node the previous handoff targeted.
     forward_connection: Arc<AsyncMutex<Option<ClientStream>>>,
+    /// Issue #474: flipped to `true` when this slot stops being the
+    /// handoff this node forwards for (evicted joiner, abandoned join,
+    /// superseded by a later `M`), so forwards already resolved against
+    /// it are dropped instead of delivered to whoever now answers at
+    /// `joining_addr` — see `ForwardTarget::revoked`.
+    forward_revoked: Arc<AtomicBool>,
 }
 
 impl ActiveMigration {
@@ -4266,6 +4276,7 @@ impl MigrationGuard {
                 // `wait_for_migration_slot_to_clear`.
                 if same_name {
                     existing.abort_requested.store(true, Ordering::SeqCst);
+                    existing.forward_revoked.store(true, Ordering::SeqCst);
                 }
                 let conflicting_joining_name = existing.joining_name.clone();
                 let conflicting_generation = existing.generation;
@@ -4319,6 +4330,13 @@ impl MigrationGuard {
             }
         }
 
+        // Issue #474: whatever handoff the slot held until now is being
+        // superseded; forwards still queued against it must not be
+        // delivered to whoever answers at its address later.
+        if let Some(existing) = guard.as_ref() {
+            existing.forward_revoked.store(true, Ordering::SeqCst);
+        }
+
         let abort_requested = Arc::new(AtomicBool::new(false));
 
         *guard = Some(ActiveMigration {
@@ -4337,6 +4355,7 @@ impl MigrationGuard {
             pre_completion_ring: None,
             pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
         });
         drop(guard);
 
@@ -6298,6 +6317,7 @@ fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> AbandonO
         match slot.as_ref() {
             Some(active) if active.joining_name == joining_name => {
                 active.abort_requested.store(true, Ordering::SeqCst);
+                active.forward_revoked.store(true, Ordering::SeqCst);
                 if active.completed_at.is_some() {
                     slot.take()
                 } else {
@@ -6585,6 +6605,26 @@ struct ForwardTarget {
     /// `migration_target_for` sources it from `ActiveMigration::
     /// joining_token`, `leave_target_for` from `LeaveState::tokens`.
     token: String,
+    /// Issue #474: set once the handoff this target was resolved from is
+    /// no longer the one this node is forwarding for — its joiner was
+    /// evicted (`adopt_membership`'s early close), the join was abandoned
+    /// (`abandon_migration`), or the slot was superseded by a later `M`
+    /// (`MigrationGuard::new`). A forward is resolved to its target when
+    /// it is *spawned* but runs only once it wins the target's connection
+    /// lock, and behind a dead peer that can be tens of seconds later
+    /// (each earlier forward burns up to `FORWARD_TIMEOUT` per attempt);
+    /// by then the address may belong to a different process — Docker,
+    /// and any orchestrator that recycles IPs, hands a killed node's
+    /// address to the next one started — which would receive a `U` with
+    /// a stale token (rejected, but thousands of times) or a plain `S`
+    /// for a key it doesn't own (accepted). `forward_with_retries` checks
+    /// this before every attempt and drops the forward silently: the
+    /// data is safe either way (the write is applied locally and the
+    /// replacement join re-homes it), only the delivery to a peer that
+    /// stopped being the target is skipped. Shared per `ActiveMigration`
+    /// (`forward_revoked`); `leave_target_for` hands out a fresh `false`
+    /// — a leaver's own targets are not recycled under it.
+    revoked: Arc<AtomicBool>,
 }
 
 /// Bounded by `FORWARD_TIMEOUT` as a single whole — see that constant's
@@ -7132,6 +7172,12 @@ async fn forward_with_retries(
     let attempts = forward_attempts_for(&target.addr, &target.token);
 
     for attempt in 1..=attempts {
+        // Issue #474: re-checked before every attempt, not just once —
+        // the wait for the lock above and each failed attempt's timeout
+        // are exactly the windows in which the target goes stale.
+        if target.revoked.load(Ordering::SeqCst) {
+            return;
+        }
         match write.attempt(&node_context, &target, &mut connection).await {
             Ok(()) => {
                 clear_forward_failure(&target.addr, &target.token);
@@ -7254,6 +7300,7 @@ fn migration_target_for(node_context: &NodeContext, key: &Key) -> Option<Forward
             addr: active.joining_addr.clone(),
             connection: Arc::clone(&active.forward_connection),
             token: active.joining_token.clone(),
+            revoked: Arc::clone(&active.forward_revoked),
         })
 }
 
@@ -7289,6 +7336,7 @@ fn leave_target_for(node_context: &NodeContext, key: &Key) -> Option<ForwardTarg
         addr,
         connection,
         token,
+        revoked: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -7688,6 +7736,7 @@ mod tests {
             addr: joining_addr,
             connection: Arc::new(AsyncMutex::new(None)),
             token: "tok-target".to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
         };
 
         let forward_task = tokio::spawn(async move {
@@ -7778,6 +7827,7 @@ mod tests {
             addr: joining_addr,
             connection: Arc::new(AsyncMutex::new(None)),
             token: "tok-target".to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
         };
 
         set_on_joining_node(&node_context, &target, &key(b"name"), b"Alice", None)
@@ -7853,6 +7903,7 @@ mod tests {
             addr: joining_addr,
             connection: Arc::new(AsyncMutex::new(None)),
             token: "tok-target".to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
         });
 
         let first_forward = tokio::spawn({
@@ -7929,6 +7980,7 @@ mod tests {
             addr: joining_addr,
             connection: Arc::new(AsyncMutex::new(None)),
             token: "tok-target".to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
         };
 
         // If this never retried, the joining task would hang forever
@@ -7998,6 +8050,7 @@ mod tests {
             addr: addr.clone(),
             connection: Arc::clone(&connection),
             token: "tok-target".to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
         };
         let write = || OwnedForwardedWrite::Set {
             key: key(b"name"),
@@ -8026,6 +8079,7 @@ mod tests {
             addr: addr.clone(),
             connection: Arc::clone(&connection),
             token: "tok-target-restarted".to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
         };
         forward_with_retries(node_context.clone(), restarted_target, write()).await;
         assert_eq!(
@@ -8044,6 +8098,100 @@ mod tests {
             accepts.load(Ordering::SeqCst),
             3 * KEY_TRANSFER_ATTEMPTS as usize + 1,
             "after the marker clears, the full budget is back"
+        );
+
+        peer_task.abort();
+    }
+
+    /// Issue #474: a forward resolved against a handoff that has since
+    /// been revoked (evicted joiner, abandoned join, superseded slot)
+    /// must not touch whoever answers at the target address now — even
+    /// when the revocation lands while the forward is still waiting for
+    /// the target's connection lock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_revoked_forward_is_dropped_without_dialing_the_target() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_for_task = Arc::clone(&accepts);
+        let peer_task = tokio::spawn(async move {
+            loop {
+                let Ok((connection, _)) = listener.accept().await else {
+                    return;
+                };
+                accepts_for_task.fetch_add(1, Ordering::SeqCst);
+                drop(connection);
+            }
+        });
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+        let connection = Arc::new(AsyncMutex::new(None));
+        let revoked = Arc::new(AtomicBool::new(false));
+        let target = || ForwardTarget {
+            addr: addr.clone(),
+            connection: Arc::clone(&connection),
+            token: "tok-target".to_string(),
+            revoked: Arc::clone(&revoked),
+        };
+        let write = || OwnedForwardedWrite::Set {
+            key: key(b"name"),
+            value: Bytes::from_static(b"v"),
+            ttl: None,
+        };
+
+        // Revoked up front: never dialed.
+        revoked.store(true, Ordering::SeqCst);
+        forward_with_retries(node_context.clone(), target(), write()).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            0,
+            "a revoked forward must not dial"
+        );
+
+        // Revoked while queued behind the connection lock: still never dialed.
+        revoked.store(false, Ordering::SeqCst);
+        let held = connection.lock().await;
+        let queued = tokio::spawn(forward_with_retries(
+            node_context.clone(),
+            target(),
+            write(),
+        ));
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !queued.is_finished(),
+            "the forward should be waiting for the lock"
+        );
+        revoked.store(true, Ordering::SeqCst);
+        drop(held);
+        timeout(Duration::from_secs(5), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            0,
+            "a forward revoked while waiting for the lock must not dial either"
+        );
+
+        // Control: the same target, not revoked, does reach the peer.
+        revoked.store(false, Ordering::SeqCst);
+        forward_with_retries(node_context, target(), write()).await;
+        assert!(
+            accepts.load(Ordering::SeqCst) >= 1,
+            "an un-revoked forward dials the target"
         );
 
         peer_task.abort();
@@ -8123,6 +8271,7 @@ mod tests {
                 addr: joining_addr.clone(),
                 connection: Arc::clone(&connection),
                 token: "tok-target".to_string(),
+                revoked: Arc::new(AtomicBool::new(false)),
             },
             OwnedForwardedWrite::Set {
                 key: key(b"name"),
@@ -8141,6 +8290,7 @@ mod tests {
                 addr: joining_addr,
                 connection: Arc::clone(&connection),
                 token: "tok-target".to_string(),
+                revoked: Arc::new(AtomicBool::new(false)),
             },
             OwnedForwardedWrite::Set {
                 key: key(b"name"),
@@ -8246,6 +8396,7 @@ mod tests {
                 pre_completion_ring: None,
                 pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
             auth_secret: None,
@@ -8269,6 +8420,7 @@ mod tests {
                         addr: stalled_addr.clone(),
                         connection: Arc::new(AsyncMutex::new(None)),
                         token: "tok-target".to_string(),
+                        revoked: Arc::new(AtomicBool::new(false)),
                     },
                     OwnedForwardedWrite::Set {
                         key: key(name),
@@ -8386,6 +8538,7 @@ mod tests {
                 pre_completion_ring: None,
                 pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
             auth_secret: None,
@@ -9717,6 +9870,7 @@ mod tests {
                 pre_completion_ring: None,
                 pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
             auth_secret: None,
@@ -10392,6 +10546,7 @@ mod tests {
                 pre_completion_ring: None,
                 pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
             auth_secret: None,
@@ -10512,6 +10667,7 @@ mod tests {
                 pre_completion_ring: None,
                 pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
             auth_secret: None,
@@ -10790,6 +10946,7 @@ mod tests {
                         pre_completion_ring: None,
                         pending_clears: PendingClears::default(),
                         forward_connection: Arc::new(AsyncMutex::new(None)),
+                        forward_revoked: Arc::new(AtomicBool::new(false)),
                     });
                 }
                 if real_tx.send(request).await.is_err() {
@@ -11696,6 +11853,7 @@ mod tests {
                     pre_completion_ring: None,
                     pending_clears: PendingClears::default(),
                     forward_connection: Arc::new(AsyncMutex::new(None)),
+                    forward_revoked: Arc::new(AtomicBool::new(false)),
                 });
                 sleep(Duration::from_millis(10)).await;
             }
@@ -12671,6 +12829,7 @@ mod tests {
                 pre_completion_ring: Some(Arc::clone(&pre_completion_ring)),
                 pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
             }))),
             known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
                 ring: Arc::clone(&after_ring),
@@ -12952,6 +13111,7 @@ mod tests {
             pre_completion_ring: None,
             pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
         });
 
         assert!(migration_target_for(&node_context, &key(b"key-0")).is_none());
@@ -12987,6 +13147,7 @@ mod tests {
             pre_completion_ring: None,
             pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![
@@ -13037,6 +13198,7 @@ mod tests {
             pre_completion_ring: None,
             pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![
@@ -13093,6 +13255,7 @@ mod tests {
             pre_completion_ring: None,
             pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![
@@ -13156,6 +13319,7 @@ mod tests {
             pre_completion_ring: None,
             pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![
@@ -13239,6 +13403,7 @@ mod tests {
             pre_completion_ring: Some(Arc::clone(&pre_completion_ring)),
             pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
         })));
 
         // `M` for joiner-0 again at generation 2 (a fresh join after a
@@ -13316,6 +13481,7 @@ mod tests {
             pre_completion_ring: None,
             pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![
@@ -13917,6 +14083,7 @@ mod tests {
             pre_completion_ring: None,
             pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -14835,6 +15002,65 @@ mod tests {
         );
     }
 
+    /// Issue #474: every way a slot stops being the handoff this node
+    /// forwards for must revoke the forwards already resolved against it.
+    #[test]
+    fn abandoning_a_handoff_revokes_its_queued_forwards() {
+        for completed_at in [None, Some(Instant::now())] {
+            let slot = Arc::new(Mutex::new(Some(test_active_migration(completed_at))));
+            let revoked = Arc::clone(&slot.lock().unwrap().as_ref().unwrap().forward_revoked);
+            let node_context = test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::clone(&slot),
+            );
+
+            abandon_migration(&node_context, "joiner-0");
+
+            assert!(
+                revoked.load(Ordering::SeqCst),
+                "abandon must revoke forwards (completed_at={completed_at:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn superseding_a_completed_handoff_revokes_its_queued_forwards() {
+        let mut previous = test_active_migration(Some(Instant::now()));
+        previous.confirmed = true;
+        let revoked = Arc::clone(&previous.forward_revoked);
+        let slot = Arc::new(Mutex::new(Some(previous)));
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let joined = vec![("test-node".to_string(), "127.0.0.1:1".to_string())];
+
+        let outcome = MigrationGuard::new(
+            Arc::clone(&slot),
+            "joiner-1".to_string(),
+            "127.0.0.1:10".to_string(),
+            "tok-joiner-1".to_string(),
+            Arc::new(HashRing::new(vec![
+                "test-node".to_string(),
+                "joiner-1".to_string(),
+            ])),
+            2,
+            None,
+            &joined,
+            &known_ring,
+        );
+
+        assert!(matches!(outcome, MigrationOutcome::New { .. }));
+        assert!(
+            revoked.load(Ordering::SeqCst),
+            "the superseded slot's forwards must be revoked"
+        );
+        let fresh = Arc::clone(&slot.lock().unwrap().as_ref().unwrap().forward_revoked);
+        assert!(
+            !fresh.load(Ordering::SeqCst),
+            "the new slot starts un-revoked"
+        );
+    }
+
     fn test_active_migration(completed_at: Option<Instant>) -> ActiveMigration {
         ActiveMigration {
             joining_name: "joiner-0".to_string(),
@@ -14855,6 +15081,7 @@ mod tests {
             pre_completion_ring: None,
             pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
         }
     }
 
