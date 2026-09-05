@@ -55,9 +55,9 @@ then pick the shape that matches how you run things.</p>
   node; planned removal with <code>systemctl stop</code>. No
   orchestrator, no Auto Scaling group.</li>
   <li><a href="deployment-ecs.html">Cluster on ECS (Fargate,
-  multi-AZ)</a> — discovery and nodes as services behind Cloud Map,
-  target-tracking autoscaling on the node metrics, scale-in that drains
-  through SIGTERM.</li>
+  multi-AZ)</a> — discovery and nodes as services behind Cloud Map
+  across two zones, grown by the node service's desired count, with a
+  drain through SIGTERM on the way down.</li>
   <li><a href="deployment-eks.html">Cluster on EKS (multi-AZ)</a> — the
   same cluster as Kubernetes manifests: an eksctl cluster, a
   Deployment per role, HPA on the node metrics, the same drain.</li>
