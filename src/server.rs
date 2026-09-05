@@ -209,12 +209,16 @@ const READ_CHUNK_SIZE: usize = 1024;
 const KEY_TRANSFER_ATTEMPTS: u32 = 3;
 /// Bound on `wait_for_migration_slot_to_clear`'s poll for a still-
 /// transferring handoff to actually unwind and drop its slot after `X`
-/// sets `abort_requested` — see that function's own doc comment. Sized
-/// with headroom over the worst case `run_migration` can still be blocked
-/// before it next checks `abort_requested`: `KEY_TRANSFER_ATTEMPTS` (3)
-/// reconnect/send attempts for one key, each up to `OUTBOUND_IO_TIMEOUT`
-/// (10s).
-const MIGRATION_ABANDON_DRAIN_WAIT: Duration = Duration::from_secs(45);
+/// sets `abort_requested` — see that function's own doc comment. Kept
+/// *under* discovery's `OUTBOUND_IO_TIMEOUT` (10s, the time it waits
+/// for the `X` ack before giving up on this node and moving on): an ack
+/// that lands after that is one discovery never reads, so waiting longer
+/// buys nothing — the slot-clearing this covers is the common case where
+/// `run_migration` is between keys and sees `abort_requested` within one
+/// key's send; a send stuck on an unresponsive joiner can hold the slot
+/// for up to `KEY_TRANSFER_ATTEMPTS` × `OUTBOUND_IO_TIMEOUT` (30s), and
+/// that case is left to `MigrationGuard::new`'s generation check.
+const MIGRATION_ABANDON_DRAIN_WAIT: Duration = Duration::from_secs(8);
 /// Issue #7: `handle_connection`'s read buffer grows (via `reserve`) to fit
 /// whatever request it's mid-receiving, up to `MAX_REQUEST_SIZE`, but never
 /// shrinks back on its own — a connection that ever sent one large request
@@ -6348,17 +6352,27 @@ fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> AbandonO
 /// still be blocked inside one stuck send — up to `KEY_TRANSFER_ATTEMPTS`
 /// (3) × `OUTBOUND_IO_TIMEOUT` (10s) — before it even re-checks `abort_requested`.
 /// So instead of hoping the retries outlast that window, this wait closes
-/// it at the source: the slot is actually free before discovery is ever
-/// told the cancel is done.
+/// the *common* case at the source: `run_migration` checks
+/// `abort_requested` between keys, so unless it is mid-send to a joiner
+/// that has stopped answering, the slot is free within one key's send
+/// and the ack goes out with it already empty. The stuck-send case is
+/// not closed here and cannot be: discovery reads the `X` ack for only
+/// `OUTBOUND_IO_TIMEOUT` (10s) and then calls `try_begin_next_join`
+/// regardless, so `MIGRATION_ABANDON_DRAIN_WAIT` stays under that and a
+/// slot still held by a 30s stuck send is left to `MigrationGuard::new`'s
+/// generation check, which rejects the new-generation `M` with
+/// `Conflict` rather than mistaking it for a retry.
 ///
 /// Bounded, never indefinite (this codebase's rule for every wait on
-/// another task) — a handoff that ignores `abort_requested` (stuck on an
-/// unresponsive peer past even its own retries) must not hang this `X`
-/// connection forever. Past the bound this logs and acks anyway, leaving
-/// the same race `MigrationGuard::new`'s `Conflict` path already handles
-/// safely for a caller that retries beyond it.
+/// another task), and it also stops at shutdown: this runs inside the
+/// `X` connection's task, which `run`'s shutdown sequence gives
+/// `SHUTDOWN_TIMEOUT` to finish before aborting *every* connection task
+/// together — a wait here that ignored `shutdown_rx` could push the
+/// whole drain past that and take unrelated, otherwise-finishing
+/// connections down with it. Past the bound this logs and acks anyway.
 async fn wait_for_migration_slot_to_clear(node_context: &NodeContext, joining_name: &str) {
     let deadline = Instant::now() + MIGRATION_ABANDON_DRAIN_WAIT;
+    let mut shutdown_rx = node_context.shutdown_rx.clone();
     loop {
         let still_present = node_context
             .active_migration
@@ -6369,6 +6383,9 @@ async fn wait_for_migration_slot_to_clear(node_context: &NodeContext, joining_na
         if !still_present {
             return;
         }
+        if *shutdown_rx.borrow() {
+            return;
+        }
         if Instant::now() >= deadline {
             eprintln!(
                 "WARN abandon of {joining_name}: the handoff was still unwinding after {}s; \
@@ -6377,7 +6394,10 @@ async fn wait_for_migration_slot_to_clear(node_context: &NodeContext, joining_na
             );
             return;
         }
-        sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = sleep(Duration::from_millis(100)) => {}
+            _ = shutdown_rx.changed() => {}
+        }
     }
 }
 
@@ -14773,6 +14793,46 @@ mod tests {
         fake_discovery.abort();
 
         assert_join_then_heartbeats(&received.lock().unwrap(), 8356);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandon_wait_for_a_still_transferring_slot_stops_at_shutdown() {
+        let slot = Arc::new(Mutex::new(Some(test_active_migration(None))));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut node_context = test_node_context(
+            "test-node",
+            "tk-test-node",
+            Arc::new(Mutex::new(None)),
+            Arc::clone(&slot),
+        );
+        node_context.shutdown_rx = shutdown_rx;
+
+        let waiter = tokio::spawn(async move {
+            let started = Instant::now();
+            wait_for_migration_slot_to_clear(&node_context, "joiner-0").await;
+            started.elapsed()
+        });
+
+        sleep(Duration::from_millis(250)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the slot is still held, so the wait must still be polling"
+        );
+        shutdown_tx.send_replace(true);
+
+        let waited = timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the wait must return promptly once shutdown is signalled")
+            .unwrap();
+        assert!(
+            waited < MIGRATION_ABANDON_DRAIN_WAIT,
+            "shutdown must cut the wait short of its {}s bound (took {waited:?})",
+            MIGRATION_ABANDON_DRAIN_WAIT.as_secs()
+        );
+        assert!(
+            slot.lock().unwrap().is_some(),
+            "stopping at shutdown must not clear the slot itself"
+        );
     }
 
     fn test_active_migration(completed_at: Option<Instant>) -> ActiveMigration {
