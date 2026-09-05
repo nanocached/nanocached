@@ -244,11 +244,11 @@ Requires=docker.service
 
 [Service]
 ExecStartPre=-/usr/bin/docker rm -f nanocached-node
-ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:6881b0f1ba9122e59f7377694162eebacaf7257ba29dabd590858f23092378af
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:372b23265139d54cf44da4abf621a191f49cb58b2df61c8bcd314b4ec327a678
 ExecStart=/usr/bin/docker run --rm --name nanocached-node \
   --network host \
   --env-file /etc/nanocached/env \
-  ghcr.io/nanocached/nanocached-node@sha256:6881b0f1ba9122e59f7377694162eebacaf7257ba29dabd590858f23092378af \
+  ghcr.io/nanocached/nanocached-node@sha256:372b23265139d54cf44da4abf621a191f49cb58b2df61c8bcd314b4ec327a678 \
   --host 0.0.0.0 --port 8356 --metrics-port 9356 \
   --max-memory 1073741824
 ExecStop=/usr/bin/docker stop -t 30 nanocached-node
@@ -274,12 +274,11 @@ systemctl enable --now nanocached-node</code></pre>
   planner</a> turns a hit-rate target into a number.</li>
   <li><b>The image</b> — pinned by digest so an instance replacement
   can't silently pick up a different build. The digest above is the
-  <code>latest</code> build this guide was verified with; the
-  <code>0.3.0</code> release tag predates <code>--metrics-port</code>
-  and <code>--drain-timeout</code> and will refuse this command line.
-  <code>docker buildx imagetools inspect
-  ghcr.io/nanocached/nanocached-node:latest</code> prints the current
-  digest when you want to move.</li>
+  <code>0.4.0</code> release (the first tag with <code>--metrics-port</code>
+  and <code>--drain-timeout</code>; <code>0.3.0</code> refuses this
+  command line). <code>docker buildx imagetools inspect
+  ghcr.io/nanocached/nanocached-node:0.4.0</code> prints it, and the
+  same command against a newer tag prints the digest to move to.</li>
 </ul>
 <p>Launch it, plus a throwaway client in the app group to verify from.
 The client's user-data installs the <a href="sdks.html">Python
@@ -289,7 +288,7 @@ it installs 3.11 alongside:</p>
 #!/bin/bash
 set -euo pipefail
 dnf install -y python3.11 python3.11-pip
-python3.11 -m pip install nanocached==0.3.0
+python3.11 -m pip install nanocached==0.4.0
 EOF
 
 AMI_ID=$(aws ssm get-parameter \
@@ -530,7 +529,7 @@ the record the moment the task stops.</p>
 <p><code>td-discovery.json</code>:</p>
 <pre><code>[{
   "name": "nanocached-discovery",
-  "image": "ghcr.io/nanocached/nanocached-discovery@sha256:879595cd9513073c38ddf2ab970a839f7359e3094b6148854dd72d19b0123231",
+  "image": "ghcr.io/nanocached/nanocached-discovery@sha256:356b684962709bd8eeb60112446b6e5e88e9d23951c8fe4c9bfc7c5750906f1c",
   "essential": true,
   "command": ["--host", "0.0.0.0", "--port", "8357", "--replication-factor", "2",
               "--metrics-port", "9357"],
@@ -545,7 +544,7 @@ the record the moment the task stops.</p>
 <p><code>td-node.json</code>:</p>
 <pre><code>[{
   "name": "nanocached-node",
-  "image": "ghcr.io/nanocached/nanocached-node@sha256:6881b0f1ba9122e59f7377694162eebacaf7257ba29dabd590858f23092378af",
+  "image": "ghcr.io/nanocached/nanocached-node@sha256:372b23265139d54cf44da4abf621a191f49cb58b2df61c8bcd314b4ec327a678",
   "essential": true,
   "command": ["--host", "0.0.0.0", "--port", "8356", "--discovery", "disc.nanocached.local:8357",
               "--drain-timeout", "20", "--metrics-port", "9356", "--max-memory", "536870912"],
@@ -864,7 +863,7 @@ spec:
     spec:
       containers:
         - name: discovery
-          image: ghcr.io/nanocached/nanocached-discovery@sha256:879595cd9513073c38ddf2ab970a839f7359e3094b6148854dd72d19b0123231
+          image: ghcr.io/nanocached/nanocached-discovery@sha256:356b684962709bd8eeb60112446b6e5e88e9d23951c8fe4c9bfc7c5750906f1c
           args: ["--host", "0.0.0.0", "--port", "8357", "--replication-factor", "2",
                  "--metrics-port", "9357"]
           envFrom:
@@ -915,7 +914,7 @@ spec:
             matchLabels: {app: nanocached-node}
       containers:
         - name: node
-          image: ghcr.io/nanocached/nanocached-node@sha256:6881b0f1ba9122e59f7377694162eebacaf7257ba29dabd590858f23092378af
+          image: ghcr.io/nanocached/nanocached-node@sha256:372b23265139d54cf44da4abf621a191f49cb58b2df61c8bcd314b4ec327a678
           args: ["--host", "0.0.0.0", "--port", "8356", "--discovery", "disc:8357",
                  "--drain-timeout", "20", "--metrics-port", "9356", "--max-memory", "536870912"]
           envFrom:
@@ -1008,7 +1007,7 @@ kubectl -n nanocached get hpa node
 <h3>Verifying</h3>
 <p>A client pod with the Python SDK stands in for the application:</p>
 <pre><code>kubectl -n nanocached run client --image=python:3.11-slim --restart=Never -- \
-  sh -c "pip install -q nanocached==0.3.0 && sleep 7200"
+  sh -c "pip install -q nanocached==0.4.0 && sleep 7200"
 kubectl -n nanocached cp smoke.py client:/tmp/smoke.py    # the EC2 smoke test with DISC = [("disc", 8357)]
 kubectl -n nanocached exec client -- python /tmp/smoke.py
 # 2 / hello / True / None / AuthenticationError</code></pre>
