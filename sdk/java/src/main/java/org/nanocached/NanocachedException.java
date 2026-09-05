@@ -70,18 +70,21 @@ public class NanocachedException extends RuntimeException {
      */
     public static class ConnectionFailed extends NanocachedException {
         /**
-         * Issue #225: {@code true} only when this connection is known to
-         * have never sent the failed request's bytes at all — {@link
-         * Connection#request}'s pre-write {@code isClosed()} checks are
-         * the only place this is set, and it means the connection was
-         * already marked closed before this call ever attempted to write,
-         * almost always because the reader thread had already noticed the
-         * peer's FIN (e.g. its idle timeout) moments earlier. Only then is
-         * redialing and resending a <em>non-idempotent</em> request
+         * Issue #225 / #484: {@code true} only when this connection can
+         * prove no complete frame of the failed request reached the
+         * peer — {@link Connection#request}'s pre-write {@code isClosed()}
+         * checks (the connection was already marked closed before this
+         * call ever attempted to write, almost always because the reader
+         * thread had noticed the peer's FIN moments earlier), or the
+         * write/flush itself failing while the connection was still this
+         * SDK's own (a failed write leaves at most a truncated frame,
+         * which the server never executes). Only then is redialing and
+         * resending a <em>non-idempotent</em> request
          * (INCR/CAS/delete-if-matches) safe — see {@link
          * NanocachedClient}'s {@code applyReconnectingNonIdempotent}.
-         * Every other {@code ConnectionFailed} (the write itself failing
-         * partway, a request timeout, or the reply simply never arriving
+         * Every other {@code ConnectionFailed} (a request timeout —
+         * including a write that failed because the timeout watchdog
+         * closed the socket under it — or the reply simply never arriving
          * after a successful write) leaves the request's fate genuinely
          * unknown, so it must not be replayed. Irrelevant to get/set/
          * delete/clear, which stay safe to retry unconditionally because

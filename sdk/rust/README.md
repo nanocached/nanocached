@@ -146,6 +146,19 @@ retried, since nothing could have been applied yet. On
 `Err(Error::ConnectionLost)`, whether the counter actually changed is
 unknown — check with a subsequent `get` if that matters.
 
+**What "never sent" means (issue #484).** A non-idempotent request is
+replayed after a redial only when this SDK can prove no complete frame
+reached the server: the connection was already closed before the frame
+was written, or the write call itself failed while the connection was
+still the SDK's own — a failed write leaves at most a truncated frame on
+the wire, and the server never executes an incomplete request. Anything
+after the frame was handed over in full (no reply, a request timeout, a
+desynced reply, a close by another request's failure or by the timeout
+watchdog while the write was in progress) is ambiguous and is never
+replayed. Every SDK applies this same rule; the Node and asyncio SDKs,
+whose runtimes buffer writes in user space and flush them in the
+background, can only ever prove the first case.
+
 ## Batched get and set
 
 `get_many`/`get_many_bytes` and `set_many`/`set_many_bytes` (the `m`/`o`
@@ -253,7 +266,9 @@ idempotent — replaying a request that already succeeded could report a
 now-stale condition as a mismatch — so, exactly like `incr`/`decr` above,
 this SDK never silently retries a `put_if_absent`/`replace_if_present`/
 `replace`/`delete_if_matches` request whose bytes had already been fully
-written to the socket when the connection was lost. That surfaces as a
+written to the socket when the connection was lost (the rule is the
+same in every SDK — see "What \"never sent\" means" under `incr`/`decr`
+above). That surfaces as a
 plain `Err(Error::ConnectionLost)` instead of a redial-and-retry, and
 whether the write actually happened is unknown — check with a subsequent
 `get`/`get_with_token` if that matters. Only a connection already dead
