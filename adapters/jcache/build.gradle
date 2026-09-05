@@ -47,7 +47,7 @@ repositories {
 dependencies {
     // The SDK the adapter is built on. `api`: NanocachedClient appears in
     // the adapter's public construction API.
-    api 'org.nanocached:nanocached:0.3.0'
+    api 'org.nanocached:nanocached:0.4.0'
     // The JCache SPI this module implements. `api`: javax.cache types
     // (Cache, CacheManager, Configuration, ...) appear throughout this
     // module's own public API.
