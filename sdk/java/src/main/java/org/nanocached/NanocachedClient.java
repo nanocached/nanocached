@@ -1089,19 +1089,45 @@ public final class NanocachedClient implements AutoCloseable {
         replication = cluster.replication();
         backgroundReplicaWritePermitCount = maxInFlightBackgroundReplicaWrites;
         backgroundReplicaWritePermits = new java.util.concurrent.Semaphore(backgroundReplicaWritePermitCount);
-        // Bounded (not newCachedThreadPool, which grows one thread per
-        // submitted task with no cap) — see REPLICA_WRITER_POOL_HEADROOM.
-        // The queue backing a fixed-size pool is unbounded, so a burst
-        // beyond the fixed thread count simply queues rather than being
-        // rejected or blocking the submitter; only the thread count itself
-        // is bounded (audit finding, unbounded replica-writer
-        // threads).
-        replicaWriters = Executors.newFixedThreadPool(
-                backgroundReplicaWritePermitCount + REPLICA_WRITER_POOL_HEADROOM, runnable -> {
+        replicaWriters = newReplicaWriterPool(backgroundReplicaWritePermitCount + REPLICA_WRITER_POOL_HEADROOM);
+    }
+
+    /**
+     * The pool every background leg runs on — bounded in both dimensions
+     * (issue #486): {@code threads} fixed threads (not newCachedThreadPool,
+     * which grows one thread per submitted task with no cap — see
+     * REPLICA_WRITER_POOL_HEADROOM) over a queue of the same depth. Only
+     * the permit-gated legs (fire-and-forget replica writes, read repair)
+     * and the hedge legs ({@code maxInFlightHedgeLoserLegs}) are bounded
+     * before they get here; synchronous-fallback legs and the batched
+     * get/set owner legs are limited only by how many calls the
+     * application has in flight, so with an unbounded queue a burst of
+     * them could pile up without limit. When the queue is full the
+     * submitter runs the task itself — the same synchronous fallback
+     * every call site already has for the permit-exhausted case — which
+     * also applies back-pressure to the caller producing the burst. A
+     * pool that has been shut down still rejects with
+     * RejectedExecutionException, so each call site's existing
+     * "close() raced us, run inline" handling keeps working (the default
+     * CallerRunsPolicy would silently discard the task in that case and
+     * leave its CompletableFuture never completing).
+     */
+    static ExecutorService newReplicaWriterPool(int threads) {
+        java.util.concurrent.ThreadPoolExecutor pool = new java.util.concurrent.ThreadPoolExecutor(
+                threads, threads, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(threads),
+                runnable -> {
                     Thread thread = new Thread(runnable, "nanocached-replica-writer");
                     thread.setDaemon(true);
                     return thread;
+                },
+                (runnable, executor) -> {
+                    if (executor.isShutdown()) {
+                        throw new RejectedExecutionException("replica writer pool is shut down");
+                    }
+                    runnable.run();
                 });
+        return pool;
     }
 
     // ── 公開 API ──────────────────────────────────────────────────
@@ -4319,8 +4345,17 @@ public final class NanocachedClient implements AutoCloseable {
         // own full connect attempt instead of ever hitting the
         // fast-rejection branch in dialWithCooldown.
         if (!reconnectCooldownDisabled) {
-            reconnectCooldowns.put(
-                    address, new CooldownEntry(System.nanoTime() + reconnectCooldownNanos, error));
+            long now = System.nanoTime();
+            // Issue #486: drop every entry whose window has already passed
+            // while we're here — an expired entry is inert (dialWithCooldown
+            // checks the deadline on every read) and would otherwise only
+            // go away on a successful redial of that exact address or a
+            // node-list refresh, neither of which proxy mode ever does. This
+            // keeps the map bounded by the addresses that failed within the
+            // last reconnectCooldown, whichever code path dials.
+            reconnectCooldowns.entrySet().removeIf(
+                    entry -> !entry.getKey().equals(address) && now >= entry.getValue().untilNanos);
+            reconnectCooldowns.put(address, new CooldownEntry(now + reconnectCooldownNanos, error));
         }
     }
 
