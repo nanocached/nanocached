@@ -47,7 +47,7 @@ repositories {
 dependencies {
     // The SDK the adapter is built on. `api`: NanocachedClient appears in
     // the adapter's public construction API.
-    api 'org.nanocached:nanocached:0.3.0'
+    api 'org.nanocached:nanocached:0.4.0'
     // Spring's cache SPI. `api` for the same reason: the whole point of
     // this module is implementing org.springframework.cache types.
     api 'org.springframework:spring-context:6.2.8'
