@@ -140,7 +140,8 @@ to spare.</p>
 instance, standalone (no discovery server, no replication — a cache, so
 losing the instance loses its contents and nothing else). This section
 builds everything around it from an empty account with the AWS CLI:
-a VPC and public subnet, two security groups, an SSM-only instance
+a VPC with two public subnets (one for the node, one for the
+application tier), two security groups, an SSM-only instance
 role, and an Amazon Linux 2023 instance that installs Docker and runs
 the node under systemd from user-data. Every command was run against a
 real account in this order and then torn down with the commands at the
@@ -150,8 +151,14 @@ pull its image and reach Systems Manager — nothing inbound ever uses
 it. Its security group admits the data port only from the
 <em>application's</em> security group, the operations port only from
 inside the VPC, and no SSH at all; you get a shell through SSM Session
-Manager. Clients run in the same VPC and carry the
-<code>nanocached-app</code> security group.</p>
+Manager. The application servers that use the cache — an API or
+backend tier, whatever holds the SDK — run in their own subnet of the
+same VPC and carry the <code>nanocached-app</code> security group; the
+node's rule names that group, not a subnet or an address range, so
+where the application tier lives is a routing decision and not a
+firewall one. No NAT gateway: both subnets
+are public, and outbound (image pull, package installs, Systems
+Manager) goes straight out through the internet gateway.</p>
 
 <pre><code>export AWS_REGION=us-east-1
 NAME=nanocached
@@ -163,10 +170,16 @@ TAG="{Key=Project,Value=$NAME}"     # every resource carries it — see teardown
 aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
 aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
 
-SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.0.0/24 \
+NODE_SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.0.0/24 \
   --availability-zone ${AWS_REGION}a \
-  --tag-specifications "ResourceType=subnet,Tags=[$TAG]" --query Subnet.SubnetId --output text)
-aws ec2 modify-subnet-attribute --subnet-id $SUBNET_ID --map-public-ip-on-launch
+  --tag-specifications "ResourceType=subnet,Tags=[$TAG,{Key=Name,Value=$NAME-node}]" \
+  --query Subnet.SubnetId --output text)
+APP_SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 \
+  --availability-zone ${AWS_REGION}a \
+  --tag-specifications "ResourceType=subnet,Tags=[$TAG,{Key=Name,Value=$NAME-app}]" \
+  --query Subnet.SubnetId --output text)
+aws ec2 modify-subnet-attribute --subnet-id $NODE_SUBNET_ID --map-public-ip-on-launch
+aws ec2 modify-subnet-attribute --subnet-id $APP_SUBNET_ID --map-public-ip-on-launch
 
 IGW_ID=$(aws ec2 create-internet-gateway \
   --tag-specifications "ResourceType=internet-gateway,Tags=[$TAG]" \
@@ -176,23 +189,26 @@ aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
 RTB_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID \
   --tag-specifications "ResourceType=route-table,Tags=[$TAG]" --query RouteTable.RouteTableId --output text)
 aws ec2 create-route --route-table-id $RTB_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
-aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $SUBNET_ID</code></pre>
+aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $NODE_SUBNET_ID
+aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $APP_SUBNET_ID</code></pre>
 <p>Name the availability zone explicitly. Left to AWS, the subnet can
 land in a zone that doesn't offer the instance type you're about to
 launch (<code>us-east-1e</code> has no <code>t3</code>, and
 <code>run-instances</code> fails with <code>Unsupported</code> only
 after the network is built).</p>
-<p>Already have a VPC? Set <code>VPC_ID</code> and <code>SUBNET_ID</code>
-to an existing public subnet and skip this block; substitute your VPC's
-CIDR for <code>10.0.0.0/16</code> in the operations-port rule below.</p>
+<p>Already have a VPC? Set <code>VPC_ID</code>,
+<code>NODE_SUBNET_ID</code> and <code>APP_SUBNET_ID</code> to existing
+public subnets (the same one twice is fine for a trial) and skip this
+block; substitute your VPC's CIDR for <code>10.0.0.0/16</code> in the
+operations-port rule below.</p>
 
 <h3>Security groups</h3>
-<p>Two groups: <code>nanocached-app</code> is a label the clients wear
-(no rules of its own); <code>nanocached-node</code> refers to it, so
-adding a client is a matter of launching it in the app group, never of
-editing an IP allow-list.</p>
+<p>Two groups: <code>nanocached-app</code> is a label the application
+servers wear (no rules of its own); <code>nanocached-node</code> refers
+to it, so adding an application server is a matter of launching it in
+the app group, never of editing an IP allow-list.</p>
 <pre><code>APP_SG=$(aws ec2 create-security-group --group-name $NAME-app \
-  --description "nanocached clients" --vpc-id $VPC_ID \
+  --description "nanocached application tier" --vpc-id $VPC_ID \
   --tag-specifications "ResourceType=security-group,Tags=[$TAG]" --query GroupId --output text)
 NODE_SG=$(aws ec2 create-security-group --group-name $NAME-node \
   --description "nanocached node" --vpc-id $VPC_ID \
@@ -266,7 +282,8 @@ systemctl enable --now nanocached-node</code></pre>
   <li><b><code>NANOCACHED_AUTH_SECRET</code></b> — pick a real one. It
   is an environment variable rather than a flag so it never shows up in
   <code>ps</code>; the file is <code>0600</code> for the same reason.
-  Clients pass the same value (see <a href="getting-started.html#auth">authentication</a>).</li>
+  The application's SDK configuration carries the same value (see
+  <a href="getting-started.html#auth">authentication</a>).</li>
   <li><b><code>--max-memory</code></b> — the cache's budget in bytes.
   1&nbsp;GiB is right for a 2&nbsp;GiB <code>t3.small</code>: leave
   the kernel, Docker and the per-connection buffers the rest. Scale it
@@ -280,39 +297,24 @@ systemctl enable --now nanocached-node</code></pre>
   ghcr.io/nanocached/nanocached-node:0.4.0</code> prints it, and the
   same command against a newer tag prints the digest to move to.</li>
 </ul>
-<p>Launch it, plus a throwaway client in the app group to verify from.
-The client's user-data installs the <a href="sdks.html">Python
-SDK</a> — Amazon Linux 2023's default <code>python3</code> is 3.9, so
-it installs 3.11 alongside:</p>
-<pre><code>cat &gt; client-user-data.sh &lt;&lt;'EOF'
-#!/bin/bash
-set -euo pipefail
-dnf install -y python3.11 python3.11-pip
-python3.11 -m pip install nanocached==0.4.0
-EOF
-
-AMI_ID=$(aws ssm get-parameter \
+<p>Launch it:</p>
+<pre><code>AMI_ID=$(aws ssm get-parameter \
   --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
   --query Parameter.Value --output text)
 
 NODE_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.small \
-  --subnet-id $SUBNET_ID --security-group-ids $NODE_SG \
+  --subnet-id $NODE_SUBNET_ID --security-group-ids $NODE_SG \
   --iam-instance-profile Name=$NAME-ec2 --user-data file://node-user-data.sh \
   --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-node}]" \
   --query 'Instances[0].InstanceId' --output text)
 
-CLIENT_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.micro \
-  --subnet-id $SUBNET_ID --security-group-ids $APP_SG \
-  --iam-instance-profile Name=$NAME-ec2 --user-data file://client-user-data.sh \
-  --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-client}]" \
-  --query 'Instances[0].InstanceId' --output text)
-
-aws ec2 wait instance-running --instance-ids $NODE_ID $CLIENT_ID
+aws ec2 wait instance-running --instance-ids $NODE_ID
 NODE_IP=$(aws ec2 describe-instances --instance-ids $NODE_ID \
   --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)</code></pre>
 <p>From launch to a ready node took about 70&nbsp;s (Docker install
-plus the image pull); Systems Manager needs another minute or so to
-register the instances before Run Command can reach them.</p>
+plus the image pull), and the instance was registered with Systems
+Manager by then, so Run Command could reach it as soon as it was
+useful.</p>
 
 <h3>Verifying</h3>
 <p>On the node itself (<code>aws ssm start-session --target $NODE_ID</code>
@@ -322,27 +324,15 @@ for a shell, or <code>aws ssm send-command</code> as below):</p>
     "curl -s -o /dev/null -w healthz=%{http_code}\\\\n http://127.0.0.1:9356/healthz",
     "curl -s -o /dev/null -w readyz=%{http_code}\\\\n http://127.0.0.1:9356/readyz"]'
 # active / healthz=200 / readyz=200</code></pre>
-<p>From the client, the smoke test is the SDK doing the three
-operations, then trying the wrong secret. Save it as
-<code>smoke.py</code> (substitute the node's private IP) and run it
-with <code>python3.11 smoke.py</code> over Session Manager:</p>
-<pre><code>import asyncio
-from nanocached import NanocachedClient, AuthenticationError
-
-NODE = [("10.0.0.212", 8356)]
-
-async def main():
-    async with await NanocachedClient.connect(NODE, auth_secret="change-me") as c:
-        await c.set("greeting", "hello", ttl_seconds=60)
-        print("get      ->", await c.get("greeting"))      # hello
-        print("delete   ->", await c.delete("greeting"))   # True
-        print("get again->", await c.get("greeting"))      # None
-    try:
-        await NanocachedClient.connect(NODE, auth_secret="wrong")
-    except AuthenticationError as e:
-        print("wrong secret ->", type(e).__name__)      # AuthenticationError
-
-asyncio.run(main())</code></pre>
+<p>From the application tier, the cache is reachable as soon as an
+instance carries the app group: the SDK's configuration is the node's
+private IP (<code>$NODE_IP</code>), port 8356 and the secret, and
+nothing else — see <a href="sdks.html">the SDKs</a> for each
+language and the framework adapters. This node was exercised that way
+from an instance in the app subnet with the Python, TypeScript, Go,
+Java and Rust SDKs: set / get / delete succeed with the secret, and a
+wrong secret is rejected with each SDK's authentication error.</p>
+<p>The operations endpoint answers from anywhere inside the VPC:</p>
 <pre><code>curl -s http://$NODE_IP:9356/metrics | grep -v '^#' | head -3
 # nanocached_node_memory_used_bytes 0
 # nanocached_node_memory_max_bytes 1073741824
@@ -354,6 +344,10 @@ your laptop, say — both ports refuse:</p>
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 nc -z -w 5 $NODE_PUBLIC_IP 8356 || echo "8356 blocked (expected)"
 nc -z -w 5 $NODE_PUBLIC_IP 9356 || echo "9356 blocked (expected)"</code></pre>
+<p>(On macOS, <code>nc</code>'s <code>-w</code> is an idle timeout, not
+a connect timeout, so a filtered port keeps it waiting for the kernel's
+75&nbsp;s; use <code>-G 5</code> there instead and each line comes back
+in five seconds.)</p>
 <p>Finally, <code>systemctl restart nanocached-node</code> on the node:
 <code>/readyz</code> answered 200 again within a second (the image is
 already local). Logs are <code>journalctl -u nanocached-node</code> —
@@ -365,11 +359,12 @@ href="#eks">EKS</a> shapes below once an empty cache after a restart is
 no longer acceptable.</p>
 
 <h3>Teardown</h3>
-<p>The reverse order — instances first (a security group can't be
+<p>The reverse order — the instance first (a security group can't be
 deleted while an ENI references it, and the VPC can't go until
-everything inside it has):</p>
-<pre><code>aws ec2 terminate-instances --instance-ids $NODE_ID $CLIENT_ID
-aws ec2 wait instance-terminated --instance-ids $NODE_ID $CLIENT_ID
+everything inside it has; anything you launched in the app group goes
+first too):</p>
+<pre><code>aws ec2 terminate-instances --instance-ids $NODE_ID
+aws ec2 wait instance-terminated --instance-ids $NODE_ID
 
 aws iam remove-role-from-instance-profile --instance-profile-name $NAME-ec2 --role-name $NAME-ec2
 aws iam delete-instance-profile --instance-profile-name $NAME-ec2
@@ -380,13 +375,15 @@ aws iam delete-role --role-name $NAME-ec2
 aws ec2 delete-security-group --group-id $NODE_SG   # first: it references $APP_SG
 aws ec2 delete-security-group --group-id $APP_SG
 
-ASSOC=$(aws ec2 describe-route-tables --route-table-ids $RTB_ID \
-  --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text)
-aws ec2 disassociate-route-table --association-id $ASSOC
+for ASSOC in $(aws ec2 describe-route-tables --route-table-ids $RTB_ID \
+  --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text); do
+  aws ec2 disassociate-route-table --association-id $ASSOC
+done
 aws ec2 delete-route-table --route-table-id $RTB_ID
 aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
 aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID
-aws ec2 delete-subnet --subnet-id $SUBNET_ID
+aws ec2 delete-subnet --subnet-id $NODE_SUBNET_ID
+aws ec2 delete-subnet --subnet-id $APP_SUBNET_ID
 aws ec2 delete-vpc --vpc-id $VPC_ID</code></pre>
 <p>Confirm nothing is left: <code>aws ec2 describe-vpcs --filters
 Name=isDefault,Values=false</code> and <code>aws ec2 describe-instances
