@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cluster on ECS (Fargate, multi-AZ) — nanocached</title>
-<meta name="description" content="A replicated, autoscaled nanocached cluster on ECS Fargate across availability zones, verified: Cloud Map discovery, task definitions, services, autoscaling on the node metrics, graceful scale-in, teardown.">
+<meta name="description" content="A replicated nanocached cluster on ECS Fargate across availability zones, verified: Cloud Map discovery, task definitions, services, growing the node service, graceful drain, teardown.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="icon" href="favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -30,24 +30,25 @@
 <main>
 
 <h1>Cluster on ECS (Fargate, multi-AZ)</h1>
-<p>A replicated cluster that scales itself: one discovery task and a
-node service of two to four tasks, spread across two availability
-zones, on Fargate. Discovery gets a stable name through Cloud Map
-private DNS; nodes find it by that name, join the ring, and hand their
-entries off on the way out when the autoscaler removes them. Target
-tracking on CPU grows and shrinks the node service — the memory
-watermark is the better signal (<a href="deployment-operations.html#metrics">above</a>) but
-needs a metrics pipeline, which is its own guide. Every command below
-was run in this order against a real account, including a scale-out
-and scale-in under load, then torn down with the commands at the
-end.</p>
-<p>What the pieces are for: two subnets in two zones so a zone loss
-costs at most half the ring (R=2 means the surviving copy of every key
-is elsewhere); one security group for the cluster's own traffic and the
-same <code>nanocached-app</code> label as the EC2 guide for clients; the
-auth secret in Parameter Store, pulled into the tasks by the execution
-role so it appears in no task definition; a health check on
-<code>/readyz</code> so the scheduler only routes to nodes that have
+<p>A replicated cluster on Fargate: one discovery task and a node
+service, spread across two availability zones. Discovery gets a stable
+name through Cloud Map private DNS; nodes find it by that name, join
+the ring with a staged handoff, and hand their entries off on the way
+out when ECS stops them. The node service grows and shrinks by its
+<code>desired-count</code> — this page builds the cluster and grows it
+by one; wiring the count to a metric (the memory watermark, see <a
+href="deployment-operations.html#metrics">metrics to scale on</a>) is
+Application Auto Scaling configuration on top of exactly this and is
+not covered here. Every block below was run in this order against a
+real account and torn down with the commands at the end.</p>
+<p>What the pieces are for: two cache subnets in two zones so a zone
+loss costs at most half the ring (R=2 means the surviving copy of every
+key is elsewhere) and a third subnet for the application tier; one
+security group for the cluster's own traffic and the same
+<code>nanocached-app</code> label as the EC2 guides for the application
+servers; the auth secret in Parameter Store, pulled into the tasks by
+the execution role so it appears in no task definition; a health check
+on <code>/readyz</code> so the scheduler only routes to nodes that have
 joined; and <code>stopTimeout</code> sized to the drain.</p>
 
 <pre><code>export AWS_REGION=us-east-1
@@ -61,13 +62,20 @@ TAG="{Key=Project,Value=$NAME}"</code></pre>
 aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
 aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames   # Cloud Map needs both
 
+# Two cache subnets in two zones for the tasks, one for the application tier.
 SUBNET_A=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.1.0.0/24 \
   --availability-zone ${AWS_REGION}a \
-  --tag-specifications "ResourceType=subnet,Tags=[$TAG]" --query Subnet.SubnetId --output text)
+  --tag-specifications "ResourceType=subnet,Tags=[$TAG,{Key=Name,Value=$NAME-cache-a}]" \
+  --query Subnet.SubnetId --output text)
 SUBNET_B=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.1.1.0/24 \
   --availability-zone ${AWS_REGION}b \
-  --tag-specifications "ResourceType=subnet,Tags=[$TAG]" --query Subnet.SubnetId --output text)
-for s in $SUBNET_A $SUBNET_B; do
+  --tag-specifications "ResourceType=subnet,Tags=[$TAG,{Key=Name,Value=$NAME-cache-b}]" \
+  --query Subnet.SubnetId --output text)
+APP_SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.1.2.0/24 \
+  --availability-zone ${AWS_REGION}a \
+  --tag-specifications "ResourceType=subnet,Tags=[$TAG,{Key=Name,Value=$NAME-app}]" \
+  --query Subnet.SubnetId --output text)
+for s in $SUBNET_A $SUBNET_B $APP_SUBNET_ID; do
   aws ec2 modify-subnet-attribute --subnet-id $s --map-public-ip-on-launch
 done
 
@@ -78,32 +86,37 @@ aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
 RTB_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID \
   --tag-specifications "ResourceType=route-table,Tags=[$TAG]" --query RouteTable.RouteTableId --output text)
 aws ec2 create-route --route-table-id $RTB_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
-for s in $SUBNET_A $SUBNET_B; do
+for s in $SUBNET_A $SUBNET_B $APP_SUBNET_ID; do
   aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $s
 done</code></pre>
 <p>Public subnets with <code>assignPublicIp=ENABLED</code> on the
 services is how the tasks pull their image and reach Parameter Store
 and CloudWatch without a NAT gateway; nothing inbound uses those
-addresses (the security group sees to that). Private subnets behind a
-NAT gateway or VPC endpoints work identically — set
-<code>assignPublicIp=DISABLED</code>.</p>
+addresses (the security group sees to that). The application tier has
+its own subnet for the same reason it does in the EC2 guides — where
+it lives is a routing decision; what may reach the cluster is the
+security group's.</p>
 
 <h2>Security groups</h2>
 <pre><code>APP_SG=$(aws ec2 create-security-group --group-name $NAME-app \
-  --description "nanocached clients" --vpc-id $VPC_ID \
+  --description "nanocached application tier" --vpc-id $VPC_ID \
   --tag-specifications "ResourceType=security-group,Tags=[$TAG]" --query GroupId --output text)
 CLUSTER_SG=$(aws ec2 create-security-group --group-name $NAME-cluster \
   --description "nanocached cluster tasks" --vpc-id $VPC_ID \
   --tag-specifications "ResourceType=security-group,Tags=[$TAG]" --query GroupId --output text)
 
+aws ec2 wait security-group-exists --group-ids $CLUSTER_SG $APP_SG   # the groups are not always visible to the next call yet
 aws ec2 authorize-security-group-ingress --group-id $CLUSTER_SG --ip-permissions \
   "IpProtocol=tcp,FromPort=8356,ToPort=8357,UserIdGroupPairs=[{GroupId=$CLUSTER_SG,Description=node/discovery traffic within the cluster}]" \
   "IpProtocol=tcp,FromPort=8356,ToPort=8357,UserIdGroupPairs=[{GroupId=$APP_SG,Description=data + discovery from app tier}]" \
   "IpProtocol=tcp,FromPort=9356,ToPort=9357,IpRanges=[{CidrIp=10.1.0.0/16,Description=operations endpoints from inside the VPC}]"</code></pre>
 <p>The cluster group refers to itself: nodes heartbeat to discovery on
-8357 and hand entries to each other on 8356. Clients need both ports
-too — they fetch the roster from discovery and then talk to nodes
-directly.</p>
+8357 and hand entries to each other on 8356. The application tier
+needs both ports too — its SDK fetches the roster from discovery and
+then talks to nodes directly. The wait is there because in one run the
+<code>authorize</code> call, issued straight after the two
+<code>create-security-group</code> calls, failed and succeeded on
+re-run: a new group is not always visible to the next API call.</p>
 
 <h2>The auth secret</h2>
 <pre><code>aws ssm put-parameter --name /$NAME/auth-secret --type SecureString \
@@ -156,7 +169,12 @@ aws logs put-retention-policy --log-group-name /ecs/$NAME --retention-in-days 7<
 <p>Discovery is therefore <code>disc.nanocached.local:8357</code> from
 anywhere in the VPC. A 5-second TTL keeps a discovery restart short
 for the nodes' heartbeats; the custom health check lets ECS withdraw
-the record the moment the task stops.</p>
+the record the moment the task stops. The namespace is a Route&nbsp;53
+private hosted zone; if this block is interrupted after
+<code>create-private-dns-namespace</code>, re-running it fails with
+<code>ConflictingDomainExists</code> — take <code>NS_ID</code> from
+<code>aws servicediscovery list-namespaces</code> instead (the new
+namespace can take a minute to appear there).</p>
 
 <h2>Task definitions</h2>
 <p><code>td-discovery.json</code>:</p>
@@ -266,99 +284,76 @@ cache expires; a longer node <code>startPeriod</code> stops ECS from
 replacing it in the meantime, at the cost of slower replacement of a
 task that is genuinely broken.</p>
 
-<h2>Autoscaling</h2>
-<pre><code>aws application-autoscaling register-scalable-target --service-namespace ecs \
-  --resource-id service/$NAME/node --scalable-dimension ecs:service:DesiredCount \
-  --min-capacity 2 --max-capacity 4 --tags Project=$NAME
-aws application-autoscaling put-scaling-policy --service-namespace ecs \
-  --resource-id service/$NAME/node --scalable-dimension ecs:service:DesiredCount \
-  --policy-name $NAME-node-cpu --policy-type TargetTrackingScaling \
-  --target-tracking-scaling-policy-configuration '{
-    "TargetValue": 30.0,
-    "PredefinedMetricSpecification": {"PredefinedMetricType": "ECSServiceAverageCPUUtilization"},
-    "ScaleOutCooldown": 60, "ScaleInCooldown": 60}'</code></pre>
-<p>Target tracking creates two CloudWatch alarms. The scale-out alarm
-fires after 3 minutes above target; the scale-in alarm needs 15
-consecutive minutes below 90% of it — that asymmetry is built in and
-is why the cooldowns above are short. <code>min-capacity 2</code> is
-the floor for R=2 to mean anything; a 30% target is low so the
-verification below triggers quickly — pick yours from the
-<a href="capacity-planner.html">capacity planner</a> and the metrics
-section.</p>
-
 <h2>Verifying</h2>
-<p>A throwaway client in the app group, as in the EC2 guide (same
-<code>client-user-data.sh</code>):</p>
-<pre><code>AMI_ID=$(aws ssm get-parameter \
-  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
-  --query Parameter.Value --output text)
-CLIENT_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.small \
-  --subnet-id $SUBNET_A --security-group-ids $APP_SG \
-  --iam-instance-profile Name=$NAME-ec2 --user-data file://client-user-data.sh \
-  --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-client}]" \
-  --query 'Instances[0].InstanceId' --output text)</code></pre>
-<p>The smoke test is the EC2 one with discovery as the address — the
-SDK sees from the handshake that it is talking to a discovery server,
-fetches the roster and connects to the nodes itself:</p>
-<pre><code>DISC = [("disc.nanocached.local", 8357)]
-
-async with await NanocachedClient.connect(DISC, auth_secret="change-me") as c:
-    print(c.replication)                                 # 2
-    await c.set("greeting", "hello", ttl_seconds=60)
-    print(await c.get("greeting"))                       # hello
-    print(await c.delete("greeting"))                    # True
-# and NanocachedClient.connect(DISC, auth_secret="wrong") raises AuthenticationError</code></pre>
-<p>Discovery's own metrics say how many nodes are in the ring, and
-they are the thing to watch during the scaling steps below:</p>
+<p>Discovery's name and its metrics answer the first question — how
+many nodes are in the ring. From anywhere in the VPC:</p>
 <pre><code>DISC_IP=$(getent hosts disc.nanocached.local | awk '{print $1}')
 curl -s http://$DISC_IP:9357/metrics | grep ^nanocached_discovery_members
 # nanocached_discovery_members 2</code></pre>
-<p><b>Scale-out.</b> Seed 20,000 entries, then run a mixed read/write
-load from the client (24 connections was 8,600&nbsp;ops/s against two
-tasks and pushed their CPU to 31%). The alarm tripped after three
-minutes over target; the third task started, had the two members hand
-it its share of the ring (<code>migration completed … sent 6726
-keys</code> in their logs) and was promoted seven seconds after
-launch; a fourth followed one cooldown later. The load saw 0 misses, 0
-corrupt reads and 0 errors across 3.9 million operations while the
-ring went from two to four.</p>
-<p><b>Scale-in.</b> Stop the load and wait: the service went 4 → 3 →
-2 sixteen and eighteen minutes later. Each leaver's log is the drain
-this whole guide is built around:</p>
+<p>Each task's log is in the one log group, prefixed by service.
+<code>describe-tasks</code> shows the zone each task landed in:</p>
+<pre><code>aws logs tail /ecs/$NAME --since 10m --format short
+aws logs filter-log-events --log-group-name /ecs/$NAME \
+  --log-stream-name-prefix node/ --filter-pattern '"joined the cluster"'
+aws ecs describe-tasks --cluster $NAME --query 'tasks[].[availabilityZone,healthStatus]' --output text \
+  --tasks $(aws ecs list-tasks --cluster $NAME --service-name node --query taskArns --output text)</code></pre>
+<p>Observed: the node service reached a steady state 2&nbsp;min
+40&nbsp;s after the first <code>create-service</code> (of which the
+Cloud Map wait was about 35&nbsp;s); the two tasks were placed one per
+zone, both <code>HEALTHY</code>, and both logged <code>joined the
+cluster via discovery at disc.nanocached.local:8357</code> on their
+first attempt — zero <code>Name does not resolve</code> lines in the
+log group.</p>
+<p>From the application tier, the SDK's configuration is
+<code>disc.nanocached.local</code>, port 8357 and the secret; the SDK
+sees from the handshake that it is talking to a discovery server,
+fetches the roster and connects to the nodes itself (see <a
+href="sdks.html">the SDKs</a>). This cluster was exercised that way
+from an instance in the app subnet with all six SDKs at 0.4.1: set /
+get / delete succeed through discovery, a wrong secret is rejected, and
+20,000 keys written before the next step were read back complete after
+it.</p>
+
+<h2>Growing the cluster</h2>
+<p>One more node is one more task:</p>
+<pre><code>aws ecs update-service --cluster $NAME --service node --desired-count 3
+aws ecs wait services-stable --cluster $NAME --services node</code></pre>
+<p>Observed: the third task was placed in the zone with one task,
+registered with discovery 24&nbsp;s after ECS created it, and was
+promoted the same second; each of the two members handed it 13,367
+keys — its share of the ring under R=2 — before the join completed
+(<code>migration completed … sent 13367 keys</code> in both members'
+logs, <code>join promoted … members now 3</code> in discovery's), and
+all 20,000 keys read back from the application tier. Going the other
+way is the same command with a smaller count: ECS sends SIGTERM, the
+node runs its planned leave inside <code>--drain-timeout</code>, and
+<code>stopTimeout</code> gives it the room (<a
+href="deployment-operations.html#graceful-scale-in">graceful
+scale-in</a>). What that looks like in a leaver's log, from this
+cluster's teardown:</p>
 <pre><code>INFO shutdown signal received — decommissioning (budget 20s)
-INFO decommission: handed off 9914 entr(ies)
-INFO decommission: forwarding window open for 12s
-INFO decommission finished — shutting down</code></pre>
-<p>and discovery's shows <code>node left the cluster</code> rather than
-an eviction. Both leavers exited 0 inside the 45&nbsp;s stop timeout,
-one from each zone (the scheduler keeps the survivors balanced), and a
-read of all 20,000 seeded keys afterwards found every one of them.</p>
-<p>The same check with the drain broken is instructive: this guide's
-first run hit a bug in which an authenticated node could not fetch the
-roster on the way out (<a
+INFO decommission: handed off 13288 entr(ies)
+INFO decommission: forwarding window open for 10s</code></pre>
+<p>(At teardown every task, discovery included, is stopped at once, so
+the leavers also log a <code>WARN decommission: leave notification to
+disc.nanocached.local:8357 failed</code> — the record was already
+withdrawn. Under a normal scale-in discovery is up and logs <code>node
+left the cluster</code> instead.)</p>
+<p>The same drain with a bug in it is instructive: this guide's first
+run hit a bug in which an authenticated node could not fetch the roster
+on the way out (<a
 href="https://github.com/nanocached/nanocached/issues/171">#171</a>,
 fixed in the images pinned above). The leavers exited 0 on time, ECS
 was satisfied, and 2,736 of the 20,000 keys were gone. Watch the
 leaver's log, not just the exit code.</p>
-<p><b>Logs.</b> Everything each task writes is in one log group,
-prefixed by service:</p>
-<pre><code>aws logs tail /ecs/$NAME --since 10m --format short
-aws logs filter-log-events --log-group-name /ecs/$NAME \
-  --log-stream-name-prefix node/ --filter-pattern '"decommission"'</code></pre>
 
 <h2>Teardown</h2>
-<pre><code>aws application-autoscaling delete-scaling-policy --service-namespace ecs \
-  --resource-id service/$NAME/node --scalable-dimension ecs:service:DesiredCount \
-  --policy-name $NAME-node-cpu
-aws application-autoscaling deregister-scalable-target --service-namespace ecs \
-  --resource-id service/$NAME/node --scalable-dimension ecs:service:DesiredCount
-
-for s in node discovery; do
+<pre><code>for s in node discovery; do
   aws ecs update-service --cluster $NAME --service $s --desired-count 0
   aws ecs delete-service --cluster $NAME --service $s --force
 done
 aws ecs wait services-inactive --cluster $NAME --services node discovery
-aws ec2 terminate-instances --instance-ids $CLIENT_ID
+aws ec2 terminate-instances --instance-ids $APP_ID
 
 for arn in $(aws ecs list-task-definitions --family-prefix $NAME- --query taskDefinitionArns --output text); do
   aws ecs deregister-task-definition --task-definition $arn
@@ -385,7 +380,7 @@ aws iam detach-role-policy --role-name $NAME-ec2 \
   --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 aws iam delete-role --role-name $NAME-ec2
 
-aws ec2 wait instance-terminated --instance-ids $CLIENT_ID
+aws ec2 wait instance-terminated --instance-ids $APP_ID
 # stopped tasks' ENIs linger for a minute or two; the security group can't go until they have
 until [ "$(aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=$VPC_ID \
   --query 'length(NetworkInterfaces)' --output text)" = 0 ]; do sleep 5; done
@@ -400,6 +395,7 @@ aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
 aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID
 aws ec2 delete-subnet --subnet-id $SUBNET_A
 aws ec2 delete-subnet --subnet-id $SUBNET_B
+aws ec2 delete-subnet --subnet-id $APP_SUBNET_ID
 aws ec2 delete-vpc --vpc-id $VPC_ID</code></pre>
 <p>Confirm: <code>aws ecs describe-clusters --clusters nanocached</code>
 reports <code>INACTIVE</code>, <code>aws servicediscovery
