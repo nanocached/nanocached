@@ -329,9 +329,10 @@ instance carries the app group: the SDK's configuration is the node's
 private IP (<code>$NODE_IP</code>), port 8356 and the secret, and
 nothing else — see <a href="sdks.html">the SDKs</a> for each
 language and the framework adapters. This node was exercised that way
-from an instance in the app subnet with the Python, TypeScript, Go,
-Java and Rust SDKs: set / get / delete succeed with the secret, and a
-wrong secret is rejected with each SDK's authentication error.</p>
+from an instance in the app subnet with all six SDKs at 0.4.1 (Python,
+TypeScript, Go, Java, .NET and Rust): set / get / delete succeed with
+the secret, and a wrong secret is rejected with each SDK's
+authentication error.</p>
 <p>The operations endpoint answers from anywhere inside the VPC:</p>
 <pre><code>curl -s http://$NODE_IP:9356/metrics | grep -v '^#' | head -3
 # nanocached_node_memory_used_bytes 0
@@ -349,8 +350,9 @@ a connect timeout, so a filtered port keeps it waiting for the kernel's
 75&nbsp;s; use <code>-G 5</code> there instead and each line comes back
 in five seconds.)</p>
 <p>Finally, <code>systemctl restart nanocached-node</code> on the node:
-<code>/readyz</code> answered 200 again within a second (the image is
-already local). Logs are <code>journalctl -u nanocached-node</code> —
+<code>/readyz</code> answered 200 again about half a second after the
+restart returned (the image is already local, so the container only has
+to start). Logs are <code>journalctl -u nanocached-node</code> —
 the container's stderr goes straight to the journal. Note that a
 standalone node has nobody to hand its entries to, so a restart is a
 cold cache — that is the trade-off this shape makes, and the reason to
