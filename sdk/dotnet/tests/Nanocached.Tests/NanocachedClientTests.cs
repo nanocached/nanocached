@@ -1416,6 +1416,58 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task GetManyBytesAsyncKeepsAnEarlierChunksHitsWhenALaterChunkFailsInClusterMode()
+    {
+        // Issue #485: in cluster mode RunMultiGetLegAsync used to discard
+        // the chunks an owner had already answered when a later chunk
+        // failed at the connection level, and resend the whole group on
+        // the retry pass — which, against a node that keeps failing,
+        // meant the already-fetched hits never reached the caller. The
+        // leg must keep the resolved prefix and retry only the tail (as
+        // the multi-set leg and the Rust/TypeScript SDKs do). Two ~600 KB
+        // keys with the same primary force exactly two `m` sub-frames on
+        // that node; from its 2nd `m` request onward the node fails
+        // (stickily, so the built-in redial and the retry pass fail too),
+        // and the surviving evidence is key0's value inside the
+        // PartialWrongNodeException the batch ends with.
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        var rng = new Random(485);
+        string MakeKey(int i)
+        {
+            var keyBytes = new byte[600_000];
+            rng.NextBytes(keyBytes);
+            for (int b = 0; b < keyBytes.Length; b++) keyBytes[b] = (byte)(keyBytes[b] & 0x7F);
+            return $"k{i}-" + Encoding.ASCII.GetString(keyBytes);
+        }
+        var keys = new List<string>();
+        for (int i = 0; keys.Count < 2; i++)
+        {
+            string candidate = MakeKey(i);
+            if (OwnersOf(candidate)[0] == Names[0]) keys.Add(candidate);
+        }
+        string key0 = keys[0];
+        string key1 = keys[1];
+        await client.SetAsync(key0, "v0");
+        await client.SetAsync(key1, "v1");
+
+        MockNode primary = cluster.Nodes[Names[0]];
+        primary.FailMultiGetFromRequestOnward(2);
+
+        PartialWrongNodeException<Dictionary<string, byte[]>> error =
+            await Assert.ThrowsAsync<PartialWrongNodeException<Dictionary<string, byte[]>>>(
+                () => client.GetManyBytesAsync(new[] { key0, key1 }));
+
+        // chunk 1 (key0) answered; every later `m` — chunk 2, its redial,
+        // and the retry pass's resend of the tail — failed.
+        Assert.True(primary.MultiGetRequestCount >= 3, $"got {primary.MultiGetRequestCount} `m` requests");
+        Assert.Equal(Encoding.UTF8.GetBytes("v0"), error.PartialValues[key0]);
+        Assert.False(error.PartialValues.ContainsKey(key1));
+    }
+
+    [Fact]
     public async Task SetManyBytesAsyncThrowsPartialConnectionLostExceptionWhenALaterChunkFailsAfterAnEarlierOneSucceeded()
     {
         // SetMany counterpart to the GetMany regression above. Two ~600 KB

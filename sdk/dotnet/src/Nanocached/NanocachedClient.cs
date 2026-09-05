@@ -1394,10 +1394,14 @@ public sealed class NanocachedClient : IDisposable
     }
 
     /// <summary>One owner group's <c>m</c> exchange: a connection-level
-    /// failure retries the whole group (indistinguishable from a
-    /// possibly-idle-closed connection, same stance
-    /// <see cref="ApplyReconnectingAsync{T}"/>'s own callers take
-    /// elsewhere); a per-key <c>W</c> retries just that key; a hit is
+    /// failure retries whatever the group's chunk(s) never resolved
+    /// (indistinguishable from a possibly-idle-closed connection, same
+    /// stance <see cref="ApplyReconnectingAsync{T}"/>'s own callers take
+    /// elsewhere) — the whole group when its first chunk failed, only the
+    /// tail from the failing chunk onward when an earlier chunk had already
+    /// succeeded (issue #411 / #485; those hits are kept, as the multi-set
+    /// leg and the Rust/TypeScript SDKs already do); a per-key <c>W</c>
+    /// retries just that key; a hit is
     /// spliced into <paramref name="values"/> (a client-side <c>Compress</c>
     /// mismatch propagates, aborting the batch immediately — never fed
     /// into the retry pass, since it isn't a routing outcome).</summary>
@@ -1412,29 +1416,40 @@ public sealed class NanocachedClient : IDisposable
             groupKeys[i] = keyBytes[groupIndices[i]];
         }
 
-        List<Connection.MultiEntry> entries;
+        IReadOnlyList<Connection.MultiEntry> entries;
+        // issue #485: how many leading entries are real results. Equal to
+        // the group size on success; on a ChunkedBatchInterruptedException
+        // it is the count of entries the chunks before the failing one
+        // already fetched, and everything from there on goes back to the
+        // retry pass untouched.
+        int resolved;
         try
         {
             entries = await MultiGetChunkedAsync(owner, namespaceBytes, groupKeys).ConfigureAwait(false);
+            resolved = entries.Count;
         }
-        catch (Exception error) when (error is NanocachedException or ChunkedBatchInterruptedException)
+        catch (ChunkedBatchInterruptedException partial)
         {
-            // issue #411: MultiGetChunkedAsync now throws
-            // ChunkedBatchInterruptedException (not a NanocachedException)
-            // instead of a bare connection exception when a chunk after
-            // the first one fails mid-leg — caught here alongside it so it
-            // can't escape uncaught. Reusing its partial entries for a
-            // per-key retry/success split (like the multi-set leg runner
-            // now does) isn't done here — out of this issue's confirmed
-            // scope for the get side — so this whole leg is retried in
-            // full, exactly as any other leg-level connection failure
-            // already was before this fix; a retried key that already
-            // resolved just resolves again.
+            // issue #411 / #485: a chunk after the first failed at the
+            // connection level (surviving the built-in redial) — keep the
+            // earlier chunks' hits and retry only the unresolved tail,
+            // rather than resending keys that already resolved.
+            entries = partial.CompletedEntries;
+            resolved = entries.Count;
+        }
+        catch (NanocachedException)
+        {
+            // The first chunk itself failed: nothing resolved, the whole
+            // group goes back to the retry pass, exactly as before.
             return new List<int>(groupIndices);
         }
 
         var retry = new List<int>();
-        for (int i = 0; i < groupIndices.Count; i++)
+        for (int i = resolved; i < groupIndices.Count; i++)
+        {
+            retry.Add(groupIndices[i]);
+        }
+        for (int i = 0; i < resolved; i++)
         {
             int idx = groupIndices[i];
             Connection.MultiEntry entry = entries[i];

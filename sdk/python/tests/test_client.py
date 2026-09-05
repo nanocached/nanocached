@@ -5699,6 +5699,52 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_get_many_retries_only_the_unresolved_tail_when_a_later_chunk_fails_in_cluster_mode(self):
+        # Issue #485: in cluster mode a connection-level failure on chunk
+        # N>1 of one owner's group used to throw away the chunks that
+        # had already succeeded and resend the whole group on the retry
+        # pass. The TypeScript and Rust SDKs keep the resolved prefix and
+        # retry only the tail; this SDK must do the same.
+        from nanocached.client import _MAX_BATCH_KEYS
+
+        nodes, discovery = await self.start_cluster()
+        try:
+            primary_name = NAMES[0]
+            primary = nodes[primary_name]
+            keys: list[str] = []
+            i = 0
+            while len(keys) < _MAX_BATCH_KEYS + 50:
+                candidate = f"tail-{i}"
+                if self.owners_of(candidate)[0] == primary_name:
+                    keys.append(candidate)
+                i += 1
+            values = {key: f"v-{key}" for key in keys}
+
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                await client.set_many(values)
+                primary.multi_get_count = 0
+                primary.multi_get_frame_sizes.clear()
+                # Chunk 1 (the first _MAX_BATCH_KEYS keys) answers; chunk 2
+                # (the remaining 50) dies at the connection level, once.
+                primary.fail_multi_get_after(1)
+
+                self.assertEqual(await client.get_many(keys), values)
+
+                # chunk 1 + the failed chunk 2 + the retry pass resending
+                # ONLY chunk 2's keys — not the whole group again (which
+                # would be two more `m` frames, four in total).
+                self.assertEqual(primary.multi_get_count, 3)
+                sizes = primary.multi_get_frame_sizes
+                self.assertLess(sizes[2], sizes[0], f"retry frame should carry only the tail: {sizes}")
+                self.assertEqual(sizes[2], sizes[1], f"retry frame should equal the failed chunk: {sizes}")
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
     async def test_set_many_stores_on_every_owner_under_replication(self):
         nodes, discovery = await self.start_cluster()
         try:

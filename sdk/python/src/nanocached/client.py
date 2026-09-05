@@ -1376,11 +1376,14 @@ class NanocachedClient:
         by their current primary owner (matching plain get()'s own
         primary-first stance), dispatch one (possibly chunked) ``m``
         exchange per owner concurrently, splice hits into ``values``,
-        and return the indices still unresolved: a per-key ``W``, or a
-        whole owner group whose call failed outright (indistinguishable
-        from a possibly-idle-closed connection, same stance _read()
-        itself takes). Called once for the initial pass and once more,
-        if needed, after a single forced refresh — see
+        and return the indices still unresolved: a per-key ``W``, or the
+        keys an owner group's connection-level failure never resolved
+        (indistinguishable from a possibly-idle-closed connection, same
+        stance _read() itself takes) — the whole group when its first
+        chunk failed, only the tail from the failing chunk onward when
+        an earlier chunk had already succeeded (issue #411 / #485; the
+        hits it returned are kept). Called once for the initial pass and
+        once more, if needed, after a single forced refresh — see
         _get_many_bytes()."""
         indices = retry_indices if retry_indices is not None else list(range(len(originals)))
 
@@ -1395,14 +1398,20 @@ class NanocachedClient:
 
         async def run_group(owner: str, group_indices: list[int]) -> tuple[list[int], dict[str | bytes, bytes]]:
             group_keys = [key_bytes_list[idx] for idx in group_indices]
-            entries, error, _failed_at = await self._multi_get_chunked(
+            entries, error, failed_at = await self._multi_get_chunked(
                 lambda: self._member_connection(owner), namespace, group_keys
             )
-            if error is not None:
-                return list(group_indices), {}
-            local_retry: list[int] = []
+            # Issue #411 / #485: a connection-level failure on chunk N>1
+            # leaves entries[:failed_at] as real, already-fetched results
+            # — keep them, and send only the unresolved tail
+            # (entries[failed_at:], still at their None placeholder) back
+            # for the retry pass, the same way the TypeScript and Rust
+            # SDKs do. A first-chunk failure (failed_at == 0) retries the
+            # whole group, exactly as before.
+            resolved = len(group_indices) if error is None else failed_at
+            local_retry: list[int] = list(group_indices[resolved:])
             local_values: dict[str | bytes, bytes] = {}
-            for idx, entry in zip(group_indices, entries):
+            for idx, entry in zip(group_indices[:resolved], entries[:resolved]):
                 if entry is WRONG_NODE:
                     local_retry.append(idx)
                 elif entry is not None:
