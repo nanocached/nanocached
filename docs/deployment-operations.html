@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What every deployment needs — nanocached</title>
+<meta name="description" content="What every nanocached deployment needs from the server binaries: the operations endpoint (/healthz, /readyz, /metrics), the metrics to scale on, and the SIGTERM drain that makes scale-in lossless.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <nav>
+    <a class="brand" href="index.html"><img src="favicon.svg" alt=""><span><b>nano</b>cached</span></a>
+    <div class="links">
+      <a href="getting-started.html">Getting started</a>
+      <a href="protocol.html">Protocol</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="sdks.html">SDKs</a>
+      <a href="deployment.html" aria-current="page">Deployment</a>
+      <a href="capacity-planner.html">Capacity planner</a>
+      <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+
+<h1>What every deployment needs</h1>
+<p class="lede">The three things an orchestrator — or a person with a
+shell — needs from nanocached before any of the shapes in the <a
+href="deployment.html">deployment guides</a>: probes to route around
+instances that aren't ready, metrics to scale on, and a SIGTERM-driven
+drain so scale-in never loses data.</p>
+
+<h2 id="ops">The operations endpoint</h2>
+<p>Each binary takes <code>--metrics-port &lt;port&gt;</code> and serves
+three paths on it (plain HTTP, on <code>--host</code>):</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Path</th><th>What it returns</th></tr></thead>
+  <tbody>
+    <tr><td><code>GET /metrics</code></td><td>Prometheus text format.</td></tr>
+    <tr><td><code>GET /healthz</code></td><td><code>200</code> while the process is serving — a liveness probe.</td></tr>
+    <tr><td><code>GET /readyz</code></td><td><code>200</code> only when the instance can do useful work — a readiness probe. A node is ready once it has adopted cluster membership; a proxy once it has a node roster; a discovery server once its startup grace period is over.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>The endpoint is unauthenticated by design (probes and scrapers don't
+do protocol handshakes) — bind it to an internal interface and don't
+expose it outside the task network. Omitting the flag disables the
+endpoint entirely.</p>
+
+<h2 id="metrics">Metrics to scale on</h2>
+<p><strong>Nodes</strong> scale on the memory watermark. Sum
+<code>nanocached_node_memory_used_bytes</code> over the fleet, divide by
+the summed <code>nanocached_node_memory_max_bytes</code>, and target a
+utilization (say 70%) with your autoscaler. Entry counts, hit/miss/set/
+delete/eviction/expiration counters, connection counts
+(<code>nanocached_node_connections</code> against
+<code>…_connections_max</code>, the <code>--max-connections</code> bound
+— raise <code>--max-connections-per-ip</code> too when clients share a
+source IP, as behind NAT or on Kubernetes), and per-namespace
+breakdowns (<code>nanocached_node_namespace_used_bytes</code>,
+<code>…_namespace_entries</code>) are exported alongside for dashboards
+and alerting.</p>
+<p><strong>Proxies</strong> scale on connections:
+<code>nanocached_proxy_client_connections</code> against
+<code>…_client_connections_max</code> (plus CPU).
+<code>…_requests_total</code> and <code>…_upstream_failures_total</code>
+give request and error rates.</p>
+<p><strong>Discovery</strong> exports roster sizes
+(<code>nanocached_discovery_members</code>, <code>…_proxies</code>,
+<code>…_waiting_nodes</code>, <code>…_joining_nodes</code>) and join
+counters — not scaling signals, but the first thing to graph when a
+scale event misbehaves.</p>
+
+<h2 id="graceful-scale-in">Graceful scale-in</h2>
+<p>Scale-in terminates instances that are <em>not</em> dead, and
+orchestrators signal that with SIGTERM followed by SIGKILL after a
+grace period. Both server binaries treat SIGTERM as "drain, then
+exit" — so ordinary deployments, autoscaler scale-in, and spot/Spot
+reclaim all get the graceful path with no extra hooks.</p>
+
+<h2>Node: decommission</h2>
+<p>On SIGTERM a clustered node runs a planned leave within
+<code>--drain-timeout</code> seconds (default 25):</p>
+<ol>
+  <li>It hands every key it owns to the node that becomes the new owner
+  once it's gone — so even at R=1 the only copy <em>moves</em> rather
+  than dies.</li>
+  <li>It leaves the cluster membership immediately (no liveness timeout
+  to wait out), so clients refresh onto the surviving nodes.</li>
+  <li>It keeps serving and forwards writes it no longer owns for the
+  rest of the budget while clients catch up, then exits 0.</li>
+</ol>
+<p><code>--drain-timeout 0</code> skips the handoff (the old
+crash-equivalent shutdown) — acceptable for fast restarts at
+R&nbsp;≥&nbsp;2, where replicas cover the gap.</p>
+<p><strong>Scale in one node at a time.</strong> A draining node plans
+its entire handoff from one roster snapshot taken as the drain begins.
+Two nodes draining at once each plan against a roster that still lists
+the other, so a key whose owners included both can come out of the
+double-leave one replica short until a later membership change, a
+rewrite, or its TTL turns it over — and at R=1, a handoff that lands on
+the other leaver can be dropped outright (see
+<a href="architecture.html">Architecture</a> on the self-healing
+consistency model). Scale-in policies that step the desired count down
+one instance per action avoid the window entirely; a larger single step
+(or a spot reclaim of several instances at once) trades that safety for
+speed and should be reserved for R&nbsp;≥&nbsp;2.</p>
+
+<h2>Proxy: drain</h2>
+<p>On SIGTERM a proxy deregisters from discovery's proxy roster
+immediately (new clients stop being handed its address), finishes
+in-flight requests within <code>--drain-timeout</code> (default 25),
+and exits 0. Clients connected to it reconnect to a surviving proxy
+transparently — at most one reconnect per connection.</p>
+
+<h2>Sizing the stop grace</h2>
+<p>The orchestrator's grace period must outlast the drain:
+<strong>set ECS <code>stopTimeout</code> / Kubernetes
+<code>terminationGracePeriodSeconds</code> to at least
+<code>--drain-timeout</code> plus a margin</strong> (twice it is a
+comfortable rule). A node's handoff time scales with the data it holds
+— a 20&nbsp;s budget drains hundreds of MB comfortably on an
+in-network transfer, but measure with your value sizes; keys that miss
+the budget are logged and left to the surviving replicas. The default
+25&nbsp;s fits inside a spot interruption's 2-minute warning with room
+to spare.</p>
+
+<h2>Verifying a deployment</h2>
+<p>The repository ships runnable scale-in scenarios under
+<a href="https://github.com/nanocached/nanocached/tree/main/tests/e2e"><code>tests/e2e</code></a>:
+<code>scalein.sh</code> (a node leaves under load at R=2 — zero loss,
+zero corruption, membership follows) and <code>proxydrain.sh</code> (a
+proxy drains under via-proxy load — immediate roster removal, exit 0,
+clients reconnect). They document the exact guarantees the drain makes
+and are the fastest way to see the choreography before wiring up an
+autoscaler.</p>
+</main>
+
+<footer class="site-footer">
+  <div>
+    <span>nanocached</span>
+    <a href="https://github.com/nanocached/nanocached/blob/main/LICENSE">MIT License</a>
+    <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    <a href="https://github.com/nanocached/nanocached/issues">Issues</a>
+  </div>
+</footer>
+
+</body>
+</html>

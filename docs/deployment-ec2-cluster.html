@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cluster on EC2 — nanocached</title>
+<meta name="description" content="A verified nanocached cluster on EC2: one discovery server plus a node at a fixed address, any number of identical nodes, grown by launching more from an AMI of a node — network, security groups, IAM, systemd, planned leave, teardown.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <nav>
+    <a class="brand" href="index.html"><img src="favicon.svg" alt=""><span><b>nano</b>cached</span></a>
+    <div class="links">
+      <a href="getting-started.html">Getting started</a>
+      <a href="protocol.html">Protocol</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="sdks.html">SDKs</a>
+      <a href="deployment.html" aria-current="page">Deployment</a>
+      <a href="capacity-planner.html">Capacity planner</a>
+      <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+
+<h1>Cluster on EC2</h1>
+<p class="lede">A replicated cache on plain EC2 instances, without an
+orchestrator: one instance runs the discovery server and a node at a
+fixed private address, every other instance runs an identical node,
+and the cluster grows by launching more instances from an image of one
+of those nodes. Built from an empty account with the AWS CLI, verified
+two nodes up, a third added from the image, one node removed, and torn
+down again. Read <a href="deployment-operations.html">what every
+deployment needs</a> first for the operations endpoint, the metrics
+and the SIGTERM drain every shape relies on; this page builds on the
+<a href="deployment-ec2-single.html">single node on EC2</a>.</p>
+
+<h2 id="shape">The shape</h2>
+<p>Two kinds of instance, one systemd unit for the node on both:</p>
+<ul>
+  <li><b>The seed</b> — <code>nanocached-discovery</code> and a
+  <code>nanocached-node</code> on one instance, launched with a fixed
+  private IP (<code>10.0.0.11</code> below). That address is the one
+  thing every other node and every client is configured with: nodes
+  register and heartbeat there (<code>--discovery
+  10.0.0.11:8357</code>), clients fetch the node list from it and then
+  talk to nodes directly. Discovery is never on the data path.</li>
+  <li><b>Nodes</b> — every other instance. Same unit file as the seed's
+  node, same command line; a node has no identity of its own on disk
+  (it picks a random name each start, and its address is learned by
+  discovery from the heartbeat connection), so nodes are
+  interchangeable and an image of one is an image of all of them.</li>
+</ul>
+<p>Adding a node is <code>run-instances</code> from that image with no
+user-data; the node joins with a staged data handoff, so the keys it
+takes ownership of move to it before it serves. Removing one is
+<code>systemctl stop</code>, which the node turns into a planned leave
+(<a href="deployment-operations.html#graceful-scale-in">graceful scale-in</a>),
+and then <code>terminate-instances</code>. With discovery's default
+replication factor of 2, every key lives on two nodes, so a single
+instance loss — planned or not — loses nothing.</p>
+<p>What this shape does not do: it has one discovery server. Nodes and
+clients that are already connected keep working if it is down (only
+membership updates stop), but a new client cannot bootstrap and a
+restarted node cannot re-register until it is back; the address is
+fixed precisely so the seed can be rebuilt in place. Nor is there an
+Auto Scaling group — growth is a command you run. Both are deliberate:
+this is the shape for a handful of instances that people operate; the
+<a href="deployment-ecs.html">ECS</a> and <a
+href="deployment-eks.html">EKS</a> shapes are the ones that scale on
+their own.</p>
+
+<pre><code>export AWS_REGION=us-east-1
+NAME=nanocached
+TAG="{Key=Project,Value=$NAME}"     # every resource carries it — see teardown</code></pre>
+
+<h2 id="network">Network</h2>
+<p>The same VPC as the single-node shape: two public subnets, one for
+the cache tier and one for the application tier, on one route table
+through an internet gateway. No NAT gateway — outbound (image pulls,
+package installs, Systems Manager) goes straight out, and inbound is
+whatever the security groups admit. The subnet CIDR matters more here
+than it did with one node: <code>10.0.0.11</code> below has to be a
+free address inside the node subnet.</p>
+<pre><code>VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 \
+  --tag-specifications "ResourceType=vpc,Tags=[$TAG]" --query Vpc.VpcId --output text)
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+
+NODE_SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.0.0/24 \
+  --availability-zone ${AWS_REGION}a \
+  --tag-specifications "ResourceType=subnet,Tags=[$TAG,{Key=Name,Value=$NAME-node}]" \
+  --query Subnet.SubnetId --output text)
+APP_SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 \
+  --availability-zone ${AWS_REGION}a \
+  --tag-specifications "ResourceType=subnet,Tags=[$TAG,{Key=Name,Value=$NAME-app}]" \
+  --query Subnet.SubnetId --output text)
+aws ec2 modify-subnet-attribute --subnet-id $NODE_SUBNET_ID --map-public-ip-on-launch
+aws ec2 modify-subnet-attribute --subnet-id $APP_SUBNET_ID --map-public-ip-on-launch
+
+IGW_ID=$(aws ec2 create-internet-gateway \
+  --tag-specifications "ResourceType=internet-gateway,Tags=[$TAG]" \
+  --query InternetGateway.InternetGatewayId --output text)
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+
+RTB_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=route-table,Tags=[$TAG]" --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id $RTB_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $NODE_SUBNET_ID
+aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $APP_SUBNET_ID</code></pre>
+<p>Name the availability zone explicitly (a subnet left to AWS can land
+in a zone without <code>t3</code>). Already have a VPC? Set
+<code>VPC_ID</code>, <code>NODE_SUBNET_ID</code> and
+<code>APP_SUBNET_ID</code> to existing public subnets, pick a free
+address in the node subnet for the seed, and substitute your VPC's
+CIDR for <code>10.0.0.0/16</code> in the operations-port rule.</p>
+
+<h2 id="security-groups">Security groups</h2>
+<p>Two groups, as before — <code>nanocached-app</code> is the label the
+application servers wear, <code>nanocached-node</code> refers to it —
+with two additions for a cluster: the discovery port (8357) opens to
+the app group alongside the data port, and the node group refers to
+<em>itself</em>, because nodes hand keys to each other on 8356 and
+register with discovery on 8357. The operations range now covers both
+the node's 9356 and discovery's 9357.</p>
+<pre><code>APP_SG=$(aws ec2 create-security-group --group-name $NAME-app \
+  --description "nanocached application tier" --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=security-group,Tags=[$TAG]" --query GroupId --output text)
+NODE_SG=$(aws ec2 create-security-group --group-name $NAME-node \
+  --description "nanocached node" --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=security-group,Tags=[$TAG]" --query GroupId --output text)
+
+aws ec2 authorize-security-group-ingress --group-id $NODE_SG --ip-permissions \
+  "IpProtocol=tcp,FromPort=8356,ToPort=8357,UserIdGroupPairs=[{GroupId=$APP_SG,Description=data and discovery ports from app tier}]" \
+  "IpProtocol=tcp,FromPort=8356,ToPort=8357,UserIdGroupPairs=[{GroupId=$NODE_SG,Description=node-to-node handoff and discovery registration}]" \
+  "IpProtocol=tcp,FromPort=9356,ToPort=9357,IpRanges=[{CidrIp=10.0.0.0/16,Description=operations endpoints (node 9356 and discovery 9357) from inside the VPC}]"</code></pre>
+<p>Port 22 stays absent; the shell is Session Manager. The operations
+endpoints are unauthenticated, hence a CIDR inside the VPC and never
+<code>0.0.0.0/0</code>.</p>
+
+<h2 id="iam">IAM</h2>
+<p>One role with <code>AmazonSSMManagedInstanceCore</code>, shared by
+every instance:</p>
+<pre><code>aws iam create-role --role-name $NAME-ec2 --tags Key=Project,Value=$NAME \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+    "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name $NAME-ec2 \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam create-instance-profile --instance-profile-name $NAME-ec2
+aws iam add-role-to-instance-profile --instance-profile-name $NAME-ec2 --role-name $NAME-ec2
+sleep 15   # a brand-new instance profile takes a few seconds to become launchable</code></pre>
+
+<h2 id="seed">The seed</h2>
+<p>Save this as <code>seed-user-data.sh</code>. It is the single-node
+user-data with a second unit for discovery and two flags on the node:
+<code>--discovery</code> naming the seed's own fixed address, and
+<code>--drain-timeout</code>, the budget a stopping node gets to hand
+its keys away (20&nbsp;s here, inside the unit's 30&nbsp;s
+<code>docker stop</code> grace). Discovery reads the same secret file;
+its <code>--replication-factor 2</code> is the cluster's R.</p>
+<pre><code>#!/bin/bash
+set -euo pipefail
+dnf install -y docker
+systemctl enable --now docker
+
+install -d -m 700 /etc/nanocached
+cat &gt; /etc/nanocached/env &lt;&lt;'ENV'
+NANOCACHED_AUTH_SECRET=change-me
+ENV
+chmod 600 /etc/nanocached/env
+
+cat &gt; /etc/systemd/system/nanocached-discovery.service &lt;&lt;'UNIT'
+[Unit]
+Description=nanocached discovery
+After=docker.service
+Requires=docker.service
+
+[Service]
+ExecStartPre=-/usr/bin/docker rm -f nanocached-discovery
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-discovery@sha256:356b684962709bd8eeb60112446b6e5e88e9d23951c8fe4c9bfc7c5750906f1c
+ExecStart=/usr/bin/docker run --rm --name nanocached-discovery \
+  --network host \
+  --env-file /etc/nanocached/env \
+  ghcr.io/nanocached/nanocached-discovery@sha256:356b684962709bd8eeb60112446b6e5e88e9d23951c8fe4c9bfc7c5750906f1c \
+  --host 0.0.0.0 --port 8357 --metrics-port 9357 \
+  --replication-factor 2
+ExecStop=/usr/bin/docker stop -t 30 nanocached-discovery
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat &gt; /etc/systemd/system/nanocached-node.service &lt;&lt;'UNIT'
+[Unit]
+Description=nanocached node
+After=docker.service nanocached-discovery.service
+Requires=docker.service
+
+[Service]
+ExecStartPre=-/usr/bin/docker rm -f nanocached-node
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:372b23265139d54cf44da4abf621a191f49cb58b2df61c8bcd314b4ec327a678
+ExecStart=/usr/bin/docker run --rm --name nanocached-node \
+  --network host \
+  --env-file /etc/nanocached/env \
+  ghcr.io/nanocached/nanocached-node@sha256:372b23265139d54cf44da4abf621a191f49cb58b2df61c8bcd314b4ec327a678 \
+  --host 0.0.0.0 --port 8356 --metrics-port 9356 \
+  --discovery 10.0.0.11:8357 --drain-timeout 20 \
+  --max-memory 1073741824
+ExecStop=/usr/bin/docker stop -t 30 nanocached-node
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now nanocached-discovery nanocached-node</code></pre>
+<p>The node unit names <code>nanocached-discovery.service</code> in its
+<code>After=</code> so that on the seed the registry is up before the
+node registers; on a plain node, where that unit does not exist,
+systemd ignores the reference — which is what lets the unit be
+byte-for-byte the same on both. Everything the single-node guide says
+about <code>NANOCACHED_AUTH_SECRET</code>, <code>--max-memory</code>
+and the pinned image digests applies unchanged.</p>
+
+<h2 id="node">A node</h2>
+<p>Save this as <code>node-user-data.sh</code>: the same preamble and
+the same node unit, nothing else.</p>
+<pre><code>#!/bin/bash
+set -euo pipefail
+dnf install -y docker
+systemctl enable --now docker
+
+install -d -m 700 /etc/nanocached
+cat &gt; /etc/nanocached/env &lt;&lt;'ENV'
+NANOCACHED_AUTH_SECRET=change-me
+ENV
+chmod 600 /etc/nanocached/env
+
+cat &gt; /etc/systemd/system/nanocached-node.service &lt;&lt;'UNIT'
+[Unit]
+Description=nanocached node
+After=docker.service nanocached-discovery.service
+Requires=docker.service
+
+[Service]
+ExecStartPre=-/usr/bin/docker rm -f nanocached-node
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:372b23265139d54cf44da4abf621a191f49cb58b2df61c8bcd314b4ec327a678
+ExecStart=/usr/bin/docker run --rm --name nanocached-node \
+  --network host \
+  --env-file /etc/nanocached/env \
+  ghcr.io/nanocached/nanocached-node@sha256:372b23265139d54cf44da4abf621a191f49cb58b2df61c8bcd314b4ec327a678 \
+  --host 0.0.0.0 --port 8356 --metrics-port 9356 \
+  --discovery 10.0.0.11:8357 --drain-timeout 20 \
+  --max-memory 1073741824
+ExecStop=/usr/bin/docker stop -t 30 nanocached-node
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now nanocached-node</code></pre>
+
+<h2 id="launch">Launch</h2>
+<p>The seed goes first, at its fixed address; then a node. Both from
+the current Amazon Linux 2023 AMI:</p>
+<pre><code>AMI_ID=$(aws ssm get-parameter \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --query Parameter.Value --output text)
+
+# A: the seed — discovery plus a node, at the fixed address every other
+# node and every client will name.
+SEED_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.small \
+  --subnet-id $NODE_SUBNET_ID --security-group-ids $NODE_SG --private-ip-address 10.0.0.11 \
+  --iam-instance-profile Name=$NAME-ec2 --user-data file://seed-user-data.sh \
+  --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-seed}]" \
+  --query 'Instances[0].InstanceId' --output text)
+
+# B: a plain node.
+NODE_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.small \
+  --subnet-id $NODE_SUBNET_ID --security-group-ids $NODE_SG \
+  --iam-instance-profile Name=$NAME-ec2 --user-data file://node-user-data.sh \
+  --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-node}]" \
+  --query 'Instances[0].InstanceId' --output text)
+
+aws ec2 wait instance-running --instance-ids $SEED_ID $NODE_ID
+NODE_IP=$(aws ec2 describe-instances --instance-ids $NODE_ID \
+  --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)</code></pre>
+<p>Timing, from launch: the seed's discovery and node both answered
+<code>/readyz</code> 200 and discovery reported two members at
+86&nbsp;s after boot; the plain node registered at about 80&nbsp;s and
+was promoted to a member twelve seconds later, once the seed's own
+node had joined ahead of it. The order in the discovery log is the
+staged join at work — a node waits until the members before it have
+finished handing over.</p>
+
+<h2 id="verifying">Verifying</h2>
+<p>On the seed, both services and the membership count. Discovery
+serves <code>/healthz</code>, <code>/readyz</code> and
+<code>/metrics</code> on its own operations port, 9357:</p>
+<pre><code>aws ssm send-command --instance-ids $SEED_ID --document-name AWS-RunShellScript \
+  --parameters 'commands=["systemctl is-active nanocached-discovery nanocached-node",
+    "curl -s -o /dev/null -w discovery-readyz=%{http_code}\\\\n http://127.0.0.1:9357/readyz",
+    "curl -s -o /dev/null -w node-readyz=%{http_code}\\\\n http://127.0.0.1:9356/readyz",
+    "curl -s http://127.0.0.1:9357/metrics | grep ^nanocached_discovery_members"]'
+# active / active / discovery-readyz=200 / node-readyz=200 / nanocached_discovery_members 2</code></pre>
+<p><code>journalctl -u nanocached-discovery</code> narrates every
+membership change (<code>node registered</code>, <code>join
+started</code>, <code>join promoted</code>, <code>node left the
+cluster</code>) and <code>journalctl -u nanocached-node</code> the
+handoffs (<code>migration started/completed</code>, <code>re-replication
+after membership change</code>) — the two logs quoted in the rest of
+this page.</p>
+<p>From the application tier, the SDK's configuration is discovery's
+address — <code>10.0.0.11</code>, port 8357 — and the secret; the SDK
+fetches the node list and routes each key to its owners itself (see
+<a href="sdks.html">the SDKs</a>). This cluster was exercised that way
+from an instance in the app subnet with all six SDKs at 0.4.1:
+set / get / delete succeed through discovery, a wrong secret is
+rejected, and 2,000 keys written before the steps below were read back
+complete after each of them.</p>
+
+<h2 id="growing">Growing the cluster</h2>
+<p>Take an image of a node. <code>--no-reboot</code> keeps it running:
+a node keeps nothing on disk, so there is nothing to quiesce, and a
+reboot would only cost the cluster a leave-and-rejoin. The image
+carries the unit, the secret file and the already-pulled container
+image:</p>
+<pre><code># Bake the plain node into an AMI without stopping it: the node keeps
+# nothing on disk, so there is nothing to quiesce.
+IMAGE_ID=$(aws ec2 create-image --instance-id $NODE_ID --name $NAME-node-$(date +%Y%m%d-%H%M) \
+  --no-reboot --tag-specifications "ResourceType=image,Tags=[$TAG]" "ResourceType=snapshot,Tags=[$TAG]" \
+  --query ImageId --output text)
+aws ec2 wait image-available --image-ids $IMAGE_ID</code></pre>
+<p>Then add a node from it — no user-data, no configuration:</p>
+<pre><code># Add a node from the image: no user-data — the unit, the secret file and
+# the pulled image are already on the disk, and the node picks a fresh
+# identity on start.
+NODE2_ID=$(aws ec2 run-instances --image-id $IMAGE_ID --instance-type t3.small \
+  --subnet-id $NODE_SUBNET_ID --security-group-ids $NODE_SG \
+  --iam-instance-profile Name=$NAME-ec2 \
+  --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-node}]" \
+  --query 'Instances[0].InstanceId' --output text)
+aws ec2 wait instance-running --instance-ids $NODE2_ID</code></pre>
+<p>Observed: the image was available three minutes after
+<code>create-image</code>; the new instance registered with discovery
+37&nbsp;s after launch and was promoted the same second, the seed's
+node handing it 1,328 of the 2,000 test keys (the share the ring now
+assigns to it) before the join completed; every key still read back
+from the application tier. Repeat the block for each node you want —
+the image is good until you change the unit, the secret or the pinned
+digest, at which point you bake a new one from a node running the new
+configuration.</p>
+
+<h2 id="removing">Removing a node</h2>
+<p>Stop the service first, then terminate the instance.
+<code>systemctl stop</code> sends SIGTERM through <code>docker
+stop</code>; the node deregisters and hands its keys to their next
+owners within <code>--drain-timeout</code>:</p>
+<pre><code>aws ssm send-command --instance-ids $NODE_ID --document-name AWS-RunShellScript \
+  --parameters 'commands=["systemctl stop nanocached-node"]'
+# then, once the command reports Success:
+aws ec2 terminate-instances --instance-ids $NODE_ID</code></pre>
+<p>Observed with three members: discovery logged <code>node left the
+cluster</code> in the same second the stop was issued, the two
+remaining nodes re-replicated 672 entries between them so every key
+was again on two nodes, and <code>systemctl stop</code> returned after
+20&nbsp;s — the drain budget. The 2,000 keys read back complete
+throughout. Terminating an instance without the stop is what an
+unplanned loss looks like: discovery drops the node after its
+liveness timeout instead of immediately, and the keys are still on
+their other owner.</p>
+
+<h2 id="teardown">Teardown</h2>
+<p>Instances first, then the image and its snapshot (deregistering an
+AMI does not delete the snapshot behind it), then the rest in reverse
+order. Anything you launched in the app group goes first too.</p>
+<pre><code>aws ec2 terminate-instances --instance-ids $SEED_ID $NODE_ID $NODE2_ID
+aws ec2 wait instance-terminated --instance-ids $SEED_ID $NODE_ID $NODE2_ID
+
+SNAPSHOT_ID=$(aws ec2 describe-images --image-ids $IMAGE_ID \
+  --query 'Images[0].BlockDeviceMappings[0].Ebs.SnapshotId' --output text)
+aws ec2 deregister-image --image-id $IMAGE_ID
+aws ec2 delete-snapshot --snapshot-id $SNAPSHOT_ID
+
+aws iam remove-role-from-instance-profile --instance-profile-name $NAME-ec2 --role-name $NAME-ec2
+aws iam delete-instance-profile --instance-profile-name $NAME-ec2
+aws iam detach-role-policy --role-name $NAME-ec2 \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam delete-role --role-name $NAME-ec2
+
+aws ec2 delete-security-group --group-id $NODE_SG   # first: it references $APP_SG
+aws ec2 delete-security-group --group-id $APP_SG
+
+for ASSOC in $(aws ec2 describe-route-tables --route-table-ids $RTB_ID \
+  --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text); do
+  aws ec2 disassociate-route-table --association-id $ASSOC
+done
+aws ec2 delete-route-table --route-table-id $RTB_ID
+aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID
+aws ec2 delete-subnet --subnet-id $NODE_SUBNET_ID
+aws ec2 delete-subnet --subnet-id $APP_SUBNET_ID
+aws ec2 delete-vpc --vpc-id $VPC_ID</code></pre>
+<p>Confirm nothing is left: <code>aws ec2 describe-vpcs --filters
+Name=isDefault,Values=false</code>, <code>aws ec2 describe-instances
+--filters Name=instance-state-name,Values=running</code>, <code>aws ec2
+describe-images --owners self</code> and <code>aws ec2
+describe-snapshots --owner-ids self</code> should all come back empty,
+and <code>aws iam get-role --role-name nanocached-ec2</code> should say
+<code>NoSuchEntity</code>.</p>
+
+</main>
+
+<footer class="site-footer">
+  <div>
+    <span>nanocached</span>
+    <a href="https://github.com/nanocached/nanocached/blob/main/LICENSE">MIT License</a>
+    <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    <a href="https://github.com/nanocached/nanocached/issues">Issues</a>
+  </div>
+</footer>
+
+</body>
+</html>
