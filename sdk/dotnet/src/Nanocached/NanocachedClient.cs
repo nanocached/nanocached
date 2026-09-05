@@ -19,9 +19,10 @@ namespace Nanocached;
 /// replica never fails a write), reads ask the primary and fall over to
 /// the next owner only when the holder is unreachable. Dead connections
 /// are redialed lazily on use (with one transparent retry — a socket only
-/// learns of a peer FIN on I/O, and every operation is idempotent), and an
-/// opt-in keep-alive can hold connections open across the server's 60s
-/// idle timeout.
+/// learns of a peer FIN on I/O; the retry is skipped for the non-idempotent
+/// counter and compare-and-set operations once the request may have been
+/// sent, see issue #225), and an opt-in keep-alive can hold connections
+/// open across the server's 60s idle timeout.
 ///
 /// Thread-safe. Requests are serialized per connection; concurrent
 /// callers queue.

@@ -31,7 +31,7 @@ interface Waiter {
   tag?: number;
 }
 
-// Issue: `Buffer.from(uint8array)` copies its input, and every caller here
+// `Buffer.from(uint8array)` copies its input, and every caller here
 // immediately hands the result to `Buffer.concat` (in encodeGet/encodeSet/
 // encodeDelete), which copies again to build the final frame — a Uint8Array
 // key/value paid for two copies where one suffices. `Buffer.concat` accepts
@@ -203,6 +203,12 @@ export class Connection {
    * opens before the client instance (and so this callback) exists; no `R`
    * can arrive before then, since identify traffic never sees one. */
   private onTransientRetry: (() => void) | undefined;
+
+  /** Set by the socket's `"close"` handler — distinct from `closed`, which
+   * `poison()` flips *before* the event fires, and from `socket.destroyed`,
+   * which `destroy()` flips synchronously; only this one means the event
+   * itself (and every listener on it) has run. See `whenClosed`. */
+  private closeEmitted = false;
 
   constructor(socket: Socket | TLSSocket, tagged = false, onTransientRetry?: () => void) {
     this.socket = socket;
@@ -427,6 +433,18 @@ export class Connection {
 
   close(): void {
     this.socket.destroy();
+  }
+
+  /** Resolves once the socket's native `"close"` event has fired — i.e.
+   * after every listener registered on it (including the per-target
+   * open-connection bookkeeping in `client.ts`) has run. `destroy()` only
+   * schedules that event; it is emitted on a later tick, so a caller that
+   * needs "the connection is gone" as a settled fact (`NanocachedClient.close()`)
+   * awaits this after `close()`. Resolves immediately when the event has
+   * already fired — a closed socket never emits `"close"` again. */
+  whenClosed(): Promise<void> {
+    if (this.closeEmitted) return Promise.resolve();
+    return new Promise((resolve) => this.socket.once("close", () => resolve()));
   }
 
   /** Whether the underlying socket has closed — locally via close(), or
@@ -654,6 +672,7 @@ export class Connection {
 
   private onClose(): void {
     this.closed = true;
+    this.closeEmitted = true;
     this.clearRequestTimer();
     const error = this.closeError();
     const waiters = this.pending.splice(0);

@@ -696,24 +696,6 @@ type clusterDialOutcome struct {
 	err    error
 }
 
-// openCluster dials every node discovery listed, concurrently — the
-// per-dial timeout is connectDeadline either way, so doing this
-// concurrently instead of one at a time is purely a latency win once more
-// than one node is unreachable. A node that can't be reached (issue #67:
-// typically one that just died and discovery hasn't evicted yet — its
-// liveness window is seconds long, and every key is still served by
-// another owner when replication > 1) is installed as a member with no
-// live connection — the same deadConnection placeholder a freshly
-// discovered node gets in refreshNodeList — and its reconnect cooldown
-// armed, exactly the state a member is in after dying mid-life: requests
-// for its keys fail over per request instead of the whole Connect
-// failing, and the next request after the cooldown redials it. Only a
-// cluster with *no* reachable node fails Connect, with the last dial
-// error. A listed address that identifies as something other than a node
-// (a discovery misconfiguration, not a transient failure) remains a hard,
-// non-tolerated error, checked before anything is installed so it can't
-// leak a socket successfully opened for a different node in the same
-// dial round.
 // dedupeDiscoveredNodes drops repeated node names from discovery's raw
 // list, first occurrence winning — the same stance NewHashRing takes
 // (issues #328/#360), carried into the connection layer (issue #389).
@@ -739,6 +721,24 @@ func dedupeDiscoveredNodes(nodes []discoveredNode) []discoveredNode {
 	return deduped
 }
 
+// openCluster dials every node discovery listed, concurrently — the
+// per-dial timeout is connectDeadline either way, so doing this
+// concurrently instead of one at a time is purely a latency win once more
+// than one node is unreachable. A node that can't be reached (issue #67:
+// typically one that just died and discovery hasn't evicted yet — its
+// liveness window is seconds long, and every key is still served by
+// another owner when replication > 1) is installed as a member with no
+// live connection — the same deadConnection placeholder a freshly
+// discovered node gets in refreshNodeList — and its reconnect cooldown
+// armed, exactly the state a member is in after dying mid-life: requests
+// for its keys fail over per request instead of the whole Connect
+// failing, and the next request after the cooldown redials it. Only a
+// cluster with *no* reachable node fails Connect, with the last dial
+// error. A listed address that identifies as something other than a node
+// (a discovery misconfiguration, not a transient failure) remains a hard,
+// non-tolerated error, checked before anything is installed so it can't
+// leak a socket successfully opened for a different node in the same
+// dial round.
 func (c *Client) openCluster(result *identified) error {
 	nodes := dedupeDiscoveredNodes(result.nodes)
 	outcomes := make([]clusterDialOutcome, len(nodes))
@@ -2852,8 +2852,10 @@ func (c *Client) dialSlot(slot, address string) (conn *connection, dialedAddress
 // than deadAddress — the one that just failed to redial — when the fresh
 // roster offers a choice; deadAddress may simply have been dropped from
 // discovery's roster too, in which case every candidate is already
-// "other". Falls back to deadAddress's own dial error when discovery
-// can't be reached (or reports no proxies) either.
+// "other". When discovery can't be reached (or reports no proxies) either,
+// the result is a plain ErrConnectionLost naming deadAddress — the
+// original dial error is not attached, since fetchProxyList reports only
+// success or failure.
 func (c *Client) reconnectAnotherProxy(deadAddress string) (*connection, string, error) {
 	proxies, ok := c.fetchProxyList()
 	if !ok || len(proxies) == 0 {

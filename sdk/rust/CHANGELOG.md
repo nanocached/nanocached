@@ -6,6 +6,19 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-05
+
+### Fixed
+
+- Documentation only (issue #478): the crate-level doc no longer claims every
+  operation is idempotent (`incr`/`decr`/`cas`/`delete_if_matches` are not,
+  see issue #225), the read-repair doc comment and README no longer describe
+  the write-back as untracked/undrained (it shares the fire-and-forget
+  replica budget and `close()` drains it), and the `close()` example in the
+  project docs now awaits it. No code change.
+
+## [0.4.0] - 2026-09-05
+
 ### Added
 
 - `incr`/`decr` (issue #129): `client.incr(key, delta)` atomically adds a

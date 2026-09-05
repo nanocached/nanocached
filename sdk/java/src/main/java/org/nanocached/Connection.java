@@ -883,11 +883,11 @@ final class Connection {
     // protocol. Without a cap, a malicious or buggy node that streams
     // bytes with no '\n' would grow readLine()'s buffer without bound,
     // gated only by requestTimeoutMillis rather than failing fast — mirrors
-    // .NET's Connection.MaxHeaderLineLength and Rust's 4 KiB (issue: audit
+    // .NET's Connection.MaxHeaderLineLength and Rust's 4 KiB (audit
     // finding, unbounded readLine). Package-private (not private): shared
     // with Identify.java's own readLine, which bounds the discovery
     // server's `N <count> <r>`/entry header lines against the same
-    // failure mode (issue: audit finding J-readLine — Identify's readLine
+    // failure mode (audit finding J-readLine — Identify's readLine
     // had no cap at all).
     static final int MAX_HEADER_LINE_LENGTH = 4096;
 
