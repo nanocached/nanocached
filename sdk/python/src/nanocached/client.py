@@ -1304,21 +1304,26 @@ class NanocachedClient:
         try:
             raw = await self._get_many_bytes(namespace, keys)
         except (PartialWrongNodeError, PartialConnectionLostError) as error:
-            # Defensive decode (issue #412): a stored value need not be
-            # valid UTF-8 even when this is get_many() rather than
-            # get_many_bytes() (nothing on the write side enforces
-            # that) — a plain .decode() raising UnicodeDecodeError here
-            # would replace the exception this except block exists to
-            # enrich and re-raise with an unrelated decode error,
-            # masking the wrong-node/partial-failure information callers
-            # need. errors="replace" keeps this best-effort convenience
-            # view lossy rather than exception-prone; the exact bytes
-            # are still available via partial_values before this
-            # reassignment, and via get_many_bytes() to any caller who
-            # needs them exact.
-            error.partial_values = {
-                key: value.decode(errors="replace") for key, value in error.partial_values.items()
-            }
+            # Defensive decode (issue #412, revised by issue #488): a
+            # stored value need not be valid UTF-8 even when this is
+            # get_many() rather than get_many_bytes() (nothing on the
+            # write side enforces that) — a plain .decode() raising
+            # UnicodeDecodeError here would replace the exception this
+            # except block exists to enrich and re-raise with an
+            # unrelated decode error, masking the wrong-node/partial-
+            # failure information callers need. Decoding is strict, the
+            # same as the success path's, but a value that fails it is
+            # left out of partial_values rather than handed back with
+            # replacement characters — a cache must never return a value
+            # it did not store. The exact bytes are still available via
+            # get_many_bytes() to any caller who needs them.
+            decoded: dict[str | bytes, str] = {}
+            for key, value in error.partial_values.items():
+                try:
+                    decoded[key] = value.decode()
+                except UnicodeDecodeError:
+                    continue
+            error.partial_values = decoded
             raise
         return {key: value.decode() for key, value in raw.items()}
 
