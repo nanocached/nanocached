@@ -740,6 +740,10 @@ func dedupeDiscoveredNodes(nodes []discoveredNode) []discoveredNode {
 // leak a socket successfully opened for a different node in the same
 // dial round.
 func (c *Client) openCluster(result *identified) error {
+	replication, err := result.nodeReplication()
+	if err != nil {
+		return err
+	}
 	nodes := dedupeDiscoveredNodes(result.nodes)
 	outcomes := make([]clusterDialOutcome, len(nodes))
 	var wg sync.WaitGroup
@@ -800,7 +804,7 @@ func (c *Client) openCluster(result *identified) error {
 	}
 
 	c.ring = NewHashRing(names)
-	c.replication = result.replication
+	c.replication = replication
 	return nil
 }
 
@@ -2514,8 +2518,14 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 	// every Add happens-before that Wait (mirrors the identical guard on
 	// backgroundReplicaWG in write() and tryReadRepair()); without it, a
 	// leg starting exactly as Close() observes the counter at zero could
-	// race sync.WaitGroup's Add/Wait and panic. There is no synchronous
-	// fallback here — a leg that loses this race is simply never started.
+	// race sync.WaitGroup's Add/Wait and panic. A refused start needs no
+	// fallback (issue #486): for the primary leg the caller below returns
+	// ErrClosed, exactly what any operation racing Close() gets; for a
+	// hedge leg the read simply carries on with the legs already in
+	// flight (tryStartNext treats the refusal as having run out of
+	// owners), which is the right outcome while Close() is draining —
+	// a hedge is an optimization, not a guarantee, and no new work should
+	// start on connections teardown is about to close.
 	start := func(index int) bool {
 		c.mu.Lock()
 		if c.closed {
@@ -2776,9 +2786,7 @@ func (c *Client) slotConnection(slot string) (*connection, error) {
 	fresh, dialedAddress, err := c.dialSlot(slot, address)
 	if err != nil {
 		if c.reconnectCooldown > 0 {
-			c.redialCooldownMu.Lock()
-			c.redialCooldowns[address] = redialCooldown{until: time.Now().Add(c.reconnectCooldown), err: err}
-			c.redialCooldownMu.Unlock()
+			c.armRedialCooldown(address, err)
 		}
 		return nil, err
 	}
@@ -2862,6 +2870,16 @@ func (c *Client) reconnectAnotherProxy(deadAddress string) (*connection, string,
 		return nil, "", connectionLost("proxy "+deadAddress+" is unreachable", nil)
 	}
 
+	// Issue #486 (the Go side of Java/.NET's issue #296 prune): in proxy
+	// mode refreshNodeList — the only other place cooldown entries are
+	// dropped — never runs, and once the client fails over, the dead
+	// proxy's address is never dialed by this client again, so its entry
+	// would sit in redialCooldowns for the client's whole lifetime — one
+	// per proxy the tier has ever autoscaled away. A fresh roster is
+	// exactly the set of addresses that can still be dialed; keep only
+	// those.
+	c.retainRedialCooldowns(proxies)
+
 	candidates := proxies
 	if len(proxies) > 1 {
 		other := make([]discoveredNode, 0, len(proxies)-1)
@@ -2875,6 +2893,41 @@ func (c *Client) reconnectAnotherProxy(deadAddress string) (*connection, string,
 		}
 	}
 	return c.dialRandomProxy(candidates)
+}
+
+// armRedialCooldown records a failed dial of address (see redialCooldown),
+// and, so the map can never grow past the set of addresses that failed
+// within the last reconnectCooldown regardless of which code path dials
+// (issue #486), drops every entry whose window has already passed — an
+// expired entry is inert (checked against time.Now on every read) and
+// would otherwise only be removed by a successful redial of that exact
+// address or by a node-list refresh, neither of which proxy mode has.
+func (c *Client) armRedialCooldown(address string, err error) {
+	now := time.Now()
+	c.redialCooldownMu.Lock()
+	defer c.redialCooldownMu.Unlock()
+	for other, cooldown := range c.redialCooldowns {
+		if other != address && !now.Before(cooldown.until) {
+			delete(c.redialCooldowns, other)
+		}
+	}
+	c.redialCooldowns[address] = redialCooldown{until: now.Add(c.reconnectCooldown), err: err}
+}
+
+// retainRedialCooldowns drops every cooldown entry whose address is not in
+// roster — see reconnectAnotherProxy (issue #486).
+func (c *Client) retainRedialCooldowns(roster []discoveredNode) {
+	live := make(map[string]struct{}, len(roster))
+	for _, entry := range roster {
+		live[entry.Address] = struct{}{}
+	}
+	c.redialCooldownMu.Lock()
+	defer c.redialCooldownMu.Unlock()
+	for address := range c.redialCooldowns {
+		if _, ok := live[address]; !ok {
+			delete(c.redialCooldowns, address)
+		}
+	}
 }
 
 func (c *Client) openNodeConnection(address string) (*connection, error) {
@@ -3003,7 +3056,11 @@ func (c *Client) fetchNodeList() ([]discoveredNode, int, bool) {
 		if len(result.nodes) == 0 {
 			continue
 		}
-		return result.nodes, result.replication, true
+		replication, err := result.nodeReplication()
+		if err != nil {
+			continue
+		}
+		return result.nodes, replication, true
 	}
 	return nil, 0, false
 }

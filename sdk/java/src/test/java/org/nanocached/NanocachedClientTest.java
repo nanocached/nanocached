@@ -5205,4 +5205,41 @@ class NanocachedClientTest {
             }
         }
     }
+
+    // Issue #486: the replica-writer pool is bounded in both threads and
+    // queue depth. Past both, the submitter runs the task itself (the same
+    // synchronous fallback every call site has for the permit-exhausted
+    // case) — and a pool that has been shut down still rejects, so the
+    // call sites' existing "close() raced us" handling keeps working.
+    @Test
+    void replicaWriterPoolRunsOverflowInlineAndStillRejectsAfterShutdown() throws Exception {
+        java.util.concurrent.ExecutorService pool = NanocachedClient.newReplicaWriterPool(1);
+        try {
+            java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch occupied = new java.util.concurrent.CountDownLatch(1);
+            Runnable block = () -> {
+                occupied.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            };
+            pool.execute(block);                       // occupies the single thread
+            assertTrue(occupied.await(5, java.util.concurrent.TimeUnit.SECONDS));
+            pool.execute(block);                       // fills the single queue slot
+
+            Thread[] ranOn = new Thread[1];
+            pool.execute(() -> ranOn[0] = Thread.currentThread());
+            assertSame(Thread.currentThread(), ranOn[0], "overflow must run on the submitter, not be queued or dropped");
+
+            release.countDown();
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertThrows(java.util.concurrent.RejectedExecutionException.class, () -> pool.execute(() -> {}),
+                    "a shut-down pool must still reject rather than silently discard");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
 }

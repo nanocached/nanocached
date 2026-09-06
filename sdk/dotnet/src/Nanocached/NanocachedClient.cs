@@ -3402,7 +3402,22 @@ public sealed class NanocachedClient : IDisposable
     {
         if (_reconnectCooldown is TimeSpan resolvedCooldown)
         {
-            _reconnectCooldowns[address] = (DateTime.UtcNow + resolvedCooldown, error);
+            DateTime now = DateTime.UtcNow;
+            // Issue #486: drop every entry whose window has already passed
+            // while we're here — an expired entry is inert
+            // (DialWithCooldownAsync checks the deadline on every read) and
+            // would otherwise only go away on a successful redial of that
+            // exact address or a node-list refresh, neither of which proxy
+            // mode ever does. Keeps the map bounded by the addresses that
+            // failed within the last cooldown, whichever code path dials.
+            foreach (var pair in _reconnectCooldowns)
+            {
+                if (pair.Key != address && now >= pair.Value.Until)
+                {
+                    _reconnectCooldowns.TryRemove(pair.Key, out _);
+                }
+            }
+            _reconnectCooldowns[address] = (now + resolvedCooldown, error);
         }
     }
 

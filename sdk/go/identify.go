@@ -37,11 +37,14 @@ type identified struct {
 	// property of how identify() was called (see discoveryListCommand),
 	// not of this struct.
 	nodes []discoveredNode
+	// list records which roster command produced nodes (issue #486) —
+	// listNodes or listProxies; zero on a node (`conn`) result.
+	list discoveryListCommand
 	// replication is only meaningful for a node-list (`L`) result — a
 	// proxy roster (`Q`) carries no replication field on the wire (a
 	// proxy client needs no R; see nanocached-discovery.rs's
-	// ListProxies), so this is left zero on a `Q` result and must not be
-	// read by proxy-mode callers.
+	// ListProxies). Read it through nodeReplication, which refuses a `Q`
+	// result instead of handing back a meaningless zero.
 	replication int
 	// tagged (echoed response tags): the node accepted the extended `A ... T`,
 	// so this connection's G/S/D traffic must carry tags and its
@@ -337,7 +340,18 @@ func identify(conn net.Conn, address string, authSecret []byte, probe authProbe,
 		return nil, err
 	}
 	_ = conn.Close()
-	return &identified{nodes: nodes, replication: replication}, nil
+	return &identified{nodes: nodes, replication: replication, list: list}, nil
+}
+
+// nodeReplication returns the replication factor a node-list (`L`) result
+// carried. A proxy roster (`Q`) has none, and a cluster-mode caller that
+// reads one is a bug, so this reports it instead of returning zero
+// (issue #486).
+func (r *identified) nodeReplication() (int, error) {
+	if r.list != listNodes {
+		return 0, fmt.Errorf("nanocached: replication factor requested from a %c roster", byte(r.list))
+	}
+	return r.replication, nil
 }
 
 // bufferedConn keeps the identify-time bufio.Reader attached to the

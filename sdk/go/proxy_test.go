@@ -299,3 +299,58 @@ func TestViaProxyHedgedReadOptionIsInert(t *testing.T) {
 		t.Fatalf("expected exactly 1 G on the wire (no hedge attempted), got %d", got)
 	}
 }
+
+// TestViaProxyFailoverDropsTheDeadProxysCooldownEntry (issue #486): in
+// proxy mode nothing ever refreshes the node list, so a cooldown entry
+// armed for a proxy the client has since failed away from used to stay in
+// redialCooldowns for the client's lifetime. Failing over fetches a fresh
+// roster, and every entry for an address not on it must go.
+func TestViaProxyFailoverDropsTheDeadProxysCooldownEntry(t *testing.T) {
+	proxyA := startMockNode(t, nil)
+	proxyB := startMockNode(t, nil)
+	discovery := startMockDiscovery(t, nil, 2)
+	discovery.setProxies([]discoveredNode{{Name: "proxy-a", Address: proxyA.address()}})
+
+	client, err := Connect(Config{
+		Addresses:         []Address{addr(discovery.address())},
+		ViaProxy:          true,
+		ReconnectCooldown: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Set("k", "v1", 0); err != nil {
+		t.Fatal(err)
+	}
+	deadAddress := proxyA.address()
+	hasCooldown := func(address string) bool {
+		client.redialCooldownMu.Lock()
+		defer client.redialCooldownMu.Unlock()
+		_, ok := client.redialCooldowns[address]
+		return ok
+	}
+
+	// Proxy A dies with nothing to fail over to yet: the redial fails
+	// outright and arms A's cooldown.
+	proxyA.dropConnections()
+	proxyA.close()
+	discovery.setProxies(nil)
+	if err := client.Set("k", "v2", 0); err == nil {
+		t.Fatal("expected the write to fail with no proxy reachable")
+	}
+	if !hasCooldown(deadAddress) {
+		t.Fatalf("expected a cooldown entry for the dead proxy %s", deadAddress)
+	}
+
+	// Once the cooldown lapses, the next redial fails over to B via a
+	// fresh roster — which no longer lists A.
+	time.Sleep(80 * time.Millisecond)
+	discovery.setProxies([]discoveredNode{{Name: "proxy-b", Address: proxyB.address()}})
+	if err := client.Set("k", "v3", 0); err != nil {
+		t.Fatalf("expected the client to fail over to proxy B, got %v", err)
+	}
+	if hasCooldown(deadAddress) {
+		t.Fatalf("expected the failover to drop the cooldown entry for %s", deadAddress)
+	}
+}
