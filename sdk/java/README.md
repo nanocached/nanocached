@@ -439,10 +439,10 @@ one connection and no ring view:
 - **No client-side replication.** There is nothing to fan a write out to
   or read a fallback from — the proxy (and whatever's behind it) owns
   that.
-- **`readHedgeAfter` is inert.** Hedging needs a second owner to send the
-  same read to; a single connection has none, so a configured hedge
-  interval simply never fires here (it is not rejected — it may still
-  apply to a different, non-proxy client sharing the same `Options`).
+- **`readHedgeAfter` is rejected.** Hedging needs a second owner to send
+  the same read to; a single connection has none, so `connect()` refuses
+  a `readHedgeAfter` set together with `viaProxy` (issue #488) rather than
+  carrying an option that can never take effect.
 
 On a lost connection, the client first retries the same proxy (it may
 simply have restarted); only if that also fails does it re-fetch the
@@ -462,8 +462,8 @@ NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
 
 `tls` is a plain boolean, default `false`. `ca` names a PEM file of
 trusted root certificate(s) — it's meaningful only when `tls` is `true`
-(silently ignored otherwise), and an unreadable or unparseable CA file is
-a connect-time error. `ca` accepts a `java.nio.file.Path`, or a `String`
+(set without it, `connect()` rejects the options — issue #488), and an
+unreadable or unparseable CA file is a connect-time error. `ca` accepts a `java.nio.file.Path`, or a `String`
 path / `java.io.File` via convenience overloads.
 
 ## Value compression

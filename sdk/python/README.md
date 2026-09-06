@@ -78,8 +78,10 @@ client = await NanocachedClient.connect(
 
 A proxy looks like a single node that owns every key, so once connected this
 client is in its ordinary single-connection mode: no ring, no client-side
-replication, and `read_hedge_after` is inert — there are no replicas to
-hedge to, so it is simply ignored rather than rejected. Namespaces,
+replication, and no hedged reads — there are no replicas to hedge to, so
+`connect()` rejects a `read_hedge_after` set together with `via_proxy`
+(issue #488: an option that can never take effect is a misconfiguration,
+not something to ignore). Namespaces,
 clear/clear_all, tags, keep-alive and compression all work unchanged.
 Pointing `via_proxy` at an address that turns out to be a cache node (not a
 discovery server) fails `connect()` outright with a clear error; an empty
@@ -389,8 +391,8 @@ single copy there is nobody to hedge to. Writes are unaffected — every
 copy must be written, so a slow owner bounds writes to it regardless
 (`fire_and_forget_replicas` moves only the replica legs off the caller's
 path). The losing leg of a hedge is left to finish and is drained by
-`close()`. Also inert with `via_proxy` (see Proxy mode) for the same
-reason — a proxy connection has no replicas of its own to hedge to either.
+`close()`. Rejected by `connect()` together with `via_proxy` (see Proxy
+mode) — a proxy connection has no replicas of its own to hedge to either.
 
 ## Reconnect and keep-alive
 
@@ -480,8 +482,10 @@ client = await NanocachedClient.connect(
 )
 ```
 
-`ca` is only meaningful when `tls=True`; if `tls=False` it is silently
-ignored. An unreadable or unparseable CA file is a connect-time error.
+`ca` is only meaningful when `tls=True`; a `ca` set with `tls=False` is
+rejected by `connect()` (issue #488) — it is almost always a forgotten
+`tls=True`. An unreadable or unparseable CA file is a connect-time error
+too.
 
 ## Value compression
 

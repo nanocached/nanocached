@@ -4346,27 +4346,36 @@ public class NanocachedClientTests
     }
 
     [Fact]
-    public async Task ViaProxyIgnoresReadHedgeAfterSinceThereIsNoReplicaToHedgeTo()
+    public async Task ConnectRejectsReadHedgeAfterWithViaProxy()
     {
+        // Issue #488: a proxy connection has no replicas to hedge to, so a
+        // configured ReadHedgeAfter can never take effect — ConnectAsync
+        // rejects the combination instead of ignoring it.
         using var proxy = new MockNode();
         using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
         discovery.SetProxies(new[] { ("proxy-1", proxy.Address) });
 
-        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        var error = await Assert.ThrowsAsync<ArgumentException>(() => NanocachedClient.ConnectAsync(new NanocachedClient.Options
         {
             Addresses = { ("127.0.0.1", discovery.Port) },
             ViaProxy = true,
             ReadHedgeAfter = TimeSpan.FromMilliseconds(50),
-        });
+        }));
+        Assert.Contains("ReadHedgeAfter has no effect with ViaProxy", error.Message);
+    }
 
-        await client.SetAsync("k", "v");
-        Assert.Equal("v", await client.GetAsync("k"));
-        Assert.Equal("v", await client.GetAsync("k"));
-
-        // No ring in proxy mode, so ReadAsync never reaches
-        // ReadHedgedAsync at all: exactly one G per GetAsync call, on the
-        // one connection, whatever ReadHedgeAfter says.
-        Assert.Equal(2, proxy.GetCount); // the two GetAsync calls above
+    [Fact]
+    public async Task ConnectRejectsCaWithoutTls()
+    {
+        // Issue #488: a CA file is only ever read over TLS; setting one
+        // without Tls = true is almost always a forgotten Tls = true.
+        using var node = new MockNode();
+        var error = await Assert.ThrowsAsync<ArgumentException>(() => NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", node.Port) },
+            Ca = "/nonexistent/ca.pem",
+        }));
+        Assert.Contains("Ca is only used when Tls is true", error.Message);
     }
 }
 

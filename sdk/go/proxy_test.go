@@ -9,6 +9,7 @@ package nanocached
 // G/S/D/g/s/d/c/F, never W.
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -268,35 +269,32 @@ func TestViaProxyGetManyAndSetManyRideTheSingleConnection(t *testing.T) {
 	}
 }
 
-func TestViaProxyHedgedReadOptionIsInert(t *testing.T) {
+func TestViaProxyRejectsReadHedgeAfter(t *testing.T) {
+	// Issue #488: a proxy connection has no replicas to hedge to, so a
+	// configured ReadHedgeAfter can never take effect — Connect rejects
+	// the combination instead of ignoring it.
 	proxy := startMockNode(t, nil)
 	discovery := startMockDiscovery(t, nil, 2)
 	discovery.setProxies([]discoveredNode{{Name: "proxy-a", Address: proxy.address()}})
 
-	client, err := Connect(Config{
+	_, err := Connect(Config{
 		Addresses:      []Address{addr(discovery.address())},
 		ViaProxy:       true,
 		ReadHedgeAfter: time.Millisecond,
 	})
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "ReadHedgeAfter has no effect with ViaProxy") {
+		t.Fatalf("expected Connect to reject ReadHedgeAfter with ViaProxy, got %v", err)
 	}
-	defer client.Close()
+}
 
-	proxy.delayGets(20 * time.Millisecond) // long past ReadHedgeAfter
-	if err := client.Set("k", "v", 0); err != nil {
-		t.Fatal(err)
-	}
-	value, ok, err := client.Get("k")
-	if err != nil || !ok || value != "v" {
-		t.Fatalf("Get() = %q, %v, %v", value, ok, err)
-	}
-	// A single owner (the one proxy connection) means there is nothing to
-	// hedge to even if the option were somehow live — one G is the only
-	// possible outcome, hedged or not. This asserts it explicitly rather
-	// than relying on that structural argument alone.
-	if got := proxy.getCount.Load(); got != 1 {
-		t.Fatalf("expected exactly 1 G on the wire (no hedge attempted), got %d", got)
+func TestConnectRejectsCAWithoutTLS(t *testing.T) {
+	// Issue #488: a CA file is only ever read when TLS is on; setting one
+	// without TLS is almost always a forgotten TLS: true, so Connect says
+	// so instead of silently connecting in plaintext.
+	node := startMockNode(t, nil)
+	_, err := Connect(Config{Addresses: []Address{addr(node.address())}, CA: "/nonexistent/ca.pem"})
+	if err == nil || !strings.Contains(err.Error(), "CA is only used when TLS is true") {
+		t.Fatalf("expected Connect to reject CA without TLS, got %v", err)
 	}
 }
 

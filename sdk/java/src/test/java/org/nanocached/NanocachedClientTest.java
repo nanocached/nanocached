@@ -5187,22 +5187,31 @@ class NanocachedClientTest {
     }
 
     @Test
-    void viaProxyIgnoresReadHedgeAfterAndSendsASingleGet() throws Exception {
+    void connectRejectsReadHedgeAfterWithViaProxy() throws Exception {
+        // Issue #488: a proxy connection has no replicas to hedge to, so a
+        // configured readHedgeAfter can never take effect — connect()
+        // rejects the combination instead of ignoring it.
         try (MockNode proxy = new MockNode();
                 MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
             discovery.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
-            // Slow but alive: would trigger a hedge leg to a second owner
-            // if hedging were ever attempted here — proxy mode has only
-            // one connection, so there is nobody to hedge to regardless.
-            proxy.delayGets(50);
+            IllegalArgumentException error = assertThrows(IllegalArgumentException.class, () ->
+                    NanocachedClient.connect(
+                            viaProxyOptions(discovery.port()).readHedgeAfter(Duration.ofMillis(10))));
+            assertTrue(error.getMessage().contains("readHedgeAfter has no effect with viaProxy"), error.getMessage());
+        }
+    }
 
-            try (NanocachedClient client = NanocachedClient.connect(
-                    viaProxyOptions(discovery.port()).readHedgeAfter(Duration.ofMillis(10)))) {
-                client.set("k", "v");
-                assertEquals(Optional.of("v"), client.get("k"));
-                assertEquals(1, proxy.getCount.get(),
-                        "readHedgeAfter must be inert in viaProxy mode — no hedge leg on the wire");
-            }
+    @Test
+    void connectRejectsCaWithoutTls() throws Exception {
+        // Issue #488: a CA file is only ever read over TLS; setting one
+        // without tls(true) is almost always a forgotten tls(true).
+        try (MockNode node = new MockNode()) {
+            IllegalArgumentException error = assertThrows(IllegalArgumentException.class, () ->
+                    NanocachedClient.connect(
+                            NanocachedClient.builder()
+                                    .addresses(List.of(new Address("127.0.0.1", node.port())))
+                                    .ca("/nonexistent/ca.pem")));
+            assertTrue(error.getMessage().contains("ca is only used when tls is enabled"), error.getMessage());
         }
     }
 

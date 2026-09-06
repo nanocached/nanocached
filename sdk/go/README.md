@@ -158,9 +158,10 @@ Pointing `ViaProxy` at a plain node address (not discovery) fails
 A proxy answers the identify handshake exactly like a single node that
 owns every key, so from there the client runs in its ordinary
 single-connection mode: no ring, no per-node connections, and — since a
-single connection has no replicas to hedge to — **a configured
-`ReadHedgeAfter` is inert in proxy mode** (every read simply goes to the
-one connection; there is nothing to hedge onto). Every other option —
+single connection has no replicas to hedge to — **`Connect` rejects a
+configured `ReadHedgeAfter` together with `ViaProxy`** (issue #488: an
+option that can never take effect is a misconfiguration, not something
+to ignore). Every other option —
 `Compress`, `FireAndForgetReplicas`, `ReadRepair`, namespaces,
 `Clear`/`ClearAll`, keep-alive — works unchanged over the one connection.
 
@@ -482,8 +483,10 @@ client, err := nanocached.Connect(nanocached.Config{
 })
 ```
 
-`CA` is silently ignored when `TLS` is `false`. An unreadable or
-unparseable CA file when `TLS` is `true` fails `Connect`.
+A set `CA` with `TLS` `false` fails `Connect` (issue #488) — a CA is
+only ever read over TLS, so that combination is almost always a
+forgotten `TLS: true`. An unreadable or unparseable CA file when `TLS`
+is `true` fails `Connect` too.
 
 ## Values and TTL
 

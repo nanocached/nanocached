@@ -4305,6 +4305,20 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
     HEDGE_READ_TUNING.maxLoserLegs = 32;
   });
 
+  it("rejects readHedgeAfterMs together with viaProxy (issue #488)", async () => {
+    await assert.rejects(
+      () => NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: 1 }], viaProxy: true, readHedgeAfterMs: 50 }),
+      (error: Error) => error instanceof NanocachedError && error.message.includes("readHedgeAfterMs has no effect with viaProxy"),
+    );
+  });
+
+  it("rejects ca without tls (issue #488)", async () => {
+    await assert.rejects(
+      () => NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: 1 }], ca: "/nonexistent/ca.pem" }),
+      (error: Error) => error instanceof NanocachedError && error.message.includes("ca is only used when tls is true"),
+    );
+  });
+
   it("rejects a non-positive readHedgeAfterMs", async () => {
     for (const bad of [0, -1]) {
       await assert.rejects(
@@ -5961,26 +5975,22 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
     }
   });
 
-  it("ignores readHedgeAfterMs — a proxy connection has no replicas to hedge to", async () => {
+  it("rejects readHedgeAfterMs — a proxy connection has no replicas to hedge to (issue #488)", async () => {
     const proxy = await startMockNode();
     const discovery = await startMockDiscovery([]);
     discovery.setProxies([{ name: "proxy-1", address: proxy.address }]);
     try {
-      const client = await NanocachedClient.connect({
-        addresses: [{ host: "127.0.0.1", port: discovery.port }],
-        viaProxy: true,
-        readHedgeAfterMs: 10,
-      });
-      try {
-        await client.set("k", "v");
-        proxy.delayGets(50);
-        assert.equal(await client.get("k"), "v");
-        // A hedge would have sent a second G shortly after the first;
-        // exactly one reached the wire.
-        assert.equal(proxy.getCount(), 1);
-      } finally {
-        client.close();
-      }
+      await assert.rejects(
+        () =>
+          NanocachedClient.connect({
+            addresses: [{ host: "127.0.0.1", port: discovery.port }],
+            viaProxy: true,
+            readHedgeAfterMs: 10,
+          }),
+        (error: Error) => error instanceof NanocachedError && error.message.includes("readHedgeAfterMs has no effect with viaProxy"),
+      );
+      // Nothing was dialed: the rejection is a configuration check, ahead of any socket.
+      assert.equal(proxy.getCount(), 0);
     } finally {
       await Promise.all([discovery.close(), proxy.close()]);
     }

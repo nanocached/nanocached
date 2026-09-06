@@ -127,8 +127,9 @@ const client = await NanocachedClient.connect({
 ```
 
 `ca` is only meaningful when `tls: true`; a `ca` set with `tls` unset or
-`false` is silently ignored. An unreadable or unparseable CA file is a
-connect-time error.
+`false` is rejected by `connect()` (issue #488) — it is almost always a
+forgotten `tls: true`. An unreadable or unparseable CA file is a
+connect-time error too.
 
 ## Value compression
 
@@ -317,8 +318,9 @@ direct-node fallback.
 A proxy looks exactly like a single node that owns every key, so once
 connected the client is in the same single-connection mode a direct node
 address puts it in: no ring view, no per-node connections, and **no hedged
-reads** — `readHedgeAfterMs` is inert under `viaProxy`, since a proxy
-connection has no replicas to hedge to. Namespaces, `clear`/`clearAll`,
+reads** — `connect()` rejects a `readHedgeAfterMs` set together with
+`viaProxy` (issue #488), since a proxy connection has no replicas to hedge
+to and an option that can never take effect is a misconfiguration. Namespaces, `clear`/`clearAll`,
 tags, keep-alive, and compression all work unchanged over that one
 connection.
 

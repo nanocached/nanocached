@@ -5219,26 +5219,34 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             await proxy.close()
 
-    async def test_hedge_option_is_inert_in_proxy_mode(self):
+    async def test_connect_rejects_read_hedge_after_with_via_proxy(self):
+        # Issue #488: a proxy connection has no replicas to hedge to, so a
+        # configured read_hedge_after can never take effect — connect()
+        # rejects the combination instead of ignoring it.
         proxy = await MockNode().start()
         discovery = await MockDiscovery(
             nodes=[], proxies=[(NAMES[0], proxy.address)]
         ).start()
         try:
-            client = await NanocachedClient.connect(
-                [("127.0.0.1", discovery.port)], via_proxy=True, read_hedge_after=0.01
-            )
-            try:
-                await client.set("k", "v")
-                proxy.get_count = 0
-                self.assertEqual(await client.get("k"), "v")
-                # No hedge leg — exactly one G reached the wire.
-                self.assertEqual(proxy.get_count, 1)
-            finally:
-                await client.close()
+            with self.assertRaises(ValueError) as ctx:
+                await NanocachedClient.connect(
+                    [("127.0.0.1", discovery.port)], via_proxy=True, read_hedge_after=0.01
+                )
+            self.assertIn("read_hedge_after has no effect with via_proxy", str(ctx.exception))
         finally:
             await discovery.close()
             await proxy.close()
+
+    async def test_connect_rejects_ca_without_tls(self):
+        # Issue #488: a CA file is only ever read over TLS; setting one
+        # without tls=True is almost always a forgotten tls=True.
+        node = await MockNode().start()
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                await NanocachedClient.connect([("127.0.0.1", node.port)], ca="/nonexistent/ca.pem")
+            self.assertIn("ca is only used when tls is True", str(ctx.exception))
+        finally:
+            await node.close()
 
 
 class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):

@@ -179,8 +179,9 @@ export interface NanocachedClientOptions {
    * with a clear error, since proxy mode has no direct-node fallback.
    * Once connected, this client is in the same single-connection mode a
    * lone node address puts it in: no ring view, no per-node connections,
-   * and no hedged reads — `readHedgeAfterMs` is inert here, since a proxy
-   * connection has no replicas to hedge to. Namespaces, clear/clearAll,
+   * and no hedged reads — `connect()` rejects a `readHedgeAfterMs` set
+   * together with `viaProxy` (issue #488), since a proxy connection has no
+   * replicas to hedge to. Namespaces, clear/clearAll,
    * tags, keep-alive, and compression all work unchanged over that one
    * connection. The proxy is chosen at random from discovery's roster
    * (spreading a fleet of clients across proxies), with random failover
@@ -202,9 +203,9 @@ export interface NanocachedClientOptions {
    * self-signed certificate with no CA-issued alternative available.
    * Read once (synchronously) inside `connect()` and reused for every
    * dial this client ever makes, including reconnects and node-list
-   * refreshes. Only meaningful when `tls` is true; silently ignored
-   * otherwise. An unreadable or unparseable file is a connect-time
-   * error. */
+   * refreshes. Only meaningful when `tls` is true; set without it,
+   * `connect()` rejects the options (issue #488). An unreadable or
+   * unparseable file is a connect-time error. */
   ca?: string;
   /** Transparently compress values above `compressionThreshold` on `set`
    * and decompress them on `get`/`getBytes` (value compression). Off by
@@ -243,9 +244,10 @@ export interface NanocachedClientOptions {
    * read that touches it at its full round trip. Only applies when the
    * key has at least 2 owners (`replication >= 2`); with a single copy
    * there is nobody to hedge to. Must be a positive number when set — a
-   * non-positive value is rejected at `connect()`. Inert under `viaProxy`
-   * (issue #122): a proxy connection is single-connection mode, so there
-   * is never a second owner to hedge to either. */
+   * non-positive value is rejected at `connect()`, and so is setting it
+   * together with `viaProxy` (issue #488): a proxy connection is
+   * single-connection mode, so there is never a second owner to hedge to
+   * either. */
   readHedgeAfterMs?: number;
   /** How long, after a reconnect dial to an address fails, that address is
    * treated as still down — a request routed to it during this window
@@ -753,11 +755,20 @@ export class NanocachedClient {
     if (options.readHedgeAfterMs !== undefined && !(options.readHedgeAfterMs > 0)) {
       throw new NanocachedError("nanocached: readHedgeAfterMs must be a positive number of milliseconds");
     }
+    // Issue #488: an option that can have no effect in this configuration
+    // is a misconfiguration, not something to ignore quietly.
+    if (options.viaProxy === true && options.readHedgeAfterMs !== undefined) {
+      throw new NanocachedError(
+        "nanocached: readHedgeAfterMs has no effect with viaProxy (a proxy connection has no replicas to hedge to); unset one of them",
+      );
+    }
+    if (options.ca !== undefined && options.tls !== true) {
+      throw new NanocachedError("nanocached: ca is only used when tls is true; enable tls or unset ca");
+    }
 
-    // ca is meaningful only paired with tls: true; a set ca with tls not
-    // enabled is silently ignored rather than an error. Read once here
-    // (not per-dial) and reused for every connection this instance ever
-    // opens, including reconnects and node-list refreshes.
+    // ca is meaningful only paired with tls: true (checked above). Read
+    // once here (not per-dial) and reused for every connection this
+    // instance ever opens, including reconnects and node-list refreshes.
     const ca = options.tls === true && options.ca !== undefined ? readFileSync(options.ca) : undefined;
     const compress = options.compress === true;
     const compressionThreshold = options.compressionThreshold ?? DEFAULT_COMPRESSION_THRESHOLD;

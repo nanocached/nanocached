@@ -5894,11 +5894,10 @@ async fn via_proxy_reconnect_purges_the_departed_proxys_cooldown_entry() {
 }
 
 #[tokio::test]
-async fn via_proxy_ignores_read_hedge_after_and_sends_a_single_get() {
-    // Hedging is inert in proxy mode (Options::via_proxy's own doc
-    // comment): Target::Single short-circuits before the hedge path ever
-    // runs, so this asserts exactly one `G` reaches the wire even with a
-    // very short hedge window that would otherwise fire immediately.
+async fn connect_rejects_read_hedge_after_with_via_proxy() {
+    // Issue #488: a proxy connection has no replicas to hedge to, so a
+    // configured read_hedge_after can never take effect — connect()
+    // rejects the combination instead of ignoring it.
     let proxy = MockNode::start().await;
     let discovery = MockDiscovery::start_with_proxies(
         vec![],
@@ -5907,20 +5906,48 @@ async fn via_proxy_ignores_read_hedge_after_and_sends_a_single_get() {
     )
     .await;
 
-    let client = NanocachedClient::connect(
+    let result = NanocachedClient::connect(
         Options::new()
             .addresses([("127.0.0.1", discovery.port)])
             .via_proxy(true)
             .read_hedge_after(Duration::from_millis(1)),
     )
-    .await
-    .unwrap();
-    client.set("k", "v", 0).await.unwrap();
-    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+    .await;
+    match result {
+        Err(Error::InvalidArgument(message)) => {
+            assert!(
+                message.contains("read_hedge_after has no effect with via_proxy"),
+                "{message}"
+            )
+        }
+        Err(other) => panic!("expected InvalidArgument, got {other:?}"),
+        Ok(_) => panic!("expected InvalidArgument, got a connected client"),
+    }
 
-    assert_eq!(proxy.state.gets.load(Ordering::SeqCst), 1);
-
-    client.close().await;
     discovery.stop();
     proxy.stop();
+}
+
+#[tokio::test]
+async fn connect_rejects_ca_without_tls() {
+    // Issue #488: a CA file is only ever read over TLS; setting one
+    // without tls(true) is almost always a forgotten tls(true).
+    let node = MockNode::start().await;
+    let result = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", node.port)])
+            .ca("/nonexistent/ca.pem"),
+    )
+    .await;
+    match result {
+        Err(Error::InvalidArgument(message)) => {
+            assert!(
+                message.contains("ca is only used when tls(true)"),
+                "{message}"
+            )
+        }
+        Err(other) => panic!("expected InvalidArgument, got {other:?}"),
+        Ok(_) => panic!("expected InvalidArgument, got a connected client"),
+    }
+    node.stop();
 }

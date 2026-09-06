@@ -127,7 +127,8 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         /** A PEM file of trusted root certificate(s). Meaningful only when
-         * {@link #tls} is enabled — silently ignored otherwise. */
+         * {@link #tls} is enabled — set without it, {@code connect()}
+         * rejects the options (issue #488). */
         public Options ca(Path path) {
             this.ca = path;
             return this;
@@ -664,6 +665,18 @@ public final class NanocachedClient implements AutoCloseable {
             throw new IllegalArgumentException(
                     "nanocached: compressionThreshold must not be negative, got "
                             + options.compressionThreshold);
+        }
+        // Issue #488: an option that can have no effect in this
+        // configuration is a misconfiguration, not something to ignore
+        // quietly.
+        if (options.viaProxy && options.readHedgeAfter != null) {
+            throw new IllegalArgumentException(
+                    "nanocached: readHedgeAfter has no effect with viaProxy "
+                            + "(a proxy connection has no replicas to hedge to); unset one of them");
+        }
+        if (options.ca != null && !options.tls) {
+            throw new IllegalArgumentException(
+                    "nanocached: ca is only used when tls is enabled; enable tls or unset ca");
         }
 
         SSLContext sslContext = buildSslContext(options.tls, options.ca);
