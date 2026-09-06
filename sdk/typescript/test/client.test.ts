@@ -2319,6 +2319,32 @@ describe("NanocachedClient incr/decr cluster replication (issue #129) — primar
     }
   });
 
+  it("survives a primary TTL past Number.MAX_SAFE_INTEGER, clamping the replica's set to it (issue #501)", async () => {
+    // Regression: a TTL another SDK stored as a u64 above 2^53 (this
+    // SDK's encodeSet refuses to send one) came back on the primary's
+    // `I` reply and was rejected as an invalid field — which poisoned
+    // the whole connection, not just this request. It must parse, incr
+    // must resolve, the replica forward must carry the largest TTL this
+    // SDK can encode, and the connection must keep working afterwards.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "incr-u64-ttl";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await client.set(key, "10");
+      primary.mock.answerIncrTtlOnce("18446744073709551615");
+      assert.equal(await client.incr(key), 11);
+
+      assert.equal(replica.mock.lastCommand(), "S");
+      assert.equal(replica.mock.lastSetTtl(), Number.MAX_SAFE_INTEGER, "the replica's set must carry the clamped TTL");
+      assert.equal(await client.get(key), "11", "the primary's connection must not have been poisoned");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
   it("never touches the replica on a miss or a non-numeric value — nothing was written", async () => {
     const cluster = await startReplicatedCluster();
     const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });

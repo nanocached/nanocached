@@ -472,7 +472,9 @@ export interface ParsedResponse {
    * fields after `<value-length>` means no TTL, 1 means TTL present; on a
    * tagged connection 1 trailing field means "just the tag", 2 means
    * "ttl then tag" — disambiguated purely by whether the connection is
-   * tagged, never guessed frame by frame. */
+   * tagged, never guessed frame by frame. Any u64 the wire can carry
+   * (issue #501); imprecise as a `number` past 2^53, like an INCR
+   * counter — see parseTtlSeconds. */
   ttlSeconds?: number;
   /** Batched get's per-key roster (issues #128/#150/#151), present only
    * on a `"multi"` response, one entry per requested key in request
@@ -589,19 +591,26 @@ function parseTag(field: string): number {
 // whole seconds, same strict decimal-digits-only grammar as a tag (see
 // TAG_PATTERN's own doc comment); a desynced/corrupt field must not be
 // silently accepted the way bare `Number(field)` would. Issue #233: also
-// bounded by magnitude, same as parseTag — a long-enough digit string
-// parses to `Infinity` (or a value that's silently lost precision) via
-// bare `Number()` instead of failing, unlike Rust's `str::parse::<u64>`
-// (this field's wire type), which errors on overflow.
+// bounded by magnitude — a long-enough digit string parses to `Infinity`
+// via bare `Number()` instead of failing, unlike Rust's
+// `str::parse::<u64>` (this field's wire type), which errors on overflow.
+// Issue #501: the bound is the wire type's own, u64, not
+// `Number.isSafeInteger`. The server echoes whatever TTL the entry was
+// stored with, and the Python and Rust SDKs can store the full u64
+// range, so a TTL between 2^53 and 2^64 is a legitimate reply (one this
+// SDK cannot *send*, see encodeSet, but must not mistake for a desynced
+// stream — that mistake poisoned the whole connection). Past 2^53 the
+// returned number is imprecise, exactly like an INCR counter past that
+// point (parseCounterValue); the only consumer, the replica forward in
+// NanocachedClient, clamps it to Number.MAX_SAFE_INTEGER.
+const TTL_PATTERN = /^[0-9]{1,20}$/;
+const MAX_TTL_SECONDS = 2n ** 64n - 1n;
+
 function parseTtlSeconds(field: string): number {
-  if (!TAG_PATTERN.test(field)) {
+  if (!TTL_PATTERN.test(field) || BigInt(field) > MAX_TTL_SECONDS) {
     throw new NanocachedError("nanocached: invalid ttl in response");
   }
-  const ttlSeconds = Number(field);
-  if (!Number.isSafeInteger(ttlSeconds)) {
-    throw new NanocachedError("nanocached: invalid ttl in response");
-  }
-  return ttlSeconds;
+  return Number(field);
 }
 
 // Same strict-decimal-digits-only, magnitude-checked parsing as
