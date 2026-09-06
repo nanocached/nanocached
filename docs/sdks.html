@@ -165,6 +165,15 @@ existed, err := client.Delete("greeting")</code></pre>
 
 <h2 id="behavior">Shared behavior, briefly</h2>
 <ul>
+  <li><b>Tuning knobs that tests can turn</b> — each SDK exposes a handful
+  of production constants (request timeout, keep-alive interval, the
+  in-flight budgets for fire-and-forget replica writes and hedge legs,
+  the batch-decompression cap) as mutable, documented-but-hidden values
+  so its own test suite can shrink them. That is a deliberate convention
+  (issue #488), not an API: they are not part of any SDK's public
+  surface, changing one affects every client in the process, and a test
+  that lowers one is expected to restore it. Applications configure
+  what they need through the connect options instead.</li>
   <li><b>Framework adapters</b> — separate, ecosystem-specific packages on
   top of the SDKs (outside the SDK parity policy): Spring
   (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/spring">adapters/spring</a>,
