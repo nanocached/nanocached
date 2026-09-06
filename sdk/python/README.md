@@ -536,8 +536,9 @@ produce a value the protocol can't safely round-trip — see "Counters
   returns only after any in-flight background replica writes finish and
   every connection is torn down. It also waits for an in-flight
   node-list refresh or redial to finish before returning — a guarantee
-  the other SDKs' `close()` does not make (see issue #488 for whether
-  that stays a Python-only difference). It is idempotent, but calling it again
+  the other SDKs' `close()` does not make — a deliberate Python-only
+  guarantee (issue #488), kept because asyncio makes it cheap here and
+  it would slow `close()` down elsewhere. It is idempotent, but calling it again
   on an already-closed client prints a warning to stderr — usually a sign the client's
   lifecycle was mismanaged. Likewise, calling `connect()` again for the
   same single address while a previous connection to it is still open
