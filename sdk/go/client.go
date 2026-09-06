@@ -90,7 +90,7 @@ type Config struct {
 	TLS bool
 	// CA names a PEM file of trusted root certificate(s), replacing the
 	// platform/system trust store. Only meaningful when TLS is true; a
-	// set CA is silently ignored when TLS is false.
+	// set CA with TLS false is rejected by Connect (issue #488).
 	CA string
 	// Compress transparently DEFLATE-compresses values at or above
 	// CompressionThreshold on Set/SetBytes and decompresses them on
@@ -163,9 +163,9 @@ type Config struct {
 	// that owns every key, so from then on the client runs in its
 	// ordinary single-connection mode: no ring, no per-node connections,
 	// and — since a single connection has no replicas to hedge to — a
-	// configured ReadHedgeAfter is inert (every other option — Compress,
-	// FireAndForgetReplicas, ReadRepair, namespaces, clear/clear-all,
-	// keep-alive — is unaffected). Losing the proxy connection first
+	// configured ReadHedgeAfter is rejected by Connect (issue #488; every
+	// other option — Compress, FireAndForgetReplicas, ReadRepair,
+	// namespaces, clear/clear-all, keep-alive — is unaffected). Losing the proxy connection first
 	// retries the same proxy (it may simply have restarted); only if
 	// that also fails does the client re-fetch the roster and pick
 	// another at random. Off by default.
@@ -550,10 +550,18 @@ func Connect(config Config) (*Client, error) {
 		return nil, fmt.Errorf(
 			"nanocached: ReadHedgeAfter must not be negative, got %v", config.ReadHedgeAfter)
 	}
-	// ReadHedgeAfter isn't rejected alongside ViaProxy: it's merely inert
-	// there (see Config.ViaProxy's doc), not a misconfiguration — a
-	// caller that toggles ViaProxy per environment shouldn't also have to
-	// conditionally unset ReadHedgeAfter.
+	// Issue #488: an option that can have no effect in this configuration
+	// is a misconfiguration, not something to ignore quietly — a caller
+	// that toggles ViaProxy per environment must unset ReadHedgeAfter
+	// alongside it, and a CA without TLS is almost always a forgotten
+	// TLS: true.
+	if config.ViaProxy && config.ReadHedgeAfter > 0 {
+		return nil, fmt.Errorf(
+			"nanocached: ReadHedgeAfter has no effect with ViaProxy (a proxy connection has no replicas to hedge to); unset one of them")
+	}
+	if config.CA != "" && !config.TLS {
+		return nil, fmt.Errorf("nanocached: CA is only used when TLS is true; enable TLS or unset CA")
+	}
 
 	tlsConfig, err := buildTLSConfig(config)
 	if err != nil {

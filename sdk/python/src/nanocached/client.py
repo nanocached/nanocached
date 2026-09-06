@@ -401,8 +401,9 @@ def _check_token(token: str) -> bytes:
 
 
 def _build_ssl_context(tls: bool, ca: str | os.PathLike | None) -> ssl_module.SSLContext | None:
-    """``ca`` is meaningful only when ``tls`` is true — silently ignored
-    otherwise. An unreadable/unparseable CA file is a connect-time error
+    """``ca`` is meaningful only when ``tls`` is true — connect() has
+    already rejected a ``ca`` without ``tls`` by the time this runs (issue
+    #488). An unreadable/unparseable CA file is a connect-time error
     (raised synchronously, before any socket is opened)."""
     if not tls:
         return None
@@ -563,6 +564,16 @@ class NanocachedClient:
             raise ValueError("nanocached: connect() needs a non-empty addresses list")
         if read_hedge_after is not None and not read_hedge_after > 0:
             raise ValueError("nanocached: read_hedge_after must be a positive number of seconds")
+        # Issue #488: an option that can have no effect in this
+        # configuration is a misconfiguration, not something to ignore
+        # quietly.
+        if via_proxy and read_hedge_after is not None:
+            raise ValueError(
+                "nanocached: read_hedge_after has no effect with via_proxy "
+                "(a proxy connection has no replicas to hedge to); unset one of them"
+            )
+        if ca is not None and not tls:
+            raise ValueError("nanocached: ca is only used when tls is True; enable tls or unset ca")
 
         client = cls()
         client._addresses = list(addresses)

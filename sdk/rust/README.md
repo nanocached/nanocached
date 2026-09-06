@@ -75,9 +75,10 @@ let client = NanocachedClient::connect(
 
 A proxy looks, on the wire, exactly like a single node that owns every
 key, so from here on the client runs in its existing single-connection
-mode: no ring view, no per-node connections, and **`read_hedge_after` is
-inert if also set** — there are no replicas on this one connection to
-hedge a read to. Namespaces, `clear`/`clear_all`, compression, and
+mode: no ring view, no per-node connections, and **`connect()` rejects a
+`read_hedge_after` set together with `via_proxy`** (issue #488) — there
+are no replicas on this one connection to hedge a read to, and an option
+that can never take effect is a misconfiguration. Namespaces, `clear`/`clear_all`, compression, and
 keep-alive all work unchanged. If the proxy connection is lost, the same
 proxy is redialed first (it may simply have restarted); only if that
 also fails does the client re-fetch the roster from discovery and swap
@@ -524,8 +525,8 @@ nanocached = { version = "0.2", default-features = false } # plaintext only, sma
 ```
 
 `tls` is a plain bool; `ca` names a PEM file of trusted root
-certificate(s) and is only meaningful when `tls(true)` (silently ignored
-otherwise). Without `ca`, `tls(true)` verifies against the platform's
+certificate(s) and is only meaningful when `tls(true)` (set without it,
+`connect()` rejects the options — issue #488). Without `ca`, `tls(true)` verifies against the platform's
 trust store; with it, `ca`'s certificate(s) replace that store entirely.
 An unreadable or unparseable CA file is a `connect()`-time error, as is
 `tls(true)` when the crate was built with `default-features = false`.

@@ -76,8 +76,9 @@ of silently pinning to it. A proxy looks exactly like a single node that
 owns every key (full `Get`/`Set`/`Delete`, never routing-stale), so once
 connected the client is in its ordinary single-connection mode: **no
 ring, no per-node connections, and no hedged reads** — there is nobody
-else to hedge to, so a configured `ReadHedgeAfter` is accepted but inert
-under `ViaProxy`. Namespaces, `ClearAsync`/`ClearAllAsync`, response
+else to hedge to, so `ConnectAsync` rejects a `ReadHedgeAfter` set
+together with `ViaProxy` (issue #488: an option that can never take
+effect is a misconfiguration, not something to ignore). Namespaces, `ClearAsync`/`ClearAllAsync`, response
 tags, keep-alive, and compression all work unchanged over the one
 connection.
 
@@ -397,8 +398,9 @@ single copy there is nobody to hedge to. Writes are unaffected — every
 copy must be written, so a slow owner bounds writes to it regardless
 (`FireAndForgetReplicas` moves only the replica legs off the caller's
 path). The losing leg of a hedge is left to finish and is drained by
-`Close()`. Inert under [SDK proxy mode](#sdk-proxy-mode) (`ViaProxy`):
-a proxy connection has no ring and nobody else to hedge to.
+`Close()`. Rejected by `ConnectAsync` together with [SDK proxy
+mode](#sdk-proxy-mode) (`ViaProxy`): a proxy connection has no ring and
+nobody else to hedge to.
 
 ## Reconnect and keep-alive
 
@@ -477,9 +479,9 @@ other SDKs — not a literal zero-length secret.
 
 For a private CA, point `Ca` at a PEM file of trusted root certificate(s)
 — it replaces the default trust store and is only consulted when `Tls`
-is true (a set `Ca` is silently ignored when `Tls` is false; an
-unreadable or unparseable CA file when `Tls` is true is a connect-time
-error):
+is true (a set `Ca` with `Tls` false is rejected by `ConnectAsync` —
+issue #488; an unreadable or unparseable CA file when `Tls` is true is a
+connect-time error too):
 
 ```csharp
 using NanocachedClient client = await NanocachedClient.ConnectAsync(

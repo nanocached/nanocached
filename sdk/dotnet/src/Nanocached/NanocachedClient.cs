@@ -49,8 +49,9 @@ public sealed class NanocachedClient : IDisposable
         public string? AuthSecret { get; set; }
 
         /// <summary>Connect over TLS. Defaults to the platform/system
-        /// trust store; set <see cref="Ca"/> for a private CA. Ignored
-        /// (silently) when false, even if <see cref="Ca"/> is set.</summary>
+        /// trust store; set <see cref="Ca"/> for a private CA. A set
+        /// <see cref="Ca"/> with this false is rejected by
+        /// <see cref="ConnectAsync(Options)"/> (issue #488).</summary>
         public bool Tls { get; set; }
 
         /// <summary>Path to a PEM file of trusted root certificate(s),
@@ -158,8 +159,9 @@ public sealed class NanocachedClient : IDisposable
         /// connected this client is in its ordinary single-connection
         /// mode: no ring, no per-node connections, and no hedged reads —
         /// there is nobody else to hedge to, so a configured
-        /// <see cref="ReadHedgeAfter"/> is accepted but inert under
-        /// <see cref="ViaProxy"/>. Namespaces, clear/clear-all, tags,
+        /// <see cref="ReadHedgeAfter"/> together with
+        /// <see cref="ViaProxy"/> is rejected by
+        /// <see cref="ConnectAsync(Options)"/> (issue #488). Namespaces, clear/clear-all, tags,
         /// keep-alive, and compression all work unchanged over the one
         /// connection.
         ///
@@ -507,6 +509,20 @@ public sealed class NanocachedClient : IDisposable
             throw new ArgumentOutOfRangeException(
                 nameof(options),
                 "nanocached: ReadHedgeAfter must be a positive duration");
+        }
+        // Issue #488: an option that can have no effect in this
+        // configuration is a misconfiguration, not something to ignore
+        // quietly.
+        if (options.ViaProxy && options.ReadHedgeAfter is not null)
+        {
+            throw new ArgumentException(
+                "nanocached: ReadHedgeAfter has no effect with ViaProxy (a proxy connection has no replicas to hedge to); unset one of them",
+                nameof(options));
+        }
+        if (options.Ca is not null && !options.Tls)
+        {
+            throw new ArgumentException(
+                "nanocached: Ca is only used when Tls is true; enable Tls or unset Ca", nameof(options));
         }
 
         var client = new NanocachedClient(options);

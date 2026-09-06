@@ -504,8 +504,9 @@ impl Options {
 
     /// A PEM file of trusted root certificate(s), replacing the platform
     /// trust store `tls(true)` verifies against by default. Meaningful
-    /// only when `tls(true)`; silently ignored otherwise. An
-    /// unreadable/unparseable file is a `connect()`-time error.
+    /// only when `tls(true)`; set without it, `connect()` rejects the
+    /// options (issue #488). An unreadable/unparseable file is a
+    /// `connect()`-time error too.
     pub fn ca(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.ca = Some(path.into());
         self
@@ -642,7 +643,8 @@ impl Options {
     /// support, never `W`), so from here on this client runs in its
     /// existing single-connection mode: no ring view, no per-node
     /// connections, and — since there are no replicas to hedge a read
-    /// to — [`Self::read_hedge_after`] is simply inert if also set;
+    /// to — `connect()` rejects [`Self::read_hedge_after`] if also set
+    /// (issue #488);
     /// namespaces, `clear`/`clear_all`, compression, and keep-alive all
     /// work unchanged over the one connection. If the connection to the
     /// proxy is lost, the same proxy is redialed first (it may simply have
@@ -1062,6 +1064,19 @@ impl NanocachedClient {
         if matches!(options.read_hedge_after, Some(duration) if duration.is_zero()) {
             return Err(Error::InvalidArgument(
                 "nanocached: read_hedge_after must be a positive duration".to_string(),
+            ));
+        }
+        // Issue #488: an option that can have no effect in this
+        // configuration is a misconfiguration, not something to ignore
+        // quietly.
+        if options.via_proxy && options.read_hedge_after.is_some() {
+            return Err(Error::InvalidArgument(
+                "nanocached: read_hedge_after has no effect with via_proxy (a proxy connection has no replicas to hedge to); unset one of them".to_string(),
+            ));
+        }
+        if options.ca.is_some() && !options.tls {
+            return Err(Error::InvalidArgument(
+                "nanocached: ca is only used when tls(true); enable tls or unset ca".to_string(),
             ));
         }
 
