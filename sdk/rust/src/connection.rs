@@ -63,21 +63,16 @@ pub static MAX_MULTI_GET_RESPONSE_BYTES: AtomicUsize = AtomicUsize::new(64 * 102
 /// it (and, transitively, `close()`'s in-flight background-write
 /// drain). Generous versus the server's own 10s outbound timeouts.
 ///
-/// Cross-SDK note: this is a *per-request* wall-clock bound (measured
-/// from when each request is issued), which is deliberately stricter than
-/// the Go SDK's *connection-level, progress-based* deadline (re-armed
-/// whenever any response arrives). Under very deep pipelining against a
-/// slow-but-healthy server the two differ — a request that waits out this
-/// whole window for its turn is timed out here even while the server is
-/// still answering others. That's intentional: this wrapper's job is to
-/// guarantee an abandoned queue slot (one nothing will *ever* answer) is
-/// cleared and the socket released, which requires a bound tied to the
-/// individual request, not to whole-connection liveness. Kept as an
-/// accepted difference rather than reworked, since making it
-/// progress-based would mean threading connection-wide liveness state
-/// through this SDK's cancellation-safe per-request wait — a change to
-/// the most concurrency-sensitive path here for a benefit that only
-/// shows up at pipelining depths past this timeout.
+/// Cross-SDK note: like the Go SDK's connection-level deadline this is
+/// *progress-based* (issue #488): a request's timer is armed per request,
+/// but when it fires the request is only given up if the connection has
+/// received no response at all within the last window — if it has, the
+/// server is answering, the request is merely queued behind others, and
+/// the wait is re-armed for whatever is left of the window since that
+/// last response. A slot nothing will ever answer (a half-open server) is
+/// therefore still reclaimed within one window of the connection going
+/// quiet, while deep pipelining against a slow-but-healthy server no
+/// longer times out requests the server is on its way to answering.
 /// Public-but-hidden purely as a test hook, mirroring
 /// `client::KEEPALIVE_INTERVAL_MS` — but read fresh on every request
 /// rather than once at connect, so a test that lowers it should restore
@@ -131,6 +126,11 @@ struct Shared {
     /// Milliseconds since `epoch` of the last request — what the
     /// keep-alive timer checks against its interval.
     last_used_ms: AtomicU64,
+    /// Milliseconds since `epoch` at which the read task last parsed a
+    /// complete response of any kind — `Connection::request`'s notion of
+    /// "the connection is making progress" (issue #488). Zero until the
+    /// first response.
+    last_response_ms: AtomicU64,
     epoch: Instant,
     /// The open-targets key this connection was counted against (see
     /// `open_targets`) — `None` for the pre-poisoned `dead()` placeholder,
@@ -327,6 +327,7 @@ impl Connection {
             }),
             closed: AtomicBool::new(false),
             last_used_ms: AtomicU64::new(0),
+            last_response_ms: AtomicU64::new(0),
             epoch: Instant::now(),
             tracking_key: Some(tracking_key),
             tagged,
@@ -365,6 +366,7 @@ impl Connection {
                 }),
                 closed: AtomicBool::new(true),
                 last_used_ms: AtomicU64::new(0),
+                last_response_ms: AtomicU64::new(0),
                 epoch: Instant::now(),
                 tracking_key: None,
                 tagged: false,
@@ -608,27 +610,46 @@ impl Connection {
         }
     }
 
-    /// Wraps `request_uncapped` in `REQUEST_TIMEOUT_MS`: if the whole
-    /// round trip hasn't completed by then, the server is presumed dead
-    /// (a half-open server that accepts but never answers looks
-    /// identical to one that's still slow) and this connection is
-    /// poisoned so the abandoned request's queue slot — otherwise stuck
-    /// forever with no receiver ever coming back for it, since nothing
-    /// will ever answer — gets cleared and the socket released, instead
-    /// of merely leaving it for a read that will never arrive to
-    /// eventually skip over.
+    /// Wraps `request_uncapped` in the request timeout, progress-aware
+    /// (issue #488, see `REQUEST_TIMEOUT_MS`): when the timer fires and
+    /// the connection has received no response at all for a whole window,
+    /// the server is presumed dead (a half-open server that accepts but
+    /// never answers looks identical to one that's still slow) and this
+    /// connection is poisoned so the abandoned request's queue slot —
+    /// otherwise stuck forever with no receiver ever coming back for it,
+    /// since nothing will ever answer — gets cleared and the socket
+    /// released. If a response did arrive within the window, the server
+    /// is merely working through the queue ahead of this request, and the
+    /// wait continues for the remainder of the window since that last
+    /// response. The pending future is kept alive across re-arms (only
+    /// the timer wrapper is recreated), so `WriteGuard`'s
+    /// cancelled-mid-write handling is never tripped by a re-arm.
     async fn request<F>(&self, build: F) -> Result<ResponseKind>
     where
         F: Fn(Option<u32>) -> Vec<u8>,
     {
         let timeout = self.request_timeout;
-        match tokio::time::timeout(timeout, self.request_uncapped(build)).await {
-            Ok(result) => result,
-            Err(_) => {
-                self.close();
-                Err(Error::ConnectionLost(format!(
-                    "nanocached: request timed out after {timeout:?} waiting for a response"
-                )))
+        let pending = self.request_uncapped(build);
+        tokio::pin!(pending);
+        let mut wait = timeout;
+        loop {
+            match tokio::time::timeout(wait, &mut pending).await {
+                Ok(result) => return result,
+                Err(_) => {
+                    let now_ms = self.shared.epoch.elapsed().as_millis() as u64;
+                    let last_ms = self.shared.last_response_ms.load(Ordering::SeqCst);
+                    let since_last = Duration::from_millis(now_ms.saturating_sub(last_ms));
+                    if last_ms != 0 && since_last < timeout {
+                        // Progress within the window: keep waiting for
+                        // what's left of it, measured from that response.
+                        wait = timeout - since_last;
+                        continue;
+                    }
+                    self.close();
+                    return Err(Error::ConnectionLost(format!(
+                        "nanocached: request timed out after {timeout:?} with no response from the server"
+                    )));
+                }
             }
         }
     }
@@ -1097,7 +1118,14 @@ async fn read_loop(
         };
 
         let (marker, value, ttl_seconds, tag, entries) = match response {
-            Ok(response) => response,
+            Ok(response) => {
+                // Issue #488: a complete response of any kind is progress
+                // for `Connection::request`'s progress-aware deadline.
+                shared
+                    .last_response_ms
+                    .store(shared.epoch.elapsed().as_millis() as u64, Ordering::SeqCst);
+                response
+            }
             Err(error) => {
                 // error belongs to whichever request has been waiting
                 // longest — the read loop only ever reads one response

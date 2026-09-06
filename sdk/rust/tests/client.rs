@@ -2467,6 +2467,42 @@ async fn dropping_every_client_handle_without_close_stops_the_keep_alive_task() 
 }
 
 #[tokio::test]
+async fn a_request_queued_behind_steady_progress_is_not_timed_out() {
+    // Issue #488: the per-request timeout is progress-based. Four GETs
+    // pipelined onto one connection against a server that takes 150ms
+    // each take ~600ms in total — far past a 250ms timeout — but the
+    // server is answering every 150ms, so none of them may be timed out.
+    let node = MockNode::start().await;
+    node.state.gets_delay_ms.store(150, Ordering::SeqCst);
+    let client =
+        NanocachedClient::connect(options(node.port).request_timeout(Duration::from_millis(250)))
+            .await
+            .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+
+    let started = tokio::time::Instant::now();
+    let (a, b, c, d) = tokio::join!(
+        client.get("k"),
+        client.get("k"),
+        client.get("k"),
+        client.get("k")
+    );
+    for (i, result) in [a, b, c, d].into_iter().enumerate() {
+        assert_eq!(
+            result.unwrap(),
+            Some("v".to_string()),
+            "get #{i} must not time out behind progress"
+        );
+    }
+    assert!(
+        started.elapsed() >= Duration::from_millis(500),
+        "the four gets should have been served one after another, took {:?}",
+        started.elapsed()
+    );
+    client.close().await;
+}
+
+#[tokio::test]
 async fn a_request_to_a_half_open_server_fails_within_the_timeout_and_close_returns() {
     // Regression: a server that completes the A handshake but then never
     // answers a G/S/D (accepts the TCP connection and goes silent — a
