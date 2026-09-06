@@ -209,12 +209,20 @@ choice, one proxy carried 21,607 requests and the other 200 while three
 clients ran (per-client stickiness, not per-request balancing — the
 skew evens out with many clients); and each node's
 <code>nanocached_node_connections</code> read 2, the proxy count, after
-all of that traffic. One log line to expect: after a minute with no
-client connected at all, the first request logs <code>WARN backend
-connection to &lt;node&gt; poisoned; will redial on next request</code>
-for each node it touches — the node had closed the idle connection
-(its 60&nbsp;s idle timeout), and the proxy redials. The churn clients
-that produced it saw no failure.</p>
+all of that traffic. One log line to expect from the 0.4.1 image
+pinned above: after a minute with no client connected at all, the
+first request logs <code>WARN backend connection to &lt;node&gt;
+poisoned; will redial on next request</code> for each node it touches
+— the node had closed the idle connection (its 60&nbsp;s idle
+timeout), and the proxy redials. The get/set churn clients that
+produced it saw no failure; a non-idempotent first request (INCR, CAS)
+would have been answered with an error, since a frame already written
+can't be retried. Newer proxies keep their backend connections alive
+themselves (the same 30&nbsp;s probe the SDKs send), so the line no
+longer appears; a node that closes an idle backend connection anyway —
+a restart, or a scale-in the proxy's roster hasn't caught up with — is
+logged at <code>INFO</code> instead (<a
+href="https://github.com/nanocached/nanocached/issues/514">#514</a>).</p>
 
 <h3>Scaling the proxy tier</h3>
 <p>One more proxy is <code>--desired-count</code> plus one; it

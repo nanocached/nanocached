@@ -76,8 +76,14 @@
 //!   the tag match having bounded the blast radius to exactly those
 //!   requests, and the next request redials — with the drivers'
 //!   retry/fallback paths (`retry_get_on`, `refan_write`,
-//!   `finish_clear`) absorbing the common node-side idle close so a
-//!   long-lived shared connection's death is invisible to clients.
+//!   `finish_clear`) absorbing a node-side close so a long-lived shared
+//!   connection's death is invisible to clients. Issue #514: a backend
+//!   connection with nothing written for `BACKEND_KEEPALIVE_INTERVAL`
+//!   probes the node itself (the SDKs' reserved keep-alive key), so a
+//!   proxy with no client connected never lets the node's idle timeout
+//!   close its connections underneath it, and a connection the node
+//!   closed anyway is found by the probe rather than by the next
+//!   request.
 //!   Thin-client mode falls out of the client-facing contract above
 //!   (one proxy address, no ring view, no discovery client) and shipped
 //!   with #109/#122 (`via_proxy`).
@@ -161,8 +167,30 @@ const METRICS_MAX_CONNECTIONS: usize = 16;
 
 /// Client connections idle longer than this are closed — the node's own
 /// idle policy, mirrored so a proxy hop doesn't change lifecycle
-/// expectations (SDK keep-alives flow through and reset it).
+/// expectations (SDK keep-alives flow through and reset it). Applies to
+/// *client* connections only; the shared backend connections keep
+/// themselves alive instead (`BACKEND_KEEPALIVE_INTERVAL`).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Issue #514: how long a shared backend connection may sit with nothing
+/// written before `run_backend` sends a keep-alive probe on it. SDK
+/// keep-alives only reach a node while a client is connected to the
+/// proxy, so without a probe of its own a proxy with no clients (a quiet
+/// period, or a tier provisioned ahead of its first application) let
+/// every backend connection go stale at exactly the node's 60 s idle
+/// timeout — the first request after that was written to a socket the
+/// node had already closed, failed once, and was redialed under a
+/// `WARN`. Half the node's idle timeout, the same margin the SDKs use.
+const BACKEND_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Issue #514: the key the keep-alive probe reads — the same reserved
+/// key every SDK pings with, so it can never collide with an application
+/// key (a leading 0x00 keeps it out of any UTF-8 key space). Always the
+/// default namespace: the key is reserved wire-wide, not per-namespace.
+/// The node answers `N` (or `W` when it doesn't own the key); either
+/// proves liveness and resets its idle deadline, and the reply is
+/// discarded.
+const KEEPALIVE_KEY: &[u8] = b"\x00nanocached-keepalive";
 
 /// Issue #420: bounds each write to a client socket, the same way
 /// `IDLE_TIMEOUT` bounds a client's reads. Without this, a client that
@@ -1821,6 +1849,7 @@ impl BackendHandle {
         tls_connector: &Option<TlsConnector>,
         slot: Arc<tokio::sync::Mutex<Option<BackendHandle>>>,
         dialed: Arc<std::sync::atomic::AtomicUsize>,
+        keepalive_interval: Duration,
     ) -> io::Result<Self> {
         let mut stream = timeout(UPSTREAM_IO_TIMEOUT, connect_upstream(addr, tls_connector))
             .await
@@ -1861,13 +1890,28 @@ impl BackendHandle {
             stream,
             buf,
             receiver,
-            addr.to_string(),
-            Arc::downgrade(&slot),
-            dialed,
-            id,
+            BackendIdentity {
+                addr: addr.to_string(),
+                slot: Arc::downgrade(&slot),
+                dialed,
+                own_id: id,
+                keepalive_interval,
+            },
         ));
         Ok(Self { id, sender })
     }
+}
+
+/// What `run_backend` needs to know about the connection it owns beyond
+/// the stream itself: where it goes, the pool slot to clear and the
+/// gauge to decrement at teardown, its own id for the slot recheck, and
+/// (issue #514) how long it may sit idle before probing.
+struct BackendIdentity {
+    addr: String,
+    slot: std::sync::Weak<tokio::sync::Mutex<Option<BackendHandle>>>,
+    dialed: Arc<std::sync::atomic::AtomicUsize>,
+    own_id: u64,
+    keepalive_interval: Duration,
 }
 
 /// The shared backend connection's writer half (issue #110): assigns
@@ -1887,18 +1931,36 @@ impl BackendHandle {
 /// request's oneshot resolves as an error. The tag verification is what
 /// bounds the blast radius to exactly the requests on this connection
 /// (see the module docs); the next `enqueue` redials.
+///
+/// Keep-alive (issue #514): once nothing has been written for
+/// `keepalive_interval`, the writer sends a `G` on `KEEPALIVE_KEY` down
+/// the same tag/reservation/write path as a request, with no reply
+/// sender — the reader verifies the tag and discards the reply. That
+/// keeps the node's idle deadline re-armed while no client is connected
+/// to the proxy (SDK keep-alives only flow through while one is), and
+/// turns a connection the node closed anyway into a poison the probe
+/// finds — logged at `INFO`, since no client request was on it — so the
+/// next request dials fresh instead of being the one written to a dead
+/// socket (which, for an INCR/CAS, could not be retried once written).
 async fn run_backend(
     stream: UpstreamStream,
     buf: BytesMut,
     mut receiver: mpsc::Receiver<BackendRequest>,
-    addr: String,
-    slot: std::sync::Weak<tokio::sync::Mutex<Option<BackendHandle>>>,
-    dialed: Arc<std::sync::atomic::AtomicUsize>,
-    own_id: u64,
+    identity: BackendIdentity,
 ) {
+    let BackendIdentity {
+        addr,
+        slot,
+        dialed,
+        own_id,
+        keepalive_interval,
+    } = identity;
     let (mut read_half, mut write_half) = tokio::io::split(stream);
+    // Issue #514: the reply sender is `None` for a keep-alive probe the
+    // writer sent on its own (nobody is waiting for that reply), `Some`
+    // for a client's request.
     let (pending_tx, mut pending_rx) =
-        mpsc::channel::<(u32, Expect, oneshot::Sender<io::Result<NodeReply>>)>(
+        mpsc::channel::<(u32, Expect, Option<oneshot::Sender<io::Result<NodeReply>>>)>(
             MAX_BACKEND_IN_FLIGHT,
         );
 
@@ -1913,6 +1975,14 @@ async fn run_backend(
     // the writer's first `notified().await`.
     let poisoned = Arc::new(tokio::sync::Notify::new());
     let reader_poisoned = Arc::clone(&poisoned);
+    // Issue #514: whether the poison resolved any *client* request with
+    // an error, as opposed to only a keep-alive probe of our own. The
+    // exit log below is a `WARN` only in the former case: a connection
+    // the node closed while nothing but the probe was on it is an
+    // expected idle close (the node restarted, or was scaled in and the
+    // roster hasn't caught up yet), and no client saw it.
+    let clients_affected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_clients_affected = Arc::clone(&clients_affected);
 
     // The reader half: resolves pending replies in FIFO order. The
     // per-reply timeout is a *progress* bound (each reply must arrive
@@ -1936,7 +2006,12 @@ async fn run_backend(
             });
 
             let poisoned = result.is_err();
-            let _ = reply.send(result);
+            if let Some(reply) = reply {
+                if poisoned {
+                    reader_clients_affected.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                let _ = reply.send(result);
+            }
             if poisoned {
                 // Issue #497: everything still queued behind the failed
                 // reply was reserved *before* its frame was written (see
@@ -1954,6 +2029,10 @@ async fn run_backend(
                 // non-`not_sent` error.
                 pending_rx.close();
                 while let Some((_, _, reply)) = pending_rx.recv().await {
+                    let Some(reply) = reply else {
+                        continue;
+                    };
+                    reader_clients_affected.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = reply.send(Err(io::Error::other(
                         "backend connection poisoned after the request was written",
                     )));
@@ -1974,31 +2053,44 @@ async fn run_backend(
     // wind down promptly instead.
     let mut poisoned_exit = false;
 
+    // Issue #514: when the last frame went out, for the keep-alive timer.
+    // The node re-arms its idle deadline whenever a full command arrives,
+    // so "time since our last write" tracks its view of this connection's
+    // idleness to within one network hop.
+    let mut last_write = tokio::time::Instant::now();
+    let keepalive_frame = frame_get(b"", KEEPALIVE_KEY);
+
     loop {
-        let request = tokio::select! {
+        let (frame, expect, reply) = tokio::select! {
             request = receiver.recv() => match request {
-                Some(request) => request,
+                Some(request) => (request.frame, request.expect, Some(request.reply)),
                 None => break,
             },
             () = poisoned.notified() => {
                 poisoned_exit = true;
                 break;
             }
+            // Issue #514: nothing written for a whole interval — probe the
+            // node so its idle timeout never closes a connection we still
+            // hold, and so a connection it *has* closed (restart, scale-in
+            // ahead of the roster refresh) is found by this probe rather
+            // than by the next client's request. Goes through the same
+            // tag/reservation/write path as a request, so it is ordered
+            // and accounted like one.
+            () = tokio::time::sleep_until(last_write + keepalive_interval) => {
+                (keepalive_frame.clone(), Expect::Value, None)
+            }
         };
 
         let tag = next_tag;
         next_tag = next_tag.wrapping_add(1);
 
-        let (header, body) = substitute_tag(request.frame, tag);
+        let (header, body) = substitute_tag(frame, tag);
 
         // Reserve the reply slot before writing: if the reader is gone
         // (poisoned), this fails and the request errors without touching
         // a desynced stream.
-        if pending_tx
-            .send((tag, request.expect, request.reply))
-            .await
-            .is_err()
-        {
+        if pending_tx.send((tag, expect, reply)).await.is_err() {
             poisoned_exit = true;
             break;
         }
@@ -2031,6 +2123,7 @@ async fn run_backend(
             poisoned_exit = true;
             break;
         }
+        last_write = tokio::time::Instant::now();
     }
 
     // Queue closed (handle dropped or poisoned): let the reader drain
@@ -2043,11 +2136,14 @@ async fn run_backend(
     // "backend connection is gone" error with no address attached. A
     // clean drain (every sender dropped, e.g. prune retired the address)
     // is expected teardown, not a fault, so it is logged differently.
-    if poisoned_exit {
-        eprintln!("WARN backend connection to {addr} poisoned; will redial on next request");
-    } else {
-        eprintln!("INFO backend connection to {addr} closed; no callers remain");
-    }
+    eprintln!(
+        "{}",
+        backend_exit_log_line(
+            &addr,
+            poisoned_exit,
+            clients_affected.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    );
 
     // issue #192: eagerly clear this connection's slot and decrement the
     // `dialed` gauge right when the task actually exits, rather than
@@ -2076,6 +2172,22 @@ async fn run_backend(
         None => {
             dialed.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+}
+
+/// `run_backend`'s exit line. Issue #514: a connection that died with
+/// only our own keep-alive probe on it — no client request was resolved
+/// with an error — is an idle-side loss (the node closed it, restarted,
+/// left, or stopped answering; the next request simply redials), logged
+/// at `INFO`. `WARN` is reserved for a poison that failed at least one
+/// client's request.
+fn backend_exit_log_line(addr: &str, poisoned_exit: bool, clients_affected: bool) -> String {
+    if !poisoned_exit {
+        format!("INFO backend connection to {addr} closed; no callers remain")
+    } else if clients_affected {
+        format!("WARN backend connection to {addr} poisoned; will redial on next request")
+    } else {
+        format!("INFO backend connection to {addr} lost while idle; will redial on next request")
     }
 }
 
@@ -2551,14 +2663,23 @@ struct SharedBackends {
     /// long ago — `enqueue` fails fast against `DIAL_BACKOFF` instead of
     /// re-dialing. Cleared on the next successful dial to that address.
     dial_failures: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// Issue #514: passed to every `run_backend` this pool dials —
+    /// `BACKEND_KEEPALIVE_INTERVAL` in production, shortened only by
+    /// tests that exercise the keep-alive itself (`with_keepalive_interval`).
+    keepalive_interval: Duration,
 }
 
 impl SharedBackends {
     fn new() -> Self {
+        Self::with_keepalive_interval(BACKEND_KEEPALIVE_INTERVAL)
+    }
+
+    fn with_keepalive_interval(keepalive_interval: Duration) -> Self {
         Self {
             slots: std::sync::Mutex::new(HashMap::new()),
             dialed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dial_failures: std::sync::Mutex::new(HashMap::new()),
+            keepalive_interval,
         }
     }
 
@@ -2686,6 +2807,7 @@ impl SharedBackends {
                             &context.tls_connector,
                             Arc::clone(&slot),
                             Arc::clone(&self.dialed),
+                            self.keepalive_interval,
                         )
                         .await
                         {
@@ -5330,6 +5452,14 @@ mod tests {
         /// `a_cas_results_fan_out_never_replays_the_operation_on_a_replica`).
         cas_sets: Arc<AtomicUsize>,
         cas_deletes: Arc<AtomicUsize>,
+        /// Issue #514: how many keep-alive probes (`G` on `KEEPALIVE_KEY`)
+        /// this node received — proves the proxy pings an idle shared
+        /// connection on its own, with no client traffic to carry an
+        /// SDK's keep-alive through.
+        keepalives: Arc<AtomicUsize>,
+        /// Issue #514: when set, a connection with no frame for this long
+        /// is closed — the real node's `IDLE_TIMEOUT`, shrunk.
+        close_when_idle_for: Arc<StdMutex<Option<Duration>>>,
     }
 
     impl MockNode {
@@ -5353,6 +5483,8 @@ mod tests {
                 incrs: Arc::new(AtomicUsize::new(0)),
                 cas_sets: Arc::new(AtomicUsize::new(0)),
                 cas_deletes: Arc::new(AtomicUsize::new(0)),
+                keepalives: Arc::new(AtomicUsize::new(0)),
+                close_when_idle_for: Arc::new(StdMutex::new(None)),
             };
             let store = Arc::clone(&node.store);
             let cleared = Arc::clone(&node.cleared);
@@ -5370,6 +5502,8 @@ mod tests {
             let incrs = Arc::clone(&node.incrs);
             let cas_sets = Arc::clone(&node.cas_sets);
             let cas_deletes = Arc::clone(&node.cas_deletes);
+            let keepalives = Arc::clone(&node.keepalives);
+            let close_when_idle_for = Arc::clone(&node.close_when_idle_for);
             tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -5397,6 +5531,8 @@ mod tests {
                             incrs: Arc::clone(&incrs),
                             cas_sets: Arc::clone(&cas_sets),
                             cas_deletes: Arc::clone(&cas_deletes),
+                            keepalives: Arc::clone(&keepalives),
+                            close_when_idle_for: Arc::clone(&close_when_idle_for),
                         },
                     ));
                 }
@@ -5445,6 +5581,8 @@ mod tests {
         incrs: Arc<AtomicUsize>,
         cas_sets: Arc<AtomicUsize>,
         cas_deletes: Arc<AtomicUsize>,
+        keepalives: Arc<AtomicUsize>,
+        close_when_idle_for: Arc<StdMutex<Option<Duration>>>,
     }
 
     /// Issue #141: same content-digest algorithm as the real node's
@@ -5477,11 +5615,22 @@ mod tests {
             incrs,
             cas_sets,
             cas_deletes,
+            keepalives,
+            close_when_idle_for,
         } = state;
         let mut buf = BytesMut::new();
         let result: io::Result<()> = async {
             loop {
-                let line = read_line(&mut stream, &mut buf).await?;
+                let idle_limit = *close_when_idle_for.lock().unwrap();
+                let line = match idle_limit {
+                    Some(limit) => match timeout(limit, read_line(&mut stream, &mut buf)).await {
+                        Ok(line) => line?,
+                        // Issue #514: the real node's idle timeout —
+                        // nothing arrived in time, close the connection.
+                        Err(_) => return Ok(()),
+                    },
+                    None => read_line(&mut stream, &mut buf).await?,
+                };
                 let mut parts = line.split(' ');
                 let command = parts.next().unwrap_or_default().to_string();
                 if command != "A" && close_once.swap(false, Ordering::SeqCst) {
@@ -5513,6 +5662,9 @@ mod tests {
                             read_exact_into(&mut stream, &mut buf, key_length).await?;
                             (Vec::new(), buf.split_to(key_length).to_vec())
                         };
+                        if key == KEEPALIVE_KEY {
+                            keepalives.fetch_add(1, Ordering::SeqCst);
+                        }
                         let pause = *delay.lock().unwrap();
                         if !pause.is_zero() {
                             sleep(pause).await;
@@ -5998,11 +6150,39 @@ mod tests {
         max_connections: usize,
         announce: Option<ProxyIdentity>,
     ) -> (String, watch::Sender<bool>, Arc<ProxyContext>) {
+        start_proxy_full(
+            discovery_addr,
+            secret,
+            max_connections,
+            announce,
+            Arc::new(SharedBackends::new()),
+        )
+        .await
+    }
+
+    /// Issue #514: `start_proxy`, on a caller-built `SharedBackends` —
+    /// for the keep-alive tests, which need an interval short enough to
+    /// observe without slowing every other test's backend connections.
+    async fn start_proxy_with_backends(
+        discovery_addr: &str,
+        backends: Arc<SharedBackends>,
+    ) -> (String, Arc<ProxyContext>) {
+        let (addr, _drain, context) =
+            start_proxy_full(discovery_addr, None, 64, None, backends).await;
+        (addr, context)
+    }
+
+    async fn start_proxy_full(
+        discovery_addr: &str,
+        secret: Option<&str>,
+        max_connections: usize,
+        announce: Option<ProxyIdentity>,
+        backends: Arc<SharedBackends>,
+    ) -> (String, watch::Sender<bool>, Arc<ProxyContext>) {
         let (ring_tx, ring_rx) = watch::channel(None);
         let (refresh_tx, refresh_rx) = mpsc::channel(16);
         let (drain_tx, drain_rx) = watch::channel(false);
         let secret = secret.map(|secret| Bytes::from(secret.to_string()));
-        let backends = Arc::new(SharedBackends::new());
         tokio::spawn(run_refresher(
             RefresherConfig {
                 discovery: vec![discovery_addr.to_string()],
@@ -7040,6 +7220,117 @@ mod tests {
             node.auth_count.load(Ordering::SeqCst),
             3,
             "each drop must cost exactly one redial"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_idle_shared_backend_connection_is_kept_alive_inside_the_nodes_idle_timeout() {
+        // Issue #514: with no client connected to the proxy, nothing used
+        // to flow on a shared backend connection, so the node's idle
+        // timeout closed it and the first request after the quiet period
+        // was written to a dead socket. The proxy now probes an idle
+        // connection on its own, well inside that timeout: a node that
+        // closes after 200 ms idle never gets to, and the next request —
+        // a non-idempotent INCR, which must not be replayed once written
+        // (#272/#497) — rides the same connection and succeeds first try.
+        let node = MockNode::start().await;
+        *node.close_when_idle_for.lock().unwrap() = Some(Duration::from_millis(200));
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let backends = Arc::new(SharedBackends::with_keepalive_interval(
+            Duration::from_millis(50),
+        ));
+        let (proxy, context) = start_proxy_with_backends(&discovery, backends).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 7 1\ncounter1").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        // Three node idle timeouts with no client traffic at all.
+        sleep(Duration::from_millis(600)).await;
+
+        assert!(
+            node.keepalives.load(Ordering::SeqCst) >= 4,
+            "the proxy must probe the idle connection on its own (saw {} probes)",
+            node.keepalives.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            node.auth_count.load(Ordering::SeqCst),
+            1,
+            "the probes must keep the original connection open, not redial"
+        );
+        assert_eq!(context.backends.dialed.load(Ordering::Relaxed), 1);
+
+        stream.write_all(b"i 0 7 5\ncounter").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"6");
+        assert_eq!(node.incrs(), 1, "one attempt, on the kept-alive connection");
+        assert_eq!(node.auth_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_backend_connection_the_node_closed_while_idle_is_found_by_the_keep_alive() {
+        // Issue #514, the other half: a node that does close an idle
+        // shared connection (restart, scale-in ahead of the proxy's
+        // roster refresh) is noticed by the next keep-alive probe, not by
+        // the next client request. The pool clears the slot on its own
+        // with no client traffic, and the request that follows dials
+        // fresh and reaches the node exactly once — even a non-idempotent
+        // INCR, which used to be the request written to the dead socket
+        // and, once written, could not be retried.
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let backends = Arc::new(SharedBackends::with_keepalive_interval(
+            Duration::from_millis(50),
+        ));
+        let (proxy, context) = start_proxy_with_backends(&discovery, backends).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 7 1\ncounter1").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(context.backends.dialed.load(Ordering::Relaxed), 1);
+
+        // The next frame on the connection — the keep-alive probe, since
+        // the client sends nothing — is answered by the node closing it.
+        node.close_once.store(true, Ordering::SeqCst);
+        timeout(Duration::from_secs(2), async {
+            while context.backends.dialed.load(Ordering::Relaxed) != 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the keep-alive must find the closed connection with no client traffic");
+
+        stream.write_all(b"i 0 7 5\ncounter").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"6");
+        assert_eq!(node.incrs(), 1, "one attempt, on a fresh connection");
+        assert_eq!(
+            node.auth_count.load(Ordering::SeqCst),
+            2,
+            "exactly one redial, made by the request rather than by the probe"
+        );
+    }
+
+    #[test]
+    fn a_backend_that_died_with_only_a_keep_alive_on_it_is_logged_at_info() {
+        // Issue #514: WARN is reserved for a poison that failed a
+        // client's request; an idle-side close found by the probe is
+        // expected and logged at INFO, like a clean teardown.
+        assert_eq!(
+            backend_exit_log_line("10.0.0.1:8356", false, false),
+            "INFO backend connection to 10.0.0.1:8356 closed; no callers remain"
+        );
+        assert_eq!(
+            backend_exit_log_line("10.0.0.1:8356", true, false),
+            "INFO backend connection to 10.0.0.1:8356 lost while idle; will redial on next request"
+        );
+        assert_eq!(
+            backend_exit_log_line("10.0.0.1:8356", true, true),
+            "WARN backend connection to 10.0.0.1:8356 poisoned; will redial on next request"
         );
     }
 
