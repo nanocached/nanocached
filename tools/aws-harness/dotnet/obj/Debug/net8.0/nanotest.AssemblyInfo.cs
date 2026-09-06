@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("nanotest")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+1a95bcf84167bc11ae587039ccdf4cab21fe4428")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+1fed4ddecc64e1310a1ebd6cc5c178f38142afe2")]
 [assembly: System.Reflection.AssemblyProductAttribute("nanotest")]
 [assembly: System.Reflection.AssemblyTitleAttribute("nanotest")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

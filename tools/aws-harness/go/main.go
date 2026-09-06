@@ -66,6 +66,8 @@ func run() int {
 		// NANOTEST_VIA_PROXY=1: SDK proxy mode — addresses stay discovery's,
 		// the client fetches the proxy roster and goes through one proxy.
 		ViaProxy: os.Getenv("NANOTEST_VIA_PROXY") == "1",
+		// NANOTEST_SECRET: the cluster's NANOCACHED_AUTH_SECRET, when it has one.
+		AuthSecret: os.Getenv("NANOTEST_SECRET"),
 	})
 	if err != nil {
 		fmt.Println("connect failed:", err)

@@ -55,7 +55,9 @@ async def connect_client():
     # NANOTEST_VIA_PROXY=1: SDK proxy mode — addresses stay discovery's, the
     # client fetches the proxy roster and goes through one proxy.
     via_proxy = os.environ.get("NANOTEST_VIA_PROXY") == "1"
-    return await NanocachedClient.connect(addresses(), via_proxy=via_proxy)
+    # NANOTEST_SECRET: the cluster's NANOCACHED_AUTH_SECRET, when it has one.
+    secret = os.environ.get("NANOTEST_SECRET") or None
+    return await NanocachedClient.connect(addresses(), auth_secret=secret, via_proxy=via_proxy)
 
 
 def bulk_value(i: int) -> bytes:

@@ -18,6 +18,11 @@ public final class Main {
         NanocachedClient.Options options = NanocachedClient.builder()
                 .addresses(addresses)
                 .viaProxy("1".equals(System.getenv("NANOTEST_VIA_PROXY")));
+        // NANOTEST_SECRET: the cluster's NANOCACHED_AUTH_SECRET, when it has one.
+        String secret = System.getenv("NANOTEST_SECRET");
+        if (secret != null && !secret.isEmpty()) {
+            options = options.authSecret(secret);
+        }
 
         // Checked before connecting: an invalid invocation should fail
         // loudly with a usage message, not crash with an

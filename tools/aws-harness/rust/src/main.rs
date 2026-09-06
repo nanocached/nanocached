@@ -15,7 +15,13 @@ async fn main() {
     // NANOTEST_VIA_PROXY=1: SDK proxy mode — addresses stay discovery's,
     // the client fetches the proxy roster and goes through one proxy.
     let via_proxy = std::env::var("NANOTEST_VIA_PROXY").as_deref() == Ok("1");
-    let options = Options::new().addresses(addresses).via_proxy(via_proxy);
+    let mut options = Options::new().addresses(addresses).via_proxy(via_proxy);
+    // NANOTEST_SECRET: the cluster's NANOCACHED_AUTH_SECRET, when it has one.
+    if let Ok(secret) = std::env::var("NANOTEST_SECRET") {
+        if !secret.is_empty() {
+            options = options.auth_secret(secret);
+        }
+    }
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
