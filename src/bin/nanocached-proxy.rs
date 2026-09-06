@@ -1938,6 +1938,26 @@ async fn run_backend(
             let poisoned = result.is_err();
             let _ = reply.send(result);
             if poisoned {
+                // Issue #497: everything still queued behind the failed
+                // reply was reserved *before* its frame was written (see
+                // the writer's `pending_tx.send` below), so by now each of
+                // those frames is on the wire — or mid-write — and the
+                // node may already have applied it. Returning here and
+                // just dropping the queue would resolve every one of them
+                // as `RecvError`, which `SharedBackends::enqueue` maps to
+                // `not_sent` — the marker INCR/CAS trust as "safe to
+                // replay" (#272/#293), so the pipelined follow-ups of a
+                // timed-out reply would be double-applied on the redial.
+                // Close the queue first (so the writer's next reservation
+                // fails before it writes — that one really is unsent),
+                // then drain what was already reserved with a plain,
+                // non-`not_sent` error.
+                pending_rx.close();
+                while let Some((_, _, reply)) = pending_rx.recv().await {
+                    let _ = reply.send(Err(io::Error::other(
+                        "backend connection poisoned after the request was written",
+                    )));
+                }
                 reader_poisoned.notify_one();
                 return;
             }
@@ -2466,7 +2486,11 @@ fn frame_clear_all() -> Bytes {
 /// as one where the frame provably never reached the backend's socket —
 /// a dial failure, the dial backoff fast-fail, or the request never got
 /// pulled off `run_backend`'s queue (and so never reached
-/// `write_half.write_all`) before the connection poisoned. Wraps the
+/// `write_half.write_all`) before the connection poisoned. Issue #497:
+/// a request that *was* reserved on the reader's queue is never in this
+/// class — once the reader poisons it drains that queue with a plain
+/// error, because each of those frames was written (or mid-write) and
+/// may have been applied. Wraps the
 /// original error rather than replacing it, so logging still shows the
 /// real cause; `request_not_sent` is how a caller tests for the marker.
 /// Mirrors `sdk/go`'s `errRequestNotSent` (issue #225) — the same
@@ -2693,6 +2717,11 @@ impl SharedBackends {
                 .is_ok()
             {
                 return Box::pin(async move {
+                    // `RecvError` here means `run_backend` dropped the
+                    // request before ever reserving it on the reader's
+                    // queue — i.e. before `write_all` (issue #497: once
+                    // reserved, a poisoned reader resolves it with a
+                    // plain error instead, never by dropping it).
                     reply_rx.await.map_err(|_| {
                         not_sent(io::Error::other("backend connection dropped mid-request"))
                     })?
@@ -5269,6 +5298,13 @@ mod tests {
         /// before ever touching the store). Proves a retry after this
         /// must not resend `i` and double-apply the delta.
         close_after_incr_apply_once: Arc<AtomicBool>,
+        /// Issue #497: the pipelined cousin of `close_after_incr_apply_once`
+        /// — applies the next N `i` requests to the store *without*
+        /// replying to any of them, then drops the connection after the
+        /// Nth. With N=2 both deltas are on the wire (and applied) when
+        /// the proxy's shared connection poisons on the first missing
+        /// reply; proves the second one is not replayed on the redial.
+        close_after_incr_applies: Arc<AtomicUsize>,
         /// Issue #293: same idea as `close_after_incr_apply_once`, but
         /// for the next `k` (CAS set) request — applies it to the store,
         /// then drops the connection instead of sending the `S`/`N`
@@ -5308,6 +5344,7 @@ mod tests {
                 wrong_node_once: Arc::new(AtomicBool::new(false)),
                 close_once: Arc::new(AtomicBool::new(false)),
                 close_after_incr_apply_once: Arc::new(AtomicBool::new(false)),
+                close_after_incr_applies: Arc::new(AtomicUsize::new(0)),
                 close_after_cas_set_apply_once: Arc::new(AtomicBool::new(false)),
                 close_after_cas_delete_apply_once: Arc::new(AtomicBool::new(false)),
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
@@ -5323,6 +5360,7 @@ mod tests {
             let wrong_once = Arc::clone(&node.wrong_node_once);
             let close_once = Arc::clone(&node.close_once);
             let close_after_incr_apply_once = Arc::clone(&node.close_after_incr_apply_once);
+            let close_after_incr_applies = Arc::clone(&node.close_after_incr_applies);
             let close_after_cas_set_apply_once = Arc::clone(&node.close_after_cas_set_apply_once);
             let close_after_cas_delete_apply_once =
                 Arc::clone(&node.close_after_cas_delete_apply_once);
@@ -5346,6 +5384,7 @@ mod tests {
                             wrong_once: Arc::clone(&wrong_once),
                             close_once: Arc::clone(&close_once),
                             close_after_incr_apply_once: Arc::clone(&close_after_incr_apply_once),
+                            close_after_incr_applies: Arc::clone(&close_after_incr_applies),
                             close_after_cas_set_apply_once: Arc::clone(
                                 &close_after_cas_set_apply_once,
                             ),
@@ -5397,6 +5436,7 @@ mod tests {
         wrong_once: Arc<AtomicBool>,
         close_once: Arc<AtomicBool>,
         close_after_incr_apply_once: Arc<AtomicBool>,
+        close_after_incr_applies: Arc<AtomicUsize>,
         close_after_cas_set_apply_once: Arc<AtomicBool>,
         close_after_cas_delete_apply_once: Arc<AtomicBool>,
         delay: Arc<StdMutex<Duration>>,
@@ -5428,6 +5468,7 @@ mod tests {
             wrong_once,
             close_once,
             close_after_incr_apply_once,
+            close_after_incr_applies,
             close_after_cas_set_apply_once,
             close_after_cas_delete_apply_once,
             delay,
@@ -5693,6 +5734,18 @@ mod tests {
                                         if close_after_incr_apply_once.swap(false, Ordering::SeqCst)
                                         {
                                             return Ok(());
+                                        }
+                                        // Issue #497: applied, but hold the
+                                        // reply; drop the connection once the
+                                        // Nth pipelined delta has landed too.
+                                        let held = close_after_incr_applies.load(Ordering::SeqCst);
+                                        if held > 0 {
+                                            close_after_incr_applies
+                                                .store(held - 1, Ordering::SeqCst);
+                                            if held == 1 {
+                                                return Ok(());
+                                            }
+                                            continue;
                                         }
                                         stream
                                             .write_all(
@@ -7605,6 +7658,59 @@ mod tests {
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 2 3");
         read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
         assert_eq!(&buf.split_to(2)[..], b"20");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pipelined_incr_behind_a_lost_reply_is_not_replayed_on_the_redial() {
+        // Issue #497: two clients' INCRs share one backend connection.
+        // The node applies both, answers neither, and drops the
+        // connection. The reader poisons on the first missing reply;
+        // the second request was already written (and applied), so it
+        // must surface as "may have been applied" — not as `not_sent`,
+        // which would replay it onto the redialed connection and apply
+        // the delta a third time. Proven by the node's `i` count (2,
+        // not 3) and the stored value (10 + 5 + 5, never + 5 again).
+        let (nodes, proxy) = cluster(1).await;
+        let node = &nodes[0];
+        let (mut first, mut first_buf) = connect_and_auth_tagged(&proxy).await;
+        let (mut second, mut second_buf) = connect_and_auth_tagged(&proxy).await;
+
+        first.write_all(b"S 7 2 1\ncounter10").await.unwrap();
+        assert_eq!(read_line(&mut first, &mut first_buf).await.unwrap(), "S 1");
+
+        node.close_after_incr_applies.store(2, Ordering::SeqCst);
+        first.write_all(b"i 0 7 5 2\ncounter").await.unwrap();
+        second.write_all(b"i 0 7 5 3\ncounter").await.unwrap();
+
+        // Both callers get the per-request "may have been applied" `R`.
+        assert_eq!(read_line(&mut first, &mut first_buf).await.unwrap(), "R 2");
+        assert_eq!(
+            read_line(&mut second, &mut second_buf).await.unwrap(),
+            "R 3"
+        );
+
+        assert_eq!(
+            node.incrs(),
+            2,
+            "the pipelined INCR behind the lost reply must not be replayed"
+        );
+        assert_eq!(
+            node.entry(b"", b"counter"),
+            Some(b"20".to_vec()),
+            "each delta must be applied exactly once"
+        );
+
+        // The pool redials on the next request: a fresh INCR works and
+        // continues from the two applied deltas.
+        second.write_all(b"i 0 7 5 4\ncounter").await.unwrap();
+        assert_eq!(
+            read_line(&mut second, &mut second_buf).await.unwrap(),
+            "I 2 4"
+        );
+        read_exact_into(&mut second, &mut second_buf, 2)
+            .await
+            .unwrap();
+        assert_eq!(&second_buf.split_to(2)[..], b"25");
     }
 
     #[tokio::test(flavor = "current_thread")]
