@@ -2528,7 +2528,13 @@ export class NanocachedClient {
     }
 
     const valueBytes = result.raw;
-    const ttlSeconds = result.ttlSeconds ?? 0;
+    // Issue #501: the primary echoes the entry's TTL as a u64, which
+    // another SDK (Python, Rust) may have stored past 2^53 — beyond what
+    // encodeSet accepts (Number.isSafeInteger). Clamp rather than fail:
+    // both values are hundreds of millions of years out, so the replica's
+    // entry is "never expires" either way, and a RangeError here would
+    // throw out of incr() after the primary already applied the delta.
+    const ttlSeconds = Math.min(result.ttlSeconds ?? 0, Number.MAX_SAFE_INTEGER);
 
     const replicaWrite = async (name: string): Promise<void> => {
       try {

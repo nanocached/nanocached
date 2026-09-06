@@ -613,12 +613,28 @@ describe("tryParseResponse — INCR's `I` response (issue #129)", () => {
     assert.throws(() => tryParseResponse(Buffer.from("I 2 abc\n42")), /invalid ttl/);
   });
 
+  it("accepts any u64 ttl the wire can carry, imprecise past 2^53 (issue #501)", () => {
+    // Regression: the magnitude bound below used to be
+    // `Number.isSafeInteger`, but the field's wire type is u64 and the
+    // Python/Rust SDKs store TTLs in that full range — a legitimate
+    // reply this SDK rejected, poisoning the whole connection.
+    const i64Max = "9223372036854775807";
+    let parsed = tryParseResponse(Buffer.from(`I 2 ${i64Max}\n42`));
+    assert.equal(parsed?.response.ttlSeconds, Number(i64Max));
+    const u64Max = "18446744073709551615";
+    parsed = tryParseResponse(Buffer.from(`I 2 ${u64Max}\n42`));
+    assert.equal(parsed?.response.ttlSeconds, Number(u64Max));
+    // One past u64::MAX is not a value the server could ever have stored.
+    assert.throws(() => tryParseResponse(Buffer.from("I 2 18446744073709551616\n42")), /invalid ttl/);
+    assert.throws(() => tryParseResponse(Buffer.from("I 2 +5\n42")), /invalid ttl/);
+  });
+
   it("throws on a ttl field with no magnitude bound (issue #233)", () => {
     // Regression: unlike parseTag's MAX_TAG check, parseTtlSeconds used
     // to accept any all-digit string, so a desynced/corrupt field long
-    // enough to overflow `Number.isSafeInteger` (or even `Number` itself,
-    // returning `Infinity`) was silently accepted instead of raising a
-    // protocol error.
+    // enough to overflow u64 (or even `Number` itself, returning
+    // `Infinity`) was silently accepted instead of raising a protocol
+    // error.
     const hugeButFinite = "9".repeat(30); // parses to a finite double, but well past 2^53-1
     assert.throws(() => tryParseResponse(Buffer.from(`I 2 ${hugeButFinite}\n42`)), /invalid ttl/);
     const overflowsToInfinity = "9".repeat(400);

@@ -95,6 +95,12 @@ export interface MockNode extends MockServerBase {
    * replica must receive a `set`/`s` carrying the primary's literal
    * result, and must NEVER receive an `i` frame at all. */
   incrCount(): number;
+  /** Issue #501: makes the next `I` reply carry `ttlField` verbatim as
+   * its remaining-TTL field, whatever the entry's real TTL — for a TTL
+   * this SDK cannot itself store (past Number.MAX_SAFE_INTEGER, which
+   * the Python/Rust SDKs can write as a u64) and so could never get into
+   * `ttls` through the wire. */
+  answerIncrTtlOnce(ttlField: string): void;
   /** How many `k` (compare-and-set, issue #141) requests this server has
    * ever received — the critical assertion for cluster-replication tests:
    * a replica must receive a `set`/`s` carrying the primary's literal
@@ -367,6 +373,7 @@ export async function startMockNode(
   // reply — the "primary applied it, only the ack was lost" shape a
   // non-idempotent retry must never replay.
   let dropAfterIncr = 0;
+  let incrTtlOverride: string | undefined; // issue #501, see answerIncrTtlOnce
   let dropAfterCas = 0;
   let clears = 0;
   let failClearReplies = 0;
@@ -858,7 +865,11 @@ export async function startMockNode(
             }
 
             const ttlSeconds = ttlsFor(namespace).get(key) ?? 0;
-            const ttlField = ttlSeconds > 0 ? ` ${ttlSeconds}` : "";
+            let ttlField = ttlSeconds > 0 ? ` ${ttlSeconds}` : "";
+            if (incrTtlOverride !== undefined) {
+              ttlField = ` ${incrTtlOverride}`;
+              incrTtlOverride = undefined;
+            }
             socket.write(Buffer.concat([Buffer.from(`I ${newValueBytes.length}${ttlField}${tag}\n`), newValueBytes]));
             break;
           }
@@ -1099,6 +1110,9 @@ export async function startMockNode(
     connectionCount: () => connections,
     getCount: () => gets,
     incrCount: () => incrs,
+    answerIncrTtlOnce: (ttlField) => {
+      incrTtlOverride = ttlField;
+    },
     casCount: () => casRequests,
     casDeleteCount: () => casDeleteRequests,
     clearCount: () => clears,
