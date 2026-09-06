@@ -74,6 +74,13 @@ internal sealed class MockNode : IDisposable
             ? entry
             : null;
 
+    /// <summary>Plants <paramref name="value"/> under <paramref name="key"/>
+    /// in namespace <paramref name="ns"/> as if a client had set it — lets
+    /// a test stage bytes the adapter itself would no longer write (issue
+    /// #499: an envelope in the older whole-seconds format).</summary>
+    internal void Seed(string ns, byte[] key, byte[] value, long ttlSeconds) =>
+        Store(ns)[EncodeKey(key)] = new Entry(value, ttlSeconds);
+
     private static string EncodeKey(byte[] bytes) => Convert.ToBase64String(bytes);
 
     /// <summary>The SDK's CAS token shape (issue #141): the first 16 bytes
