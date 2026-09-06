@@ -482,6 +482,14 @@ can't tell "not specified" apart from "explicitly zero"); call
 request that finds a dead connection pays its own full dial attempt) —
 the Go SDK's equivalent is a negative `Config.ReconnectCooldown`.
 
+The per-request timeout (30 s by default; `Options::request_timeout`)
+is progress-based, as in the Go SDK (issue #488): when a request's
+timer fires it is only given up if the connection received no response
+at all within the last window — a server that is still answering, just
+slowly, never has a queued request timed out on it; a server that has
+gone silent still fails every pending request within one window and
+the connection is redialed.
+
 `connect()` itself tolerates a node that discovery still lists but that
 can't be reached — typically one that just died and hasn't been evicted
 yet (a window of seconds): the node is kept in the ring without a
