@@ -444,13 +444,15 @@ public final class NanocachedClient implements AutoCloseable {
     // keepAliveIntervalMillis.
     static volatile int maxInFlightBackgroundReplicaWrites = 32;
     // Headroom above maxInFlightBackgroundReplicaWrites for replicaWriters'
-    // fixed thread count (see openCluster): background legs are capped by
-    // backgroundReplicaWritePermits, but synchronous-fallback legs (option
-    // off, or the cap already reached) are not permit-gated and can pile up
-    // from many concurrent write() calls — this headroom lets a burst of
-    // them run with real parallelism instead of only ever queueing, without
-    // reintroducing newCachedThreadPool's unbounded thread growth. Chosen,
-    // not derived: no formula makes this precise, just generous enough in
+    // fixed thread count (see openCluster): synchronous-fallback legs
+    // (option off, or the cap already reached), batched get/set owner legs
+    // and hedge legs are not permit-gated and can pile up from many
+    // concurrent calls — this headroom lets a burst of them run with real
+    // parallelism instead of only ever queueing, without reintroducing
+    // newCachedThreadPool's unbounded thread growth. The permit-gated
+    // background legs themselves run on their own pool (backgroundLegs,
+    // issue #500) and don't compete for these threads. Chosen, not
+    // derived: no formula makes this precise, just generous enough in
     // practice.
     private static final int REPLICA_WRITER_POOL_HEADROOM = 16;
 
@@ -615,6 +617,20 @@ public final class NanocachedClient implements AutoCloseable {
     private long lastFetchNanos = System.nanoTime();
 
     private ExecutorService replicaWriters;
+    /** Issue #500: the pool for the permit-gated background legs only —
+     * fire-and-forget replica writes (set, delete, setMany) and read
+     * repair — sized to exactly {@link #backgroundReplicaWritePermitCount}
+     * threads over a queue of the same depth. Every leg that lands here
+     * holds a permit from {@link #backgroundReplicaWritePermits}, so at
+     * most that many are ever in flight and the pool can never be full:
+     * the "caller runs the task" overflow policy shared with {@link
+     * #replicaWriters} is unreachable here in practice. That is the
+     * point of the split — on the shared pool, a burst of the legs no
+     * permit bounds (synchronous fallbacks, batched get/set owner legs)
+     * could fill the queue and make a permit-holding fire-and-forget
+     * {@code set()} run its replica leg inline, blocking the caller the
+     * option promises to return to as soon as the primary acks. */
+    private ExecutorService backgroundLegs;
     private ScheduledExecutorService keepAlive;
 
     private static final class Member {
@@ -1103,27 +1119,29 @@ public final class NanocachedClient implements AutoCloseable {
         backgroundReplicaWritePermitCount = maxInFlightBackgroundReplicaWrites;
         backgroundReplicaWritePermits = new java.util.concurrent.Semaphore(backgroundReplicaWritePermitCount);
         replicaWriters = newReplicaWriterPool(backgroundReplicaWritePermitCount + REPLICA_WRITER_POOL_HEADROOM);
+        backgroundLegs = newReplicaWriterPool(backgroundReplicaWritePermitCount);
     }
 
     /**
-     * The pool every background leg runs on — bounded in both dimensions
-     * (issue #486): {@code threads} fixed threads (not newCachedThreadPool,
-     * which grows one thread per submitted task with no cap — see
-     * REPLICA_WRITER_POOL_HEADROOM) over a queue of the same depth. Only
-     * the permit-gated legs (fire-and-forget replica writes, read repair)
-     * and the hedge legs ({@code maxInFlightHedgeLoserLegs}) are bounded
-     * before they get here; synchronous-fallback legs and the batched
-     * get/set owner legs are limited only by how many calls the
-     * application has in flight, so with an unbounded queue a burst of
-     * them could pile up without limit. When the queue is full the
+     * A leg pool bounded in both dimensions (issue #486): {@code threads}
+     * fixed threads (not newCachedThreadPool, which grows one thread per
+     * submitted task with no cap — see REPLICA_WRITER_POOL_HEADROOM) over
+     * a queue of the same depth. Two instances (issue #500): {@link
+     * #replicaWriters} for the legs nothing bounds ahead of the pool —
+     * synchronous-fallback replica legs and the batched get/set owner
+     * legs, limited only by how many calls the application has in
+     * flight — plus the hedge legs ({@code maxInFlightHedgeLoserLegs});
+     * and {@link #backgroundLegs} for the permit-gated fire-and-forget
+     * legs, which can never fill it. When the queue is full the
      * submitter runs the task itself — the same synchronous fallback
      * every call site already has for the permit-exhausted case — which
-     * also applies back-pressure to the caller producing the burst. A
-     * pool that has been shut down still rejects with
-     * RejectedExecutionException, so each call site's existing
-     * "close() raced us, run inline" handling keeps working (the default
-     * CallerRunsPolicy would silently discard the task in that case and
-     * leave its CompletableFuture never completing).
+     * applies back-pressure to the caller producing the burst, and only
+     * to that caller now that a permit-holding fire-and-forget leg no
+     * longer shares the queue. A pool that has been shut down still
+     * rejects with RejectedExecutionException, so each call site's
+     * existing "close() raced us, run inline" handling keeps working
+     * (the default CallerRunsPolicy would silently discard the task in
+     * that case and leave its CompletableFuture never completing).
      */
     static ExecutorService newReplicaWriterPool(int threads) {
         java.util.concurrent.ThreadPoolExecutor pool = new java.util.concurrent.ThreadPoolExecutor(
@@ -1680,7 +1698,7 @@ public final class NanocachedClient implements AutoCloseable {
                     }
                 };
                 try {
-                    CompletableFuture.runAsync(repair, replicaWriters)
+                    CompletableFuture.runAsync(repair, backgroundLegs)
                             .whenComplete((ignoredResult, error) -> {
                                 backgroundReplicaWritePermits.release();
                                 // error is non-null only for a genuine bug
@@ -1691,7 +1709,7 @@ public final class NanocachedClient implements AutoCloseable {
                                 reportBackgroundWriteBug(error);
                             });
                 } catch (RejectedExecutionException rejected) {
-                    // close() shut replicaWriters down concurrently — see
+                    // close() shut backgroundLegs down concurrently — see
                     // the matching handling in write(). The repair is
                     // opportunistic, so simply release the permit and skip
                     // it rather than run it inline; a later miss repairs
@@ -2571,7 +2589,7 @@ public final class NanocachedClient implements AutoCloseable {
                 Runnable backgroundLeg =
                         () -> runMultiSetLeg(namespace, name, batch, keyBytes, backgroundValues, ttlSeconds, retry);
                 try {
-                    CompletableFuture.runAsync(backgroundLeg, replicaWriters)
+                    CompletableFuture.runAsync(backgroundLeg, backgroundLegs)
                             .whenComplete((ignoredResult, error) -> {
                                 backgroundReplicaWritePermits.release();
                                 reportBackgroundWriteBug(error);
@@ -3145,6 +3163,13 @@ public final class NanocachedClient implements AutoCloseable {
         // background replica writes just above, before that pool is shut
         // down.
         drainHedgedReads();
+        // Issue #500: every permit is held above, so no background leg is
+        // running or queued here any more — this is teardown of idle
+        // threads, bounded by the plain termination margin.
+        if (backgroundLegs != null) {
+            backgroundLegs.shutdown();
+            awaitTerminationQuietly(backgroundLegs);
+        }
         if (replicaWriters != null) {
             replicaWriters.shutdown();
             // A longer bound than keepAlive's: a synchronous (or
@@ -3240,7 +3265,7 @@ public final class NanocachedClient implements AutoCloseable {
 
     /** Closes every connection this attempt opened. Called both from
      * {@link #close()} (after it has already drained/shut down {@link
-     * #replicaWriters}/{@link #keepAlive} itself) and from {@link
+     * #replicaWriters}/{@link #backgroundLegs}/{@link #keepAlive} itself) and from {@link
      * #connect}'s catch blocks whenever anything after {@link
      * #openCluster} fails — including {@link #startKeepAlive} itself
      * throwing, which can happen after openCluster already built {@link
@@ -3263,6 +3288,9 @@ public final class NanocachedClient implements AutoCloseable {
         }
         if (keepAlive != null) {
             keepAlive.shutdownNow();
+        }
+        if (backgroundLegs != null) {
+            backgroundLegs.shutdown();
         }
         if (replicaWriters != null) {
             replicaWriters.shutdown();
@@ -3726,7 +3754,7 @@ public final class NanocachedClient implements AutoCloseable {
                     }
                 };
                 try {
-                    CompletableFuture.runAsync(replicaWrite, replicaWriters)
+                    CompletableFuture.runAsync(replicaWrite, backgroundLegs)
                             .whenComplete((ignoredResult, error) -> {
                                 backgroundReplicaWritePermits.release();
                                 // error is non-null only for a genuine bug
@@ -3737,7 +3765,7 @@ public final class NanocachedClient implements AutoCloseable {
                                 reportBackgroundWriteBug(error);
                             });
                 } catch (RejectedExecutionException rejected) {
-                    // close() shut replicaWriters down concurrently: the
+                    // close() shut backgroundLegs down concurrently: the
                     // permit was already acquired, but the task was never
                     // submitted, so whenComplete would never run to release
                     // it — release it here instead of leaking it, and run
@@ -3946,13 +3974,13 @@ public final class NanocachedClient implements AutoCloseable {
                     }
                 };
                 try {
-                    CompletableFuture.runAsync(replicaWrite, replicaWriters)
+                    CompletableFuture.runAsync(replicaWrite, backgroundLegs)
                             .whenComplete((ignoredResult, error) -> {
                                 backgroundReplicaWritePermits.release();
                                 reportBackgroundWriteBug(error);
                             });
                 } catch (RejectedExecutionException rejected) {
-                    // close() shut replicaWriters down concurrently — see
+                    // close() shut backgroundLegs down concurrently — see
                     // write()'s identical handling.
                     backgroundReplicaWritePermits.release();
                     replicaWrite.run();

@@ -2751,6 +2751,65 @@ class NanocachedClientTest {
     }
 
     @Test
+    void fireAndForgetReplicasStillReturnImmediatelyWhenTheSharedLegPoolIsSaturated() throws Exception {
+        // Regression for issue #500: #486 bounded the shared leg pool's
+        // queue and made its overflow policy "the submitter runs the task
+        // itself". That pool also carried the fire-and-forget legs, so a
+        // burst of legs no permit bounds (synchronous fallbacks, batched
+        // get/set owner legs) filling it made a permit-holding
+        // fire-and-forget set() run its replica leg inline — blocking a
+        // caller the option promises to return to as soon as the primary
+        // acks. The fire-and-forget legs now run on their own pool
+        // (backgroundLegs), which the permits keep from ever filling.
+        // Saturate every thread *and* every queue slot of replicaWriters
+        // with unrelated blocking work, then prove set() still returns
+        // well inside the replica's delay.
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+
+        try (Cluster cluster = startCluster(2)) {
+            String replica = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            cluster.nodes().get(replica).delaySets(300);
+
+            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+                Field replicaWritersField = NanocachedClient.class.getDeclaredField("replicaWriters");
+                replicaWritersField.setAccessible(true);
+                ExecutorService replicaWriters = (ExecutorService) replicaWritersField.get(client);
+
+                // 1 (maxInFlightBackgroundReplicaWrites) + REPLICA_WRITER_POOL_HEADROOM (16)
+                // threads over a queue of the same depth: 34 slots in all. One
+                // more submit would run on this thread (the overflow policy) —
+                // exactly what the fire-and-forget leg must no longer risk.
+                int threads = 17;
+                java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.CountDownLatch occupied = new java.util.concurrent.CountDownLatch(threads);
+                for (int i = 0; i < 2 * threads; i++) {
+                    replicaWriters.submit(() -> {
+                        occupied.countDown();
+                        release.await();
+                        return null;
+                    });
+                }
+                assertTrue(occupied.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                        "every replicaWriters thread should have started its blocking dummy task");
+                try {
+                    long start = System.nanoTime();
+                    client.set("k", "v");
+                    long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+                    assertTrue(elapsedMillis < 300,
+                            "set() must not run its replica leg inline just because the shared pool is full, took "
+                                    + elapsedMillis + "ms");
+
+                    String stored = MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8));
+                    waitFor(() -> cluster.nodes().get(replica).store.containsKey(stored),
+                            "the background write to land on the replica");
+                } finally {
+                    release.countDown();
+                }
+            }
+        }
+    }
+
+    @Test
     void fireAndForgetReplicaLegDoesNotAliasTheCallersArray() throws Exception {
         // Issue #326: with compress off, set()'s `outgoing` used to be the
         // caller's own `value` array, not a copy — a fire-and-forget
@@ -2765,33 +2824,35 @@ class NanocachedClientTest {
         //
         // To make "how late the leg actually runs" deterministic instead
         // of a real-time race, permits/pool size are shrunk to 1 replica
-        // writer slot and every replicaWriters thread is occupied with a
-        // blocking dummy task before set() is even called — so the real
-        // leg is guaranteed to still be sitting in the queue, not yet
-        // read `outgoing`, at the point this test mutates `value`.
+        // writer slot and the one backgroundLegs thread (issue #500: the
+        // fire-and-forget legs' own pool, sized to the permit count) is
+        // occupied with a blocking dummy task before set() is even called
+        // — so the real leg is guaranteed to still be sitting in that
+        // pool's queue, not yet read `outgoing`, at the point this test
+        // mutates `value`.
         NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
 
         try (Cluster cluster = startCluster(2)) {
             String replica = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
 
             try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
-                Field replicaWritersField = NanocachedClient.class.getDeclaredField("replicaWriters");
-                replicaWritersField.setAccessible(true);
-                ExecutorService replicaWriters = (ExecutorService) replicaWritersField.get(client);
+                Field backgroundLegsField = NanocachedClient.class.getDeclaredField("backgroundLegs");
+                backgroundLegsField.setAccessible(true);
+                ExecutorService backgroundLegs = (ExecutorService) backgroundLegsField.get(client);
 
-                // 1 (maxInFlightBackgroundReplicaWrites) + REPLICA_WRITER_POOL_HEADROOM (16) threads.
-                int poolSize = 17;
+                // maxInFlightBackgroundReplicaWrites (1) threads.
+                int poolSize = 1;
                 java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
                 java.util.concurrent.CountDownLatch occupied = new java.util.concurrent.CountDownLatch(poolSize);
                 for (int i = 0; i < poolSize; i++) {
-                    replicaWriters.submit(() -> {
+                    backgroundLegs.submit(() -> {
                         occupied.countDown();
                         release.await();
                         return null;
                     });
                 }
                 assertTrue(occupied.await(5, java.util.concurrent.TimeUnit.SECONDS),
-                        "every replicaWriters thread should have started its blocking dummy task");
+                        "every backgroundLegs thread should have started its blocking dummy task");
 
                 byte[] value = "original".getBytes(StandardCharsets.UTF_8);
                 client.set("k".getBytes(StandardCharsets.UTF_8), value);
