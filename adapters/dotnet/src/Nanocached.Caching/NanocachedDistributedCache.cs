@@ -43,11 +43,14 @@ public class NanocachedDistributedCache : IDistributedCache
 {
     // Envelope layout (see the class doc comment): 1 version byte, a
     // 4-byte big-endian sliding-seconds field (0 = no sliding), an 8-byte
-    // big-endian absolute-expiry Unix-seconds field (0 = no absolute
-    // expiry), then the caller's payload untouched. Fixed-width and
-    // versioned so a future format change can recognize — and reject
-    // rather than misread — an entry written by an older adapter version.
-    private const byte EnvelopeVersion = 0x01;
+    // big-endian absolute-expiry field (0 = no absolute expiry) — Unix
+    // milliseconds since version 0x02 (issue #499); version 0x01 held
+    // whole Unix seconds and is still read, never written — then the
+    // caller's payload untouched. Fixed-width and versioned so a format
+    // change can recognize — and convert or reject rather than misread —
+    // an entry written by an older adapter version.
+    private const byte EnvelopeVersion = 0x02;
+    private const byte EnvelopeVersionSeconds = 0x01;
     private const int EnvelopeHeaderLength = 1 + 4 + 8;
 
     private readonly NanocachedNamespace _namespace;
@@ -194,28 +197,23 @@ public class NanocachedDistributedCache : IDistributedCache
     private readonly struct Envelope
     {
         internal readonly long SlidingSeconds; // 0 = no sliding window
-        internal readonly long AbsoluteUnixSeconds; // 0 = no absolute expiry
+        // Issue #499: Unix *milliseconds*, not seconds. Version 0x01 stored
+        // whole seconds, floored — so IsPastAbsoluteExpiry (issue #233)
+        // would notice an expiry the moment real time reached it — while
+        // the wire TTL for the same entry was ceiled from the precise
+        // instant (issue #418) and so outlived it. In the sub-second gap
+        // between the two, Get/Refresh declared a still-live entry expired
+        // (and deleted it) up to 1s before the configured instant. Keeping
+        // the instant to the millisecond leaves nothing to round on either
+        // side: "past" is past, and the remaining duration ceils once.
+        internal readonly long AbsoluteUnixMillis; // 0 = no absolute expiry
         internal readonly byte[] Payload;
 
-        // Issue #418: the sub-second remainder that AbsoluteUnixSeconds'
-        // whole-second wire format necessarily discards (see FromOptions).
-        // Populated only by FromOptions, for the immediate SetAsync write
-        // that just computed it — never persisted, never present on an
-        // envelope round-tripped through Parse (a later Get/Refresh
-        // renewal), so those keep computing WireTtlSeconds purely from the
-        // (floored) AbsoluteUnixSeconds, same as IsPastAbsoluteExpiry
-        // already does (needed for issue #233's prompt "already past"
-        // detection — rounding that up would delay it by up to 1s).
-        private readonly DateTimeOffset? _preciseAbsoluteExpiry;
-
-        private Envelope(
-            long slidingSeconds, long absoluteUnixSeconds, byte[] payload,
-            DateTimeOffset? preciseAbsoluteExpiry = null)
+        private Envelope(long slidingSeconds, long absoluteUnixMillis, byte[] payload)
         {
             SlidingSeconds = slidingSeconds;
-            AbsoluteUnixSeconds = absoluteUnixSeconds;
+            AbsoluteUnixMillis = absoluteUnixMillis;
             Payload = payload;
-            _preciseAbsoluteExpiry = preciseAbsoluteExpiry;
         }
 
         /// <summary>
@@ -269,31 +267,22 @@ public class NanocachedDistributedCache : IDistributedCache
                 slidingSeconds = CeilSeconds(sliding);
             }
 
-            // AbsoluteUnixSeconds floors to whole seconds — required so
-            // IsPastAbsoluteExpiry (issue #233) flags an already-passed
-            // absolute expiry as soon as real time reaches it, rather than
-            // rounding that detection up to a full second late. That same
-            // floored field feeds WireTtlSeconds for a later Get/Refresh
-            // renewal too, where the precise original instant below is no
-            // longer available (only these wire bytes survive a round
-            // trip) — a renewal's TTL is at most ~1s short of the caller's
-            // original request, the same slop CeilSeconds already accepts
-            // elsewhere on the wire.
-            long absoluteUnixSeconds = absolute is { } a ? a.ToUnixTimeSeconds() : 0;
-            // Issue #418: for *this* write, though, the precise instant is
-            // still in hand — hand it to WireTtlSeconds below so it can
-            // ceil the true remaining duration once, instead of ceiling an
-            // already-floored (up to ~1s short) reconstruction of it, which
-            // could turn e.g. a 5.9s-from-now expiration into a 5s wire TTL
-            // instead of the intended 6 — expiring up to ~1s early.
-            return new Envelope(slidingSeconds, absoluteUnixSeconds, payload, absolute);
+            // Issue #499: the instant is kept to the millisecond — the
+            // only rounding left on this field, and under 1ms of it
+            // (truncation of the 100ns ticks). WireTtlSeconds ceils the
+            // remaining duration from it, so a "5.9s from now" request is
+            // still a 6-second wire TTL (issue #418) and an exact "5s" is
+            // still 5, without a second, precise copy of the instant.
+            long absoluteUnixMillis = absolute is { } a ? a.ToUnixTimeMilliseconds() : 0;
+            return new Envelope(slidingSeconds, absoluteUnixMillis, payload);
         }
 
         private static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b) => a < b ? a : b;
 
         internal static Envelope Parse(byte[] raw)
         {
-            if (raw.Length < EnvelopeHeaderLength || raw[0] != EnvelopeVersion)
+            if (raw.Length < EnvelopeHeaderLength
+                || (raw[0] != EnvelopeVersion && raw[0] != EnvelopeVersionSeconds))
             {
                 throw new InvalidOperationException(
                     "nanocached.caching: stored value is not a recognized cache envelope — was this key "
@@ -301,6 +290,15 @@ public class NanocachedDistributedCache : IDistributedCache
             }
             long sliding = BinaryPrimitives.ReadUInt32BigEndian(raw.AsSpan(1, 4));
             long absolute = BinaryPrimitives.ReadInt64BigEndian(raw.AsSpan(5, 8));
+            // Issue #499: an entry written by the whole-seconds format
+            // (0x01) is still honoured as it was written — its floored
+            // second, as milliseconds — and re-written as 0x02 by the next
+            // sliding renewal, so a rolling upgrade never throws on, or
+            // silently re-times, what an older adapter stored.
+            if (raw[0] == EnvelopeVersionSeconds && absolute > 0)
+            {
+                absolute *= 1000;
+            }
             byte[] payload = raw[EnvelopeHeaderLength..];
             return new Envelope(sliding, absolute, payload);
         }
@@ -324,7 +322,7 @@ public class NanocachedDistributedCache : IDistributedCache
             // real, uncapped SlidingSeconds for this write's own wire TTL.
             uint slidingSecondsWire = SlidingSeconds > uint.MaxValue ? uint.MaxValue : (uint)SlidingSeconds;
             BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(1, 4), slidingSecondsWire);
-            BinaryPrimitives.WriteInt64BigEndian(bytes.AsSpan(5, 8), AbsoluteUnixSeconds);
+            BinaryPrimitives.WriteInt64BigEndian(bytes.AsSpan(5, 8), AbsoluteUnixMillis);
             Payload.CopyTo(bytes.AsSpan(EnvelopeHeaderLength));
             return bytes;
         }
@@ -338,10 +336,12 @@ public class NanocachedDistributedCache : IDistributedCache
         /// (issue #233): that method's own floor exists for a sub-second-but-still-future
         /// remainder, not for "already past", and would otherwise turn an
         /// expired entry into a fresh 1-second TTL instead of the miss it
-        /// should be.
+        /// should be. Compared to the millisecond (issue #499), so it can
+        /// neither fire early — before the configured instant, while the
+        /// server still holds the entry — nor a whole second late.
         /// </summary>
         internal bool IsPastAbsoluteExpiry(DateTimeOffset now) =>
-            AbsoluteUnixSeconds > 0 && DateTimeOffset.FromUnixTimeSeconds(AbsoluteUnixSeconds) <= now;
+            AbsoluteUnixMillis > 0 && DateTimeOffset.FromUnixTimeMilliseconds(AbsoluteUnixMillis) <= now;
 
         /// <summary>
         /// The wire TTL (whole seconds) for this envelope's next write:
@@ -352,28 +352,16 @@ public class NanocachedDistributedCache : IDistributedCache
         /// TTL — nanocached's "lives until evicted/removed") when neither
         /// is set. Callers with a sliding window must rule out
         /// <see cref="IsPastAbsoluteExpiry"/> first — see its own doc
-        /// comment.
-        ///
-        /// <para>Issue #418: when this envelope still carries the precise
-        /// (not-yet-floored) absolute instant — i.e. this call is the
-        /// immediate write right after <see cref="FromOptions"/>, not a
-        /// later renewal reconstructed via <see cref="Parse"/> — the
-        /// remaining duration is ceiled once from that precise instant
-        /// rather than from <see cref="AbsoluteUnixSeconds"/>' whole-second
-        /// floor, so a request like "5.9s from now" yields a 6-second wire
-        /// TTL, not 5.</para>
+        /// comment. The absolute remainder is ceiled once from the stored
+        /// millisecond instant (issues #418/#499), on the first write and
+        /// on every renewal alike.
         /// </summary>
         internal long WireTtlSeconds(DateTimeOffset now)
         {
             long? ttl = SlidingSeconds > 0 ? SlidingSeconds : null;
-            if (_preciseAbsoluteExpiry is { } precise)
+            if (AbsoluteUnixMillis > 0)
             {
-                long remaining = CeilSeconds(precise - now);
-                ttl = ttl is { } sliding ? Math.Min(sliding, remaining) : remaining;
-            }
-            else if (AbsoluteUnixSeconds > 0)
-            {
-                long remaining = CeilSeconds(DateTimeOffset.FromUnixTimeSeconds(AbsoluteUnixSeconds) - now);
+                long remaining = CeilSeconds(DateTimeOffset.FromUnixTimeMilliseconds(AbsoluteUnixMillis) - now);
                 ttl = ttl is { } sliding ? Math.Min(sliding, remaining) : remaining;
             }
             return ttl ?? 0;

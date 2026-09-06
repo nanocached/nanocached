@@ -107,8 +107,10 @@ nanocached's TTL is a one-shot countdown — a key's remaining time never
 changes just because it was read. `DistributedCacheEntryOptions.SlidingExpiration`
 is emulated on top of that: every value is wrapped in a small envelope
 (one version byte, the configured sliding window, the configured absolute
-expiry, then the payload) so a later `Get`/`Refresh` knows what to
-recompute. `Get` on an entry with a sliding window re-sets it — envelope
+expiry to the millisecond, then the payload) so a later `Get`/`Refresh`
+knows what to recompute. Envelopes written by earlier adapter releases
+(version byte `0x01`, whole-second absolute expiry) are still read, and the
+next renewal re-writes them in the current format. `Get` on an entry with a sliding window re-sets it — envelope
 and all — with a freshly computed TTL before returning, awaited (never
 fire-and-forget); `Refresh` does the same without returning the value, and
 is a no-op on a missing key, per the SPI's contract. An entry with no

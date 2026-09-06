@@ -322,6 +322,78 @@ public sealed class NanocachedDistributedCacheTests
         Assert.Null(node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key));
     }
 
+    [Fact]
+    public async Task Get_still_hits_in_the_last_sub_second_before_a_sliding_plus_absolute_expiry()
+    {
+        // Regression for issue #499: the envelope stored the absolute
+        // expiry floored to a whole second while the wire TTL was ceiled
+        // from the precise instant, so for the sub-second between the
+        // floored second and the configured instant, Get declared a
+        // still-live entry expired — a miss — and deleted it from the
+        // server. Pin the instant at whole-second S + 900ms and read at
+        // S + 300ms: inside the old bug window, well before the expiry.
+        using var node = new MockNode();
+        await using ServiceProvider provider = BuildProvider(node);
+        IDistributedCache cache = provider.GetRequiredService<IDistributedCache>();
+        byte[] key = "last-sub-second"u8.ToArray();
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        DateTimeOffset wholeSecond = DateTimeOffset.FromUnixTimeSeconds(now.ToUnixTimeSeconds() + 2);
+        DateTimeOffset absolute = wholeSecond.AddMilliseconds(900);
+        await cache.SetAsync(
+            "last-sub-second", new byte[] { 7 },
+            new DistributedCacheEntryOptions
+            {
+                SlidingExpiration = TimeSpan.FromSeconds(30),
+                AbsoluteExpiration = absolute,
+            });
+
+        await Task.Delay(wholeSecond.AddMilliseconds(300) - DateTimeOffset.UtcNow);
+        Assert.True(DateTimeOffset.UtcNow < absolute, "the read must land before the configured expiry");
+
+        byte[]? value = await cache.GetAsync("last-sub-second");
+
+        Assert.Equal(new byte[] { 7 }, value);
+        MockNode.Entry? entry = node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key);
+        Assert.NotNull(entry);
+        // The renewal's TTL covers the (sub-second) remainder: 1, never 0.
+        Assert.Equal(1, entry!.TtlSeconds);
+    }
+
+    [Fact]
+    public async Task Reads_and_upgrades_an_envelope_written_in_the_whole_seconds_format()
+    {
+        // Issue #499 changed the envelope's absolute-expiry field from
+        // whole seconds (version 0x01) to milliseconds (0x02). An entry an
+        // older adapter stored must still be served — and re-written in
+        // the current format by the sliding renewal — rather than thrown
+        // on or mis-timed a thousandfold.
+        using var node = new MockNode();
+        await using ServiceProvider provider = BuildProvider(node);
+        IDistributedCache cache = provider.GetRequiredService<IDistributedCache>();
+        byte[] key = "legacy-envelope"u8.ToArray();
+
+        long absoluteSeconds = DateTimeOffset.UtcNow.AddSeconds(90).ToUnixTimeSeconds();
+        var legacy = new byte[1 + 4 + 8 + 2];
+        legacy[0] = 0x01;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(legacy.AsSpan(1, 4), 30);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(legacy.AsSpan(5, 8), absoluteSeconds);
+        legacy[13] = 0xAB;
+        legacy[14] = 0xCD;
+        node.Seed(NanocachedCacheOptions.DefaultNamespace, key, legacy, 30);
+
+        byte[]? value = await cache.GetAsync("legacy-envelope");
+
+        Assert.Equal(new byte[] { 0xAB, 0xCD }, value);
+        MockNode.Entry? entry = node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key);
+        Assert.NotNull(entry);
+        Assert.Equal(0x02, entry!.Value[0]);
+        Assert.Equal(
+            absoluteSeconds * 1000,
+            System.Buffers.Binary.BinaryPrimitives.ReadInt64BigEndian(entry.Value.AsSpan(5, 8)));
+        Assert.InRange(entry.TtlSeconds, 1, 30);
+    }
+
     // ── Absolute expiration ─────────────────────────────────────────
 
     [Fact]
