@@ -8,6 +8,8 @@ variable:
 
 ```sh
 export NANOTEST_ADDRESSES="10.0.0.1:8357,10.0.0.2:8357"   # discovery replicas, in order
+export NANOTEST_VIA_PROXY=1   # optional: SDK proxy mode — same discovery addresses, traffic goes through one nanocached-proxy
+export NANOTEST_SECRET=change-me   # optional: the cluster's NANOCACHED_AUTH_SECRET
 ```
 
 ## The scenario driver (Python)

@@ -8,6 +8,12 @@ foreach (var part in Environment.GetEnvironmentVariable("NANOTEST_ADDRESSES")!.S
     var idx = part.LastIndexOf(':');
     options.Addresses.Add((part[..idx], int.Parse(part[(idx + 1)..])));
 }
+// NANOTEST_VIA_PROXY=1: SDK proxy mode — addresses stay discovery's, the
+// client fetches the proxy roster and goes through one proxy.
+options.ViaProxy = Environment.GetEnvironmentVariable("NANOTEST_VIA_PROXY") == "1";
+// NANOTEST_SECRET: the cluster's NANOCACHED_AUTH_SECRET, when it has one.
+var secret = Environment.GetEnvironmentVariable("NANOTEST_SECRET");
+if (!string.IsNullOrEmpty(secret)) options.AuthSecret = secret;
 
 // Checked before connecting: an invalid invocation should fail loudly
 // with a usage message, not crash with an IndexOutOfRangeException on a

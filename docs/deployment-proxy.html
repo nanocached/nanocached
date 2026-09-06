@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The proxy tier — nanocached</title>
+<meta name="description" content="When a nanocached cluster needs nanocached-proxy, where it runs (with the cluster, in the cluster's own shape), how many, and how applications reach it — verified on ECS Fargate, with the EKS manifests and the sidecar alternative.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <nav>
+    <a class="brand" href="index.html"><img src="favicon.svg" alt=""><span><b>nano</b>cached</span></a>
+    <div class="links">
+      <a href="getting-started.html">Getting started</a>
+      <a href="protocol.html">Protocol</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="sdks.html">SDKs</a>
+      <a href="deployment.html" aria-current="page">Deployment</a>
+      <a href="capacity-planner.html">Capacity planner</a>
+      <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+
+<h1>The proxy tier</h1>
+<p><code>nanocached-proxy</code> is optional. A cluster works without it:
+every SDK fetches the roster from discovery and talks to the nodes
+directly, one connection per node per client process (<a
+href="architecture.html">architecture</a>). The proxy exists for the
+case where that stops scaling — a large or elastic application fleet,
+where the node-side connection count (processes × nodes) grows past
+what a node should hold — and for the case where the application side
+can only be given one stable address. It terminates many client
+connections, routes on their behalf with the same rendezvous hashing
+the SDKs use, and keeps one pipelined connection per node, so the
+node-side count becomes the proxy count. To a client it looks like a
+single node that owns every key.</p>
+<p>This page is about <em>where</em> to run it and <em>how many</em>,
+not how it works. The ECS section was run in that order against a
+real account and torn down; the EKS section is the same design as
+Kubernetes manifests and was not run on a cluster; the sidecar section
+is the alternative, with the constraints that make it the alternative.</p>
+
+<h2 id="when">When you need one</h2>
+<ul>
+  <li><b>Connection count.</b> Every client process holds one
+  connection per node. With <var>P</var> processes and <var>N</var>
+  nodes, each node sees <var>P</var> connections; a node's own bound is
+  its <code>--max-connections</code>. When <var>P</var> is in the
+  thousands, or elastic enough that you cannot say what it is, put a
+  proxy tier in front: each node then sees one connection per proxy.
+  <code>nanocached_node_connections</code> against
+  <code>nanocached_node_connections_max</code> on the <a
+  href="deployment-operations.html#metrics">operations endpoint</a> is
+  the number to watch.</li>
+  <li><b>One address.</b> A client that cannot run a discovery client
+  of its own — a bare protocol client, or a fleet you would rather hand
+  a single endpoint — points at a proxy (or a load balancer in front
+  of several) and needs nothing else.</li>
+  <li><b>Otherwise, no.</b> A fixed fleet of a few dozen application
+  servers does not need one. The <a href="deployment-ec2-cluster.html">EC2
+  cluster</a> is that shape; it has no proxy section, and if you do want
+  one there, run it the way that guide runs a node — a systemd unit
+  from the same image lineage, two instances, one per zone.</li>
+</ul>
+
+<h2 id="where">Where it runs</h2>
+<p>The proxy is part of the cache cluster, not of the application: it
+is stateless, it registers itself with discovery, and it needs to reach
+discovery and the nodes — nothing about the application. So it runs
+<b>with the cluster, in the cluster's own shape</b>: a third ECS service
+next to discovery and node, a third Deployment on EKS. Applications on
+any platform in the same VPC reach it the same way. This keeps one
+operational model per cluster; a proxy tier on EC2 in front of an ECS
+cluster would work, but it would mean AMIs, SSM and manual replacement
+for one component and task definitions for the rest.</p>
+<p><b>How applications find it.</b> A proxy registers its own address
+with discovery on start. An SDK in <em>proxy mode</em> (<code>via_proxy</code>
+/ <code>viaProxy</code> / <code>ViaProxy</code> — see the <a
+href="sdks.html">SDK docs</a>) is still configured with discovery's
+address; it fetches the proxy roster instead of the node roster and
+connects to one proxy, chosen at random, reconnecting to another if it
+goes away. No Cloud Map entry or Service is needed for the proxies
+themselves. If you want a single address instead, put an internal
+Network Load Balancer in front of the proxy tasks and configure the
+SDK with that address as a plain single node.</p>
+<p><b>How many.</b> The three roles scale for three different reasons,
+which is why they are three services with three desired counts:</p>
+<table>
+  <tr><th>role</th><th>count is set by</th><th>rule of thumb</th></tr>
+  <tr><td>discovery</td><td>nothing — it is the coordinator, joins are
+  staged one at a time through it, a second copy would not help. Its
+  loss stops new client bootstraps until the scheduler replaces it;
+  nodes and proxies keep working on their last roster.</td><td>1</td></tr>
+  <tr><td>node</td><td>data: dataset × R ÷ the task's
+  <code>--max-memory</code>, even across zones</td><td>≥ 2, even</td></tr>
+  <tr><td>proxy</td><td>client connections and throughput: concurrent
+  application connections ÷ <code>--max-connections</code> (1024 per
+  proxy) with headroom; at least one per zone for availability. Node
+  count does not enter into it.</td><td>≥ 2, one per zone;
+  grow when <code>nanocached_proxy_client_connections</code> approaches
+  <code>_max</code></td></tr>
+</table>
+<p>For example, 40 application tasks × 8 connections = 320 client
+connections: two proxies (capacity 2,048) carry that, and growing the
+dataset changes the node count, not the proxy count.</p>
+
+<h2 id="ecs">On ECS: a third service</h2>
+<p>Everything below assumes the cluster from <a
+href="deployment-ecs.html">Cluster on ECS</a> exists as that page
+builds it — the same variables (<code>$NAME</code>,
+<code>$CLUSTER_SG</code>, <code>$APP_SG</code>, <code>$EXEC_ARN</code>,
+<code>$NETCFG</code>), the same subnets, the same secret in Parameter
+Store. It was run that way: the ECS guide's blocks first, then these.</p>
+
+<h3>Security group</h3>
+<p>Two more rules on the cluster's group: the proxy's client port from
+the application tier, and its operations port from inside the VPC.
+Proxy → node and proxy → discovery are already covered by the rule
+that lets the cluster's group talk to itself on 8356–8357.</p>
+<pre><code>aws ec2 authorize-security-group-ingress --group-id $CLUSTER_SG --ip-permissions \
+  "IpProtocol=tcp,FromPort=8358,ToPort=8358,UserIdGroupPairs=[{GroupId=$APP_SG,Description=proxy from app tier}]" \
+  "IpProtocol=tcp,FromPort=9358,ToPort=9358,IpRanges=[{CidrIp=10.1.0.0/16,Description=proxy operations endpoint from inside the VPC}]"</code></pre>
+
+<h3>Task definition</h3>
+<p><code>td-proxy.json</code>:</p>
+<pre><code>[{
+  "name": "nanocached-proxy",
+  "image": "ghcr.io/nanocached/nanocached-proxy@sha256:0217ea01962f27db85d5b1b98b29f4ec34674e0a3c246842d459c2510880f05f",
+  "essential": true,
+  "command": ["--host", "0.0.0.0", "--port", "8358", "--discovery", "disc.nanocached.local:8357",
+              "--drain-timeout", "20", "--metrics-port", "9358"],
+  "secrets": [{"name": "NANOCACHED_AUTH_SECRET",
+               "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/nanocached/auth-secret"}],
+  "portMappings": [{"containerPort": 8358}, {"containerPort": 9358}],
+  "stopTimeout": 45,
+  "healthCheck": {"command": ["CMD-SHELL", "wget -qO- http://127.0.0.1:9358/readyz || exit 1"],
+                  "interval": 10, "timeout": 5, "retries": 3, "startPeriod": 30},
+  "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": "/ecs/nanocached",
+                       "awslogs-region": "us-east-1", "awslogs-stream-prefix": "proxy"}}
+}]</code></pre>
+<pre><code>aws ecs register-task-definition --family $NAME-proxy --network-mode awsvpc \
+  --requires-compatibilities FARGATE --cpu 256 --memory 512 --execution-role-arn $EXEC_ARN \
+  --tags key=Project,value=$NAME --container-definitions file://td-proxy.json</code></pre>
+<p>Substitute your account ID in <code>valueFrom</code>, as in the
+node's definition. The choices that matter:</p>
+<ul>
+  <li><b>The same secret, the same way.</b> The proxy authenticates to
+  discovery and to every node with <code>NANOCACHED_AUTH_SECRET</code>,
+  and its clients authenticate to it with the same secret — one
+  parameter, injected by the execution role, in no task definition.</li>
+  <li><b><code>/readyz</code></b> answers 200 once the proxy holds a
+  node roster from discovery, which is when it can do useful work;
+  before that it answers 503. <code>startPeriod: 30</code> is enough —
+  unlike a node, a proxy has nothing to hand over or join; it fetched
+  its roster and was healthy well inside that in verification.</li>
+  <li><b><code>stopTimeout: 45</code> against <code>--drain-timeout
+  20</code></b>, the same pairing as the node: on SIGTERM the proxy
+  deregisters from discovery at once, finishes what is in flight
+  within the drain budget and exits 0 (<a
+  href="deployment-operations.html#graceful-scale-in">graceful
+  scale-in</a>); ECS must not SIGKILL it first.</li>
+  <li><b>0.25 vCPU, 512 MiB.</b> The proxy holds no data; its memory is
+  connection buffers. Watch CPU and
+  <code>nanocached_proxy_client_connections</code> before sizing up
+  or out.</li>
+  <li><b>No service registry.</b> Discovery is the proxy roster; nothing
+  resolves a proxy by name.</li>
+</ul>
+
+<h3>Service</h3>
+<pre><code>aws ecs create-service --cluster $NAME --service-name proxy \
+  --task-definition $NAME-proxy --desired-count 2 --launch-type FARGATE \
+  --network-configuration "$NETCFG" --tags key=Project,value=$NAME
+aws ecs wait services-stable --cluster $NAME --services proxy</code></pre>
+<p>Observed: the service was stable 43&nbsp;s after
+<code>create-service</code> (the cluster it joined had taken
+149&nbsp;s to bring discovery and two nodes up), with the two tasks
+placed one per zone like the nodes.</p>
+
+<h3>Verifying</h3>
+<p>From anywhere in the VPC, each proxy task's operations port says
+whether it is ready and how busy it is, and discovery's counts how
+many are registered — the task IPs come from <code>describe-tasks</code>:</p>
+<pre><code>for ip in $(aws ecs describe-tasks --cluster $NAME \
+  --tasks $(aws ecs list-tasks --cluster $NAME --service-name proxy --query taskArns --output text) \
+  --query 'tasks[].attachments[0].details[?name==`privateIPv4Address`].value' --output text); do
+  curl -s -o /dev/null -w "$ip readyz %{http_code}\n" http://$ip:9358/readyz
+  curl -s http://$ip:9358/metrics | grep -E '^nanocached_proxy_(client_connections|backend_connections|requests_total) '
+done
+DISC_IP=$(getent hosts disc.nanocached.local | awk '{print $1}')
+curl -s http://$DISC_IP:9357/metrics | grep ^nanocached_discovery_proxies
+# nanocached_discovery_proxies 2</code></pre>
+<p>From the application tier, the SDK's configuration is the same
+<code>disc.nanocached.local:8357</code> and secret as before, plus
+proxy mode. This cluster was exercised that way from an instance in
+the app subnet with the Python, TypeScript and Go SDKs: set / get /
+delete and INCR succeed through a proxy, a wrong secret is rejected at
+the proxy, and keys written through one SDK read back through the
+others. Two things are worth seeing once: with proxy mode's random
+choice, one proxy carried 21,607 requests and the other 200 while three
+clients ran (per-client stickiness, not per-request balancing — the
+skew evens out with many clients); and each node's
+<code>nanocached_node_connections</code> read 2, the proxy count, after
+all of that traffic. One log line to expect: after a minute with no
+client connected at all, the first request logs <code>WARN backend
+connection to &lt;node&gt; poisoned; will redial on next request</code>
+for each node it touches — the node had closed the idle connection
+(its 60&nbsp;s idle timeout), and the proxy redials. The churn clients
+that produced it saw no failure.</p>
+
+<h3>Scaling the proxy tier</h3>
+<p>One more proxy is <code>--desired-count</code> plus one; it
+registers with discovery on start and clients pick it up on their next
+roster fetch. Going the other way is the drain. Verified with six
+via-proxy churn clients running against the two proxies:</p>
+<pre><code>aws ecs update-service --cluster $NAME --service proxy --desired-count 1
+aws ecs wait services-stable --cluster $NAME --services proxy</code></pre>
+<p>Observed, with three of the six clients on each proxy: the service
+was stable at one task 7&nbsp;s after the command; the stopped task's
+log shows the whole drain —</p>
+<pre><code>INFO drain: stop signal received — deregistering and finishing in-flight work
+INFO drain complete</code></pre>
+<p>— 2&nbsp;ms apart (nothing was mid-flight at that instant; the
+budget is for what is), and it exited 0. ECS reported the task
+stopped 35&nbsp;s after it began stopping, which is ENI teardown
+after the exit, not the drain. <code>nanocached_discovery_proxies</code>
+read 1 while the service was at one task, and the survivor's
+<code>nanocached_proxy_client_connections</code> went from 3 to 6: the
+three clients that had been on the stopped proxy reconnected to it.
+All six churn clients finished their 150&nbsp;s with 0 failures
+(5,528–5,592 operations each), and the 20,000 keys written before the
+scale-in read back complete afterwards. Setting the count back to 2
+brought a fresh task up, registered, in 23&nbsp;s on one run; on
+another it took 119&nbsp;s because the first placement failed to pull
+the image (<code>CannotPullContainerError … not found</code> from
+ghcr.io for a digest that pulled fine four other times that hour — a
+registry transient) and ECS placed a replacement a minute later, which
+was ready on its first check. Discovery counted 2 again both
+times.</p>
+
+<h3>Teardown</h3>
+<p>The ECS guide's teardown with <code>proxy</code> added to the
+service loop — it is stopped first, so its drain runs while the nodes
+are still there to answer what is in flight:</p>
+<pre><code>for s in proxy node discovery; do
+  aws ecs update-service --cluster $NAME --service $s --desired-count 0
+  aws ecs delete-service --cluster $NAME --service $s --force
+done
+aws ecs wait services-inactive --cluster $NAME --services proxy node discovery</code></pre>
+<p>The rest is unchanged: the <code>$NAME-</code> task-definition loop
+already covers <code>$NAME-proxy</code>, and the security-group rules
+go with the group.</p>
+
+<h2 id="eks">On EKS: a third Deployment</h2>
+<p>The same design as Kubernetes manifests, for the cluster from <a
+href="deployment-eks.html">Cluster on EKS</a>. <b>Not run on a
+cluster</b> — this is the ECS-verified design transcribed, with the
+same probes, grace period and counts; the EKS-specific parts (pod IP
+reachability through the VPC CNI, an internal NLB Service) are
+described, not measured.</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy
+  namespace: nanocached
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: nanocached-proxy}
+  template:
+    metadata:
+      labels: {app: nanocached-proxy}
+    spec:
+      terminationGracePeriodSeconds: 45
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: nanocached-proxy}
+      containers:
+        - name: proxy
+          image: ghcr.io/nanocached/nanocached-proxy@sha256:0217ea01962f27db85d5b1b98b29f4ec34674e0a3c246842d459c2510880f05f
+          args: ["--host", "0.0.0.0", "--port", "8358", "--discovery", "disc:8357",
+                 "--drain-timeout", "20", "--metrics-port", "9358"]
+          envFrom:
+            - secretRef: {name: nanocached-auth}
+          ports:
+            - {containerPort: 8358, name: data}
+            - {containerPort: 9358, name: ops}
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+            failureThreshold: 6         # 30 s of not-ready before it counts
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {memory: 512Mi}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: proxy
+  namespace: nanocached
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: nanocached-proxy}</code></pre>
+<ul>
+  <li><b>No Service.</b> The proxy registers its pod IP with discovery;
+  with the VPC CNI a pod IP is routable from the whole VPC, so
+  application pods — and applications on EC2 or ECS in the same VPC —
+  reach it in proxy mode through discovery's address
+  (<code>disc.nanocached.svc.cluster.local</code> from inside the
+  cluster). For a single address instead, add a <code>type:
+  LoadBalancer</code> Service with the internal NLB annotations of your
+  load-balancer controller and point the SDK at it as a plain single
+  node.</li>
+  <li><b>The PodDisruptionBudget</b> keeps a worker-node drain or an
+  upgrade from taking both proxies down at once. The node Deployment
+  deserves the same (<code>maxUnavailable: 1</code>); the EKS guide does
+  not add one.</li>
+  <li><b>Scaling</b> is <code>kubectl scale deployment/proxy
+  --replicas</code>, or a CPU-based HPA; scaling on
+  <code>nanocached_proxy_client_connections</code> needs a custom
+  metrics adapter and is out of scope here.</li>
+</ul>
+
+<h2 id="sidecar">The sidecar alternative</h2>
+<p>A proxy container inside each application task (ECS) or pod (EKS),
+with the application configured for <code>127.0.0.1:8358</code> as a
+plain single node — <em>not</em> proxy mode, which would pick a random
+proxy from discovery's roster, most likely on another host. What it
+buys: no extra network hop, and an application configuration that is
+one fixed address. What it costs:</p>
+<ul>
+  <li>Every sidecar registers with discovery like any proxy, so the
+  proxy roster lists all of them — discovery caps it at 1,024 — and
+  any client that does use proxy mode may be handed a sidecar on
+  another host.</li>
+  <li>Each sidecar holds its own connection to every node, so the
+  node-side count is the application <em>task</em> count, not the
+  proxy count: a reduction from processes to tasks, not to a handful.</li>
+  <li>The sidecar's stop is the task's stop: <code>stopTimeout</code>
+  must still cover its drain, and it must reach discovery and the
+  nodes from the application's subnet and security group.</li>
+</ul>
+<p>Sensible for a small fleet that wants the single-address
+configuration; not the way to bring the connection count down. On ECS
+it is one more entry in the application's container definitions,
+identical to the task definition above minus <code>essential</code>
+(set it <code>false</code> so an application container's exit, not the
+proxy's, decides the task's fate) — on EKS, a second container in the
+application pod, or a DaemonSet with <code>hostPort</code> and
+application pods pointed at <code>status.hostIP</code> (managed node
+groups only; not available on Fargate).</p>
+
+</main>
+
+<footer class="site-footer">
+  <div>
+    <span>nanocached</span>
+    <a href="https://github.com/nanocached/nanocached/blob/main/LICENSE">MIT License</a>
+    <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    <a href="https://github.com/nanocached/nanocached/issues">Issues</a>
+  </div>
+</footer>
+
+</body>
+</html>
