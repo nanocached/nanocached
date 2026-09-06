@@ -244,7 +244,7 @@ failure is logged-and-swallowed into `Stats().ReplicaWriteFailures`,
 exactly like a plain `SetAsync`'s own replica legs.
 
 Very large batches are transparently split into more than one `m`/`o`
-sub-frame per owner — callers never need to think about this.
+sub-frame per owner — callers never need to think about this. Hedged reads and read repair do not apply to batches.
 
 ## Compare-and-set
 
@@ -579,7 +579,7 @@ dotnet pack src/Nanocached
 ```
 
 This SDK speaks the current wire protocol (rendezvous hashing,
-replication-aware `L`/`W`); it requires an up-to-date server. The hash
+replication-aware `L`/`W`); it requires an up-to-date server. Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise. The hash
 pipeline is pinned to cross-language test vectors that the server and
 the TypeScript/Python/Java/Rust SDKs also assert.
 

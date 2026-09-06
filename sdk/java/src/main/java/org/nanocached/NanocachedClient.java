@@ -1127,9 +1127,9 @@ public final class NanocachedClient implements AutoCloseable {
      * bits), lowercase hex-encoded (32 characters) — the CAS content
      * digest (issue #141), computed identically by the server and every
      * SDK; see docs/protocol.html#cas for the pinned cross-language test
-     * vector. Public and static so code that already holds a value (a
-     * future JCache adapter, issue #118, computing an expected token
-     * without a prior GET) can compute one directly — see {@link
+     * vector. Public and static so code that already holds a value (the
+     * JCache adapter, issue #118, computing an expected token for its
+     * getAndPut family without a prior GET) can compute one directly — see {@link
      * #replace(byte[], String, byte[], long)}'s doc for why that path is
      * only safe when the reconstruction is byte-identical to what the
      * server actually stores, unlike a token taken from {@link

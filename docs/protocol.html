@@ -358,6 +358,20 @@ documented above. See
 Echoed response tags
 for the design.</p>
 
+<h3 id="untagged-desync">What an untagged connection cannot promise</h3>
+<p>Without tags, an SDK pairs each response with the oldest request
+still waiting, by order alone. When a response of the wrong <em>kind</em>
+arrives (an <code>S</code> answering a <code>G</code>, say), the SDK
+knows the streams are misaligned, poisons the connection and redials —
+but the requests queued <em>behind</em> the mismatched one may already
+have been handed another request's reply, and a reply of the right kind
+for the wrong request is indistinguishable from a correct one. That
+window is inherent to matching by order; it is exactly what tagged mode
+removes, which is why every SDK asks for <code>T</code> and only falls
+back to an untagged connection against a server that predates tags
+(one that rejects the extended <code>A</code>). On such a server the
+window is the same one the pre-tags protocol always had.</p>
+
 <h2 id="status">Other statuses you may see</h2>
 <div class="table-wrap">
 <table>

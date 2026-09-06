@@ -153,8 +153,9 @@ pub(crate) async fn resolve_tls(
 }
 
 /// Builds a rustls `ClientConfig`: a `ca` PEM file's certificate(s) as
-/// the sole trusted roots (replacing the default store, today's
-/// semantics), or the platform's native trust store when `ca` is absent
+/// the sole trusted roots (replacing the platform store, not extending
+/// it — a private CA is then the only issuer this client accepts), or
+/// the platform's native trust store when `ca` is absent
 /// (mirrors src/server.rs's `load_tls_connector`, minus the private-CA
 /// requirement).
 #[cfg(feature = "tls")]
@@ -336,7 +337,7 @@ pub(crate) async fn connect_and_identify(
                     // as a parse error and closes without replying —
                     // redial once more with the plain form and run the
                     // connection untagged (the pre-0019 behavior, desync
-                    // window included).
+                    // window included — see docs/protocol.html#untagged-desync).
                     run_identify_attempt(
                         host,
                         port,

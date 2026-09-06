@@ -395,7 +395,11 @@ export class Connection {
    * means the request/response streams are misaligned — every later
    * response would answer the wrong request, silently returning other
    * keys' data. Poison the connection, and classify as a connection error
-   * so the client's retry layer redials and retries once. */
+   * so the client's retry layer redials and retries once. * Requests already queued behind the mismatched one may have been
+   * resolved with misaligned data by then — the window inherent to
+   * matching by order on an untagged connection, documented once for
+   * every SDK at docs/protocol.html#untagged-desync.
+   */
   private mismatch(response: ParsedResponse): ConnectionLostError {
     return this.desynced(`response "${response.kind}" does not match the request`);
   }

@@ -414,7 +414,8 @@ export async function connectAndIdentify(options: IdentifyOptions): Promise<Iden
       // Echoed response tags transparent fallback: a pre-0019 server rejects the
       // extended `A ... T` as a parse error and closes without replying —
       // redial once with the plain form and run the connection untagged
-      // (the pre-0019 behavior, desync window included).
+      // (the pre-0019 behavior, desync window included — see
+      // docs/protocol.html#untagged-desync).
       return identifyOnce(options, false, false);
     }
   }

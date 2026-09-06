@@ -210,7 +210,7 @@ is logged-and-swallowed into `stats().replica_write_failures`, exactly
 like a plain `set`'s own replica legs.
 
 Very large batches are transparently split into more than one `m`/`o`
-sub-frame per owner — callers never need to think about this. In
+sub-frame per owner — callers never need to think about this. Hedged reads and read repair do not apply to batches. In
 single-node/proxy mode, if the connection is lost partway through a
 multi-sub-frame batch — after at least one sub-frame already
 succeeded, and the SDK's own built-in reconnect-and-retry for the
@@ -577,7 +577,11 @@ plain integer on the wire.
 - Requires Rust 1.85 or newer (`rust-version` in `Cargo.toml`; checked in
   CI). See [CHANGELOG.md](CHANGELOG.md) for release notes.
 - This SDK speaks the current wire protocol (rendezvous hashing,
-  replication-aware `L`/`W`); it requires an up-to-date server.
+  replication-aware `L`/`W`); it requires an up-to-date server. Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.
+- `connect()` warns to stderr (`was close() forgotten?`) when called again
+  for a single address whose previous connection is still open; the check
+  is skipped for multi-address configs, where concurrent clients sharing
+  an address list are legitimate (issue #12).
 - It shares no code with the server (the repository's independence
   rule); the hash pipeline is pinned to cross-language test vectors that
   the server, TypeScript, Python, and Java implementations also assert.
