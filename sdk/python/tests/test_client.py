@@ -5860,26 +5860,31 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
         # used to build partial_values with a plain .decode(), which
         # raises UnicodeDecodeError on a non-UTF-8 stored value — masking
         # the PartialWrongNodeError (the wrong-node/partial-failure
-        # information) it was meant to construct and propagate. Stores
-        # raw non-UTF-8 bytes for the key that stays healthy so the
-        # decode inside that handler is actually exercised, and asserts
-        # PartialWrongNodeError still comes through (with a lossy
-        # errors="replace" decode) instead of UnicodeDecodeError.
+        # information) it was meant to construct and propagate. Issue
+        # #488 then settled what the handler does with such a value:
+        # decode strictly, like the success path, and leave the key OUT
+        # of partial_values rather than hand back a replacement-character
+        # rendering the cache never stored. Stores raw non-UTF-8 bytes
+        # for one healthy key and a normal string for another, and
+        # asserts PartialWrongNodeError still comes through carrying only
+        # the decodable one.
         nodes, discovery = await self.start_cluster()
         try:
             client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
             try:
-                key, other = "some-key", "other-key"
+                key, other, plain = "some-key", "other-key", "plain-key"
                 non_utf8 = b"\xff\xfe\x00\x01"
-                await client.set_many({key: "v", other: non_utf8})
+                await client.set_many({key: "v", other: non_utf8, plain: "text"})
                 owner = nodes[self.owners_of(key)[0]]
 
                 owner.answer_wrong_node_for_keys({key.encode()}, times=10)
                 with self.assertRaises(PartialWrongNodeError) as ctx:
-                    await client.get_many([key, other])
-                self.assertEqual(
-                    ctx.exception.partial_values, {other: non_utf8.decode(errors="replace")}
-                )
+                    await client.get_many([key, other, plain])
+                self.assertEqual(ctx.exception.partial_values, {plain: "text"})
+                # The exact bytes are still there for a caller who wants them.
+                with self.assertRaises(PartialWrongNodeError) as raw:
+                    await client.get_many_bytes([key, other, plain])
+                self.assertEqual(raw.exception.partial_values, {other: non_utf8, plain: b"text"})
             finally:
                 await client.close()
         finally:

@@ -237,7 +237,12 @@ a plain `set`'s own replica legs.
 
 Very large batches are transparently split into more than one `m`/`o`
 sub-frame per owner — callers never need to think about this. Hedged
-reads and read repair do not apply to batches.
+reads and read repair do not apply to batches. When a batch
+ends in `PartialWrongNodeError`/`PartialConnectionLostError`,
+`get_many`'s `partial_values` are decoded as strictly as a successful
+read's; a stored value that isn't valid UTF-8 is left out of them rather
+than returned with replacement characters (issue #488) — use
+`get_many_bytes` for the exact bytes.
 
 ## Compare-and-set
 
