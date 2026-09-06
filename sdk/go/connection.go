@@ -651,7 +651,7 @@ func appendMultiSetFrame(namespace []byte, keys, values [][]byte, ttlSeconds int
 // Requests still pending behind this one may already have been resolved
 // with misaligned data by the time this runs (the read loop doesn't wait
 // for a caller to notice a mismatch before dispatching the next parsed
-// response) — an inherent limitation of matching-by-order pipelining
+// response) — an inherent limitation of matching-by-order pipelining (documented once, for every SDK, at docs/protocol.html#untagged-desync)
 // shared with the TypeScript SDK's Connection, not something this
 // SDK introduces.
 func (c *connection) mismatch(marker byte) error {

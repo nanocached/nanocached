@@ -168,7 +168,8 @@ async def _connect_and_identify_generic(
         # Echoed response tags transparent fallback: a pre-0019 server treats the
         # extended `A ... T` as a parse error and closes without replying
         # — redial once with the plain form and run the connection
-        # untagged (the pre-0019 behavior, desync window included).
+        # untagged (the pre-0019 behavior, desync window included — see
+        # docs/protocol.html#untagged-desync).
         pass
 
     return await _connect_and_identify_with_deadline(

@@ -227,7 +227,7 @@ failure is logged-and-swallowed into `stats().replicaWriteFailures`,
 exactly like a plain `set`'s own replica legs.
 
 Very large batches are transparently split into more than one `m`/`o`
-sub-frame per owner — callers never need to think about this.
+sub-frame per owner — callers never need to think about this. Hedged reads and read repair do not apply to batches.
 
 ## Compare-and-set
 
@@ -251,8 +251,8 @@ client.deleteIfMatches("counter", current.token()); // only if unchanged since t
 `replace`/`deleteIfMatches` take a **token**, not a literal expected
 value — a 32-character digest of the key's exact stored bytes, obtained
 from `getWithToken` (or computed directly from a value already in hand via
-the static `NanocachedClient.contentDigest(byte[])`, e.g. for a future
-adapter that never needs to GET first). Reconstructing a token from a
+the static `NanocachedClient.contentDigest(byte[])`, as the JCache adapter
+does for its `getAndPut` family, which never needs to GET first). Reconstructing a token from a
 value the caller already holds, rather than one taken from a real prior
 read, is only correct if that reconstruction is byte-identical to what
 the server actually stores — the same hazard memcached's own value-based
@@ -505,7 +505,9 @@ warning to stderr (`nanocached: close() called again on an
 already-closed client`) since it usually means the caller lost track of
 this client's lifecycle. Likewise, calling `connect()` again for the
 same single address while a previous connection to it is still open
-warns to stderr — `was close() forgotten?`.
+warns to stderr — `was close() forgotten?`. That check is skipped for
+multi-address configs, where concurrent clients sharing an address list
+are legitimate (issue #12).
 
 ## Errors
 
@@ -544,7 +546,7 @@ gradle jar
 ```
 
 This SDK speaks the current wire protocol (rendezvous hashing,
-replication-aware `L`/`W`); it requires an up-to-date server.
+replication-aware `L`/`W`); it requires an up-to-date server. Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.
 
 ## License
 

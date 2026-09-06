@@ -334,7 +334,7 @@ its connections warm automatically, pinging any connection that real
 traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
 restart, a network blip) redials and retries once transparently (all
-operations are idempotent).
+operations are idempotent). Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.
 
 An address whose redial just failed is treated as still down for
 `reconnectCooldownMs` (default 1000): requests routed to it during that
@@ -485,7 +485,7 @@ is logged-and-swallowed into `stats().replicaWriteFailures`, exactly
 like a plain `set`'s own replica legs.
 
 Very large batches are transparently split into more than one `m`/`o`
-sub-frame per owner — callers never need to think about this.
+sub-frame per owner — callers never need to think about this. Hedged reads and read repair do not apply to batches.
 
 ## Compare-and-set
 
@@ -613,7 +613,11 @@ never replayed.
   background replica writes finish and all connections are closed; later
   calls reject with `AlreadyClosedError`; a second `close()` warns but
   stays idempotent. Awaiting it is optional — un-awaited, teardown still
-  happens once the drain settles
+  happens once the drain settles. `connect()` warns (`was close()
+  forgotten?`) when called again for a single address whose previous
+  connection is still open; the check is skipped for multi-address
+  configs, where concurrent clients sharing an address list are
+  legitimate (issue #12)
 - `client.nodeUrls` — addresses currently connected to (introspection)
 - `client.stats()` — a snapshot `ClientStats` of counters for failures and
   events this client swallows or retries by design instead of raising

@@ -522,10 +522,13 @@ produce a value the protocol can't safely round-trip — see "Counters
   the TypeScript SDK: concurrent callers on the same connection each pay
   only their own network latency, not everyone else's ahead of them.
 - This SDK speaks the current wire protocol (rendezvous hashing,
-  replication-aware `L`/`W`); it requires an up-to-date server.
+  replication-aware `L`/`W`); it requires an up-to-date server. Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.
 - `close()` is a coroutine (like aiohttp's `ClientSession.close`): it
   returns only after any in-flight background replica writes finish and
-  every connection is torn down. It is idempotent, but calling it again
+  every connection is torn down. It also waits for an in-flight
+  node-list refresh or redial to finish before returning — a guarantee
+  the other SDKs' `close()` does not make (see issue #488 for whether
+  that stays a Python-only difference). It is idempotent, but calling it again
   on an already-closed client prints a warning to stderr — usually a sign the client's
   lifecycle was mismanaged. Likewise, calling `connect()` again for the
   same single address while a previous connection to it is still open

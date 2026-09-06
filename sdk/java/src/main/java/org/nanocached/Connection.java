@@ -408,7 +408,7 @@ final class Connection {
      * so the client's retry layer redials and retries once. Requests
      * still pending behind this one may already have been resolved with
      * misaligned data by the time this runs — an inherent limitation of
-     * matching-by-order pipelining shared with the TypeScript SDK's
+     * matching-by-order pipelining (documented once, for every SDK, at docs/protocol.html#untagged-desync) shared with the TypeScript SDK's
      * Connection (request pipelining), not something this SDK introduces.
      */
     private NanocachedException mismatch(int marker) {
