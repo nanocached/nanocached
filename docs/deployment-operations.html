@@ -118,7 +118,9 @@ speed and should be reserved for R&nbsp;≥&nbsp;2.</p>
 immediately (new clients stop being handed its address), finishes
 in-flight requests within <code>--drain-timeout</code> (default 25),
 and exits 0. Clients connected to it reconnect to a surviving proxy
-transparently — at most one reconnect per connection.</p>
+transparently — at most one reconnect per connection. Where the
+proxy tier runs and how many to run is <a
+href="deployment-proxy.html">its own page</a>.</p>
 
 <h2>Sizing the stop grace</h2>
 <p>The orchestrator's grace period must outlast the drain:

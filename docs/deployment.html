@@ -62,6 +62,11 @@ then pick the shape that matches how you run things.</p>
   same cluster as Kubernetes manifests: an eksctl cluster from one
   config file, a Deployment per role, grown by the node Deployment's
   replica count, the same drain.</li>
+  <li><a href="deployment-proxy.html">The proxy tier</a> — when a
+  cluster needs <code>nanocached-proxy</code>, where it runs (with the
+  cluster, in the cluster's own shape: a third ECS service, a third
+  Deployment), how many, and how applications reach it; verified on
+  ECS, with the EKS manifests and the sidecar alternative.</li>
 </ul>
 
 </main>
