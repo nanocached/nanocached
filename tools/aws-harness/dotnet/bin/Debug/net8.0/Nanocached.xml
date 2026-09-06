@@ -1,0 +1,2380 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>Nanocached</name>
+    </assembly>
+    <members>
+        <member name="T:Nanocached.Compression">
+            <summary>
+            Value compression: transparent, opt-in value compression. Values are
+            prefixed with a one-byte marker once <c>Compress</c> is enabled on a
+            client — <c>0x00</c> for stored-as-is (below threshold, or
+            compression didn't shrink it), <c>0x01</c> for raw-DEFLATE-compressed
+            (RFC 1951, no zlib/gzip wrapper — <see cref="T:System.IO.Compression.DeflateStream"/> is,
+            despite the name, already header-less raw DEFLATE). Never present when
+            <c>Compress</c> is off.
+            </summary>
+        </member>
+        <member name="M:Nanocached.Compression.CompressValue(System.Byte[],System.Int32)">
+            <summary>Below <paramref name="threshold"/>, or when compressing
+            doesn't actually shrink the value (incompressible data), the
+            marker byte alone is added and the value is stored unchanged.
+            Always returns a value with the marker byte prefixed.</summary>
+        </member>
+        <member name="M:Nanocached.Compression.DecompressValue(System.Byte[])">
+            <summary>The GetAsync/GetBytesAsync counterpart to
+            <see cref="M:Nanocached.Compression.CompressValue(System.Byte[],System.Int32)"/>. Only ever called when <c>Compress</c>
+            is enabled on this client — see value compression.</summary>
+        </member>
+        <member name="T:Nanocached.Connection">
+             <summary>
+             One already-identified connection to a single nanocached-node, speaking
+             the cache protocol (<c>G</c>/<c>S</c>/<c>D</c>, their namespaced
+             counterparts <c>g</c>/<c>s</c>/<c>d</c> — issue #105 — the
+             namespace-clear/flush-everything commands <c>c</c>/<c>F</c> — issue
+             #106 — the always-namespaced counter op <c>i</c> — issue #129 — and
+             the always-namespaced compare-and-set ops <c>k</c>/<c>x</c> — issue
+             #141 — the <c>A</c> identify exchange happens in <see cref="T:Nanocached.Identify"/>
+             before a Connection exists).
+             Requests are pipelined onto the socket and matched to responses in send
+             order (request pipelining): a dedicated read loop, started in the
+             constructor, consumes responses and dispatches each to the oldest
+             still-pending request, since nanocached-node itself only ever answers in
+             the order it received requests. <see cref="T:System.IO.Stream"/> supports one
+             concurrent reader and one concurrent writer safely, so the read loop
+             never contends with writers. Enqueuing the pending slot and writing the
+             frame happen under one semaphore, so concurrent callers' queue order
+             always matches the order their frames actually hit the wire.
+            
+             <para>echoed response tags: when <see cref="F:Nanocached.Connection._tagged"/> (negotiated during
+             identify), every request carries a per-connection tag as its header's
+             last field, and the server echoes it in the response. The tag is
+             claimed inside the same enqueue+write critical section as the pending
+             slot itself, so tag order can never skew from queue/wire order, and the
+             read loop verifies the echoed tag against the oldest pending slot's
+             expected tag <em>before</em> that slot is handed its response — closing
+             the desync window an off-by-one stream corruption (e.g. a swallowed
+             response) would otherwise leave open (the caller-side kind check in
+             <see cref="M:Nanocached.Connection.Mismatch(System.Byte)"/> only ever notices that after the fact).</para>
+            
+             <para>issue #125 — retryable-error status <c>R</c>: any data command
+             (G/S/D/g/s/d/c/F) may be answered <c>R</c> instead of its usual
+             response — the request specifically failed transiently (e.g. a proxy's
+             upstream node was briefly unreachable); the connection itself is fine.
+             <see cref="M:Nanocached.Connection.RequestAsync(System.Func{System.Nullable{System.UInt32},System.Byte[]})"/> retries the SAME request transparently, up
+             to twice more on this SAME connection, before ever surfacing anything
+             to the caller — see its own doc comment. <c>R</c> is never a reason to
+             close or redial: it is not a connection error, not a <c>W</c>, not an
+             <c>E</c>.</para>
+             </summary>
+        </member>
+        <member name="F:Nanocached.Connection.RequestTimeout">
+            <summary>Bounds how long the connection may go without progress
+            while requests are outstanding (issue #42) — each response must
+            arrive within this window of the previous one (or of its own send,
+            when the queue was empty): without it, a half-open server that
+            accepts the TCP connection but never writes back — or stops
+            mid-stream — would hang Get/Set/Delete forever. No
+            <see cref="T:System.Threading.CancellationToken"/> ever reaches the <see cref="T:System.IO.Stream"/>
+            calls (see <see cref="M:Nanocached.Connection.RequestAsync(System.Func{System.Nullable{System.UInt32},System.Byte[]})"/>'s doc comment), so the
+            watchdog instead disposes the stream, which unblocks the read loop
+            with an IO error the existing poison path already handles.
+            Generous versus the server's own 10s outbound timeouts, and the
+            same 30s the Go and Rust SDKs use. Mutable only so tests can
+            shorten it, mirroring <c>KeepAliveInterval</c>.</summary>
+        </member>
+        <member name="F:Nanocached.Connection._tagged">
+            <summary>echoed response tags: negotiated during identify — when true, every
+            request carries a tag the server echoes, and the read loop verifies
+            the echo against the oldest pending slot before resolving it.</summary>
+        </member>
+        <member name="F:Nanocached.Connection._onTransientRetry">
+            <summary>issue #125 — retryable-error status <c>R</c>: fired once
+            per <c>R</c> response this connection sees, whether it was
+            transparently retried away or ultimately surfaced as
+            <see cref="T:Nanocached.RetryableException"/> — the client's hook for
+            <c>Stats().TransientRetries</c>.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.#ctor(System.IO.Stream,System.Boolean,System.Action,System.Action)">
+            <summary><paramref name="tagged"/> (echoed response tags): whether identify
+            negotiated tagged mode for this connection. <paramref name="onClosed"/>,
+            when given, fires exactly once — the first time this connection
+            actually closes — no matter how many call sites call
+            <see cref="M:Nanocached.Connection.Close"/> on it. Lets the client hook every place it
+            closes or discards a connection (issue #12's forgotten-close
+            tracking) without each call site worrying about double-counting.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.Close">
+            <summary>Idempotent — safe to call concurrently from more than one
+            caller. Rejects every request still pending with a
+            connection-closed error — the read loop's own exit path (a failed
+            read) also routes through here, so this is the single place
+            draining ever happens.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.CloseWithReason(System.Exception)">
+            <summary>Same idempotency as <see cref="M:Nanocached.Connection.Close"/>, but drains every
+            still-pending request with <paramref name="reason"/> instead of the
+            generic closed error — used by the echoed response tags tag check below so that
+            every request behind a desynced one is rejected with a message that
+            actually says so, not a generic "connection closed".</summary>
+        </member>
+        <member name="M:Nanocached.Connection.GetAsync(System.Byte[],System.Byte[])">
+            <summary>issue #105: as the single-argument overload, but scoped to
+            <paramref name="namespaceBytes"/> — an empty namespace sends the
+            legacy <c>G</c> frame byte-for-byte; a non-empty one sends the
+            namespaced <c>g</c> frame, whose header gains a leading
+            <c>&lt;namespace-length&gt;</c> field and whose body leads with the
+            namespace bytes ahead of the key.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.SetAsync(System.Byte[],System.Byte[],System.Int64)">
+            <summary><paramref name="ttlSeconds"/> of 0 means no expiry, mapped
+            on the wire exactly as the old absent-TTL header was.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.SetAsync(System.Byte[],System.Byte[],System.Byte[],System.Int64)">
+            <summary>issue #105: as the unnamespaced overload, but scoped to
+            <paramref name="namespaceBytes"/> — see <see cref="M:Nanocached.Connection.GetAsync(System.Byte[],System.Byte[])"/>'s
+            doc comment for the legacy-vs-namespaced frame rule.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.DeleteAsync(System.Byte[],System.Byte[])">
+            <summary>issue #105: as the unnamespaced overload, but scoped to
+            <paramref name="namespaceBytes"/> — see <see cref="M:Nanocached.Connection.GetAsync(System.Byte[],System.Byte[])"/>'s
+            doc comment for the legacy-vs-namespaced frame rule.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.ClearAsync(System.Byte[])">
+            <summary>issue #106: drops every entry in one namespace on this
+            node — <paramref name="namespaceBytes"/> empty clears the default
+            namespace (<c>c 0\n</c>, not rejected). Unlike
+            <see cref="M:Nanocached.Connection.GetAsync(System.Byte[],System.Byte[])"/>/Set/Delete, there is no
+            legacy uppercase counterpart to fall back to for the empty
+            namespace: <c>c</c>/<c>F</c> are new in #106 and always sent
+            lowercase, whatever the namespace. Never answered <c>W</c> (not
+            key-addressed, docs/protocol.html's "c / F" section) — the
+            fan-out-and-refresh-once-and-retry logic for a node that fails
+            this lives in <see cref="T:Nanocached.NanocachedClient"/>, not here; this
+            method only speaks for the one node this connection is dialed
+            to.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.ClearAllAsync">
+            <summary>issue #106: drops every namespace on this node, the
+            default one included (<c>F\n</c>). See <see cref="M:Nanocached.Connection.ClearAsync(System.Byte[])"/>'s
+            doc comment for the shared <c>C</c>-ack/no-<c>W</c> rules.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.IncrAsync(System.Byte[],System.Byte[],System.Int64)">
+             <summary>issue #129 — the always-namespaced counter op: increments
+             (a negative <paramref name="delta"/> decrements — there is no
+             separate decrement opcode) the counter stored at (<paramref
+             name="namespaceBytes"/>, <paramref name="key"/>) and returns its new
+             value plus, when the entry carries a TTL, its remaining seconds —
+             or <c>null</c> when the key is missing or expired, the same
+             not-found convention <see cref="M:Nanocached.Connection.GetAsync(System.Byte[],System.Byte[])"/> uses.
+             Throws <see cref="T:Nanocached.NotNumericException"/> when the stored value isn't
+             INCR's counter grammar or applying the delta would overflow a
+             signed 64-bit integer (<c>T</c>). Unlike <c>G</c>/<c>S</c>/<c>D</c>,
+             <c>i</c> has no legacy uppercase form — every request always carries
+             an explicit (possibly zero) namespace length.
+            
+             <para>Cluster replication (issue #129's design note): this method
+             only ever talks to the ONE node this connection is dialed to — it
+             has no notion of owners or replicas. It is <see cref="T:Nanocached.NanocachedClient"/>'s
+             job to call this against the primary owner only, and — on success —
+             forward the literal resulting value to the replicas via this same
+             connection's <see cref="M:Nanocached.Connection.SetAsync(System.Byte[],System.Byte[],System.Byte[],System.Int64)"/>,
+             never by sending <c>i</c> to a replica (which could let a replica's
+             counter drift from the primary's).</para></summary>
+        </member>
+        <member name="M:Nanocached.Connection.GetHeader(System.Byte[],System.Int32,System.Nullable{System.UInt32})">
+            <summary>issue #105: <c>g &lt;ns-len&gt; &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
+            when namespaced, or the untouched legacy <c>G &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
+            otherwise.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.SetHeader(System.Byte[],System.Int32,System.Int32,System.Int64,System.Nullable{System.UInt32})">
+            <summary>issue #105: <c>s &lt;ns-len&gt; &lt;key-len&gt; &lt;val-len&gt; [&lt;ttl&gt;][ &lt;tag&gt;]\n</c>
+            when namespaced, or the untouched legacy <c>S</c> form otherwise —
+            see <see cref="M:Nanocached.Connection.SetAsync(System.Byte[],System.Byte[],System.Int64)"/>'s doc comment for
+            the TTL-omission rule, unchanged by namespacing.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.DeleteHeader(System.Byte[],System.Int32,System.Nullable{System.UInt32})">
+            <summary>issue #105: <c>d &lt;ns-len&gt; &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
+            when namespaced, or the untouched legacy <c>D &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
+            otherwise.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.ClearHeader(System.Byte[],System.Nullable{System.UInt32})">
+            <summary>issue #106: <c>c &lt;ns-len&gt;[ &lt;tag&gt;]\n</c> — always
+            lowercase, even for the empty (default) namespace, since <c>c</c>
+            has no legacy uppercase form to fall back to (it postdates
+            namespaces).</summary>
+        </member>
+        <member name="M:Nanocached.Connection.IncrHeader(System.Byte[],System.Int32,System.Int64,System.Nullable{System.UInt32})">
+            <summary>issue #129: <c>i &lt;ns-len&gt; &lt;key-len&gt; &lt;delta&gt;[ &lt;tag&gt;]\n</c> —
+            always lowercase and always namespaced (0 addresses the default
+            namespace), since <c>i</c> postdates namespaces and has no legacy
+            uppercase form. <paramref name="delta"/> is emitted via
+            <see cref="P:System.Globalization.CultureInfo.InvariantCulture"/> so its wire form is
+            always the canonical signed-decimal grammar the server expects
+            (optional leading <c>-</c>, no leading zeros, no <c>+</c>), never a
+            locale-dependent one.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.CasHeader(System.Byte[],System.Int32,System.Int32,System.String,System.Int64,System.Nullable{System.UInt32})">
+            <summary>issue #141: <c>k &lt;ns-len&gt; &lt;key-len&gt; &lt;val-len&gt; &lt;cond&gt; [&lt;ttl-seconds&gt;][ &lt;tag&gt;]\n</c> —
+            always lowercase and always namespaced, like <see cref="M:Nanocached.Connection.IncrHeader(System.Byte[],System.Int32,System.Int64,System.Nullable{System.UInt32})"/>.
+            <paramref name="cond"/> is emitted as a bare token, never
+            length-prefixed — its own shape (<c>A</c>, <c>P</c>, or a
+            32-character hex digest) identifies it.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.RemoveIfMatchesHeader(System.Byte[],System.Int32,System.String,System.Nullable{System.UInt32})">
+            <summary>issue #141: <c>x &lt;ns-len&gt; &lt;key-len&gt; &lt;cond&gt; [&lt;tag&gt;]\n</c> —
+            <paramref name="digest"/> here is always a content digest, never
+            <c>A</c>/<c>P</c> (see <see cref="M:Nanocached.Connection.RemoveIfMatchesAsync(System.Byte[],System.Byte[],System.String)"/>'s doc
+            comment).</summary>
+        </member>
+        <member name="M:Nanocached.Connection.CasAsync(System.Byte[],System.Byte[],System.Byte[],System.String,System.Int64)">
+             <summary>issue #141 — compare-and-set: stores <paramref name="value"/>
+             at (<paramref name="namespaceBytes"/>, <paramref name="key"/>) only
+             if <paramref name="cond"/> holds against the key's current stored
+             bytes — <c>"A"</c> (absent), <c>"P"</c> (present, any value), or a
+             32-character lowercase hex digest (exact content match). Returns
+             <c>true</c> on success (<c>S</c>), <c>false</c> on a condition
+             mismatch (<c>N</c> — a normal outcome, not an exception, the same
+             idiom <see cref="M:Nanocached.Connection.DeleteAsync(System.Byte[],System.Byte[])"/> uses for "nothing to
+             act on"). <paramref name="ttlSeconds"/> means exactly what it means
+             for <see cref="M:Nanocached.Connection.SetAsync(System.Byte[],System.Byte[],System.Byte[],System.Int64)"/> (0 = no
+             expiry). Always namespaced, like <see cref="M:Nanocached.Connection.IncrAsync(System.Byte[],System.Byte[],System.Int64)"/> — no legacy
+             uppercase form.
+            
+             <para>Not a distributed lock: LRU eviction can still reclaim the key
+             exactly as it would after a plain <c>Set</c>.</para>
+            
+             <para>Cluster replication (same rule as <see cref="M:Nanocached.Connection.IncrAsync(System.Byte[],System.Byte[],System.Int64)"/>):
+             this method only ever talks to the ONE node this connection is
+             dialed to. It is <see cref="T:Nanocached.NanocachedClient"/>'s job to call this
+             against the primary owner only, and — on success — forward the
+             literal resulting value to the replicas via this same connection's
+             <see cref="M:Nanocached.Connection.SetAsync(System.Byte[],System.Byte[],System.Byte[],System.Int64)"/>, never by
+             sending <c>k</c> to a replica (which could let a replica evaluate
+             <paramref name="cond"/> against its own possibly-different copy and
+             reach a different outcome than the primary just did).</para></summary>
+        </member>
+        <member name="M:Nanocached.Connection.RemoveIfMatchesAsync(System.Byte[],System.Byte[],System.String)">
+            <summary>issue #141 — compare-and-set: removes the key at
+            (<paramref name="namespaceBytes"/>, <paramref name="key"/>) only if
+            <paramref name="digest"/> — always a content digest here; an
+            absent/present-only conditioned delete is already the plain
+            unconditional <see cref="M:Nanocached.Connection.DeleteAsync(System.Byte[],System.Byte[])"/> — matches its
+            current stored bytes. Returns <c>true</c> on success (<c>D</c>),
+            <c>false</c> on a mismatch or a missing key (<c>N</c>). See
+            <see cref="M:Nanocached.Connection.CasAsync(System.Byte[],System.Byte[],System.Byte[],System.String,System.Int64)"/>'s doc comment for the shared not-a-lock
+            caveat and cluster-replication rule (a successful removal is
+            forwarded to replicas as an ordinary
+            <see cref="M:Nanocached.Connection.DeleteAsync(System.Byte[],System.Byte[])"/>, never by replaying
+            <c>x</c>).</summary>
+        </member>
+        <member name="T:Nanocached.Connection.MultiEntry">
+            <summary>One key's outcome inside an <c>M</c> (multi-get) or
+            <c>O</c> (multi-set) response (issue #151,
+            docs/protocol.html#multi) — a batch never fails as a whole, so
+            each key's result is independent of every other key's. Reused for
+            both response kinds rather than two near-identical types:
+            <list type="bullet">
+            <item><c>M</c>: <see cref="P:Nanocached.Connection.MultiEntry.Ok"/> true is a hit (<see cref="P:Nanocached.Connection.MultiEntry.Value"/>
+            holds the bytes, possibly empty); <see cref="P:Nanocached.Connection.MultiEntry.WrongNode"/> is a
+            per-key <c>W</c>; neither set is a clean miss (<c>-</c>).</item>
+            <item><c>O</c>: <see cref="P:Nanocached.Connection.MultiEntry.Ok"/> true is <c>S</c> (stored);
+            <see cref="P:Nanocached.Connection.MultiEntry.WrongNode"/> is <c>W</c>; <see cref="P:Nanocached.Connection.MultiEntry.Value"/> is always
+            <c>null</c> — a set has nothing to echo back.</item>
+            </list></summary>
+        </member>
+        <member name="M:Nanocached.Connection.MultiGetAsync(System.Byte[],System.Collections.Generic.IReadOnlyList{System.Byte[]})">
+            <summary>Sends <c>m</c> — one round trip for every key in
+            <paramref name="keys"/> (docs/protocol.html#multi).
+            <c>entries[i]</c> answers <c>keys[i]</c>, in request order. A
+            reply whose roster length doesn't match <c>keys.Count</c> is
+            treated as a desynced connection, same stance as
+            <see cref="M:Nanocached.Connection.Mismatch(System.Byte)"/> — a malformed reply can't be trusted
+            key-for-key.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.MultiGetFrame(System.Byte[],System.Collections.Generic.IReadOnlyList{System.Byte[]},System.Nullable{System.UInt32})">
+            <summary>Builds an <c>m</c> request frame: <c>m &lt;ns-len&gt;
+            &lt;n&gt; &lt;key-len-1&gt; ... &lt;key-len-n&gt;[ &lt;tag&gt;]\n&lt;ns&gt;&lt;key-1&gt;...&lt;key-n&gt;</c>
+            (docs/protocol.html#multi).</summary>
+        </member>
+        <member name="M:Nanocached.Connection.MultiSetAsync(System.Byte[],System.Collections.Generic.IReadOnlyList{System.Byte[]},System.Collections.Generic.IReadOnlyList{System.Byte[]},System.Int64)">
+            <summary>Sends <c>o</c> — stores every key/value pair in one round
+            trip, one shared <paramref name="ttlSeconds"/> (0 means no expiry)
+            for the whole batch rather than per key
+            (docs/protocol.html#multi). <c>entries[i]</c> answers
+            <c>keys[i]</c>/<c>values[i]</c>, in request order; see
+            <see cref="M:Nanocached.Connection.MultiGetAsync(System.Byte[],System.Collections.Generic.IReadOnlyList{System.Byte[]})"/> for the same "only a desynced roster
+            is an error" stance.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.MultiSetFrame(System.Byte[],System.Collections.Generic.IReadOnlyList{System.Byte[]},System.Collections.Generic.IReadOnlyList{System.Byte[]},System.Int64,System.Nullable{System.UInt32})">
+            <summary>Builds an <c>o</c> request frame: <c>o &lt;ns-len&gt;
+            &lt;n&gt; &lt;key-len-1&gt; &lt;value-len-1&gt; ... &lt;key-len-n&gt;
+            &lt;value-len-n&gt; [&lt;ttl&gt;][ &lt;tag&gt;]\n&lt;ns&gt;&lt;key-1&gt;&lt;value-1&gt;...&lt;key-n&gt;&lt;value-n&gt;</c>
+            (docs/protocol.html#multi). The optional TTL sits ahead of the
+            tag, same convention <see cref="M:Nanocached.Connection.CasHeader(System.Byte[],System.Int32,System.Int32,System.String,System.Int64,System.Nullable{System.UInt32})"/>'s own
+            <c>[ttl-seconds]</c> uses.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.DesyncedEntryCount(System.String,System.Int32,System.Int32)">
+            <summary>An <c>M</c>/<c>O</c> response whose result-roster length
+            doesn't match the request's key count: the streams are just as
+            desynced as a kind mismatch (<see cref="M:Nanocached.Connection.Mismatch(System.Byte)"/>), so this
+            poisons the connection the same way.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.Frame(System.String,System.Byte[],System.Byte[],System.Byte[])">
+            <summary>issue #105: <paramref name="namespaceBytes"/> leads the
+            body, ahead of the key (and, for a Set, the value) — empty for
+            every legacy (unnamespaced) call, so
+            <c>namespaceBytes.CopyTo(...)</c> below is then a no-op and the
+            frame is exactly what it always was.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.TagField(System.Nullable{System.UInt32})">
+            <summary>echoed response tags: on a tagged connection every request header's
+            last field is the client's tag; an untagged connection's wire bytes
+            are unchanged from before this field existed.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.Mismatch(System.Byte)">
+            <summary>
+            A well-formed response of the wrong kind (a <c>S</c> answering a G)
+            means the request/response streams are misaligned — every later
+            response would answer the wrong request, silently returning other
+            keys' data. Poison the connection, and classify as connection-lost
+            so the client's retry layer redials and retries once. Requests
+            still pending behind this one may already have been resolved with
+            misaligned data by the time this runs — an inherent limitation of
+            matching-by-order pipelining (documented once, for every SDK, at docs/protocol.html#untagged-desync) shared with the TypeScript SDK's
+            Connection (request pipelining), not something this SDK introduces.
+            This is the second line of defense: on a tagged connection, the
+            read loop's own tag check (echoed response tags) normally catches a desync like
+            this before any response is ever handed to a caller.
+            </summary>
+        </member>
+        <member name="F:Nanocached.Connection.MaxRequestAttempts">
+            <summary>issue #125 — retryable-error status <c>R</c>: how many
+            times a single logical request is attempted in total before a
+            still-<c>R</c> answer surfaces as <see cref="T:Nanocached.RetryableException"/> —
+            1 initial attempt plus up to 2 retries. Fixed by the protocol's
+            spec, not configurable.</summary>
+        </member>
+        <member name="F:Nanocached.Connection.RetryDelays">
+            <summary>issue #125: the delay before each retry —
+            <c>RetryDelays[0]</c> before the 2nd attempt, <c>RetryDelays[1]</c>
+            before the 3rd.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.RequestAsync(System.Func{System.Nullable{System.UInt32},System.Byte[]})">
+            <summary>issue #125 — retryable-error status <c>R</c>: wraps
+            <see cref="M:Nanocached.Connection.SendOnceAsync(System.Func{System.Nullable{System.UInt32},System.Byte[]})"/> with the protocol's bounded transient
+            retry. An <c>R</c> answer means THIS request specifically failed
+            transiently and the connection is fine — retry the same request on
+            the same connection, up to <see cref="F:Nanocached.Connection.MaxRequestAttempts"/> attempts
+            total, sleeping <see cref="F:Nanocached.Connection.RetryDelays"/> between attempts. Every
+            <c>R</c> seen is reported via <see cref="F:Nanocached.Connection._onTransientRetry"/>
+            (<c>Stats().TransientRetries</c>) whether or not it's the one that
+            ultimately fails the call. A still-<c>R</c> answer on the final
+            attempt raises <see cref="T:Nanocached.RetryableException"/> — this connection is
+            never closed or redialed for that (<c>R</c> is not a connection
+            error, not a <c>W</c>, not an <c>E</c>) and stays usable for the
+            next operation. <paramref name="buildFrame"/> runs again for each
+            attempt, so a tagged connection claims a fresh tag per attempt —
+            see <see cref="M:Nanocached.Connection.SendOnceAsync(System.Func{System.Nullable{System.UInt32},System.Byte[]})"/>'s own doc comment for what it does
+            with it.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.SendOnceAsync(System.Func{System.Nullable{System.UInt32},System.Byte[]})">
+            <summary>Enqueues a pending slot and writes the built frame under
+            one semaphore — see the class doc comment — then awaits its own
+            <see cref="T:System.Threading.Tasks.TaskCompletionSource`1"/>, not the stream.
+            Nothing here needs to guard against the caller abandoning this
+            await (e.g. racing it with a timeout): unlike some other SDKs'
+            ports of this design, this method never receives a
+            <see cref="T:System.Threading.CancellationToken"/> to pass into the underlying
+            <see cref="T:System.IO.Stream"/> calls, so the write, once started, always
+            runs to completion regardless of what the caller does
+            afterward — and completing an abandoned
+            <see cref="T:System.Threading.Tasks.TaskCompletionSource`1"/> that nothing is
+            awaiting anymore is harmless. The await below is still bounded:
+            <see cref="F:Nanocached.Connection.RequestTimeout"/>'s watchdog poisons the connection
+            when a response stops making progress (issue #42). One send-and-await
+            of ONE attempt — <see cref="M:Nanocached.Connection.RequestAsync(System.Func{System.Nullable{System.UInt32},System.Byte[]})"/>, the only caller, is
+            what turns a run of these into the bounded <c>R</c> retry.</summary>
+            <param name="buildFrame">Builds the wire frame from this request's
+            claimed tag (<c>null</c> on an untagged connection). Called inside
+            the write-gate critical section, after the tag is claimed but
+            before anything is enqueued — an encoder that rejects its input
+            must fail with nothing queued, or the next response would resolve
+            an orphaned waiter and desync the stream (echoed response tags).</param>
+        </member>
+        <member name="M:Nanocached.Connection.ClaimTag">
+            <summary>Only ever called from inside the <c>_writeGate</c>
+            critical section, so no interlocking is needed despite concurrent
+            callers of <see cref="M:Nanocached.Connection.RequestAsync(System.Func{System.Nullable{System.UInt32},System.Byte[]})"/>.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.ReadLoopAsync">
+            <summary>This connection's only reader, for its whole lifetime —
+            nothing else may read from <see cref="F:Nanocached.Connection._stream"/>. Consumes
+            responses off the wire and dispatches each to the oldest pending
+            request (FIFO — request pipelining), until a read fails.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.TryParseWireCounter(System.String,System.Int64@)">
+            <summary>The node's counter body
+            is an optional <c>-</c> followed by digits — never a <c>+</c>, never
+            whitespace — and every other wire integer is digits only, so all of
+            them are parsed with <see cref="F:System.Globalization.NumberStyles.None"/> and the
+            invariant culture (matching the encode side); this is the one
+            place a sign is allowed, and only the minus.</summary>
+        </member>
+        <member name="M:Nanocached.Connection.ExpectLfAsync">
+            <summary>Consumes one byte and verifies it is '\n' — used for the
+            untagged fixed-shape responses (S/D/N/W/B), which are exactly two
+            bytes on the wire. A byte other than '\n' here means the streams
+            are desynced (e.g. a server that unexpectedly tagged a response on
+            an untagged connection) and every later response would be
+            misaligned too, so this must poison the connection rather than
+            silently discard the extra byte. Mirrors the Java SDK's
+            expectLf() (Connection.java:492-498). Throwing here relies on the
+            same path every other ReadResponseAsync failure already uses:
+            ReadLoopAsync's catch classifies this as a ConnectionLostException
+            and poisons the connection via Close().</summary>
+        </member>
+        <member name="M:Nanocached.Connection.ReadLineAsync(System.Boolean)">
+            <summary>Reads up to (and consuming) the next '\n'. Every header
+            line the wire sends carries exactly one mandatory space right
+            after the marker byte — the field delimiter, not part of any
+            field's value — so <paramref name="stripLeadingSpace"/> (true by
+            default) strips exactly that one leading space, never more.
+            Issue #462: a blanket <c>.Trim()</c> here used to strip ANY amount
+            of leading/trailing whitespace from the whole line, which silently
+            absorbed a malicious server's extra padding around the first or
+            last field on the line — the one place NumberStyles.None's
+            leading/trailing-whitespace rejection could never see it, since
+            the whitespace was gone before Split(' ') ever ran. Now only the
+            single mandatory delimiter is ever removed; any other stray
+            whitespace stays in the string and reaches Split/TryParse, which
+            then reject it exactly like any other non-digit byte would.
+            Callers that have already consumed and validated that single
+            delimiter space themselves (the bare-marker tagged-response path)
+            pass <paramref name="stripLeadingSpace"/> as false, since there is
+            no delimiter left in the line for this method to strip.</summary>
+        </member>
+        <member name="T:Nanocached.HashRing">
+             <summary>
+             Rendezvous (highest-random-weight) hashing over a fixed node list (the
+             client-side replication design). This is deliberately a
+             byte-for-byte port of the same computation every other nanocached
+             participant uses (the Rust node, the Go/TypeScript/Python/Java/Rust SDKs)
+             — not just "a" rendezvous hash, but <em>this specific</em> one: if this
+             SDK's ranking disagreed with a node's own copy, the two would disagree
+             about which nodes hold a key. Cross-language test vectors pin the
+             pipeline.
+            
+             For each (node, key) pair,
+             <c>score = fmix64(fnv1a(name) ^ key_hash)</c>; a key's owners are the
+             <c>replicas</c> highest-scoring nodes in descending (unsigned) score
+             order (ties — effectively impossible at 64 bits — break toward the
+             lexicographically smaller name), and its primary is the top one.
+            
+             Built from node <em>names</em>, not addresses (node identity decoupled from address).
+            
+             <para>Namespaces (issue #105) enter the key side of the score via
+             <see cref="M:Nanocached.HashRing.KeyHash(System.ReadOnlySpan{System.Byte},System.ReadOnlySpan{System.Byte})"/> — see that method's doc comment for the two
+             forms. Every <c>Owners</c>/<c>Route</c> overload below that omits a
+             namespace is exactly the empty-namespace case (a thin wrapper), so
+             existing callers are unaffected.</para>
+             </summary>
+        </member>
+        <member name="M:Nanocached.HashRing.#ctor(System.Collections.Generic.IReadOnlyList{System.String})">
+            <summary>
+            Builds the ring over <paramref name="nodes"/>, deduplicating
+            repeated names first-occurrence-wins (issue #461, mirroring the
+            server's <c>HashRing::new</c> dedupe (issue #328, src/hash_ring.rs)
+            and the Go/Python SDKs' own fix, issue #360). Without
+            this, a name repeated in <paramref name="nodes"/> would score
+            independently for each of its slots in
+            <see cref="M:Nanocached.HashRing.Owners(System.ReadOnlySpan{System.Byte},System.Int32)"/>'s
+            bounded top-<c>replicas</c> insertion, letting a duplicated node
+            occupy more than one replica slot and inflating its effective
+            share of the ring. Construction order is otherwise unaffected.
+            </summary>
+        </member>
+        <member name="M:Nanocached.HashRing.Fnv1a(System.ReadOnlySpan{System.Byte})">
+            <summary>FNV-1a over 64 bits; C#'s ulong arithmetic wraps like Rust's u64.</summary>
+        </member>
+        <member name="M:Nanocached.HashRing.Fnv1aContinue(System.UInt64,System.ReadOnlySpan{System.Byte})">
+            <summary>Feeds <paramref name="data"/> into an in-progress FNV-1a
+            state, so a multi-part input hashes exactly as its concatenation
+            would — with no allocation to actually build that concatenation.
+            <see cref="M:Nanocached.HashRing.KeyHash(System.ReadOnlySpan{System.Byte},System.ReadOnlySpan{System.Byte})"/> uses this to stream namespace-length,
+            namespace, and key through one FNV-1a pass (issue #105).</summary>
+        </member>
+        <member name="M:Nanocached.HashRing.KeyHash(System.ReadOnlySpan{System.Byte},System.ReadOnlySpan{System.Byte})">
+             <summary>
+             The canonical key-side hash (issue #105) — consensus-critical
+             across the server, this SDK, and the other five: every
+             implementation must agree byte-for-byte or two clients would
+             disagree about which nodes hold a key.
+            
+             <list type="bullet">
+             <item>default (empty) namespace: <c>fnv1a(key)</c> — byte-identical
+             to the pre-namespace form, so every existing key keeps its
+             placement across a rolling upgrade (no cluster-wide hit-rate cliff,
+             and mixed-version clients agree on placement);</item>
+             <item>non-empty namespace: <c>fnv1a(be32(len(ns)) || ns || key)</c>
+             — the namespace length as a 4-byte big-endian integer, then the
+             namespace bytes, then the key bytes, hashed as one stream.
+             Length-prefixed so <c>("ab", "c")</c> and <c>("a", "bc")</c> never
+             share an input; including the namespace at all is what keeps
+             placement balanced — hashing the key alone would pile every
+             namespace's common singleton keys (e.g. <c>config</c>) onto the
+             same nodes.</item>
+             </list>
+             </summary>
+        </member>
+        <member name="M:Nanocached.HashRing.Fmix64(System.UInt64)">
+            <summary>MurmurHash3's 64-bit finalizer: the full-avalanche mix FNV-1a lacks.</summary>
+        </member>
+        <member name="M:Nanocached.HashRing.Owners(System.ReadOnlySpan{System.Byte},System.Int32)">
+             <summary>
+             The key's owners: the <c>replicas</c> highest-scoring nodes,
+             primary first. Returns fewer when the cluster is smaller.
+            
+             <para>Top-<c>replicas</c> selection via a bounded insertion of the
+             <c>replicas</c> best candidates seen so far (O(n * replicas))
+             instead of sorting every node (O(n log n)) — this runs per key
+             while the client's routing lock is held
+             (<see cref="T:Nanocached.NanocachedClient"/>'s <c>_stateLock</c>), and
+             <c>replicas</c> is typically small (a handful) next to the cluster
+             size, so this avoids paying for a full ranking this call only ever
+             uses the front of. Mirrors the Go SDK's <c>HashRing.Owners</c>
+             (sdk/go/hashring.go) and the Java SDK's PriorityQueue-based
+             approach (HashRing.java); produces the identical ordering a full
+             sort would (same comparator, <see cref="M:Nanocached.HashRing.Less(System.ValueTuple{System.UInt64,System.String},System.ValueTuple{System.UInt64,System.String})"/>), just without
+             sorting the nodes this call discards.</para>
+             </summary>
+        </member>
+        <member name="M:Nanocached.HashRing.Owners(System.ReadOnlySpan{System.Byte},System.ReadOnlySpan{System.Byte},System.Int32)">
+            <summary>
+            As <see cref="M:Nanocached.HashRing.Owners(System.ReadOnlySpan{System.Byte},System.Int32)"/>, scoped to
+            <paramref name="namespaceBytes"/> (issue #105): the same key name in
+            two namespaces is two independent entries, routed via
+            <see cref="M:Nanocached.HashRing.KeyHash(System.ReadOnlySpan{System.Byte},System.ReadOnlySpan{System.Byte})"/> and (possibly) owned by different nodes. The
+            empty namespace routes identically to the single-span overload — see
+            <see cref="M:Nanocached.HashRing.KeyHash(System.ReadOnlySpan{System.Byte},System.ReadOnlySpan{System.Byte})"/> for why that equivalence holds byte-for-byte.
+            </summary>
+        </member>
+        <member name="M:Nanocached.HashRing.Less(System.ValueTuple{System.UInt64,System.String},System.ValueTuple{System.UInt64,System.String})">
+            <summary>Whether <paramref name="a"/> ranks strictly ahead of
+            <paramref name="b"/> in owner order: higher score wins; ties break
+            toward the lexicographically smaller name (ordinal comparison,
+            matching byte-wise ordering elsewhere) — a total order every
+            nanocached implementation agrees on.</summary>
+        </member>
+        <member name="M:Nanocached.HashRing.Route(System.ReadOnlySpan{System.Byte})">
+            <summary>The key's primary — <c>Owners(key, 1)[0]</c>.</summary>
+        </member>
+        <member name="M:Nanocached.HashRing.Route(System.ReadOnlySpan{System.Byte},System.ReadOnlySpan{System.Byte})">
+            <summary>As <see cref="M:Nanocached.HashRing.Route(System.ReadOnlySpan{System.Byte})"/>, scoped to
+            <paramref name="namespaceBytes"/> (issue #105) — <c>Owners(namespaceBytes, key, 1)[0]</c>.</summary>
+        </member>
+        <member name="T:Nanocached.DiscoveredNode">
+            <summary>
+            A node's hash-ring identity (a random per-process UUID) and its network
+            address (<c>host:port</c>) — two different things since
+            Node identity decoupled from address: <see cref="P:Nanocached.DiscoveredNode.Name"/> is what routing hashes;
+            <see cref="P:Nanocached.DiscoveredNode.Address"/> is only for opening a connection.
+            </summary>
+        </member>
+        <member name="M:Nanocached.DiscoveredNode.#ctor(System.String,System.String)">
+            <summary>
+            A node's hash-ring identity (a random per-process UUID) and its network
+            address (<c>host:port</c>) — two different things since
+            Node identity decoupled from address: <see cref="P:Nanocached.DiscoveredNode.Name"/> is what routing hashes;
+            <see cref="P:Nanocached.DiscoveredNode.Address"/> is only for opening a connection.
+            </summary>
+        </member>
+        <member name="T:Nanocached.Identify">
+            <summary>
+            Connect-and-identify: dials <c>host:port</c>, authenticates, and
+            figures out from the server's own <c>A</c> response whether it reached
+            a cache node (<c>On</c>) or a discovery server (<c>Od</c>) — the caller
+            never says which it expects (the server type in the auth response). A node's stream is
+            handed back live; a discovery connection is used once for <c>L</c> and
+            disposed, returning the name/address list and the cluster's replication
+            factor R (node identity, discovery HA, replication).
+            </summary>
+        </member>
+        <member name="T:Nanocached.Identify.ProxyListTarget">
+            <summary>SDK proxy mode (issue #122): the roster a discovery
+            server's <c>Q</c> answers with — every currently-announced
+            <c>nanocached-proxy</c>, by (name, address). Unlike
+            <see cref="T:Nanocached.Identify.ClusterTarget"/> there is no replication factor on the
+            wire (a proxy owns every key, so replication is meaningless to a
+            client of one) and no ring — the caller picks exactly one proxy to
+            connect to, single-connection style.</summary>
+        </member>
+        <member name="M:Nanocached.Identify.ProxyListTarget.#ctor(System.Collections.Generic.IReadOnlyList{Nanocached.DiscoveredNode})">
+            <summary>SDK proxy mode (issue #122): the roster a discovery
+            server's <c>Q</c> answers with — every currently-announced
+            <c>nanocached-proxy</c>, by (name, address). Unlike
+            <see cref="T:Nanocached.Identify.ClusterTarget"/> there is no replication factor on the
+            wire (a proxy owns every key, so replication is meaningless to a
+            client of one) and no ring — the caller picks exactly one proxy to
+            connect to, single-connection style.</summary>
+        </member>
+        <member name="M:Nanocached.Identify.ConnectAndIdentifyAsync(System.String,System.Int32,System.Byte[],System.Net.Security.SslClientAuthenticationOptions,System.Boolean)">
+             <summary>
+             Always dials with the extended <c>A ... T R</c> first (echoed
+             response tags plus the retryable-error capability token, issue
+             #125), so a server that supports both tags this connection and
+             knows it may answer a data command <c>R</c> from the start. Only
+             when that extended form itself signals a server that doesn't
+             understand the <c>R</c> token — the connection closed/EOF/reset
+             before any reply arrived, never a timeout or a malformed-but-present
+             reply — does this transparently redial once with <c>A ... T</c>
+             (tags only, the pre-#125 extended form); and if THAT signals a
+             pre-0019 server the same way, redial once more with the plain
+             <c>A</c> form and run the connection untagged, exactly as before
+             echoed response tags existed. Three stages, one fallback signal,
+             reused at each stage — not three different mechanisms.
+            
+             <para>The <c>R</c> token is never sent on its own — the wire
+             contract fixes the token order as <c>[T] [R]</c> — so a connection
+             is either tagged-and-retryable-declared, tagged-only, or neither;
+             there is no tagged-but-not-declaring-R stage to fall back to
+             separately. <c>R</c> is a pure client-declared capability: the
+             server's <c>A</c> reply shape (<c>On</c>/<c>OnT</c>/<c>Od</c>/<c>OdT</c>)
+             is unchanged and never echoes it, and a data command can answer
+             <c>R</c> on ANY connection regardless of what was declared (a
+             server too old to know the token simply never sends <c>R</c>), so
+             <see cref="T:Nanocached.Connection"/>'s handling of it needs no per-connection
+             flag the way tagging does.</para>
+            
+             <para>SDK proxy mode (issue #122): <paramref name="viaProxy"/> only
+             changes what happens once the server identifies itself as
+             discovery — <c>Q</c> (returning a <see cref="T:Nanocached.Identify.ProxyListTarget"/>)
+             instead of the usual <c>L</c> (<see cref="T:Nanocached.Identify.ClusterTarget"/>). A
+             server that identifies as a plain cache node answers the same
+             <see cref="T:Nanocached.Identify.NodeTarget"/> either way; it is the caller's job (see
+             <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/>) to treat that as a
+             hard "ViaProxy needs discovery addresses" error instead of pinning
+             to it as a single node the way non-proxy mode would.</para>
+             </summary>
+        </member>
+        <member name="T:Nanocached.Identify.AuthProbeStage">
+            <summary>issue #125: the three stages the public
+            <c>ConnectAndIdentifyAsync</c> tries in order, each one's
+            extended-<c>A</c>-rejected signal falling back to the next. Token
+            order on the wire is fixed as <c>[T] [R]</c>, so <c>R</c> only ever
+            accompanies <c>T</c>.</summary>
+        </member>
+        <member name="F:Nanocached.Identify.AuthProbeStage.TaggedAndRetryable">
+            <summary><c>A &lt;len&gt; T R</c> — tags plus the retryable-error capability.</summary>
+        </member>
+        <member name="F:Nanocached.Identify.AuthProbeStage.TaggedOnly">
+            <summary><c>A &lt;len&gt; T</c> — tags only, the pre-#125 extended form.</summary>
+        </member>
+        <member name="F:Nanocached.Identify.AuthProbeStage.Legacy">
+            <summary><c>A &lt;len&gt;</c> — the plain pre-0019 form, untagged.</summary>
+        </member>
+        <member name="M:Nanocached.Identify.AuthTokenSuffix(Nanocached.Identify.AuthProbeStage)">
+            <summary>The <c>A</c> header's trailing token field for
+            <paramref name="stage"/> — see <see cref="T:Nanocached.Identify.AuthProbeStage"/>.</summary>
+        </member>
+        <member name="M:Nanocached.Identify.IsLegacyServerSignal(System.Exception)">
+            <summary>Whether an identify failure looks like a pre-0019 server
+            slamming the door on the extended <c>A</c> (close/reset before any
+            reply) — the only failures worth retrying with the plain form. A
+            timeout is not one: the server kept the connection open, it just
+            didn't answer (and is handled by its own catch in
+            <see cref="M:Nanocached.Identify.ConnectAndIdentifyWithDeadlineAsync(System.String,System.Int32,System.Byte[],System.Net.Security.SslClientAuthenticationOptions,Nanocached.Identify.AuthProbeStage,System.Boolean)"/>, never reaching
+            here). A malformed-but-present reply is not one either — that's a
+            real protocol error, not a legacy server's silence.</summary>
+        </member>
+        <member name="M:Nanocached.Identify.OpenAsync(System.String,System.Int32,System.Net.Security.SslClientAuthenticationOptions,System.Threading.CancellationToken)">
+            <summary>Every read this SDK does past this point — this method's
+            own identify-handshake reads (the <c>A</c> ack, a discovery
+            server's node list) and, once a node's stream lives on as a
+            <see cref="T:Nanocached.Connection"/>, every header byte <see cref="T:Nanocached.Connection"/>
+            reads too — goes one byte at a time via <c>ReadExactlyAsync</c> on
+            a 1-byte buffer (audit finding: unbuffered per-byte reads).
+            Wrapping the stream in a <see cref="T:Nanocached.ReadBufferedStream"/> here, the
+            single place a connection's stream is created, turns what would
+            otherwise be a syscall per byte into one read filling the buffer,
+            which then serves many subsequent 1-byte reads — see that type's
+            own doc comment for why it, and not the BCL's own
+            <see cref="T:System.IO.BufferedStream"/>, is used: this stream is duplex (one
+            concurrent reader, one concurrent writer — <see cref="T:Nanocached.Connection"/>'s
+            dedicated reader loop runs for the connection's whole lifetime
+            while requests are written concurrently), which
+            <see cref="T:System.IO.BufferedStream"/>'s shared read/write buffer state does
+            not support safely. Safe under TLS: <see cref="T:System.Net.Security.SslStream"/> already
+            only ever exposes decrypted application data through Read/Write, so
+            buffering on top of it behaves exactly like buffering on top of a
+            plain <see cref="T:System.Net.Sockets.NetworkStream"/>.</summary>
+        </member>
+        <member name="M:Nanocached.Identify.ReadProxyListAsync(System.IO.Stream,System.Threading.CancellationToken)">
+            <summary>SDK proxy mode (issue #122): parses a <c>Q</c> reply —
+            <c>N &lt;count&gt;\n</c> then, per proxy, the exact same
+            <c>&lt;name-len&gt; &lt;addr-len&gt;\n&lt;name&gt;&lt;addr&gt;\n</c>
+            entry shape <see cref="M:Nanocached.Identify.ReadNodeListAsync(System.IO.Stream,System.Threading.CancellationToken)"/> reads for <c>L</c> —
+            except the header carries no replication field (a proxy needs no
+            R: it owns every key). Same bounded parsing throughout
+            (<see cref="F:Nanocached.Identify.MaxNodeCount"/>/<see cref="F:Nanocached.Identify.MaxNodeListResponseBytes"/>/
+            <see cref="F:Nanocached.Identify.MaxHeaderLineLength"/>, shared with <see cref="M:Nanocached.Identify.ReadNodeListAsync(System.IO.Stream,System.Threading.CancellationToken)"/>)
+            and the same <c>B</c>-during-startup-grace handling.</summary>
+        </member>
+        <member name="T:Nanocached.NanocachedClient">
+             <summary>
+             The public client. An address list names either a single
+             nanocached-node or discovery server(s) fronting a cluster —
+             <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/> finds out from the server's own handshake
+             response (the server type in the auth response), so calling code is identical either way.
+            
+             Cluster mode implements client-side replication client-side replication: writes fan
+             out to each key's top-R owners (the primary's result decides; a dead
+             replica never fails a write), reads ask the primary and fall over to
+             the next owner only when the holder is unreachable. Dead connections
+             are redialed lazily on use (with one transparent retry — a socket only
+             learns of a peer FIN on I/O; the retry is skipped for the non-idempotent
+             counter and compare-and-set operations once the request may have been
+             sent, see issue #225), and an opt-in keep-alive can hold connections
+             open across the server's 60s idle timeout.
+            
+             Thread-safe. Requests are serialized per connection; concurrent
+             callers queue.
+             </summary>
+        </member>
+        <member name="T:Nanocached.NanocachedClient.Options">
+            <summary>Options for <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/>.</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.Addresses">
+            <summary>Targets to try, in order — a one-element list is the
+            single-target case. Everything is either a single
+            nanocached-node or a discovery replica (discovery HA) fronting a
+            cluster; both the initial connect and every later node-list
+            refresh walk this list until one yields a working target.</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.AuthSecret">
+            <summary>Shared secret matching NANOCACHED_AUTH_SECRET on the
+            server. An empty string is the same as none, matching the
+            other SDKs: sent literally, an empty secret would reach the
+            wire as an explicit zero-length secret, which the server
+            rejects and closes the connection for without replying —
+            turning what should be "no auth configured" into an opaque
+            <see cref="T:Nanocached.ConnectionLostException"/>.</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.Tls">
+            <summary>Connect over TLS. Defaults to the platform/system
+            trust store; set <see cref="P:Nanocached.NanocachedClient.Options.Ca"/> for a private CA. A set
+            <see cref="P:Nanocached.NanocachedClient.Options.Ca"/> with this false is rejected by
+            <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/> (issue #488).</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.Ca">
+            <summary>Path to a PEM file of trusted root certificate(s),
+            replacing the default trust store. Only meaningful when
+            <see cref="P:Nanocached.NanocachedClient.Options.Tls"/> is true; an unreadable or unparseable file is
+            a connect-time error.</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.Compress">
+            <summary>Transparently compress values above
+            <see cref="P:Nanocached.NanocachedClient.Options.CompressionThreshold"/> on set and decompress them
+            on get/getBytes (value compression). Off by default. <b>Every
+            client that reads or writes a given set of keys must agree on
+            this setting</b> — it is a per-keyspace format decision, not a
+            per-client preference; take care before
+            enabling this against an existing keyspace another client may
+            still touch with <see cref="P:Nanocached.NanocachedClient.Options.Compress"/> off.</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.CompressionThreshold">
+            <summary>Values shorter than this (in bytes) are never
+            compressed — the per-value overhead of attempting it outweighs
+            the savings. Only meaningful when <see cref="P:Nanocached.NanocachedClient.Options.Compress"/> is
+            true. Default 256. Negative is rejected by
+            <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/>.</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.FireAndForgetReplicas">
+            <summary>Let SetAsync/DeleteAsync return as soon as the primary
+            owner acks, letting replica legs finish in the background
+            instead of waiting for them too (fire-and-forget replica writes). Off by
+            default. Unlike <see cref="P:Nanocached.NanocachedClient.Options.Compress"/>, this is a pure
+            latency/durability trade for this client's own writes — it
+            carries no wire format and needs no agreement with other
+            clients.</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.ReadRepair">
+            <summary>On a clean miss (the key's first-reached owner reports
+            it missing), probe the remaining owners before accepting that,
+            and repair the primary in the background if one still has the
+            value (read repair). Off by default. Costs extra reads
+            only on the misses this actually applies to.</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.ReadHedgeAfter">
+             <summary>Send the same read to the next owner as well once the
+             current wait has been silent for this long — first the primary,
+             then (if still no answer) each further owner in turn, one more
+             per interval, until every owner is in flight (Hedged reads). A
+             slow-but-alive owner otherwise bounds every read that touches it
+             at its full round trip, since the sequential read path only
+             moves on to the next owner when the current one *fails*.
+             <c>null</c> (the default) is off. Applies only when a ring is
+             known and the key has at least 2 owners; with a single copy
+             there is nobody to hedge to.
+            
+             <para>The first answer decides: a hit from any owner is final;
+             a miss is final only from the primary — a replica's miss is
+             provisional (it may simply lack the copy), so the primary is
+             still waited for and hedging never turns a hit into a miss. A
+             failure (connection-level, or any SDK exception other than
+             <see cref="T:Nanocached.WrongNodeException"/>) hedges onward immediately,
+             with no wait; a <see cref="T:Nanocached.WrongNodeException"/> from any owner
+             propagates exactly as the non-hedged read path's does. The
+             losing leg of a hedge is never cancelled — cancelling mid-write
+             could desync a connection — but is left to finish detached and
+             drained by <see cref="M:Nanocached.NanocachedClient.Close"/>, the same as a fire-and-forget
+             replica write. Writes are unaffected. Rejected as invalid
+             unless positive.</para></summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.ReconnectCooldown">
+             <summary>How long, after a reconnect dial to an address fails,
+             that address is treated as still down — a call routed to it
+             during this window fails immediately with the original dial
+             error instead of paying another full connect timeout redialing
+             an address that just proved unreachable. Default 1 second. Keep
+             well under <c>NodeListStaleAfter</c> (30s) so a node that
+             genuinely recovers isn't shut out for long.
+            
+             <para><see cref="F:System.TimeSpan.Zero"/> means "use the default"
+             (1 second), not "disable it" — this field already carries its
+             own default value above, so zero is only ever seen here when a
+             caller explicitly sets it back to zero, matching the Go SDK's
+             zero-value <c>Config.ReconnectCooldown</c> and the Rust SDK's
+             <c>Duration::ZERO</c>. To disable the cooldown entirely — every
+             request that finds an address's connection dead pays its own
+             full dial attempt instead of reusing a cached failure — set
+             <see cref="P:Nanocached.NanocachedClient.Options.DisableReconnectCooldown"/> instead (the Go SDK's
+             equivalent is a negative <c>Config.ReconnectCooldown</c>; Rust's
+             and Java's is their own <c>disableReconnectCooldown()</c>).
+             Rejected as invalid if set negative; use
+             <see cref="P:Nanocached.NanocachedClient.Options.DisableReconnectCooldown"/> to disable, not a
+             negative value.</para></summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.DisableReconnectCooldown">
+            <summary>Disables the per-address reconnect cooldown entirely:
+            every request that finds an address's connection dead pays its
+            own full dial attempt instead of reusing a cached failure. See
+            <see cref="P:Nanocached.NanocachedClient.Options.ReconnectCooldown"/> for what the cooldown is. Off
+            by default.</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Options.ViaProxy">
+             <summary>SDK proxy mode (issue #122): route through one
+             <c>nanocached-proxy</c> — chosen at random from the fleet
+             discovery currently knows about, via its <c>Q</c> roster —
+             instead of connecting directly to every owner of a key. A
+             proxy looks exactly like a single node that owns every key
+             (full <c>G</c>/<c>S</c>/<c>D</c>, never <c>W</c>), so once
+             connected this client is in its ordinary single-connection
+             mode: no ring, no per-node connections, and no hedged reads —
+             there is nobody else to hedge to, so a configured
+             <see cref="P:Nanocached.NanocachedClient.Options.ReadHedgeAfter"/> together with
+             <see cref="P:Nanocached.NanocachedClient.Options.ViaProxy"/> is rejected by
+             <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/> (issue #488). Namespaces, clear/clear-all, tags,
+             keep-alive, and compression all work unchanged over the one
+             connection.
+            
+             <para>Only meaningful when every configured
+             <see cref="P:Nanocached.NanocachedClient.Options.Addresses"/> entry is a discovery server: if the
+             first reachable one instead identifies as a cache node — the
+             same identify handshake every other mode uses — <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/>
+             fails fast with a clear error rather than silently pinning to
+             that node as non-proxy single mode would. An empty proxy
+             roster, or every listed proxy being unreachable, is the SDK's
+             ordinary connect error.</para>
+            
+             <para>On reconnect, the SDK first retries the same proxy (it
+             may simply have restarted); only when that also fails does it
+             re-fetch the roster from discovery and fail over to another
+             proxy chosen at random — reusing the same lazy
+             reconnect-on-use plumbing every other mode uses, not a second
+             mechanism. Off by default.</para></summary>
+        </member>
+        <member name="T:Nanocached.NanocachedClient.ClientStats">
+            <summary>
+            Point-in-time snapshot returned by <see cref="M:Nanocached.NanocachedClient.Stats"/>: counters
+            for failures this client swallows by design instead of surfacing
+            to the caller — a dead replica leg on a write (client-side replication,
+            Fire-and-forget replica writes), a failed background repair of the primary
+            after read-repair found a value on another owner (read repair),
+            a failed node-list refresh attempt or per-node reconnect
+            during one, and (issue #125) every retryable-error status <c>R</c>
+            a connection received, whether it was transparently retried away or
+            ultimately raised <see cref="T:Nanocached.RetryableException"/>. None of these
+            ever fail an operation by themselves — an <c>R</c> retry only fails
+            the call after 3 straight attempts (see
+            <see cref="T:Nanocached.RetryableException"/>) — so this is purely observability:
+            an operator who only watches for thrown exceptions can still notice
+            replication silently degrading, a node-list refresh stuck failing,
+            or an upstream (e.g. behind a proxy) degrading before it ever
+            surfaces as a hard failure.
+            </summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ClientStats.#ctor(System.Int64,System.Int64,System.Int64,System.Int64)">
+            <summary>
+            Point-in-time snapshot returned by <see cref="M:Nanocached.NanocachedClient.Stats"/>: counters
+            for failures this client swallows by design instead of surfacing
+            to the caller — a dead replica leg on a write (client-side replication,
+            Fire-and-forget replica writes), a failed background repair of the primary
+            after read-repair found a value on another owner (read repair),
+            a failed node-list refresh attempt or per-node reconnect
+            during one, and (issue #125) every retryable-error status <c>R</c>
+            a connection received, whether it was transparently retried away or
+            ultimately raised <see cref="T:Nanocached.RetryableException"/>. None of these
+            ever fail an operation by themselves — an <c>R</c> retry only fails
+            the call after 3 straight attempts (see
+            <see cref="T:Nanocached.RetryableException"/>) — so this is purely observability:
+            an operator who only watches for thrown exceptions can still notice
+            replication silently degrading, a node-list refresh stuck failing,
+            or an upstream (e.g. behind a proxy) degrading before it ever
+            surfaces as a hard failure.
+            </summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Member.Connection">
+            <summary>The member's current connection — <c>null</c> for a
+            member that discovery listed but that this client could not
+            reach when it bootstrapped (issue #67): it stays routable (the
+            ring already includes it — membership comes from discovery,
+            unchanged), so a request for one of its keys fails over the
+            same way it would after a mid-life node death, and the next
+            request after the reconnect cooldown redials it (see
+            <see cref="M:Nanocached.NanocachedClient.SlotConnectionAsync(System.String)"/>).</summary>
+        </member>
+        <member name="F:Nanocached.NanocachedClient._reconnectCooldowns">
+            <summary>Per-address reconnect cooldown (see
+            <see cref="P:Nanocached.NanocachedClient.Options.ReconnectCooldown"/>): the address of the most
+            recently failed dial, and how long it stays "down" before another
+            dial to it is attempted. Keyed by address, not slot — a member's
+            slot (node name) can be reassigned to a different address by a
+            refresh, but the address itself is what's actually unreachable.
+            Mirrors TypeScript's reconnectCooldowns.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.BuildTlsOptions(Nanocached.NanocachedClient.Options)">
+            <summary>Builds the internal TLS options for every dial this client
+            makes. <c>null</c> means plaintext. <see cref="P:Nanocached.NanocachedClient.Options.Ca"/> is
+            silently ignored when <see cref="P:Nanocached.NanocachedClient.Options.Tls"/> is false; an
+            unreadable/unparseable CA file when true is a connect-time
+            error.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.NewConnection(System.IO.Stream,System.Boolean)">
+            <summary>Wraps a freshly identified node stream into a tracked
+            <see cref="T:Nanocached.Connection"/>: increments <see cref="F:Nanocached.NanocachedClient.OpenTargets"/> for
+            this client's <see cref="F:Nanocached.NanocachedClient._targetKey"/> now, and decrements it
+            exactly once whenever this connection eventually closes — however
+            that happens (client.Close(), a refresh reconciling a departed
+            node, a dead-connection replacement, or discarding a redial that
+            raced a concurrent Close()).</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.OpenClusterAsync(Nanocached.Identify.ClusterTarget)">
+            <summary>Dials every node discovery listed, concurrently. A node
+            that can't be reached (issue #67: typically one that just died and
+            discovery hasn't evicted yet — its liveness window is seconds long,
+            and every key is still served by another owner when R &gt; 1) is
+            installed without a connection and with its reconnect cooldown
+            armed (<see cref="M:Nanocached.NanocachedClient.ArmReconnectCooldown(System.String,System.Exception)"/>), exactly the state a
+            member is in after dying mid-life, so requests for its keys fail
+            over per request instead of the whole <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/>
+            failing. Only a cluster with <em>no</em> reachable node fails,
+            with the last such dial error. A listed address that answers but no
+            longer identifies as a cache node — or fails for any other reason
+            that isn't a connection-level failure — remains a hard error, as
+            before this fix: every dial outcome is gathered first (so any
+            connections opened for other, reachable nodes are still recorded in
+            <see cref="F:Nanocached.NanocachedClient._members"/> and get torn down by
+            <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/>'s catch-and-<see cref="M:Nanocached.NanocachedClient.Teardown"/>,
+            rather than leaking), and only then is that non-connection-level
+            error re-thrown.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DedupeDiscoveredNodes(System.Collections.Generic.IReadOnlyList{Nanocached.DiscoveredNode})">
+            <summary>Drops repeated node names from discovery's raw list,
+            first occurrence winning (issue #461, mirroring the Go SDK's
+            <c>dedupeDiscoveredNodes</c> from issue #389). Without this, a
+            duplicated name in the roster gets dialed and installed into
+            <see cref="F:Nanocached.NanocachedClient._members"/> twice: the second
+            <c>_members[node.Name] = ...</c> write silently overwrites the
+            first, leaking its connection (never closed, invisible to
+            <see cref="M:Nanocached.NanocachedClient.Close"/> and <see cref="M:Nanocached.NanocachedClient.Stats"/>) — and dialing it
+            twice in the first place is wasted, racy work. Called once, up
+            front, by both <see cref="M:Nanocached.NanocachedClient.OpenClusterAsync(Nanocached.Identify.ClusterTarget)"/> and
+            <see cref="M:Nanocached.NanocachedClient.RefreshNodeListAsync"/> so every use of the roster
+            downstream already sees unique names.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.OpenProxyAsync(System.Collections.Generic.IReadOnlyList{Nanocached.DiscoveredNode})">
+            <summary>SDK proxy mode (issue #122): connects to exactly one of
+            <paramref name="proxies"/>, picked at random (spreads a fleet of
+            clients over the proxy fleet), failing over through the rest in
+            random order on a dial failure. Leaves the client in its ordinary
+            single-connection mode (<see cref="F:Nanocached.NanocachedClient._ring"/> stays <c>null</c>) —
+            a proxy owns every key, so there is no ring to build. Throws the
+            last dial error when every proxy in the roster is unreachable,
+            exactly like <see cref="M:Nanocached.NanocachedClient.OpenClusterAsync(Nanocached.Identify.ClusterTarget)"/> does when every node
+            is.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ConnectToAnyProxyAsync(System.Collections.Generic.IReadOnlyList{Nanocached.DiscoveredNode})">
+            <summary>Shared by the initial SDK proxy mode connect
+            (<see cref="M:Nanocached.NanocachedClient.OpenProxyAsync(System.Collections.Generic.IReadOnlyList{Nanocached.DiscoveredNode})"/>) and reconnect failover
+            (<see cref="M:Nanocached.NanocachedClient.DialProxyWithFailoverAsync(System.String)"/>) — reusing one
+            dial-and-pick routine rather than building it twice. Dials every
+            proxy in <paramref name="proxies"/>, in a fresh random order each
+            call (<see cref="M:Nanocached.NanocachedClient.ShuffleProxies(System.Collections.Generic.IReadOnlyList{Nanocached.DiscoveredNode})"/>), and returns the first that
+            connects — the same <see cref="M:Nanocached.NanocachedClient.OpenNodeConnectionAsync(System.String)"/> a
+            cluster node dial uses, since a proxy identifies exactly like one.
+            Throws the last dial error when none connect.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ShuffleProxies(System.Collections.Generic.IReadOnlyList{Nanocached.DiscoveredNode})">
+            <summary>Fisher-Yates over a copy of <paramref name="proxies"/> —
+            never mutates the roster the caller passed in.
+            <see cref="P:System.Random.Shared"/> is thread-safe, so this needs no
+            synchronization of its own even though several clients (or several
+            concurrent redials on this one client) may shuffle at once.</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedClient.Replication">
+            <summary>How many nodes hold each key (client-side replication) — 1 against a single node.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.Stats">
+            <summary>
+            A snapshot of counters for failures this client swallows by
+            design (client-side replication / fire-and-forget replica writes's replica-leg writes, read repair's
+            read-repair, and node-list refresh) — see <see cref="T:Nanocached.NanocachedClient.ClientStats"/>
+            for exactly what each counts. Nothing here ever fails an
+            operation; this exists purely so an operator can detect
+            replication silently degrading or a node-list refresh that is
+            stuck failing.
+            </summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.Namespace(System.Byte[])">
+             <summary>
+             issue #105 — first-class namespaces: a lightweight handle scoping
+             every get/set/delete to <paramref name="namespaceBytes"/> — the same
+             key name in two namespaces is two independent entries (namespaces).
+             Cheap: shares this client's connections, and nothing is dialed or
+             allocated beyond the small wrapper itself. Forwards every call to
+             this client's own internal (namespace, key) methods rather than
+             duplicating any networking, so routing (HRW over (ns, key)),
+             replication fan-out, hedged reads, <c>W</c> refresh-and-retry,
+             response tags, and compression all behave exactly as calling this
+             client directly does.
+            
+             <para><see cref="M:Nanocached.NanocachedClient.Namespace(System.String)"/> called with <c>""</c> (the
+             empty namespace) returns a handle equivalent to this client itself
+             — it sends the legacy <c>G</c>/<c>S</c>/<c>D</c> frames,
+             byte-for-byte, and hashes exactly as an un-namespaced key always
+             has. The handle is invalid once this client is closed: every method
+             then throws the same <see cref="T:Nanocached.AlreadyClosedException"/> this
+             client's own methods raise.</para>
+             </summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.Namespace(System.String)">
+            <summary>As <see cref="M:Nanocached.NanocachedClient.Namespace(System.Byte[])"/>, with
+            <paramref name="namespaceName"/> UTF-8 encoded.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetAsync(System.Byte[])">
+            <summary>Returns the value decoded as UTF-8, or <c>null</c> when
+            the key is missing. A value that is not valid UTF-8 raises
+            <see cref="T:System.Text.DecoderFallbackException"/> — use
+            <see cref="M:Nanocached.NanocachedClient.GetBytesAsync(System.Byte[])"/> for the raw bytes instead.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetAsync(System.Byte[],System.String)">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.GetAsync(System.String)"/>, scoped to
+            <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to, rather than
+            duplicating this client's networking.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetAsync(System.Byte[],System.Byte[])">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.GetAsync(System.Byte[])"/>, scoped to
+            <paramref name="namespaceBytes"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetBytesAsync(System.Byte[])">
+            <summary>Returns the raw value, or <c>null</c> when the key is
+            missing. Transparently decompresses when <c>Compress</c> is
+            enabled (value compression). With <c>ReadRepair</c>, a clean miss
+            probes the remaining owners before being accepted as final
+            (read repair).</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetBytesAsync(System.Byte[],System.String)">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.GetBytesAsync(System.String)"/>, scoped
+            to <paramref name="namespaceBytes"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetBytesAsync(System.Byte[],System.Byte[])">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.GetBytesAsync(System.Byte[])"/>, scoped
+            to <paramref name="namespaceBytes"/> — this is the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to, rather than
+            duplicating this client's networking.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetRawBytesAsync(System.Byte[],System.Byte[])">
+            <summary>The shared read path behind <see cref="M:Nanocached.NanocachedClient.GetBytesAsync(System.Byte[],System.Byte[])"/>
+            and <see cref="M:Nanocached.NanocachedClient.GetWithTokenAsync(System.Byte[],System.Byte[])"/> (issue #141): the
+            value's EXACT WIRE BYTES, before this client's own decompression
+            step — a compression-enabled client never decompresses server-side,
+            so these are the same bytes a <c>k</c>/<c>x</c>'s condition is
+            evaluated against, and hashing anything else would silently
+            produce a digest the server can never match.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetWithTokenAsync(System.Byte[])">
+            <summary>issue #141 — compare-and-set: as <see cref="M:Nanocached.NanocachedClient.GetAsync(System.String)"/>,
+            but also returns a content digest ("CAS token") for the value, for
+            use with <see cref="M:Nanocached.NanocachedClient.ReplaceAsync(System.String,System.String,System.String,System.Int64)"/> or
+            <see cref="M:Nanocached.NanocachedClient.DeleteIfMatchesAsync(System.String,System.String)"/> — the same
+            not-found convention (<c>null</c>) as a plain <c>GetAsync</c> miss.
+            The digest is computed from the exact wire bytes (see
+            <see cref="M:Nanocached.NanocachedClient.ContentDigest(System.Byte[])"/>'s doc comment), so it is always the one
+            the server itself would compute, even with <c>Compress</c>
+            enabled.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetWithTokenAsync(System.Byte[],System.String)">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.GetWithTokenAsync(System.String)"/>,
+            scoped to <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetWithTokenAsync(System.Byte[],System.Byte[])">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.GetWithTokenAsync(System.Byte[])"/>,
+            scoped to <paramref name="namespaceBytes"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetBytesWithTokenAsync(System.Byte[])">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.GetWithTokenAsync(System.Byte[])"/>, but
+            returns the raw (decompressed) value instead of decoding it as
+            UTF-8 — the <see cref="M:Nanocached.NanocachedClient.GetBytesAsync(System.Byte[])"/> counterpart to
+            <see cref="M:Nanocached.NanocachedClient.GetWithTokenAsync(System.Byte[])"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetBytesWithTokenAsync(System.Byte[],System.String)">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.GetBytesWithTokenAsync(System.String)"/>,
+            scoped to <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetBytesWithTokenAsync(System.Byte[],System.Byte[])">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.GetBytesWithTokenAsync(System.Byte[])"/>,
+            scoped to <paramref name="namespaceBytes"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.TryReadRepairAsync(System.Byte[],System.Byte[])">
+            <summary>read repair: probes the remaining owners of
+            <paramref name="key"/> — every owner but the primary, which the
+            normal read path already probed and got a clean miss from — in
+            rank order, for a value. The first one that has it wins: its value
+            is returned, and — detached, not awaited, but bounded and tracked
+            via <see cref="F:Nanocached.NanocachedClient._backgroundReplicaPermits"/> — the same pool that
+            bounds replica writes, one combined cap —
+            that same value repairs the true primary in the background, with
+            TTL <see cref="F:Nanocached.NanocachedClient.ReadRepairTtlSeconds"/> (the original TTL can't be
+            recovered from a GET, and TTL 0 would permanently resurrect
+            already-expired data). Every failure along the way (connection
+            lost, WrongNode, another miss) is swallowed; nothing here may turn
+            an already-accepted miss into an error. A failure repairing the
+            primary specifically is counted via <see cref="M:Nanocached.NanocachedClient.Stats"/>'s
+            <c>ReadRepairFailures</c>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetManyAsync(System.Collections.Generic.IReadOnlyList{System.String})">
+            <summary>As <see cref="M:Nanocached.NanocachedClient.GetManyBytesAsync(System.Collections.Generic.IReadOnlyList{System.String})"/>,
+            decoding every hit as UTF-8.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetManyAsync(System.Byte[],System.Collections.Generic.IReadOnlyList{System.String})">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.GetManyAsync(System.Collections.Generic.IReadOnlyList{System.String})"/>,
+            scoped to <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetManyBytesAsync(System.Collections.Generic.IReadOnlyList{System.String})">
+             <summary>Returns every requested key's raw value in one round trip
+             per owner (batched get, docs/protocol.html#multi) — a missing key
+             is simply absent from the returned dictionary, never an error, the
+             same "a miss is not an error" contract <see cref="M:Nanocached.NanocachedClient.GetBytesAsync(System.Byte[])"/>
+             itself has. <paramref name="keys"/> must be non-empty.
+            
+             <para>A batch never fails as a whole: if some keys are still
+             wrong-node after one bounded refresh-and-retry, throws
+             <see cref="T:Nanocached.PartialWrongNodeException`1"/> whose
+             <c>PartialValues</c> holds every key that DID resolve, rather than
+             discarding a mostly-successful batch over a handful of stale
+             placements. In single-node/proxy mode a <c>W</c> propagates
+             immediately, exactly as <see cref="M:Nanocached.NanocachedClient.GetBytesAsync(System.Byte[])"/>'s own
+             single-mode behavior does — there is no ring to refresh
+             against.</para>
+            
+             <para>Larger batches are transparently split into more than one
+             <c>m</c> sub-frame per owner (batch chunking, see
+             <see cref="F:Nanocached.NanocachedClient.MaxBatchKeys"/> and, issue #222,
+             <see cref="F:Nanocached.NanocachedClient.MaxRequestBytes"/>) — callers never need to think about
+             this.</para></summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.GetManyBytesAsync(System.Byte[],System.Collections.Generic.IReadOnlyList{System.String})">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.GetManyBytesAsync(System.Collections.Generic.IReadOnlyList{System.String})"/>,
+            scoped to <paramref name="namespaceBytes"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.MaybeDecompress(System.Byte[])">
+            <summary><c>Compress</c>'s decompression step (see
+            <see cref="M:Nanocached.NanocachedClient.GetBytesAsync(System.Byte[],System.Byte[])"/>), generalized so
+            <see cref="M:Nanocached.NanocachedClient.GetManyBytesAsync(System.Byte[],System.Collections.Generic.IReadOnlyList{System.String})"/>'s
+            per-entry splicing can share it: a no-op when <c>Compress</c> is
+            off.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DecompressForBatch(System.Byte[],System.Int64[])">
+             <summary>Decompresses one hit value for a <c>GetMany</c> batch and
+             charges its decompressed size against the response's cumulative
+             budget (issue #386). <see cref="M:Nanocached.Compression.DecompressValue(System.Byte[])"/>
+             already caps a single value; this bounds the whole response so a
+             batch of highly compressible values can't amplify that per-value
+             cap into gigabytes of allocation. Locked on the budget holder
+             because <see cref="M:Nanocached.NanocachedClient.RunMultiGetLegAsync(System.Byte[],System.String,System.Collections.Generic.List{System.Int32},System.Collections.Generic.IReadOnlyList{System.String},System.Byte[][],System.Collections.Generic.Dictionary{System.String,System.Byte[]},System.Int64[])"/> runs one leg per owner
+             concurrently: once the budget is crossed, remaining entries (in
+             this and other legs) fail before decompressing rather than each
+             allocating another value first — peak allocation is therefore the
+             budget plus one value per concurrent leg.
+            
+             <para>The budget only applies when <c>Compress</c> is actually
+             enabled (issue #410b) — with it off, <see cref="M:Nanocached.NanocachedClient.MaybeDecompress(System.Byte[])"/>
+             is a no-op and the per-response read size already bounds this path
+             on its own, so charging it here would just be an undocumented
+             total-batch cap on uncompressed batches. And the current entry is
+             charged before the cap is checked (issue #410a) so the entry that
+             actually crosses it is caught — and excluded — rather than
+             slipping through, which matters most when it is the last hit in
+             the response.</para></summary>
+        </member>
+        <member name="T:Nanocached.NanocachedClient.ChunkedBatchInterruptedException">
+            <summary>
+            issue #411 — internal signal only, never seen outside this file.
+            Thrown by <see cref="M:Nanocached.NanocachedClient.MultiGetChunkedAsync(System.String,System.Byte[],System.Byte[][])"/>/
+            <see cref="M:Nanocached.NanocachedClient.MultiSetChunkedAsync(System.String,System.Byte[],System.Byte[][],System.Byte[][],System.Int64)"/> when a chunk's connection failure
+            (surviving <see cref="M:Nanocached.NanocachedClient.ApplyReconnectingAsync``1(System.String,System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>'s own built-in
+            redial-and-retry) interrupts a chunked call after at least one
+            earlier chunk of THAT call already completed. <see cref="P:Nanocached.NanocachedClient.ChunkedBatchInterruptedException.CompletedEntries"/>
+            holds those chunks' entries, in request order, corresponding 1:1 to
+            the prefix of whatever key/value arrays the failing
+            <see cref="M:Nanocached.NanocachedClient.MultiGetChunkedAsync(System.String,System.Byte[],System.Byte[][])"/>/<see cref="M:Nanocached.NanocachedClient.MultiSetChunkedAsync(System.String,System.Byte[],System.Byte[][],System.Byte[][],System.Int64)"/>
+            call was given — <see cref="M:Nanocached.NanocachedClient.GetManyBytesAsync(System.Byte[],System.Collections.Generic.IReadOnlyList{System.String})"/>/
+            <see cref="M:Nanocached.NanocachedClient.SetManyBytesAsync(System.Byte[],System.Collections.Generic.IReadOnlyDictionary{System.String,System.Byte[]},System.Int64)"/>'s
+            single-mode branch and <see cref="M:Nanocached.NanocachedClient.RunMultiSetLegAsync(System.Byte[],System.String,Nanocached.NanocachedClient.OwnerBatch,System.Byte[][],System.Byte[][],System.Int64,System.Collections.Generic.List{System.Int32})"/> (cluster
+            mode) each translate this into whatever "partial success" means for
+            their own public contract (a <see cref="T:Nanocached.PartialConnectionLostException`1"/>
+            for the single-mode callers; per-key retry/replica-failure
+            bookkeeping for the cluster leg runner) instead of losing it. Never
+            thrown when the very first chunk is the one that fails — there is
+            nothing to attach yet, so a bare connection-layer exception
+            propagates unchanged in that case, exactly as before this fix.
+            </summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.MultiGetChunkedAsync(System.String,System.Byte[],System.Byte[][])">
+             <summary>Issues one or more <c>m</c> sub-frames against
+             <paramref name="slot"/>'s connection (<c>null</c> for the
+             single/proxy target) — already grouped to one owner by the caller
+             — splitting so a sub-frame never exceeds <see cref="F:Nanocached.NanocachedClient.MaxBatchKeys"/>
+             keys OR (issue #222) <see cref="F:Nanocached.NanocachedClient.MaxRequestBytes"/> of cumulative
+             namespace+key wire bytes (batch chunking), whichever comes first.
+             A single key always fits on its own — <see cref="M:Nanocached.NanocachedClient.ValidateKey(System.Byte[],System.Byte[])"/>
+             already guarantees that — so the byte bound only ever closes a
+             chunk early, never drops an entry.
+            
+             <para>issue #411: when a chunk after the first one fails at the
+             connection level (surviving <see cref="M:Nanocached.NanocachedClient.ApplyReconnectingAsync``1(System.String,System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>'s
+             own redial-and-retry), throws <see cref="T:Nanocached.NanocachedClient.ChunkedBatchInterruptedException"/>
+             carrying every earlier chunk's already-completed entries instead of
+             discarding them — see that type's doc comment. A first-chunk
+             failure has nothing to attach yet, so it propagates as the bare
+             underlying exception, unchanged.</para></summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.MultiGetPassAsync(System.Byte[],System.Collections.Generic.IReadOnlyList{System.String},System.Byte[][],System.Collections.Generic.Dictionary{System.String,System.Byte[]},System.Collections.Generic.List{System.Int32},System.Int64[])">
+            <summary>One pass of <see cref="M:Nanocached.NanocachedClient.GetManyBytesAsync(System.Byte[],System.Collections.Generic.IReadOnlyList{System.String})"/>'s
+            cluster routing: group the given indices (every key, when
+            <paramref name="retryIndices"/> is <c>null</c> — the initial pass —
+            or just the keys a previous pass left unresolved) by their current
+            primary owner (matching plain <c>Get</c>'s own primary-first
+            stance), dispatch one (possibly chunked) <c>m</c> exchange per
+            owner concurrently, splice hits into <paramref name="values"/>,
+            and return the indices still unresolved: a per-key <c>W</c>, or a
+            whole owner group whose call failed outright. Called once for the
+            initial pass and once more, if needed, after a single forced
+            refresh.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.RunMultiGetLegAsync(System.Byte[],System.String,System.Collections.Generic.List{System.Int32},System.Collections.Generic.IReadOnlyList{System.String},System.Byte[][],System.Collections.Generic.Dictionary{System.String,System.Byte[]},System.Int64[])">
+            <summary>One owner group's <c>m</c> exchange: a connection-level
+            failure retries whatever the group's chunk(s) never resolved
+            (indistinguishable from a possibly-idle-closed connection, same
+            stance <see cref="M:Nanocached.NanocachedClient.ApplyReconnectingAsync``1(System.String,System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>'s own callers take
+            elsewhere) — the whole group when its first chunk failed, only the
+            tail from the failing chunk onward when an earlier chunk had already
+            succeeded (issue #411 / #485; those hits are kept, as the multi-set
+            leg and the Rust/TypeScript SDKs already do); a per-key <c>W</c>
+            retries just that key; a hit is
+            spliced into <paramref name="values"/> (a client-side <c>Compress</c>
+            mismatch propagates, aborting the batch immediately — never fed
+            into the retry pass, since it isn't a routing outcome).</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.SetAsync(System.String,System.String,System.Int64)">
+            <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)">
+            <summary><paramref name="ttlSeconds"/> of 0 (the default) means no
+            expiry. Transparently compresses values at or above
+            <c>CompressionThreshold</c> when <c>Compress</c> is enabled
+            (value compression).</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.String,System.String,System.Int64)">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.SetAsync(System.String,System.String,System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Byte[],System.Int64)">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DeleteAsync(System.Byte[])">
+            <summary>Returns whether the key existed before this call.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DeleteAsync(System.Byte[],System.String)">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.DeleteAsync(System.String)"/>, scoped to
+            <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DeleteAsync(System.Byte[],System.Byte[])">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.DeleteAsync(System.Byte[])"/>, scoped to
+            <paramref name="namespaceBytes"/>. Returns whether the key existed
+            before this call.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.SetManyAsync(System.Byte[],System.Collections.Generic.IReadOnlyDictionary{System.String,System.String},System.Int64)">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.SetManyAsync(System.Collections.Generic.IReadOnlyDictionary{System.String,System.String},System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.SetManyBytesAsync(System.Collections.Generic.IReadOnlyDictionary{System.String,System.Byte[]},System.Int64)">
+             <summary>Stores every raw value in <paramref name="values"/> in one
+             round trip per involved node (batched set,
+             docs/protocol.html#multi). <paramref name="ttlSeconds"/> of 0 (the
+             default) means no expiry, shared by the whole batch — not per key,
+             since every real caller of a batched set (Django's
+             <c>set_many</c>, cache-manager's <c>mset</c>) already passes one
+             TTL per call. <paramref name="values"/> must be non-empty.
+             Transparently compresses values at or above
+             <c>CompressionThreshold</c> when <c>Compress</c> is enabled,
+             exactly like <see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)"/>.
+            
+             <para>Within one batch, the same node can be a key's primary and
+             another key's replica at once — it receives exactly one <c>o</c>
+             sub-frame either way, and only its answer for the keys it is
+             primary for decides that key's outcome; a replica-held key's
+             failure or <c>W</c> is logged-and-swallowed into
+             <c>Stats().ReplicaWriteFailures</c>, exactly like
+             <see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)"/>'s own replica legs
+             (<see cref="M:Nanocached.NanocachedClient.WriteAsync``1(System.Byte[],System.Byte[],System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>). A batch never fails as a whole: if
+             some keys' primaries are still wrong-node after one bounded
+             refresh-and-retry, this throws <see cref="T:Nanocached.WrongNodeException"/> —
+             every other key in the batch was still stored. In
+             single-node/proxy mode a <c>W</c> propagates immediately, exactly
+             as <see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)"/>'s own single-mode
+             behavior does.</para>
+            
+             <para>Larger batches are transparently split into more than one
+             <c>o</c> sub-frame per node (batch chunking, see
+             <see cref="F:Nanocached.NanocachedClient.MaxBatchKeys"/> and, issue #222,
+             <see cref="F:Nanocached.NanocachedClient.MaxRequestBytes"/>).</para></summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.SetManyBytesAsync(System.Byte[],System.Collections.Generic.IReadOnlyDictionary{System.String,System.Byte[]},System.Int64)">
+            <summary>issue #105: as <see cref="M:Nanocached.NanocachedClient.SetManyBytesAsync(System.Collections.Generic.IReadOnlyDictionary{System.String,System.Byte[]},System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.MultiSetChunkedAsync(System.String,System.Byte[],System.Byte[][],System.Byte[][],System.Int64)">
+             <summary><see cref="M:Nanocached.NanocachedClient.MultiGetChunkedAsync(System.String,System.Byte[],System.Byte[][])"/>'s write-side twin: one
+             or more <c>o</c> sub-frames against <paramref name="slot"/>'s
+             connection, split so a sub-frame never exceeds
+             <see cref="F:Nanocached.NanocachedClient.MaxBatchKeys"/> pairs OR (issue #222)
+             <see cref="F:Nanocached.NanocachedClient.MaxRequestBytes"/> of cumulative namespace+key+value
+             wire bytes, the same way — a single pair always fits on its own,
+             since <see cref="M:Nanocached.NanocachedClient.ValidateKeyAndValue(System.Byte[],System.Byte[],System.Byte[])"/> already guarantees
+             that.
+            
+             <para>issue #411: as <see cref="M:Nanocached.NanocachedClient.MultiGetChunkedAsync(System.String,System.Byte[],System.Byte[][])"/>, throws
+             <see cref="T:Nanocached.NanocachedClient.ChunkedBatchInterruptedException"/> instead of the bare
+             connection failure when a chunk after the first one fails at the
+             connection level, carrying every earlier chunk's already-completed
+             entries.</para></summary>
+        </member>
+        <member name="T:Nanocached.NanocachedClient.OwnerBatch">
+            <summary>One owner's key/IsPrimary membership across one
+            <see cref="M:Nanocached.NanocachedClient.MultiSetPassAsync(System.Byte[],System.Collections.Generic.List{System.String},System.Byte[][],System.Byte[][],System.Int64,System.Collections.Generic.List{System.Int32})"/> call — see that method's own doc
+            comment for why a key can appear here with <c>IsPrimary</c> false:
+            the same node can be primary for one key in the batch and a
+            replica for another.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.MultiSetPassAsync(System.Byte[],System.Collections.Generic.List{System.String},System.Byte[][],System.Byte[][],System.Int64,System.Collections.Generic.List{System.Int32})">
+            <summary>One pass of <see cref="M:Nanocached.NanocachedClient.SetManyBytesAsync(System.Byte[],System.Collections.Generic.IReadOnlyDictionary{System.String,System.Byte[]},System.Int64)"/>'s
+            cluster routing: for every key still needing resolution (every
+            key, when <paramref name="retryIndices"/> is <c>null</c>, or just
+            what a previous pass left unresolved), build one sub-batch per
+            <b>owner name across every rank</b> — not just primaries, unlike
+            <see cref="M:Nanocached.NanocachedClient.MultiGetPassAsync(System.Byte[],System.Collections.Generic.IReadOnlyList{System.String},System.Byte[][],System.Collections.Generic.Dictionary{System.String,System.Byte[]},System.Collections.Generic.List{System.Int32},System.Int64[])"/> — because within one batch the
+            same node can be primary for one key and a replica for another;
+            each owner therefore gets exactly one <c>o</c> sub-frame covering
+            every key it holds in any role. Only a leg's <em>primary</em> keys
+            can end up in the returned retry list; a leg's replica-held keys
+            are logged-and-swallowed into <see cref="F:Nanocached.NanocachedClient._replicaWriteFailures"/>
+            instead, mirroring <see cref="M:Nanocached.NanocachedClient.WriteAsync``1(System.Byte[],System.Byte[],System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>'s stance for
+            single-key set. A leg that is a pure replica for every key it
+            holds is eligible for <c>FireAndForgetReplicas</c>, exactly like a
+            single-key replica write — see
+            <see cref="M:Nanocached.NanocachedClient.RunMultiSetLegAsync(System.Byte[],System.String,Nanocached.NanocachedClient.OwnerBatch,System.Byte[][],System.Byte[][],System.Int64,System.Collections.Generic.List{System.Int32})"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.RunMultiSetLegAsync(System.Byte[],System.String,Nanocached.NanocachedClient.OwnerBatch,System.Byte[][],System.Byte[][],System.Int64,System.Collections.Generic.List{System.Int32})">
+            <summary>Dispatches one owner's <c>o</c> sub-batch (via
+            <see cref="M:Nanocached.NanocachedClient.MultiSetChunkedAsync(System.String,System.Byte[],System.Byte[][],System.Byte[][],System.Int64)"/>) and applies its result to
+            <paramref name="retry"/>/<see cref="F:Nanocached.NanocachedClient._replicaWriteFailures"/>: only
+            primary-held keys can end up appended to <paramref name="retry"/>;
+            every replica-held key's failure or <c>W</c> is counted in
+            <see cref="F:Nanocached.NanocachedClient._replicaWriteFailures"/> instead, mirroring
+            <see cref="M:Nanocached.NanocachedClient.WriteAsync``1(System.Byte[],System.Byte[],System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>'s own stance for single-key set. A
+            connection-level failure for the whole leg is treated the same
+            way, key by key, since the SAME sub-frame can carry both primary-
+            and replica-held keys and a transport failure doesn't distinguish
+            between them. <paramref name="retry"/> is shared by every
+            concurrently-running owner leg, so every access is under
+            <c>lock (retry)</c>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Int64)">
+             <summary>issue #129: increments the counter stored at
+             <paramref name="key"/> by <paramref name="delta"/> (a negative
+             delta decrements — there is no separate decrement opcode; see
+             <see cref="M:Nanocached.NanocachedClient.DecrAsync(System.Byte[],System.Int64)"/>) and returns its new value, or
+             <c>null</c> when the key is missing or expired — the same
+             not-found convention <see cref="M:Nanocached.NanocachedClient.GetAsync(System.Byte[])"/> uses. Throws
+             <see cref="T:Nanocached.NotNumericException"/> when the stored value isn't an
+             integer INCR can operate on, or applying the delta would overflow a
+             signed 64-bit integer.
+            
+             <para><b>Exactly as volatile as <see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)"/></b>:
+             LRU eviction and TTL expiry reclaim an incremented value like any
+             other entry. Good for rate limiting or approximate counters, not
+             for durable counts (billing, inventory).</para>
+            
+             <para>Cluster replication: unlike <see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)"/>/
+             <see cref="M:Nanocached.NanocachedClient.DeleteAsync(System.Byte[])"/>, which send the identical write to
+             every owner, only the primary owner ever runs the increment — a
+             successful result is forwarded to the replicas as an ordinary
+             <c>Set</c> of the literal new value instead of replaying the delta
+             on each of them, which would let a replica drift from the primary
+             (e.g. after an earlier dropped replica write, or an independent
+             eviction). See <see cref="M:Nanocached.NanocachedClient.IncrPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.Int64)"/> for the
+             full mechanics.</para>
+            
+             <para><b>At-least-once on a lost connection (issue #225)</b>: unlike
+             <see cref="M:Nanocached.NanocachedClient.GetAsync(System.Byte[])"/>/<see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)"/>/
+             <see cref="M:Nanocached.NanocachedClient.DeleteAsync(System.Byte[])"/> — which are idempotent, so this
+             SDK's built-in redial-and-retry-once always resends them — Incr is
+             NOT idempotent, so the redial-and-retry only ever resends this
+             request when the connection is known to have died before the
+             request frame could be written at all (e.g. the server's idle
+             timeout closed it first). If the request frame was fully written
+             and only the reply never arrived, the primary may already have
+             applied the increment; this method throws
+             <see cref="T:Nanocached.ConnectionLostException"/> in that case instead of
+             silently double-applying it. A caller that needs to know for certain
+             whether an Incr landed after seeing this exception should read the
+             counter back rather than assume either outcome.</para>
+            
+             <para><b>Incompatible with <c>Compress</c> (issue #321)</b>: throws
+             <see cref="T:Nanocached.CompressionIncompatibleException"/> immediately, before
+             any I/O, when this client was constructed with <c>Compress</c>
+             enabled — an incremented value can't safely round-trip through
+             compression. Disable <c>Compress</c> or use a separate client for
+             counters.</para></summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.String,System.Int64)">
+            <summary>issue #129: as <see cref="M:Nanocached.NanocachedClient.IncrAsync(System.String,System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Byte[],System.Int64)">
+            <summary>issue #129: as <see cref="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/> — this is the internal
+            method <see cref="T:Nanocached.NanocachedNamespace"/> forwards to, rather than
+            duplicating this client's networking.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DecrAsync(System.String,System.Int64)">
+            <summary>issue #182: <see cref="M:Nanocached.NanocachedClient.IncrAsync(System.String,System.Int64)"/> with
+            <paramref name="delta"/> negated — never a different wire op. Same
+            at-least-once-on-a-lost-connection caveat as
+            <see cref="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Int64)"/> (issue #225): not idempotent,
+            so a connection lost after the request frame was already fully
+            written throws <see cref="T:Nanocached.ConnectionLostException"/> rather than
+            risk decrementing twice. Also throws
+            <see cref="T:Nanocached.CompressionIncompatibleException"/> when <c>Compress</c>
+            is enabled, for the same reason <see cref="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Int64)"/>
+            does (issue #321).</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DecrAsync(System.Byte[],System.Int64)">
+            <summary>issue #129: <see cref="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Int64)"/> with
+            <paramref name="delta"/> negated — never a different wire op;
+            <c>i</c>'s own signed delta already covers decrementing. issue
+            #182: delegates the negation to <see cref="M:Nanocached.NanocachedClient.NegateDecrDelta(System.Int64)"/>,
+            which rejects <see cref="F:System.Int64.MinValue"/> rather than silently
+            wrapping it back to itself. See <see cref="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Int64)"/>'s
+            doc comment for the at-least-once-on-a-lost-connection caveat
+            (issue #225) this inherits.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.NegateDecrDelta(System.Int64)">
+            <summary>issue #182: shared negation guard for every
+            <c>DecrAsync</c> overload above. <see cref="F:System.Int64.MinValue"/> has no
+            corresponding positive <see cref="T:System.Int64"/> value in two's
+            complement (<see cref="F:System.Int64.MaxValue"/> is one short of
+            <c>|long.MinValue|</c>), so negating it wraps back to
+            <see cref="F:System.Int64.MinValue"/> itself — silently turning a decrement
+            into the largest possible increment. Rejecting it client-side,
+            before any I/O, mirrors the Java and Rust SDKs' own rejection of
+            this value.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.IncrPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.Int64)">
+             <summary>issue #129 — the part that's easy to get subtly wrong: runs
+             <c>i</c> against the key's PRIMARY owner only, awaits its reply,
+             then — only on success — fans that literal result out to the
+             remaining owners as an ordinary <c>Set</c> (the same wire op and
+             framing <see cref="M:Nanocached.NanocachedClient.WriteAsync``1(System.Byte[],System.Byte[],System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>'s replica legs use), never by
+             resending <c>i</c> to a replica. Forwarding the primary's absolute
+             result keeps every replica byte-identical to it; replaying the
+             increment on each replica independently could let a replica drift
+             (e.g. if an earlier replica-leg write was dropped after a transient
+             failure, or the replica separately evicted and reset the key) —
+             the same reasoning the node's own migration/decommission-handoff
+             logic uses server-side.
+            
+             <para>A miss (<c>N</c>) or not-numeric result (<c>T</c>) is
+             returned/thrown directly, without touching any replica — nothing
+             was written, so there is nothing to forward. A dead or
+             disagreeing replica leg is swallowed exactly like
+             <see cref="M:Nanocached.NanocachedClient.WriteAsync``1(System.Byte[],System.Byte[],System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>'s own replica legs — counted via
+             <see cref="M:Nanocached.NanocachedClient.Stats"/>'s <c>ReplicaWriteFailures</c>, the same
+             counter, not a new one — and, with <see cref="P:Nanocached.NanocachedClient.Options.FireAndForgetReplicas"/>,
+             drawn from the same bounded background pool
+             (<see cref="F:Nanocached.NanocachedClient._backgroundReplicaPermits"/>) those legs already
+             share with read-repair. The primary leg's own <c>W</c> or
+             connection-level failure propagates up to
+             <see cref="M:Nanocached.NanocachedClient.WithClusterRetryAsync``1(System.Func{System.Threading.Tasks.Task{``0}})"/>'s caller, which refreshes
+             the node list and retries this whole method once — since nothing
+             is replicated until AFTER the primary succeeds, that retry only
+             ever redoes the primary leg in practice, never a replay of an
+             already-forwarded replica write.</para></summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ReplicateToOwnersAsync(System.Collections.Generic.IEnumerable{System.String},System.Func{Nanocached.Connection,System.Threading.Tasks.Task})">
+            <summary>Shared replica fan-out for the "primary evaluates, then
+            forwards the literal result" pattern used by <see cref="M:Nanocached.NanocachedClient.IncrPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.Int64)"/>
+            (issue #129) and <see cref="M:Nanocached.NanocachedClient.CasPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.Byte[],System.String,System.Int64)"/>/
+            <see cref="M:Nanocached.NanocachedClient.RemoveIfMatchesPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.String)"/> (issue #141):
+            runs <paramref name="replicate"/> against each of <paramref
+            name="names"/> (already excluding the primary, which the caller ran
+            separately and successfully). Every expected failure (a dead
+            replica, a lost socket) is swallowed and counted via
+            <see cref="M:Nanocached.NanocachedClient.Stats"/>'s <c>ReplicaWriteFailures</c> — the same
+            counter <see cref="M:Nanocached.NanocachedClient.WriteAsync``1(System.Byte[],System.Byte[],System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>'s own replica legs use, not a
+            new one — since the primary already succeeded and a replica gap is
+            healed by the next node-list refresh, not by failing an already-
+            completed write. With <see cref="P:Nanocached.NanocachedClient.Options.FireAndForgetReplicas"/>,
+            up to <see cref="F:Nanocached.NanocachedClient.MaxInFlightBackgroundReplicaWrites"/> legs run in
+            the background instead of being awaited here, sharing the one pool
+            <see cref="M:Nanocached.NanocachedClient.WriteAsync``1(System.Byte[],System.Byte[],System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>'s own replica legs and read-repair
+            draw from.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ContentDigest(System.Byte[])">
+            <summary>issue #141 — compare-and-set: SHA-256 of <paramref
+            name="value"/>, truncated to the first 16 bytes (128 bits),
+            lowercase-hex-encoded (32 characters) — the digest ("CAS token")
+            the server computes over a key's exact stored bytes. Public and
+            pure so a caller that already holds a value can compute its
+            expected digest without a prior read — see
+            <see cref="M:Nanocached.NanocachedClient.ReplaceAsync(System.Byte[],System.String,System.Byte[],System.Int64)"/>'s doc
+            comment for why that shortcut is only safe when the caller's own
+            serialization reproduces the stored bytes exactly, unlike the
+            always-correct read-then-write-back path via
+            <see cref="M:Nanocached.NanocachedClient.GetWithTokenAsync(System.Byte[])"/>. Computed identically by
+            the server and every SDK; pinned by a fixed cross-language test
+            vector (see NanocachedClientTests).</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.PutIfAbsentAsync(System.Byte[],System.Byte[],System.Int64)">
+             <summary>issue #141 — <c>add</c>/<c>putIfAbsent</c>: stores
+             <paramref name="value"/> only if <paramref name="key"/> is
+             currently absent (including lazily expired). Returns <c>true</c>
+             when stored, <c>false</c> when the key already existed — a
+             condition mismatch is a normal boolean outcome, never an
+             exception, the same idiom <see cref="M:Nanocached.NanocachedClient.DeleteAsync(System.Byte[])"/> uses.
+            
+             <para><b>Not a distributed lock</b>: LRU eviction can still reclaim
+             the key exactly as it would after a plain <see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)"/>
+             — if a key used as a lock is evicted under memory pressure, a
+             second caller's <c>PutIfAbsentAsync</c> succeeds while the first
+             caller still believes it holds the lock. See
+             docs/protocol.html#cas.</para>
+            
+             <para>Cluster replication: only the key's primary owner evaluates
+             the condition; on success the SDK forwards the literal value to the
+             remaining owners as an ordinary <see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)"/>,
+             never by replaying <c>k</c> on a replica — see
+             <see cref="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Int64)"/>'s doc comment for why that
+             matters.</para>
+            
+             <para><b>At-least-once on a lost connection (issue #225)</b>: like
+             <see cref="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Int64)"/>, CAS is NOT idempotent — a
+             mismatch response and an already-succeeded response mean different
+             things, so blindly replaying it after a redial could report an
+             already-successful CAS as a mismatch. The redial-and-retry this SDK
+             builds in for <see cref="M:Nanocached.NanocachedClient.GetAsync(System.Byte[])"/>/<see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)"/>/
+             <see cref="M:Nanocached.NanocachedClient.DeleteAsync(System.Byte[])"/> only ever resends this request
+             when the connection is known to have died before the request frame
+             could be written at all; if the frame was fully written and only
+             the reply was lost, this method throws
+             <see cref="T:Nanocached.ConnectionLostException"/> instead of guessing. The same
+             caveat applies to <see cref="M:Nanocached.NanocachedClient.ReplaceIfPresentAsync(System.Byte[],System.Byte[],System.Int64)"/>,
+             <see cref="M:Nanocached.NanocachedClient.ReplaceAsync(System.Byte[],System.String,System.Byte[],System.Int64)"/>, and
+             <see cref="M:Nanocached.NanocachedClient.DeleteIfMatchesAsync(System.Byte[],System.String)"/>, which all share
+             this same primary-then-replicate path.</para></summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.PutIfAbsentAsync(System.Byte[],System.String,System.String,System.Int64)">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.PutIfAbsentAsync(System.String,System.String,System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.PutIfAbsentAsync(System.Byte[],System.Byte[],System.Byte[],System.Int64)">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.PutIfAbsentAsync(System.Byte[],System.Byte[],System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ReplaceIfPresentAsync(System.Byte[],System.Byte[],System.Int64)">
+            <summary>issue #141 — the two-argument <c>replace(key, value)</c>:
+            stores <paramref name="value"/> only if <paramref name="key"/>
+            currently holds any (unexpired) value, whatever it is. Returns
+            <c>true</c> when replaced, <c>false</c> when the key was absent —
+            see <see cref="M:Nanocached.NanocachedClient.PutIfAbsentAsync(System.Byte[],System.Byte[],System.Int64)"/>'s doc
+            comment for the shared not-a-lock caveat and replication
+            rule.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ReplaceIfPresentAsync(System.Byte[],System.String,System.String,System.Int64)">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.ReplaceIfPresentAsync(System.String,System.String,System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ReplaceIfPresentAsync(System.Byte[],System.Byte[],System.Byte[],System.Int64)">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.ReplaceIfPresentAsync(System.Byte[],System.Byte[],System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ReplaceAsync(System.Byte[],System.String,System.Byte[],System.Int64)">
+             <summary>issue #141 — the three-argument <c>replace(key, old, new)</c>:
+             stores <paramref name="newValue"/> only if <paramref name="key"/>
+             holds an unexpired value whose content digest equals <paramref
+             name="token"/> exactly (32-character lowercase hex — see
+             <see cref="M:Nanocached.NanocachedClient.ContentDigest(System.Byte[])"/>). Returns <c>true</c> when replaced,
+             <c>false</c> on a digest mismatch (including a since-deleted key).
+            
+             <para><paramref name="token"/> is ordinarily obtained from a real
+             prior <see cref="M:Nanocached.NanocachedClient.GetWithTokenAsync(System.Byte[])"/> — that path is always
+             correct. Reconstructing a digest via <see cref="M:Nanocached.NanocachedClient.ContentDigest(System.Byte[])"/>
+             from a value the caller already holds (skipping the read) is only
+             correct if that reconstruction produces byte-identical bytes to
+             what the server actually stores — true within one client sharing
+             one serializer/compressor, not guaranteed across languages or
+             mismatched <c>Compress</c> settings (the same caveat memcached's
+             own value-based CAS has).</para>
+            
+             <para>See <see cref="M:Nanocached.NanocachedClient.PutIfAbsentAsync(System.Byte[],System.Byte[],System.Int64)"/>'s
+             doc comment for the shared not-a-lock caveat, replication rule, and
+             — since ReplaceAsync is CAS, not idempotent — the
+             at-least-once-on-a-lost-connection caveat (issue #225).</para></summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ReplaceAsync(System.Byte[],System.String,System.String,System.String,System.Int64)">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.ReplaceAsync(System.String,System.String,System.String,System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ReplaceAsync(System.Byte[],System.Byte[],System.String,System.Byte[],System.Int64)">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.ReplaceAsync(System.Byte[],System.String,System.Byte[],System.Int64)"/>,
+            scoped to <paramref name="namespaceBytes"/>. issue #223: validates
+            <paramref name="token"/> before it ever reaches the wire — see
+            <see cref="M:Nanocached.NanocachedClient.ValidateToken(System.String)"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DeleteIfMatchesAsync(System.Byte[],System.String)">
+             <summary>issue #141 — the two-argument <c>remove(key, old)</c>:
+             removes <paramref name="key"/> only if its current stored value's
+             content digest equals <paramref name="token"/> exactly. Returns
+             <c>true</c> when removed, <c>false</c> on a digest mismatch or a
+             missing key — see <see cref="M:Nanocached.NanocachedClient.ReplaceAsync(System.Byte[],System.String,System.Byte[],System.Int64)"/>'s
+             doc comment for how to obtain <paramref name="token"/>.
+            
+             <para>Cluster replication: only the primary owner evaluates the
+             digest; on success the SDK forwards the removal to the remaining
+             owners as an ordinary <see cref="M:Nanocached.NanocachedClient.DeleteAsync(System.Byte[])"/>, never by
+             replaying <c>x</c> on a replica.</para>
+            
+             <para><b>At-least-once on a lost connection (issue #225)</b>: unlike
+             <see cref="M:Nanocached.NanocachedClient.DeleteAsync(System.Byte[])"/>, this is a conditional remove, not
+             idempotent — a mismatch and an already-succeeded removal mean
+             different things. The built-in redial-and-retry only ever resends
+             this request when the connection is known to have died before the
+             request frame could be written at all; if the frame was fully
+             written and only the reply was lost, this method throws
+             <see cref="T:Nanocached.ConnectionLostException"/> instead of reporting a
+             possibly-already-successful removal as a mismatch. See
+             <see cref="M:Nanocached.NanocachedClient.PutIfAbsentAsync(System.Byte[],System.Byte[],System.Int64)"/>'s doc comment
+             for the same caveat shared by every CAS method.</para></summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DeleteIfMatchesAsync(System.Byte[],System.String,System.String)">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.DeleteIfMatchesAsync(System.String,System.String)"/>,
+            scoped to <paramref name="namespaceBytes"/> — the internal method
+            <see cref="T:Nanocached.NanocachedNamespace"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DeleteIfMatchesAsync(System.Byte[],System.Byte[],System.String)">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.DeleteIfMatchesAsync(System.Byte[],System.String)"/>,
+            scoped to <paramref name="namespaceBytes"/>. issue #223: validates
+            <paramref name="token"/> before it ever reaches the wire — see
+            <see cref="M:Nanocached.NanocachedClient.ValidateToken(System.String)"/>.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.CasAsync(System.Byte[],System.Byte[],System.Byte[],System.String,System.Int64)">
+            <summary>issue #141: as <see cref="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Byte[],System.Int64)"/>
+            but for <c>k</c> — validates, compresses (reusing
+            <see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Byte[],System.Int64)"/>'s exact
+            encode step, so a subsequent plain <see cref="M:Nanocached.NanocachedClient.GetAsync(System.Byte[])"/>
+            from any client can always decompress it), and runs the
+            primary-evaluates-then-replicates driver.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.CasPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.Byte[],System.String,System.Int64)">
+            <summary>issue #141 — mirrors <see cref="M:Nanocached.NanocachedClient.IncrPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.Int64)"/>
+            exactly: runs <c>k</c> against the key's PRIMARY owner only —
+            <paramref name="value"/> here is already the outgoing (possibly
+            compressed) wire bytes — then, only on success, forwards that same
+            literal value to the remaining owners as an ordinary <c>Set</c>,
+            never by replaying <c>k</c> on a replica (which could evaluate
+            <paramref name="cond"/> against a possibly-different copy and reach
+            a different outcome).</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.RemoveIfMatchesPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.String)">
+            <summary>issue #141 — mirrors <see cref="M:Nanocached.NanocachedClient.CasPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.Byte[],System.String,System.Int64)"/>
+            for <c>x</c>: runs the digest-conditioned remove against the
+            primary owner only, then — only on success — forwards the removal
+            to the remaining owners as an ordinary <c>Delete</c>, never by
+            replaying <c>x</c> on a replica.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ClearAsync(System.Byte[])">
+            <summary>issue #106: drops every entry in <paramref name="namespaceBytes"/>
+            (empty clears the default namespace — not rejected, see
+            <see cref="T:Nanocached.NanocachedNamespace"/>'s doc comment on
+            <c>Namespace("")</c>). The internal method
+            <see cref="M:Nanocached.NanocachedNamespace.ClearAsync"/> forwards to.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ClearAllAsync">
+            <summary>issue #106: drops every namespace, the default one
+            included — the client-side equivalent of the server's <c>F</c>.
+            Per the issue, deliberately not named "flush" to keep the public
+            API's vocabulary to get/set/delete/clear.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ClearFanOutWithRetryAsync(System.Func{Nanocached.Connection,System.Threading.Tasks.Task})">
+             <summary>
+             issue #106: a clear/flush is never key-addressed (docs/protocol.html's
+             "c / F" section — no <c>W</c> ever, so <see cref="M:Nanocached.NanocachedClient.WithClusterRetryAsync``1(System.Func{System.Threading.Tasks.Task{``0}})"/>'s
+             single-key retry doesn't apply), so it fans out to <em>every</em>
+             node in the client's current node list concurrently, the same way
+             <see cref="M:Nanocached.NanocachedClient.WriteAsync``1(System.Byte[],System.Byte[],System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/> fans a replicated write out to a key's
+             owners. Success requires every node to have acked <c>C</c>: on any
+             failure the node list is refreshed once (the same refresh path
+             <see cref="M:Nanocached.NanocachedClient.WithClusterRetryAsync``1(System.Func{System.Threading.Tasks.Task{``0}})"/> uses for a stale ring) and
+             the clear is retried against every node of the <em>refreshed</em>
+             list — not just the ones that failed, since a refresh can also
+             reassign which node owns which share. A node still failing after
+             that retry fails the whole call — a clear must never silently
+             leave a namespace partially cleared — but the operation is
+             idempotent, so a caller can simply retry it.
+            
+             <para>Single/standalone mode (<see cref="F:Nanocached.NanocachedClient._ring"/> is <c>null</c>)
+             has only the one connected node, so there is nothing to fan out to
+             or refresh: <paramref name="op"/> just runs against it directly,
+             through the same lazy-reconnect path every other operation
+             uses.</para>
+             </summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ClearFanOutAsync(System.Collections.Generic.IReadOnlyList{System.String},System.Func{Nanocached.Connection,System.Threading.Tasks.Task})">
+            <summary>Runs <paramref name="op"/> against every node in
+            <paramref name="names"/> concurrently (fan-out — see
+            <see cref="M:Nanocached.NanocachedClient.ClearFanOutWithRetryAsync(System.Func{Nanocached.Connection,System.Threading.Tasks.Task})"/>), through the same
+            lazy-reconnect path a replica write uses. Returns the nodes that
+            failed, paired with why, instead of throwing — the caller decides
+            whether a first-pass failure warrants a refresh-and-retry or, on a
+            second pass, is fatal.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ValidateKey(System.Byte[],System.Byte[])">
+            <summary>Rejects an empty key, or a (namespace, key) pair so large
+            that a bare <c>"g "</c>/<c>"G "</c>/<c>"d "</c>/<c>"D "</c> header
+            plus the namespace and key alone would already risk tripping the
+            server's MAX_REQUEST_SIZE (audit finding D2) — checked
+            synchronously, before any connection is touched, mirroring
+            <see cref="M:Nanocached.NanocachedClient.SetAsync(System.Byte[],System.Byte[],System.Int64)"/>'s ttlSeconds check.
+            issue #105: the namespace counts toward the same budget as the key
+            — the wire imposes no separate limit on it, so neither does this
+            (the empty namespace contributes 0 bytes, so this is
+            byte-identical to the pre-namespace check).</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ValidateKeyAndValue(System.Byte[],System.Byte[],System.Byte[])">
+            <summary>As <see cref="M:Nanocached.NanocachedClient.ValidateKey(System.Byte[],System.Byte[])"/>, plus rejects a
+            namespace+key+value combination too large for a single
+            <c>s</c>/<c>S</c> request to have any chance of fitting under the
+            server's MAX_REQUEST_SIZE (audit finding D2). Checked against the
+            caller-supplied value, before compression — compression only ever
+            shrinks what actually goes on the wire, so this is the conservative
+            (never falsely permissive) side to check.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ValidateToken(System.String)">
+            <summary>issue #223: rejects a caller-supplied CAS <paramref
+            name="token"/> that isn't exactly 32 lowercase hex characters —
+            mirrors Java's <c>validateToken</c>. <see cref="M:Nanocached.NanocachedClient.CasAsync(System.Byte[],System.Byte[],System.Byte[],System.String,System.Int64)"/>'s
+            wire encoding embeds <c>cond</c> (the <c>k</c> frame's condition
+            field, and the <c>x</c> frame's digest) as a bare, non-length-
+            prefixed field terminated by a newline — an unvalidated token
+            (e.g. one forwarded from external input) could contain <c>\n</c>
+            and smuggle an extra pipelined request onto the connection. Only
+            called on the real digest path (<see cref="M:Nanocached.NanocachedClient.ReplaceAsync(System.Byte[],System.Byte[],System.String,System.Byte[],System.Int64)"/>,
+            <see cref="M:Nanocached.NanocachedClient.DeleteIfMatchesAsync(System.Byte[],System.Byte[],System.String)"/>) —
+            never on the internal <see cref="F:Nanocached.NanocachedClient.CondAbsent"/>/<see cref="F:Nanocached.NanocachedClient.CondPresent"/>
+            sentinels, which are fixed, safe constants, not caller
+            input.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.Close">
+            <summary>Idempotent; later operations throw <see cref="T:Nanocached.AlreadyClosedException"/>.
+            A second call warns to stderr instead of erroring — usually a sign
+            the caller lost track of this instance's lifecycle.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.WithClusterRetryAsync``1(System.Func{System.Threading.Tasks.Task{``0}})">
+            <summary>
+            Runs the operation; on a <c>W</c> answer (stale routing) or a
+            connection-level failure that exhausted the current ranking (e.g.
+            the key's primary died), forces a node-list refresh and retries the
+            whole operation once against the fresh ranking. The retry window
+            for a dead node is therefore bounded by discovery's liveness
+            timeout. A second failure after a fresh refresh propagates.
+            </summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.OwnerNames(System.Byte[],System.Byte[])">
+            <summary>issue #105: (namespace, key) routes to owners via
+            <see cref="M:Nanocached.HashRing.Owners(System.ReadOnlySpan{System.Byte},System.ReadOnlySpan{System.Byte},System.Int32)"/>
+            — the empty namespace routes identically to the pre-namespace
+            single-key form.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ApplyReconnectingAsync``1(System.String,System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})">
+             <summary>
+             Runs <paramref name="op"/> against the slot's connection, retrying
+             once on a connection-level failure: a socket only learns of a peer
+             FIN (e.g. the server's 60s idle timeout) on I/O, so lazy
+             reconnect-on-use means the failed request poisons the connection,
+             the redial replaces it, and the operation runs again. Safe because
+             get/set/delete/clear are all idempotent — replaying one after a
+             redial can never do anything worse than replaying it does anyway.
+            
+             <para>issue #225: NOT used for the primary leg of Incr/CAS/
+             RemoveIfMatches — those are not idempotent (replaying a fully-sent
+             Incr double-applies it; replaying a fully-sent CAS/conditional-delete
+             can report an already-successful op as a mismatch). See
+             <see cref="M:Nanocached.NanocachedClient.ApplyReconnectingNotIdempotentAsync``1(System.String,System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>.</para>
+             </summary>
+        </member>
+        <member name="T:Nanocached.NanocachedClient.UnsafeToReplayException">
+            <summary>
+            issue #225 — internal marker exception: wraps a
+            <see cref="T:Nanocached.ConnectionLostException"/> that must never be replayed,
+            not even by <see cref="M:Nanocached.NanocachedClient.WithClusterRetryAsync``1(System.Func{System.Threading.Tasks.Task{``0}})"/>'s own broader
+            refresh-and-retry. Thrown only by
+            <see cref="M:Nanocached.NanocachedClient.ApplyReconnectingNotIdempotentAsync``1(System.String,System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>, specifically so
+            it passes UNCAUGHT through <see cref="M:Nanocached.NanocachedClient.WithClusterRetryAsync``1(System.Func{System.Threading.Tasks.Task{``0}})"/>'s
+            <c>catch (... or ConnectionLostException)</c> — that catch would
+            otherwise retry the whole operation (refresh the ring, call the
+            delegate again) exactly as blindly as the bug this issue fixes.
+            Every public entry point whose primary leg can throw this
+            (<see cref="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Byte[],System.Int64)"/>, the private
+            <c>CasAsync</c>, <see cref="M:Nanocached.NanocachedClient.DeleteIfMatchesAsync(System.Byte[],System.Byte[],System.String)"/>)
+            unwraps it back to the inner <see cref="T:Nanocached.ConnectionLostException"/>
+            before it can ever reach a caller — nothing outside this file ever
+            sees this type.
+            </summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ApplyReconnectingNotIdempotentAsync``1(System.String,System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})">
+             <summary>
+             issue #225 — the non-idempotent counterpart to
+             <see cref="M:Nanocached.NanocachedClient.ApplyReconnectingAsync``1(System.String,System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>, used only for the primary
+             leg of Incr/CAS/RemoveIfMatches (<see cref="M:Nanocached.NanocachedClient.IncrPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.Int64)"/>,
+             <see cref="M:Nanocached.NanocachedClient.CasPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.Byte[],System.String,System.Int64)"/>,
+             <see cref="M:Nanocached.NanocachedClient.RemoveIfMatchesPrimaryThenReplicateAsync(System.Byte[],System.Byte[],System.String)"/> — never the
+             replica legs those forward as ordinary Set/Delete, which stay on the
+             plain idempotent-safe method above). Blindly redialing and resending
+             on ANY connection-level failure — what
+             <see cref="M:Nanocached.NanocachedClient.ApplyReconnectingAsync``1(System.String,System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/> does — is unsafe here: if the
+             primary already applied the operation and only the reply was lost,
+             replaying it double-applies an Incr, or turns an already-successful
+             CAS/conditional-delete into a false mismatch.
+            
+             <para>Connection distinguishes the two failure shapes via
+             <see cref="P:Nanocached.ConnectionLostException.RequestNotSent"/>: true means the
+             request frame failed to write at all — the idle-FIN case, where the
+             connection was already dead and the peer never received so much as a
+             partial frame — so redialing and resending is exactly as safe as it
+             is for Get/Set/Delete, and this method retries once, just like
+             <see cref="M:Nanocached.NanocachedClient.ApplyReconnectingAsync``1(System.String,System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/> does. False (the default on
+             every other <see cref="T:Nanocached.ConnectionLostException"/> — a lost reply
+             after a fully-written frame, a request timeout, a stream desync)
+             means the request may already have reached the peer: this method
+             does not retry, and wraps the exception in
+             <see cref="T:Nanocached.NanocachedClient.UnsafeToReplayException"/> so
+             <see cref="M:Nanocached.NanocachedClient.WithClusterRetryAsync``1(System.Func{System.Threading.Tasks.Task{``0}})"/>'s own broader retry can't
+             replay it either — the caller unwraps it back to the plain
+             <see cref="T:Nanocached.ConnectionLostException"/> this SDK's exception contract
+             promises.</para>
+             </summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ReadHedgedAsync``1(System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}},System.Collections.Generic.IReadOnlyList{System.String},System.TimeSpan)">
+             <summary>
+             Hedged reads (<see cref="P:Nanocached.NanocachedClient.Options.ReadHedgeAfter"/>): a slow — not
+             dead — owner otherwise bounds every read that touches it at its
+             full round trip, since <see cref="M:Nanocached.NanocachedClient.ReadAsync``1(System.Byte[],System.Byte[],System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>'s sequential path
+             only moves on to the next owner when the current one *fails*. Here
+             the read starts at the primary, and if no answer has arrived within
+             <paramref name="hedgeAfter"/> the same read is also sent to the next
+             owner (and so on, one more owner per interval, until every owner is
+             in flight); the first answer decides:
+            
+             <list type="bullet">
+             <item>a hit from any owner is final;</item>
+             <item>a miss is final only from the primary — a replica's miss is
+             provisional (it may simply lack the copy) and the primary is still
+             waited for, so hedging never turns a hit into a miss; it is
+             accepted only once every owner has answered or failed;</item>
+             <item>a failure (connection-level, or any
+             <see cref="T:Nanocached.NanocachedException"/> other than
+             <see cref="T:Nanocached.WrongNodeException"/>) hedges onward immediately, with
+             no wait;</item>
+             <item><see cref="T:Nanocached.WrongNodeException"/> propagates as in
+             <see cref="M:Nanocached.NanocachedClient.ReadAsync``1(System.Byte[],System.Byte[],System.Func{Nanocached.Connection,System.Threading.Tasks.Task{``0}})"/>.</item>
+             </list>
+            
+             The losing legs are never cancelled — cancelling mid-write could
+             desync a connection (see <see cref="T:Nanocached.Connection"/>'s own doc
+             comment) — but are left to finish detached in
+             <see cref="F:Nanocached.NanocachedClient._hedgedReads"/>, their outcome observed, and drained by
+             <see cref="M:Nanocached.NanocachedClient.Close"/>.
+             </summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ResolveHedgeLosersAsync``1(System.Collections.Generic.HashSet{System.Threading.Tasks.Task{``0}})">
+            <summary>issue #276: <paramref name="tasks"/> is this read's own
+            remaining legs once it has already decided its outcome via a
+            different leg — normally left running detached in
+            <see cref="F:Nanocached.NanocachedClient._hedgedReads"/> for <see cref="M:Nanocached.NanocachedClient.Close"/> to eventually
+            drain (they're already registered there, added by
+            <c>StartLeg</c>, and self-remove via their own continuation). But
+            past <see cref="F:Nanocached.NanocachedClient.MaxInFlightHedgeLoserLegs"/> concurrently detached
+            legs — checked against <see cref="F:Nanocached.NanocachedClient._hedgedReads"/>, which still
+            counts <paramref name="tasks"/> themselves at this point — the
+            rest are pulled out of the registry and awaited right here
+            instead, the same "fall back to synchronous" shape
+            <see cref="F:Nanocached.NanocachedClient.MaxInFlightBackgroundReplicaWrites"/> uses past its own
+            cap, so a client issuing many concurrent hedged reads against a
+            slow owner can't accumulate unbounded background legs. Outcomes
+            are ignored either way: a loser's result was never going to be
+            used.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.InstallRedialedConnection(System.String,Nanocached.Connection)">
+            <summary>Installs <paramref name="fresh"/> — a connection this
+            slot's redial just finished dialing — into <c>_single</c> or the
+            named member, or discards it. Split out of
+            <see cref="M:Nanocached.NanocachedClient.SlotConnectionAsync(System.String)"/> so its guarded logic is
+            independently testable (issue #330's regression test drives this
+            directly, since forcing the underlying race deterministically from
+            outside proved impractical — see that test's comment).</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DialWithCooldownAsync(System.String)">
+            <summary>Redials <paramref name="address"/>, honoring the
+            per-address reconnect cooldown (see <see cref="F:Nanocached.NanocachedClient._reconnectCooldowns"/>):
+            an address whose dial just failed stays "down" for
+            <see cref="F:Nanocached.NanocachedClient._reconnectCooldown"/>, so a burst of calls routed to it —
+            or one call every keep-alive tick — fails immediately with the same
+            error the dial itself produced, instead of each paying another full
+            connect timeout in turn. Callers must hold the slot's redial
+            gate.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.ArmReconnectCooldown(System.String,System.Exception)">
+            <summary>Arms the per-address reconnect cooldown (see
+            <see cref="F:Nanocached.NanocachedClient._reconnectCooldowns"/>) after a dial to
+            <paramref name="address"/> failed with <paramref name="error"/> — used
+            both by a lazy redial's own failed dial (<see cref="M:Nanocached.NanocachedClient.DialWithCooldownAsync(System.String)"/>)
+            and by <see cref="M:Nanocached.NanocachedClient.OpenClusterAsync(Nanocached.Identify.ClusterTarget)"/> installing an unreachable
+            member at bootstrap (issue #67), so a request that reaches it right
+            after connect fails immediately with this same cached error instead
+            of paying its own dial. A no-op when
+            <see cref="P:Nanocached.NanocachedClient.Options.DisableReconnectCooldown"/> was set
+            (<see cref="F:Nanocached.NanocachedClient._reconnectCooldown"/> is <c>null</c>) — every request
+            then pays its own full dial attempt instead of reusing a cached
+            failure.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.DialProxyWithFailoverAsync(System.String)">
+            <summary>SDK proxy mode (issue #122) reconnect: first retries
+            <paramref name="address"/> — the currently connected proxy, which
+            may simply have restarted — through the ordinary
+            <see cref="M:Nanocached.NanocachedClient.DialWithCooldownAsync(System.String)"/> (same per-address cooldown as
+            every other redial). Only when that also fails does this re-fetch
+            the proxy roster from discovery (<see cref="M:Nanocached.NanocachedClient.FetchProxyListAsync"/>)
+            and fail over to another proxy chosen at random
+            (<see cref="M:Nanocached.NanocachedClient.ConnectToAnyProxyAsync(System.Collections.Generic.IReadOnlyList{Nanocached.DiscoveredNode})"/> — the same dial-and-pick
+            <see cref="M:Nanocached.NanocachedClient.OpenProxyAsync(System.Collections.Generic.IReadOnlyList{Nanocached.DiscoveredNode})"/>'s initial connect uses, not a second
+            mechanism). On success, <see cref="F:Nanocached.NanocachedClient._singleAddress"/> is updated to
+            the winner so the *next* redial retries the new proxy first, same
+            as this one did. An empty roster is reported with a message naming
+            the situation, same wording as <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/>'s
+            own empty-roster error; every proxy in a non-empty roster being
+            unreachable surfaces as the last dial error, same as any other
+            connect failure.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.FetchNodeListAsync">
+            <summary>Walks every configured address (discovery HA); <c>null</c>
+            means keep the last-known list.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedClient.FetchProxyListAsync">
+            <summary>SDK proxy mode (issue #122): as <see cref="M:Nanocached.NanocachedClient.FetchNodeListAsync"/>,
+            but walks <see cref="F:Nanocached.NanocachedClient._addresses"/> for a discovery server willing
+            to answer <c>Q</c> instead of <c>L</c>. Used by
+            <see cref="M:Nanocached.NanocachedClient.DialProxyWithFailoverAsync(System.String)"/>'s reconnect fallback; the
+            initial connect fetches <c>Q</c> directly in
+            <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/>'s own loop instead, since that
+            first fetch also needs the loop's own per-address bookkeeping
+            (<c>_targetKey</c>, the forgotten-close warning). Unlike
+            <see cref="M:Nanocached.NanocachedClient.FetchNodeListAsync"/>, an address that identifies as a
+            plain cache node is not skipped as merely uninteresting: it means
+            ViaProxy is pointed at the wrong kind of address, the same
+            configuration error <see cref="M:Nanocached.NanocachedClient.ConnectAsync(Nanocached.NanocachedClient.Options)"/> fails fast
+            on, so it is thrown here too rather than silently trying the next
+            address.</summary>
+        </member>
+        <member name="T:Nanocached.NanocachedException">
+            <summary>Base class for every error this SDK raises on its own behalf.</summary>
+        </member>
+        <member name="T:Nanocached.AlreadyClosedException">
+            <summary>Raised by get/set/delete after Close(); Close() itself is idempotent.</summary>
+        </member>
+        <member name="T:Nanocached.WrongNodeException">
+             <summary>
+             A node answered <c>W</c> (staged node join): per its own view of cluster
+             membership it doesn't hold this key — the caller's routing table is
+             stale. The client catches this internally to refresh the node list and
+             retry once; it only escapes when that retry also fails, or in
+             single-node mode where there is no discovery to refresh from.
+            
+             <para>Not <c>sealed</c> (unlike this SDK's other leaf exceptions) so
+             <see cref="T:Nanocached.PartialWrongNodeException`1"/> — issue #151's batched-get
+             partial-failure carrier — can subclass it while still satisfying every
+             existing <c>catch (WrongNodeException)</c>.</para>
+             </summary>
+        </member>
+        <member name="T:Nanocached.PartialWrongNodeException`1">
+            <summary>
+            issue #151 — raised by <c>NanocachedClient.GetManyAsync</c>/
+            <c>NanocachedClient.GetManyBytesAsync</c> when some keys are
+            still wrong-node after the one bounded refresh-and-retry every batch
+            gets (the per-key analogue of <c>GetAsync</c>'s own <c>W</c>
+            refresh-and-retry). A <see cref="T:Nanocached.WrongNodeException"/> subclass, so
+            existing <c>catch (WrongNodeException)</c> handling keeps working
+            unchanged; <see cref="P:Nanocached.PartialWrongNodeException`1.PartialValues"/> holds every key that DID
+            resolve — a batch never fails as a whole (docs/protocol.html#multi),
+            so a handful of stale placements shouldn't force discarding an
+            otherwise successful batch. <c>NanocachedClient.SetManyAsync</c>/
+            <c>NanocachedClient.SetManyBytesAsync</c> have nothing to
+            return on success, so they just throw a plain
+            <see cref="T:Nanocached.WrongNodeException"/> on the same condition.
+            </summary>
+        </member>
+        <member name="T:Nanocached.AuthenticationFailedException">
+            <summary>
+            The server rejected the <c>A</c> handshake's secret — either no
+            <c>AuthSecret</c> was configured for a server that requires one, or
+            the configured secret is wrong. Never transient: retrying with the
+            same configuration cannot succeed.
+            </summary>
+        </member>
+        <member name="T:Nanocached.DiscoveryBusyException">
+            <summary>
+            A discovery server answered <c>L</c> with <c>B</c> — it is inside its
+            startup grace (discovery HA), re-learning membership after a restart. Try
+            another address, or retry shortly.
+            </summary>
+        </member>
+        <member name="T:Nanocached.ConnectionLostException">
+             <summary>A connection-level failure; the client redials lazily on the next use.
+            
+             <para>Not <c>sealed</c> (unlike this SDK's other leaf exceptions) so
+             <see cref="T:Nanocached.PartialConnectionLostException`1"/> — issue #411's
+             chunked-batch partial-failure carrier — can subclass it while still
+             satisfying every existing <c>catch (ConnectionLostException)</c>, the
+             same reason <see cref="T:Nanocached.WrongNodeException"/> is deliberately left
+             unsealed for <see cref="T:Nanocached.PartialWrongNodeException`1"/>.</para>
+             </summary>
+        </member>
+        <member name="P:Nanocached.ConnectionLostException.RequestNotSent">
+            <summary>
+            issue #225 / #484 — internal only: true when this SDK can prove no
+            complete request frame reached the peer — the connection was
+            already closed before the frame was written (Connection's
+            <c>IsClosed</c> pre-write checks), or <c>WriteAsync</c> itself failed
+            while the connection was still this SDK's own (a failed write leaves
+            at most a truncated frame, which the server never executes). False
+            (the default, used by every other throw site — a lost reply after a
+            fully-written frame, a <c>FlushAsync</c> failure after the write
+            completed, a request timeout, a stream desync, or a write that
+            failed because a concurrent <c>Close</c> disposed the stream under
+            it) means the request may already have reached the peer and possibly
+            been applied. <see cref="T:Nanocached.NanocachedClient"/>
+            uses this to decide whether replaying a non-idempotent request
+            (Incr/CAS/RemoveIfMatches) after a redial is safe: true is exactly
+            as safe as retrying an idempotent Get/Set/Delete; false is not — see
+            NanocachedClient's ApplyReconnectingNotIdempotentAsync.
+            </summary>
+        </member>
+        <member name="T:Nanocached.PartialConnectionLostException`1">
+             <summary>
+             issue #411 — raised by <c>NanocachedClient.GetManyBytesAsync</c>/
+             <c>NanocachedClient.SetManyBytesAsync</c> (and their decoded-string
+             siblings) when a connection failure interrupts a chunked multi-get/
+             multi-set batch (batch chunking, issue #222: <c>MultiGetChunkedAsync</c>/
+             <c>MultiSetChunkedAsync</c> split an over-<c>MaxBatchKeys</c> or
+             over-<c>MaxRequestBytes</c> batch into more than one <c>m</c>/<c>o</c>
+             wire sub-frame) after at least one earlier sub-frame already completed —
+             and this SDK's own built-in reconnect-and-retry
+             (<c>ApplyReconnectingAsync</c>) already tried and failed on the
+             sub-frame that lost the connection. A <see cref="T:Nanocached.ConnectionLostException"/>
+             subclass — chaining the original failure as <see cref="P:System.Exception.InnerException"/> —
+             so existing <c>catch (ConnectionLostException)</c> handling keeps working
+             unchanged, mirroring how <see cref="T:Nanocached.PartialWrongNodeException`1"/>
+             subclasses <see cref="T:Nanocached.WrongNodeException"/> for the analogous wrong-node
+             case. <see cref="P:Nanocached.PartialConnectionLostException`1.PartialValues"/> holds whatever the batch DID confirm
+             before the failing sub-frame: for get, every key that resolved
+             (<c>T</c> = <c>Dictionary&lt;string, byte[]&gt;</c>, exactly like
+             <see cref="T:Nanocached.PartialWrongNodeException`1"/>'s own <c>T</c>); for set,
+             since there's nothing to "return" on success, every key confirmed
+             stored instead (<c>T</c> = <c>HashSet&lt;string&gt;</c>).
+            
+             <para>If the very FIRST sub-frame is the one that fails, there is no
+             partial data yet, so a plain (bare) <see cref="T:Nanocached.ConnectionLostException"/>
+             propagates instead — this type is only thrown once a second or later
+             sub-frame fails.</para>
+             </summary>
+        </member>
+        <member name="T:Nanocached.DecompressionException">
+            <summary>
+            Raised by GetAsync/GetBytesAsync when a value with <c>Compress</c>
+            enabled can't be interpreted — almost always a <c>Compress</c>
+            mismatch between clients sharing this key (value compression's
+            compatibility caveat: every client touching a given keyspace must
+            agree on <c>Compress</c>), not a transient failure.
+            </summary>
+        </member>
+        <member name="T:Nanocached.RetryableException">
+            <summary>
+            issue #125 — retryable-error status <c>R</c>: a single request answered
+            <c>R</c> (this request failed transiently — e.g. the proxy's upstream
+            node was briefly unreachable — but the connection itself is fine) on
+            every one of its bounded attempts (an initial attempt plus up to 2
+            transparent retries on the same connection, 50ms then 100ms apart).
+            Unlike every other <see cref="T:Nanocached.NanocachedException"/> raised by a bad
+            response, this one never closes or redials the connection — <c>R</c>
+            is not a connection error, not a <c>W</c>, not an <c>E</c> — the
+            connection remains usable for the caller's next operation. Every
+            <c>R</c> received, whether it led to this exception or was transparently
+            retried away, is counted in <see cref="P:Nanocached.NanocachedClient.ClientStats.TransientRetries"/>.
+            </summary>
+        </member>
+        <member name="T:Nanocached.NotNumericException">
+            <summary>
+            issue #129 — INCR/DECR: the target key exists but its stored value
+            isn't INCR's counter grammar (a decimal ASCII signed 64-bit integer),
+            or applying the delta would overflow one (<c>T</c>). Never transient:
+            retrying the same INCR against the same stored value cannot succeed
+            until something else (a Set, a Delete, or a differently-shaped Incr)
+            changes it first.
+            </summary>
+        </member>
+        <member name="T:Nanocached.CompressionIncompatibleException">
+            <summary>
+            issue #321 — INCR/DECR is structurally incompatible with <c>Compress</c>:
+            a successful increment forwards the primary's literal ASCII result to
+            replicas as an unmarked <c>Set</c>, while <c>Compress</c> unconditionally
+            runs decompression on every subsequent <c>Get</c>, so reading that key
+            back always fails (and incrementing a value <c>Compress</c> itself wrote
+            fails <see cref="T:Nanocached.NotNumericException"/> instead). The server never
+            interprets values, so this can't be fixed with a wire-level marker byte
+            alone — raised immediately, before any I/O, rather than let either
+            failure mode surface later. Disable <c>Compress</c> on the client used
+            for counters, or use a separate client for keys that need compression.
+            </summary>
+        </member>
+        <member name="T:Nanocached.NanocachedNamespace">
+             <summary>
+             issue #105 — first-class namespaces: a lightweight handle scoping every
+             operation to one namespace. A namespace is a flat, opaque byte string —
+             no delimiter, no escaping, no hierarchy (see docs/protocol.html's
+             "g / s / d — namespaced get, set, delete" section) — so the same key
+             name in two namespaces is two independent entries, routed to
+             (possibly) different owners: HRW hashing mixes the namespace into the
+             key-side hash (<see cref="M:Nanocached.HashRing.KeyHash(System.ReadOnlySpan{System.Byte},System.ReadOnlySpan{System.Byte})"/>), which is what keeps a
+             common singleton key name (e.g. <c>config</c>) shared across many
+             namespaces from piling onto the same few nodes.
+            
+             <para>Obtained from <see cref="M:Nanocached.NanocachedClient.Namespace(System.Byte[])"/> /
+             <see cref="M:Nanocached.NanocachedClient.Namespace(System.String)"/>. Cheap — shares the
+             owning client's connections, and nothing is dialed or allocated beyond
+             this small wrapper — and forwards every call to the client's own
+             internal (namespace, key) methods, so it duplicates none of the
+             client's networking: routing, replication fan-out, hedged reads,
+             <c>W</c> refresh-and-retry, response tags, compression, and error types
+             are all identical to calling the client directly. Invalid once the
+             owning client is closed — every method then throws the same
+             <see cref="T:Nanocached.AlreadyClosedException"/> the client's own methods
+             raise.</para>
+            
+             <para><c>client.Namespace("")</c> (the empty namespace) returns a
+             handle equivalent to the client itself: it sends the legacy
+             <c>G</c>/<c>S</c>/<c>D</c> frames, byte-for-byte, and hashes exactly as
+             an un-namespaced key always has — so a namespace-unaware deployment
+             reached through this handle is wire-indistinguishable from one reached
+             through the client directly.</para>
+             </summary>
+        </member>
+        <member name="P:Nanocached.NanocachedNamespace.Namespace">
+            <summary>This handle's namespace, decoded as UTF-8. Exposed for the
+            framework adapters built on top of namespaces (issue #107/#108),
+            which need to know which namespace a handle addresses. Only
+            meaningful when the namespace was itself constructed from valid
+            UTF-8 — a namespace built from arbitrary bytes (see
+            <see cref="M:Nanocached.NanocachedClient.Namespace(System.Byte[])"/>) may not decode
+            cleanly; use <see cref="P:Nanocached.NanocachedNamespace.NamespaceBytes"/> for the raw form in that
+            case.</summary>
+        </member>
+        <member name="P:Nanocached.NanocachedNamespace.NamespaceBytes">
+            <summary>This handle's namespace as the raw bytes sent on the wire.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.GetAsync(System.Byte[])">
+            <summary>Returns the value decoded as UTF-8, or <c>null</c> when
+            the key is missing. A value that is not valid UTF-8 raises
+            <see cref="T:System.Text.DecoderFallbackException"/> — use
+            <see cref="M:Nanocached.NanocachedNamespace.GetBytesAsync(System.Byte[])"/> for the raw bytes instead.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.GetBytesAsync(System.Byte[])">
+            <summary>Returns the raw value, or <c>null</c> when the key is
+            missing. Transparently decompresses when the owning client's
+            <c>Compress</c> is enabled (value compression). With
+            <c>ReadRepair</c>, a clean miss probes the remaining owners before
+            being accepted as final (read repair).</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.SetAsync(System.String,System.String,System.Int64)">
+            <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.SetAsync(System.Byte[],System.Byte[],System.Int64)">
+            <summary><paramref name="ttlSeconds"/> of 0 (the default) means no
+            expiry. Transparently compresses values at or above the owning
+            client's <c>CompressionThreshold</c> when <c>Compress</c> is
+            enabled (value compression).</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.DeleteAsync(System.Byte[])">
+            <summary>Returns whether the key existed before this call.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.GetManyAsync(System.Collections.Generic.IReadOnlyList{System.String})">
+            <summary>issue #151: as <see cref="M:Nanocached.NanocachedClient.GetManyAsync(System.Collections.Generic.IReadOnlyList{System.String})"/>,
+            scoped to this handle's namespace.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.GetManyBytesAsync(System.Collections.Generic.IReadOnlyList{System.String})">
+            <summary>issue #151: as <see cref="M:Nanocached.NanocachedClient.GetManyBytesAsync(System.Collections.Generic.IReadOnlyList{System.String})"/>,
+            scoped to this handle's namespace.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.SetManyAsync(System.Collections.Generic.IReadOnlyDictionary{System.String,System.String},System.Int64)">
+            <summary>issue #151: as
+            <see cref="M:Nanocached.NanocachedClient.SetManyAsync(System.Collections.Generic.IReadOnlyDictionary{System.String,System.String},System.Int64)"/>,
+            scoped to this handle's namespace.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.SetManyBytesAsync(System.Collections.Generic.IReadOnlyDictionary{System.String,System.Byte[]},System.Int64)">
+            <summary>issue #151: as
+            <see cref="M:Nanocached.NanocachedClient.SetManyBytesAsync(System.Collections.Generic.IReadOnlyDictionary{System.String,System.Byte[]},System.Int64)"/>,
+            scoped to this handle's namespace.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.IncrAsync(System.String,System.Int64)">
+            <summary>issue #129: as <see cref="M:Nanocached.NanocachedClient.IncrAsync(System.Byte[],System.Int64)"/>,
+            scoped to this handle's namespace. As volatile as
+            <see cref="M:Nanocached.NanocachedNamespace.SetAsync(System.Byte[],System.Byte[],System.Int64)"/> — not for durable
+            counts — and, in a cluster, only the primary owner runs the
+            increment; replicas receive the resulting value via <c>Set</c>. Throws
+            <see cref="T:Nanocached.CompressionIncompatibleException"/> immediately when this
+            client has <c>Compress</c> enabled (issue #321). See the client
+            method's own doc comment for the full replication design.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.DecrAsync(System.String,System.Int64)">
+            <summary>issue #129: <see cref="M:Nanocached.NanocachedNamespace.IncrAsync(System.Byte[],System.Int64)"/> with
+            <paramref name="delta"/> negated — never a different wire op.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.GetWithTokenAsync(System.String)">
+            <summary>issue #141 — compare-and-set: as
+            <see cref="M:Nanocached.NanocachedClient.GetWithTokenAsync(System.String)"/>, scoped to
+            this handle's namespace.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.GetBytesWithTokenAsync(System.String)">
+            <summary>issue #141: as
+            <see cref="M:Nanocached.NanocachedClient.GetBytesWithTokenAsync(System.String)"/>,
+            scoped to this handle's namespace.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.PutIfAbsentAsync(System.String,System.String,System.Int64)">
+            <summary>issue #141 — <c>add</c>/<c>putIfAbsent</c>: as
+            <see cref="M:Nanocached.NanocachedClient.PutIfAbsentAsync(System.String,System.String,System.Int64)"/>,
+            scoped to this handle's namespace. See the client method's own doc
+            comment for the not-a-lock caveat and cluster replication rule.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.ReplaceIfPresentAsync(System.String,System.String,System.Int64)">
+            <summary>issue #141 — the two-argument <c>replace(key, value)</c>:
+            as <see cref="M:Nanocached.NanocachedClient.ReplaceIfPresentAsync(System.String,System.String,System.Int64)"/>,
+            scoped to this handle's namespace.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.ReplaceAsync(System.String,System.String,System.String,System.Int64)">
+            <summary>issue #141 — the three-argument <c>replace(key, old, new)</c>:
+            as <see cref="M:Nanocached.NanocachedClient.ReplaceAsync(System.String,System.String,System.String,System.Int64)"/>,
+            scoped to this handle's namespace.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.DeleteIfMatchesAsync(System.String,System.String)">
+            <summary>issue #141 — the two-argument <c>remove(key, old)</c>: as
+            <see cref="M:Nanocached.NanocachedClient.DeleteIfMatchesAsync(System.String,System.String)"/>,
+            scoped to this handle's namespace.</summary>
+        </member>
+        <member name="M:Nanocached.NanocachedNamespace.ClearAsync">
+            <summary>issue #106: drops every entry in this handle's namespace —
+            on the empty namespace (<c>client.Namespace("")</c>), clears the
+            default namespace (<c>c 0\n</c>), not rejected. Fanned out to every
+            node in the owning client's current node list, with a
+            refresh-once-and-retry on any node failure and never a silent
+            partial clear — see <see cref="M:Nanocached.NanocachedClient.ClearAllAsync"/>'s
+            doc comment for the shared fan-out/retry logic this and it both
+            use.</summary>
+        </member>
+        <member name="T:Nanocached.ReadBufferedStream">
+             <summary>
+             Buffers reads only; every write passes straight through to the inner
+             stream unbuffered. Wraps the stream at the single place a connection's
+             <see cref="T:System.IO.Stream"/> is created (<see cref="T:Nanocached.Identify"/>'s
+             OpenAsync), turning this SDK's per-byte header reads (<see
+             cref="T:Nanocached.Connection"/>'s ReadByteAsync/ReadLineAsync, and this class's own
+             identify-handshake reads) from one syscall each into one read that
+             fills the buffer, which then serves many subsequent 1-byte reads.
+            
+             <para>Deliberately not the BCL's own <see cref="T:System.IO.BufferedStream"/>:
+             that type buffers both directions through one shared buffer/position,
+             which is unsafe here — <see cref="T:Nanocached.Connection"/> has a dedicated reader
+             loop reading continuously for the connection's whole lifetime while
+             requests are written concurrently under their own write gate (the class
+             doc comment's "one concurrent reader and one concurrent writer"), and
+             <see cref="T:System.IO.BufferedStream"/>'s shared internal state isn't safe under
+             that concurrent-read-while-write duplex pattern — confirmed by testing:
+             wrapping the connection stream in a plain <see cref="T:System.IO.BufferedStream"/>
+             produced spurious <see cref="T:System.ObjectDisposedException"/>
+             ("Cannot access a closed Stream") failures under the test suite's
+             concurrency. This type keeps read state (<see cref="F:Nanocached.ReadBufferedStream._bufferStart"/>,
+             <see cref="F:Nanocached.ReadBufferedStream._bufferLength"/>) entirely separate from writes, which never
+             touch it, so there is no such hazard: a write is simply forwarded to
+             the inner stream, which (like the <see cref="T:System.Net.Sockets.NetworkStream"/>
+             or <see cref="T:System.Net.Security.SslStream"/> this always wraps) is
+             itself safe for one concurrent reader plus one concurrent writer.</para>
+            
+             <para>A read for at least the buffer's own size bypasses the buffer
+             (after first draining whatever is already buffered) and reads directly
+             from the inner stream — so a large read done in one call, like the
+             <c>V</c> response's value body, pays no extra copy.</para>
+             </summary>
+        </member>
+    </members>
+</doc>

@@ -63,6 +63,9 @@ func run() int {
 
 	client, err := nanocached.Connect(nanocached.Config{
 		Addresses: parseAddresses(os.Getenv("NANOTEST_ADDRESSES")),
+		// NANOTEST_VIA_PROXY=1: SDK proxy mode — addresses stay discovery's,
+		// the client fetches the proxy roster and goes through one proxy.
+		ViaProxy: os.Getenv("NANOTEST_VIA_PROXY") == "1",
 	})
 	if err != nil {
 		fmt.Println("connect failed:", err)

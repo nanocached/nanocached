@@ -13,7 +13,11 @@ public final class Main {
             int idx = part.lastIndexOf(':');
             addresses.add(new Address(part.substring(0, idx), Integer.parseInt(part.substring(idx + 1))));
         }
-        NanocachedClient.Options options = NanocachedClient.builder().addresses(addresses);
+        // NANOTEST_VIA_PROXY=1: SDK proxy mode — addresses stay discovery's,
+        // the client fetches the proxy roster and goes through one proxy.
+        NanocachedClient.Options options = NanocachedClient.builder()
+                .addresses(addresses)
+                .viaProxy("1".equals(System.getenv("NANOTEST_VIA_PROXY")));
 
         // Checked before connecting: an invalid invocation should fail
         // loudly with a usage message, not crash with an

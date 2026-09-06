@@ -27,7 +27,9 @@ if (!Number.isSafeInteger(count) || count <= 0) {
   process.exit(1);
 }
 
-const client = await NanocachedClient.connect({ addresses });
+// NANOTEST_VIA_PROXY=1: SDK proxy mode — addresses stay discovery's, the
+// client fetches the proxy roster and goes through one proxy.
+const client = await NanocachedClient.connect({ addresses, viaProxy: process.env.NANOTEST_VIA_PROXY === "1" });
 let rc = 0;
 
 if (cmd === "write") {

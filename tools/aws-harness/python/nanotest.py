@@ -51,12 +51,19 @@ def addresses():
     return out
 
 
+async def connect_client():
+    # NANOTEST_VIA_PROXY=1: SDK proxy mode — addresses stay discovery's, the
+    # client fetches the proxy roster and goes through one proxy.
+    via_proxy = os.environ.get("NANOTEST_VIA_PROXY") == "1"
+    return await NanocachedClient.connect(addresses(), via_proxy=via_proxy)
+
+
 def bulk_value(i: int) -> bytes:
     return (f"v-bulk-{i}-" + "x" * 80).encode()
 
 
 async def cmd_write(label: str, count: int) -> int:
-    client = await NanocachedClient.connect(addresses())
+    client = await connect_client()
     for i in range(count):
         await client.set(f"x:{label}:{i}", f"v-{label}-{i}")
     await client.close()
@@ -65,7 +72,7 @@ async def cmd_write(label: str, count: int) -> int:
 
 
 async def cmd_read(label: str, count: int) -> int:
-    client = await NanocachedClient.connect(addresses())
+    client = await connect_client()
     bad = []
     for i in range(count):
         value = await client.get(f"x:{label}:{i}")
@@ -87,7 +94,7 @@ async def cmd_readall(labels: str, count: int) -> int:
 
 
 async def cmd_preload(count: int) -> int:
-    client = await NanocachedClient.connect(addresses())
+    client = await connect_client()
     for start in range(0, count, 100):
         await asyncio.gather(
             *(client.set(f"bulk:{i}", bulk_value(i)) for i in range(start, min(start + 100, count)))
@@ -98,7 +105,7 @@ async def cmd_preload(count: int) -> int:
 
 
 async def cmd_verify(count: int) -> int:
-    client = await NanocachedClient.connect(addresses())
+    client = await connect_client()
     missing, wrong = [], []
 
     async def check(i: int):
@@ -121,7 +128,7 @@ async def cmd_verify(count: int) -> int:
 
 
 async def cmd_churn(seconds: float, outfile: str) -> int:
-    client = await NanocachedClient.connect(addresses())
+    client = await connect_client()
     t0 = time.monotonic()
     events = []
     ops = fails = 0
