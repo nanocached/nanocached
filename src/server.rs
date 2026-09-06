@@ -581,8 +581,17 @@ fn spawn_forward(
                     // Best-effort: if the send itself fails (the consumer
                     // closed the channel while this waiter was queued),
                     // there's nothing left to do — same as the
-                    // `TrySendError::Closed` case above.
-                    let _ = forward_tx.send(task).await;
+                    // `TrySendError::Closed` case above. Issue #502: `run`'s
+                    // shutdown drain keeps receiving while any waiter is
+                    // pending, so this only happens once the drain's own
+                    // `SHUTDOWN_TIMEOUT` ran out; say so rather than lose
+                    // the write silently.
+                    if forward_tx.send(task).await.is_err() {
+                        eprintln!(
+                            "WARN dropped a concurrent write forward for {description}: the node \
+                             shut down before forward_tx was drained"
+                        );
+                    }
                     PENDING_FORWARD_WAITERS.fetch_sub(1, Ordering::SeqCst);
                 });
             } else {
@@ -591,6 +600,60 @@ fn spawn_forward(
                     "WARN dropped a concurrent write forward for {description}: forward_tx is \
                      full and {MAX_PENDING_FORWARD_WAITERS} waiters are already queued behind it"
                 );
+            }
+        }
+    }
+}
+
+/// `run`'s shutdown drain: runs every connection task to completion
+/// while still servicing `migration_rx`/`forward_rx`, exactly as the
+/// main loop did — a connection task that is mid-request when shutdown
+/// lands may still hand a forwarded write (or the tail of a handoff) to
+/// one of these channels, and with the main loop gone nobody else would
+/// spawn it: the client would have its `S`/`D` acked and the forward
+/// silently dropped.
+///
+/// Issue #502: "until every connection task is done" is not the whole
+/// condition. A forward can be sitting in `forward_rx` (or `migration_rx`)
+/// with no connection task left to keep this loop going — the task that
+/// queued it may have exited right after — and a forward that found the
+/// channel full is held by a detached `spawn_forward` waiter that has
+/// nothing to do with `connection_tasks` at all. Stopping on the task set
+/// alone left both to be dropped when `run` returned and `forward_rx`
+/// with it — the very loss `spawn_forward`'s waiter exists to prevent.
+/// So this also drains whatever the channels still hold and, while any
+/// waiter is still blocked on its `send`, keeps receiving so it can hand
+/// its forward over. Bounded by the caller's `SHUTDOWN_TIMEOUT`, like
+/// the tasks themselves.
+async fn drain_connection_tasks(
+    connection_tasks: &mut JoinSet<()>,
+    migration_rx: &mut mpsc::Receiver<MigrationTask>,
+    forward_rx: &mut mpsc::Receiver<MigrationTask>,
+) {
+    loop {
+        // Queued forwards first: each one spawned keeps the task set
+        // non-empty, which is what the join branch below keys off.
+        while let Ok(task) = forward_rx.try_recv() {
+            connection_tasks.spawn(task);
+        }
+        while let Ok(task) = migration_rx.try_recv() {
+            connection_tasks.spawn(task);
+        }
+        let waiters_pending = PENDING_FORWARD_WAITERS.load(Ordering::SeqCst) > 0;
+        if connection_tasks.is_empty() && !waiters_pending {
+            return;
+        }
+        tokio::select! {
+            result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    eprintln!("WARN connection task failed: {error}");
+                }
+            }
+            Some(task) = migration_rx.recv() => {
+                connection_tasks.spawn(task);
+            }
+            Some(task) = forward_rx.recv() => {
+                connection_tasks.spawn(task);
             }
         }
     }
@@ -1181,23 +1244,10 @@ pub(crate) async fn run(
     // it was never going to block a connection task regardless, but
     // draining it here still lets a forward queued right before shutdown
     // actually run instead of being dropped.
-    let connections_finished = timeout(SHUTDOWN_TIMEOUT, async {
-        while !connection_tasks.is_empty() {
-            tokio::select! {
-                result = connection_tasks.join_next() => {
-                    if let Some(Err(error)) = result {
-                        eprintln!("WARN connection task failed: {error}");
-                    }
-                }
-                Some(task) = migration_rx.recv() => {
-                    connection_tasks.spawn(task);
-                }
-                Some(task) = forward_rx.recv() => {
-                    connection_tasks.spawn(task);
-                }
-            }
-        }
-    })
+    let connections_finished = timeout(
+        SHUTDOWN_TIMEOUT,
+        drain_connection_tasks(&mut connection_tasks, &mut migration_rx, &mut forward_rx),
+    )
     .await;
 
     if connections_finished.is_err() {
@@ -15130,6 +15180,75 @@ mod tests {
     /// ring change that drops a member (so `request_tx` — never actually
     /// read by anything — is safe to leave dangling: no re-replication
     /// task ever gets far enough to use it).
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_drain_runs_forwards_still_queued_or_held_by_a_waiter_with_no_connection_left()
+    {
+        // Regression (issue #502): `run`'s shutdown drain looped only
+        // while a connection task was still alive. A forward the last
+        // connection task queued right before exiting sat in `forward_rx`
+        // (and one that found the channel full was held by a detached
+        // `spawn_forward` waiter, blocked on its `send`) with nothing left
+        // to keep the loop going — both were dropped, unrun and unlogged,
+        // when `run` returned. The drain must run both: the queued one
+        // and the one the waiter hands over once the queue has room.
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(1);
+        let (_migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(1);
+        let mut connection_tasks: JoinSet<()> = JoinSet::new();
+
+        let queued_ran = Arc::new(AtomicBool::new(false));
+        let waiting_ran = Arc::new(AtomicBool::new(false));
+
+        let flag = Arc::clone(&queued_ran);
+        forward_tx
+            .try_send(Box::pin(async move {
+                flag.store(true, Ordering::SeqCst);
+            }))
+            .expect("capacity 1, channel starts empty");
+
+        // A waiter exactly as `spawn_forward` spawns one on a full
+        // channel: counted in PENDING_FORWARD_WAITERS, blocked on the
+        // channel's ordinary `send`.
+        let flag = Arc::clone(&waiting_ran);
+        let waiter_tx = forward_tx.clone();
+        PENDING_FORWARD_WAITERS.fetch_add(1, Ordering::SeqCst);
+        let waiter = tokio::spawn(async move {
+            let _ = waiter_tx
+                .send(Box::pin(async move {
+                    flag.store(true, Ordering::SeqCst);
+                }))
+                .await;
+            PENDING_FORWARD_WAITERS.fetch_sub(1, Ordering::SeqCst);
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // No connection task is left — the shape the old loop returned
+        // from immediately, forwards and all.
+        timeout(
+            Duration::from_secs(2),
+            drain_connection_tasks(&mut connection_tasks, &mut migration_rx, &mut forward_rx),
+        )
+        .await
+        .expect("the drain must finish once the queue, the waiter and every spawned task are done");
+
+        assert!(
+            queued_ran.load(Ordering::SeqCst),
+            "the forward still queued in forward_rx must run"
+        );
+        assert!(
+            waiting_ran.load(Ordering::SeqCst),
+            "the forward held by the waiter must run"
+        );
+        assert!(connection_tasks.is_empty());
+        // Only once the drain has received from the channel can the
+        // waiter's blocked `send` complete — with the old loop it never did.
+        timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the waiter must have handed its forward over")
+            .unwrap();
+    }
+
     fn test_node_context(
         name: &str,
         token: &str,
