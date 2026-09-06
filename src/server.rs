@@ -5830,8 +5830,21 @@ async fn wait_for_rereplication_to_clear(node_context: &NodeContext, abort_reque
 /// flagged it, `run_migration` is already on its way to unwinding and
 /// clearing the slot (see `MigrationGuard::drop`); there is nothing left
 /// here worth waiting the full `RING_CHANGE_HANDOFF_WAIT` for.
+///
+/// Issue #498: also stops at shutdown. This runs inside a re-replication
+/// task in `send_heartbeats`'s `JoinSet`, which `run` awaits with no
+/// bound of its own after the connection drain — so a wait here that
+/// ignored `shutdown_rx` could hold process exit for the whole 60s
+/// deadline (twice that, with `run_superseding_rereplication`'s own
+/// wait behind it), well past `SHUTDOWN_TIMEOUT` and past the stop
+/// grace ECS/EKS give a task before SIGKILL. `run_rereplication` itself
+/// checks `shutdown_rx` before every send, so returning early here just
+/// lets it fall through to that check. A closed `shutdown_rx` (its
+/// sender lives in `run`) means `run` has already returned — nothing
+/// left to wait for either.
 async fn wait_for_migration_to_clear(node_context: &NodeContext) {
     let deadline = Instant::now() + RING_CHANGE_HANDOFF_WAIT;
+    let mut shutdown_rx = node_context.shutdown_rx.clone();
     loop {
         let busy = node_context
             .active_migration
@@ -5844,6 +5857,9 @@ async fn wait_for_migration_to_clear(node_context: &NodeContext) {
         if !busy {
             return;
         }
+        if *shutdown_rx.borrow() {
+            return;
+        }
         if Instant::now() >= deadline {
             eprintln!(
                 "WARN re-replication: a join migration was still in flight after {}s; \
@@ -5852,7 +5868,14 @@ async fn wait_for_migration_to_clear(node_context: &NodeContext) {
             );
             return;
         }
-        sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = sleep(Duration::from_millis(100)) => {}
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -5989,9 +6012,26 @@ async fn run_superseding_rereplication(
     let previous = take_over_rereplication_slot(&node_context.active_rereplication, &state);
     if let Some(previous) = previous {
         previous.abort_requested.store(true, Ordering::SeqCst);
+        // Issue #498: bounded by the deadline *and* by shutdown — see
+        // `wait_for_migration_to_clear`'s doc comment for why a wait in
+        // this task must not sit out its deadline once shutdown is
+        // pending. The previous run is itself shutdown-aware
+        // (`run_rereplication`), so it is on its way out too; and
+        // `run_rereplication` below bails on its first key check, so
+        // leaving early here can't start a second transfer alongside it.
         let deadline = Instant::now() + RING_CHANGE_HANDOFF_WAIT;
-        while !previous.done.load(Ordering::SeqCst) && Instant::now() < deadline {
-            sleep(Duration::from_millis(100)).await;
+        while !previous.done.load(Ordering::SeqCst)
+            && !*shutdown_rx.borrow()
+            && Instant::now() < deadline
+        {
+            tokio::select! {
+                _ = sleep(Duration::from_millis(100)) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -15167,6 +15207,88 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "should return immediately once the occupying migration's own abort_requested is set"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_migration_to_clear_returns_immediately_once_shutdown_is_requested() {
+        // Regression (issue #498): this wait polled only the occupying
+        // migration and its own 60s deadline, never `shutdown_rx`, so a
+        // SIGTERM landing while a join migration was in flight held
+        // process exit (`run` awaits the heartbeat `JoinSet` this runs
+        // in, with no bound) for the whole deadline.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut node_context = test_node_context(
+            "self",
+            "tok-self",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(test_active_migration(None)))),
+        );
+        node_context.shutdown_rx = shutdown_rx;
+        shutdown_tx.send_replace(true);
+
+        let started = Instant::now();
+        wait_for_migration_to_clear(&node_context).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "should return immediately once shutdown is requested, not wait out the deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_superseding_rereplication_stops_waiting_on_its_predecessor_at_shutdown() {
+        // Regression (issue #498): the wait on the superseded run's
+        // `done` flag had the same blind spot — a predecessor that is
+        // slow to unwind kept this task, and so `run`'s exit, parked for
+        // up to another 60s after shutdown was requested. Shutdown lands
+        // *while* it is waiting here (a never-completing predecessor),
+        // and it must return promptly rather than on the deadline.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut node_context = test_node_context(
+            "self",
+            "tok-self",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.shutdown_rx = shutdown_rx.clone();
+        let previous = Arc::new(ActiveRereplication {
+            abort_requested: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+        });
+        *node_context.active_rereplication.lock().unwrap() = Some(Arc::clone(&previous));
+
+        let ring = Arc::new(HashRing::new(vec!["self".to_string()]));
+        let run = tokio::spawn(run_superseding_rereplication(
+            node_context.clone(),
+            Arc::clone(&ring),
+            ring,
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            shutdown_rx,
+        ));
+        sleep(Duration::from_millis(250)).await;
+        assert!(
+            !run.is_finished(),
+            "with its predecessor never done and no shutdown, the run must still be waiting"
+        );
+        assert!(
+            previous.abort_requested.load(Ordering::SeqCst),
+            "the predecessor must have been told to abort before the wait began"
+        );
+
+        let started = Instant::now();
+        shutdown_tx.send_replace(true);
+        timeout(Duration::from_secs(5), run)
+            .await
+            .expect(
+                "the run must return promptly once shutdown is requested, not on the 60s deadline",
+            )
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            node_context.active_rereplication.lock().unwrap().is_none(),
+            "the run still owns the slot and must clear it on the way out"
         );
     }
 
