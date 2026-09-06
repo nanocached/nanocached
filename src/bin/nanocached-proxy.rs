@@ -2187,9 +2187,7 @@ fn backend_exit_log_line(addr: &str, poisoned_exit: bool, clients_affected: bool
     } else if clients_affected {
         format!("WARN backend connection to {addr} poisoned; will redial on next request")
     } else {
-        format!(
-            "INFO backend connection to {addr} lost while idle; will redial on next request"
-        )
+        format!("INFO backend connection to {addr} lost while idle; will redial on next request")
     }
 }
 
