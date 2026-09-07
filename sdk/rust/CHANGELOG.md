@@ -6,6 +6,18 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-07
+
+### Fixed
+
+- `connect()` now rejects `read_hedge_after` combined with `via_proxy(true)`
+  and `ca` combined with `tls(false)`, both previously silently inert
+  (issue #488).
+- The per-request timeout is now progress-based, like the Go SDK: a
+  request queued behind others under deep pipelining is no longer timed
+  out while the server is still answering; a half-open server is still
+  reclaimed within one window (issue #488).
+
 ## [0.4.1] - 2026-09-05
 
 ### Fixed
