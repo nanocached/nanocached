@@ -133,7 +133,7 @@ that lets the cluster's group talk to itself on 8356–8357.</p>
 <p><code>td-proxy.json</code>:</p>
 <pre><code>[{
   "name": "nanocached-proxy",
-  "image": "ghcr.io/nanocached/nanocached-proxy@sha256:0217ea01962f27db85d5b1b98b29f4ec34674e0a3c246842d459c2510880f05f",
+  "image": "ghcr.io/nanocached/nanocached-proxy@sha256:72a425690c22dedefbeb4ae38015c44d45018cd8b2efad2cb8ad4c5529582e03",
   "essential": true,
   "command": ["--host", "0.0.0.0", "--port", "8358", "--discovery", "disc.nanocached.local:8357",
               "--drain-timeout", "20", "--metrics-port", "9358"],
@@ -209,20 +209,32 @@ choice, one proxy carried 21,607 requests and the other 200 while three
 clients ran (per-client stickiness, not per-request balancing — the
 skew evens out with many clients); and each node's
 <code>nanocached_node_connections</code> read 2, the proxy count, after
-all of that traffic. One log line to expect from the 0.4.1 image
-pinned above: after a minute with no client connected at all, the
-first request logs <code>WARN backend connection to &lt;node&gt;
-poisoned; will redial on next request</code> for each node it touches
-— the node had closed the idle connection (its 60&nbsp;s idle
-timeout), and the proxy redials. The get/set churn clients that
-produced it saw no failure; a non-idempotent first request (INCR, CAS)
-would have been answered with an error, since a frame already written
-can't be retried. Newer proxies keep their backend connections alive
-themselves (the same 30&nbsp;s probe the SDKs send), so the line no
-longer appears; a node that closes an idle backend connection anyway —
-a restart, or a scale-in the proxy's roster hasn't caught up with — is
-logged at <code>INFO</code> instead (<a
-href="https://github.com/nanocached/nanocached/issues/514">#514</a>).</p>
+all of that traffic. On the 0.4.1 image, a minute with no client
+connected at all produced <code>WARN backend connection to
+&lt;node&gt; poisoned; will redial on next request</code> on the first
+request afterward, for each node it touched — the node had closed the
+idle connection (its 60&nbsp;s idle timeout) and the proxy redialed.
+The get/set churn that produced it saw no failure, but a non-idempotent
+first request (INCR, CAS) would have been answered with an error, since
+a frame already written can't be retried — the proxy's own backend
+connections are exactly as exposed to that 60&nbsp;s timeout as an
+SDK's, just with no traffic of their own to keep them busy while no
+client is attached. Re-run on the 0.4.2 image pinned above (issue <a
+href="https://github.com/nanocached/nanocached/issues/514">#514</a>):
+a key set, then 100&nbsp;s — well past the node's 60&nbsp;s idle
+timeout — with the proxy otherwise untouched, then a fresh connection
+sending <code>INCR +1</code>. The log group carried nothing but the
+three startup lines for the whole window: no <code>poisoned</code>, no
+redial, and the increment came back correct (<code>5</code> to
+<code>6</code>, proving the node received it) — the proxy's own
+30&nbsp;s probe (the same one the SDKs send) kept both backend
+connections live under the node's timeout the entire time.
+<code>nanocached_proxy_backend_connections</code> read 2 throughout,
+never dropping to redial. A node that closes an idle backend
+connection anyway — a restart, or a scale-in the proxy's roster hasn't
+caught up with — is logged at <code>INFO</code> instead of
+<code>WARN</code>, since no client request failed; that path is the
+fix's documented fallback, not something this run exercised.</p>
 
 <h3>Scaling the proxy tier</h3>
 <p>One more proxy is <code>--desired-count</code> plus one; it
@@ -296,7 +308,7 @@ spec:
             matchLabels: {app: nanocached-proxy}
       containers:
         - name: proxy
-          image: ghcr.io/nanocached/nanocached-proxy@sha256:0217ea01962f27db85d5b1b98b29f4ec34674e0a3c246842d459c2510880f05f
+          image: ghcr.io/nanocached/nanocached-proxy@sha256:72a425690c22dedefbeb4ae38015c44d45018cd8b2efad2cb8ad4c5529582e03
           args: ["--host", "0.0.0.0", "--port", "8358", "--discovery", "disc:8357",
                  "--drain-timeout", "20", "--metrics-port", "9358"]
           envFrom:
