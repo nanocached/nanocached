@@ -3062,17 +3062,12 @@ async fn run_cache(
 /// generated alongside `name` and presented on every command naming this
 /// node — the discovery server binds it to `name` at registration and
 /// rejects any later `P`/`H`/`C` for the name that doesn't present it.
-fn join_message(name: &str, port: u16, token: &str) -> Vec<u8> {
-    let mut message = format!("J {} {port} {}\n", name.len(), token.len()).into_bytes();
-    message.extend_from_slice(name.as_bytes());
-    message.extend_from_slice(token.as_bytes());
-    message
-}
-
-/// Discovery HA: same shape as `join_message`, but declares an
-/// already-promoted member — no handoff orchestration on the other end.
-fn announce_message(name: &str, port: u16, token: &str) -> Vec<u8> {
-    let mut message = format!("P {} {port} {}\n", name.len(), token.len()).into_bytes();
+///
+/// `letter` is `J` for a staged join, or `P` (discovery HA) to declare an
+/// already-promoted member — same shape, no handoff orchestration on the
+/// other end.
+fn registration_message(letter: char, name: &str, port: u16, token: &str) -> Vec<u8> {
+    let mut message = format!("{letter} {} {port} {}\n", name.len(), token.len()).into_bytes();
     message.extend_from_slice(name.as_bytes());
     message.extend_from_slice(token.as_bytes());
     message
@@ -3238,8 +3233,8 @@ async fn register_with_discovery(
     mut role: DiscoveryRole,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let join = join_message(&node_context.name, port, &node_context.token);
-    let announce = announce_message(&node_context.name, port, &node_context.token);
+    let join = registration_message('J', &node_context.name, port, &node_context.token);
+    let announce = registration_message('P', &node_context.name, port, &node_context.token);
 
     // A standby must not announce a node the primary hasn't promoted yet:
     // that would make it visible in the standby's `L` before its staged node join
@@ -6296,18 +6291,8 @@ async fn run_rereplication(
 }
 
 async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Key>> {
-    let (response_tx, response_rx) = oneshot::channel();
-
-    request_tx
-        .send(CacheRequest {
-            command: Command::ListEntries,
-            response_tx,
-        })
-        .await
-        .ok()?;
-
-    match response_rx.await.ok()? {
-        Response::Keys(keys) => Some(keys),
+    match execute_command(request_tx, Command::ListEntries).await {
+        Ok(Response::Keys(keys)) => Some(keys),
         _ => None,
     }
 }
@@ -6316,50 +6301,18 @@ async fn peek_entry(
     request_tx: &mpsc::Sender<CacheRequest>,
     key: &Key,
 ) -> Option<(Key, Bytes, Option<Duration>)> {
-    let (response_tx, response_rx) = oneshot::channel();
-
-    request_tx
-        .send(CacheRequest {
-            command: Command::PeekEntry { key: key.clone() },
-            response_tx,
-        })
-        .await
-        .ok()?;
-
-    match response_rx.await.ok()? {
-        Response::Entries(mut entries) => entries.pop(),
+    match execute_command(request_tx, Command::PeekEntry { key: key.clone() }).await {
+        Ok(Response::Entries(mut entries)) => entries.pop(),
         _ => None,
     }
 }
 
 async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
-    let (response_tx, response_rx) = oneshot::channel();
-
-    if request_tx
-        .send(CacheRequest {
-            command: Command::MarkMigrated { key: key.clone() },
-            response_tx,
-        })
-        .await
-        .is_ok()
-    {
-        let _ = response_rx.await;
-    }
+    let _ = execute_command(request_tx, Command::MarkMigrated { key: key.clone() }).await;
 }
 
 async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
-    let (response_tx, response_rx) = oneshot::channel();
-
-    if request_tx
-        .send(CacheRequest {
-            command: Command::UnmarkMigrated { key: key.clone() },
-            response_tx,
-        })
-        .await
-        .is_ok()
-    {
-        let _ = response_rx.await;
-    }
+    let _ = execute_command(request_tx, Command::UnmarkMigrated { key: key.clone() }).await;
 }
 
 /// What `abandon_migration` found for `joining_name` in `active_migration`.
@@ -7454,27 +7407,14 @@ async fn report_complete(
     joining_name: &str,
     generation: Option<u64>,
 ) -> io::Result<()> {
-    let mut stream = connect_client_stream(
+    let mut stream = connect_and_authenticate(
+        node_context,
         &node_context.discovery_addr,
-        node_context.tls_connector.as_ref(),
+        AuthPeer::Discovery,
     )
     .await?;
 
     timeout(OUTBOUND_IO_TIMEOUT, async {
-        if let Some(secret) = &node_context.auth_secret {
-            stream.write_all(&auth_message(secret)).await?;
-
-            let mut ack = [0u8; 3];
-            stream.read_exact(&mut ack).await?;
-
-            if &ack != b"Od\n" {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "discovery server rejected the auth secret",
-                ));
-            }
-        }
-
         stream
             .write_all(&complete_message(
                 &node_context.name,
@@ -13106,7 +13046,7 @@ mod tests {
     #[test]
     fn join_message_declares_the_name_length_and_the_port() {
         assert_eq!(
-            join_message("some-name", 8356, "tk-some-name"),
+            registration_message('J', "some-name", 8356, "tk-some-name"),
             b"J 9 8356 12\nsome-nametk-some-name".to_vec()
         );
     }

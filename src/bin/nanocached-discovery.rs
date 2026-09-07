@@ -517,7 +517,7 @@ const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MIGRATE_SEND_ATTEMPTS: u32 = 3;
 const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 /// Upper bound on a `name`/`joining_name` field's length, enforced at
-/// parse time (`parse_two_string_fields`/`parse_three_string_fields`).
+/// parse time (`parse_string_fields`).
 /// Both `nanocached-node` and `verify-staged-join` only ever generate a
 /// v4 UUID (`Uuid::new_v4().to_string()`, 36 bytes — see `src/server.rs`,
 /// Node identity decoupled from address) for a name, so 128 is far more headroom than any legitimate
@@ -705,7 +705,7 @@ fn next_join_generation() -> u64 {
 /// `NodeInfo::address`) plus a `generation` counter (issue #95) bumped
 /// on every change that would alter the heartbeat-ack roster — a node
 /// joining/leaving, an address change, or a `reported_replication`
-/// update. `build_heartbeat_ack` re-serializes the whole `Joined` roster,
+/// update. `build_roster_response` re-serializes the whole `Joined` roster,
 /// and with #61 every `H` from every node carries it; caching the
 /// serialized ack and rebuilding it only when `generation` moves turns
 /// what was O(nodes²) CPU per liveness cycle (a full scan + re-serialize
@@ -741,21 +741,21 @@ struct RegistryState {
     /// moves (issue #95). Co-located with the map and counter it derives
     /// from, so it travels wherever the registry does — no plumbing
     /// through `ConnectionConfig`/`handle_connection`.
-    heartbeat_ack: Mutex<Option<CachedAck>>,
+    heartbeat_ack: Mutex<Option<CachedResponse>>,
     /// The `L` response, cached the same way and keyed off the same
     /// `generation` (issue #298): `L` renders exactly the same
     /// `roster_snapshot` (the `Joined` set, addresses, and
     /// `reported_replication` votes) that `cached_heartbeat_ack` already
     /// invalidates on every relevant mutation, so no separate bump is
     /// needed here — see `cached_list_response`.
-    list_cache: Mutex<Option<CachedList>>,
+    list_cache: Mutex<Option<CachedResponse>>,
     /// The `T` (NodeRoster) response, cached the same way (issue #356):
     /// `T` renders every entry's name/address/token regardless of state,
     /// a strictly broader view than `L`/`H`'s `Joined`-only roster, so
     /// `generation` is bumped on *every* mutation of that view (see
     /// `bump_roster`) — the Waiting/Joining-only mutations that never
     /// mattered to the other two caches included.
-    roster_cache: Mutex<Option<CachedRoster>>,
+    roster_cache: Mutex<Option<CachedResponse>>,
 }
 
 impl Default for RegistryState {
@@ -797,43 +797,16 @@ fn bump_roster(registry: &Registry) {
     registry.generation.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The cached heartbeat-ack serialization and the `generation` it was
-/// built at (issue #95). Held in `RegistryState::heartbeat_ack`, one per
-/// discovery process; the `refuse` decision is folded into `ack` (the
-/// `list_ready_at` startup grace is not — it's time-gated and handled by
-/// the caller), so a cache hit needs only a generation comparison.
+/// One cached response serialization and the `generation` it was built at
+/// — the heartbeat ack (issue #95), the `L` response (#298) and the `T`
+/// response (#356) each hold one in `RegistryState`, rebuilt by
+/// `cached_by_generation` only when `generation` moves. Whatever
+/// membership-gated decision the response folds in (the `H`/`L` refuse
+/// cases) is baked into `response`; the `list_ready_at` startup grace is
+/// time-gated, so it stays outside the cache and is handled by the caller.
 /// `Arc<[u8]>` so a hit hands out the shared buffer without recopying it
-/// per heartbeat.
-struct CachedAck {
-    generation: u64,
-    replication: usize,
-    ack: Arc<[u8]>,
-}
-
-/// The cached `L` response and the `generation` it was built at (issue
-/// #298) — `CachedAck`'s sibling for `RegistryState::list_cache`. `L`
-/// renders `roster_snapshot`'s `Joined` set/addresses and the
-/// `reported_replication` vote tally, exactly what `generation` already
-/// tracks for `CachedAck`, so the two share one invalidation signal. The
-/// refuse decision (`B\n`) is folded into `response`, same as `CachedAck`
-/// folds its withheld-roster case into `ack`; the `list_ready_at` startup
-/// grace is time-, not membership-gated, so it stays outside the cache and
-/// is handled by the caller.
-struct CachedList {
-    generation: u64,
-    replication: usize,
-    response: Arc<[u8]>,
-}
-
-/// The cached `T` (NodeRoster) response and the `generation` it was built
-/// at (issue #356) — `CachedList`'s sibling for
-/// `RegistryState::roster_cache`. Unlike `L`/`H` there is no folded-in
-/// refuse decision: `T` skips the replication vote entirely (see the
-/// handler's own comment), so the cached bytes are always a full `N`
-/// listing. The per-requester authentication and the `list_ready_at`
-/// startup grace both stay outside the cache, handled by the caller —
-/// the former is per-connection, the latter time- not membership-gated.
-struct CachedRoster {
+/// per request.
+struct CachedResponse {
     generation: u64,
     replication: usize,
     response: Arc<[u8]>,
@@ -1550,8 +1523,14 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
 
             let name_length = parse_length(name_length)?;
             let token_length = parse_length(token_length)?;
-            let (name, token) =
-                parse_two_string_fields(input, header_end, name_length, token_length)?;
+            let [name, token] = parse_string_fields(
+                input,
+                header_end,
+                [
+                    (name_length, MAX_NAME_LENGTH),
+                    (token_length, MAX_TOKEN_LENGTH),
+                ],
+            )?;
 
             Ok(DiscoveryCommand::NodeLeave { name, token })
         }
@@ -1566,8 +1545,14 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
 
             let name_length = parse_length(name_length)?;
             let token_length = parse_length(token_length)?;
-            let (name, token) =
-                parse_two_string_fields(input, header_end, name_length, token_length)?;
+            let [name, token] = parse_string_fields(
+                input,
+                header_end,
+                [
+                    (name_length, MAX_NAME_LENGTH),
+                    (token_length, MAX_TOKEN_LENGTH),
+                ],
+            )?;
 
             Ok(DiscoveryCommand::ProxyDeregister { name, token })
         }
@@ -1591,8 +1576,14 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
 
             let name_length = parse_length(name_length)?;
             let token_length = parse_length(token_length)?;
-            let (name, token) =
-                parse_two_string_fields(input, header_end, name_length, token_length)?;
+            let [name, token] = parse_string_fields(
+                input,
+                header_end,
+                [
+                    (name_length, MAX_NAME_LENGTH),
+                    (token_length, MAX_TOKEN_LENGTH),
+                ],
+            )?;
 
             Ok(DiscoveryCommand::NodeRoster { name, token })
         }
@@ -1615,8 +1606,14 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
                 r => Some(r),
             };
             let token_length = parse_length(token_length)?;
-            let (name, token) =
-                parse_two_string_fields(input, header_end, name_length, token_length)?;
+            let [name, token] = parse_string_fields(
+                input,
+                header_end,
+                [
+                    (name_length, MAX_NAME_LENGTH),
+                    (token_length, MAX_TOKEN_LENGTH),
+                ],
+            )?;
 
             Ok(DiscoveryCommand::Heartbeat {
                 name,
@@ -1647,12 +1644,14 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
                 .map(parse_length)
                 .transpose()?
                 .map(|generation| generation as u64);
-            let (name, joining_name, token) = parse_three_string_fields(
+            let [name, joining_name, token] = parse_string_fields(
                 input,
                 header_end,
-                name_length,
-                joining_length,
-                token_length,
+                [
+                    (name_length, MAX_NAME_LENGTH),
+                    (joining_length, MAX_NAME_LENGTH),
+                    (token_length, MAX_TOKEN_LENGTH),
+                ],
             )?;
 
             Ok(DiscoveryCommand::Complete {
@@ -1690,8 +1689,14 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
                 b"Y" => |name, port, token| DiscoveryCommand::ProxyAnnounce { name, port, token },
                 _ => |name, port, token| DiscoveryCommand::Announce { name, port, token },
             };
-            let (name, token) =
-                parse_two_string_fields(input, header_end, name_length, token_length)?;
+            let [name, token] = parse_string_fields(
+                input,
+                header_end,
+                [
+                    (name_length, MAX_NAME_LENGTH),
+                    (token_length, MAX_TOKEN_LENGTH),
+                ],
+            )?;
 
             Ok(make(name, port, token))
         }
@@ -1700,108 +1705,59 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
     }
 }
 
-/// Parses two consecutive length-prefixed fields (`H`/`J`/`P`'s name then
-/// token — issue #34), checking both are fully buffered before consuming
-/// any of `input`, so `parse`'s "untouched on `Incomplete`" contract
-/// holds even though this reads across two fields in one call. Bounds
-/// each field to `MAX_NAME_LENGTH`/`MAX_TOKEN_LENGTH` — see those
+/// Parses `N` consecutive length-prefixed string fields (`H`/`J`/`P`'s
+/// name then token, `C`'s name, joining name, then token — issue #34),
+/// each given as `(length, max)`, checking all are fully buffered before
+/// consuming any of `input`, so `parse`'s "untouched on `Incomplete`"
+/// contract holds even though this reads across several fields in one
+/// call. `max` is `MAX_NAME_LENGTH`/`MAX_TOKEN_LENGTH` — see those
 /// constants' own doc comments for why.
-fn parse_two_string_fields(
+fn parse_string_fields<const N: usize>(
     input: &mut BytesMut,
     header_end: usize,
-    first_length: usize,
-    second_length: usize,
-) -> Result<(String, String), ParseError> {
-    if first_length == 0 || second_length == 0 {
+    fields: [(usize, usize); N],
+) -> Result<[String; N], ParseError> {
+    if fields.iter().any(|(length, _)| *length == 0) {
         return Err(ParseError::EmptyField);
     }
-    if first_length > MAX_NAME_LENGTH || second_length > MAX_TOKEN_LENGTH {
+    if fields.iter().any(|(length, max)| length > max) {
         return Err(ParseError::InvalidLength);
     }
 
-    let first_start = header_end + 1;
-    let first_end = first_start
-        .checked_add(first_length)
-        .ok_or(ParseError::InvalidLength)?;
-    let second_end = first_end
-        .checked_add(second_length)
-        .ok_or(ParseError::InvalidLength)?;
+    let mut ends = [0usize; N];
+    let mut cursor = header_end + 1;
+    for (end, (length, _)) in ends.iter_mut().zip(fields) {
+        cursor = cursor
+            .checked_add(length)
+            .ok_or(ParseError::InvalidLength)?;
+        *end = cursor;
+    }
 
-    if input.len() < second_end {
+    if input.len() < cursor {
         return Err(ParseError::Incomplete);
     }
 
-    let frame = input.split_to(second_end);
-    let first = String::from_utf8(frame[first_start..first_end].to_vec())
-        .map_err(|_| ParseError::InvalidUtf8)?;
-    let second = String::from_utf8(frame[first_end..second_end].to_vec())
-        .map_err(|_| ParseError::InvalidUtf8)?;
+    let frame = input.split_to(cursor);
+    let mut start = header_end + 1;
+    let mut decoded: [String; N] = std::array::from_fn(|_| String::new());
+    for (field, end) in decoded.iter_mut().zip(ends) {
+        *field =
+            String::from_utf8(frame[start..end].to_vec()).map_err(|_| ParseError::InvalidUtf8)?;
+        start = end;
+    }
 
-    // issue #192: both fields end up in server logs verbatim (name via
-    // `node registered`/`node left the cluster`/etc., token never
-    // logged today but held to the same bar) — reject control
+    // issue #192: these fields end up in server logs verbatim (name via
+    // `node registered`/`node left the cluster`/handoff completion, token
+    // never logged today but held to the same bar) — reject control
     // characters here rather than escaping at every print site.
-    if contains_control_character(&first) || contains_control_character(&second) {
-        return Err(ParseError::ControlCharacter);
-    }
-
-    Ok((first, second))
-}
-
-/// Parses three consecutive length-prefixed fields (`C`'s name, joining
-/// name, then token — issue #34), with the same "untouched on
-/// `Incomplete`" contract as `parse_two_string_fields`. Bounds each field
-/// to `MAX_NAME_LENGTH`/`MAX_TOKEN_LENGTH`, same as that function.
-fn parse_three_string_fields(
-    input: &mut BytesMut,
-    header_end: usize,
-    first_length: usize,
-    second_length: usize,
-    third_length: usize,
-) -> Result<(String, String, String), ParseError> {
-    if first_length == 0 || second_length == 0 || third_length == 0 {
-        return Err(ParseError::EmptyField);
-    }
-    if first_length > MAX_NAME_LENGTH
-        || second_length > MAX_NAME_LENGTH
-        || third_length > MAX_TOKEN_LENGTH
-    {
-        return Err(ParseError::InvalidLength);
-    }
-
-    let first_start = header_end + 1;
-    let first_end = first_start
-        .checked_add(first_length)
-        .ok_or(ParseError::InvalidLength)?;
-    let second_end = first_end
-        .checked_add(second_length)
-        .ok_or(ParseError::InvalidLength)?;
-    let third_end = second_end
-        .checked_add(third_length)
-        .ok_or(ParseError::InvalidLength)?;
-
-    if input.len() < third_end {
-        return Err(ParseError::Incomplete);
-    }
-
-    let frame = input.split_to(third_end);
-    let first = String::from_utf8(frame[first_start..first_end].to_vec())
-        .map_err(|_| ParseError::InvalidUtf8)?;
-    let second = String::from_utf8(frame[first_end..second_end].to_vec())
-        .map_err(|_| ParseError::InvalidUtf8)?;
-    let third = String::from_utf8(frame[second_end..third_end].to_vec())
-        .map_err(|_| ParseError::InvalidUtf8)?;
-
-    // issue #192: `name`/`joining_name` are logged verbatim on handoff
-    // completion — same rejection as `parse_two_string_fields`.
-    if contains_control_character(&first)
-        || contains_control_character(&second)
-        || contains_control_character(&third)
+    if decoded
+        .iter()
+        .any(|field| contains_control_character(field))
     {
         return Err(ParseError::ControlCharacter);
     }
 
-    Ok((first, second, third))
+    Ok(decoded)
 }
 
 fn find_lf(input: &[u8]) -> Option<usize> {
@@ -3790,98 +3746,12 @@ fn roster_snapshot_locked(
     }
 }
 
-/// The `H` ack carrying a roster (issue #61): `A <count> <replication>\n`
-/// then one `<name-len> <addr-len>\n<name><addr>\n` per `Joined` node —
-/// the same entry layout `L` uses, so a node parses it the way an SDK
-/// parses `L`.
-fn build_heartbeat_ack(nodes: &[(String, String)], replication: usize) -> Vec<u8> {
-    let mut ack = format!("A {} {}\n", nodes.len(), replication).into_bytes();
-    for (name, addr) in nodes {
-        ack.extend_from_slice(format!("{} {}\n", name.len(), addr.len()).as_bytes());
-        ack.extend_from_slice(name.as_bytes());
-        ack.extend_from_slice(addr.as_bytes());
-        ack.push(b'\n');
-    }
-    ack
-}
-
-/// The heartbeat-ack roster, cached and rebuilt only when the registry's
-/// `generation` has moved since the last build (issue #95). With #61
-/// every `H` from every `Joined` node carries the full roster; rebuilding
-/// it per heartbeat is O(nodes) scan + serialize under the registry lock,
-/// O(nodes²) per liveness cycle. Membership changes far less often than
-/// nodes heartbeat, so on the common path this returns the shared cached
-/// buffer after one atomic load and an equality check — no registry lock,
-/// no re-serialization.
-///
-/// The withheld-roster cases (`refuse`, a bare `A\n`) are baked into the
-/// cached bytes; the startup-grace `A\n` is handled by the caller before
-/// this is reached (it's time- not membership-gated, so it must not be
-/// cached). Whether the ack was built at exactly the latest generation
-/// doesn't matter for correctness — the roster is a convergence aid the
-/// next heartbeat refreshes — so the fast-path generation read need not
-/// be taken under the registry lock.
-fn cached_heartbeat_ack(registry: &Registry, replication: usize) -> Arc<[u8]> {
-    let generation = registry.generation.load(Ordering::Relaxed);
-    {
-        let cached = registry
-            .heartbeat_ack
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(current) = cached.as_ref()
-            && current.generation == generation
-            && current.replication == replication
-        {
-            return Arc::clone(&current.ack);
-        }
-    }
-
-    // Rebuild: read the generation under the registry lock so it matches
-    // the roster this snapshot serializes (a concurrent bump lands either
-    // fully before or fully after this critical section).
-    let snapshot;
-    let built_generation;
-    {
-        let guard = lock(registry);
-        built_generation = registry.generation.load(Ordering::Relaxed);
-        snapshot = roster_snapshot_locked(&guard, replication);
-    }
-    // Issue #279: the `refuse()` branch — a bare `A\n`, no roster — is
-    // exactly the case `RosterSnapshot::refuse`'s doc comment warns about:
-    // for as long as this replica's `--replication-factor` disagreement
-    // persists, every `H` answered here tells the heartbeating node
-    // nothing about membership, eviction included.
-    let ack: Arc<[u8]> = if snapshot.refuse() {
-        Arc::from(b"A\n".as_slice())
-    } else {
-        Arc::from(build_heartbeat_ack(&snapshot.nodes, replication).as_slice())
-    };
-
-    let mut cached = registry
-        .heartbeat_ack
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Only advance the cache — a concurrent rebuild that already stored a
-    // newer generation for this same replication must not be overwritten
-    // with this older one.
-    if cached.as_ref().is_none_or(|current| {
-        current.replication != replication || current.generation <= built_generation
-    }) {
-        *cached = Some(CachedAck {
-            generation: built_generation,
-            replication,
-            ack: Arc::clone(&ack),
-        });
-    }
-    ack
-}
-
-/// The `L` response: `N <count> <replication>\n` then one `<name-len>
-/// <addr-len>\n<name><addr>\n` per `Joined` node — `build_heartbeat_ack`'s
-/// sibling for `L`'s own `N` tag (see its doc comment; the two share the
-/// same per-entry layout, so an SDK parses either the same way).
-fn build_list_response(nodes: &[(String, String)], replication: usize) -> Vec<u8> {
-    let mut response = format!("N {} {}\n", nodes.len(), replication).into_bytes();
+/// The `Joined` roster as the `H` ack (issue #61, `tag` `A`) and the `L`
+/// response (`tag` `N`) both carry it: `<tag> <count> <replication>\n`
+/// then one `<name-len> <addr-len>\n<name><addr>\n` per node — one entry
+/// layout, so a node parses the ack the way an SDK parses `L`.
+fn build_roster_response(tag: char, nodes: &[(String, String)], replication: usize) -> Vec<u8> {
+    let mut response = format!("{tag} {} {}\n", nodes.len(), replication).into_bytes();
     for (name, addr) in nodes {
         response.extend_from_slice(format!("{} {}\n", name.len(), addr.len()).as_bytes());
         response.extend_from_slice(name.as_bytes());
@@ -3889,6 +3759,96 @@ fn build_list_response(nodes: &[(String, String)], replication: usize) -> Vec<u8
         response.push(b'\n');
     }
     response
+}
+
+/// One response derived from the registry, cached in `cache` and rebuilt
+/// only when the registry's `generation` has moved since the last build.
+/// On the common path this returns the shared cached buffer after one
+/// atomic load and an equality check — no registry lock, no
+/// re-serialization. `snapshot` runs under the registry lock and captures
+/// whatever the response needs; `render` serializes it outside the lock.
+///
+/// Whether the response was built at exactly the latest generation doesn't
+/// matter for correctness — the roster is a convergence aid the next
+/// heartbeat/refresh picks up — so the fast-path generation read need not
+/// be taken under the registry lock. The rebuild reads it under the lock,
+/// so it matches the state the snapshot serializes (a concurrent bump
+/// lands either fully before or fully after that critical section), and
+/// only ever advances the cache: a concurrent rebuild that already stored
+/// a newer generation for this same replication is never overwritten with
+/// an older one.
+fn cached_by_generation<S>(
+    registry: &Registry,
+    cache: &Mutex<Option<CachedResponse>>,
+    replication: usize,
+    snapshot: impl FnOnce(&FxHashMap<String, NodeInfo>) -> S,
+    render: impl FnOnce(S) -> Arc<[u8]>,
+) -> Arc<[u8]> {
+    let generation = registry.generation.load(Ordering::Relaxed);
+    {
+        let cached = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(current) = cached.as_ref()
+            && current.generation == generation
+            && current.replication == replication
+        {
+            return Arc::clone(&current.response);
+        }
+    }
+
+    let (built_generation, snapshot) = {
+        let guard = lock(registry);
+        let generation = registry.generation.load(Ordering::Relaxed);
+        (generation, snapshot(&guard))
+    };
+    let response = render(snapshot);
+
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cached.as_ref().is_none_or(|current| {
+        current.replication != replication || current.generation <= built_generation
+    }) {
+        *cached = Some(CachedResponse {
+            generation: built_generation,
+            replication,
+            response: Arc::clone(&response),
+        });
+    }
+    response
+}
+
+/// The heartbeat-ack roster, cached and rebuilt only when the registry's
+/// `generation` has moved since the last build (issue #95). With #61
+/// every `H` from every `Joined` node carries the full roster; rebuilding
+/// it per heartbeat is O(nodes) scan + serialize under the registry lock,
+/// O(nodes²) per liveness cycle. Membership changes far less often than
+/// nodes heartbeat, so `cached_by_generation`'s fast path serves nearly
+/// every `H`.
+///
+/// The withheld-roster cases (`refuse`, a bare `A\n`) are baked into the
+/// cached bytes; the startup-grace `A\n` is handled by the caller before
+/// this is reached (it's time- not membership-gated, so it must not be
+/// cached). Issue #279: the `refuse()` branch — a bare `A\n`, no roster —
+/// is exactly the case `RosterSnapshot::refuse`'s doc comment warns about:
+/// for as long as this replica's `--replication-factor` disagreement
+/// persists, every `H` answered here tells the heartbeating node nothing
+/// about membership, eviction included.
+fn cached_heartbeat_ack(registry: &Registry, replication: usize) -> Arc<[u8]> {
+    cached_by_generation(
+        registry,
+        &registry.heartbeat_ack,
+        replication,
+        |guard| roster_snapshot_locked(guard, replication),
+        |snapshot| {
+            if snapshot.refuse() {
+                Arc::from(b"A\n".as_slice())
+            } else {
+                Arc::from(build_roster_response('A', &snapshot.nodes, replication).as_slice())
+            }
+        },
+    )
 }
 
 /// The `L` response, cached and rebuilt only when the registry's
@@ -3914,97 +3874,63 @@ fn build_list_response(nodes: &[(String, String)], replication: usize) -> Vec<u8
 /// do on every request now fires only on an actual rebuild — a cache hit
 /// skips it exactly as it skips re-tallying the vote in the first place.
 fn cached_list_response(registry: &Registry, replication: usize) -> Arc<[u8]> {
-    let generation = registry.generation.load(Ordering::Relaxed);
-    {
-        let cached = registry
-            .list_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(current) = cached.as_ref()
-            && current.generation == generation
-            && current.replication == replication
-        {
-            return Arc::clone(&current.response);
-        }
-    }
+    cached_by_generation(
+        registry,
+        &registry.list_cache,
+        replication,
+        |guard| roster_snapshot_locked(guard, replication),
+        |snapshot| {
+            // Issue #30 (amended, HIGH-severity follow-up): see the module
+            // docs' `L` entry and `RosterSnapshot::refuse`'s own doc
+            // comment for why replication-factor disagreement gets a
+            // strict-majority vote rather than refusing on any dissent.
+            // Logged here, on rebuild only, rather than on every request
+            // as the un-cached handler used to.
+            if !snapshot.dissenting.is_empty() {
+                if snapshot.refuse() {
+                    eprintln!(
+                        "WARN refusing L: {} of {} voting Joined nodes report a \
+                         replication factor different from this replica's own \
+                         --replication-factor {} (a strict majority) — dissenting: {} — \
+                         discovery replicas have drifted out of alignment; the operator \
+                         must align --replication-factor across every replica (see \
+                         Discovery HA)",
+                        snapshot.dissenting.len(),
+                        snapshot.dissenting.len() + snapshot.agreeing,
+                        replication,
+                        snapshot.dissenting.join(", ")
+                    );
+                } else {
+                    // Logged on rebuild rather than rate-limited or
+                    // deduplicated against a remembered dissenter set:
+                    // simpler, and with the cache in place a persistent
+                    // single dissenter now logs only as often as
+                    // membership actually changes, not per `L` call.
+                    eprintln!(
+                        "WARN L served despite {} of {} voting Joined nodes reporting a \
+                         replication factor different from this replica's own \
+                         --replication-factor {} — not yet a strict majority, so still \
+                         served, but worth investigating: {}",
+                        snapshot.dissenting.len(),
+                        snapshot.dissenting.len() + snapshot.agreeing,
+                        replication,
+                        snapshot.dissenting.join(", ")
+                    );
+                }
+            }
 
-    // Rebuild: read the generation under the registry lock so it matches
-    // the roster this snapshot serializes (a concurrent bump lands either
-    // fully before or fully after this critical section) — mirrors
-    // `cached_heartbeat_ack`.
-    let snapshot;
-    let built_generation;
-    {
-        let guard = lock(registry);
-        built_generation = registry.generation.load(Ordering::Relaxed);
-        snapshot = roster_snapshot_locked(&guard, replication);
-    }
-
-    // Issue #30 (amended, HIGH-severity follow-up): see the module docs'
-    // `L` entry and `RosterSnapshot::refuse`'s own doc comment for why
-    // replication-factor disagreement gets a strict-majority vote rather
-    // than refusing on any dissent. Logged here, on rebuild only, rather
-    // than on every request as the un-cached handler used to.
-    if !snapshot.dissenting.is_empty() {
-        if snapshot.refuse() {
-            eprintln!(
-                "WARN refusing L: {} of {} voting Joined nodes report a \
-                 replication factor different from this replica's own \
-                 --replication-factor {} (a strict majority) — dissenting: {} — \
-                 discovery replicas have drifted out of alignment; the operator \
-                 must align --replication-factor across every replica (see \
-                 Discovery HA)",
-                snapshot.dissenting.len(),
-                snapshot.dissenting.len() + snapshot.agreeing,
-                replication,
-                snapshot.dissenting.join(", ")
-            );
-        } else {
-            // Logged on rebuild rather than rate-limited or deduplicated
-            // against a remembered dissenter set: simpler, and with the
-            // cache in place a persistent single dissenter now logs only
-            // as often as membership actually changes, not per `L` call.
-            eprintln!(
-                "WARN L served despite {} of {} voting Joined nodes reporting a \
-                 replication factor different from this replica's own \
-                 --replication-factor {} — not yet a strict majority, so still \
-                 served, but worth investigating: {}",
-                snapshot.dissenting.len(),
-                snapshot.dissenting.len() + snapshot.agreeing,
-                replication,
-                snapshot.dissenting.join(", ")
-            );
-        }
-    }
-
-    let response: Arc<[u8]> = if snapshot.refuse() {
-        Arc::from(b"B\n".as_slice())
-    } else {
-        Arc::from(build_list_response(&snapshot.nodes, replication).as_slice())
-    };
-
-    let mut cached = registry
-        .list_cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Only advance the cache — a concurrent rebuild that already stored a
-    // newer generation for this same replication must not be overwritten
-    // with this older one.
-    if cached.as_ref().is_none_or(|current| {
-        current.replication != replication || current.generation <= built_generation
-    }) {
-        *cached = Some(CachedList {
-            generation: built_generation,
-            replication,
-            response: Arc::clone(&response),
-        });
-    }
-    response
+            if snapshot.refuse() {
+                Arc::from(b"B\n".as_slice())
+            } else {
+                Arc::from(build_roster_response('N', &snapshot.nodes, replication).as_slice())
+            }
+        },
+    )
 }
 
 /// The `T` (NodeRoster) response: `N <count> <replication>\n` then one
 /// `<name-len> <addr-len> <token-len>\n<name><addr><token>\n` per
-/// registered node — `build_list_response`'s sibling for `T`'s
+/// registered node — `build_roster_response`'s sibling for `T`'s
 /// token-carrying, every-state listing (see the `NodeRoster` handler for
 /// why `Waiting`/`Joining` entries belong in it).
 fn build_node_roster_response(entries: &[(String, String, String)], replication: usize) -> Vec<u8> {
@@ -4037,55 +3963,18 @@ fn build_node_roster_response(entries: &[(String, String, String)], replication:
 /// comment); requester authentication and the `list_ready_at` startup
 /// grace are the caller's, exactly as they are for `L`/`H`.
 fn cached_node_roster(registry: &Registry, replication: usize) -> Arc<[u8]> {
-    let generation = registry.generation.load(Ordering::Relaxed);
-    {
-        let cached = registry
-            .roster_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(current) = cached.as_ref()
-            && current.generation == generation
-            && current.replication == replication
-        {
-            return Arc::clone(&current.response);
-        }
-    }
-
-    // Rebuild: read the generation under the registry lock so it matches
-    // the entries this snapshot serializes (a concurrent bump lands
-    // either fully before or fully after this critical section) — mirrors
-    // `cached_list_response`.
-    let entries: Vec<(String, String, String)>;
-    let built_generation;
-    {
-        let guard = lock(registry);
-        built_generation = registry.generation.load(Ordering::Relaxed);
-        entries = guard
-            .iter()
-            .map(|(name, info)| (name.clone(), info.address.clone(), info.token.clone()))
-            .collect();
-    }
-
-    let response: Arc<[u8]> =
-        Arc::from(build_node_roster_response(&entries, replication).as_slice());
-
-    let mut cached = registry
-        .roster_cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Only advance the cache — a concurrent rebuild that already stored a
-    // newer generation for this same replication must not be overwritten
-    // with this older one.
-    if cached.as_ref().is_none_or(|current| {
-        current.replication != replication || current.generation <= built_generation
-    }) {
-        *cached = Some(CachedRoster {
-            generation: built_generation,
-            replication,
-            response: Arc::clone(&response),
-        });
-    }
-    response
+    cached_by_generation(
+        registry,
+        &registry.roster_cache,
+        replication,
+        |guard| -> Vec<(String, String, String)> {
+            guard
+                .iter()
+                .map(|(name, info)| (name.clone(), info.address.clone(), info.token.clone()))
+                .collect()
+        },
+        |entries| Arc::from(build_node_roster_response(&entries, replication).as_slice()),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6029,7 +5918,7 @@ mod tests {
         // The cached bytes match a fresh serialization of the roster.
         assert_eq!(
             &*first,
-            build_heartbeat_ack(&roster_snapshot(&registry, 2).nodes, 2).as_slice()
+            build_roster_response('A', &roster_snapshot(&registry, 2).nodes, 2).as_slice()
         );
         assert!(first.starts_with(b"A 2 2\n"));
 
@@ -6104,7 +5993,7 @@ mod tests {
         );
         assert_eq!(
             &*first,
-            build_list_response(&roster_snapshot(&registry, 2).nodes, 2).as_slice()
+            build_roster_response('N', &roster_snapshot(&registry, 2).nodes, 2).as_slice()
         );
         assert!(first.starts_with(b"N 2 2\n"));
 
