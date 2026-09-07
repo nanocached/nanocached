@@ -625,15 +625,8 @@ fn parse_with_mode(
             }
 
             let secret_start = header_end + 1;
-            let secret_end = secret_start
-                .checked_add(secret_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            if input.len() < secret_end {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(secret_end).freeze();
+            let [secret_end] = field_ends(secret_start, [secret_length])?;
+            let frame = take_frame(input, secret_end)?;
             let secret = frame.slice(secret_start..secret_end);
 
             Ok((
@@ -671,20 +664,11 @@ fn parse_with_mode(
             }
 
             let namespace_start = header_end + 1;
-            let key_start = namespace_start
-                .checked_add(namespace_length)
-                .ok_or(ParseError::InvalidLength)?;
-            let key_end = key_start
-                .checked_add(key_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            if input.len() < key_end {
-                return Err(ParseError::Incomplete);
-            }
+            let [key_start, key_end] = field_ends(namespace_start, [namespace_length, key_length])?;
 
             let is_get = command == b"G" || command == b"g";
 
-            let frame = input.split_to(key_end).freeze();
+            let frame = take_frame(input, key_end)?;
             let key = Key::new(
                 frame.slice(namespace_start..key_start),
                 frame.slice(key_start..key_end),
@@ -729,21 +713,9 @@ fn parse_with_mode(
             }
 
             let token_start = header_end + 1;
-            let namespace_start = token_start
-                .checked_add(token_length)
-                .ok_or(ParseError::InvalidLength)?;
-            let key_start = namespace_start
-                .checked_add(namespace_length)
-                .ok_or(ParseError::InvalidLength)?;
-            let key_end = key_start
-                .checked_add(key_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            if input.len() < key_end {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(key_end).freeze();
+            let [namespace_start, key_start, key_end] =
+                field_ends(token_start, [token_length, namespace_length, key_length])?;
+            let frame = take_frame(input, key_end)?;
             let token = decode_field(&frame, token_start, token_length)?;
             let key = Key::new(
                 frame.slice(namespace_start..key_start),
@@ -798,11 +770,7 @@ fn parse_with_mode(
                 key_spans.push((start, cursor));
             }
 
-            if input.len() < cursor {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(cursor).freeze();
+            let frame = take_frame(input, cursor)?;
             let namespace = frame.slice(namespace_start..namespace_start + namespace_length);
             let keys = key_spans
                 .into_iter()
@@ -836,31 +804,8 @@ fn parse_with_mode(
                 lengths.push((key_length, value_length));
             }
 
-            // Same "[ttl] [tag]" disambiguation `S`/`s` uses: the
-            // connection's negotiated mode says whether one trailing
-            // field is the tag alone or TTL-then-tag.
-            let (ttl, tag) = if tagged {
-                let first = parts.next().ok_or(ParseError::InvalidLength)?;
-                match parts.next() {
-                    Some(second) => (Some(first), Some(parse_tag(second)?)),
-                    None => (None, Some(parse_tag(first)?)),
-                }
-            } else {
-                (parts.next(), None)
-            };
-
-            if parts.next().is_some() {
-                return Err(ParseError::InvalidLength);
-            }
-
-            let ttl = match ttl {
-                Some(ttl) => {
-                    let seconds = parse_length(ttl)?;
-                    let seconds = u64::try_from(seconds).map_err(|_| ParseError::InvalidLength)?;
-                    Some(Duration::from_secs(seconds))
-                }
-                None => None,
-            };
+            let (ttl, tag) = parse_ttl_and_tag(&mut parts, tagged)?;
+            let ttl = ttl.map(parse_ttl).transpose()?;
 
             let namespace_start = header_end + 1;
             let mut cursor = namespace_start
@@ -870,20 +815,12 @@ fn parse_with_mode(
 
             for (key_length, value_length) in lengths {
                 let key_start = cursor;
-                let value_start = key_start
-                    .checked_add(key_length)
-                    .ok_or(ParseError::InvalidLength)?;
-                cursor = value_start
-                    .checked_add(value_length)
-                    .ok_or(ParseError::InvalidLength)?;
-                spans.push((key_start, value_start, cursor));
+                let [value_start, value_end] = field_ends(key_start, [key_length, value_length])?;
+                cursor = value_end;
+                spans.push((key_start, value_start, value_end));
             }
 
-            if input.len() < cursor {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(cursor).freeze();
+            let frame = take_frame(input, cursor)?;
             let namespace = frame.slice(namespace_start..namespace_start + namespace_length);
             let mut keys = Vec::with_capacity(spans.len());
             let mut values = Vec::with_capacity(spans.len());
@@ -937,18 +874,8 @@ fn parse_with_mode(
             let delta = parse_decimal_i64(delta).ok_or(ParseError::InvalidLength)?;
 
             let namespace_start = header_end + 1;
-            let key_start = namespace_start
-                .checked_add(namespace_length)
-                .ok_or(ParseError::InvalidLength)?;
-            let key_end = key_start
-                .checked_add(key_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            if input.len() < key_end {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(key_end).freeze();
+            let [key_start, key_end] = field_ends(namespace_start, [namespace_length, key_length])?;
+            let frame = take_frame(input, key_end)?;
             let key = Key::new(
                 frame.slice(namespace_start..key_start),
                 frame.slice(key_start..key_end),
@@ -969,20 +896,7 @@ fn parse_with_mode(
             let value_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let cond = parts.next().ok_or(ParseError::InvalidLength)?;
             let condition = parse_cas_condition(cond, true)?;
-
-            let (ttl, tag) = if tagged {
-                let first = parts.next().ok_or(ParseError::InvalidLength)?;
-                match parts.next() {
-                    Some(second) => (Some(first), Some(parse_tag(second)?)),
-                    None => (None, Some(parse_tag(first)?)),
-                }
-            } else {
-                (parts.next(), None)
-            };
-
-            if parts.next().is_some() {
-                return Err(ParseError::InvalidLength);
-            }
+            let (ttl, tag) = parse_ttl_and_tag(&mut parts, tagged)?;
 
             let key_length = parse_length(key_length)?;
             let value_length = parse_length(value_length)?;
@@ -991,31 +905,14 @@ fn parse_with_mode(
                 return Err(ParseError::EmptyKey);
             }
 
-            let ttl = match ttl {
-                Some(ttl) => {
-                    let seconds = parse_length(ttl)?;
-                    let seconds = u64::try_from(seconds).map_err(|_| ParseError::InvalidLength)?;
-                    Some(Duration::from_secs(seconds))
-                }
-                None => None,
-            };
+            let ttl = ttl.map(parse_ttl).transpose()?;
 
             let namespace_start = header_end + 1;
-            let key_start = namespace_start
-                .checked_add(namespace_length)
-                .ok_or(ParseError::InvalidLength)?;
-            let key_end = key_start
-                .checked_add(key_length)
-                .ok_or(ParseError::InvalidLength)?;
-            let value_end = key_end
-                .checked_add(value_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            if input.len() < value_end {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(value_end).freeze();
+            let [key_start, key_end, value_end] = field_ends(
+                namespace_start,
+                [namespace_length, key_length, value_length],
+            )?;
+            let frame = take_frame(input, value_end)?;
             let key = Key::new(
                 frame.slice(namespace_start..key_start),
                 frame.slice(key_start..key_end),
@@ -1060,18 +957,8 @@ fn parse_with_mode(
             }
 
             let namespace_start = header_end + 1;
-            let key_start = namespace_start
-                .checked_add(namespace_length)
-                .ok_or(ParseError::InvalidLength)?;
-            let key_end = key_start
-                .checked_add(key_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            if input.len() < key_end {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(key_end).freeze();
+            let [key_start, key_end] = field_ends(namespace_start, [namespace_length, key_length])?;
+            let frame = take_frame(input, key_end)?;
             let key = Key::new(
                 frame.slice(namespace_start..key_start),
                 frame.slice(key_start..key_end),
@@ -1097,15 +984,8 @@ fn parse_with_mode(
             let namespace_length = parse_length(namespace_length)?;
 
             let namespace_start = header_end + 1;
-            let namespace_end = namespace_start
-                .checked_add(namespace_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            if input.len() < namespace_end {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(namespace_end).freeze();
+            let [namespace_end] = field_ends(namespace_start, [namespace_length])?;
+            let frame = take_frame(input, namespace_end)?;
             let namespace = frame.slice(namespace_start..namespace_end);
 
             Ok((Command::Clear { namespace }, tag))
@@ -1133,31 +1013,7 @@ fn parse_with_mode(
             };
             let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let value_length = parts.next().ok_or(ParseError::InvalidLength)?;
-
-            // Every field after `<value-len>`, in wire order: `[<ttl>]
-            // [<tag>]`. Collected up front — capped, so a frame with
-            // extra fields errors here rather than silently reading
-            // `parts` past what a human wrote — then peeled back to
-            // front: the tag is always last in tagged mode.
-            let max_trailing = 2;
-            let mut trailing: Vec<&[u8]> = Vec::with_capacity(max_trailing);
-            for part in parts.by_ref() {
-                trailing.push(part);
-                if trailing.len() > max_trailing {
-                    return Err(ParseError::InvalidLength);
-                }
-            }
-
-            let tag = if tagged {
-                Some(parse_tag(trailing.pop().ok_or(ParseError::InvalidLength)?)?)
-            } else {
-                None
-            };
-
-            if trailing.len() > 1 {
-                return Err(ParseError::InvalidLength);
-            }
-            let ttl = trailing.pop();
+            let (ttl, tag) = parse_ttl_and_tag(&mut parts, tagged)?;
 
             let key_length = parse_length(key_length)?;
             let value_length = parse_length(value_length)?;
@@ -1166,35 +1022,14 @@ fn parse_with_mode(
                 return Err(ParseError::EmptyKey);
             }
 
-            let ttl = match ttl {
-                Some(ttl) => {
-                    let seconds = parse_length(ttl)?;
-                    let seconds = u64::try_from(seconds).map_err(|_| ParseError::InvalidLength)?;
-
-                    Some(Duration::from_secs(seconds))
-                }
-                None => None,
-            };
+            let ttl = ttl.map(parse_ttl).transpose()?;
 
             let namespace_start = header_end + 1;
-
-            let key_start = namespace_start
-                .checked_add(namespace_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            let key_end = key_start
-                .checked_add(key_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            let value_end = key_end
-                .checked_add(value_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            if input.len() < value_end {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(value_end).freeze();
+            let [key_start, key_end, value_end] = field_ends(
+                namespace_start,
+                [namespace_length, key_length, value_length],
+            )?;
+            let frame = take_frame(input, value_end)?;
             let key = Key::new(
                 frame.slice(namespace_start..key_start),
                 frame.slice(key_start..key_end),
@@ -1263,39 +1098,14 @@ fn parse_with_mode(
                 return Err(ParseError::EmptyField);
             }
 
-            let ttl = match ttl {
-                Some(ttl) => {
-                    let seconds = parse_length(ttl)?;
-                    let seconds = u64::try_from(seconds).map_err(|_| ParseError::InvalidLength)?;
-
-                    Some(Duration::from_secs(seconds))
-                }
-                None => None,
-            };
+            let ttl = ttl.map(parse_ttl).transpose()?;
 
             let token_start = header_end + 1;
-
-            let namespace_start = token_start
-                .checked_add(token_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            let key_start = namespace_start
-                .checked_add(namespace_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            let key_end = key_start
-                .checked_add(key_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            let value_end = key_end
-                .checked_add(value_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            if input.len() < value_end {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(value_end).freeze();
+            let [namespace_start, key_start, key_end, value_end] = field_ends(
+                token_start,
+                [token_length, namespace_length, key_length, value_length],
+            )?;
+            let frame = take_frame(input, value_end)?;
             let token = decode_field(&frame, token_start, token_length)?;
             let key = Key::new(
                 frame.slice(namespace_start..key_start),
@@ -1334,18 +1144,9 @@ fn parse_with_mode(
             // so the connection handler can verify it before acting on the
             // cancel (see `Command::CancelMigration::token`).
             let token_start = header_end + 1;
-            let joining_name_start = token_start
-                .checked_add(token_length)
-                .ok_or(ParseError::InvalidLength)?;
-            let joining_name_end = joining_name_start
-                .checked_add(joining_name_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            if input.len() < joining_name_end {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(joining_name_end);
+            let [joining_name_start, joining_name_end] =
+                field_ends(token_start, [token_length, joining_name_length])?;
+            let frame = take_frame(input, joining_name_end)?;
             let token = decode_field(&frame, token_start, token_length)?;
             let joining_name = decode_field(&frame, joining_name_start, joining_name_length)?;
 
@@ -1474,18 +1275,20 @@ fn parse_migrate(
     // stays a plain fixed-offset field unaffected by `entries`' own
     // resumable scan below.
     let token_start = header_end + 1;
-    let joining_name_start = token_start
-        .checked_add(token_length)
-        .ok_or(ParseError::InvalidLength)?;
-    let joining_addr_start = joining_name_start
-        .checked_add(joining_name_length)
-        .ok_or(ParseError::InvalidLength)?;
-    let joining_token_start = joining_addr_start
-        .checked_add(joining_addr_length)
-        .ok_or(ParseError::InvalidLength)?;
-    let mut cursor = joining_token_start
-        .checked_add(joining_token_length)
-        .ok_or(ParseError::InvalidLength)?;
+    let [
+        joining_name_start,
+        joining_addr_start,
+        joining_token_start,
+        mut cursor,
+    ] = field_ends(
+        token_start,
+        [
+            token_length,
+            joining_name_length,
+            joining_addr_length,
+            joining_token_length,
+        ],
+    )?;
 
     if input.len() < cursor {
         return Err(ParseError::Incomplete);
@@ -1597,12 +1400,7 @@ fn scan_joined_entries(
         }
 
         let name_start = entry_header_end + 1;
-        let addr_start = name_start
-            .checked_add(name_length)
-            .ok_or(ParseError::InvalidLength)?;
-        let entry_end = addr_start
-            .checked_add(addr_length)
-            .ok_or(ParseError::InvalidLength)?;
+        let [addr_start, entry_end] = field_ends(name_start, [name_length, addr_length])?;
 
         if input.len() < entry_end {
             return Err(ParseError::Incomplete);
@@ -1617,6 +1415,64 @@ fn scan_joined_entries(
 
 fn decode_field(frame: &[u8], start: usize, length: usize) -> Result<String, ParseError> {
     String::from_utf8(frame[start..start + length].to_vec()).map_err(|_| ParseError::InvalidUtf8)
+}
+
+/// The end offset of each of `lengths`' consecutive body fields, the first
+/// starting at `start` — each field's end is the next one's start, so
+/// `let [key_start, key_end] = field_ends(header_end + 1, [namespace_length,
+/// key_length])?` names every boundary a body needs. Offset overflow is
+/// `InvalidLength`, like every other malformed length.
+fn field_ends<const N: usize>(start: usize, lengths: [usize; N]) -> Result<[usize; N], ParseError> {
+    let mut ends = [0usize; N];
+    let mut cursor = start;
+    for (end, length) in ends.iter_mut().zip(lengths) {
+        cursor = cursor
+            .checked_add(length)
+            .ok_or(ParseError::InvalidLength)?;
+        *end = cursor;
+    }
+    Ok(ends)
+}
+
+/// Splits the frame ending at `end` off the front of `input`, or returns
+/// `Incomplete` — leaving `input` untouched — while it isn't all buffered.
+fn take_frame(input: &mut BytesMut, end: usize) -> Result<Bytes, ParseError> {
+    if input.len() < end {
+        return Err(ParseError::Incomplete);
+    }
+    Ok(input.split_to(end).freeze())
+}
+
+/// A `[ttl]` field: whole seconds, in the same decimal encoding as a length.
+fn parse_ttl(field: &[u8]) -> Result<Duration, ParseError> {
+    let seconds = u64::try_from(parse_length(field)?).map_err(|_| ParseError::InvalidLength)?;
+    Ok(Duration::from_secs(seconds))
+}
+
+/// The optional `[ttl] [tag]` tail `S`/`s`, `o` and `k` share, consuming the
+/// rest of `parts`: the connection's negotiated mode says whether one
+/// trailing field is the tag alone or TTL-then-tag, never a frame-by-frame
+/// guess. The ttl comes back raw (see `parse_ttl`) so a caller can finish
+/// its own length checks first. Anything past the tail is `InvalidLength`.
+fn parse_ttl_and_tag<'a>(
+    parts: &mut impl Iterator<Item = &'a [u8]>,
+    tagged: bool,
+) -> Result<(Option<&'a [u8]>, Option<u32>), ParseError> {
+    let (ttl, tag) = if tagged {
+        let first = parts.next().ok_or(ParseError::InvalidLength)?;
+        match parts.next() {
+            Some(second) => (Some(first), Some(parse_tag(second)?)),
+            None => (None, Some(parse_tag(first)?)),
+        }
+    } else {
+        (parts.next(), None)
+    };
+
+    if parts.next().is_some() {
+        return Err(ParseError::InvalidLength);
+    }
+
+    Ok((ttl, tag))
 }
 
 /// Echoed response tags: in tagged mode the next header field is the required
