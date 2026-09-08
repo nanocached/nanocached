@@ -91,10 +91,13 @@ client directly, for anything this store doesn't itself surface —
 - **TTL.** `cache-manager` passes milliseconds throughout (`Config.ttl`,
   `Store.set`'s `ttl` parameter); the wire's unit is whole seconds. A
   positive value under one second **rounds up** to 1s — it never rounds
-  down to "no expiry". A call's `ttl` (when positive) wins; `ttl` 0 or
-  omitted falls back to the store's configured default (`ttl` in the
-  config above); no default configured either means no expiry (TTL 0 on
-  the wire). This is a real, documented precision loss:
+  down to "no expiry". A call's `ttl` wins whenever it is given — an
+  explicit `0` means "no expiry" and is *not* replaced by the default,
+  exactly as in `cache-manager-redis-yet` and the built-in memory store;
+  only an omitted `ttl` falls back to the store's configured default
+  (`ttl` in the config above), and no default configured either means
+  no expiry (TTL 0 on the wire). This is a real, documented precision
+  loss:
   `cache.set(key, value, 1)` (1ms) and `cache.set(key, value, 999)`
   (999ms) both land on the wire as a 1-second TTL — nanocached has no
   finer granularity.

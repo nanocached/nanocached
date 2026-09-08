@@ -62,10 +62,16 @@ export interface NanocachedStoreConfig extends Config {
 // milliseconds throughout (Config.ttl, Store.set's ttl parameter). A
 // positive sub-second value must round UP, never down to 0 ("no expiry")
 // — losing a caller's intended expiry silently would be far worse than
-// rounding it up to 1s. `effectiveMs` folds in the "0/absent means fall
-// back to the store's configured default" rule cache-manager stores
-// generally follow (ttl 0 is indistinguishable from "not passed" here,
-// matching the Redis store's own handling of Milliseconds).
+// rounding it up to 1s. Only an *omitted* per-call ttl (`undefined`)
+// falls back to the store's configured default; an explicit `0` is a
+// real value meaning "no expiry" and wins over the default (issue #521).
+// That is what the reference stores do: cache-manager-redis-yet's
+// `set`/`mset` compute `ttl === undefined ? options.ttl : ttl` and skip
+// `PX` when the result is 0, and cache-manager's own memory store passes
+// `opt ?? lruOptions.ttl` to lru-cache, where 0 is "never expires". This
+// function used to fold 0 into the default on the mistaken belief that
+// it matched the Redis store, so `set(key, value, 0)` on a store
+// configured with a default silently expired at the default.
 //
 // A *negative* per-call ttl is different from 0/absent: it means "this
 // entry is already expired" (issue #300), same semantic the Django
@@ -94,7 +100,7 @@ function resolveTtlSeconds(
   defaultTtlMs: Milliseconds | undefined,
 ): number | typeof DO_NOT_CACHE {
   if (ttlMs !== undefined && ttlMs < 0) return DO_NOT_CACHE;
-  const effectiveMs = ttlMs !== undefined && ttlMs > 0 ? ttlMs : defaultTtlMs;
+  const effectiveMs = ttlMs !== undefined ? ttlMs : defaultTtlMs;
   if (effectiveMs === undefined) return 0;
   if (effectiveMs < 0) return DO_NOT_CACHE;
   if (effectiveMs === 0) return 0;
