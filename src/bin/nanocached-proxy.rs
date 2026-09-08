@@ -132,19 +132,31 @@
 //!   understands; single-address SDK clients reconnect and retry
 //!   exactly as they do against a restarting node.
 //!
-//! Self-contained by repo policy: binaries share no modules (see
-//! `verify-staged-join`'s module docs), so the HRW ring, the `L` client
-//! and the frame grammar are independent re-implementations of the same
-//! wire contracts, pinned by the same cross-implementation vectors.
+//! Protocol code is deliberately self-contained rather than shared with
+//! `nanocached-node`/`nanocached-discovery` (see `verify-staged-join`'s
+//! module docs): the HRW ring, the `L` client and the frame grammar are
+//! independent re-implementations of the same wire contracts, pinned by
+//! the same cross-implementation vectors every SDK is pinned by too — a
+//! bug a single shared implementation could hide from every caller at
+//! once. Connection- and process-level glue that has nothing to do with
+//! either protocol (TLS setup, the metrics HTTP responder, shutdown
+//! handling, accept-loop backoff) *is* shared, via `nanocached::infra` —
+//! see that crate's own module docs for exactly where the line is drawn.
 
 use bytes::{Bytes, BytesMut};
+use nanocached::infra::{
+    ACCEPT_ERROR_BACKOFF, METRICS_MAX_CONNECTIONS, read_http_request_path,
+    should_backoff_after_accept_error, shutdown_signal, write_http_response,
+};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
@@ -156,14 +168,6 @@ const MAX_REQUEST_SIZE: usize = 1_048_576;
 /// Client connections accepted at once (`--max-connections`); the
 /// default mirrors the node's `MAX_CONNECTIONS`.
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
-
-/// Issue #233: metrics/health/ready connections accepted at once — a
-/// small, fixed cap dedicated to the metrics listener, independent of
-/// `--max-connections` (that semaphore is only read here for the
-/// `nanocached_proxy_client_connections` gauge, it never governs this
-/// listener). A scrape storm or a stuck orchestrator probe on this port
-/// shouldn't be able to spawn an unbounded number of tasks.
-const METRICS_MAX_CONNECTIONS: usize = 16;
 
 /// Client connections idle longer than this are closed — the node's own
 /// idle policy, mirrored so a proxy hop doesn't change lifecycle
@@ -523,116 +527,13 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
     Ok(args)
 }
 
-// ─── TLS plumbing (mirrors src/server.rs's, see the module docs on
-//     independent re-implementation) ─────────────────────────────────
+// ─── TLS plumbing ───────────────────────────────────────────────────
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use std::io::BufReader;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use nanocached::infra::{self, MaybeTls, load_tls_acceptor, load_tls_connector};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-enum MaybeTls<P, T> {
-    Plain(P),
-    Tls(Box<T>),
-}
-
-type ServerStream = MaybeTls<TcpStream, tokio_rustls::server::TlsStream<TcpStream>>;
-type UpstreamStream = MaybeTls<TcpStream, tokio_rustls::client::TlsStream<TcpStream>>;
-
-impl<P: AsyncRead + Unpin, T: AsyncRead + Unpin> AsyncRead for MaybeTls<P, T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MaybeTls::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
-            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
-        }
-    }
-}
-
-impl<P: AsyncWrite + Unpin, T: AsyncWrite + Unpin> AsyncWrite for MaybeTls<P, T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            MaybeTls::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
-            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MaybeTls::Plain(stream) => Pin::new(stream).poll_flush(cx),
-            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MaybeTls::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
-            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
-        }
-    }
-}
-
-fn load_tls_acceptor(cert_path: &str, key_path: &str) -> io::Result<TlsAcceptor> {
-    let certs = load_cert_chain(cert_path)?;
-    let key = load_private_key(key_path)?;
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    Ok(TlsAcceptor::from(Arc::new(config)))
-}
-
-fn load_tls_connector(ca_path: &str) -> io::Result<TlsConnector> {
-    let certs = load_cert_chain(ca_path)?;
-    let mut roots = RootCertStore::empty();
-    for cert in certs {
-        roots
-            .add(cert)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    }
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(TlsConnector::from(Arc::new(config)))
-}
-
-fn load_cert_chain(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)?;
-    rustls_pemfile::certs(&mut BufReader::new(file)).collect()
-}
-
-fn load_private_key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)?;
-    rustls_pemfile::private_key(&mut BufReader::new(file))?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("no private key found in {path}"),
-        )
-    })
-}
-
-fn server_name_from_addr(addr: &str) -> io::Result<ServerName<'static>> {
-    let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
-    let host = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    ServerName::try_from(host.to_string()).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid TLS server name {host:?}: {error}"),
-        )
-    })
-}
+type ServerStream = infra::MaybeTls<TcpStream, tokio_rustls::server::TlsStream<TcpStream>>;
+type UpstreamStream = infra::MaybeTls<TcpStream, tokio_rustls::client::TlsStream<TcpStream>>;
 
 /// Everything the per-connection tasks need, shared once.
 struct ProxyContext {
@@ -844,7 +745,7 @@ async fn connect_upstream(
     match tls_connector {
         None => Ok(MaybeTls::Plain(stream)),
         Some(connector) => {
-            let server_name = server_name_from_addr(addr)?;
+            let server_name = infra::server_name_from_addr(addr)?;
             let tls = connector.connect(server_name, stream).await?;
             Ok(MaybeTls::Tls(Box::new(tls)))
         }
@@ -4719,9 +4620,9 @@ async fn run(
     let permits = Arc::new(Semaphore::new(args.max_connections));
 
     // Issue #124: the operations sidecar — /metrics + /healthz + /readyz
-    // on its own listener, mirroring the node's (see that binary's
-    // `run_metrics_server` docs; independent re-implementation per the
-    // no-shared-modules policy).
+    // on its own listener. The HTTP framing and the listener's own
+    // connection cap are `nanocached::infra` (shared with the node and
+    // discovery); what each endpoint reports is this binary's own.
     if let Some(port) = args.metrics_port {
         let metrics_listener = TcpListener::bind((args.host.as_str(), port)).await?;
         println!("INFO metrics endpoint listening on {}:{port}", args.host);
@@ -4760,51 +4661,6 @@ async fn drained(rx: &mut watch::Receiver<bool>) {
     }
 }
 
-/// SIGTERM or ctrl-c — mirrors the node's shutdown_signal.
-async fn shutdown_signal() -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        let mut terminate = signal(SignalKind::terminate())?;
-
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await
-    }
-}
-
-/// Whether `error` (from a failed `listener.accept()`) looks like the
-/// process (EMFILE) or the whole system (ENFILE) being out of file
-/// descriptors — the two accept() failures where retrying immediately
-/// would spin the accept loop hot instead of recovering (see
-/// `ACCEPT_ERROR_BACKOFF`). EMFILE/ENFILE share the same numeric errno on
-/// every Unix this project targets (Linux, macOS/BSD), so this hardcodes
-/// them rather than pulling in a `libc` dependency for two integers.
-/// Mirrors the node's and discovery's own copy of this check (no
-/// shared-modules policy).
-#[cfg(unix)]
-fn is_fd_exhaustion_error(error: &io::Error) -> bool {
-    const EMFILE: i32 = 24;
-    const ENFILE: i32 = 23;
-    matches!(error.raw_os_error(), Some(EMFILE) | Some(ENFILE))
-}
-
-#[cfg(not(unix))]
-fn is_fd_exhaustion_error(_error: &io::Error) -> bool {
-    false
-}
-
-/// Backoff after an accept() failure recognized by
-/// `is_fd_exhaustion_error` — same value as the node's and discovery's.
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
-
 /// Issue #124: minimal, dependency-free HTTP responder for Prometheus
 /// text-format metrics and orchestrator probes. `/readyz` answers `503`
 /// until the first roster fetch has landed — a proxy with no ring view
@@ -4829,7 +4685,7 @@ async fn run_metrics_server(
                 // busy-loop this task hot under EMFILE/ENFILE instead of
                 // backing off, making recovery harder right when file
                 // descriptors are already scarce.
-                if is_fd_exhaustion_error(&error) {
+                if should_backoff_after_accept_error(&error) {
                     sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
                 continue;
@@ -4914,47 +4770,6 @@ async fn serve_metrics_connection(
     write_http_response(&mut stream, status, &body).await
 }
 
-/// Bounded read of one HTTP request head; GET path or error. Mirrors
-/// the node's copy.
-async fn read_http_request_path(stream: &mut TcpStream) -> io::Result<String> {
-    let mut head = Vec::new();
-    let mut chunk = [0u8; 1024];
-    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-        if head.len() > 8192 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "oversized http request head",
-            ));
-        }
-        let bytes_read = stream.read(&mut chunk).await?;
-        if bytes_read == 0 {
-            break;
-        }
-        head.extend_from_slice(&chunk[..bytes_read]);
-    }
-
-    let head = String::from_utf8_lossy(&head);
-    let request_line = head.lines().next().unwrap_or_default();
-    let mut parts = request_line.split(' ');
-    match (parts.next(), parts.next()) {
-        (Some("GET"), Some(path)) => Ok(path.to_string()),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not a GET request",
-        )),
-    }
-}
-
-async fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.shutdown().await
-}
-
 /// The accept loop, factored from `run` so tests can drive it against a
 /// listener they bound themselves.
 async fn serve(
@@ -4988,7 +4803,7 @@ async fn serve(
                 // loop's pace, never its continuation — matches the
                 // metrics accept loop and discovery's accept loop.
                 eprintln!("WARN accept failed: {error}");
-                if is_fd_exhaustion_error(&error) {
+                if should_backoff_after_accept_error(&error) {
                     sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
                 continue;
@@ -5083,6 +4898,9 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nanocached::infra::is_fd_exhaustion;
+    use rustls::pki_types::{PrivateKeyDer, ServerName};
+    use rustls::{ClientConfig, RootCertStore, ServerConfig};
     use std::collections::HashMap as StdHashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -5092,10 +4910,10 @@ mod tests {
     fn fd_exhaustion_is_detected_for_emfile_and_enfile() {
         // Issue #184: the metrics accept loop used to `continue` on any
         // accept() error with no backoff, busy-looping under EMFILE/
-        // ENFILE — matches the node's and discovery's own copy of this
-        // check (`is_fd_exhaustion`/`is_fd_exhaustion_error`).
-        assert!(is_fd_exhaustion_error(&io::Error::from_raw_os_error(24))); // EMFILE
-        assert!(is_fd_exhaustion_error(&io::Error::from_raw_os_error(23))); // ENFILE
+        // ENFILE — matches `infra::is_fd_exhaustion`, shared with the
+        // node's and discovery's own accept loops.
+        assert!(is_fd_exhaustion(&io::Error::from_raw_os_error(24))); // EMFILE
+        assert!(is_fd_exhaustion(&io::Error::from_raw_os_error(23))); // ENFILE
     }
 
     #[test]
@@ -5103,7 +4921,7 @@ mod tests {
         // ECONNABORTED is a recoverable per-connection failure, not one
         // that means the process is out of descriptors — it shouldn't
         // trigger the backoff.
-        assert!(!is_fd_exhaustion_error(&io::Error::from(
+        assert!(!is_fd_exhaustion(&io::Error::from(
             io::ErrorKind::ConnectionAborted
         )));
     }
