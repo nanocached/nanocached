@@ -567,6 +567,20 @@ loud `WARN` if that disagrees with its own configured value.
   node in a cluster the same flags, as with `--max-memory`
 - Idle connection timeout: 60 seconds
 
+### nanocached-proxy
+
+- Maximum request size: 1 MiB (mirrors the node's)
+- Maximum concurrent client connections: 1,024 by default, configurable
+  with `--max-connections <n>`, and at most 256 from any one source IP
+  by default, configurable with `--max-connections-per-ip <n>` — the
+  same two caps and the same rules as the node's (never above the total;
+  an unset per-IP cap shrinks to match a lowered total). The proxy is
+  the tier that faces application clients directly, so the NAT /
+  Kubernetes caveat above applies with more force here: when every
+  application pod reaches the proxy through one egress IP, the per-IP
+  cap is the whole fleet's ceiling — raise it
+- Idle connection timeout: 60 seconds
+
 ### nanocached-discovery
 
 - Maximum request size: 4 KiB

@@ -145,8 +145,8 @@
 
 use bytes::{Bytes, BytesMut};
 use nanocached::infra::{
-    ACCEPT_ERROR_BACKOFF, METRICS_MAX_CONNECTIONS, read_http_request_path,
-    should_backoff_after_accept_error, shutdown_signal, write_http_response,
+    ACCEPT_ERROR_BACKOFF, METRICS_MAX_CONNECTIONS, PerIpConnections, read_http_request_path,
+    should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip, write_http_response,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -168,6 +168,21 @@ const MAX_REQUEST_SIZE: usize = 1_048_576;
 /// Client connections accepted at once (`--max-connections`); the
 /// default mirrors the node's `MAX_CONNECTIONS`.
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
+/// Default for `--max-connections-per-ip` (issue #520): how many live
+/// client connections one source IP may hold at once, layered under the
+/// global `--max-connections` semaphore. Mirrors the node's own cap
+/// (`--max-connections-per-ip`, issue #126) — the proxy is the tier that
+/// faces application clients directly, and until #520 it was the only
+/// listener without one: a single IP could hold the whole
+/// `--max-connections` budget in idle connections and every other client
+/// got `B`. Deliberately coarse, like the node's: a pooled application
+/// host or a fleet behind one NAT legitimately holds many connections,
+/// and this only stops one source from monopolising the proxy. Behind
+/// NAT or on Kubernetes, where clients share one source IP, *this* is
+/// the effective fleet ceiling — raise it there. See
+/// `try_acquire_per_ip`.
+const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 256;
 
 /// Client connections idle longer than this are closed — the node's own
 /// idle policy, mirrored so a proxy hop doesn't change lifecycle
@@ -414,6 +429,14 @@ struct Args {
     port: u16,
     discovery: Vec<String>,
     max_connections: usize,
+    /// Issue #520: `--max-connections-per-ip`. `None` until the flag is
+    /// seen; resolved by `connection_limits` to
+    /// `min(default, max_connections)` — keeping the raw `Option` until
+    /// then is what lets an explicit value be validated against
+    /// `--max-connections` regardless of flag order, while an implicit
+    /// default silently shrinks to fit a lowered total instead of
+    /// failing (the node's own shape, issue #126).
+    max_connections_per_ip: Option<usize>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_ca: Option<String>,
@@ -434,6 +457,7 @@ impl Default for Args {
             port: 8358,
             discovery: Vec::new(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_connections_per_ip: None,
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
@@ -457,6 +481,7 @@ impl From<String> for ArgsError {
 fn usage() -> String {
     "usage: nanocached-proxy --discovery <host:port>[,<host:port>...] \
      [--host <host>] [--port <port>] [--max-connections <n>] \
+     [--max-connections-per-ip <n>] \
      [--tls-cert <pem> --tls-key <pem>] [--tls-ca <pem>] [--metrics-port <port>]\n\
      [--drain-timeout <secs>]\n\
      The shared auth secret is read from NANOCACHED_AUTH_SECRET."
@@ -492,6 +517,17 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                 }
                 args.max_connections = parsed;
             }
+            "--max-connections-per-ip" => {
+                let parsed: usize = value()?
+                    .parse()
+                    .map_err(|_| "--max-connections-per-ip must be a number".to_string())?;
+                if parsed == 0 {
+                    return Err("--max-connections-per-ip must be at least 1"
+                        .to_string()
+                        .into());
+                }
+                args.max_connections_per_ip = Some(parsed);
+            }
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
             "--tls-ca" => args.tls_ca = Some(value()?),
@@ -523,8 +559,43 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
             .to_string()
             .into());
     }
+    // Issue #520 (the node's #126 rule): an explicit per-IP cap above the
+    // total is a misconfiguration (it could never bind); the implicit
+    // default instead shrinks to fit a lowered total. Checked here, after
+    // the loop, so the two flags may appear in either order.
+    if let Some(per_ip) = args.max_connections_per_ip
+        && per_ip > args.max_connections
+    {
+        return Err(format!(
+            "--max-connections-per-ip ({per_ip}) must not exceed --max-connections ({})",
+            args.max_connections
+        )
+        .into());
+    }
 
     Ok(args)
+}
+
+/// The two accepted-connection caps, resolved from `--max-connections` /
+/// `--max-connections-per-ip` (issue #520) and threaded to the global
+/// semaphore and the per-IP reservation in `serve`.
+#[derive(Clone, Copy)]
+struct ConnectionLimits {
+    max_connections: usize,
+    max_connections_per_ip: usize,
+}
+
+/// An unset per-IP cap follows a lowered total down (a 100-connection
+/// proxy shouldn't keep a 256 per-IP default that could never bind); an
+/// explicit value was already validated by `parse_args_from` to not
+/// exceed the total.
+fn connection_limits(args: &Args) -> ConnectionLimits {
+    ConnectionLimits {
+        max_connections: args.max_connections,
+        max_connections_per_ip: args
+            .max_connections_per_ip
+            .unwrap_or_else(|| DEFAULT_MAX_CONNECTIONS_PER_IP.min(args.max_connections)),
+    }
 }
 
 // ─── TLS plumbing ───────────────────────────────────────────────────
@@ -4617,7 +4688,9 @@ async fn run(
         args.discovery.join(",")
     );
 
-    let permits = Arc::new(Semaphore::new(args.max_connections));
+    let limits = connection_limits(&args);
+    let permits = Arc::new(Semaphore::new(limits.max_connections));
+    let per_ip_connections: PerIpConnections = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     // Issue #124: the operations sidecar — /metrics + /healthz + /readyz
     // on its own listener. The HTTP framing and the listener's own
@@ -4631,12 +4704,21 @@ async fn run(
             metrics_listener,
             Arc::clone(&context),
             Arc::clone(&permits),
-            args.max_connections,
+            limits.max_connections,
             metrics_permits,
         ));
     }
 
-    serve(listener, context, tls_acceptor, permits, args.drain_timeout).await?;
+    serve(
+        listener,
+        context,
+        tls_acceptor,
+        permits,
+        per_ip_connections,
+        limits.max_connections_per_ip,
+        args.drain_timeout,
+    )
+    .await?;
 
     // The refresher exits after sending the deregistration; give it its
     // moment so `Z` reliably reaches discovery before the process ends.
@@ -4772,11 +4854,33 @@ async fn serve_metrics_connection(
 
 /// The accept loop, factored from `run` so tests can drive it against a
 /// listener they bound themselves.
+/// Best-effort `B` on an over-limit connection, off the accept loop (a
+/// peer that never reads it must not stall accepts). Tenth-pass audit
+/// (2026-09-02): a TLS-configured proxy has no plaintext channel to
+/// answer on before the handshake — the peer is expecting a ServerHello,
+/// so a plaintext `B\n` is meaningless (wrong-protocol) rather than
+/// merely unread. Mirrors the node's own `reject_over_limit`, which skips
+/// the busy write entirely once TLS is on and just closes. The write is
+/// bounded like every other client write — a peer with a zero receive
+/// window that never reads this reply must not leak the spawned task and
+/// socket forever.
+fn reply_busy_and_close(stream: TcpStream, tls_configured: bool) {
+    if tls_configured {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut stream = stream;
+        let _ = timeout(CLIENT_WRITE_TIMEOUT, stream.write_all(b"B\n")).await;
+    });
+}
+
 async fn serve(
     listener: TcpListener,
     context: Arc<ProxyContext>,
     tls_acceptor: Option<TlsAcceptor>,
     permits: Arc<Semaphore>,
+    per_ip_connections: PerIpConnections,
+    max_connections_per_ip: usize,
     drain_timeout: Duration,
 ) -> io::Result<()> {
     let mut connections = tokio::task::JoinSet::new();
@@ -4814,25 +4918,23 @@ async fn serve(
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
             // Over the connection budget: answer busy and move on, the
             // node's own stance (see `reject_over_limit`).
-            let tls_configured = tls_acceptor.is_some();
-            tokio::spawn(async move {
-                let mut stream = stream;
-                // Tenth-pass audit (2026-09-02): a TLS-configured proxy has
-                // no plaintext channel to answer on before the handshake —
-                // the peer is expecting a ServerHello, so a plaintext `B\n`
-                // is meaningless (wrong-protocol) rather than merely
-                // unread. Mirrors the node's own `reject_over_limit`, which
-                // skips the busy write entirely once TLS is on and just
-                // closes.
-                if tls_configured {
-                    return;
-                }
-                // Tenth-pass audit (2026-09-02): bounded like every other
-                // client write — a peer with a zero receive window that
-                // never reads this reply must not leak the spawned task
-                // and socket forever.
-                let _ = timeout(CLIENT_WRITE_TIMEOUT, stream.write_all(b"B\n")).await;
-            });
+            reply_busy_and_close(stream, tls_acceptor.is_some());
+            continue;
+        };
+
+        // Issue #520: the per-source-IP cap, layered under the global
+        // permit above — without it a single source could hold every
+        // `max_connections` permit by itself and starve every other
+        // client, with the global semaphore never reporting anything
+        // unusual short of the very last permit. Reserved before the
+        // TLS handshake for the same reason as the global permit (a peer
+        // that dials and stalls its handshake must not spend handshake
+        // CPU/fds past the cap). Rejected exactly like the global cap:
+        // same `B`, same close.
+        let Some(per_ip_permit) =
+            try_acquire_per_ip(&per_ip_connections, peer.ip(), max_connections_per_ip)
+        else {
+            reply_busy_and_close(stream, tls_acceptor.is_some());
             continue;
         };
 
@@ -4840,6 +4942,7 @@ async fn serve(
         let acceptor = tls_acceptor.clone();
         connections.spawn(async move {
             let _permit = permit;
+            let _per_ip_permit = per_ip_permit;
             let stream: ServerStream = match acceptor {
                 None => MaybeTls::Plain(stream),
                 // Tenth-pass audit (2026-09-02): bounded by
@@ -5128,6 +5231,103 @@ mod tests {
             args(&["--discovery", "d:1", "--max-connections", "0"]),
             Err(ArgsError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn connection_limit_flags_parse_and_default_correctly() {
+        // Issue #520: defaults match the node's when the flags are
+        // omitted...
+        let limits = connection_limits(&args(&["--discovery", "d:1"]).ok().unwrap());
+        assert_eq!(limits.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(
+            limits.max_connections_per_ip,
+            DEFAULT_MAX_CONNECTIONS_PER_IP
+        );
+
+        // ...and both configurable when given.
+        let limits = connection_limits(
+            &args(&[
+                "--discovery",
+                "d:1",
+                "--max-connections",
+                "4096",
+                "--max-connections-per-ip",
+                "1000",
+            ])
+            .ok()
+            .unwrap(),
+        );
+        assert_eq!(limits.max_connections, 4096);
+        assert_eq!(limits.max_connections_per_ip, 1000);
+
+        assert!(matches!(
+            args(&["--discovery", "d:1", "--max-connections-per-ip", "0"]),
+            Err(ArgsError::Invalid(_))
+        ));
+        assert!(matches!(
+            args(&["--discovery", "d:1", "--max-connections-per-ip", "many"]),
+            Err(ArgsError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn an_unset_per_ip_cap_follows_a_lowered_total_down() {
+        // Issue #520 (the node's #126 rule): --max-connections 100 alone
+        // must not keep the 256 per-IP default — a per-IP cap above the
+        // total could never bind.
+        let limits = connection_limits(
+            &args(&["--discovery", "d:1", "--max-connections", "100"])
+                .ok()
+                .unwrap(),
+        );
+        assert_eq!(limits.max_connections, 100);
+        assert_eq!(limits.max_connections_per_ip, 100);
+    }
+
+    #[test]
+    fn an_explicit_per_ip_cap_above_the_total_is_rejected_in_either_flag_order() {
+        for flags in [
+            [
+                "--discovery",
+                "d:1",
+                "--max-connections",
+                "100",
+                "--max-connections-per-ip",
+                "101",
+            ],
+            [
+                "--discovery",
+                "d:1",
+                "--max-connections-per-ip",
+                "101",
+                "--max-connections",
+                "100",
+            ],
+        ] {
+            match args(&flags) {
+                Err(ArgsError::Invalid(message)) => assert!(
+                    message.contains("must not exceed --max-connections"),
+                    "unexpected message: {message}"
+                ),
+                Err(ArgsError::Help(_)) => panic!("help text instead of a validation error"),
+                Ok(_) => panic!("{flags:?} should have been rejected"),
+            }
+        }
+        // Equal to the total is fine (the per-IP cap may bind at the
+        // very last permit, same as the node).
+        let limits = connection_limits(
+            &args(&[
+                "--discovery",
+                "d:1",
+                "--max-connections",
+                "100",
+                "--max-connections-per-ip",
+                "100",
+            ])
+            .ok()
+            .unwrap(),
+        );
+        assert_eq!(limits.max_connections_per_ip, 100);
     }
 
     // ── ring: the cross-implementation vectors ───────────────────────
@@ -5921,11 +6121,25 @@ mod tests {
         start_proxy_full(
             discovery_addr,
             secret,
-            max_connections,
+            test_limits(max_connections),
             announce,
             Arc::new(SharedBackends::new()),
         )
         .await
+    }
+
+    /// Issue #520: a proxy with an explicit per-IP cap, for the tests
+    /// that exercise it independently of the global total.
+    async fn start_proxy_with_limits(discovery_addr: &str, limits: ConnectionLimits) -> String {
+        start_proxy_full(
+            discovery_addr,
+            None,
+            limits,
+            None,
+            Arc::new(SharedBackends::new()),
+        )
+        .await
+        .0
     }
 
     /// Issue #514: `start_proxy`, on a caller-built `SharedBackends` —
@@ -5936,14 +6150,24 @@ mod tests {
         backends: Arc<SharedBackends>,
     ) -> (String, Arc<ProxyContext>) {
         let (addr, _drain, context) =
-            start_proxy_full(discovery_addr, None, 64, None, backends).await;
+            start_proxy_full(discovery_addr, None, test_limits(64), None, backends).await;
         (addr, context)
+    }
+
+    /// The production default resolution for a test-sized total: the
+    /// per-IP cap follows the total down, so a `max_connections` of 1
+    /// still admits that one connection from localhost.
+    fn test_limits(max_connections: usize) -> ConnectionLimits {
+        ConnectionLimits {
+            max_connections,
+            max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP.min(max_connections),
+        }
     }
 
     async fn start_proxy_full(
         discovery_addr: &str,
         secret: Option<&str>,
-        max_connections: usize,
+        limits: ConnectionLimits,
         announce: Option<ProxyIdentity>,
         backends: Arc<SharedBackends>,
     ) -> (String, watch::Sender<bool>, Arc<ProxyContext>) {
@@ -5979,7 +6203,9 @@ mod tests {
             listener,
             Arc::clone(&context),
             None,
-            Arc::new(Semaphore::new(max_connections)),
+            Arc::new(Semaphore::new(limits.max_connections)),
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+            limits.max_connections_per_ip,
             Duration::from_secs(5),
         ));
 
@@ -6079,11 +6305,14 @@ mod tests {
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let limits = test_limits(max_connections);
         tokio::spawn(serve(
             listener,
             Arc::clone(&context),
             Some(tls_acceptor),
-            Arc::new(Semaphore::new(max_connections)),
+            Arc::new(Semaphore::new(limits.max_connections)),
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+            limits.max_connections_per_ip,
             Duration::from_secs(5),
         ));
 
@@ -8525,6 +8754,57 @@ mod tests {
             "elapsed {:?} is suspiciously fast for a write that was supposed to stall",
             start.elapsed()
         );
+    }
+
+    // ── Issue #520: the per-source-IP cap ──────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_source_ip_at_its_own_cap_is_answered_busy_despite_global_headroom() {
+        // Regression: `max_connections` alone let a single source IP hold
+        // every global permit by itself and starve every other client.
+        // With the per-IP cap at 1 and the global total at 10, a second
+        // connection from the same IP (everything here is localhost) must
+        // get `B` even though nine global permits remain — and get it
+        // back once the first connection closes.
+        let node = MockNode::start().await;
+        let roster = vec![("node".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let proxy = start_proxy_with_limits(
+            &discovery,
+            ConnectionLimits {
+                max_connections: 10,
+                max_connections_per_ip: 1,
+            },
+        )
+        .await;
+
+        // Fully established (a served reply proves the accept loop has
+        // taken both permits) before the second dial.
+        let mut first = TcpStream::connect(&proxy).await.unwrap();
+        let mut first_buf = BytesMut::new();
+        first.write_all(b"A 1\nx").await.unwrap();
+        assert_eq!(read_line(&mut first, &mut first_buf).await.unwrap(), "On");
+
+        let mut second = TcpStream::connect(&proxy).await.unwrap();
+        let mut second_buf = BytesMut::new();
+        assert_eq!(read_line(&mut second, &mut second_buf).await.unwrap(), "B");
+
+        // The slot is released with the connection, not leaked: the very
+        // next dial from this IP is served again.
+        drop(first);
+        timeout(UPSTREAM_IO_TIMEOUT, async {
+            loop {
+                let mut probe = TcpStream::connect(&proxy).await.unwrap();
+                let mut probe_buf = BytesMut::new();
+                probe.write_all(b"A 1\nx").await.unwrap();
+                match read_line(&mut probe, &mut probe_buf).await.as_deref() {
+                    Ok("On") => return,
+                    _ => sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("the per-IP slot must be released once the first connection closes");
     }
 
     // ── Tenth-pass audit (2026-09-02): bound the TLS handshake and the

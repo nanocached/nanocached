@@ -104,7 +104,10 @@ which is why they are three services with three desired counts:</p>
   <tr><td>proxy</td><td>client connections and throughput: concurrent
   application connections ÷ <code>--max-connections</code> (1024 per
   proxy) with headroom; at least one per zone for availability. Node
-  count does not enter into it.</td><td>≥ 2, one per zone;
+  count does not enter into it. A proxy also caps connections per
+  source IP (<code>--max-connections-per-ip</code>, 256 by default, the
+  node's own rule): when application tasks reach it through one NAT or
+  egress IP, that cap is the fleet's ceiling — raise it.</td><td>≥ 2, one per zone;
   grow when <code>nanocached_proxy_client_connections</code> approaches
   <code>_max</code></td></tr>
 </table>
