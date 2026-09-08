@@ -136,7 +136,7 @@ that lets the cluster's group talk to itself on 8356–8357.</p>
 <p><code>td-proxy.json</code>:</p>
 <pre><code>[{
   "name": "nanocached-proxy",
-  "image": "ghcr.io/nanocached/nanocached-proxy@sha256:72a425690c22dedefbeb4ae38015c44d45018cd8b2efad2cb8ad4c5529582e03",
+  "image": "ghcr.io/nanocached/nanocached-proxy@sha256:5f82f77057c1e7d7caea5299904610b994c4ccdcc6f3373acebff2aa128c96e1",
   "essential": true,
   "command": ["--host", "0.0.0.0", "--port", "8358", "--discovery", "disc.nanocached.local:8357",
               "--drain-timeout", "20", "--metrics-port", "9358"],
@@ -222,7 +222,8 @@ first request (INCR, CAS) would have been answered with an error, since
 a frame already written can't be retried — the proxy's own backend
 connections are exactly as exposed to that 60&nbsp;s timeout as an
 SDK's, just with no traffic of their own to keep them busy while no
-client is attached. Re-run on the 0.4.2 image pinned above (issue <a
+client is attached. Re-run on the 0.4.2 image, the release that shipped
+the fix (issue <a
 href="https://github.com/nanocached/nanocached/issues/514">#514</a>):
 a key set, then 100&nbsp;s — well past the node's 60&nbsp;s idle
 timeout — with the proxy otherwise untouched, then a fresh connection
@@ -311,7 +312,7 @@ spec:
             matchLabels: {app: nanocached-proxy}
       containers:
         - name: proxy
-          image: ghcr.io/nanocached/nanocached-proxy@sha256:72a425690c22dedefbeb4ae38015c44d45018cd8b2efad2cb8ad4c5529582e03
+          image: ghcr.io/nanocached/nanocached-proxy@sha256:5f82f77057c1e7d7caea5299904610b994c4ccdcc6f3373acebff2aa128c96e1
           args: ["--host", "0.0.0.0", "--port", "8358", "--discovery", "disc:8357",
                  "--drain-timeout", "20", "--metrics-port", "9358"]
           envFrom:
