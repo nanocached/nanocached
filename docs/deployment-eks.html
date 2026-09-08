@@ -118,7 +118,7 @@ spec:
     spec:
       containers:
         - name: discovery
-          image: ghcr.io/nanocached/nanocached-discovery@sha256:92d5b57f8b6b7a39630670791bdfdc0228c40634b047a1ae5f4f27295550f147
+          image: ghcr.io/nanocached/nanocached-discovery@sha256:2066f83648aaa509c269563fa1ee119bd3b24bec77458eccc956d4e458e3de0e
           args: ["--host", "0.0.0.0", "--port", "8357", "--replication-factor", "2",
                  "--metrics-port", "9357"]
           envFrom:
@@ -169,7 +169,7 @@ spec:
             matchLabels: {app: nanocached-node}
       containers:
         - name: node
-          image: ghcr.io/nanocached/nanocached-node@sha256:151175072c128f6b854d5e2acc98351f14b8e2aa174a4af9fc96b102e73a613d
+          image: ghcr.io/nanocached/nanocached-node@sha256:e68dcfecf3c66d9cb1dadc60b98f655e95f011128cb0dc8004f8679138b30bc2
           args: ["--host", "0.0.0.0", "--port", "8356", "--discovery", "disc:8357",
                  "--drain-timeout", "20", "--metrics-port", "9356", "--max-memory", "536870912"]
           envFrom:
