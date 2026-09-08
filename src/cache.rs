@@ -1,7 +1,7 @@
 use crate::key::Key;
-use crate::server::constant_time_eq;
 use bytes::Bytes;
 use lru::LruCache;
+use nanocached::infra::constant_time_eq;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};

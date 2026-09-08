@@ -6,6 +6,7 @@ mod response;
 mod server;
 
 use bytes::Bytes;
+use nanocached::infra::{load_tls_acceptor, load_tls_connector};
 use server::HeartbeatConfig;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -361,7 +362,7 @@ async fn main() -> ExitCode {
     };
 
     let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
-        (Some(cert), Some(key)) => match server::load_tls_acceptor(cert, key) {
+        (Some(cert), Some(key)) => match load_tls_acceptor(cert, key) {
             Ok(acceptor) => Some(acceptor),
             Err(err) => {
                 eprintln!("nanocached-node: {err}");
@@ -372,7 +373,7 @@ async fn main() -> ExitCode {
     };
 
     let tls_connector = match &args.tls_ca {
-        Some(ca) => match server::load_tls_connector(ca) {
+        Some(ca) => match load_tls_connector(ca) {
             Ok(connector) => Some(connector),
             Err(err) => {
                 eprintln!("nanocached-node: {err}");

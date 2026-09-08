@@ -38,14 +38,16 @@
 //! `M` frame the node could no longer parse) sat on main that way until
 //! this harness was run by hand.
 //!
-//! This binary has no dependency on the node/discovery implementations
-//! (the binaries share no modules by design — see size-derived migration timeout and
-//! `nanocached-discovery.rs`'s module docs): it only spawns the sibling
-//! binaries as subprocesses and
-//! speaks the wire protocol to them, with its own minimal copy of just
-//! the pieces it needs (`A`/`G`/`S` and discovery's `L`). No TLS/auth
-//! support yet — this is for local verification (see staged node join's Context);
-//! add it if/when AWS verification needs it.
+//! This binary has no dependency on the node/discovery implementations,
+//! protocol or otherwise (not even `nanocached::infra`, the connection-
+//! and process-level glue those two share with `nanocached-proxy` — see
+//! that crate's own module docs): it only spawns the sibling binaries as
+//! subprocesses and speaks the wire protocol to them, with its own
+//! minimal copy of just the pieces it needs (`A`/`G`/`S` and discovery's
+//! `L`), so a bug shared infrastructure or a shared protocol
+//! implementation could hide from every caller at once still shows up
+//! here. No TLS/auth support yet — this is for local verification (see
+//! staged node join's Context); add it if/when AWS verification needs it.
 
 use bytes::BytesMut;
 use std::collections::{HashMap, HashSet};

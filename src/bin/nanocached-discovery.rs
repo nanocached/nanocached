@@ -1,10 +1,14 @@
 //! Standalone cluster-membership registry for nanocached cache nodes.
 //!
-//! This binary has no dependency on the cache server's own modules —
-//! `nanocached-node` and `nanocached-discovery` share no modules by
-//! design (size-derived migration timeout); its protocol is unrelated to nanocached's
-//! cache protocol, so nothing is shared. Run it via `ncd discovery start`,
-//! or directly as `nanocached-discovery`.
+//! This binary has no dependency on the cache server's own protocol code —
+//! `nanocached-node` and `nanocached-discovery` independently implement
+//! their own, unrelated wire protocols (size-derived migration timeout),
+//! so nothing protocol-shaped is shared. It does share `nanocached::infra`
+//! with the other binaries: connection- and process-level glue (TLS setup,
+//! the metrics HTTP responder, shutdown handling, accept-loop backoff,
+//! per-IP connection limiting) with nothing to do with either protocol —
+//! see that crate's own module docs for the line this policy draws. Run it
+//! via `ncd discovery start`, or directly as `nanocached-discovery`.
 //!
 //! Protocol (ASCII header line, terminated by `\n`; a command may repeat
 //! on the same connection):
@@ -226,21 +230,22 @@
 //! same registry by listening to the same nodes.
 
 use bytes::{Bytes, BytesMut};
+use nanocached::infra;
+use nanocached::infra::{
+    ACCEPT_ERROR_BACKOFF, METRICS_MAX_CONNECTIONS, MaybeTls, PerIpConnections, constant_time_eq,
+    load_tls_acceptor, load_tls_connector, read_http_request_path, reject_over_limit,
+    should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip, write_http_response,
+};
 use rustc_hash::FxHashMap;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
-use std::io::BufReader;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
@@ -252,18 +257,6 @@ const MAX_REQUEST_SIZE: usize = 4096;
 const MAX_CONNECTIONS: usize = 1024;
 /// Issue #358: metrics/health/ready connections accepted at once on
 /// `--metrics-port` — a small, fixed cap dedicated to that listener,
-/// independent of `MAX_CONNECTIONS` (that semaphore governs the
-/// registration port; `run_metrics_server` never touches it). Without
-/// this, the metrics accept loop spawned one unbounded task per
-/// connection — a scrape storm, or a peer that just opens connections
-/// and holds them, could grow its task/fd count without limit. Fixed
-/// rather than a CLI flag: this port only ever sees a handful of
-/// legitimate scrapers (Prometheus, a load balancer's health check),
-/// never registration traffic, so there's no per-deployment tuning need
-/// to expose. Mirrors the node's and `nanocached-proxy`'s
-/// `METRICS_MAX_CONNECTIONS` (issues #327/#233) — same problem, same
-/// fix, independent re-implementation per the no-shared-modules policy.
-const METRICS_MAX_CONNECTIONS: usize = 16;
 /// Coarse cap on how many live connections a single source IP may hold at
 /// once, layered under the global `MAX_CONNECTIONS` semaphore (mirrors
 /// `src/server.rs`'s own `MAX_CONNECTIONS_PER_IP`: no per-source-IP
@@ -494,15 +487,6 @@ const UNIDENTIFIED_CONNECTION_TIMEOUT: Duration = IDLE_TIMEOUT;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Backoff applied after an `accept()` failure that looks like file-
-/// descriptor exhaustion (EMFILE/ENFILE, see `is_fd_exhaustion_error`) —
-/// issue: `listener.accept()`'s error used to be propagated with `?`,
-/// killing the whole process on what is, for this and every other
-/// recoverable accept() error (ECONNABORTED, ENOBUFS, ...), a transient
-/// condition. Retrying immediately under fd exhaustion would just spin
-/// the accept loop hot instead of giving descriptors a chance to free up;
-/// short enough not to meaningfully delay recovery once they do.
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// Bounds every outbound dial and ack read this process makes toward a
 /// node (`M`/`X`, issue #6): without it, one node that accepts TCP but
 /// never answers freezes the single sweep task — and with it all
@@ -862,163 +846,26 @@ struct ClusterState {
     current_join: CurrentJoin,
 }
 
-/// Wraps either a plain TCP connection or one wrapped in TLS behind a
-/// single type, so the rest of the connection-handling code doesn't need to
-/// know which is in play. Generic over the plain (`P`) and TLS (`T`) stream
-/// types since this process both accepts connections (`ServerStream`, TLS
-/// terminated by `TlsAcceptor`) and, since staged node join added `M`/`X`, also
-/// opens its own outbound ones to nodes (`ClientStream`, TLS via
-/// `TlsConnector`) — the two use different `tokio_rustls` stream types.
-enum MaybeTls<P, T> {
-    Plain(P),
-    Tls(Box<T>),
-}
-
-impl<P: AsyncRead + Unpin, T: AsyncRead + Unpin> AsyncRead for MaybeTls<P, T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MaybeTls::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
-            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
-        }
-    }
-}
-
-impl<P: AsyncWrite + Unpin, T: AsyncWrite + Unpin> AsyncWrite for MaybeTls<P, T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            MaybeTls::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
-            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MaybeTls::Plain(stream) => Pin::new(stream).poll_flush(cx),
-            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MaybeTls::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
-            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
-        }
-    }
-}
-
 /// A connection this process accepted, plaintext or TLS-terminated.
-type ServerStream = MaybeTls<TcpStream, tokio_rustls::server::TlsStream<TcpStream>>;
+type ServerStream = infra::MaybeTls<TcpStream, tokio_rustls::server::TlsStream<TcpStream>>;
 /// A connection this process opened outbound (to a node, sending `M`/`X`),
 /// plaintext or TLS-secured.
-type ClientStream = MaybeTls<TcpStream, tokio_rustls::client::TlsStream<TcpStream>>;
-
-/// Loads a certificate chain and private key from PEM files and builds a
-/// `TlsAcceptor` for terminating incoming TLS connections.
-fn load_tls_acceptor(cert_path: &str, key_path: &str) -> io::Result<TlsAcceptor> {
-    let certs = load_cert_chain(cert_path)?;
-    let key = load_private_key(key_path)?;
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-
-    Ok(TlsAcceptor::from(Arc::new(config)))
-}
-
-/// Loads CA certificates from a PEM file and builds a `TlsConnector` that
-/// trusts only those CAs (not the system trust store), for this process's
-/// own outbound connections to a node's TLS-secured port (sending `M`/`X`).
-fn load_tls_connector(ca_path: &str) -> io::Result<TlsConnector> {
-    let certs = load_cert_chain(ca_path)?;
-    let mut roots = RootCertStore::empty();
-
-    for cert in certs {
-        roots
-            .add(cert)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    }
-
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    Ok(TlsConnector::from(Arc::new(config)))
-}
-
-fn load_cert_chain(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)?;
-    rustls_pemfile::certs(&mut BufReader::new(file)).collect()
-}
-
-fn load_private_key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)?;
-    rustls_pemfile::private_key(&mut BufReader::new(file))?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("no private key found in {path}"),
-        )
-    })
-}
-
-/// Parses the host portion of a `host:port` address into a TLS server name
-/// for certificate verification, accepting either a DNS name or IP address.
-/// A bracketed IPv6 host (`[::1]:8356`, required so the port's `:` is
-/// unambiguous) has its brackets stripped before conversion — left in,
-/// `ServerName::try_from` rejects the string both as an IP (brackets
-/// aren't part of the address) and as a DNS name (`[`/`]` aren't valid
-/// there either), so TLS to an IPv6 address would otherwise always fail.
-/// Mirrors `nanocached-node`'s own copy in `src/server.rs`.
-fn server_name_from_addr(addr: &str) -> io::Result<ServerName<'static>> {
-    let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
-    let host = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-
-    ServerName::try_from(host.to_string()).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid TLS server name {host:?}: {error}"),
-        )
-    })
-}
+type ClientStream = infra::MaybeTls<TcpStream, tokio_rustls::client::TlsStream<TcpStream>>;
 
 /// Connects to `addr` (a node, to send `M`/`X`), upgrading to TLS first if
 /// `tls_connector` is set. There is no plaintext fallback: if TLS is
-/// configured and the handshake fails, the connection attempt fails too —
-/// mirrors `nanocached-node`'s own `connect_client_stream`.
+/// configured and the handshake fails, the connection attempt fails too.
 async fn connect_client_stream(
     addr: &str,
     tls_connector: Option<&TlsConnector>,
 ) -> io::Result<ClientStream> {
-    let stream = timeout(OUTBOUND_IO_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
-    let _ = stream.set_nodelay(true);
-
-    match tls_connector {
-        Some(connector) => {
-            let server_name = server_name_from_addr(addr)?;
-            let tls_stream = timeout(
-                TLS_HANDSHAKE_TIMEOUT,
-                connector.connect(server_name, stream),
-            )
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
-
-            Ok(ClientStream::Tls(Box::new(tls_stream)))
-        }
-        None => Ok(ClientStream::Plain(stream)),
-    }
+    infra::connect_client_stream(
+        addr,
+        tls_connector,
+        OUTBOUND_IO_TIMEOUT,
+        TLS_HANDSHAKE_TIMEOUT,
+    )
+    .await
 }
 
 /// Per-connection settings that don't change once `run` starts, grouped so
@@ -1055,23 +902,6 @@ fn read_auth_secret() -> Option<Bytes> {
         .ok()
         .filter(|secret| !secret.is_empty())
         .map(Bytes::from)
-}
-
-/// Compares two byte strings without leaking, via timing, how many leading
-/// bytes matched. Length differs openly (no secret ever has a length worth
-/// hiding), but once lengths match, every byte is compared regardless of
-/// earlier mismatches.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-
-    diff == 0
 }
 
 /// Per-source-IP cooldown state guarding new registry insertions via `P`
@@ -1802,7 +1632,7 @@ async fn run_metrics_server(
                 // under EMFILE/ENFILE instead of backing off, making
                 // recovery harder right when file descriptors are already
                 // scarce.
-                if is_fd_exhaustion_error(&error) {
+                if should_backoff_after_accept_error(&error) {
                     tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
                 continue;
@@ -1894,47 +1724,6 @@ async fn serve_metrics_connection(
     };
 
     write_http_response(&mut stream, status, &body).await
-}
-
-/// Bounded read of one HTTP request head; GET path or error. Mirrors the
-/// node's copy.
-async fn read_http_request_path(stream: &mut TcpStream) -> io::Result<String> {
-    let mut head = Vec::new();
-    let mut chunk = [0u8; 1024];
-    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-        if head.len() > 8192 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "oversized http request head",
-            ));
-        }
-        let bytes_read = stream.read(&mut chunk).await?;
-        if bytes_read == 0 {
-            break;
-        }
-        head.extend_from_slice(&chunk[..bytes_read]);
-    }
-
-    let head = String::from_utf8_lossy(&head);
-    let request_line = head.lines().next().unwrap_or_default();
-    let mut parts = request_line.split(' ');
-    match (parts.next(), parts.next()) {
-        (Some("GET"), Some(path)) => Ok(path.to_string()),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not a GET request",
-        )),
-    }
-}
-
-async fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.shutdown().await
 }
 
 fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, NodeInfo>> {
@@ -3222,48 +3011,6 @@ async fn wait_for_promotion(
     }
 }
 
-async fn shutdown_signal() -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        let mut terminate = signal(SignalKind::terminate())?;
-
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await
-    }
-}
-
-/// Whether `error` (from a failed `listener.accept()`) looks like the
-/// process (EMFILE) or the whole system (ENFILE) being out of file
-/// descriptors — the two accept() failures where retrying immediately
-/// would spin the accept loop hot instead of recovering (see
-/// `ACCEPT_ERROR_BACKOFF`). EMFILE/ENFILE share the same numeric errno on
-/// every Unix this project targets (Linux, macOS/BSD), so this hardcodes
-/// them rather than pulling in a `libc` dependency for two integers. Any
-/// other accept() error (ECONNABORTED, ENOBUFS, ...) is still logged and
-/// retried immediately by the caller — just without the backoff, since
-/// those aren't a resource-pressure condition an immediate retry would
-/// make worse.
-#[cfg(unix)]
-fn is_fd_exhaustion_error(error: &io::Error) -> bool {
-    const EMFILE: i32 = 24;
-    const ENFILE: i32 = 23;
-    matches!(error.raw_os_error(), Some(EMFILE) | Some(ENFILE))
-}
-
-#[cfg(not(unix))]
-fn is_fd_exhaustion_error(_error: &io::Error) -> bool {
-    false
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run(
     address: &str,
@@ -3308,10 +3055,11 @@ async fn run(
         startup_grace.as_secs()
     );
 
-    // Issue #124: the operations sidecar — /metrics + /healthz +
-    // /readyz, mirroring the node's (independent re-implementation per
-    // the no-shared-modules policy). /readyz answers 503 during the
-    // startup grace, exactly the window where `L`/`Q` answer `B`.
+    // Issue #124: the operations sidecar — /metrics + /healthz + /readyz.
+    // The HTTP framing and the listener's own connection cap are
+    // `nanocached::infra` (shared with the node and proxy); what each
+    // endpoint reports is this binary's own. /readyz answers 503 during
+    // the startup grace, exactly the window where `L`/`Q` answer `B`.
     if let Some(metrics_address) = &metrics_address {
         let metrics_listener = TcpListener::bind(metrics_address.as_str()).await?;
         println!("INFO metrics endpoint listening on {metrics_address}");
@@ -3408,7 +3156,7 @@ async fn run(
                     Ok(pair) => pair,
                     Err(error) => {
                         eprintln!("WARN accept failed: {error}");
-                        if is_fd_exhaustion_error(&error) {
+                        if should_backoff_after_accept_error(&error) {
                             tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                         }
                         continue;
@@ -3455,96 +3203,6 @@ async fn run(
     Ok(())
 }
 
-/// Live connection counts per source IP, backing `MAX_CONNECTIONS_PER_IP`
-/// (see that constant). Mirrors `src/server.rs`'s own `PerIpConnections`:
-/// a plain `Mutex<HashMap<..>>` rather than anything fancier, since every
-/// access here is a brief increment/decrement with no I/O under the lock,
-/// and every accepted connection already pays for a `Semaphore`
-/// acquisition on the shared `connection_limit`, so this adds no
-/// bottleneck relative to that existing one.
-type PerIpConnections = Arc<Mutex<HashMap<std::net::IpAddr, usize>>>;
-
-/// Releases one `MAX_CONNECTIONS_PER_IP` slot on drop — the per-IP
-/// counterpart to the `Semaphore` permit `dispatch_connection` already
-/// holds for `MAX_CONNECTIONS` (`_connection_permit`, which frees itself
-/// the same way). Mirrors `src/server.rs`'s own `PerIpConnectionGuard`.
-struct PerIpConnectionGuard {
-    counts: PerIpConnections,
-    ip: std::net::IpAddr,
-}
-
-impl Drop for PerIpConnectionGuard {
-    fn drop(&mut self) {
-        let mut counts = self
-            .counts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(count) = counts.get_mut(&self.ip) {
-            *count -= 1;
-            if *count == 0 {
-                // Don't let a long-lived process accumulate one entry
-                // per distinct IP that has ever connected, most of which
-                // will never connect again.
-                counts.remove(&self.ip);
-            }
-        }
-    }
-}
-
-/// Reserves one of `MAX_CONNECTIONS_PER_IP` slots for `ip`, or `None` if
-/// it's already at the cap — see `MAX_CONNECTIONS_PER_IP`. Mirrors
-/// `src/server.rs`'s own `try_acquire_per_ip`.
-fn try_acquire_per_ip(
-    counts: &PerIpConnections,
-    ip: std::net::IpAddr,
-) -> Option<PerIpConnectionGuard> {
-    let mut guard = counts
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let count = guard.entry(ip).or_insert(0);
-    if *count >= MAX_CONNECTIONS_PER_IP {
-        return None;
-    }
-    *count += 1;
-    drop(guard);
-
-    Some(PerIpConnectionGuard {
-        counts: Arc::clone(counts),
-        ip,
-    })
-}
-
-/// Best-effort "Busy" reply on `stream` before the caller drops it —
-/// shared by every over-limit rejection in `dispatch_connection`
-/// (`MAX_CONNECTIONS` and, per source IP, `MAX_CONNECTIONS_PER_IP`).
-/// Mirrors `src/server.rs`'s own `reject_over_limit`. A TLS-configured
-/// server has no plaintext channel to answer on before the handshake
-/// completes (TLS support: no plaintext fallback once TLS is set) — it just
-/// closes. A plaintext server can still reply on the raw stream. Bounded
-/// by `TLS_HANDSHAKE_TIMEOUT` (reused rather than a new constant: a peer
-/// that never reads this reply must not leak the task by leaving the
-/// write pending indefinitely — the same reasoning as the handshake
-/// itself).
-async fn reject_over_limit(
-    mut stream: TcpStream,
-    address: SocketAddr,
-    tls_acceptor: &Option<TlsAcceptor>,
-) {
-    if tls_acceptor.is_none() {
-        match timeout(TLS_HANDSHAKE_TIMEOUT, stream.write_all(b"B\n")).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                eprintln!("WARN failed to send busy response to {address}: {error}");
-            }
-            Err(_) => {
-                eprintln!("WARN sending busy response to {address} timed out");
-            }
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn dispatch_connection(
     stream: TcpStream,
@@ -3583,7 +3241,14 @@ fn dispatch_connection(
         let permit = match connection_limit.try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                reject_over_limit(stream, address, &config.tls_acceptor).await;
+                reject_over_limit(
+                    stream,
+                    address,
+                    &config.tls_acceptor,
+                    TLS_HANDSHAKE_TIMEOUT,
+                    b"B\n",
+                )
+                .await;
                 return;
             }
         };
@@ -3596,13 +3261,21 @@ fn dispatch_connection(
         // the global permit — see `MAX_CONNECTIONS_PER_IP`. Distinct
         // from `MAX_WAITING_PER_SOURCE_IP` (see that constant), which
         // this does not replace.
-        let per_ip_permit = match try_acquire_per_ip(&per_ip_connections, address.ip()) {
-            Some(permit) => permit,
-            None => {
-                reject_over_limit(stream, address, &config.tls_acceptor).await;
-                return;
-            }
-        };
+        let per_ip_permit =
+            match try_acquire_per_ip(&per_ip_connections, address.ip(), MAX_CONNECTIONS_PER_IP) {
+                Some(permit) => permit,
+                None => {
+                    reject_over_limit(
+                        stream,
+                        address,
+                        &config.tls_acceptor,
+                        TLS_HANDSHAKE_TIMEOUT,
+                        b"B\n",
+                    )
+                    .await;
+                    return;
+                }
+            };
 
         let stream: ServerStream = match &config.tls_acceptor {
             Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
@@ -5101,6 +4774,9 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nanocached::infra::server_name_from_addr;
+    use rustls::pki_types::{PrivateKeyDer, ServerName};
+    use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
     #[test]
     fn parse_reports_incomplete_before_the_header_is_fully_buffered() {
@@ -10107,21 +9783,24 @@ mod tests {
 
         let mut guards = Vec::new();
         for _ in 0..MAX_CONNECTIONS_PER_IP {
-            guards.push(try_acquire_per_ip(&counts, ip).expect("under the per-IP cap"));
+            guards.push(
+                try_acquire_per_ip(&counts, ip, MAX_CONNECTIONS_PER_IP)
+                    .expect("under the per-IP cap"),
+            );
         }
 
         assert!(
-            try_acquire_per_ip(&counts, ip).is_none(),
+            try_acquire_per_ip(&counts, ip, MAX_CONNECTIONS_PER_IP).is_none(),
             "the per-IP cap must reject a connection once MAX_CONNECTIONS_PER_IP is reached"
         );
 
         // A different source IP has its own, independent budget.
         let other_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
-        assert!(try_acquire_per_ip(&counts, other_ip).is_some());
+        assert!(try_acquire_per_ip(&counts, other_ip, MAX_CONNECTIONS_PER_IP).is_some());
 
         // Dropping one guard frees its slot for the same IP again.
         guards.pop();
-        assert!(try_acquire_per_ip(&counts, ip).is_some());
+        assert!(try_acquire_per_ip(&counts, ip, MAX_CONNECTIONS_PER_IP).is_some());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
