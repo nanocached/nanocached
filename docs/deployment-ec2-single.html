@@ -154,11 +154,11 @@ Requires=docker.service
 
 [Service]
 ExecStartPre=-/usr/bin/docker rm -f nanocached-node
-ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:e68dcfecf3c66d9cb1dadc60b98f655e95f011128cb0dc8004f8679138b30bc2
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:7ca62b477976620b9a81d8d903683187fa901a4ef09d74f23ab8371b0b147623
 ExecStart=/usr/bin/docker run --rm --name nanocached-node \
   --network host \
   --env-file /etc/nanocached/env \
-  ghcr.io/nanocached/nanocached-node@sha256:e68dcfecf3c66d9cb1dadc60b98f655e95f011128cb0dc8004f8679138b30bc2 \
+  ghcr.io/nanocached/nanocached-node@sha256:7ca62b477976620b9a81d8d903683187fa901a4ef09d74f23ab8371b0b147623 \
   --host 0.0.0.0 --port 8356 --metrics-port 9356 \
   --max-memory 1073741824
 ExecStop=/usr/bin/docker stop -t 30 nanocached-node
@@ -185,10 +185,10 @@ systemctl enable --now nanocached-node</code></pre>
   planner</a> turns a hit-rate target into a number.</li>
   <li><b>The image</b> — pinned by digest so an instance replacement
   can't silently pick up a different build. The digest above is the
-  <code>0.4.3</code> release (<code>0.4.0</code> was the first tag with
+  <code>0.4.4</code> release (<code>0.4.0</code> was the first tag with
   <code>--metrics-port</code> and <code>--drain-timeout</code>;
   <code>0.3.0</code> refuses this command line). <code>docker buildx
-  imagetools inspect ghcr.io/nanocached/nanocached-node:0.4.3</code>
+  imagetools inspect ghcr.io/nanocached/nanocached-node:0.4.4</code>
   prints it, and the same command against a newer tag prints the digest
   to move to.</li>
 </ul>
