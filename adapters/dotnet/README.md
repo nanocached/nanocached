@@ -19,6 +19,14 @@ run against a nanocached cluster.
 - Values are opaque `byte[]` — the SPI's own type — with no serializer
   involved.
 
+## Install
+
+```sh
+dotnet add package Nanocached.Caching
+```
+
+Depends on the `Nanocached` SDK package of the same version.
+
 ## Setup
 
 Two ways to wire this up, matching the two ways an application already

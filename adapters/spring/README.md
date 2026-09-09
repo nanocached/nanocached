@@ -21,6 +21,24 @@ friends run against a nanocached cluster.
   Spring's own cache implementations; disable with
   `allowNullValues(false)`.
 
+## Install
+
+```groovy
+implementation 'org.nanocached:nanocached-spring:0.4.4'
+```
+
+```xml
+<dependency>
+  <groupId>org.nanocached</groupId>
+  <artifactId>nanocached-spring</artifactId>
+  <version>0.4.4</version>
+</dependency>
+```
+
+Brings in the `org.nanocached:nanocached` SDK of the same version. Spring
+Boot applications should use the starter instead
+(`nanocached-spring-boot-starter`), which depends on this module.
+
 ## Setup
 
 Two beans set the adapter up — the SDK client and the manager — plus

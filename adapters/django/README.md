@@ -35,6 +35,14 @@ and friends run against a nanocached cluster.
   `INCR`'s own decimal-ASCII counter grammar instead, so `incr`/`decr`
   can operate on it server-side. See "Counter storage" below.
 
+## Install
+
+```sh
+pip install nanocached-django
+```
+
+Pulls in the `nanocached` SDK of the same version and `Django>=4.2`.
+
 ## Setup
 
 Point `CACHES["default"]["BACKEND"]` at this class — adding the

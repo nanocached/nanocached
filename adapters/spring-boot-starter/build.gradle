@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'org.nanocached'
-version = '0.1.0'
+version = '0.4.4'
 
 mavenPublishing {
     publishToMavenCentral(true)
@@ -48,7 +48,7 @@ dependencies {
     // A starter is a dependency aggregator: pulling this in is meant to be
     // the only nanocached-related dependency a Boot app needs, so both the
     // adapter and Boot's own autoconfigure/base starter are `api`.
-    api 'org.nanocached:nanocached-spring:0.1.0'
+    api 'org.nanocached:nanocached-spring:0.4.4'
     api platform('org.springframework.boot:spring-boot-dependencies:3.5.3')
     api 'org.springframework.boot:spring-boot-starter'
     implementation 'org.springframework.boot:spring-boot-autoconfigure'

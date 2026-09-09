@@ -1,6 +1,6 @@
 {
   "name": "nanocached-cache-manager",
-  "version": "0.1.0",
+  "version": "0.4.4",
   "description": "cache-manager v5 store adapter for nanocached, a tiny distributed cache with client-side replication",
   "license": "MIT",
   "repository": {

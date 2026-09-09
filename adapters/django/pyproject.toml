@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nanocached-django"
-version = "0.1.0"
+version = "0.4.4"
 description = "Django cache backend for nanocached, a tiny distributed cache with client-side replication"
 readme = "README.md"
 license = "MIT"
@@ -19,9 +19,11 @@ classifiers = [
   "Topic :: Software Development :: Libraries",
 ]
 # Not part of the six-language SDK parity policy (#25) — this is an
-# ecosystem-specific adapter on top of the Python SDK core, versioned and
-# released on its own, like the Spring adapter is on top of the Java SDK.
-dependencies = ["nanocached>=0.3", "Django>=4.2"]
+# ecosystem-specific adapter on top of the Python SDK core, like the
+# Spring adapter is on top of the Java SDK. Released at the project's one
+# shared version (server, SDKs and adapters move together), pinned to the
+# SDK release of the same cycle.
+dependencies = ["nanocached>=0.4.4", "Django>=4.2"]
 
 [project.urls]
 Homepage = "https://nanocached.org"
