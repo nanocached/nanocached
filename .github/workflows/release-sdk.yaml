@@ -230,17 +230,23 @@ jobs:
       - run: npm install -g npm@latest
 
       # `pnpm install` links the sibling SDK checkout (the manifest's
-      # `link:../../sdk/typescript`), which prepublishOnly's test + build
-      # run against. The *published* manifest must depend on the SDK
-      # release of the same version instead — a `link:` spec is
-      # meaningless outside this repo — so the dependency is rewritten
-      # right before `npm publish`; node_modules keeps the link.
+      # `link:../../sdk/typescript`), which the test + build run against.
+      # The *published* manifest must depend on the SDK release of the
+      # same version instead — a `link:` spec is meaningless outside this
+      # repo — so the dependency is rewritten after test + build and right
+      # before `npm publish`. The rewrite makes package.json disagree with
+      # pnpm-lock.yaml, and pnpm 11 refuses to `pnpm run` anything in that
+      # state (ERR_PNPM_OUTDATED_LOCKFILE — this is what failed the first
+      # 0.4.4 attempt), so test + build run first and the publish skips
+      # prepublishOnly (which would re-run them) with --ignore-scripts.
       - name: Build and publish to npm
         working-directory: adapters/${{ steps.tag.outputs.name }}
         run: |
           pnpm install --frozen-lockfile
+          pnpm test
+          pnpm build
           npm pkg set "dependencies.nanocached=^${{ steps.tag.outputs.ver }}"
-          npm publish --access public
+          npm publish --access public --ignore-scripts
 
   adapter-pypi:
     if: startsWith(github.ref_name, 'adapter/django/v')
