@@ -175,20 +175,28 @@ existed, err := client.Delete("greeting")</code></pre>
   that lowers one is expected to restore it. Applications configure
   what they need through the connect options instead.</li>
   <li><b>Framework adapters</b> — separate, ecosystem-specific packages on
-  top of the SDKs (outside the SDK parity policy): Spring
-  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/spring">adapters/spring</a>,
-  plus a Spring Boot starter at
+  top of the SDKs (outside the SDK parity policy), published at the same
+  version as the SDK they sit on and depending on that SDK release: Spring
+  (<code>org.nanocached:nanocached-spring</code>,
+  <a href="https://github.com/nanocached/nanocached/tree/main/adapters/spring">adapters/spring</a>,
+  plus a Spring Boot starter,
+  <code>org.nanocached:nanocached-spring-boot-starter</code>, at
   <a href="https://github.com/nanocached/nanocached/tree/main/adapters/spring-boot-starter">adapters/spring-boot-starter</a>),
   ASP.NET Core's <code>IDistributedCache</code>
-  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/dotnet">adapters/dotnet</a>),
+  (<code>dotnet add package Nanocached.Caching</code>,
+  <a href="https://github.com/nanocached/nanocached/tree/main/adapters/dotnet">adapters/dotnet</a>),
   a Django cache backend
-  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/django">adapters/django</a>),
+  (<code>pip install nanocached-django</code>,
+  <a href="https://github.com/nanocached/nanocached/tree/main/adapters/django">adapters/django</a>),
   a cache-manager v5 store for Node
-  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/cache-manager">adapters/cache-manager</a>),
+  (<code>npm install nanocached-cache-manager</code>,
+  <a href="https://github.com/nanocached/nanocached/tree/main/adapters/cache-manager">adapters/cache-manager</a>),
   a JSR-107 (<code>javax.cache</code>) provider
-  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/jcache">adapters/jcache</a>),
+  (<code>org.nanocached:nanocached-jcache</code>,
+  <a href="https://github.com/nanocached/nanocached/tree/main/adapters/jcache">adapters/jcache</a>),
   and a Keyv storage adapter for cache-manager v6+/NestJS 11
-  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/keyv">adapters/keyv</a>).</li>
+  (<code>npm install nanocached-keyv</code>,
+  <a href="https://github.com/nanocached/nanocached/tree/main/adapters/keyv">adapters/keyv</a>).</li>
   <li><b>Addresses</b> — one list-shaped option in every SDK; list every
   discovery replica, and connect and refresh try them in order, skipping
   busy or unreachable replicas.</li>

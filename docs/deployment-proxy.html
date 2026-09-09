@@ -136,7 +136,7 @@ that lets the cluster's group talk to itself on 8356–8357.</p>
 <p><code>td-proxy.json</code>:</p>
 <pre><code>[{
   "name": "nanocached-proxy",
-  "image": "ghcr.io/nanocached/nanocached-proxy@sha256:5f82f77057c1e7d7caea5299904610b994c4ccdcc6f3373acebff2aa128c96e1",
+  "image": "ghcr.io/nanocached/nanocached-proxy@sha256:268707fa53a4791ee07f493c8ead20f481106226a95de4ab2cb25db009bddc46",
   "essential": true,
   "command": ["--host", "0.0.0.0", "--port", "8358", "--discovery", "disc.nanocached.local:8357",
               "--drain-timeout", "20", "--metrics-port", "9358"],
@@ -312,7 +312,7 @@ spec:
             matchLabels: {app: nanocached-proxy}
       containers:
         - name: proxy
-          image: ghcr.io/nanocached/nanocached-proxy@sha256:5f82f77057c1e7d7caea5299904610b994c4ccdcc6f3373acebff2aa128c96e1
+          image: ghcr.io/nanocached/nanocached-proxy@sha256:268707fa53a4791ee07f493c8ead20f481106226a95de4ab2cb25db009bddc46
           args: ["--host", "0.0.0.0", "--port", "8358", "--discovery", "disc:8357",
                  "--drain-timeout", "20", "--metrics-port", "9358"]
           envFrom:
