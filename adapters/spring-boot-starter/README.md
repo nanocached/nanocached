@@ -5,6 +5,23 @@ Spring Boot autoconfiguration for [`nanocached-spring`](../spring): the same
 of the two manual `@Bean` methods that module's README describes. Adding
 this dependency and setting `nanocached.addresses` is the whole setup.
 
+## Install
+
+```groovy
+implementation 'org.nanocached:nanocached-spring-boot-starter:0.4.4'
+```
+
+```xml
+<dependency>
+  <groupId>org.nanocached</groupId>
+  <artifactId>nanocached-spring-boot-starter</artifactId>
+  <version>0.4.4</version>
+</dependency>
+```
+
+Brings in `nanocached-spring` and the `org.nanocached:nanocached` SDK of
+the same version, plus `spring-boot-starter`.
+
 ## Setup
 
 ```yaml

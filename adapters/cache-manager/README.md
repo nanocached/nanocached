@@ -32,6 +32,16 @@ nanocached cluster.
   always returns `-1`, which `wrap()` treats as "unknown" and never
   refreshes ahead for. See "Refresh-ahead" below.
 
+## Install
+
+```sh
+npm install nanocached-cache-manager cache-manager@5
+```
+
+`cache-manager` v5 is a peer dependency; the `nanocached` SDK comes with
+the package (each adapter release depends on the SDK release of the same
+version).
+
 ## Setup
 
 `nanocachedStore` is a `cache-manager` v5 store *factory*: pass it as

@@ -23,6 +23,16 @@ adapters. If you're still on `cache-manager` v5, see the sibling
   all deliberately omitted** — see "Honest subset" below for why each one
   is the *more correct* choice, not just less code.
 
+## Install
+
+```sh
+npm install nanocached-keyv keyv
+```
+
+`keyv` v5 is a peer dependency; the `nanocached` SDK comes with the
+package (each adapter release depends on the SDK release of the same
+version).
+
 ## Setup
 
 ```ts

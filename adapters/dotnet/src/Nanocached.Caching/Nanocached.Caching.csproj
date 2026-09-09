@@ -8,7 +8,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
 
     <PackageId>Nanocached.Caching</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.4.4</Version>
     <Authors>Takashi Yamashina</Authors>
     <Description>IDistributedCache adapter for nanocached, on top of the Nanocached .NET SDK.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -29,8 +29,11 @@
   <ItemGroup>
     <!-- Separate module from its SDK core (issue #108's shared spec) —
          outside the six-language SDK parity policy (issue #25) — but
-         still built from the sibling checkout, not a published package,
-         so a fresh clone needs no locally-installed SDK artifact. -->
+         built from the sibling checkout, so a fresh clone needs no
+         locally-installed SDK artifact. `dotnet pack` turns this into a
+         dependency on the Nanocached package at the SDK project's version,
+         which is the same release version (server, SDKs and adapters
+         move together). -->
     <ProjectReference Include="../../../../sdk/dotnet/src/Nanocached/Nanocached.csproj" />
   </ItemGroup>
 

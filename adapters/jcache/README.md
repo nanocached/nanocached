@@ -28,6 +28,23 @@ over.
   create/update/remove, never a remote client/JVM's changes and never
   `EXPIRED`.
 
+## Install
+
+```groovy
+implementation 'org.nanocached:nanocached-jcache:0.4.4'
+```
+
+```xml
+<dependency>
+  <groupId>org.nanocached</groupId>
+  <artifactId>nanocached-jcache</artifactId>
+  <version>0.4.4</version>
+</dependency>
+```
+
+Brings in the `org.nanocached:nanocached` SDK of the same version and
+`javax.cache:cache-api`.
+
 ## Setup
 
 Get a `CacheManager` through the standard JSR-107 API. Connection settings
