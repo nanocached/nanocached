@@ -3873,16 +3873,25 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
     requests already do — and fail only when no node is reachable."""
 
     async def start_cluster(self, dead: set[str]):
+        # unused_port() frees the port the instant it returns it, and on
+        # Linux that port can be handed straight back out to the very next
+        # bind — so it must be the last socket operation here, after every
+        # real listener (MockNode, MockDiscovery) is already bound. Doing
+        # it earlier let a later bind steal the "dead" port out from under
+        # this test, turning an intentionally-unreachable address into a
+        # live (but non-node) one (#527).
         nodes = {}
-        entries = []
-        for name in NAMES:
-            if name in dead:
-                entries.append((name, f"127.0.0.1:{await unused_port()}"))
-            else:
+        entries: list[tuple[str, str] | None] = [None] * len(NAMES)
+        for i, name in enumerate(NAMES):
+            if name not in dead:
                 node = await MockNode().start()
                 nodes[name] = node
-                entries.append((name, node.address))
-        discovery = await MockDiscovery(entries, replication=2).start()
+                entries[i] = (name, node.address)
+        discovery = await MockDiscovery([], replication=2).start()
+        for i, name in enumerate(NAMES):
+            if name in dead:
+                entries[i] = (name, f"127.0.0.1:{await unused_port()}")
+        discovery.nodes = entries
         return nodes, discovery
 
     def owners_of(self, key: str):
