@@ -233,6 +233,22 @@ class NanocachedCachingProviderTest {
     }
 
     @Test
+    void malformedAddressesFailWithACacheExceptionNamingTheOffendingEntry() {
+        try (CachingProvider provider = new NanocachedCachingProvider()) {
+            for (String bad : new String[] {"localhost", "localhost:", ":8357", "localhost:abc", "localhost:0",
+                "localhost:70000", "127.0.0.1:8357,localhost"}) {
+                Properties properties = new Properties();
+                properties.setProperty("nanocached.addresses", bad);
+                CacheException error = assertThrows(
+                        CacheException.class,
+                        () -> provider.getCacheManager(URI.create("test:bad-address"), null, properties),
+                        bad);
+                assertTrue(error.getMessage().contains("nanocached.addresses"), error.getMessage());
+            }
+        }
+    }
+
+    @Test
     void theBareNoArgGetCacheManagerUsesEmptyDefaultPropertiesAndSoHasNoAddresses() {
         // This adapter only reads connection settings from the Properties
         // passed explicitly to getCacheManager(uri, classLoader,

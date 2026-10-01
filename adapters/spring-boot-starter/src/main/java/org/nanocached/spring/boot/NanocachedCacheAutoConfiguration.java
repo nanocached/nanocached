@@ -112,8 +112,33 @@ public class NanocachedCacheAutoConfiguration {
      * supported by that convention any more than they are there. */
     private static List<NanocachedClient.Address> parseAddresses(List<String> addresses) {
         return addresses.stream()
-                .map(address -> address.split(":", 2))
-                .map(parts -> new NanocachedClient.Address(parts[0], Integer.parseInt(parts[1])))
+                .map(String::trim)
+                .map(NanocachedCacheAutoConfiguration::parseAddress)
                 .toList();
+    }
+
+    /** One {@code host:port}; the last colon splits, so a bracketed IPv6 host works. */
+    private static NanocachedClient.Address parseAddress(String address) {
+        int colon = address.lastIndexOf(':');
+        if (colon <= 0 || colon == address.length() - 1) {
+            throw new IllegalArgumentException(
+                    "nanocached.addresses: expected host:port, got \"" + address + "\"");
+        }
+        String host = address.substring(0, colon);
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
+        }
+        int port;
+        try {
+            port = Integer.parseInt(address.substring(colon + 1));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                    "nanocached.addresses: port is not a number in \"" + address + "\"");
+        }
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException(
+                    "nanocached.addresses: port out of range in \"" + address + "\"");
+        }
+        return new NanocachedClient.Address(host, port);
     }
 }

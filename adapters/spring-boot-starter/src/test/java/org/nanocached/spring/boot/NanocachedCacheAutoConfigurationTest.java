@@ -160,6 +160,20 @@ class NanocachedCacheAutoConfigurationTest {
                 "no nanocached.addresses means the starter must not attempt a connection");
     }
 
+    @Test
+    void malformedAddressesFailStartupWithAMessageNamingTheOffendingEntry() {
+        for (String bad : new String[] {"localhost", "localhost:", ":8357", "localhost:abc", "localhost:0",
+            "localhost:70000"}) {
+            Exception error = assertThrows(Exception.class, () -> boot(YamlOnlyConfig.class, "nanocached.addresses=" + bad), bad);
+            Throwable cause = error;
+            while (cause != null && !(cause instanceof IllegalArgumentException)) {
+                cause = cause.getCause();
+            }
+            assertTrue(cause != null, "no IllegalArgumentException in the cause chain for " + bad);
+            assertTrue(cause.getMessage().contains("nanocached.addresses"), cause.getMessage());
+        }
+    }
+
     // issue #388: the idiomatic YAML list form binds as indexed keys
     // (nanocached.addresses[0], ...) and never produces the literal
     // nanocached.addresses key — @ConditionalOnProperty on the literal

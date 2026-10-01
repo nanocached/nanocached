@@ -2,7 +2,7 @@
 
 Minimal programs, one per SDK, for exercising a real discovery-fronted
 cluster from a test host — used for the AWS scenario tests (node join,
-node death, mid-migration death, queued joins) that verified v1.0.0.
+node death, mid-migration death, queued joins).
 Every program reads its target addresses from the same environment
 variable:
 
