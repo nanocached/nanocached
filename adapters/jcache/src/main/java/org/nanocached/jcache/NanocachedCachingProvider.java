@@ -142,11 +142,36 @@ public final class NanocachedCachingProvider implements CachingProvider {
     }
 
     private static List<NanocachedClient.Address> parseAddresses(String addresses) {
-        return List.of(addresses.split(",")).stream()
-                .map(String::trim)
-                .map(address -> address.split(":", 2))
-                .map(parts -> new NanocachedClient.Address(parts[0], Integer.parseInt(parts[1])))
-                .toList();
+        try {
+            return List.of(addresses.split(",")).stream()
+                    .map(String::trim)
+                    .map(NanocachedCachingProvider::parseAddress)
+                    .toList();
+        } catch (IllegalArgumentException e) {
+            throw new CacheException("nanocached-jcache: \"nanocached.addresses\": " + e.getMessage(), e);
+        }
+    }
+
+    /** One {@code host:port}; the last colon splits, so a bracketed IPv6 host works. */
+    private static NanocachedClient.Address parseAddress(String address) {
+        int colon = address.lastIndexOf(':');
+        if (colon <= 0 || colon == address.length() - 1) {
+            throw new IllegalArgumentException("expected host:port, got \"" + address + "\"");
+        }
+        String host = address.substring(0, colon);
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
+        }
+        int port;
+        try {
+            port = Integer.parseInt(address.substring(colon + 1));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("port is not a number in \"" + address + "\"");
+        }
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException("port out of range in \"" + address + "\"");
+        }
+        return new NanocachedClient.Address(host, port);
     }
 
     @Override
