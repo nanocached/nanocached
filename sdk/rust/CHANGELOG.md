@@ -16,7 +16,7 @@ adapters at one version, whether or not a component changed.
 
 ### Fixed
 
-- `connect()` now rejects `read_hedge_after` combined with `via_proxy(true)`
+- **Breaking:** `connect()` now rejects `read_hedge_after` combined with `via_proxy(true)`
   and `ca` combined with `tls(false)`, both previously silently inert
   (issue #488).
 - The per-request timeout is now progress-based, like the Go SDK: a
