@@ -410,6 +410,13 @@ B\n
   (Go 1.22+, standard library only, module
   `github.com/nanocached/nanocached/sdk/go`).
 
+## Compatibility
+
+The project is pre-1.0: any release may break compatibility, without a
+deprecation cycle. What 1.0.0 will freeze (the client wire protocol and the
+public API of every SDK) is described on the
+[compatibility page](https://nanocached.org/compatibility.html).
+
 ## Capacity planning
 
 Memory, effective capacity, replication (R), TTL, and hit rate trade off

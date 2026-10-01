@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compatibility — nanocached</title>
+<meta name="description" content="What nanocached promises to keep stable from 1.0.0: the client wire protocol, every SDK's public API, and how breaking changes are released.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <nav>
+    <a class="brand" href="index.html"><img src="favicon.svg" alt=""><span><b>nano</b>cached</span></a>
+    <div class="links">
+      <a href="getting-started.html">Getting started</a>
+      <a href="protocol.html">Protocol</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="sdks.html">SDKs</a>
+      <a href="deployment.html">Deployment</a>
+      <a href="capacity-planner.html">Capacity planner</a>
+      <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+
+<h1>Compatibility</h1>
+<p class="lede">What stays stable once nanocached reaches 1.0.0, and what
+does not. The project is still on 0.x, so this page describes the rules
+that take effect <em>at</em> 1.0.0; until then only the
+<a href="#pre-1">pre-1.0 rule</a> applies.</p>
+
+<h2 id="versioning">Versioning</h2>
+<p>The server (<code>nanocached-node</code>, <code>nanocached-proxy</code>,
+<code>nanocached-discovery</code>), the six SDKs and the framework adapters
+are released together and carry the same version number, whether or not a
+given component changed. Versions follow
+<a href="https://semver.org/">semantic versioning</a>: a breaking change
+to anything on this page raises the major version, new
+backward-compatible features raise the minor version, fixes raise the
+patch version.</p>
+
+<h2 id="wire">Client wire protocol: frozen</h2>
+<p>From 1.0.0 the client-facing wire protocol is frozen. Covered:</p>
+<ul>
+  <li>every command a caching client sends — <code>A</code>,
+  <code>G</code>/<code>S</code>/<code>D</code>,
+  <code>g</code>/<code>s</code>/<code>d</code>, <code>c</code>/<code>F</code>,
+  <code>i</code>, <code>k</code>/<code>x</code>, <code>m</code>/<code>o</code>
+  — together with the two membership queries SDKs send,
+  <code>L</code> and <code>Q</code>;</li>
+  <li>every response and status those commands can produce, and the
+  <a href="protocol.html#tags">response tags</a> capability.</li>
+</ul>
+<p>Frozen means no 1.x release changes the syntax or the meaning of
+anything above, and none removes it. A 1.x release may <em>add</em> a new
+command, a new optional trailing token or a new status; an older node that
+does not know the addition answers <code>E\n</code> and closes the
+connection (see <a href="protocol.html#namespaces">namespaces</a>), so a
+client must not use a newer feature before every node has been
+upgraded. Any other change to this protocol waits for a new major
+version.</p>
+
+<h3 id="internal">Not frozen: cluster-internal frames</h3>
+<p>The frames that only nodes, discovery servers and proxies exchange with
+each other — join, heartbeat, announce, migrate, cancel, complete, proxy
+announce, handoff and leave, node roster (see
+<a href="protocol.html#cluster">cluster-internal commands</a>) — are
+versioned with the server and may change in any release, including a patch
+release. Run one server version across a cluster; a mixed-version cluster
+is only a transient rolling-upgrade state, in the order the changelog
+gives.</p>
+
+<h2 id="sdk">SDK public API: all six SDKs</h2>
+<p>From 1.0.0 the public API of each of the Rust, Go, TypeScript, Python,
+Java and .NET SDKs is covered: the exported types, functions, methods,
+options and their documented behavior, and the error types and the
+conditions that raise them. A breaking change to any of them is released
+only as a new major version. Behavior that an SDK's documentation
+describes as a limit or as unspecified is not covered.</p>
+<p>The framework adapters (Spring, Spring Boot starter, JCache, Django,
+cache-manager, Keyv, and <code>Nanocached.Caching</code> for .NET) ship at the same version and follow the
+same rule for their public API and configuration keys.</p>
+
+<h2 id="deprecation">No deprecation period</h2>
+<p>nanocached does not deprecate before it removes. There is no release
+that keeps an old form working alongside its replacement with a warning.
+A breaking change lands in a major release, takes effect there, and is
+recorded in the changelog of every affected component. Pin the major
+version you depend on; upgrading to the next major is the point at which
+you read the changelog.</p>
+
+<h2 id="not-covered">Not covered by this page</h2>
+<p>These have no compatibility promise yet; a decision for each is still
+open:</p>
+<ul>
+  <li>command-line flags and environment variables of the server
+  binaries;</li>
+  <li>metric names and the operations endpoints (<code>/healthz</code>,
+  <code>/readyz</code>, <code>/metrics</code>);</li>
+  <li>the container image layout and tags other than the version tag;</li>
+  <li>anything under the <code>tests/</code> and <code>tools/</code>
+  directories.</li>
+</ul>
+
+<h2 id="pre-1">Before 1.0.0</h2>
+<p>On the 0.x line none of the above is promised. A breaking change may
+ship in any release, minor or patch, without a deprecation cycle; the
+Rust SDK's <a href="https://github.com/nanocached/nanocached/blob/main/sdk/rust/CHANGELOG.md">changelog</a>
+lists the ones so far. Pin an exact version.</p>
+
+</main>
+
+<footer class="site-footer">
+  <div>
+    <span>nanocached</span>
+    <a href="https://github.com/nanocached/nanocached/blob/main/LICENSE">MIT License</a>
+    <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    <a href="https://github.com/nanocached/nanocached/issues">Issues</a>
+  </div>
+</footer>
+
+</body>
+</html>
