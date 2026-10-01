@@ -36,6 +36,10 @@ declared byte lengths. Bodies have no terminator and may contain
 arbitrary bytes. One-byte commands keep overhead minimal while frames
 stay readable during development.</p>
 
+<p>From 1.0.0 the client-facing protocol on this page is frozen; the
+<a href="compatibility.html#wire">compatibility policy</a> says what that
+covers.</p>
+
 <p>Multiple requests per connection and pipelining are both supported. A
 <code>&lt;key-length&gt;</code> of <code>0</code> is rejected for every
 command; there is no dedicated key or value length limit beyond the
@@ -439,7 +443,9 @@ and acks <code>S\n</code> either way, since a key already present there
 is a success for the sender, not a conflict. An ordinary decommission
 handoff never sets it. These are versioned with the
 server and not part of
-the public caching API; the server
+the public caching API, so the
+<a href="compatibility.html#internal">compatibility policy</a> does not
+freeze them; the server
 source documents them in detail.</p>
 
 <h2 id="example">A complete session</h2>
