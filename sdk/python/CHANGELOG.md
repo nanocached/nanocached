@@ -173,7 +173,9 @@ adapters at one version, whether or not a component changed.
   simultaneous hit, so hedging cannot turn a hit into a miss (issue #387).
   Losing legs that finish in the same tick as the winner are no longer
   leaked (issue #229); legs are no longer leaked when the caller cancels the
-  read, for example with `asyncio.wait_for` (issue #324); a leg registered
+  read, for example with `asyncio.wait_for` (issue #324), including when
+  the cancellation lands while joining an over-cap batch of losing legs
+  (issue #364); a leg registered
   while `close()` is running is no longer missed by its drain (issue #91);
   and the number of detached losing legs is capped at 32, with further legs
   awaited inline (issue #192).
@@ -191,9 +193,9 @@ adapters at one version, whether or not a component changed.
 - `HashRing` keeps only the first occurrence of a duplicated node name, and
   the initial connect no longer dials or installs a duplicated name twice,
   which had inflated that node's share of the ring (issues #360, #461).
-- `_open_cluster`: a discovery roster entry that is not a node no longer
-  raises `AttributeError` that masked the intended error and leaked
-  sockets (pass-7 audit).
+- `connect()`: a discovery roster entry that is not a cache node no longer
+  raises an `AttributeError` that masked the intended error and leaked
+  sockets.
 
 ## [0.3.0] - 2026-08-22
 
@@ -310,6 +312,8 @@ without a deprecation cycle and are listed below.
   desyncing it.
 - A redial that is still running when its awaiting caller is cancelled is no
   longer started a second time by the next caller.
+- `nanocached.__version__` now matches the package version; the 0.1.1
+  release reported `"1.0.0"`.
 - The keep-alive ping uses a dedicated key (`"\x00nanocached-keepalive"`)
   instead of a single NUL, so it no longer touches the LRU recency of an
   application key that happens to be `"\x00"`.
