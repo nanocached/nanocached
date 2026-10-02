@@ -11,6 +11,13 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- `NanocachedClient`: the cluster ring and replication count are now
+  `volatile`. They are written under the client's state lock by a roster
+  refresh but read lock-free on the request path, so a request thread could
+  keep routing by a stale ring.
+
 ## [0.4.4] - 2026-09-09
 
 No changes. Version aligned with the rest of the project: from 0.4.4 on,

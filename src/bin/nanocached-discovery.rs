@@ -1623,8 +1623,26 @@ async fn run_metrics_server(
     list_ready_at: Instant,
     metrics_permits: Arc<Semaphore>,
 ) {
+    // Tracked in a `JoinSet` and reaped as it goes (same shape as the node's
+    // `run_metrics_server`), instead of bare detached `tokio::spawn`s whose
+    // panic in `serve_metrics_connection` would go unobserved. Bounded by
+    // `metrics_permits` regardless, so this never grows past that many
+    // outstanding at once; when the process shuts down the runtime drops
+    // this task and the set aborts whatever is left.
+    let mut connection_tasks: JoinSet<()> = JoinSet::new();
+
     loop {
-        let stream = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+
+            result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    eprintln!("WARN metrics connection task failed: {error}");
+                }
+                continue;
+            }
+        };
+        let stream = match accepted {
             Ok((stream, _)) => stream,
             Err(error) => {
                 // Issue #184: mirrors `run`'s own accept loop above — an
@@ -1649,7 +1667,7 @@ async fn run_metrics_server(
         };
 
         let registry = Arc::clone(&registry);
-        tokio::spawn(async move {
+        connection_tasks.spawn(async move {
             let _metrics_permit = metrics_permit;
             let _ = tokio::time::timeout(
                 Duration::from_secs(5),
