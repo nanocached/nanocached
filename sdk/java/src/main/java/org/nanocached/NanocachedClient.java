@@ -612,8 +612,14 @@ public final class NanocachedClient implements AutoCloseable {
     private volatile Connection single;              // single-node mode
     private String singleAddress;
     private final Map<String, Member> members = new LinkedHashMap<>(); // cluster mode
-    private HashRing ring;
-    private int replication = 1;
+    // volatile: written under stateLock by the refresh, read lock-free on
+    // the request path (ring == null picks single-node vs cluster routing,
+    // ring.owners(...) routes). HashRing is immutable, so a reader sees
+    // either the old ring or the new one, never a torn one; ring and
+    // replication are not updated atomically together, which only ever
+    // yields a momentarily stale replication count.
+    private volatile HashRing ring;
+    private volatile int replication = 1;
     private long lastFetchNanos = System.nanoTime();
 
     private ExecutorService replicaWriters;

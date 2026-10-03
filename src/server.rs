@@ -7055,14 +7055,18 @@ async fn report_complete(
     joining_name: &str,
     generation: Option<u64>,
 ) -> io::Result<()> {
-    let mut stream = connect_and_authenticate(
-        node_context,
-        &node_context.discovery_addr,
-        AuthPeer::Discovery,
-    )
-    .await?;
-
+    // One budget for the whole call (dial, TLS, auth, C/A round trip), not
+    // `connect_and_authenticate`'s own per-leg bounds stacked in front of a
+    // second `OUTBOUND_IO_TIMEOUT` for the exchange: a discovery that is
+    // merely slow at each leg could otherwise hold this for twice as long.
     timeout(OUTBOUND_IO_TIMEOUT, async {
+        let mut stream = connect_and_authenticate(
+            node_context,
+            &node_context.discovery_addr,
+            AuthPeer::Discovery,
+        )
+        .await?;
+
         stream
             .write_all(&complete_message(
                 &node_context.name,
@@ -7291,6 +7295,52 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    // The whole `C` report shares one OUTBOUND_IO_TIMEOUT: a discovery that
+    // answers the auth leg slowly and then never acks must not get a second
+    // full budget for the exchange (it used to: auth bound + exchange bound).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn report_complete_shares_one_timeout_across_auth_and_exchange() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let _ = connection.read(&mut buf).await;
+            tokio::time::sleep(OUTBOUND_IO_TIMEOUT - Duration::from_secs(4)).await;
+            let _ = connection.write_all(b"Od\n").await;
+            // Read the C frame, then never acknowledge it.
+            let _ = connection.read(&mut buf).await;
+            std::future::pending::<()>().await;
+        });
+
+        let node_context = NodeContext {
+            name: "reporter".to_string(),
+            token: "tk-reporter".to_string(),
+            discovery_addr,
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: Some(Bytes::from_static(b"shared-secret")),
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let started = tokio::time::Instant::now();
+        let error = report_complete(&node_context, "joiner", None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < OUTBOUND_IO_TIMEOUT + Duration::from_secs(1),
+            "took {:?}, expected one OUTBOUND_IO_TIMEOUT",
+            started.elapsed()
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

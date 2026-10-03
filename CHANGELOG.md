@@ -12,6 +12,16 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-node`: reporting a finished migration to discovery (`C`) is now
+  bounded by one 10 s budget for the whole call. Before, the auth leg and the
+  `C`/`A` exchange each had their own 10 s, so a slow discovery could hold the
+  report for up to 20 s.
+- `nanocached-proxy` and `nanocached-discovery`: a panic while serving a
+  metrics scrape is now logged (`WARN metrics connection task failed`)
+  instead of going unobserved, like the node's metrics endpoint.
+
 ## [0.4.4] - 2026-09-09
 
 No changes. Version aligned with the rest of the project (the first release
