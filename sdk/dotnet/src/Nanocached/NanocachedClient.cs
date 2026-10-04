@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net.Security;
 using System.Runtime.ExceptionServices;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -552,7 +553,14 @@ public sealed class NanocachedClient : IDisposable
                     .ConnectAndIdentifyAsync(host, port, client._authSecret, client._tls, options.ViaProxy)
                     .ConfigureAwait(false);
             }
-            catch (Exception error) when (error is NanocachedException or IOException or System.Net.Sockets.SocketException)
+            // AuthenticationException (a TLS certificate/handshake failure) is
+            // not an IOException, so it needs naming here: an address whose
+            // handshake fails is an unreachable address — try the next one,
+            // like the other SDKs. It stays the thrown error if it is the
+            // last one, so a single-address connect still surfaces the cause
+            // as the original exception.
+            catch (Exception error) when (error is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or AuthenticationException)
             {
                 lastError = error;
                 continue;
@@ -663,21 +671,8 @@ public sealed class NanocachedClient : IDisposable
     /// error re-thrown.</summary>
     private async Task OpenClusterAsync(Identify.ClusterTarget cluster)
     {
-        async Task<(DiscoveredNode Node, Connection? Connection, Exception? Error)> DialNodeAsync(
-            DiscoveredNode node)
-        {
-            try
-            {
-                return (node, await OpenNodeConnectionAsync(node.Address).ConfigureAwait(false), null);
-            }
-            catch (Exception error)
-            {
-                return (node, null, error);
-            }
-        }
-
         List<DiscoveredNode> nodes = DedupeDiscoveredNodes(cluster.Nodes);
-        var outcomes = await Task.WhenAll(nodes.Select(DialNodeAsync)).ConfigureAwait(false);
+        var outcomes = await DialNodesAsync(nodes).ConfigureAwait(false);
 
         Exception? lastError = null;
         Exception? fatal = null;
@@ -715,6 +710,50 @@ public sealed class NanocachedClient : IDisposable
 
         _ring = new HashRing(nodes.Select(node => node.Name).ToList());
         _replication = cluster.Replication;
+    }
+
+    /// <summary>Bound on how many of a roster's nodes are dialed at once by
+    /// <see cref="DialNodesAsync"/>. A discovery roster can list up to
+    /// <c>MaxNodeCount</c> (65536) nodes, and dialing them all at the same
+    /// instant would open that many sockets and handshakes in one burst; the
+    /// Java SDK caps its bootstrap dialers the same way
+    /// (<c>MAX_BOOTSTRAP_DIALER_THREADS</c>). Internal and mutable only so
+    /// tests can shrink it.</summary>
+    internal static int MaxConcurrentDials = 64;
+
+    /// <summary>Dials every node in <paramref name="nodes"/> with at most
+    /// <see cref="MaxConcurrentDials"/> dials in flight, and gathers every
+    /// outcome — a dial never throws out of here, whatever it fails with,
+    /// so one bad node can neither fault the round nor orphan the
+    /// connections its siblings already opened (they come back in the
+    /// result for the caller to install or close). Shared by bootstrap
+    /// (<see cref="OpenClusterAsync"/>) and refresh
+    /// (<see cref="RefreshNodeListAsync"/>); results are in input
+    /// order.</summary>
+    private async Task<(DiscoveredNode Node, Connection? Connection, Exception? Error)[]> DialNodesAsync(
+        IReadOnlyList<DiscoveredNode> nodes)
+    {
+        using var slots = new SemaphoreSlim(Math.Max(1, MaxConcurrentDials));
+
+        async Task<(DiscoveredNode Node, Connection? Connection, Exception? Error)> DialNodeAsync(
+            DiscoveredNode node)
+        {
+            await slots.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                return (node, await OpenNodeConnectionAsync(node.Address).ConfigureAwait(false), null);
+            }
+            catch (Exception error)
+            {
+                return (node, null, error);
+            }
+            finally
+            {
+                slots.Release();
+            }
+        }
+
+        return await Task.WhenAll(nodes.Select(DialNodeAsync)).ConfigureAwait(false);
     }
 
     /// <summary>Drops repeated node names from discovery's raw list,
@@ -3516,7 +3555,14 @@ public sealed class NanocachedClient : IDisposable
                 .ConnectAndIdentifyAsync(host, port, _authSecret, _tls)
                 .ConfigureAwait(false);
         }
-        catch (Exception error) when (error is IOException or System.Net.Sockets.SocketException)
+        // AuthenticationException — a TLS certificate/handshake failure — is
+        // not an IOException, but to every caller of this (bootstrap and
+        // refresh dials, lazy redials, proxy failover) a node whose
+        // handshake fails is simply a node that can't be connected to, the
+        // same as the other SDKs treat it; the cause stays visible in the
+        // message and InnerException.
+        catch (Exception error) when (error is IOException or System.Net.Sockets.SocketException
+            or AuthenticationException)
         {
             throw new ConnectionLostException(
                 $"nanocached: could not connect to {address}: {error.Message}", error);
@@ -3602,25 +3648,15 @@ public sealed class NanocachedClient : IDisposable
             }
         }
 
-        // Dial every newly discovered node concurrently (issue #227):
-        // this runs under _refreshGate, so a serial foreach here would
-        // block refreshes/retries for N × connect-timeout on a scale-out
-        // of N nodes. Every dial outcome is gathered first, then results
-        // are installed under one lock — mirroring OpenClusterAsync.
-        async Task<(DiscoveredNode Node, Connection? Connection, Exception? Error)> DialNodeAsync(
-            DiscoveredNode node)
-        {
-            try
-            {
-                return (node, await OpenNodeConnectionAsync(node.Address).ConfigureAwait(false), null);
-            }
-            catch (NanocachedException error)
-            {
-                return (node, null, error);
-            }
-        }
-
-        var outcomes = await Task.WhenAll(toOpen.Select(DialNodeAsync)).ConfigureAwait(false);
+        // Dial every newly discovered node concurrently (issue #227), at
+        // most MaxConcurrentDials at a time: this runs under
+        // _refreshGate, so a serial foreach here would block
+        // refreshes/retries for N × connect-timeout on a scale-out of N
+        // nodes. Every dial outcome is gathered first (DialNodesAsync never
+        // throws, so one node failing — a bad TLS certificate included —
+        // can't fault the round and orphan its siblings' connections), then
+        // results are installed under one lock — mirroring OpenClusterAsync.
+        var outcomes = await DialNodesAsync(toOpen).ConfigureAwait(false);
 
         lock (_stateLock)
         {
@@ -3655,7 +3691,12 @@ public sealed class NanocachedClient : IDisposable
                 // failure is still silent to the caller (refresh is best-effort)
                 // and counted via Stats().RefreshFailures.
                 _members[node.Name] = new Member(node.Address, null);
-                ArmReconnectCooldown(node.Address, error!);
+                // Refresh is best-effort and a cooldown error is rethrown to
+                // callers routed to this node, so it must be a connection-level
+                // SDK exception, whatever the dial actually threw.
+                ArmReconnectCooldown(node.Address, error as NanocachedException
+                    ?? new ConnectionLostException(
+                        $"nanocached: could not connect to {node.Address}: {error!.Message}", error));
             }
 
             _ring = new HashRing(_members.Keys.ToList());
@@ -3685,7 +3726,8 @@ public sealed class NanocachedClient : IDisposable
                         continue;
                 }
             }
-            catch (Exception error) when (error is NanocachedException or IOException or System.Net.Sockets.SocketException)
+            catch (Exception error) when (error is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or AuthenticationException)
             {
                 Interlocked.Increment(ref _refreshFailures);
                 // Silent by design — refresh is opportunistic/best-effort
@@ -3723,7 +3765,8 @@ public sealed class NanocachedClient : IDisposable
                     .ConnectAndIdentifyAsync(host, port, _authSecret, _tls, viaProxy: true)
                     .ConfigureAwait(false);
             }
-            catch (Exception error) when (error is NanocachedException or IOException or System.Net.Sockets.SocketException)
+            catch (Exception error) when (error is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or AuthenticationException)
             {
                 Interlocked.Increment(ref _refreshFailures);
                 lastError = error;
@@ -3782,6 +3825,7 @@ public sealed class NanocachedClient : IDisposable
         TimeSpan every = KeepAliveInterval;
 
         CancellationToken token = _lifetime.Token;
+        var pingsInFlight = new ConcurrentDictionary<Connection, byte>();
         _ = Task.Run(async () =>
         {
             using var timer = new PeriodicTimer(every);
@@ -3798,19 +3842,35 @@ public sealed class NanocachedClient : IDisposable
                         // its next real use.
                         : _members.Values.Select(member => member.Connection).OfType<Connection>().ToList();
                 }
+                // Pings run concurrently, one task per idle connection, and
+                // are not joined here (issue #192, as fixed in the Go SDK):
+                // a half-open node can hold its ping for the whole request
+                // timeout (30s), and awaiting it in line would delay the
+                // ping to every other member until ~60s idle — exactly the
+                // server's idle limit. A connection whose previous ping is
+                // still in flight is skipped, so a hung node costs one
+                // pending request per timeout window rather than one per tick.
                 foreach (Connection connection in connections)
                 {
                     if (connection.IsClosed || connection.Idle < every) continue;
-                    try
+                    if (!pingsInFlight.TryAdd(connection, 0)) continue;
+                    _ = Task.Run(async () =>
                     {
-                        // Any parseable reply proves liveness — N, or W
-                        // from a non-owner — and resets the idle timer.
-                        await connection.GetAsync(KeepaliveKey).ConfigureAwait(false);
-                    }
-                    catch (Exception)
-                    {
-                        // Keep-alive failures never surface; use redials lazily.
-                    }
+                        try
+                        {
+                            // Any parseable reply proves liveness — N, or W
+                            // from a non-owner — and resets the idle timer.
+                            await connection.GetAsync(KeepaliveKey).ConfigureAwait(false);
+                        }
+                        catch (Exception)
+                        {
+                            // Keep-alive failures never surface; use redials lazily.
+                        }
+                        finally
+                        {
+                            pingsInFlight.TryRemove(connection, out _);
+                        }
+                    }, CancellationToken.None);
                 }
             }
         }, token);

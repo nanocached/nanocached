@@ -1156,9 +1156,18 @@ public sealed class MockDiscovery : IDisposable
     private volatile IReadOnlyList<(string Name, string Address)> _proxies =
         Array.Empty<(string, string)>();
 
-    public MockDiscovery(IReadOnlyList<(string Name, string Address)> nodes, int replication = 1)
+    /// <summary>When set, every accepted connection is wrapped in an
+    /// <see cref="SslStream"/> presenting this certificate before the
+    /// protocol loop runs — the way <see cref="MockNode"/> does — for
+    /// clusters whose client dials discovery over TLS too.</summary>
+    private readonly X509Certificate2? _serverCertificate;
+
+    public MockDiscovery(
+        IReadOnlyList<(string Name, string Address)> nodes, int replication = 1,
+        X509Certificate2? serverCertificate = null)
     {
         _nodes = nodes;
+        _serverCertificate = serverCertificate;
         _replication = replication;
         _listener = new TcpListener(IPAddress.Loopback, 0);
         _listener.Start();
@@ -1205,7 +1214,14 @@ public sealed class MockDiscovery : IDisposable
     {
         try
         {
-            NetworkStream stream = client.GetStream();
+            Stream stream = client.GetStream();
+            if (_serverCertificate is not null)
+            {
+                var ssl = new SslStream(stream, leaveInnerStreamOpen: false);
+                await ssl.AuthenticateAsServerAsync(_serverCertificate, clientCertificateRequired: false,
+                    checkCertificateRevocation: false);
+                stream = ssl;
+            }
             while (true)
             {
                 string[] parts = (await Wire.ReadLineAsync(stream)).Split(' ');

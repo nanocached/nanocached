@@ -4785,4 +4785,306 @@ public class TolerantBootstrapTests
         Connection? after = GetMemberConnection(client, name);
         Assert.Same(before, after);
     }
+
+    // ── TLS failures count as an unreachable node ────────────────────
+    //
+    // SslStream.AuthenticateAsClientAsync throws AuthenticationException
+    // (not an IOException) on a certificate/handshake failure. The dial
+    // paths only mapped IOException/SocketException to "unreachable", so
+    // one node with a bad certificate faulted Task.WhenAll on refresh
+    // (orphaning the other new nodes' connections and breaking "refresh
+    // never throws") and aborted a whole bootstrap.
+
+    /// <summary>A private CA (one self-signed certificate valid for
+    /// 127.0.0.1) the client trusts via <c>Ca</c>, plus a second,
+    /// untrusted certificate for the node with the bad one.</summary>
+    private sealed class TlsFixture : IDisposable
+    {
+        internal readonly X509Certificate2 Good = Tls.GenerateSelfSigned("good", sanIpAddress: IPAddress.Loopback);
+        internal readonly X509Certificate2 Bad = Tls.GenerateSelfSigned("bad", sanIpAddress: IPAddress.Loopback);
+        internal readonly string CaPath;
+
+        internal TlsFixture() => CaPath = Tls.WritePemCertificate(Good);
+
+        internal NanocachedClient.Options ClientOptions(int discoveryPort) => new()
+        {
+            Addresses = { ("127.0.0.1", discoveryPort) },
+            Tls = true,
+            Ca = CaPath,
+        };
+
+        public void Dispose()
+        {
+            File.Delete(CaPath);
+            Good.Dispose();
+            Bad.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task RefreshTreatsANewNodeWithABadCertificateAsUnreachableAndKeepsItsSiblings()
+    {
+        using var tls = new TlsFixture();
+        using var seed = MockNode.WithTls(tls.Good);
+        using var goodNew = MockNode.WithTls(tls.Good);
+        using var goodNew2 = MockNode.WithTls(tls.Good);
+        using var badNew = MockNode.WithTls(tls.Bad);
+        using var discovery = new MockDiscovery(new[] { ("seed", seed.Address) }, replication: 1, tls.Good);
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(tls.ClientOptions(discovery.Port));
+
+        discovery.SetNodes(new[]
+        {
+            ("seed", seed.Address),
+            ("good-1", goodNew.Address),
+            ("bad", badNew.Address),
+            ("good-2", goodNew2.Address),
+        });
+
+        long before = client.Stats().RefreshFailures;
+        await ForceRefreshAsync(client); // must not throw
+
+        // Both healthy new nodes were installed with live connections (not
+        // orphaned by the bad one faulting the round)...
+        Assert.NotNull(GetMemberConnection(client, "good-1"));
+        Assert.NotNull(GetMemberConnection(client, "good-2"));
+        Assert.Equal(1, goodNew.ConnectionCount);
+        Assert.Equal(1, goodNew2.ConnectionCount);
+        // ...and the bad one is just an unreachable member: kept in the
+        // ring (issue #67) with no connection and its cooldown armed.
+        Assert.True(HasMember(client, "bad"));
+        Assert.Null(GetMemberConnection(client, "bad"));
+        Assert.True(GetCooldowns(client).Contains(badNew.Address));
+        Assert.Equal(before + 1, client.Stats().RefreshFailures);
+    }
+
+    [Fact]
+    public async Task BootstrapToleratesAClusterNodeWithABadCertificate()
+    {
+        using var tls = new TlsFixture();
+        using var good = MockNode.WithTls(tls.Good);
+        using var bad = MockNode.WithTls(tls.Bad);
+        using var discovery = new MockDiscovery(
+            new[] { (Names[0], bad.Address), (Names[1], good.Address) }, replication: 2, tls.Good);
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(tls.ClientOptions(discovery.Port));
+
+        Assert.NotNull(GetMemberConnection(client, Names[1]));
+        Assert.True(HasMember(client, Names[0]));
+        Assert.Null(GetMemberConnection(client, Names[0]));
+        // A key owned by the reachable node is served normally.
+        string key = KeyWithPrimary(Names[1]);
+        await client.SetAsync(key, "v");
+        Assert.Equal("v", await client.GetAsync(key));
+    }
+
+    [Fact]
+    public async Task BootstrapFailsWithAConnectionErrorWhenEveryClusterNodeHasABadCertificate()
+    {
+        using var tls = new TlsFixture();
+        using var bad = MockNode.WithTls(tls.Bad);
+        using var discovery = new MockDiscovery(new[] { (Names[0], bad.Address) }, replication: 1, tls.Good);
+
+        // Nothing reachable: the ordinary connect error, with the TLS
+        // failure still visible as its cause.
+        ConnectionLostException error = await Assert.ThrowsAsync<ConnectionLostException>(
+            () => NanocachedClient.ConnectAsync(tls.ClientOptions(discovery.Port)));
+        Assert.IsType<AuthenticationException>(error.InnerException);
+    }
+
+    [Fact]
+    public async Task ConnectTriesTheNextSeedWhenTheFirstOnesCertificateIsRejected()
+    {
+        using var tls = new TlsFixture();
+        using var bad = MockNode.WithTls(tls.Bad);
+        using var good = MockNode.WithTls(tls.Good);
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", bad.Port), ("127.0.0.1", good.Port) },
+            Tls = true,
+            Ca = tls.CaPath,
+        });
+
+        await client.SetAsync("k", "v");
+        Assert.Equal("v", await client.GetAsync("k"));
+    }
+
+    // ── bounded dial fan-out ─────────────────────────────────────────
+
+    /// <summary>A listener that accepts connections and never answers the
+    /// handshake, recording how many of its connections were open at once
+    /// — a blackholed address, as far as a dialing client can tell.</summary>
+    private sealed class SilentListeners : IDisposable
+    {
+        private readonly List<System.Net.Sockets.TcpListener> _listeners = new();
+        private int _open;
+        private int _maxOpen;
+
+        internal int MaxConcurrent => Volatile.Read(ref _maxOpen);
+
+        internal string StartOne()
+        {
+            var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            _listeners.Add(listener);
+            _ = AcceptAsync(listener);
+            return $"127.0.0.1:{((IPEndPoint)listener.LocalEndpoint).Port}";
+        }
+
+        private async Task AcceptAsync(System.Net.Sockets.TcpListener listener)
+        {
+            while (true)
+            {
+                System.Net.Sockets.TcpClient client;
+                try
+                {
+                    client = await listener.AcceptTcpClientAsync();
+                }
+                catch
+                {
+                    return;
+                }
+                _ = Task.Run(async () =>
+                {
+                    int now = Interlocked.Increment(ref _open);
+                    int seen;
+                    while (now > (seen = Volatile.Read(ref _maxOpen))
+                           && Interlocked.CompareExchange(ref _maxOpen, now, seen) != seen)
+                    {
+                    }
+                    try
+                    {
+                        // Drain until the client gives up and closes.
+                        var buffer = new byte[64];
+                        Stream stream = client.GetStream();
+                        while (await stream.ReadAsync(buffer) > 0)
+                        {
+                        }
+                    }
+                    catch
+                    {
+                        // Reset — the client is gone.
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _open);
+                        client.Close();
+                    }
+                });
+            }
+        }
+
+        public void Dispose()
+        {
+            foreach (var listener in _listeners) listener.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task BootstrapBoundsHowManyClusterNodesItDialsAtOnce()
+    {
+        // A roster can list up to 65536 nodes; they used to all be dialed
+        // in one burst. Every node here blackholes the handshake, so each
+        // dial runs to the (shortened) deadline and the listeners can see
+        // how many dials overlapped.
+        const int cap = 3;
+        using var silent = new SilentListeners();
+        var entries = new List<(string Name, string Address)>();
+        for (int i = 0; i < 12; i++) entries.Add(($"node-{i}", silent.StartOne()));
+        using var discovery = new MockDiscovery(entries, replication: 1);
+
+        int originalCap = NanocachedClient.MaxConcurrentDials;
+        TimeSpan originalDeadline = Identify.ConnectDeadline;
+        NanocachedClient.MaxConcurrentDials = cap;
+        Identify.ConnectDeadline = TimeSpan.FromMilliseconds(150);
+        try
+        {
+            await Assert.ThrowsAsync<ConnectionLostException>(() => NanocachedClient.ConnectAsync(
+                new NanocachedClient.Options { Addresses = { ("127.0.0.1", discovery.Port) } }));
+        }
+        finally
+        {
+            NanocachedClient.MaxConcurrentDials = originalCap;
+            Identify.ConnectDeadline = originalDeadline;
+        }
+
+        Assert.True(silent.MaxConcurrent <= cap,
+            $"{silent.MaxConcurrent} dials were in flight at once with a cap of {cap}");
+        Assert.True(silent.MaxConcurrent >= 2, "the capped dials should still overlap, not run one at a time");
+    }
+
+    [Fact]
+    public async Task RefreshBoundsHowManyNewNodesItDialsAtOnce()
+    {
+        using var seed = new MockNode();
+        using var discovery = new MockDiscovery(new[] { ("seed", seed.Address) }, replication: 1);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            new NanocachedClient.Options { Addresses = { ("127.0.0.1", discovery.Port) } });
+
+        const int cap = 3;
+        using var silent = new SilentListeners();
+        var entries = new List<(string Name, string Address)> { ("seed", seed.Address) };
+        for (int i = 0; i < 12; i++) entries.Add(($"node-{i}", silent.StartOne()));
+        discovery.SetNodes(entries);
+
+        int originalCap = NanocachedClient.MaxConcurrentDials;
+        TimeSpan originalDeadline = Identify.ConnectDeadline;
+        NanocachedClient.MaxConcurrentDials = cap;
+        Identify.ConnectDeadline = TimeSpan.FromMilliseconds(150);
+        try
+        {
+            await ForceRefreshAsync(client);
+        }
+        finally
+        {
+            NanocachedClient.MaxConcurrentDials = originalCap;
+            Identify.ConnectDeadline = originalDeadline;
+        }
+
+        Assert.True(silent.MaxConcurrent <= cap,
+            $"{silent.MaxConcurrent} dials were in flight at once with a cap of {cap}");
+        Assert.True(silent.MaxConcurrent >= 2, "the capped dials should still overlap, not run one at a time");
+        for (int i = 0; i < 12; i++) Assert.True(HasMember(client, $"node-{i}"));
+    }
+
+    // ── keep-alive isolates a hung node (issue #192) ─────────────────
+
+    [Fact]
+    public async Task KeepAlivePingsTheOtherNodesWhileOneNodeIsHung()
+    {
+        // The pings used to be awaited one connection at a time, so a
+        // half-open node (here: its G reply is held for 10s; in the field
+        // the request timeout is 30s) starved the pings to every member
+        // after it until it answered or timed out — long enough for the
+        // server's 60s idle limit to cut the healthy connections.
+        using var hung = new MockNode();
+        using var healthyA = new MockNode();
+        using var healthyB = new MockNode();
+        hung.DelayGets(10_000);
+        using var discovery = new MockDiscovery(
+            new[] { ("hung", hung.Address), ("healthy-a", healthyA.Address), ("healthy-b", healthyB.Address) },
+            replication: 1);
+
+        TimeSpan original = NanocachedClient.KeepAliveInterval;
+        NanocachedClient.KeepAliveInterval = TimeSpan.FromMilliseconds(100);
+        try
+        {
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(
+                new NanocachedClient.Options { Addresses = { ("127.0.0.1", discovery.Port) } });
+
+            await WaitForAsync(
+                () => healthyA.GetCount >= 3 && healthyB.GetCount >= 3,
+                "keep-alive pings to the healthy nodes behind the hung one");
+
+            // One ping is outstanding to the hung node; later ticks skip a
+            // connection whose previous ping hasn't returned instead of
+            // stacking requests behind it.
+            Assert.Equal(1, hung.GetCount);
+        }
+        finally
+        {
+            NanocachedClient.KeepAliveInterval = original;
+        }
+    }
 }
