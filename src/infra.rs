@@ -19,7 +19,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::collections::HashMap;
 use std::io;
 use std::io::BufReader;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -334,9 +334,26 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 // ─── per-source-IP connection limiting ──────────────────────────────────
 
-/// Live connection counts per source IP, shared between an accept loop and
-/// the `PerIpConnectionGuard`s it hands out.
+/// Live connection counts per source, shared between an accept loop and
+/// the `PerIpConnectionGuard`s it hands out. Keyed by `per_ip_key`, not by
+/// the raw peer address.
 pub type PerIpConnections = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+/// The key a peer address is counted under. IPv4 is itself. IPv6 is its
+/// /64 prefix: the smallest allocation an ISP or cloud hands one customer
+/// or host, so a single one can't claim a distinct key per connection
+/// (2^64 addresses) and walk around the cap. An IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`, what a dual-stack listener reports for an IPv4
+/// peer) is counted as the IPv4 address it carries.
+fn per_ip_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (!0u128 << 64))),
+        },
+    }
+}
 
 /// Held by one accepted connection for as long as it counts against its
 /// source IP's cap; decrements (and, once it reaches zero, removes) that
@@ -365,13 +382,14 @@ impl Drop for PerIpConnectionGuard {
     }
 }
 
-/// Reserves one of `cap` slots for `ip`, or `None` if it's already at the
-/// cap.
+/// Reserves one of `cap` slots for `ip` (see `per_ip_key` for what counts
+/// as one source), or `None` if it's already at the cap.
 pub fn try_acquire_per_ip(
     counts: &PerIpConnections,
     ip: IpAddr,
     cap: usize,
 ) -> Option<PerIpConnectionGuard> {
+    let ip = per_ip_key(ip);
     let mut guard = counts
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -491,5 +509,65 @@ mod tests {
 
         drop(guard);
         assert!(try_acquire_per_ip(&counts, ip, 1).is_some());
+    }
+
+    #[test]
+    fn per_ip_key_collapses_an_ipv6_address_to_its_64_prefix() {
+        let key = |text: &str| per_ip_key(text.parse().unwrap());
+
+        // IPv4 is itself.
+        assert_eq!(key("203.0.113.9"), "203.0.113.9".parse::<IpAddr>().unwrap());
+        // Same /64, different interface identifiers: one key.
+        assert_eq!(
+            key("2001:db8:1:2::1"),
+            key("2001:db8:1:2:ffff:ffff:ffff:ffff")
+        );
+        assert_eq!(
+            key("2001:db8:1:2::1"),
+            "2001:db8:1:2::".parse::<IpAddr>().unwrap()
+        );
+        // A neighbouring /64 is a different source.
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        // IPv4-mapped IPv6 is the IPv4 address it carries.
+        assert_eq!(key("::ffff:203.0.113.9"), key("203.0.113.9"));
+    }
+
+    #[test]
+    fn one_ipv6_64_prefix_shares_one_per_ip_cap() {
+        let counts: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let in_prefix =
+            |last: u16| -> IpAddr { format!("2001:db8:1:2::{last:x}").parse().unwrap() };
+
+        let first = try_acquire_per_ip(&counts, in_prefix(1), 2).expect("first fits");
+        let _second = try_acquire_per_ip(&counts, in_prefix(2), 2).expect("second fits");
+        // A third distinct address in the same /64 is over the cap.
+        assert!(try_acquire_per_ip(&counts, in_prefix(3), 2).is_none());
+        // Another /64 is unaffected.
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(try_acquire_per_ip(&counts, other, 2).is_some());
+
+        // Release goes back to the shared prefix entry, not a per-address one.
+        drop(first);
+        let _third = try_acquire_per_ip(&counts, in_prefix(3), 2).expect("freed slot is reusable");
+        assert!(try_acquire_per_ip(&counts, in_prefix(4), 2).is_none());
+    }
+
+    #[test]
+    fn an_ipv4_mapped_peer_shares_the_cap_with_its_plain_ipv4_form() {
+        let counts: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let plain: IpAddr = "203.0.113.9".parse().unwrap();
+        let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+
+        let _held = try_acquire_per_ip(&counts, plain, 1).expect("fits");
+        assert!(try_acquire_per_ip(&counts, mapped, 1).is_none());
+    }
+
+    #[test]
+    fn releasing_the_last_slot_removes_the_prefix_entry() {
+        let counts: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let ip: IpAddr = "2001:db8:1:2::7".parse().unwrap();
+
+        drop(try_acquire_per_ip(&counts, ip, 4).expect("fits"));
+        assert!(counts.lock().unwrap().is_empty());
     }
 }

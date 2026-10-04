@@ -74,6 +74,15 @@ framework adapters at one version, whether or not a component changed.
   1-2 MiB indefinitely per connection (about 1 GiB across the default 1024
   connections) because the 60 s idle timeout restarts on every read. A
   proxy with no secret is unchanged.
+- `nanocached-node`, `nanocached-proxy` and `nanocached-discovery`: the
+  per-source-IP connection cap now counts an IPv6 peer by its /64 prefix
+  instead of its full address, and an IPv4-mapped IPv6 peer
+  (`::ffff:a.b.c.d`) as the IPv4 address. Before, one /64 offered 2^64
+  distinct sources, each with a full cap of its own, so a single host could
+  hold every connection slot. IPv4 behavior is unchanged. Clients that share
+  a /64 (hosts on one subnet, or pods on one node of an IPv6 Kubernetes
+  cluster) now share one cap, so raise `--max-connections-per-ip` for them
+  as for any other shared source.
 
 ## [0.4.4] - 2026-09-09
 
