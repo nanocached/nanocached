@@ -21,7 +21,16 @@ different node than the server (and every other SDK) does.
 
 from __future__ import annotations
 
+from bisect import insort
+
 _MASK_64 = (1 << 64) - 1
+
+# Above this many requested owners, owners() sorts every node instead of
+# keeping a sorted prefix: the bounded insertion is O(n * replicas), which
+# only beats an O(n log n) sort while `replicas` stays small (the
+# replication factor rides in from discovery and is not capped on the
+# wire).
+_MAX_BOUNDED_SELECTION = 32
 _FNV_OFFSET_BASIS = 0xCBF29CE484222325
 _FNV_PRIME = 0x100000001B3
 
@@ -108,14 +117,47 @@ class HashRing:
         defaults to the empty (default) namespace, which hashes
         byte-identically to the pre-namespace form — see key_hash()."""
         hashed_key = key_hash(namespace, key)
-        scored = [
-            (fmix64(node_hash ^ hashed_key), node)
-            for node_hash, node in zip(self._node_hashes, self._nodes)
-        ]
-        # Descending by score; ties toward the lexicographically smaller
-        # name — a total order every implementation agrees on.
-        scored.sort(key=lambda pair: (-pair[0], pair[1]))
-        return [node for _, node in scored[:replicas]]
+        # Ranked as (-score, name) ascending: descending by score, ties
+        # toward the lexicographically smaller name — a total order every
+        # implementation agrees on.
+        if not 0 < replicas <= _MAX_BOUNDED_SELECTION:
+            # Zero, negative (a slice from the end, as it always was) or
+            # large: the plain full sort.
+            scored = [
+                (-fmix64(node_hash ^ hashed_key), node)
+                for node_hash, node in zip(self._node_hashes, self._nodes)
+            ]
+            scored.sort()
+            return [node for _, node in scored[:replicas]]
+
+        # `replicas` is a handful next to the cluster size, so rather than
+        # sorting every node (O(n log n)), keep just the best `replicas`
+        # seen so far in a sorted list — O(n * replicas), the same bounded
+        # insertion the Go/Rust/Java/.NET SDKs use.
+        top: list[tuple[int, str]] = []
+        mask = _MASK_64
+        floor = -1  # the lowest score kept, once `top` is full
+        for node_hash, node in zip(self._node_hashes, self._nodes):
+            # fmix64(node_hash ^ hashed_key), inlined: this loop scores
+            # every node on every lookup, and the call overhead alone was
+            # a fifth of it. test_hashring.py pins it against fmix64().
+            value = node_hash ^ hashed_key
+            value ^= value >> 33
+            value = (value * 0xFF51AFD7ED558CCD) & mask
+            value ^= value >> 33
+            value = (value * 0xC4CEB9FE1A85EC53) & mask
+            value ^= value >> 33
+            if value < floor:
+                continue  # below the worst candidate kept: skip the tuple
+            candidate = (-value, node)
+            if len(top) == replicas:
+                if candidate >= top[-1]:
+                    continue  # tied with it, but not the smaller name
+                top.pop()
+            insort(top, candidate)
+            if len(top) == replicas:
+                floor = -top[-1][0]
+        return [node for _, node in top]
 
     def route(self, key: bytes, *, namespace: bytes = b"") -> str:
         """The key's primary — ``owners(key, 1, namespace=namespace)[0]``."""

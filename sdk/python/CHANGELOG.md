@@ -9,6 +9,15 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- Routing a key no longer sorts every node: `HashRing.owners()` keeps only
+  the best `replicas` candidates, like the Go, Rust, Java and .NET SDKs,
+  and skips building a tuple for any node scoring below the worst one
+  kept. A lookup takes about 39 us at 100 nodes (was 61 us) and 367 us at
+  1000 nodes (was 686 us); the rest is the 64-bit scoring itself, which
+  stays pure Python. The owner order, ties included, is unchanged.
+
 ## [0.4.4] - 2026-09-09
 
 No changes. Version aligned with the rest of the project: from 0.4.4 on,

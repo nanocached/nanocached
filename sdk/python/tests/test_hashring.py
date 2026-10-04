@@ -136,5 +136,64 @@ class NamespaceCrossLanguageVectorTests(unittest.TestCase):
         self.assertNotEqual(key_hash(b"ab", b"c"), key_hash(b"", b"abc"))
 
 
+class BoundedSelectionTests(unittest.TestCase):
+    # owners() keeps a sorted prefix of the best `replicas` candidates
+    # instead of sorting every node. These pin it to the full-sort
+    # implementation it replaced.
+
+    @staticmethod
+    def reference_owners(ring, key, replicas, namespace=b""):
+        from nanocached._hashring import key_hash
+
+        hashed_key = key_hash(namespace, key)
+        scored = [
+            (fmix64(node_hash ^ hashed_key), node)
+            for node_hash, node in zip(ring._node_hashes, ring._nodes)
+        ]
+        scored.sort(key=lambda pair: (-pair[0], pair[1]))
+        return [node for _, node in scored[:replicas]]
+
+    def test_agrees_with_the_full_sort_over_many_keys_rosters_and_replica_counts(self):
+        import random
+
+        rng = random.Random(0x5EED)
+        for size in (1, 2, 3, 5, 8, 33, 100):
+            names = [f"node-{i}-{rng.getrandbits(40):x}" for i in range(size)]
+            ring = HashRing(names)
+            for i in range(120):
+                key = rng.randbytes(rng.randint(0, 40))
+                namespace = b"" if i % 3 == 0 else rng.randbytes(rng.randint(1, 12))
+                for replicas in (0, 1, 2, 3, 5, size, size + 4, 32, 33, 40, -1, -3):
+                    self.assertEqual(
+                        ring.owners(key, replicas, namespace=namespace),
+                        self.reference_owners(ring, key, replicas, namespace),
+                        f"size={size} replicas={replicas} key={key.hex()} ns={namespace.hex()}",
+                    )
+
+    def test_breaks_score_ties_toward_the_lexicographically_smaller_name(self):
+        # 64-bit collisions don't occur between real names, so force them:
+        # give every node the same name hash, which makes every score tie.
+        names = ["delta", "alpha", "echo", "charlie", "bravo", "foxtrot"]
+        ring = HashRing(names)
+        ring._node_hashes = [0x0123456789ABCDEF] * len(names)
+        for replicas in range(len(names) + 2):
+            self.assertEqual(
+                ring.owners(b"tie", replicas), sorted(names)[:replicas], f"replicas={replicas}"
+            )
+
+        # Partial ties: groups of equal hashes, so ties and strict order
+        # mix within one selection.
+        ring._node_hashes = [1, 1, 2, 2, 3, 3]
+        for i in range(100):
+            key = f"key-{i}".encode()
+            for replicas in range(1, 7):
+                self.assertEqual(
+                    ring.owners(key, replicas), self.reference_owners(ring, key, replicas)
+                )
+
+    def test_empty_ring_has_no_owners(self):
+        self.assertEqual(HashRing([]).owners(b"k", 3), [])
+
+
 if __name__ == "__main__":
     unittest.main()
