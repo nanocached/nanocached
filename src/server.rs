@@ -136,6 +136,16 @@ fn forwarding_grace(entries_sent: usize) -> Duration {
 /// How often the staged node join active-deletion sweep runs. See `run_sweep`.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Outer bound on how long `run` waits, after the connections are drained,
+/// for the heartbeat task to finish — it also carries any in-flight
+/// re-replication and its roster fetch. Those are shutdown-aware, but a
+/// leg they are mid-way through is only bounded by its own
+/// `OUTBOUND_IO_TIMEOUT`, so without this one unresponsive peer could hold
+/// the process past `SHUTDOWN_TIMEOUT` (and an orchestrator's stop grace,
+/// which then kills it uncleanly) for a whole leg or more. A healthy task
+/// finishes in well under a second; past this it is aborted — everything it
+/// does is retried or recomputed after a restart.
+const HEARTBEAT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 /// Tenth-pass audit (2026-09-02): how long the operator-override path (a
 /// second Ctrl-C/SIGTERM while a decommission is draining, issue #407)
 /// waits for `run_decommission`'s task to notice `shutdown_rx` and return
@@ -432,8 +442,10 @@ fn spawn_forward(
     target: ForwardTarget,
     write: OwnedForwardedWrite,
 ) {
-    // Computed before `write` moves into `forward_with_retries` below —
-    // only actually rendered if the rare drop path at the bottom needs it.
+    // Captured before `write` moves into `forward_with_retries` below —
+    // only actually rendered (`Display`) if the rare drop path at the
+    // bottom needs it, so this costs refcount bumps, not a `Debug` format
+    // of a key that can be ~1 MiB.
     let description = write.describe();
     let task: MigrationTask = Box::pin(forward_with_retries(node_context, target, write));
 
@@ -1133,9 +1145,7 @@ pub(crate) async fn run(
         .map_err(|error| io::Error::other(format!("sweep task failed: {error}")))?;
 
     if let Some(heartbeat_task) = heartbeat_task {
-        heartbeat_task
-            .await
-            .map_err(|error| io::Error::other(format!("heartbeat task failed: {error}")))?;
+        join_heartbeat_task(heartbeat_task, HEARTBEAT_SHUTDOWN_WAIT).await?;
     }
 
     if let Some(metrics_task) = metrics_task {
@@ -1146,6 +1156,30 @@ pub(crate) async fn run(
     }
 
     Ok(())
+}
+
+/// Waits up to `wait` for `run`'s heartbeat task to finish, then aborts it
+/// (see `HEARTBEAT_SHUTDOWN_WAIT`). A task that panicked or was cancelled
+/// is still an error, as it was when this was a bare `.await`.
+async fn join_heartbeat_task(
+    mut heartbeat_task: tokio::task::JoinHandle<()>,
+    wait: Duration,
+) -> io::Result<()> {
+    match timeout(wait, &mut heartbeat_task).await {
+        Ok(result) => {
+            result.map_err(|error| io::Error::other(format!("heartbeat task failed: {error}")))
+        }
+        Err(_) => {
+            eprintln!(
+                "WARN heartbeat task still running {}s after shutdown (an unresponsive peer?) — \
+                 aborting it",
+                wait.as_secs()
+            );
+            heartbeat_task.abort();
+            let _ = heartbeat_task.await;
+            Ok(())
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6046,13 +6080,30 @@ async fn run_rereplication(
                 continue;
             };
 
+            if *shutdown_rx.borrow() {
+                break;
+            }
+
             let mut delivered = false;
             for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
                 if abort_requested.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
                     break;
                 }
                 if !streams.contains_key(addr) {
-                    match connect_and_authenticate(node_context, addr, AuthPeer::Node).await {
+                    // Raced against shutdown: the dial/TLS/auth legs are
+                    // each bounded by `OUTBOUND_IO_TIMEOUT`, but only
+                    // *between* attempts was shutdown noticed, so a target
+                    // that stopped answering held the exit (and with it the
+                    // heartbeat task `run` awaits) for a whole leg or more.
+                    // Same shape as `run_decommission`'s.
+                    let connected = tokio::select! {
+                        biased;
+                        _ = shutdown_requested(shutdown_rx) => break,
+                        result = connect_and_authenticate(node_context, addr, AuthPeer::Node) => {
+                            result
+                        }
+                    };
+                    match connected {
                         Ok(stream) => {
                             streams.insert(addr.clone(), stream);
                         }
@@ -6068,12 +6119,24 @@ async fn run_rereplication(
                 let Some(stream) = streams.get_mut(addr) else {
                     continue;
                 };
-                match send_handoff_set(stream, &key, &value, ttl, true, token).await {
-                    Ok(()) => {
+                let sent_one = tokio::select! {
+                    biased;
+                    _ = shutdown_requested(shutdown_rx) => None,
+                    result = send_handoff_set(stream, &key, &value, ttl, true, token) => {
+                        Some(result)
+                    }
+                };
+                match sent_one {
+                    // Interrupted mid-send: the stream's state is unknown.
+                    None => {
+                        streams.remove(addr);
+                        break;
+                    }
+                    Some(Ok(())) => {
                         delivered = true;
                         break;
                     }
-                    Err(error) => {
+                    Some(Err(error)) => {
                         eprintln!(
                             "WARN re-replication: transfer to {addr} failed (attempt \
                              {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
@@ -6923,18 +6986,57 @@ impl OwnedForwardedWrite {
     /// Names what this write was for, for `spawn_forward`'s WARN when it
     /// must actually drop a forward past `MAX_PENDING_FORWARD_WAITERS` —
     /// enough for an operator to tell which entry (or namespace) may now
-    /// be stale on the joiner/entrant.
-    fn describe(&self) -> String {
-        match self {
-            OwnedForwardedWrite::Set { key, .. } | OwnedForwardedWrite::HandoffSet { key, .. } => {
-                format!("{} {key:?}", self.kind())
-            }
-            OwnedForwardedWrite::Delete { key } | OwnedForwardedWrite::HandoffDelete { key } => {
-                format!("{} {key:?}", self.kind())
-            }
+    /// be stale on the joiner/entrant. Cheap to call (refcount bumps
+    /// only): the text is rendered by `Display`, i.e. only on the rare
+    /// path that prints it — a key or namespace can be ~1 MiB, and
+    /// `Debug`-formatting that on every forward stalled the single thread.
+    fn describe(&self) -> ForwardDescription {
+        let subject = match self {
+            OwnedForwardedWrite::Set { key, .. }
+            | OwnedForwardedWrite::HandoffSet { key, .. }
+            | OwnedForwardedWrite::Delete { key }
+            | OwnedForwardedWrite::HandoffDelete { key } => ForwardSubject::Key(key.clone()),
             OwnedForwardedWrite::SetMany {
                 namespace, items, ..
-            } => {
+            } => ForwardSubject::KeyBatch {
+                namespace: namespace.clone(),
+                keys: items.len(),
+            },
+            OwnedForwardedWrite::Clear(ClearScope::Namespace(namespace)) => {
+                ForwardSubject::Namespace(namespace.clone())
+            }
+            OwnedForwardedWrite::Clear(ClearScope::All) => ForwardSubject::AllNamespaces,
+        };
+        ForwardDescription {
+            kind: self.kind(),
+            subject,
+        }
+    }
+}
+
+/// What `OwnedForwardedWrite::describe` captured, rendered only when
+/// displayed.
+struct ForwardDescription {
+    kind: &'static str,
+    subject: ForwardSubject,
+}
+
+enum ForwardSubject {
+    Key(Key),
+    /// A `SetMany`: how many keys, and the namespace they share.
+    KeyBatch {
+        namespace: Bytes,
+        keys: usize,
+    },
+    Namespace(Bytes),
+    AllNamespaces,
+}
+
+impl std::fmt::Display for ForwardDescription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.subject {
+            ForwardSubject::Key(key) => write!(f, "{} {key:?}", self.kind),
+            ForwardSubject::KeyBatch { namespace, keys } => {
                 // A preview, not the whole namespace name: it can be ~1 MiB.
                 let preview = &namespace[..namespace.len().min(64)];
                 let ellipsis = if namespace.len() > preview.len() {
@@ -6942,15 +7044,14 @@ impl OwnedForwardedWrite {
                 } else {
                     ""
                 };
-                format!(
-                    "SET of {} keys in namespace {preview:?}{ellipsis}",
-                    items.len()
+                write!(
+                    f,
+                    "{} of {keys} keys in namespace {preview:?}{ellipsis}",
+                    self.kind
                 )
             }
-            OwnedForwardedWrite::Clear(ClearScope::Namespace(namespace)) => {
-                format!("CLEAR namespace {namespace:?}")
-            }
-            OwnedForwardedWrite::Clear(ClearScope::All) => "CLEAR (all namespaces)".to_string(),
+            ForwardSubject::Namespace(namespace) => write!(f, "CLEAR namespace {namespace:?}"),
+            ForwardSubject::AllNamespaces => f.write_str("CLEAR (all namespaces)"),
         }
     }
 }
@@ -9721,6 +9822,58 @@ mod tests {
 
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tagged_handoff_frame_with_the_wrong_token_is_rejected_not_a_panic() {
+        // `U`/`u` answer a wrong membership token with
+        // `MigrationRejected` through `encode_response(.., tag)`, and on a
+        // tagged connection `tag` is `Some`. `encode_with_tag` had no arm
+        // for it, so the connection task panicked (`unreachable!`)
+        // instead of rejecting. The real handler path, both frames.
+        for frame in [
+            // U <ns> <key> <value> <token> <tag>\n<token><ns><key><value>
+            &b"A 6 T\nsecretU 2 1 1 5 7\nwrongnsKV"[..],
+            // u <ns> <key> <token> <tag>\n<token><ns><key>
+            &b"A 6 T\nsecretu 2 1 5 7\nwrongnsK"[..],
+        ] {
+            let (mut client, server) = tcp_pair().await;
+            let (request_tx, _request_rx) = mpsc::channel(1);
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let node_context = test_node_context(
+                "self",
+                "tok-self",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            );
+
+            let connection_task = tokio::spawn(handle_connection(
+                ServerStream::Plain(server),
+                test_client_addr(),
+                request_tx,
+                ConnectionConfig {
+                    idle_timeout: IDLE_TIMEOUT,
+                    auth_secret: Some(Bytes::from_static(b"secret")),
+                    tls_acceptor: None,
+                    node_context: Some(node_context),
+                    migration_tx: mpsc::channel(1).0,
+                    forward_tx: mpsc::channel(1).0,
+                },
+                shutdown_rx,
+            ));
+
+            client.write_all(frame).await.unwrap();
+
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"OnT\nR 7\n", "{frame:?}");
+
+            let error = connection_task
+                .await
+                .expect("the connection task must not panic")
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -15631,6 +15784,217 @@ mod tests {
             "{hashed} bytes hashed for two frames of {KEYS} keys under a {NAMESPACE_LEN}-byte \
              namespace"
         );
+    }
+
+    /// A peer that accepts connections and then never answers: with
+    /// `ack_auth` it answers the `A` handshake (`On`) and goes silent on
+    /// whatever follows, otherwise it is silent from the start.
+    fn spawn_unresponsive_peer(
+        listener: TcpListener,
+        ack_auth: bool,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((mut connection, _)) = listener.accept().await else {
+                    return;
+                };
+                if ack_auth {
+                    let mut buffer = [0u8; 64];
+                    let _ = connection.read(&mut buffer).await;
+                    let _ = connection.write_all(b"On\n").await;
+                }
+                // Held open (never read from again, never answered).
+                held.push(connection);
+            }
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_rereplication_stops_at_shutdown_even_with_a_peer_mid_leg() {
+        // The dial/auth leg (silent peer) and the send leg (peer that acks
+        // auth, then goes silent) are each bounded by OUTBOUND_IO_TIMEOUT
+        // (10 s), but shutdown was only looked at *between* attempts, so
+        // an unresponsive target held the exit for a whole leg. Shutdown
+        // must now cut the in-flight leg short.
+        for ack_auth in [false, true] {
+            let (request_tx, request_rx) = mpsc::channel(4);
+            let cache_task =
+                tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+            // R=2, node-c evicted: some key's old top-2 is {node-a, node-c},
+            // so node-a must send it to node-b.
+            let before_ring = HashRing::new(vec![
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string(),
+            ]);
+            let after_ring = HashRing::new(vec!["node-a".to_string(), "node-b".to_string()]);
+            let replication = 2;
+            let stored = (0..500)
+                .map(|index| key(format!("key-{index}").as_bytes()))
+                .find(|candidate| {
+                    rereplication_targets(
+                        &before_ring,
+                        &after_ring,
+                        KeyHash::of(candidate),
+                        replication,
+                        "node-a",
+                    ) == vec!["node-b".to_string()]
+                })
+                .expect("some key moves to node-b");
+            let (response_tx, response_rx) = oneshot::channel();
+            request_tx
+                .send(CacheRequest {
+                    command: Command::Set {
+                        key: stored,
+                        value: Bytes::from_static(b"v"),
+                        ttl: None,
+                    },
+                    response_tx,
+                })
+                .await
+                .unwrap();
+            response_rx.await.unwrap();
+
+            let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let peer_addr = peer_listener.local_addr().unwrap().to_string();
+            let peer_task = spawn_unresponsive_peer(peer_listener, ack_auth);
+
+            let mut node_context = test_node_context(
+                "node-a",
+                "tok-a",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            );
+            node_context.request_tx = request_tx.clone();
+            node_context.auth_secret = Some(Bytes::from_static(b"secret"));
+
+            let addresses = HashMap::from([("node-b".to_string(), peer_addr)]);
+            let tokens = HashMap::from([("node-b".to_string(), "tok-b".to_string())]);
+            let abort_requested = Arc::new(AtomicBool::new(false));
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let started = Instant::now();
+            let rereplication = tokio::spawn({
+                let abort_requested = Arc::clone(&abort_requested);
+                let mut shutdown_rx = shutdown_rx;
+                async move {
+                    run_rereplication(
+                        &node_context,
+                        &before_ring,
+                        &after_ring,
+                        replication,
+                        &addresses,
+                        &tokens,
+                        &abort_requested,
+                        &mut shutdown_rx,
+                    )
+                    .await;
+                }
+            });
+
+            // Long enough to be inside the dial/auth or send leg.
+            sleep(Duration::from_millis(300)).await;
+            assert!(!rereplication.is_finished(), "ack_auth={ack_auth}");
+            shutdown_tx.send_replace(true);
+
+            timeout(Duration::from_secs(3), rereplication)
+                .await
+                .expect(
+                    "shutdown must cut the in-flight leg short, not wait out OUTBOUND_IO_TIMEOUT",
+                )
+                .unwrap();
+            assert!(started.elapsed() < Duration::from_secs(3));
+
+            peer_task.abort();
+            drop(request_tx);
+            cache_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn join_heartbeat_task_aborts_a_task_that_outlives_the_wait() {
+        let stuck = tokio::spawn(std::future::pending::<()>());
+
+        let started = tokio::time::Instant::now();
+        join_heartbeat_task(stuck, HEARTBEAT_SHUTDOWN_WAIT)
+            .await
+            .unwrap();
+
+        assert_eq!(started.elapsed(), HEARTBEAT_SHUTDOWN_WAIT);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn join_heartbeat_task_returns_as_soon_as_the_task_finishes() {
+        let quick = tokio::spawn(async {
+            sleep(Duration::from_millis(50)).await;
+        });
+
+        let started = tokio::time::Instant::now();
+        join_heartbeat_task(quick, HEARTBEAT_SHUTDOWN_WAIT)
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < HEARTBEAT_SHUTDOWN_WAIT);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn join_heartbeat_task_still_reports_a_task_that_panicked() {
+        let panicked = tokio::spawn(async {
+            panic!("heartbeat task panics");
+        });
+
+        let error = join_heartbeat_task(panicked, HEARTBEAT_SHUTDOWN_WAIT)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("heartbeat task failed"));
+    }
+
+    #[test]
+    fn a_forward_description_renders_the_same_text_only_when_displayed() {
+        // `spawn_forward` captures this for every forward but prints it only
+        // when it drops one; capturing must not format (a key can be ~1 MiB
+        // of `Debug` output). The text itself is what the drop WARN has
+        // always said.
+        let set = OwnedForwardedWrite::Set {
+            key: key(b"alpha"),
+            value: Bytes::from_static(b"v"),
+            ttl: None,
+        };
+        assert_eq!(
+            set.describe().to_string(),
+            format!("SET {:?}", key(b"alpha"))
+        );
+        let delete = OwnedForwardedWrite::HandoffDelete { key: key(b"alpha") };
+        assert_eq!(
+            delete.describe().to_string(),
+            format!("DELETE {:?}", key(b"alpha"))
+        );
+        assert_eq!(
+            OwnedForwardedWrite::Clear(ClearScope::Namespace(Bytes::from_static(b"ns")))
+                .describe()
+                .to_string(),
+            format!("CLEAR namespace {:?}", Bytes::from_static(b"ns"))
+        );
+        assert_eq!(
+            OwnedForwardedWrite::Clear(ClearScope::All)
+                .describe()
+                .to_string(),
+            "CLEAR (all namespaces)"
+        );
+
+        // Capturing shares the key's bytes instead of copying or rendering
+        // them.
+        let big = key(&vec![b'k'; 1024 * 1024]);
+        let ptr = big.name.as_ptr();
+        let write = OwnedForwardedWrite::Delete { key: big };
+        let description = write.describe();
+        let ForwardSubject::Key(captured) = &description.subject else {
+            panic!("a key forward is described by its key");
+        };
+        assert_eq!(captured.name.as_ptr(), ptr);
     }
 
     fn test_active_migration(completed_at: Option<Instant>) -> ActiveMigration {
