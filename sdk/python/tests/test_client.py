@@ -4036,6 +4036,222 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
             await node.close()
 
 
+class RosterDialTests(unittest.IsolatedAsyncioTestCase):
+    """Bootstrap/refresh dial rounds: a malformed roster address is one
+    unreachable node, an abandoned round closes its siblings' sockets, and
+    at most _MAX_CONCURRENT_DIALS dials are in flight at once."""
+
+    async def test_bootstrap_treats_a_malformed_roster_address_as_one_unreachable_node(self):
+        # split_host_port() used to run outside dial()'s try, so one bad
+        # entry (no `:port`, port above 65535) raised out of the whole
+        # round and failed connect() — _refresh_node_list already handled
+        # it per node.
+        for bad in ("no-port-here", "127.0.0.1:99999"):
+            with self.subTest(bad=bad):
+                node = await MockNode().start()
+                discovery = await MockDiscovery(
+                    [(NAMES[0], node.address), (NAMES[1], bad)], replication=2
+                ).start()
+                try:
+                    client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                    try:
+                        self.assertIsNotNone(client._members[NAMES[0]].connection)
+                        self.assertIsNone(client._members[NAMES[1]].connection)
+                        self.assertIn(bad, client._redial_cooldowns)
+                    finally:
+                        await client.close()
+                finally:
+                    await discovery.close()
+                    await node.close()
+
+    async def test_an_abandoned_bootstrap_round_closes_the_sockets_its_siblings_opened(self):
+        from nanocached import client as client_module
+
+        real = client_module.connect_and_identify
+        opened = []
+
+        async def fake(host, port, auth_secret, ssl_context):
+            if port == 1:
+                await asyncio.sleep(0.1)  # after the sibling has connected
+                raise RuntimeError("a programming error, not a network one")
+            target = await real(host, port, auth_secret, ssl_context)
+            if hasattr(target, "writer"):  # a node socket, not discovery's roster
+                opened.append(target)
+            return target
+
+        node = await MockNode().start()
+        discovery = await MockDiscovery(
+            [(NAMES[0], node.address), (NAMES[1], "127.0.0.1:1")], replication=2
+        ).start()
+        try:
+            with mock.patch.object(client_module, "connect_and_identify", fake):
+                with self.assertRaises(RuntimeError):
+                    await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            self.assertEqual(len(opened), 1)
+            self.assertTrue(opened[0].writer.is_closing(), "the sibling's socket was left open")
+        finally:
+            await discovery.close()
+            await node.close()
+
+    async def test_an_abandoned_refresh_round_closes_the_sockets_its_siblings_opened(self):
+        from nanocached import client as client_module
+
+        real = client_module.connect_and_identify
+        opened = []
+
+        async def fake(host, port, auth_secret, ssl_context):
+            if port == 1:
+                await asyncio.sleep(0.1)
+                raise RuntimeError("a programming error, not a network one")
+            target = await real(host, port, auth_secret, ssl_context)
+            opened.append(target)
+            return target
+
+        existing = await MockNode().start()
+        new = await MockNode().start()
+        discovery = await MockDiscovery([(NAMES[0], existing.address)]).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                discovery.nodes = [
+                    (NAMES[0], existing.address),
+                    ("new-good", new.address),
+                    ("new-bad", "127.0.0.1:1"),
+                ]
+                opened.clear()
+                with mock.patch.object(client_module, "connect_and_identify", fake):
+                    with self.assertRaises(RuntimeError):
+                        await client._refresh_node_list()
+                # The refresh's own discovery fetch goes through the patched
+                # function too, but only node dials are NodeTargets.
+                node_targets = [t for t in opened if hasattr(t, "writer")]
+                self.assertEqual(len(node_targets), 1)
+                self.assertTrue(node_targets[0].writer.is_closing())
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await existing.close()
+            await new.close()
+
+    def counting_dial(self, client_module):
+        real = client_module.connect_and_identify
+        state = {"in_flight": 0, "max": 0}
+
+        async def counting(host, port, auth_secret, ssl_context):
+            if port == self.node_port:  # only the roster's node dials
+                state["in_flight"] += 1
+                state["max"] = max(state["max"], state["in_flight"])
+                try:
+                    await asyncio.sleep(0.02)
+                    return await real(host, port, auth_secret, ssl_context)
+                finally:
+                    state["in_flight"] -= 1
+            return await real(host, port, auth_secret, ssl_context)
+
+        return counting, state
+
+    async def test_bootstrap_dials_a_big_roster_with_bounded_concurrency(self):
+        from nanocached import client as client_module
+
+        node = await MockNode().start()
+        self.node_port = node.port
+        roster = [(f"node-{i:03d}", node.address) for i in range(30)]
+        discovery = await MockDiscovery(roster, replication=2).start()
+        counting, state = self.counting_dial(client_module)
+        try:
+            with mock.patch.object(client_module, "_MAX_CONCURRENT_DIALS", 4), mock.patch.object(
+                client_module, "connect_and_identify", counting
+            ):
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                self.assertEqual(len(client._members), 30)
+                self.assertTrue(all(m.connection is not None for m in client._members.values()))
+                self.assertLessEqual(state["max"], 4)
+                self.assertGreater(state["max"], 1, "the bound must still leave dials concurrent")
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await node.close()
+
+    async def test_refresh_dials_a_big_roster_with_bounded_concurrency(self):
+        from nanocached import client as client_module
+
+        existing = await MockNode().start()
+        node = await MockNode().start()
+        self.node_port = node.port
+        discovery = await MockDiscovery([(NAMES[0], existing.address)]).start()
+        counting, state = self.counting_dial(client_module)
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                discovery.nodes = [(NAMES[0], existing.address)] + [
+                    (f"node-{i:03d}", node.address) for i in range(30)
+                ]
+                with mock.patch.object(client_module, "_MAX_CONCURRENT_DIALS", 4), mock.patch.object(
+                    client_module, "connect_and_identify", counting
+                ):
+                    await client._maybe_refresh(force=True)
+                self.assertEqual(len(client._members), 31)
+                self.assertTrue(all(m.connection is not None for m in client._members.values()))
+                self.assertLessEqual(state["max"], 4)
+                self.assertGreater(state["max"], 1, "the bound must still leave dials concurrent")
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await existing.close()
+            await node.close()
+
+
+class KeepAliveHungNodeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from nanocached import client as client_module
+
+        self._client_module = client_module
+        self._default_interval = client_module._KEEPALIVE_INTERVAL
+
+    def tearDown(self):
+        self._client_module._KEEPALIVE_INTERVAL = self._default_interval
+
+    async def test_a_hung_node_does_not_delay_the_other_nodes_pings(self):
+        # The ping loop used to await each connection's ping in turn: a
+        # half-open node (its ping blocks until the 30s request timeout)
+        # kept every node after it from being pinged, until they sat idle
+        # for the server's own 60s limit. Go fixed the same thing in #192.
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        discovery = await MockDiscovery(
+            [(NAMES[0], node_a.address), (NAMES[1], node_b.address)], replication=2
+        ).start()
+        try:
+            self._client_module._KEEPALIVE_INTERVAL = 0.03
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                hung_calls = []
+                never = asyncio.Event()
+
+                async def hang(key):
+                    hung_calls.append(key)
+                    await never.wait()
+
+                # First in iteration order, so the old loop got stuck on it
+                # before ever reaching node B.
+                client._members[NAMES[0]].connection.get = hang
+
+                await wait_for(lambda: node_b.get_count >= 3, "node B's keep-alive pings")
+                # A's ping is still outstanding, and was not stacked up again.
+                self.assertEqual(len(hung_calls), 1)
+                self.assertFalse(client._keepalive_task.done())
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await node_a.close()
+            await node_b.close()
+
+
 class StatsTests(unittest.IsolatedAsyncioTestCase):
     # stats()/ClientStats: observability for failures swallowed by design
     # (client-side replication / fire-and-forget replica writes / read repair).

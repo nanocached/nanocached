@@ -35,7 +35,7 @@ import ssl as ssl_module
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from ._compression import (
@@ -121,6 +121,16 @@ _DEFAULT_COMPRESSION_THRESHOLD = 256
 # How long the node list may go without a re-fetch from discovery before
 # get/set/delete refreshes it first (checked lazily on use).
 _NODE_LIST_STALE_AFTER = 30.0
+
+# How many of a roster's nodes a dial round (_open_cluster's bootstrap,
+# _refresh_node_list) has in flight at once. Discovery may list up to
+# 65536 nodes; dialing them all at once opens that many sockets in one go,
+# past most processes' file-descriptor limit. Bounded rather than
+# serialized (issue #190): 64 keeps a typical roster fully parallel while
+# capping the burst. (The Java SDK bounds its bootstrap dialers too, at 16
+# threads.) Mutable only so tests can shrink it, mirroring
+# _KEEPALIVE_INTERVAL.
+_MAX_CONCURRENT_DIALS = 64
 
 # Default for NanocachedClient.connect's reconnect_cooldown: how long,
 # after a reconnect dial to an address fails, that address is treated as
@@ -286,6 +296,45 @@ def _dedupe_discovered_nodes(nodes: Sequence[DiscoveredNode]) -> list[Discovered
         seen.add(node.name)
         deduped.append(node)
     return deduped
+
+
+async def _dial_roster(
+    nodes: Sequence[DiscoveredNode],
+    dial: Callable[[DiscoveredNode], Awaitable[tuple[DiscoveredNode, Any]]],
+) -> list[tuple[DiscoveredNode, Any]]:
+    """Runs ``dial(node)`` for every node, at most _MAX_CONCURRENT_DIALS at
+    a time (in ``nodes`` order), and returns the outcomes in ``nodes``
+    order — the bounded form of ``asyncio.gather(*(dial(n) for n in
+    nodes))`` that _open_cluster and _refresh_node_list used (issue #190).
+    A roster may list up to 65536 nodes, which the unbounded form dialed
+    all at once.
+
+    ``dial`` reports every expected failure as a value (a swallowable
+    error is an outcome, not an exception). If it nevertheless raises —
+    a genuine programming error, or this task being cancelled — the round
+    is abandoned: the remaining dials are cancelled and every socket the
+    round already opened is closed, rather than left for the garbage
+    collector (a bare ``gather`` raised with its sibling dials' sockets
+    still open)."""
+    outcomes: list[tuple[DiscoveredNode, Any] | None] = [None] * len(nodes)
+    pending = iter(enumerate(nodes))
+
+    async def worker() -> None:
+        for index, node in pending:
+            outcomes[index] = await dial(node)
+
+    workers = [asyncio.ensure_future(worker()) for _ in range(min(_MAX_CONCURRENT_DIALS, len(nodes)))]
+    try:
+        await asyncio.gather(*workers)
+    except BaseException:
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        for outcome in outcomes:
+            if outcome is not None and isinstance(outcome[1], NodeTarget):
+                outcome[1].writer.close()
+        raise
+    return [outcome for outcome in outcomes if outcome is not None]
 
 
 def _to_bytes(value: str | bytes) -> bytes:
@@ -753,8 +802,13 @@ class NanocachedClient:
         nodes = _dedupe_discovered_nodes(identified.nodes)
 
         async def dial(node):
-            node_host, node_port = split_host_port(node.address)
             try:
+                # Inside the try: a malformed roster entry (no port, port
+                # above 65535) is a NanocachedError, so it is one
+                # unreachable node like in _refresh_node_list — not an
+                # exception out of the whole round that would abort
+                # connect() with every sibling dial's socket left open.
+                node_host, node_port = split_host_port(node.address)
                 target = await connect_and_identify(
                     node_host, node_port, self._auth_secret, self._ssl_context
                 )
@@ -762,7 +816,7 @@ class NanocachedClient:
                 return node, error
             return node, target
 
-        outcomes = await asyncio.gather(*(dial(node) for node in nodes))
+        outcomes = await _dial_roster(nodes, dial)
 
         # A non-node answer is a configuration error, not a liveness one:
         # checked across every outcome first so the sockets this same
@@ -2756,7 +2810,7 @@ class NanocachedClient:
         # N * dial timeout. A failed/slow dial of one node must not delay
         # installing the others, mirrored from _open_cluster's own
         # per-node outcome handling below.
-        outcomes = await asyncio.gather(*(dial(node) for node in new_nodes))
+        outcomes = await _dial_roster(new_nodes, dial)
 
         if self._closed:
             # close() ran while we were dialing (issue #10): installing
@@ -2830,39 +2884,60 @@ class NanocachedClient:
         # Module-level only so tests can shorten it.
         interval = _KEEPALIVE_INTERVAL
 
+        async def ping(connection: Connection) -> None:
+            try:
+                # Any parseable reply proves liveness — `N`, or `W` from a
+                # non-owner — and resets the idle timer. G refreshes the
+                # server's LRU recency of whatever key it names, which is
+                # exactly why _KEEPALIVE_KEY has to be a sequence reserved
+                # by the SDKs: a real application key would have had its
+                # recency silently reset every tick.
+                await connection.get(_KEEPALIVE_KEY)
+            except _SWALLOWABLE_ERRORS:
+                # issue #192: narrowed from a bare `except Exception` — a
+                # keepalive ping is best-effort and a dead/flaky
+                # connection is expected, but this loop shouldn't also
+                # hide a bug elsewhere in get()'s own code by swallowing
+                # every exception it could ever raise.
+                pass
+
         async def ping_loop() -> None:
-            while not self._closed:
-                await asyncio.sleep(interval)
-                connections = (
-                    [self._single] if self._single is not None
-                    else [
-                        member.connection
-                        for member in self._members.values()
-                        if member.connection is not None
-                    ]
-                )
-                for connection in connections:
-                    if connection is None or connection.closed:
-                        continue  # dead connections stay lazy, redialed on use
-                    if connection.idle_seconds() < interval:
-                        continue  # real traffic already reset the server's timer
-                    try:
-                        # Any parseable reply proves liveness — `N`, or `W`
-                        # from a non-owner — and resets the idle timer. G
-                        # refreshes the server's LRU recency of whatever
-                        # key it names, which is exactly why
-                        # _KEEPALIVE_KEY has to be a sequence reserved by
-                        # the SDKs: a real application key would have had
-                        # its recency silently reset every tick.
-                        await connection.get(_KEEPALIVE_KEY)
-                    except _SWALLOWABLE_ERRORS:
-                        # issue #192: narrowed from a bare `except
-                        # Exception` — a keepalive ping is best-effort and
-                        # a dead/flaky connection is expected, but this
-                        # loop shouldn't also hide a bug elsewhere in
-                        # get()'s own code by swallowing every exception
-                        # it could ever raise.
-                        pass
+            # One task per connection, not awaited by the loop: pings run
+            # concurrently (as in the Go SDK, issue #192), and a half-open
+            # node whose ping blocks until the 30s request timeout no
+            # longer holds the others back — with the pings run in turn
+            # (or just joined each round) the healthy nodes' next ping
+            # slid out to about 60s idle, the server's idle limit.
+            pings: dict[Connection, asyncio.Task[None]] = {}
+            try:
+                while not self._closed:
+                    await asyncio.sleep(interval)
+                    for connection, task in list(pings.items()):
+                        if task.done():
+                            del pings[connection]
+                            # A non-network error from a ping still ends
+                            # this loop with that exception (issue #192).
+                            task.result()
+                    connections = (
+                        [self._single] if self._single is not None
+                        else [
+                            member.connection
+                            for member in self._members.values()
+                            if member.connection is not None
+                        ]
+                    )
+                    for connection in connections:
+                        if connection is None or connection.closed:
+                            continue  # dead connections stay lazy, redialed on use
+                        if connection in pings:
+                            continue  # its last ping is still waiting on a hung node
+                        if connection.idle_seconds() < interval:
+                            continue  # real traffic already reset the server's timer
+                        pings[connection] = asyncio.ensure_future(ping(connection))
+            finally:
+                for task in pings.values():
+                    task.cancel()
+                await asyncio.gather(*pings.values(), return_exceptions=True)
 
         self._keepalive_task = asyncio.ensure_future(ping_loop())
 
