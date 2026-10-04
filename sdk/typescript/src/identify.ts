@@ -81,27 +81,54 @@ const MAX_NODE_FIELD_LENGTH = 64 * 1024;
 // constant is being added to all six SDKs.
 const MAX_NODE_LIST_RESPONSE_LENGTH = 16 * 1024 * 1024;
 
-/** Reads from `socket` until `tryParse` returns non-null, resolving with
+/** A resumable parser for `readFrame`. `parse` is handed the bytes not yet
+ * consumed and returns the result once the frame is complete, `null`
+ * while it needs more. On a `null` return it reports how far it got:
+ * `consumed` bytes at the front of `buf` are finished with (they are
+ * dropped, never handed to it again, and the next `parse` call's buffer
+ * starts right after them), and `needed` is the total length `buf` must
+ * reach before another attempt can make progress (0 = unknown, retry on
+ * any new byte). Both are relative to the `buf` just passed. */
+interface FrameParser<T> {
+  parse(buf: Buffer): T | null;
+  consumed: number;
+  needed: number;
+}
+
+/** Wraps a stateless `tryParse` (one that always re-reads from the front
+ * of the whole buffer, as the `A` reply's does) as a `FrameParser`. */
+function restartingParser<T>(tryParse: (buf: Buffer) => T | null): FrameParser<T> {
+  return { parse: tryParse, consumed: 0, needed: 0 };
+}
+
+/** Reads from `socket` until `parser` returns non-null, resolving with
  * that value. One-shot: meant for a single request/response, not a
  * long-lived connection matching multiple in-flight requests. `maxBufferLength`,
- * when given, poisons the read if the accumulated buffer grows past it
+ * when given, poisons the read if the total bytes received grow past it
  * without ever yielding a parseable frame — a backstop against a
  * malicious/misbehaving server that never sends a valid terminator
  * (issue #12 follow-up). */
 function readFrame<T>(
   socket: Socket | TLSSocket,
-  tryParse: (buf: Buffer) => T | null,
+  parser: FrameParser<T>,
   deadlineMs: number,
   maxBufferLength?: number,
 ): Promise<T> {
   return new Promise((resolve, reject) => {
-    // Chunks are accumulated in an array and only concatenated when a
-    // parse is attempted, instead of concatenating on every onData call —
-    // avoids an O(n^2) cost re-copying the whole buffer for each fragment
-    // of a large discovery response. Mirrors connection.ts's identical fix
-    // for value bodies.
+    // Chunks are accumulated in an array and only concatenated when the
+    // parser can make progress, instead of concatenating on every onData
+    // call; and what the parser has already consumed (a long roster's
+    // earlier entries) is dropped rather than carried — and re-copied,
+    // re-parsed — by every later fragment. Together that keeps a large
+    // discovery response O(n) in copies where concatenating the whole
+    // accumulation per chunk was O(n^2). Mirrors connection.ts's fix for
+    // value bodies.
     let chunks: Buffer[] = [];
     let chunksLength = 0;
+    let needed = 0;
+    // Bytes already dropped as consumed, so the size backstop still
+    // counts the whole response.
+    let discarded = 0;
 
     // A server that accepts the connection but never answers (a
     // blackholed address behaves the same way) must not hang the caller.
@@ -119,11 +146,21 @@ function readFrame<T>(
     const onData = (chunk: Buffer) => {
       chunks.push(chunk);
       chunksLength += chunk.length;
+      // Frame known to need more bytes than are buffered: nothing to
+      // parse yet, and so nothing to copy. The size backstop below still
+      // has to run, though.
+      if (chunksLength < needed) {
+        if (maxBufferLength !== undefined && discarded + chunksLength > maxBufferLength) {
+          cleanup();
+          reject(new NanocachedError("nanocached: discovery response exceeds maximum size (connection desynced)"));
+        }
+        return;
+      }
       const buffer = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, chunksLength);
 
       let parsed: T | null;
       try {
-        parsed = tryParse(buffer);
+        parsed = parser.parse(buffer);
       } catch (error) {
         cleanup();
         reject(error as Error);
@@ -136,16 +173,20 @@ function readFrame<T>(
         return;
       }
 
-      if (maxBufferLength !== undefined && buffer.length > maxBufferLength) {
+      if (maxBufferLength !== undefined && discarded + buffer.length > maxBufferLength) {
         cleanup();
         reject(new NanocachedError("nanocached: discovery response exceeds maximum size (connection desynced)"));
         return;
       }
 
-      // Collapse back to a single stored chunk so later onData calls
-      // don't re-concat bytes already merged here.
-      chunks = [buffer];
-      chunksLength = buffer.length;
+      // Collapse back to a single stored chunk (minus whatever the parser
+      // has finished with) so later onData calls don't re-concat bytes
+      // already merged here.
+      const rest = parser.consumed > 0 ? buffer.subarray(parser.consumed) : buffer;
+      discarded += parser.consumed;
+      chunks = rest.length > 0 ? [rest] : [];
+      chunksLength = rest.length;
+      needed = Math.max(0, parser.needed - parser.consumed);
     };
     const onError = (error: Error) => {
       cleanup();
@@ -248,66 +289,112 @@ const MAX_NODE_LIST_HEADER_LENGTH = 2 + String(MAX_NODE_COUNT).length + 1 + 20 +
 // MAX_NODE_FIELD_LENGTH-digit fields, a space, and the LF.
 const MAX_NODE_ENTRY_HEADER_LENGTH = 2 * String(MAX_NODE_FIELD_LENGTH).length + 1 + 1;
 
-/** Parses `count` `<name-length> <addr-length>\n<name><addr>\n` entries
- * starting at `offset` (node identity decoupled from address) — the entry
- * shape shared, byte-for-byte, by `L`'s node list and `Q`'s proxy roster
+/** Parses one `<name-length> <addr-length>\n<name><addr>\n` entry at
+ * `offset` (node identity decoupled from address) — the entry shape
+ * shared, byte-for-byte, by `L`'s node list and `Q`'s proxy roster
  * (issue #122); the two responses differ only in their header
- * (`tryParseNodeList` vs `tryParseProxyList`), never in how an individual
- * entry is laid out. Returns `null` while more bytes are still needed for
- * the next entry. */
-function parseEntries(buf: Buffer, offset: number, count: number): { entries: DiscoveredNode[]; offset: number } | null {
-  const entries: DiscoveredNode[] = [];
-
-  for (let i = 0; i < count; i++) {
-    const entryHeaderEnd = buf.indexOf(0x0a, offset);
-    if (entryHeaderEnd === -1) {
-      if (buf.length - offset > MAX_NODE_ENTRY_HEADER_LENGTH) {
-        throw new NanocachedError("nanocached: invalid entry header in discovery response (missing header terminator)");
-      }
-      return null;
+ * (`readNodeListHeader` vs `readProxyListHeader`), never in how an
+ * individual entry is laid out. Returns the node and the offset just past
+ * it, or `{ needed }` while more bytes are still needed — `needed` being
+ * the total buffer length the entry will take (0 while its header line is
+ * itself incomplete, so unknown). */
+function parseEntry(buf: Buffer, offset: number): { node: DiscoveredNode; end: number } | { needed: number } {
+  const entryHeaderEnd = buf.indexOf(0x0a, offset);
+  if (entryHeaderEnd === -1) {
+    if (buf.length - offset > MAX_NODE_ENTRY_HEADER_LENGTH) {
+      throw new NanocachedError("nanocached: invalid entry header in discovery response (missing header terminator)");
     }
-
-    const lengths = buf.subarray(offset, entryHeaderEnd).toString("ascii").split(" ");
-    if (lengths.length !== 2) {
-      throw new NanocachedError("nanocached: invalid entry header in discovery response");
-    }
-
-    // `parseStrictInteger` (digits only,
-    // safe-integer range) rather than bare `Number()` + `isInteger`, which
-    // accepted `+1`, ` 1`, `1e2` and precision-losing digit strings —
-    // the same strictness protocol.ts already applies to every node frame.
-    const nameLength = parseStrictInteger(lengths[0]);
-    const addrLength = parseStrictInteger(lengths[1]);
-    if (
-      nameLength === undefined ||
-      nameLength > MAX_NODE_FIELD_LENGTH ||
-      addrLength === undefined ||
-      addrLength > MAX_NODE_FIELD_LENGTH
-    ) {
-      throw new NanocachedError("nanocached: invalid entry lengths in discovery response");
-    }
-
-    const nameStart = entryHeaderEnd + 1;
-    const addrStart = nameStart + nameLength;
-    const addrEnd = addrStart + addrLength;
-    const entryEnd = addrEnd + 1; // the trailing '\n' after the address
-
-    if (buf.length < entryEnd) return null;
-    if (buf[addrEnd] !== 0x0a) {
-      throw new NanocachedError("nanocached: malformed entry in discovery response");
-    }
-
-    entries.push({
-      name: buf.subarray(nameStart, addrStart).toString("utf8"),
-      address: buf.subarray(addrStart, addrEnd).toString("utf8"),
-    });
-    offset = entryEnd;
+    return { needed: 0 };
   }
 
-  return { entries, offset };
+  const lengths = buf.subarray(offset, entryHeaderEnd).toString("ascii").split(" ");
+  if (lengths.length !== 2) {
+    throw new NanocachedError("nanocached: invalid entry header in discovery response");
+  }
+
+  // `parseStrictInteger` (digits only,
+  // safe-integer range) rather than bare `Number()` + `isInteger`, which
+  // accepted `+1`, ` 1`, `1e2` and precision-losing digit strings —
+  // the same strictness protocol.ts already applies to every node frame.
+  const nameLength = parseStrictInteger(lengths[0]);
+  const addrLength = parseStrictInteger(lengths[1]);
+  if (
+    nameLength === undefined ||
+    nameLength > MAX_NODE_FIELD_LENGTH ||
+    addrLength === undefined ||
+    addrLength > MAX_NODE_FIELD_LENGTH
+  ) {
+    throw new NanocachedError("nanocached: invalid entry lengths in discovery response");
+  }
+
+  const nameStart = entryHeaderEnd + 1;
+  const addrStart = nameStart + nameLength;
+  const addrEnd = addrStart + addrLength;
+  const entryEnd = addrEnd + 1; // the trailing '\n' after the address
+
+  if (buf.length < entryEnd) return { needed: entryEnd };
+  if (buf[addrEnd] !== 0x0a) {
+    throw new NanocachedError("nanocached: malformed entry in discovery response");
+  }
+
+  return {
+    node: {
+      name: buf.subarray(nameStart, addrStart).toString("utf8"),
+      address: buf.subarray(addrStart, addrEnd).toString("utf8"),
+    },
+    end: entryEnd,
+  };
 }
 
-function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: number } | null {
+/** What an `N` response's header line yields: how many entries follow,
+ * where the header ends, and how to turn the parsed entries into the
+ * caller's result. */
+interface ListHeader<T> {
+  count: number;
+  headerEnd: number;
+  finish: (nodes: DiscoveredNode[]) => T;
+}
+
+/** A resumable `N <header>\n` + `count` entries parser (`L`'s node list or
+ * `Q`'s proxy roster, depending on `readHeader`). It parses each entry
+ * exactly once and reports it consumed, so `readFrame` neither
+ * re-concatenates nor re-parses the earlier part of a long roster on
+ * every new fragment (a 65536-node roster arrives in hundreds of them). */
+function entryListParser<T>(readHeader: (buf: Buffer) => ListHeader<T> | null): FrameParser<T> {
+  let header: ListHeader<T> | undefined;
+  const entries: DiscoveredNode[] = [];
+  const parser: FrameParser<T> = {
+    consumed: 0,
+    needed: 0,
+    parse(buf) {
+      let offset = 0;
+      if (header === undefined) {
+        const read = readHeader(buf);
+        if (read === null) {
+          parser.consumed = 0;
+          parser.needed = 0;
+          return null;
+        }
+        header = read;
+        offset = read.headerEnd + 1;
+      }
+      while (entries.length < header.count) {
+        const entry = parseEntry(buf, offset);
+        if ("needed" in entry) {
+          parser.consumed = offset;
+          parser.needed = entry.needed;
+          return null;
+        }
+        entries.push(entry.node);
+        offset = entry.end;
+      }
+      return header.finish(entries);
+    },
+  };
+  return parser;
+}
+
+function readNodeListHeader(buf: Buffer): ListHeader<{ nodes: DiscoveredNode[]; replication: number }> | null {
   const headerEnd = buf.indexOf(0x0a);
   if (headerEnd === -1) {
     // Keep waiting only while the header could still turn out legal; a
@@ -343,23 +430,22 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
     throw new NanocachedError("nanocached: invalid replication factor in discovery response");
   }
 
-  const parsed = parseEntries(buf, headerEnd + 1, count);
-  return parsed === null ? null : { nodes: parsed.entries, replication };
+  return { count, headerEnd, finish: (nodes) => ({ nodes, replication }) };
 }
 
 /** Parses `Q`'s `N <count>\n` response (issue #122) — `L`'s node-list
  * header minus the trailing replication field (a proxy client needs no
- * R), followed by the exact same per-entry shape `parseEntries` already
- * knows. Entry/count caps mirror `tryParseNodeList`'s (MAX_NODE_COUNT,
+ * R), followed by the exact same per-entry shape `parseEntry` already
+ * knows. Entry/count caps mirror `readNodeListHeader`'s (MAX_NODE_COUNT,
  * MAX_NODE_FIELD_LENGTH) rather than inventing separate ones, per the
  * SDK-port spec — `Q`'s roster is bounded by the same discovery-server
  * trust model `L`'s is. */
-function tryParseProxyList(buf: Buffer): DiscoveredNode[] | null {
+function readProxyListHeader(buf: Buffer): ListHeader<DiscoveredNode[]> | null {
   const headerEnd = buf.indexOf(0x0a);
   if (headerEnd === -1) {
     // `N <count>\n` can only ever be shorter than `N <count> <r>\n`, so
     // MAX_NODE_LIST_HEADER_LENGTH is a safe (if slightly generous) bound
-    // here too — see the same reasoning on tryParseNodeList above.
+    // here too — see the same reasoning on readNodeListHeader above.
     if (buf.length > MAX_NODE_LIST_HEADER_LENGTH) {
       throw new NanocachedError("nanocached: invalid proxy-list header in discovery response (missing header terminator)");
     }
@@ -380,8 +466,7 @@ function tryParseProxyList(buf: Buffer): DiscoveredNode[] | null {
     throw new NanocachedError("nanocached: invalid proxy count in discovery response");
   }
 
-  const parsed = parseEntries(buf, headerEnd + 1, count);
-  return parsed === null ? null : parsed.entries;
+  return { count, headerEnd, finish: (proxies) => proxies };
 }
 
 /**
@@ -482,7 +567,7 @@ async function authenticate(
   let identity: AuthIdentity;
   try {
     socket.write(authFrame);
-    identity = await readFrame(socket, tryParseIdentity, remainingDeadline(deadlineMs, startedAt));
+    identity = await readFrame(socket, restartingParser(tryParseIdentity), remainingDeadline(deadlineMs, startedAt));
   } catch (error) {
     socket.destroy();
     throw error;
@@ -514,7 +599,7 @@ async function identifyOnce(options: IdentifyOptions, requestTags: boolean, requ
     identified.socket.write(Buffer.from("L\n"));
     const { nodes, replication } = await readFrame(
       identified.socket,
-      tryParseNodeList,
+      entryListParser(readNodeListHeader),
       remainingDeadline(deadlineMs, startedAt),
       MAX_NODE_LIST_RESPONSE_LENGTH,
     );
@@ -571,9 +656,9 @@ async function listProxiesOnce(options: IdentifyOptions, requestTags: boolean, r
     identified.socket.write(Buffer.from("Q\n"));
     const proxies = await readFrame(
       identified.socket,
-      tryParseProxyList,
+      entryListParser(readProxyListHeader),
       remainingDeadline(deadlineMs, startedAt),
-      // Same aggregate cap as `L` (issue #122) — see tryParseProxyList's
+      // Same aggregate cap as `L` (issue #122) — see readProxyListHeader's
       // doc comment on why the count/field caps are shared too.
       MAX_NODE_LIST_RESPONSE_LENGTH,
     );
