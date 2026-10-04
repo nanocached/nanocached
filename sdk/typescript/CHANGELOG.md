@@ -18,6 +18,24 @@ tag: 0.4.3 was a server-only release.
 - A malformed roster address (no port, port above 65535) now counts as one
   unreachable node during `connect()` and node-list refresh, instead of
   aborting the round and leaking the sockets its sibling dials had opened.
+- A large reply no longer costs quadratic CPU while it arrives. Every
+  fragment used to re-concatenate (and re-parse) everything received so
+  far, so a 64 MiB multi-get reply in 64 KiB fragments held the event loop
+  for about 3 s, and a 65536-node roster about 0.9 s. The connection now
+  waits until the frame's declared length is buffered and concatenates once,
+  and the discovery reader parses each roster entry once and drops it.
+  Wire behavior is unchanged.
+- Routing a key no longer scores every node with BigInt arithmetic and then
+  sorts them all: `HashRing.owners` keeps only the best `replicas`
+  candidates, like the Go, Rust, Java and .NET SDKs, and does the 64-bit
+  scoring on 32-bit halves. A lookup takes about 3 us at 100 nodes (was
+  22 us) and 31 us at 1000 nodes (was 278 us). The owner order, ties
+  included, is unchanged.
+- `connect()` and node-list refresh no longer dial a whole roster at once.
+  A discovery server can list up to 65536 nodes, which opened that many
+  sockets in a single tick; at most 64 dials are now in flight at a time.
+  Outcomes (which nodes are installed, which count as unreachable) are
+  unchanged.
 
 ## [0.4.4] - 2026-09-09
 

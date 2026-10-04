@@ -180,12 +180,16 @@ export class Connection {
    * against the oldest waiter before resolving it. */
   private readonly tagged: boolean;
   private nextTag = 0;
-  // Chunks are accumulated in an array and only concatenated when a parse
-  // is attempted, instead of concatenating on every onData call — avoids
-  // an O(n^2) cost re-copying the whole buffer for each fragment of a
-  // large value.
+  // Chunks are accumulated in an array and only concatenated once a parse
+  // can actually succeed, instead of concatenating on every onData call —
+  // avoids an O(n^2) cost re-copying the whole buffer for each fragment of
+  // a large value or batch reply. `neededLength` is the total frame length
+  // a previous incomplete parse said it was waiting for (0 while unknown,
+  // i.e. while the header itself is still incomplete): until that many
+  // bytes are buffered, a new chunk is just appended.
   private chunks: Buffer[] = [];
   private chunksLength = 0;
+  private neededLength = 0;
   private readonly pending: Waiter[] = [];
   private closed = false;
   private lastError: Error | null = null;
@@ -552,13 +556,20 @@ export class Connection {
   private onData(chunk: Buffer): void {
     this.chunks.push(chunk);
     this.chunksLength += chunk.length;
+    // The body of a frame whose header is already parsed is still short:
+    // nothing to parse (or copy) until the rest of it has arrived. Safe
+    // for the incomplete-frame backstop below too — `neededLength` is
+    // itself already within it (a `V`/`I` length is capped, a batch
+    // reply's total is what the backstop widens to).
+    if (this.chunksLength < this.neededLength) return;
 
     for (;;) {
       const buffer = this.chunks.length === 1 ? this.chunks[0] : Buffer.concat(this.chunks, this.chunksLength);
 
       let parsed;
+      const incomplete = { needed: 0 };
       try {
-        parsed = tryParseResponse(buffer, this.tagged);
+        parsed = tryParseResponse(buffer, this.tagged, incomplete);
       } catch (error) {
         // Route through poison() (issue #187) rather than destroying the
         // socket directly: poison() flips `closed` synchronously, before
@@ -598,12 +609,14 @@ export class Connection {
         // don't re-concat bytes already merged here.
         this.chunks = [buffer];
         this.chunksLength = buffer.length;
+        this.neededLength = incomplete.needed;
         return;
       }
 
       const remainder = buffer.subarray(parsed.consumed);
       this.chunks = remainder.length > 0 ? [remainder] : [];
       this.chunksLength = remainder.length;
+      this.neededLength = 0;
 
       // An unsolicited "busy" response means the server hit its connection
       // limit right after accept and is about to close the connection; it

@@ -731,8 +731,20 @@ export function peekMultiFrameLength(buf: Buffer, tagged: boolean): number | und
  * while more bytes are still needed. Matches `Response::encode` (and,
  * with `tagged`, `Response::encode_with_tag` — echoed response tags) on the Rust
  * side exactly. In tagged mode every response carries a trailing echoed
- * tag, except `busy`, which is unsolicited and always bare. */
-export function tryParseResponse(buf: Buffer, tagged = false): { response: ParsedResponse; consumed: number } | null {
+ * tag, except `busy`, which is unsolicited and always bare.
+ *
+ * `incomplete`, when given, receives the frame's total byte length
+ * (`needed`) on a `null` return whose header is already complete and so
+ * knows exactly how many bytes the body still needs (`V`/`I`/`M`) —
+ * otherwise it is left untouched. Connection uses it to skip re-parsing
+ * (and re-concatenating the buffered chunks) on every fragment of a
+ * large body: the next parse can only succeed once `needed` bytes are
+ * buffered. */
+export function tryParseResponse(
+  buf: Buffer,
+  tagged = false,
+  incomplete?: { needed: number },
+): { response: ParsedResponse; consumed: number } | null {
   if (buf.length === 0) return null;
 
   switch (buf[0]) {
@@ -820,7 +832,10 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
 
       const valueStart = headerEnd + 1;
       const valueEnd = valueStart + length;
-      if (buf.length < valueEnd) return null;
+      if (buf.length < valueEnd) {
+        if (incomplete) incomplete.needed = valueEnd;
+        return null;
+      }
 
       return {
         response: { kind: "value", value: Buffer.from(buf.subarray(valueStart, valueEnd)), tag },
@@ -863,7 +878,10 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
 
       const valueStart = headerEnd + 1;
       const valueEnd = valueStart + length;
-      if (buf.length < valueEnd) return null;
+      if (buf.length < valueEnd) {
+        if (incomplete) incomplete.needed = valueEnd;
+        return null;
+      }
 
       return {
         response: {
@@ -917,7 +935,10 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
 
       const bodyStart = header.headerEnd + 1;
       const bodyEnd = bodyStart + bodyLength;
-      if (buf.length < bodyEnd) return null;
+      if (buf.length < bodyEnd) {
+        if (incomplete) incomplete.needed = bodyEnd;
+        return null;
+      }
 
       const entries: MultiEntry[] = new Array(header.count);
       let offset = bodyStart;

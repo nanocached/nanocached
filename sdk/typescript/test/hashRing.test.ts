@@ -212,3 +212,107 @@ describe("HashRing", () => {
     }
   });
 });
+
+describe("HashRing.owners bounded top-R selection (audit finding)", () => {
+  // The pre-fix implementation, verbatim apart from reading the node
+  // hashes from a parameter: score every node with the BigInt primitives,
+  // sort the lot, slice. `owners` must agree with it exactly.
+  function referenceOwners(
+    names: readonly string[],
+    hashes: readonly bigint[],
+    key: Uint8Array,
+    replicas: number,
+    namespace?: Uint8Array,
+  ): string[] {
+    const hash = keyHash(key, namespace);
+    const scored = names.map((node, index) => ({ score: fmix64(hashes[index] ^ hash), node }));
+    scored.sort((a, b) => {
+      if (a.score !== b.score) return a.score < b.score ? 1 : -1;
+      return a.node < b.node ? -1 : 1;
+    });
+    return scored.slice(0, replicas).map(({ node }) => node);
+  }
+
+  function mulberry32(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+      state = (state + 0x6d2b79f5) >>> 0;
+      let t = state;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function randomBytes(random: () => number, maxLength: number): Buffer {
+    return Buffer.from(Array.from({ length: Math.floor(random() * (maxLength + 1)) }, () => Math.floor(random() * 256)));
+  }
+
+  const nameHashes = (names: readonly string[]): bigint[] => names.map((name) => fnv1a(Buffer.from(name, "utf8")));
+
+  it("agrees with the full-sort reference over many keys, rosters, namespaces and replica counts", () => {
+    const random = mulberry32(0x5eed);
+    for (const size of [1, 2, 3, 5, 8, 33, 100]) {
+      const names = Array.from({ length: size }, (_, i) => `node-${i}-${Math.floor(random() * 1e9).toString(16)}`);
+      const ring = new HashRing(names);
+      const hashes = nameHashes(names);
+      for (let i = 0; i < 150; i++) {
+        const key = randomBytes(random, 40);
+        const namespace = i % 3 === 0 ? undefined : randomBytes(random, 12);
+        for (const replicas of [0, 1, 2, 3, 5, size, size + 4, 32, 33, 40]) {
+          assert.deepEqual(
+            ring.owners(key, replicas, namespace),
+            referenceOwners(names, hashes, key, replicas, namespace),
+            `size=${size} replicas=${replicas} key=${key.toString("hex")} ns=${namespace?.toString("hex")}`,
+          );
+        }
+      }
+    }
+  });
+
+  it("agrees on unusual replica counts too (negative, fractional, NaN)", () => {
+    const names = ["a", "b", "c", "d", "e"];
+    const ring = new HashRing(names);
+    const hashes = nameHashes(names);
+    for (const replicas of [-1, -3, 2.5, 0.5, NaN, Infinity]) {
+      for (let i = 0; i < 20; i++) {
+        const key = Buffer.from(`k${i}`);
+        assert.deepEqual(ring.owners(key, replicas), referenceOwners(names, hashes, key, replicas), `replicas=${replicas}`);
+      }
+    }
+  });
+
+  it("breaks score ties toward the lexicographically smaller name, in any construction order", () => {
+    // 64-bit collisions don't occur between real names, so force them: give
+    // every node the same name hash, which makes every score tie.
+    const names = ["delta", "alpha", "echo", "charlie", "bravo", "foxtrot"];
+    const ring = new HashRing(names);
+    const internals = ring as unknown as { nodeHashHi: Uint32Array; nodeHashLo: Uint32Array };
+    internals.nodeHashHi.fill(0x01234567);
+    internals.nodeHashLo.fill(0x89abcdef);
+    const hashes = names.map(() => 0x0123456789abcdefn);
+
+    const sorted = [...names].sort();
+    for (let replicas = 0; replicas <= names.length + 1; replicas++) {
+      const owners = ring.owners(Buffer.from("tie"), replicas);
+      assert.deepEqual(owners, sorted.slice(0, replicas));
+      assert.deepEqual(owners, referenceOwners(names, hashes, Buffer.from("tie"), replicas));
+    }
+
+    // Partial ties: groups of equal hashes, so ties and strict ordering
+    // are mixed within the same selection.
+    internals.nodeHashHi.set([1, 1, 2, 2, 3, 3]);
+    internals.nodeHashLo.set([7, 7, 7, 7, 7, 7]);
+    const mixed = [(1n << 32n) | 7n, (1n << 32n) | 7n, (2n << 32n) | 7n, (2n << 32n) | 7n, (3n << 32n) | 7n, (3n << 32n) | 7n];
+    for (let i = 0; i < 100; i++) {
+      const key = Buffer.from(`key-${i}`);
+      for (let replicas = 1; replicas <= 6; replicas++) {
+        assert.deepEqual(ring.owners(key, replicas), referenceOwners(names, mixed, key, replicas));
+      }
+    }
+  });
+
+  it("returns nothing from an empty ring", () => {
+    assert.deepEqual(new HashRing([]).owners(Buffer.from("k"), 3), []);
+  });
+});
