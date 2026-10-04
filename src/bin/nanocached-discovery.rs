@@ -233,14 +233,14 @@ use bytes::{Bytes, BytesMut};
 use nanocached::infra;
 use nanocached::infra::{
     ACCEPT_ERROR_BACKOFF, METRICS_MAX_CONNECTIONS, MaybeTls, PerIpConnections, constant_time_eq,
-    load_tls_acceptor, load_tls_connector, read_http_request_path, reject_over_limit,
+    load_tls_acceptor, load_tls_connector, per_ip_key, read_http_request_path, reject_over_limit,
     should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip, write_http_response,
 };
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2400,6 +2400,21 @@ enum JoinRejection {
     TooManyWaitingTotal,
 }
 
+/// The source a registered `address` (`{peer_ip}:{port}`) counts under for
+/// `MAX_WAITING_PER_SOURCE_IP`: the same key the per-IP connection caps use
+/// (`infra::per_ip_key`, an IPv6 address's /64 prefix), so one IPv6 /64
+/// can't hold a distinct allowance per address and walk around the cap.
+/// `rsplit_once` finds the *last* `:`, which is the port separator even for
+/// an IPv6 address that itself contains colons. An address that is not an
+/// IP literal is compared as the text it is.
+fn waiting_source_key(address: &str) -> String {
+    let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
+    match host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        Ok(ip) => per_ip_key(ip).to_string(),
+        Err(_) => host.to_string(),
+    }
+}
+
 /// Registers `name` as `Waiting` with `address` (a no-op if it's already
 /// registered — this must not downgrade a node already past `Waiting`)
 /// and attempts to start it toward `Joined` immediately. Returns the
@@ -2472,14 +2487,11 @@ async fn start_join(
                 return Err(JoinRejection::TooManyWaitingTotal);
             }
 
-            let source_ip = address
-                .rsplit_once(':')
-                .map_or(address.as_str(), |(ip, _)| ip);
+            let source = waiting_source_key(&address);
             let waiting_from_source = guard
                 .values()
                 .filter(|info| {
-                    info.state != NodeState::Joined
-                        && info.address.rsplit_once(':').map(|(ip, _)| ip) == Some(source_ip)
+                    info.state != NodeState::Joined && waiting_source_key(&info.address) == source
                 })
                 .count();
             if waiting_from_source >= MAX_WAITING_PER_SOURCE_IP {
@@ -6847,6 +6859,96 @@ mod tests {
                 .owner_connection_id,
             102,
             "a duplicate J must take over ownership of the reused entry"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_waiting_cap_counts_one_ipv6_64_as_one_source() {
+        // `MAX_WAITING_PER_SOURCE_IP` used to compare the registered address
+        // text, so every address of one IPv6 /64 (2^64 of them) held a
+        // separate allowance. It counts under `infra::per_ip_key` now,
+        // like the per-IP connection caps.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "unrelated-joiner".to_string(),
+            expected: HashMap::new(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation: 1,
+        })));
+
+        for i in 0..MAX_WAITING_PER_SOURCE_IP {
+            let result = start_join(
+                &registry,
+                &current_join,
+                &None,
+                &None,
+                2,
+                Instant::now(),
+                &format!("v6-{i}"),
+                format!("2001:db8:0:1::{:x}:9000", i + 1),
+                format!("tk-v6-{i}"),
+                (i + 1) as u64,
+            )
+            .await;
+            assert!(result.is_ok(), "registration {i} should have been admitted");
+        }
+
+        // Another address of the same /64 is the same source.
+        let rejected = start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "v6-overflow",
+            "2001:db8:0:1:ffff:ffff:ffff:ffff:9000".to_string(),
+            "tk-v6-overflow".to_string(),
+            100,
+        )
+        .await;
+        let Err(JoinRejection::TooManyWaitingFromSource) = rejected else {
+            panic!("expected a TooManyWaitingFromSource rejection");
+        };
+
+        // A different /64 is a different source.
+        let other = start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "v6-other",
+            "2001:db8:0:2::1:9000".to_string(),
+            "tk-v6-other".to_string(),
+            101,
+        )
+        .await;
+        assert!(other.is_ok());
+    }
+
+    #[test]
+    fn waiting_source_key_groups_a_64_and_leaves_ipv4_and_text_alone() {
+        assert_eq!(waiting_source_key("10.0.0.1:9000"), "10.0.0.1");
+        assert_eq!(
+            waiting_source_key("2001:db8:0:1::5:9000"),
+            waiting_source_key("2001:db8:0:1:aaaa::9:1234")
+        );
+        assert_ne!(
+            waiting_source_key("2001:db8:0:1::5:9000"),
+            waiting_source_key("2001:db8:0:2::5:9000")
+        );
+        assert_eq!(
+            waiting_source_key("[2001:db8::1]:9000"),
+            waiting_source_key("2001:db8::2:9000")
+        );
+        assert_eq!(waiting_source_key("::ffff:10.0.0.1:9000"), "10.0.0.1");
+        assert_eq!(
+            waiting_source_key("node-a.internal:9000"),
+            "node-a.internal"
         );
     }
 

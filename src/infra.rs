@@ -345,7 +345,7 @@ pub type PerIpConnections = Arc<Mutex<HashMap<IpAddr, usize>>>;
 /// (2^64 addresses) and walk around the cap. An IPv4-mapped IPv6 address
 /// (`::ffff:a.b.c.d`, what a dual-stack listener reports for an IPv4
 /// peer) is counted as the IPv4 address it carries.
-fn per_ip_key(ip: IpAddr) -> IpAddr {
+pub fn per_ip_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {

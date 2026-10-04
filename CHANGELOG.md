@@ -156,6 +156,11 @@ framework adapters at one version, whether or not a component changed.
   a /64 (hosts on one subnet, or pods on one node of an IPv6 Kubernetes
   cluster) now share one cap, so raise `--max-connections-per-ip` for them
   as for any other shared source.
+- `nanocached-discovery`: the cap on concurrent `Waiting`/`Joining`
+  registrations per source (`MAX_WAITING_PER_SOURCE_IP`) now counts an IPv6
+  source by its /64 prefix, like the per-source-IP connection caps. Before,
+  it compared the registered address text, so every address of one /64 held
+  its own allowance and one host could fill the global waiting queue.
 
 ## [0.4.4] - 2026-09-09
 
