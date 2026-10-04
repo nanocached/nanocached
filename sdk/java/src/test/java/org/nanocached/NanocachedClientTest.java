@@ -5276,6 +5276,202 @@ class NanocachedClientTest {
         }
     }
 
+    // ── hedge legs never run a read under hedgedReadsLock ──────────
+
+    @Test
+    void aSaturatedLegPoolDoesNotRunAHedgeLegInlineUnderTheRegistrationLock() throws Exception {
+        // startHedgeLeg used to submit its leg to replicaWriters inside
+        // synchronized (hedgedReadsLock). When that pool's queue is full its
+        // overflow policy runs the task on the submitting thread, so a whole
+        // read round trip ran holding the lock: every other startHedgeLeg
+        // and close()'s drain blocked behind it. Saturate the pool, start a
+        // hedged read whose primary is slow, and prove another thread can
+        // still take the lock while that read is in flight. (The class's
+        // @AfterEach restores the permit count.)
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+        try (Cluster cluster = startCluster(2)) {
+            String primary = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(0);
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 5_000)) {
+                client.set("k", "v");
+
+                Field replicaWritersField = NanocachedClient.class.getDeclaredField("replicaWriters");
+                replicaWritersField.setAccessible(true);
+                ExecutorService replicaWriters = (ExecutorService) replicaWritersField.get(client);
+                // 1 + REPLICA_WRITER_POOL_HEADROOM (16) threads over a queue of the same depth.
+                int threads = 17;
+                java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.CountDownLatch occupied = new java.util.concurrent.CountDownLatch(threads);
+                // Whatever happens below, the blocked tasks must be released:
+                // client.close() waits for them, and would otherwise turn a
+                // failed assertion into a hang.
+                try {
+                    java.util.concurrent.Callable<Object> block = () -> {
+                        occupied.countDown();
+                        release.await();
+                        return null;
+                    };
+                    // First occupy every thread, and only then fill the queue:
+                    // submitting all 2 * threads at once races a worker that
+                    // is idle (set() above used one) dequeuing its first task,
+                    // and an overflowing submit would run the blocking task on
+                    // this very thread.
+                    for (int i = 0; i < threads; i++) replicaWriters.submit(block);
+                    assertTrue(occupied.await(5, java.util.concurrent.TimeUnit.SECONDS));
+                    for (int i = 0; i < threads; i++) replicaWriters.submit(block);
+
+                    Field lockField = NanocachedClient.class.getDeclaredField("hedgedReadsLock");
+                    lockField.setAccessible(true);
+                    Object hedgedReadsLock = lockField.get(client);
+
+                    cluster.nodes().get(primary).delayGets(1_500);
+                    java.util.concurrent.atomic.AtomicReference<Optional<String>> read =
+                            new java.util.concurrent.atomic.AtomicReference<>();
+                    Thread reader = new Thread(() -> read.set(client.get("k")), "test-hedged-reader");
+                    reader.start();
+                    try {
+                        // The primary leg is now running inline on the reader thread.
+                        waitFor(() -> cluster.nodes().get(primary).getCount.get() >= 1,
+                                "the saturated-pool read to reach its primary");
+
+                        java.util.concurrent.CountDownLatch acquired = new java.util.concurrent.CountDownLatch(1);
+                        Thread probe = new Thread(() -> {
+                            synchronized (hedgedReadsLock) {
+                                acquired.countDown();
+                            }
+                        }, "test-lock-probe");
+                        probe.setDaemon(true);
+                        probe.start();
+                        assertTrue(acquired.await(500, java.util.concurrent.TimeUnit.MILLISECONDS),
+                                "hedgedReadsLock is held while a hedge leg runs inline on a saturated pool");
+                        assertTrue(reader.isAlive(), "the read should still be in flight, or this proves nothing");
+                    } finally {
+                        reader.join(10_000);
+                    }
+                    assertEquals(Optional.of("v"), read.get());
+                } finally {
+                    release.countDown();
+                }
+            }
+        }
+    }
+
+    // ── refresh dials new nodes concurrently and keeps the failed ones ──
+
+    @Test
+    void refreshDialsBlackholedNewNodesConcurrently() throws Exception {
+        // refreshNodeList dialed the new nodes one at a time under
+        // refreshLock, so k blackholed nodes held every caller of
+        // beforeOperation for k connect timeouts.
+        int originalTimeout = Identify.connectTimeoutMillis;
+        List<java.net.ServerSocket> silentServers = new ArrayList<>();
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                List<DiscoveredNode> roster = new ArrayList<>(cluster.discovery().nodes);
+                for (int i = 0; i < 4; i++) {
+                    java.net.ServerSocket silent = new java.net.ServerSocket(0);
+                    silentServers.add(silent);
+                    Thread acceptor = new Thread(() -> {
+                        try {
+                            while (true) silent.accept(); // accepts, never answers
+                        } catch (java.io.IOException closed) {
+                            // test over
+                        }
+                    }, "test-silent-accept-" + i);
+                    acceptor.setDaemon(true);
+                    acceptor.start();
+                    roster.add(new DiscoveredNode("silent-" + i, "127.0.0.1:" + silent.getLocalPort()));
+                }
+                cluster.discovery().nodes = roster;
+
+                Identify.connectTimeoutMillis = 400;
+                long start = System.nanoTime();
+                forceRefresh(client);
+                long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+                // Serial: 4 x 400ms = 1.6s+. Concurrent: about one timeout.
+                assertTrue(elapsedMillis < 1_200,
+                        "4 blackholed new nodes should be dialed concurrently, refresh took " + elapsedMillis + "ms");
+                assertEquals(4, client.stats().refreshFailures());
+            }
+        } finally {
+            Identify.connectTimeoutMillis = originalTimeout;
+            for (java.net.ServerSocket silent : silentServers) silent.close();
+        }
+    }
+
+    @Test
+    void refreshKeepsAnUnreachableNewNodeInTheRingAsAMemberWithoutAConnection() throws Exception {
+        // A new node whose dial failed used to be dropped from members, so
+        // the ring was rebuilt without it and this client's primary/replica
+        // choices disagreed with every peer that did reach it (issue #67
+        // keeps such a node as a null-connection member everywhere else).
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String deadAddress = "127.0.0.1:" + MockServers.unusedPort();
+                List<DiscoveredNode> roster = new ArrayList<>(cluster.discovery().nodes);
+                roster.add(new DiscoveredNode("dead-new", deadAddress));
+                cluster.discovery().nodes = roster;
+
+                forceRefresh(client);
+
+                Field membersField = NanocachedClient.class.getDeclaredField("members");
+                membersField.setAccessible(true);
+                Map<?, ?> members = (Map<?, ?>) membersField.get(client);
+                assertTrue(members.containsKey("dead-new"), "unreachable new node must stay a member");
+                assertNull(memberConnectionOf(client, "dead-new"));
+
+                Field ringField = NanocachedClient.class.getDeclaredField("ring");
+                ringField.setAccessible(true);
+                HashRing ring = (HashRing) ringField.get(client);
+                assertTrue(ring.owners("some-key".getBytes(StandardCharsets.UTF_8), 3).contains("dead-new"),
+                        "the ring must be built with the unreachable node, like every peer's");
+
+                Field cooldownsField = NanocachedClient.class.getDeclaredField("reconnectCooldowns");
+                cooldownsField.setAccessible(true);
+                assertTrue(((Map<?, ?>) cooldownsField.get(client)).containsKey(deadAddress),
+                        "its reconnect cooldown must be armed");
+                assertEquals(1, client.stats().refreshFailures());
+            }
+        }
+    }
+
+    private static void forceRefresh(NanocachedClient client) throws Exception {
+        Method refreshNodeList = NanocachedClient.class.getDeclaredMethod("refreshNodeList");
+        refreshNodeList.setAccessible(true);
+        refreshNodeList.invoke(client);
+    }
+
+    // ── keep-alive isolates a hung node (issue #192) ───────────────
+
+    @Test
+    void keepAlivePingsTheOtherNodesWhileOneNodeIsHung() throws Exception {
+        // The pings ran one after another on one scheduler thread, so a
+        // half-open node (its G reply held 10s here; 30s request timeout in
+        // the field) delayed the ping to every member after it until ~60s
+        // idle, the server's idle limit.
+        long originalInterval = NanocachedClient.keepAliveIntervalMillis;
+        NanocachedClient.keepAliveIntervalMillis = 100;
+        try (MockNode hung = new MockNode(); MockNode healthyA = new MockNode(); MockNode healthyB = new MockNode()) {
+            hung.delayGets(10_000);
+            // members iterates in roster order, so the hung node is pinged first.
+            try (MockDiscovery discovery = new MockDiscovery(
+                    List.of(new DiscoveredNode(NAMES.get(0), hung.address()),
+                            new DiscoveredNode(NAMES.get(1), healthyA.address()),
+                            new DiscoveredNode("healthy-b", healthyB.address())),
+                    1)) {
+                try (NanocachedClient client = connect("127.0.0.1", discovery.port())) {
+                    waitFor(() -> healthyA.getCount.get() >= 3 && healthyB.getCount.get() >= 3,
+                            "keep-alive pings to the healthy nodes behind the hung one");
+                    // One ping is outstanding to the hung node; later ticks skip a
+                    // connection whose previous ping has not returned.
+                    assertEquals(1, hung.getCount.get());
+                }
+            }
+        } finally {
+            NanocachedClient.keepAliveIntervalMillis = originalInterval;
+        }
+    }
+
     // Issue #486: the replica-writer pool is bounded in both threads and
     // queue depth. Past both, the submitter runs the task itself (the same
     // synchronous fallback every call site has for the permit-exhausted

@@ -17,6 +17,26 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
   `volatile`. They are written under the client's state lock by a roster
   refresh but read lock-free on the request path, so a request thread could
   keep routing by a stale ring.
+- Hedged reads: a hedge leg is now submitted to the leg pool after the
+  client's hedge-registration lock is released. With the pool saturated the
+  submitting thread runs the leg itself, and that whole read round trip used
+  to run holding the lock, blocking every other hedged read and `close()`.
+- A node-list refresh now dials newly listed nodes concurrently, in waves of
+  at most 16, instead of one at a time under the refresh lock, so k
+  unreachable new nodes no longer stall every caller for k connect timeouts.
+  A new node that cannot be reached is kept as a member without a connection
+  (reconnect cooldown armed, redialed on first use), as at connect time and
+  in the other SDKs, so the ring matches its peers' instead of dropping it.
+- Keep-alive pings run concurrently on a small pool (16 threads) instead of
+  one after another on a single thread, with at most one ping in flight per
+  connection. One half-open node used to hold its ping for the 30 s request
+  timeout and delay the pings to every other node until about 60 s idle, the
+  server's idle limit (issue #192).
+- Host name resolution is now bounded by the 5 s connect deadline. A stalled
+  DNS server used to hang a dial outside that deadline, because
+  `new InetSocketAddress(host, port)` resolved on the calling thread; a lookup
+  that times out now fails the dial like an unreachable address. IP literals
+  are not resolved.
 
 ## [0.4.4] - 2026-09-09
 

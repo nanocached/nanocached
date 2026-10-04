@@ -2,12 +2,24 @@ package org.nanocached;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.regex.Pattern;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
@@ -225,6 +237,81 @@ final class Identify {
 
     private static final int CONNECT_TIMEOUT_MS = 5_000;
 
+    /** Bound on host name resolution plus the TCP connect together (the
+     * dial deadline). Mutable only so tests can shorten it. */
+    static volatile int connectTimeoutMillis = CONNECT_TIMEOUT_MS;
+
+    /** Host name to address, the one step of a dial the socket's own connect
+     * timeout does not cover. Replaceable only so tests can simulate a
+     * resolver that hangs. */
+    @FunctionalInterface
+    interface HostResolver {
+        InetAddress resolve(String host) throws UnknownHostException;
+    }
+
+    static volatile HostResolver hostResolver = InetAddress::getByName;
+
+    // Resolver threads: InetAddress lookups can't be interrupted or given a
+    // timeout, so a lookup that may hang runs on one of these and the dialer
+    // waits for it only until the deadline. Daemon threads, created on
+    // demand and released after a minute idle; a lookup that never returns
+    // pins one thread, so the pool is capped and queued lookups that time
+    // out are withdrawn rather than left to run.
+    private static final int MAX_RESOLVER_THREADS = 32;
+    private static final ThreadPoolExecutor RESOLVER = newResolverPool();
+
+    private static ThreadPoolExecutor newResolverPool() {
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                MAX_RESOLVER_THREADS, MAX_RESOLVER_THREADS, 60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(), runnable -> {
+                    Thread thread = new Thread(runnable, "nanocached-resolver");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
+    }
+
+    // IP literals (an IPv4 dotted quad, or anything with a ':', which no host
+    // name can contain) are parsed by InetAddress without a lookup, so they
+    // skip the resolver pool.
+    private static final Pattern IPV4_LITERAL = Pattern.compile("\\d{1,3}(\\.\\d{1,3}){3}");
+
+    /** Resolves {@code host} within {@code timeoutMs}, so a stalled DNS
+     * server fails the dial like an unreachable address instead of hanging
+     * it: {@code new InetSocketAddress(host, port)} resolves synchronously
+     * on the calling thread, outside the connect timeout. */
+    private static InetSocketAddress resolve(String host, int port, int timeoutMs) throws IOException {
+        if (host.indexOf(':') >= 0 || IPV4_LITERAL.matcher(host).matches()) {
+            return new InetSocketAddress(host, port);
+        }
+        HostResolver resolver = hostResolver;
+        Future<InetAddress> lookup;
+        try {
+            lookup = RESOLVER.submit(() -> resolver.resolve(host));
+        } catch (RejectedExecutionException rejected) {
+            throw new IOException("nanocached: could not start a lookup of " + host, rejected);
+        }
+        try {
+            return new InetSocketAddress(lookup.get(timeoutMs, TimeUnit.MILLISECONDS), port);
+        } catch (TimeoutException timeout) {
+            lookup.cancel(true);
+            RESOLVER.remove((Runnable) lookup);
+            throw new SocketTimeoutException(
+                    "nanocached: resolving " + host + " timed out after " + timeoutMs + "ms");
+        } catch (ExecutionException failed) {
+            Throwable cause = failed.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
+            }
+            throw new IOException("nanocached: could not resolve " + host + ": " + cause, cause);
+        } catch (InterruptedException interrupted) {
+            lookup.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new InterruptedIOException("nanocached: interrupted while resolving " + host);
+        }
+    }
+
     private static Socket open(String host, int port, SSLContext tls) throws IOException {
         // Both paths bound the TCP connect (issue #11): the TLS factory's
         // own connect(host, port) has no timeout, so an unresponsive
@@ -238,15 +325,20 @@ final class Identify {
         // handing a node socket to Connection.
         Socket plain = new Socket();
         try {
-            plain.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
+            // DNS counts against the same deadline as the connect itself.
+            int deadlineMs = connectTimeoutMillis;
+            long started = System.nanoTime();
+            InetSocketAddress address = resolve(host, port, deadlineMs);
+            int remainingMs = deadlineMs - (int) TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+            plain.connect(address, Math.max(1, remainingMs));
             plain.setTcpNoDelay(true);
-            plain.setSoTimeout(CONNECT_TIMEOUT_MS);
+            plain.setSoTimeout(deadlineMs);
             if (tls == null) {
                 return plain;
             }
             SSLSocket socket =
                     (SSLSocket) tls.getSocketFactory().createSocket(plain, host, port, true);
-            socket.setSoTimeout(CONNECT_TIMEOUT_MS);
+            socket.setSoTimeout(deadlineMs);
             // Without this, the JDK verifies the certificate chain but
             // never checks it was actually issued to `host` — a valid
             // cert for any other name would be accepted, defeating TLS
