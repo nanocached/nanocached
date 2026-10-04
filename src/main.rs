@@ -402,6 +402,22 @@ async fn main() -> ExitCode {
 
     let address = format!("{}:{}", args.host, args.port);
     let auth_secret = read_auth_secret();
+    // An unauthenticated connection is held to a 4096-byte `A` frame (see
+    // `server::UNAUTHENTICATED_MAX_REQUEST_SIZE`), so a longer secret could
+    // never be presented by anyone: refuse it up front rather than start a
+    // node every client is locked out of.
+    if let Some(secret) = &auth_secret
+        && !server::auth_frame_fits(secret.len())
+    {
+        eprintln!(
+            "nanocached-node: {AUTH_SECRET_ENV_VAR} is {} bytes; an auth frame must fit in {} \
+             bytes, so the secret can be at most ~{} bytes",
+            secret.len(),
+            server::UNAUTHENTICATED_MAX_REQUEST_SIZE,
+            server::UNAUTHENTICATED_MAX_REQUEST_SIZE - 16
+        );
+        return ExitCode::FAILURE;
+    }
     // Resolved before `args.discovery` is moved out below.
     let limits = connection_limits(&args);
     let heartbeat = match args.discovery {
