@@ -694,6 +694,34 @@ class NanocachedCacheTest {
     }
 
     @Test
+    void removeAllWorkerThreadsTimeOutOnceTheFanOutIsDone() throws Exception {
+        // The fan-out pool is static (JVM-wide) and never shut down, so its
+        // core threads must be allowed to time out: otherwise one large
+        // removeAll leaves up to 256 idle threads alive for the life of the
+        // JVM, pinning this class's loader across redeploys.
+        assertTrue(NanocachedCache.REMOVE_ALL_EXECUTOR.allowsCoreThreadTimeOut());
+        int keyCount = 40;
+        Map<String, String> entries = new HashMap<>();
+        for (int i = 0; i < keyCount; i++) {
+            entries.put("k" + i, "v" + i);
+        }
+        cache.putAll(entries);
+        node.deleteDelayMillis = 50;
+        try {
+            cache.removeAll(entries.keySet());
+        } finally {
+            node.deleteDelayMillis = 0;
+        }
+        assertTrue(NanocachedCache.REMOVE_ALL_EXECUTOR.getPoolSize() > 1, "the fan-out should have spun up workers");
+
+        long deadline = System.nanoTime() + 20_000_000_000L;
+        while (NanocachedCache.REMOVE_ALL_EXECUTOR.getPoolSize() > 0 && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+        }
+        assertEquals(0, NanocachedCache.REMOVE_ALL_EXECUTOR.getPoolSize(), "idle removeAll workers should exit");
+    }
+
+    @Test
     void noArgRemoveAllMapsToTheNamespaceClear() {
         cache.put("a", "1");
         cache.removeAll();

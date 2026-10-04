@@ -14,8 +14,9 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.cache.Cache;
 import javax.cache.CacheException;
@@ -133,16 +134,32 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * large the key set. */
     private static final int MAX_CONCURRENT_REMOVES = 256;
 
+    /** How long an idle {@link #REMOVE_ALL_EXECUTOR} thread lingers before
+     * exiting. Short on purpose: the pool is static, so without a timeout
+     * one large removeAll would leave up to {@link #MAX_CONCURRENT_REMOVES}
+     * idle threads (each referencing this class's loader) alive for the
+     * rest of the JVM — through every webapp redeploy. */
+    private static final long REMOVE_ALL_IDLE_SECONDS = 2;
+
     /** Shared, JVM-wide fan-out pool for {@link #removeAll(Set)} — daemon
-     * threads so it never blocks JVM shutdown, and lazily grown (a fixed
+     * threads so it never blocks JVM shutdown, lazily grown (a fixed-size
      * pool only starts a thread when a task needs one) so it costs nothing
-     * until first used. */
-    private static final ExecutorService REMOVE_ALL_EXECUTOR = Executors.newFixedThreadPool(
-            MAX_CONCURRENT_REMOVES, runnable -> {
-                Thread thread = new Thread(runnable, "nanocached-jcache-removeAll");
-                thread.setDaemon(true);
-                return thread;
-            });
+     * until first used, and with core-thread timeout so it drains back to
+     * zero threads once removeAll traffic stops. Package-private for the
+     * tests. */
+    static final ThreadPoolExecutor REMOVE_ALL_EXECUTOR = newRemoveAllExecutor();
+
+    private static ThreadPoolExecutor newRemoveAllExecutor() {
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                MAX_CONCURRENT_REMOVES, MAX_CONCURRENT_REMOVES, REMOVE_ALL_IDLE_SECONDS, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(), runnable -> {
+                    Thread thread = new Thread(runnable, "nanocached-jcache-removeAll");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
+    }
 
     private static final long NO_EXPIRY = 0L;
 
