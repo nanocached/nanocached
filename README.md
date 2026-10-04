@@ -594,7 +594,8 @@ loud `WARN` if that disagrees with its own configured value.
 - Maximum request size: 4 KiB
 - Maximum concurrent connections: 1,024, and at most 256 from any one
   source IP (fixed — the node's `--max-connections*` flags don't exist
-  here; discovery serves only brief roster fetches and heartbeats)
+  here; discovery serves only brief roster fetches and heartbeats; an
+  IPv6 source counts per /64 prefix, as on the node)
 - Idle connection timeout: 60 seconds
 
 ## License
