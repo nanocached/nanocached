@@ -475,10 +475,14 @@ async function dialClusterNode(
   tls: boolean | undefined,
   ca: Buffer | undefined,
 ): Promise<ClusterDialOutcome> {
-  const { host, port } = splitHostPort(node.address);
-
   let identified;
   try {
+    // Inside the try: a malformed roster entry (no port, port > 65535)
+    // is a NanocachedError, so it lands in "unreachable" like any other
+    // dial failure instead of rejecting this promise — which would
+    // reject connect()'s Promise.all and orphan every sibling dial's
+    // socket.
+    const { host, port } = splitHostPort(node.address);
     identified = await connectAndIdentify({ host, port, authSecret, tls, ca });
   } catch (error) {
     if (!isSwallowable(error)) return { node, kind: "hard", error: error as Error };
@@ -2974,8 +2978,13 @@ export class NanocachedClient {
     // the others' outcomes — every new node here is tolerated
     // individually (see the doc comment above), never fatal on its own to
     // the whole refresh.
+    //
+    // `async` so a malformed roster entry (splitHostPort throws) becomes
+    // that one node's rejection — treated as unreachable below — rather
+    // than a synchronous throw out of this `.map` that would skip
+    // allSettled and orphan the dials already started for earlier nodes.
     const dialResults = await Promise.allSettled(
-      newNodes.map((node) =>
+      newNodes.map(async (node) =>
         connectAndIdentify({ ...splitHostPort(node.address), authSecret: this.authSecret, tls: this.tls, ca: this.ca }),
       ),
     );

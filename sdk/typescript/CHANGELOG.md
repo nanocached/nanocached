@@ -9,6 +9,16 @@ tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- A peer reset on a node socket that had finished identify but was still
+  waiting on slower sibling dials in the same bootstrap or refresh round
+  was an uncaught `ECONNRESET` that crashed the process; identified
+  sockets now always carry an `error` listener.
+- A malformed roster address (no port, port above 65535) now counts as one
+  unreachable node during `connect()` and node-list refresh, instead of
+  aborting the round and leaking the sockets its sibling dials had opened.
+
 ## [0.4.4] - 2026-09-09
 
 No changes. Version aligned with the rest of the project: from 0.4.4 on,

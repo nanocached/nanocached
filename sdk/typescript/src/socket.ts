@@ -28,6 +28,8 @@ export interface ConnectSocketOptions {
   connectDeadlineMs?: number;
 }
 
+function ignoreSocketError(): void {}
+
 /** Opens a plain TCP or TLS connection and resolves once it's usable
  * (connected, or connected *and* the TLS handshake has completed). */
 export async function connectSocket(options: ConnectSocketOptions): Promise<Socket | TLSSocket> {
@@ -67,6 +69,15 @@ export async function connectSocket(options: ConnectSocketOptions): Promise<Sock
     socket.once(options.tls ? "secureConnect" : "connect", () => {
       clearTimeout(timer);
       socket.removeListener("error", onError);
+      // Swapped for a no-op rather than just removed: a socket handed
+      // back here can sit with no owner (identified, but waiting on
+      // sibling dials in the same bootstrap/refresh round, up to the dial
+      // deadline) before `Connection` attaches its own `error` handler,
+      // and an `error` event with no listener is an uncaught exception
+      // that takes the process down. The leftover listener is harmless
+      // once an owner exists — it only keeps Node from treating an
+      // unobserved RST as fatal; `Connection` still sees the event.
+      socket.on("error", ignoreSocketError);
       resolve(socket);
     });
   });
