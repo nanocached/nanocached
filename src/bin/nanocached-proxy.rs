@@ -166,6 +166,13 @@ use tokio::time::{sleep, timeout};
 /// more per request than a node would accept.
 const MAX_REQUEST_SIZE: usize = 1_048_576;
 
+/// Mirrors the node's `MAX_MULTI_REPLY_VALUE_BYTES`: the most value bytes
+/// one `M` reply carries. A node's reply can legitimately exceed the 1 MiB
+/// request bound (a few large hits in one batch), so `read_reply` must
+/// accept up to this much, and the client-facing reassembly in
+/// `finish_multi_get` is held to the same figure.
+const MAX_MULTI_REPLY_VALUE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Client connections accepted at once (`--max-connections`); the
 /// default mirrors the node's `MAX_CONNECTIONS`.
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
@@ -2259,8 +2266,8 @@ async fn read_reply<S: AsyncRead + Unpin>(
             })
             .collect::<io::Result<Vec<_>>>()?;
 
-        if total_value_bytes > MAX_REQUEST_SIZE {
-            return Err(invalid("M reply values exceed the request-size limit"));
+        if total_value_bytes > MAX_MULTI_REPLY_VALUE_BYTES {
+            return Err(invalid("M reply values exceed the multi-reply limit"));
         }
 
         read_exact_into(stream, buf, total_value_bytes).await?;
@@ -3643,11 +3650,29 @@ async fn finish_multi_get(
         retry_multi_get(context, namespace, keys, &retry_positions, &mut entries).await;
     }
 
-    let entries: Vec<ProxyMultiEntry> = entries
+    let mut entries: Vec<ProxyMultiEntry> = entries
         .into_iter()
         .map(|entry| entry.unwrap_or(ProxyMultiEntry::WrongNode))
         .collect();
+    cap_multi_reply_values(&mut entries);
     Ok(respond_multi(&entries, tag))
+}
+
+/// Holds the client-facing `M` reply to `MAX_MULTI_REPLY_VALUE_BYTES` of
+/// values: each node caps its own group, but a batch spread over several
+/// primaries can sum to more. Hits past the budget become misses, the same
+/// answer the node gives for its own overflow.
+fn cap_multi_reply_values(entries: &mut [ProxyMultiEntry]) {
+    let mut value_bytes: usize = 0;
+    for entry in entries {
+        if let ProxyMultiEntry::Value(value) = entry {
+            if value_bytes + value.len() > MAX_MULTI_REPLY_VALUE_BYTES {
+                *entry = ProxyMultiEntry::Miss;
+            } else {
+                value_bytes += value.len();
+            }
+        }
+    }
 }
 
 /// Issue #150/#221: the one bounded refresh-and-retry pass for keys the
@@ -5026,6 +5051,65 @@ mod tests {
     use std::collections::HashMap as StdHashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // A node's M reply may carry more than the 1 MiB request bound (a few
+    // large hits in one batch). It used to be rejected as a protocol
+    // error, which poisoned the shared backend connection for every client.
+    #[tokio::test]
+    async fn read_reply_accepts_an_m_reply_larger_than_the_request_bound() {
+        let value_len = 600 * 1024;
+        let mut wire = format!("M 3 {value_len} {value_len} {value_len} 7\n").into_bytes();
+        wire.extend(std::iter::repeat_n(b'v', value_len * 3));
+        let mut stream = std::io::Cursor::new(wire);
+        let mut buf = BytesMut::new();
+
+        let reply = read_reply(&mut stream, &mut buf, 7, Expect::Multi)
+            .await
+            .expect("an M reply under the multi-reply limit is valid");
+
+        let NodeReply::Multi(entries) = reply else {
+            panic!("expected a Multi reply");
+        };
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries
+                .iter()
+                .all(|e| matches!(e, ProxyMultiEntry::Value(v) if v.len() == value_len))
+        );
+    }
+
+    #[tokio::test]
+    async fn read_reply_rejects_an_m_reply_over_the_multi_reply_limit() {
+        let value_len = MAX_MULTI_REPLY_VALUE_BYTES + 1;
+        let wire = format!("M 1 {value_len} 7\n").into_bytes();
+        let mut stream = std::io::Cursor::new(wire);
+        let mut buf = BytesMut::new();
+
+        let error = read_reply(&mut stream, &mut buf, 7, Expect::Multi)
+            .await
+            .expect_err("values past the limit are refused before being read");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn client_facing_multi_reply_is_held_to_the_value_budget() {
+        let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
+        let fits = MAX_MULTI_REPLY_VALUE_BYTES / chunk.len();
+        let mut entries: Vec<ProxyMultiEntry> = (0..fits + 3)
+            .map(|_| ProxyMultiEntry::Value(chunk.clone()))
+            .collect();
+        entries.insert(1, ProxyMultiEntry::WrongNode);
+
+        cap_multi_reply_values(&mut entries);
+
+        let hits = entries
+            .iter()
+            .filter(|e| matches!(e, ProxyMultiEntry::Value(_)))
+            .count();
+        assert_eq!(hits, fits);
+        assert_eq!(entries[1], ProxyMultiEntry::WrongNode);
+        assert_eq!(entries.last(), Some(&ProxyMultiEntry::Miss));
+    }
 
     #[cfg(unix)]
     #[test]
