@@ -59,6 +59,13 @@ framework adapters at one version, whether or not a component changed.
   refreshes are now spaced at least 1 s apart and the nudges in between are
   coalesced into one fetch, and a fetched roster identical to the current
   one is no longer republished to the proxy's connections.
+- `nanocached-proxy`: after a client was answered the fatal `E` (or a write to
+  it failed or timed out), its connection now closes at once. Before, the
+  reader kept waiting for up to the 60 s idle timeout, holding the socket,
+  a connection permit and a per-IP slot; and a frame the client sent in that
+  window was still run against the backends before its reply failed to
+  send, so a `S` or `i` could be applied after the client had been told the
+  connection was closed.
 
 ### Security
 
