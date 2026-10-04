@@ -66,6 +66,12 @@ framework adapters at one version, whether or not a component changed.
   window was still run against the backends before its reply failed to
   send, so a `S` or `i` could be applied after the client had been told the
   connection was closed.
+- `nanocached-discovery`: a connection's idle clock for its next command now
+  starts when the previous command's handler finishes, not when it was
+  parsed. A joining node that waited in the queue for more than 60 s was
+  promoted and answered `R`, then closed as idle before its first heartbeat
+  could arrive (it recovered by redialing and re-announcing, at the cost of a
+  reconnect and a `WARN`); the same applied after a slow `C` or `V` handler.
 
 ### Security
 

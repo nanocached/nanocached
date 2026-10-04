@@ -3916,6 +3916,13 @@ async fn handle_connection(
     // below — so the tighter pre-first-command bound from
     // `UNIDENTIFIED_CONNECTION_TIMEOUT` still applies.
     let mut deadline = Instant::now() + config.idle_timeout;
+    // Set when a command was just parsed (and so handled): the handler may
+    // have awaited far longer than `idle_timeout` — a `J` parked in
+    // `wait_for_promotion` for the whole join queue, a `C`/`V` running an
+    // `M`/`X` fan-out — so the budget for the *next* command is re-anchored
+    // to the moment the handler finished, just before waiting for it. See
+    // the read below.
+    let mut handled_a_command = false;
 
     loop {
         let parsed = parse(&mut received);
@@ -3928,6 +3935,7 @@ async fn handle_connection(
         if parsed.is_ok() {
             identified = true;
             deadline = Instant::now() + config.idle_timeout;
+            handled_a_command = true;
         }
         match parsed {
             Ok(DiscoveryCommand::Auth { secret, tagging }) => {
@@ -4656,6 +4664,20 @@ async fn handle_connection(
         }
 
         received.reserve(READ_CHUNK_SIZE);
+
+        // The deadline above was set when the last command was parsed, but
+        // its handler may have run past it: a node that sat in the join
+        // queue for over `idle_timeout` is promoted, answered `R`, and then
+        // would have been closed here as idle before its first `H` could
+        // possibly arrive (it self-heals by redialing and sending `P`,
+        // costing a reconnect and a WARN). The idle clock for the next
+        // command starts when this one's handler is done. Once, per
+        // handled command — never on a bare read, so trickling bytes of the
+        // *next* command still can't push the deadline out.
+        if handled_a_command {
+            deadline = Instant::now() + config.idle_timeout;
+            handled_a_command = false;
+        }
 
         // Issue (slowloris): bound this read by whichever of the ordinary
         // per-read idle timeout and the connection's total unidentified
@@ -7745,11 +7767,20 @@ mod tests {
     async fn registry_with_a_joined_and_b_waiting(
         shutdown_rx: watch::Receiver<bool>,
     ) -> (TcpStream, TcpStream, Registry, CurrentJoin) {
+        registry_with_a_joined_and_b_waiting_idle(shutdown_rx, IDLE_TIMEOUT).await
+    }
+
+    /// `registry_with_a_joined_and_b_waiting`, with both connections held
+    /// to `idle_timeout` — a short one lets a real-time test outwait it.
+    async fn registry_with_a_joined_and_b_waiting_idle(
+        shutdown_rx: watch::Receiver<bool>,
+        idle_timeout: Duration,
+    ) -> (TcpStream, TcpStream, Registry, CurrentJoin) {
         let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
 
         let config = || ConnectionConfig {
-            idle_timeout: IDLE_TIMEOUT,
+            idle_timeout,
             list_ready_at: Instant::now(),
             replication: 2,
             auth_secret: None,
@@ -7839,6 +7870,41 @@ mod tests {
             "expected the connection to close, not data"
         );
         assert!(!lock(&registry).contains_key("node-b"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_promoted_after_waiting_longer_than_idle_timeout_keeps_its_connection() {
+        // The idle deadline used to be anchored when `J` was parsed, so a
+        // node that waited longer than `idle_timeout` in the join queue was
+        // promoted, answered `R`, and then closed as idle before its first
+        // `H` could arrive. The clock for the next command now starts when
+        // the `J` handler (the whole wait) is done.
+        let idle = Duration::from_millis(400);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_node_a, mut node_b, registry, _current_join) =
+            registry_with_a_joined_and_b_waiting_idle(shutdown_rx, idle).await;
+
+        // Outwait the idle timeout while parked in `wait_for_promotion`
+        // (which has none), then promote node-b the way a completed
+        // handoff does.
+        tokio::time::sleep(idle * 2).await;
+        {
+            let mut guard = lock(&registry);
+            let info = guard.get_mut("node-b").expect("node-b is registered");
+            info.state = NodeState::Joined;
+            info.promoted.notify_one();
+        }
+        assert_eq!(read_exactly(&mut node_b, 2).await, b"R\n");
+
+        // The first heartbeat, sent promptly after `R`, must be answered
+        // on the same connection rather than find it closed.
+        node_b.write_all(b"H 6 2 9\nnode-btk-node-b").await.unwrap();
+        let mut ack = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), node_b.read_exact(&mut ack))
+            .await
+            .expect("no heartbeat ack")
+            .expect("the promoted node's connection was closed as idle");
+        assert_eq!(&ack, b"A ");
     }
 
     #[tokio::test(flavor = "current_thread")]
