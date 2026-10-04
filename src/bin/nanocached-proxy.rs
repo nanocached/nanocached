@@ -4794,6 +4794,14 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                         let _ = fifo_tx.send(response_rx).await;
                         break 'connection Ok(());
                     }
+                    // The writer is gone (it answered `E`, or a write
+                    // failed or timed out): the client has been told the
+                    // connection is over, so a frame it already sent must
+                    // not be applied to the backends now — a `S`/`i` here
+                    // would land with no reply ever delivered.
+                    if fifo_tx.is_closed() {
+                        break 'connection Ok(());
+                    }
                     // Dispatch inline (awaiting the ordered backend
                     // enqueues) before parsing the next request — see
                     // `dispatch_request` on why order matters here.
@@ -4827,6 +4835,10 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
         let read = tokio::select! {
             read = tokio::time::timeout_at(read_deadline, read_half.read(&mut chunk)) => read,
             () = drained(&mut drain) => break 'connection Ok(()),
+            // The writer returning drops the FIFO's receiver: stop at once
+            // instead of sitting in `read` for `IDLE_TIMEOUT` holding the
+            // socket, the global permit and the per-IP slot.
+            () = fifo_tx.closed() => break 'connection Ok(()),
         };
         match read {
             Err(_) | Ok(Ok(0)) => break Ok(()),
@@ -6994,6 +7006,89 @@ mod tests {
         // own answer instead of a closed socket.
         stream.write_all(b"G 4\nname").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R");
+    }
+
+    /// A live node and a permanently dead one (replication 1): a legacy
+    /// (not retry-capable) client's `G` for `key_dead` is answered with the
+    /// fatal `E`. Returns the live node, the proxy address, and a key on
+    /// each node.
+    async fn live_and_dead_node_cluster() -> (MockNode, String, String, String) {
+        let live = MockNode::start().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let roster = vec![
+            ("node-live".to_string(), live.addr.clone()),
+            ("node-dead".to_string(), dead_addr.clone()),
+        ];
+        let discovery = start_mock_discovery(roster.clone(), 1).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+
+        let ring = RingView::new(roster, 1);
+        let mut on_live = None;
+        let mut on_dead = None;
+        for index in 0..32u8 {
+            let key = format!("key-{index}");
+            let owner = ring.owners(b"", key.as_bytes())[0].clone();
+            if owner == live.addr && on_live.is_none() {
+                on_live = Some(key);
+            } else if owner == dead_addr && on_dead.is_none() {
+                on_dead = Some(key);
+            }
+        }
+        (
+            live,
+            proxy,
+            on_live.expect("no key hashed to the live node"),
+            on_dead.expect("no key hashed to the dead node"),
+        )
+    }
+
+    /// After the writer answers `E` the connection is over: the reader
+    /// must stop at once instead of sitting in `read` under the 60 s idle
+    /// timeout holding the socket, the global permit and the per-IP slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fatal_reply_closes_the_client_connection_promptly() {
+        let (_live, proxy, _key_live, key_dead) = live_and_dead_node_cluster().await;
+
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let frame = format!("G {}\n{key_dead}", key_dead.len());
+        stream.write_all(frame.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+
+        // EOF (or a reset) well inside the idle timeout; sending nothing
+        // further, so only the proxy's own teardown can produce it.
+        let mut probe = [0u8; 16];
+        match timeout(Duration::from_secs(5), stream.read(&mut probe)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            other => panic!("connection still open after a fatal reply: {other:?}"),
+        }
+    }
+
+    /// The request that matters: a frame the client had already sent when
+    /// the fatal `E` went out must not be dispatched — it used to run
+    /// against the backends and only then fail to deliver its reply, so a
+    /// `S` could be applied after the client was told the connection was
+    /// closed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_after_a_fatal_reply_is_not_dispatched_to_a_backend() {
+        let (live, proxy, key_live, key_dead) = live_and_dead_node_cluster().await;
+
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let frame = format!("G {}\n{key_dead}", key_dead.len());
+        stream.write_all(frame.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+
+        // A complete write for the *live* node, sent after `E`. Whether
+        // the proxy has already closed (write fails or is reset) is
+        // immaterial; what matters is that it never reaches the node.
+        let frame = format!("S {} 1\n{key_live}v", key_live.len());
+        let _ = stream.write_all(frame.as_bytes()).await;
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            live.store.lock().unwrap().is_empty(),
+            "a write sent after the fatal reply was applied to the backend"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
