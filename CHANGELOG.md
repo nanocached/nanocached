@@ -22,6 +22,12 @@ framework adapters at one version, whether or not a component changed.
   metrics scrape is now logged (`WARN metrics connection task failed`)
   instead of going unobserved, like the node's metrics endpoint.
 
+### Security
+
+- Updated `rustls` to 0.23.45 in the node, proxy and discovery binaries
+  (RUSTSEC-2026-0285: TLS 1.3 handshake messages were accepted across
+  encryption-level boundaries).
+
 ## [0.4.4] - 2026-09-09
 
 No changes. Version aligned with the rest of the project (the first release
