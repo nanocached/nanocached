@@ -5312,4 +5312,52 @@ class NanocachedClientTest {
             pool.shutdownNow();
         }
     }
+
+    // A request frame blocked mid-write (the server isn't reading) used to
+    // hold the connection monitor, which the reader thread needs to
+    // dispatch every response. With big values in both directions on one
+    // pipelined connection that deadlocks: the server (which, like the real
+    // one, reads a request and then writes its response) stops reading
+    // requests while it is blocked writing responses, the reader (holding a
+    // full response, waiting for the monitor) stops reading them, and
+    // nothing moves until the request deadline poisons the connection --
+    // failing every request pending on it, non-idempotent ones as "possibly
+    // sent". Mirrors the Go and Rust SDKs' regression of the same shape.
+    @Test
+    void largeRequestsAndResponsesPipelinedTogetherDoNotDeadlock() throws Exception {
+        byte[] big = new byte[1_000_000];
+        Arrays.fill(big, (byte) 'x');
+        String value = new String(big, StandardCharsets.ISO_8859_1);
+        long original = Connection.requestTimeoutMillis;
+        Connection.requestTimeoutMillis = 5_000;
+        try (MockNode node = new MockNode()) {
+            for (int i = 0; i < 4; i++) {
+                node.store.put(MockNode.keyOf(("big-" + i).getBytes(StandardCharsets.UTF_8)), big);
+            }
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                ExecutorService callers = Executors.newFixedThreadPool(96);
+                try {
+                    long start = System.nanoTime();
+                    List<Future<?>> calls = new ArrayList<>();
+                    for (int i = 0; i < 48; i++) {
+                        int n = i;
+                        calls.add(callers.submit(() -> client.get("big-" + (n % 4))));
+                        calls.add(callers.submit(() -> client.set("set-" + n, value)));
+                    }
+                    for (Future<?> call : calls) {
+                        call.get(20, java.util.concurrent.TimeUnit.SECONDS); // a failed request throws here
+                    }
+                    long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+                    // Loopback moves 96 MB in well under a second; a stall lasts
+                    // until the request timeout.
+                    assertTrue(elapsedMillis < 2_500,
+                            "96 large requests took " + elapsedMillis + "ms, want far less than the 5000ms request timeout");
+                } finally {
+                    callers.shutdownNow();
+                }
+            }
+        } finally {
+            Connection.requestTimeoutMillis = original;
+        }
+    }
 }

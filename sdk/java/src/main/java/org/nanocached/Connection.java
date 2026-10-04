@@ -24,9 +24,10 @@ import java.util.function.Function;
  * responses in send order (request pipelining): a dedicated reader thread
  * consumes responses and dispatches each to the oldest still-pending
  * request, since nanocached-node itself only ever answers in the order it
- * received requests. Enqueuing the pending slot and writing the frame
- * happen under one monitor, so concurrent callers' queue order always
- * matches the order their frames actually hit the wire.
+ * received requests. Claiming the tag, enqueuing the pending slot and
+ * writing the frame happen under one writer lock (see {@link #writeLock}),
+ * so concurrent callers' queue order always matches the order their
+ * frames actually hit the wire.
  */
 final class Connection {
     /** Bounds how long the connection may go without progress while
@@ -56,17 +57,30 @@ final class Connection {
     private final boolean tagged;
     private int nextTag = 0;
     private final Deque<Pending> pending = new ArrayDeque<>();
+    /** Serializes request writers: one request's tag claim, pending-queue
+     * append and socket write happen under it together, so tag order,
+     * queue order and wire order can never skew. Deliberately separate
+     * from this connection's monitor, which guards {@link #pending} and
+     * {@code closed} and which {@link #readLoop} needs to dispatch each
+     * response: a large write blocked on a server that has stopped reading
+     * (because it is itself blocked writing responses nobody is reading)
+     * must not hold up the reader, or neither side can make progress until
+     * the request deadline poisons the connection, failing every pending
+     * request. Lock order is writeLock, then the monitor, then
+     * deadlineLock; {@link #poison} and the reader never take
+     * writeLock. */
+    private final Object writeLock = new Object();
     private volatile boolean closed = false;
     private volatile long lastUsedNanos = System.nanoTime();
 
     /** The progress-based request deadline (issue #42), guarded by
      * {@link #deadlineLock} — its own lock, not this connection's
-     * monitor, because the watchdog must be able to fire even while a
-     * caller is blocked in {@code out.write} holding the monitor (a
-     * half-open peer can stall the write side too, and a monitor-based
-     * watchdog could never reacquire it to act). Lock order is always
-     * monitor → deadlineLock; the watchdog takes deadlineLock alone and
-     * releases it before poisoning. 0 means unarmed. */
+     * monitor, so the watchdog never waits on a thread that holds the
+     * monitor. (A writer blocked in {@code out.write} holds only
+     * {@link #writeLock}, never the monitor; the watchdog closes the
+     * socket to unblock it.) Lock order is always monitor → deadlineLock;
+     * the watchdog takes deadlineLock alone and releases it before
+     * poisoning. 0 means unarmed. */
     private final Object deadlineLock = new Object();
     private long requestDeadlineNanos = 0;
     /** Set by the watchdog just before it closes the socket, so the
@@ -752,35 +766,42 @@ final class Connection {
         PreparedRequest prepared = null;
         for (int attempt = 1; ; attempt++) {
             CompletableFuture<Response> future = new CompletableFuture<>();
-            synchronized (this) {
-                if (isClosed()) {
-                    // As above (notSent=true) — this attempt's frame still
-                    // hasn't been written; only a concurrent poison() (or
-                    // an 'R' retry racing a close) landed between the
-                    // check above and this one.
-                    throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null, true);
+            // writeLock spans the tag claim, the enqueue and the write, so
+            // concurrent callers' tag order, queue order and wire order
+            // agree; the monitor is held only for the bookkeeping, never
+            // across the (possibly blocking) write — the reader needs it to
+            // pop responses meanwhile (see writeLock).
+            synchronized (writeLock) {
+                synchronized (this) {
+                    if (isClosed()) {
+                        // As above (notSent=true) — this attempt's frame still
+                        // hasn't been written; only a concurrent poison() (or
+                        // an 'R' retry racing a close) landed between the
+                        // check above and this one.
+                        throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null, true);
+                    }
+                    lastUsedNanos = System.nanoTime();
+                    if (prepared == null) {
+                        // Echoed response tags: the tag is claimed in the same
+                        // span that enqueues the pending slot and writes the
+                        // frame (request pipelining's enqueue+write atomicity),
+                        // so tag order can never skew from queue/wire order.
+                        // Built before enqueueing: a builder that fails (e.g. an
+                        // invalid TTL) must fail with nothing queued, or the next
+                        // response would resolve an orphaned slot and desync the
+                        // stream. Computed once — a transient retry below reuses
+                        // this same frame/tag rather than calling build again.
+                        Integer tag = tagged ? claimTag() : null;
+                        prepared = new PreparedRequest(build.apply(tag), tag == null ? -1 : tag);
+                    }
+                    pending.addLast(new Pending(future, prepared.tag()));
+                    // Armed only on the empty→non-empty transition: arming on
+                    // *every* request would let a continuous stream of new
+                    // requests push the deadline forever ahead of a server that
+                    // has stopped answering — exactly the half-open hang the
+                    // timeout exists to catch (issue #42).
+                    if (pending.size() == 1) armDeadline();
                 }
-                lastUsedNanos = System.nanoTime();
-                if (prepared == null) {
-                    // Echoed response tags: the tag is claimed in the same synchronous span
-                    // that enqueues the pending slot and writes the frame
-                    // (request pipelining's enqueue+write atomicity), so tag order
-                    // can never skew from queue/wire order. Built before
-                    // enqueueing: a builder that fails (e.g. an invalid TTL) must
-                    // fail with nothing queued, or the next response would
-                    // resolve an orphaned slot and desync the stream. Computed
-                    // once — a transient retry below reuses this same frame/tag
-                    // rather than calling build again.
-                    Integer tag = tagged ? claimTag() : null;
-                    prepared = new PreparedRequest(build.apply(tag), tag == null ? -1 : tag);
-                }
-                pending.addLast(new Pending(future, prepared.tag()));
-                // Armed only on the empty→non-empty transition: arming on
-                // *every* request would let a continuous stream of new
-                // requests push the deadline forever ahead of a server that
-                // has stopped answering — exactly the half-open hang the
-                // timeout exists to catch (issue #42).
-                if (pending.size() == 1) armDeadline();
                 try {
                     out.write(prepared.frame());
                     out.flush();
@@ -794,12 +815,12 @@ final class Connection {
                     // while the connection was still ours: a failed
                     // write/flush leaves at most a truncated frame on
                     // the wire, and the server never executes an
-                    // incomplete request. The one way a write can fail
-                    // with the whole frame already handed to the kernel
-                    // is the request-timeout watchdog closing the socket
-                    // under us (it does so without the monitor, to unwedge
-                    // exactly this write — see watchdogLoop); timedOutError
-                    // is set before that close, so its presence means
+                    // incomplete request — including when the reader's own
+                    // poison() closed the socket under this write. The one
+                    // way a write can fail with the whole frame already
+                    // handed to the kernel is the request-timeout watchdog
+                    // closing the socket under us; timedOutError is set
+                    // before that close, so its presence means
                     // "ambiguous". poison() itself must keep the plain
                     // (notSent=false) error: it drains every slot still
                     // pending, and the ones ahead of this frame were

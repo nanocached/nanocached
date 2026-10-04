@@ -13,6 +13,14 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A request blocked mid-write no longer stalls the reader thread. The writer
+  held the connection monitor across the socket write, and the reader needs
+  the same monitor to hand each response to its caller, so large values in
+  both directions on one connection (a server that has stopped reading while
+  it is blocked writing responses) deadlocked until the 30 s request timeout
+  dropped the connection, failing every pending request. A writer lock now
+  serializes tag claim, enqueue and write, and the monitor is released before
+  the write, as in the Go and Rust SDKs.
 - `NanocachedClient`: the cluster ring and replication count are now
   `volatile`. They are written under the client's state lock by a roster
   refresh but read lock-free on the request path, so a request thread could
