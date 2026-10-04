@@ -7872,11 +7872,18 @@ mod tests {
     async fn registry_with_a_joined_and_b_waiting(
         shutdown_rx: watch::Receiver<bool>,
     ) -> (TcpStream, TcpStream, Registry, CurrentJoin) {
+        registry_with_a_joined_and_b_waiting_idle(shutdown_rx, IDLE_TIMEOUT).await
+    }
+
+    async fn registry_with_a_joined_and_b_waiting_idle(
+        shutdown_rx: watch::Receiver<bool>,
+        idle_timeout: Duration,
+    ) -> (TcpStream, TcpStream, Registry, CurrentJoin) {
         let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
 
         let config = || ConnectionConfig {
-            idle_timeout: IDLE_TIMEOUT,
+            idle_timeout,
             list_ready_at: Instant::now(),
             replication: 2,
             auth_secret: None,
@@ -7968,21 +7975,27 @@ mod tests {
         assert!(!lock(&registry).contains_key("node-b"));
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tokio::test(flavor = "current_thread")]
     async fn a_node_promoted_after_waiting_longer_than_idle_timeout_keeps_its_connection() {
         // The idle deadline used to be anchored when `J` was parsed, so a
-        // node that waited longer than `IDLE_TIMEOUT` in the join queue was
-        // promoted, answered `R`, and then closed as idle before its first
-        // `H` could arrive. The clock for the next command now starts when
-        // the `J` handler (the whole wait) is done.
+        // node that waited longer than the idle timeout in the join queue
+        // was promoted, answered `R`, and then closed as idle before its
+        // first `H` could arrive. The clock for the next command now starts
+        // when the `J` handler (the whole wait) is done.
+        //
+        // Real time with a short idle timeout, not a paused clock: with
+        // real sockets a paused runtime auto-advances the clock whenever
+        // every task is parked on I/O, which fired the server's fresh idle
+        // timer while the `H` was still in flight (about one run in three).
+        let idle_timeout = Duration::from_millis(400);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_node_a, mut node_b, registry, _current_join) =
-            registry_with_a_joined_and_b_waiting(shutdown_rx).await;
+            registry_with_a_joined_and_b_waiting_idle(shutdown_rx, idle_timeout).await;
 
         // Outwait the idle timeout while parked in `wait_for_promotion`
         // (which has none), then promote node-b the way a completed
         // handoff does.
-        tokio::time::advance(IDLE_TIMEOUT + Duration::from_secs(5)).await;
+        tokio::time::sleep(idle_timeout + Duration::from_millis(200)).await;
         {
             let mut guard = lock(&registry);
             let info = guard.get_mut("node-b").expect("node-b is registered");
@@ -7992,18 +8005,12 @@ mod tests {
         assert_eq!(read_exactly(&mut node_b, 2).await, b"R\n");
 
         // The first heartbeat, sent promptly after `R`, must be answered
-        // on the same connection rather than find it closed. (Driven with
-        // explicit `yield_now`s, like the slowloris tests below: on a
-        // paused clock a loopback read doesn't reliably re-poll the
-        // server's task on its own.)
+        // on the same connection rather than find it closed.
         node_b.write_all(b"H 6 2 9\nnode-btk-node-b").await.unwrap();
-        for _ in 0..3 {
-            tokio::task::yield_now().await;
-        }
         let mut ack = [0u8; 2];
-        node_b
-            .read_exact(&mut ack)
+        tokio::time::timeout(Duration::from_secs(5), node_b.read_exact(&mut ack))
             .await
+            .expect("no heartbeat ack arrived on the same connection")
             .expect("the promoted node's connection was closed as idle");
         assert_eq!(&ack, b"A ");
     }
