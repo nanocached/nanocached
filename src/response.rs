@@ -295,7 +295,18 @@ impl Response {
             Self::Multi(entries) => encode_multi(entries, Some(tag)),
             Self::MultiAck(entries) => encode_multi_ack(entries, Some(tag)),
 
-            _ => unreachable!("only G/S/D/i responses have a tagged form (echoed response tags)"),
+            // A `U`/`u` with the wrong membership token (see the
+            // connection handler) on a tagged connection: answered with the
+            // protocol's tagged `R` form, like any other request that
+            // failed and may be retried, rather than panicking the
+            // connection task. Never sent to a legitimate peer — handoff
+            // senders connect untagged and get the bare `R\n`.
+            Self::MigrationRejected => format!("R {tag}\n").into_bytes(),
+
+            _ => unreachable!(
+                "only G/S/D/i/m/o/c/F/k/x responses and a rejected U/u have a tagged form \
+                 (echoed response tags)"
+            ),
         }
     }
 
@@ -317,6 +328,15 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_migration_has_a_tagged_form_so_a_tagged_u_cannot_panic_the_encoder() {
+        assert_eq!(Response::MigrationRejected.encode(), b"R\n".to_vec());
+        assert_eq!(
+            Response::MigrationRejected.encode_with_tag(42),
+            b"R 42\n".to_vec()
+        );
+    }
 
     #[test]
     fn cleared_encodes_as_a_bare_c_with_an_optional_tag() {

@@ -25,6 +25,15 @@ const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 /// entries rather than merely avoiding the degenerate case.
 const MIN_MAX_MEMORY_BYTES: usize = 1024 * 1024;
 
+/// Largest `--drain-timeout` accepted, in seconds (7 days). The drain
+/// computes `Instant::now() + budget`, which panics when the sum overflows
+/// the platform's `Instant` — so an unbounded `u64` (`--drain-timeout
+/// 18446744073709551615`) made the first SIGTERM panic instead of
+/// shutting down. The budget is meant to fit an orchestrator's stop grace
+/// (seconds to minutes), so this is far above anything useful while
+/// staying representable everywhere.
+const MAX_DRAIN_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// Floor on each `--namespace-budget` (issue #355). The same degenerate
 /// case as `MIN_MAX_MEMORY_BYTES` guards against exists per namespace:
 /// `Cache::enforce_namespace_budget` never evicts below one entry, so a
@@ -151,6 +160,13 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                 let secs: u64 = value()?
                     .parse()
                     .map_err(|_| "--drain-timeout must be a number of seconds".to_string())?;
+                if secs > MAX_DRAIN_TIMEOUT_SECS {
+                    return Err(format!(
+                        "--drain-timeout must be at most {MAX_DRAIN_TIMEOUT_SECS} seconds \
+                         (7 days); {secs} is far beyond any orchestrator's stop grace"
+                    )
+                    .into());
+                }
                 args.drain_timeout = std::time::Duration::from_secs(secs);
             }
             "--max-memory" => {
@@ -287,7 +303,8 @@ Usage: nanocached-node [options]
                                exiting, within this budget (default 25; 0 =
                                skip the handoff — fast restarts, replicas
                                cover at R >= 2). Must fit the orchestrator's
-                               stop grace (ECS stopTimeout etc.)
+                               stop grace (ECS stopTimeout etc.); at most
+                               604800 (7 days)
   --metrics-port <port>       serve GET /metrics (Prometheus text format),
                                /healthz and /readyz on this port at --host;
                                omitted = no operations endpoint. Keep it
@@ -481,6 +498,48 @@ mod tests {
             .map(|flag| flag.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    #[test]
+    fn drain_timeout_is_bounded_so_the_first_sigterm_cannot_overflow_an_instant() {
+        // Regression: any `u64` was accepted, and `Instant::now() +
+        // Duration::from_secs(u64::MAX)` panics when the drain starts.
+        let parsed = parse_args_from(args(&["--drain-timeout", "120"])).unwrap();
+        assert_eq!(parsed.drain_timeout, std::time::Duration::from_secs(120));
+
+        let parsed = parse_args_from(args(&["--drain-timeout", "0"])).unwrap();
+        assert!(parsed.drain_timeout.is_zero());
+
+        let parsed = parse_args_from(args(&[
+            "--drain-timeout",
+            &MAX_DRAIN_TIMEOUT_SECS.to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.drain_timeout,
+            std::time::Duration::from_secs(MAX_DRAIN_TIMEOUT_SECS)
+        );
+        // The largest accepted budget really is addable to an `Instant`.
+        assert!(
+            std::time::Instant::now()
+                .checked_add(parsed.drain_timeout)
+                .is_some()
+        );
+
+        for too_large in [
+            (MAX_DRAIN_TIMEOUT_SECS + 1).to_string(),
+            u64::MAX.to_string(),
+        ] {
+            let Err(ArgsError::Invalid(message)) =
+                parse_args_from(args(&["--drain-timeout", &too_large]))
+            else {
+                panic!("--drain-timeout {too_large} must be rejected");
+            };
+            assert!(
+                message.contains("--drain-timeout must be at most"),
+                "{message}"
+            );
+        }
     }
 
     #[test]

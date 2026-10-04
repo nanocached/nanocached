@@ -60,6 +60,26 @@ framework adapters at one version, whether or not a component changed.
   bounded only forwards still waiting: a target that stopped answering left
   an ever-growing pile of parked tasks. Past the bound, forwards wait in
   the (bounded) queue as the existing documentation describes.
+- `nanocached-node`: a `U` or `u` carrying the wrong membership token on a
+  connection that negotiated tagged mode no longer panics the connection
+  task. The rejection is now answered `R <tag>` (the tagged form of the
+  retryable-error status) before the connection is closed; handoff peers
+  connect untagged and still get the bare `R`.
+- `nanocached-node`: `--drain-timeout` is now limited to 604800 seconds
+  (7 days) and rejected above that at startup. Any larger value (the flag
+  took an unbounded `u64`) overflowed the `Instant` the drain deadline is
+  computed from, so the first SIGTERM panicked instead of shutting down.
+- `nanocached-node`: forwarding a client write to a joining node (or a
+  decommission entrant) no longer `Debug`-formats the whole key for the
+  log message on every forward; it is rendered only when a forward is
+  actually dropped. A key can be about 1 MiB, so this was a per-write
+  allocation and format on the node's single thread.
+- `nanocached-node`: shutdown no longer waits out an unresponsive peer
+  during an in-flight re-replication. The dial/auth and send legs are now
+  interrupted by the shutdown signal (before, only the gaps between
+  attempts noticed it, so a stalled leg held the exit for up to its 10 s
+  bound), and `run` waits at most 5 s for the heartbeat task (which carries
+  re-replication) before aborting it.
 - `nanocached-node` and `nanocached-proxy`: an `m`/`o` frame whose body arrives
   a few bytes at a time no longer has its (O(keys)) header re-parsed on every
   read. This ran before authentication, so a large header followed by a
