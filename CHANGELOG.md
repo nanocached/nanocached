@@ -46,6 +46,20 @@ framework adapters at one version, whether or not a component changed.
   `--namespace-budget` accounting and the `/metrics` per-namespace rows are
   unchanged; the namespace rows now sum to `used_bytes` minus these name
   charges.
+- `nanocached-node`: a large `o` (multi-set) during a join migration or a
+  decommission no longer loses forwards. Each matching key was handed to
+  the forward queue separately in a loop that never yields, so past about
+  4350 keys the excess was dropped (with a warning) and the joiner or
+  entrant never received those writes. A frame's keys for one target now
+  go out as a single forwarded unit, sent in order on the target's shared
+  connection; a retry resumes after the last acknowledged key instead of
+  starting over.
+- `nanocached-node`: the number of forward tasks in flight is now bounded
+  (256). Every forward leaving the queue became a task parked, without a
+  timeout, on its target's connection lock, so the queue and waiter limits
+  bounded only forwards still waiting: a target that stopped answering left
+  an ever-growing pile of parked tasks. Past the bound, forwards wait in
+  the (bounded) queue as the existing documentation describes.
 - `nanocached-node` and `nanocached-proxy`: an `m`/`o` frame whose body arrives
   a few bytes at a time no longer has its (O(keys)) header re-parsed on every
   read. This ran before authentication, so a large header followed by a

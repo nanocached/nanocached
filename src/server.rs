@@ -207,6 +207,17 @@ const FORWARD_CHANNEL_CAPACITY: usize = 256;
 /// `FORWARD_CHANNEL_CAPACITY` (16x) precisely because dropping here is
 /// the fallback of last resort, not the normal backpressure path.
 const MAX_PENDING_FORWARD_WAITERS: usize = 4096;
+/// How many forward tasks `run` lets be spawned (and so parked on their
+/// target's connection lock, with no timeout — see `forward_with_retries`)
+/// at once. Without it `run` spawned a task for every message the moment
+/// it left `forward_tx`, so the channel and waiter limits above only
+/// bounded forwards still *queued*: a target that stopped answering left
+/// every later forward as a fresh parked task, unbounded. Equal to
+/// `FORWARD_CHANNEL_CAPACITY` — forwards to one target are serialized by
+/// its connection lock anyway, so more concurrent tasks only queue. Past
+/// this, `run` stops draining `forward_tx` until one finishes, and the
+/// channel/waiter/drop behavior documented above applies.
+const MAX_IN_FLIGHT_FORWARDS: usize = FORWARD_CHANNEL_CAPACITY;
 const READ_CHUNK_SIZE: usize = 1024;
 /// How many times `run_migration` tries to transfer a single key to the
 /// joining node (reconnecting between tries) before giving up on the
@@ -460,6 +471,29 @@ fn spawn_forward(
                      full and {MAX_PENDING_FORWARD_WAITERS} waiters are already queued behind it"
                 );
             }
+        }
+    }
+}
+
+/// Spawns a forward received from `forward_rx` into `connection_tasks`,
+/// holding one of `slots` for as long as it runs (`MAX_IN_FLIGHT_FORWARDS`).
+/// `run` only receives while a slot is free and nothing else takes one,
+/// so the acquire cannot fail; if it somehow did, the forward still runs
+/// (unbounded) rather than being lost.
+fn spawn_forward_task(
+    connection_tasks: &mut JoinSet<()>,
+    slots: &Arc<Semaphore>,
+    task: MigrationTask,
+) {
+    match Arc::clone(slots).try_acquire_owned() {
+        Ok(permit) => {
+            connection_tasks.spawn(async move {
+                task.await;
+                drop(permit);
+            });
+        }
+        Err(_) => {
+            connection_tasks.spawn(task);
         }
     }
 }
@@ -820,6 +854,9 @@ pub(crate) async fn run(
     // or, before this split, block an unrelated client connection's
     // `spawn_forward` call outright. See `ConnectionConfig::forward_tx`.
     let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(FORWARD_CHANNEL_CAPACITY);
+    // Bounds the forward tasks spawned out of `forward_rx` — see
+    // `MAX_IN_FLIGHT_FORWARDS`.
+    let forward_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_FORWARDS));
 
     let connection_config = ConnectionConfig {
         idle_timeout: IDLE_TIMEOUT,
@@ -999,8 +1036,11 @@ pub(crate) async fn run(
                 connection_tasks.spawn(task);
             }
 
-            Some(task) = forward_rx.recv() => {
-                connection_tasks.spawn(task);
+            // Not received from while every slot is taken: the forward then
+            // waits in `forward_tx` (and `spawn_forward`'s waiters), which
+            // is bounded, instead of becoming one more parked task.
+            Some(task) = forward_rx.recv(), if forward_slots.available_permits() > 0 => {
+                spawn_forward_task(&mut connection_tasks, &forward_slots, task);
             }
 
             result = listener.accept() => {
@@ -2157,9 +2197,25 @@ async fn handle_connection(
                     // owned key, once the local write is confirmed stored
                     // (`execute` only ever answers `Stored` for an owned
                     // key, but check anyway rather than assume it).
+                    //
+                    // The matching keys are gathered per target and each
+                    // target gets ONE forwarded unit for all of them
+                    // (`OwnedForwardedWrite::SetMany`), not one forward per
+                    // key. A frame can carry >100k keys, and this loop never
+                    // yields, so per-key `spawn_forward` calls overflowed
+                    // `forward_tx` plus its waiters (~4.3k) before `run`'s
+                    // consumer could drain a single one — the excess was
+                    // dropped and the joiner/entrant never saw those writes.
+                    // One unit sends its keys in order on the target's shared
+                    // connection under one lock acquisition, so the
+                    // per-target ordering `forward_with_retries` relies on
+                    // is unchanged.
                     if let (Some(node_context), Some((forward_names, forward_values))) =
                         (&config.node_context, forward)
                     {
+                        let mut join_batches: Vec<ForwardBatch> = Vec::new();
+                        let mut leave_batches: Vec<ForwardBatch> = Vec::new();
+
                         for ((name, value), result) in forward_names
                             .into_iter()
                             .zip(forward_values)
@@ -2175,29 +2231,32 @@ async fn handle_connection(
                             if let Some(target) =
                                 migration_target_for_hashed(node_context, key_hash)
                             {
-                                spawn_forward(
-                                    &config,
-                                    node_context.clone(),
+                                ForwardBatch::add(
+                                    &mut join_batches,
                                     target,
-                                    OwnedForwardedWrite::Set {
-                                        key: key.clone(),
-                                        value: value.clone(),
-                                        ttl,
-                                    },
+                                    key.name.clone(),
+                                    value.clone(),
                                 );
                             }
 
                             // Decommission drain — see `leave_target_for`.
                             if let Some(target) = leave_target_for_hashed(node_context, key_hash) {
+                                ForwardBatch::add(&mut leave_batches, target, key.name, value);
+                            }
+                        }
+
+                        for (batches, handoff) in [(join_batches, false), (leave_batches, true)] {
+                            for batch in batches {
                                 spawn_forward(
                                     &config,
                                     node_context.clone(),
-                                    target,
-                                    OwnedForwardedWrite::HandoffSet {
-                                        key,
-                                        value,
+                                    batch.target,
+                                    OwnedForwardedWrite::SetMany {
+                                        namespace: namespace.clone(),
+                                        items: batch.items,
                                         ttl,
-                                        if_absent: false,
+                                        handoff,
+                                        sent: AtomicUsize::new(0),
                                     },
                                 );
                             }
@@ -6612,6 +6671,32 @@ impl ForwardedWrite<'_> {
     }
 }
 
+/// The keys (and values) of one `MultiSet` bound for a single forward
+/// target — gathered so they go out as one `OwnedForwardedWrite::SetMany`.
+struct ForwardBatch {
+    target: ForwardTarget,
+    items: Vec<(Bytes, Bytes)>,
+}
+
+impl ForwardBatch {
+    /// Adds `name`/`value` to the batch for `target`'s address, starting
+    /// one if this is the first key bound there. A frame's keys go to a
+    /// handful of distinct targets at most (one joiner, or the entrants
+    /// of a decommission), so the linear search is over a tiny list.
+    fn add(batches: &mut Vec<ForwardBatch>, target: ForwardTarget, name: Bytes, value: Bytes) {
+        match batches
+            .iter_mut()
+            .find(|batch| batch.target.addr == target.addr)
+        {
+            Some(batch) => batch.items.push((name, value)),
+            None => batches.push(ForwardBatch {
+                target,
+                items: vec![(name, value)],
+            }),
+        }
+    }
+}
+
 /// Owned counterpart to `ForwardedWrite`, for a forward that must outlive
 /// the client connection task that triggered it. `handle_connection`'s
 /// `S`/`D` handling hands one of these to `forward_with_retries`, which
@@ -6642,6 +6727,22 @@ enum OwnedForwardedWrite {
     },
     HandoffDelete {
         key: Key,
+    },
+    /// A `MultiSet`'s keys for one target, forwarded as a single unit
+    /// (see `handle_connection`'s `MultiSet` arm): `S` frames when
+    /// `handoff` is `false` (a join), `U` frames when it is `true` (a
+    /// decommission drain). Sent in order, one acked round trip each, on
+    /// the target's shared connection while `forward_with_retries` holds
+    /// its lock. `sent` counts the leading items already acknowledged, so
+    /// a retry resumes where the failed attempt stopped instead of
+    /// re-sending (and possibly overwriting a later write with) earlier
+    /// ones. Atomic only because the forward future must be `Send`.
+    SetMany {
+        namespace: Bytes,
+        items: Vec<(Bytes, Bytes)>,
+        ttl: Option<Duration>,
+        handoff: bool,
+        sent: AtomicUsize,
     },
     Clear(ClearScope),
 }
@@ -6732,6 +6833,65 @@ impl OwnedForwardedWrite {
                 )
                 .await
             }
+            OwnedForwardedWrite::SetMany {
+                namespace,
+                items,
+                ttl,
+                handoff,
+                sent,
+            } => {
+                // A failure after some progress is retried on the spot
+                // (the failed send already cleared the connection, so the
+                // next item re-dials): only an attempt that gets nowhere
+                // is handed back to `forward_with_retries`, which counts
+                // it against `KEY_TRANSFER_ATTEMPTS`. Otherwise one long
+                // unit would spend a budget meant for a single write on
+                // unrelated blips spread over its whole run.
+                let mut progress_mark = sent.load(Ordering::SeqCst);
+                loop {
+                    let index = sent.load(Ordering::SeqCst);
+                    let Some((name, value)) = items.get(index) else {
+                        return Ok(());
+                    };
+                    let key = Key::new(namespace.clone(), name.clone());
+                    let write = if *handoff {
+                        ForwardedWrite::HandoffSet {
+                            key: &key,
+                            value,
+                            ttl: *ttl,
+                            if_absent: false,
+                            token: &target.token,
+                        }
+                    } else {
+                        ForwardedWrite::Set {
+                            key: &key,
+                            value,
+                            ttl: *ttl,
+                        }
+                    };
+                    // Each item gets its own `FORWARD_TIMEOUT`, like a lone
+                    // forward would.
+                    let item_deadline = tokio::time::Instant::now() + FORWARD_TIMEOUT;
+                    match forward_on_locked_connection(
+                        node_context,
+                        &target.addr,
+                        connection,
+                        write,
+                        item_deadline,
+                    )
+                    .await
+                    {
+                        Ok(()) => sent.store(index + 1, Ordering::SeqCst),
+                        Err(error) => {
+                            if sent.load(Ordering::SeqCst) > progress_mark {
+                                progress_mark = sent.load(Ordering::SeqCst);
+                                continue;
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+            }
             OwnedForwardedWrite::Clear(scope) => {
                 forward_on_locked_connection(
                     node_context,
@@ -6750,7 +6910,9 @@ impl OwnedForwardedWrite {
     /// not the actual `S`/`D` protocol bytes.
     fn kind(&self) -> &'static str {
         match self {
-            OwnedForwardedWrite::Set { .. } | OwnedForwardedWrite::HandoffSet { .. } => "SET",
+            OwnedForwardedWrite::Set { .. }
+            | OwnedForwardedWrite::HandoffSet { .. }
+            | OwnedForwardedWrite::SetMany { .. } => "SET",
             OwnedForwardedWrite::Delete { .. } | OwnedForwardedWrite::HandoffDelete { .. } => {
                 "DELETE"
             }
@@ -6769,6 +6931,21 @@ impl OwnedForwardedWrite {
             }
             OwnedForwardedWrite::Delete { key } | OwnedForwardedWrite::HandoffDelete { key } => {
                 format!("{} {key:?}", self.kind())
+            }
+            OwnedForwardedWrite::SetMany {
+                namespace, items, ..
+            } => {
+                // A preview, not the whole namespace name: it can be ~1 MiB.
+                let preview = &namespace[..namespace.len().min(64)];
+                let ellipsis = if namespace.len() > preview.len() {
+                    "..."
+                } else {
+                    ""
+                };
+                format!(
+                    "SET of {} keys in namespace {preview:?}{ellipsis}",
+                    items.len()
+                )
             }
             OwnedForwardedWrite::Clear(ClearScope::Namespace(namespace)) => {
                 format!("CLEAR namespace {namespace:?}")
@@ -6949,8 +7126,10 @@ async fn forward_on_locked_connection(
 /// the wait and giving up would let a later-enqueued forward jump ahead
 /// of it, exactly the reordering this exists to prevent. The wait is
 /// still finite in practice, bounded by how many forwards to the same
-/// target are outstanding at once (`FORWARD_CHANNEL_CAPACITY` +
-/// `MAX_PENDING_FORWARD_WAITERS`) times each one's own worst case
+/// target are outstanding at once (`MAX_IN_FLIGHT_FORWARDS` parked tasks,
+/// plus `FORWARD_CHANNEL_CAPACITY` + `MAX_PENDING_FORWARD_WAITERS` still
+/// queued behind them — `run` stops spawning once the first is reached)
+/// times each one's own worst case
 /// (`KEY_TRANSFER_ATTEMPTS` x `FORWARD_TIMEOUT`) — and, tenth-pass
 /// follow-up (2026-09-04), that worst case only applies to the *first*
 /// forward to hit an unreachable target: once one has failed permanently,
@@ -10510,6 +10689,257 @@ mod tests {
 
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    /// `(connection index, key, value)` per `s` frame `spawn_s_frame_joiner`
+    /// received.
+    type JoinerFrames = Arc<std::sync::Mutex<Vec<(usize, Vec<u8>, Vec<u8>)>>>;
+
+    /// A fake joining node: accepts connections and, on each, reads
+    /// namespaced `s` frames (`s <ns> <key> <value>\n<ns><key><value>`),
+    /// recording `(connection index, key, value)` and acking `S` — until
+    /// `unacked_after` frames have been read on connection 0, after which
+    /// it closes that connection *without* acking the frame just read.
+    fn spawn_s_frame_joiner(listener: TcpListener, unacked_after: Option<usize>) -> JoinerFrames {
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&received);
+        tokio::spawn(async move {
+            let mut connection_index = 0usize;
+            loop {
+                let Ok((connection, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = Arc::clone(&recorded);
+                let this_connection = connection_index;
+                connection_index += 1;
+                tokio::spawn(async move {
+                    let mut reader = tokio::io::BufReader::new(connection);
+                    let mut on_this_connection = 0usize;
+                    loop {
+                        let mut header = Vec::new();
+                        match tokio::io::AsyncBufReadExt::read_until(
+                            &mut reader,
+                            b'\n',
+                            &mut header,
+                        )
+                        .await
+                        {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let header = String::from_utf8(header).unwrap();
+                        let fields: Vec<usize> = header
+                            .trim_end()
+                            .split(' ')
+                            .skip(1)
+                            .map(|field| field.parse().unwrap())
+                            .collect();
+                        assert!(header.starts_with("s "), "unexpected frame {header:?}");
+                        let mut body = vec![0u8; fields[0] + fields[1] + fields[2]];
+                        reader.read_exact(&mut body).await.unwrap();
+                        let key = body[fields[0]..fields[0] + fields[1]].to_vec();
+                        let value = body[fields[0] + fields[1]..].to_vec();
+                        recorded.lock().unwrap().push((this_connection, key, value));
+                        on_this_connection += 1;
+                        if this_connection == 0 && unacked_after == Some(on_this_connection) {
+                            return;
+                        }
+                        reader.get_mut().write_all(b"S\n").await.unwrap();
+                    }
+                });
+            }
+        });
+        received
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_large_multi_set_during_a_join_forwards_every_key_not_just_the_first_few_thousand() {
+        // The `MultiSet` arm used to call `spawn_forward` once per
+        // matching key in a loop that never yields. With the runtime
+        // single-threaded, `run`'s consumer cannot drain `forward_tx`
+        // meanwhile, so everything past `FORWARD_CHANNEL_CAPACITY` +
+        // `MAX_PENDING_FORWARD_WAITERS` (4352) hit the drop branch and
+        // never reached the joiner. The keys now go out as one unit.
+        const KEYS: usize = FORWARD_CHANNEL_CAPACITY + MAX_PENDING_FORWARD_WAITERS + 1_500;
+
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let received = spawn_s_frame_joiner(joining_listener, None);
+
+        // R=2 over two members: the joiner is in every key's top-R.
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let mut active = test_active_migration(None);
+        active.joining_addr = joining_addr;
+        active.after_ring = after_ring;
+        active.acked_entries = None;
+        let node_context = test_node_context(
+            "ready-node",
+            "tk-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(active))),
+        );
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(FORWARD_CHANNEL_CAPACITY);
+        // Stands in for `run`'s consumer, which cannot run while the
+        // connection task is busy in its loop.
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+            },
+            shutdown_rx,
+        ));
+
+        let pair_lens = vec!["5 1"; KEYS].join(" ");
+        let mut frame = format!("o 2 {KEYS} {pair_lens}\nns").into_bytes();
+        for index in 0..KEYS {
+            frame.extend_from_slice(format!("k{index:04}").as_bytes());
+            frame.push(b'v');
+        }
+        assert!(frame.len() < MAX_REQUEST_SIZE);
+        client.write_all(&frame).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(format!("O {KEYS} S").as_bytes()));
+        connection_task.await.unwrap().unwrap();
+
+        // The forward runs after the client was answered; wait for it.
+        timeout(Duration::from_secs(20), async {
+            while received.lock().unwrap().len() < KEYS {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every key of the MultiSet must reach the joining node");
+
+        let received = received.lock().unwrap().clone();
+        assert_eq!(received.len(), KEYS, "no key may be delivered twice");
+        // One unit: one connection, keys in frame order.
+        assert!(received.iter().all(|(connection, _, _)| *connection == 0));
+        for (index, (_, key, value)) in received.iter().enumerate() {
+            assert_eq!(key, format!("k{index:04}").as_bytes());
+            assert_eq!(value, b"v");
+        }
+
+        drop(forward_relay);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_set_forward_resumes_after_a_dropped_connection_without_resending_acked_keys() {
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        // Connection 0 reads its 4th frame and closes without acking it.
+        let received = spawn_s_frame_joiner(joining_listener, Some(4));
+
+        let node_context = test_node_context(
+            "ready-node",
+            "tk-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let target = ForwardTarget {
+            addr: joining_addr,
+            connection: Arc::new(AsyncMutex::new(None)),
+            token: "tok-joiner-0".to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
+        };
+        let items: Vec<(Bytes, Bytes)> = (0..8)
+            .map(|index| {
+                (
+                    Bytes::from(format!("k{index}").into_bytes()),
+                    Bytes::from_static(b"v"),
+                )
+            })
+            .collect();
+
+        forward_with_retries(
+            node_context,
+            target,
+            OwnedForwardedWrite::SetMany {
+                namespace: Bytes::from_static(b"ns"),
+                items,
+                ttl: None,
+                handoff: false,
+                sent: AtomicUsize::new(0),
+            },
+        )
+        .await;
+
+        let received: Vec<(usize, String)> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(connection, key, _)| (*connection, String::from_utf8(key.clone()).unwrap()))
+            .collect();
+        let expected: Vec<(usize, String)> = [
+            (0, "k0"),
+            (0, "k1"),
+            (0, "k2"),
+            // Read but never acked, so sent again on the new connection —
+            // and nothing before it is.
+            (0, "k3"),
+            (1, "k3"),
+            (1, "k4"),
+            (1, "k5"),
+            (1, "k6"),
+            (1, "k7"),
+        ]
+        .into_iter()
+        .map(|(connection, key)| (connection, key.to_string()))
+        .collect();
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_slots_bound_the_spawned_forward_tasks_and_free_up_as_they_finish() {
+        // `run` only receives from `forward_rx` while a slot is free, so
+        // the number of forward tasks that have left the channel can never
+        // exceed the semaphore's size.
+        let slots = Arc::new(Semaphore::new(2));
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        for _ in 0..2 {
+            assert!(slots.available_permits() > 0, "a free slot gates receiving");
+            let release = Arc::clone(&release);
+            let task: MigrationTask = Box::pin(async move { release.notified().await });
+            spawn_forward_task(&mut tasks, &slots, task);
+        }
+
+        assert_eq!(slots.available_permits(), 0);
+        assert_eq!(tasks.len(), 2);
+
+        // Let both tasks start waiting before releasing them
+        // (`notify_waiters` only wakes tasks already waiting).
+        tokio::task::yield_now().await;
+        release.notify_waiters();
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(slots.available_permits(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -15778,7 +16208,7 @@ mod tests {
             member_names(&known_ring),
             Some((vec!["node-b".to_string(), "test-node".to_string()], 3))
         );
-        let received = received.lock().unwrap();
+        let received = received.lock().unwrap().clone();
         assert!(
             received
                 .iter()
@@ -16547,7 +16977,7 @@ mod tests {
         heartbeat_task.await.unwrap();
         fake_discovery.abort();
 
-        let received = received.lock().unwrap();
+        let received = received.lock().unwrap().clone();
         let heartbeats: Vec<&Vec<u8>> = received[1..].iter().collect();
 
         assert!(
