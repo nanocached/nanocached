@@ -1236,6 +1236,12 @@ fn hex_nibble_field(byte: u8) -> io::Result<u8> {
 struct RequestScanState {
     header_end: Option<usize>,
     header_scanned_to: usize,
+    /// Where the frame ends, once its header has been parsed in full. An
+    /// `m`/`o` header is O(keys) tokens to validate, so a body trickling in
+    /// one small read at a time must not repeat that on every read
+    /// (pre-auth): until the buffer reaches this length the answer is
+    /// `Incomplete` without looking at the header again.
+    frame_end: Option<usize>,
 }
 
 /// Finds the header-terminating `\n`, resuming `scan`'s prior progress
@@ -1312,6 +1318,10 @@ fn parse_request_body(
         return Ok(ParseOutcome::Incomplete);
     };
 
+    if scan.frame_end.is_some_and(|end| input.len() < end) {
+        return Ok(ParseOutcome::Incomplete);
+    }
+
     let header =
         String::from_utf8(input[..header_end].to_vec()).map_err(|_| invalid("non-UTF-8 header"))?;
     let mut parts = header.split(' ');
@@ -1350,6 +1360,7 @@ fn parse_request_body(
                 return Err(invalid("request exceeds the request-size limit"));
             }
             if input.len() < frame_end {
+                scan.frame_end = Some(frame_end);
                 return Ok(ParseOutcome::Incomplete);
             }
             input.split_to(frame_end).freeze().slice(header_end + 1..)
@@ -5161,6 +5172,64 @@ mod tests {
 
         assert_eq!(parsed, Some(expected));
         assert!(input.is_empty());
+    }
+
+    // An `m`/`o` header is O(keys) tokens; once it is validated and the
+    // frame length known, a body trickling in must not walk it again.
+    // White-box: with the frame end cached, a buffer still short of it
+    // answers `Incomplete` even when an already-validated header field is
+    // made unparseable, which only holds if the header isn't re-read.
+    #[test]
+    fn parse_request_does_not_reparse_a_multi_header_while_the_body_is_short() {
+        for header in ["m 2 3 1 1 1\n", "o 2 2 1 2 1 3\n"] {
+            let mut input = BytesMut::from(header);
+            input.extend_from_slice(b"ns");
+            let mut scan = RequestScanState::default();
+            assert!(matches!(
+                parse_request(&mut input, false, &mut scan),
+                Ok(ParseOutcome::Incomplete)
+            ));
+            assert!(scan.frame_end.is_some_and(|end| end > input.len()));
+
+            // The namespace-length field: `x` is not a length.
+            input[2] = b'x';
+            assert!(matches!(
+                parse_request(&mut input, false, &mut scan),
+                Ok(ParseOutcome::Incomplete)
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_request_trickled_multi_frames_match_one_shot_parse() {
+        for frame in [
+            &b"m 2 3 1 1 1\nnsabc"[..],
+            &b"o 2 2 1 2 1 3 60\nnsaXvvbYvvv"[..],
+        ] {
+            let mut expected_input = BytesMut::from(frame);
+            let expected =
+                parse_request(&mut expected_input, false, &mut RequestScanState::default())
+                    .unwrap();
+
+            let mut input = BytesMut::new();
+            let mut scan = RequestScanState::default();
+            let mut parsed = None;
+            for byte in frame {
+                input.extend_from_slice(&[*byte]);
+                match parse_request(&mut input, false, &mut scan) {
+                    Ok(ParseOutcome::Incomplete) => {}
+                    Ok(result) => {
+                        parsed = Some(result);
+                        break;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+
+            assert_eq!(parsed, Some(expected));
+            assert!(input.is_empty());
+            assert_eq!(scan.frame_end, None);
+        }
     }
 
     #[test]
