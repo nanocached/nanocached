@@ -2218,10 +2218,11 @@ async fn read_exact_timed(
 /// that accepts the connection but stops draining its receive buffer (a
 /// crashed-but-open, blackholed, or malicious peer) would make this write
 /// block forever — and because `abandon_current_join`/`try_begin_next_join`
-/// await these sends, that would freeze `sweep_expired`, the sole task doing
-/// liveness eviction and migration-timeout reaping. Mirrors the read-side
-/// bound so the whole `M`/`X` exchange is time-bounded, exactly like
-/// `server.rs`'s `OUTBOUND_IO_TIMEOUT` machinery.
+/// await these sends, that would hold `sweep_expired`'s one in-flight join
+/// fan-out slot forever, so no later abandon or join start could run.
+/// Mirrors the read-side bound so the whole `M`/`X` exchange is
+/// time-bounded, exactly like `server.rs`'s `OUTBOUND_IO_TIMEOUT`
+/// machinery.
 async fn write_all_timed(
     stream: &mut ClientStream,
     buf: &[u8],
@@ -2246,9 +2247,9 @@ async fn write_all_timed(
 /// at a time, each byte arriving just under `io_timeout` apart, would
 /// otherwise never trip a per-read `timeout()`, turning a bounded read into
 /// an effectively unbounded one; because `send_migrate`/`send_cancel` are
-/// awaited by `sweep_expired` — the sole task doing liveness eviction and
-/// migration-timeout reaping — that would freeze it for as long as the
-/// trickle continues.
+/// awaited inside `sweep_expired`'s one in-flight join fan-out — which blocks
+/// every later abandon or join start until it ends — that would pin it for
+/// as long as the trickle continues.
 const MAX_ACK_LINE_LENGTH: usize = 64;
 
 async fn read_line_timed(stream: &mut ClientStream, io_timeout: Duration) -> io::Result<String> {
@@ -3128,9 +3129,10 @@ async fn run(
             // Issue #421(a): sweep_task's JoinHandle used to be joined only
             // at shutdown (see the `timeout(SHUTDOWN_TIMEOUT, sweep_task)`
             // below) — unlike connection_tasks above, nothing in this loop
-            // ever polled it, so a panic anywhere in sweep_expired's call
-            // graph (dead-node eviction, stalled-join reaping, post-grace
-            // join kickoff) silently killed just that task while the
+            // ever polled it, so a panic anywhere in sweep_expired's own
+            // body (dead-node eviction, stalled-join reaping — the join
+            // fan-outs it starts run on their own tasks and report a
+            // panic themselves) silently killed just that task while the
             // process kept serving normally, with no signal that
             // membership maintenance had gone dark. Watch it here and
             // respawn on exit so it comes back with a loud WARN instead.
@@ -3668,6 +3670,67 @@ fn cached_node_roster(registry: &Registry, replication: usize) -> Arc<[u8]> {
     )
 }
 
+/// What `sweep_expired` hands off to a background task instead of
+/// awaiting inline — the two join operations that fan out to other nodes.
+enum JoinFanout {
+    /// `abandon_current_join`: an `X` to every ready member of the join,
+    /// then the next join's `M`s.
+    Abandon(&'static str),
+    /// `try_begin_next_join`: the post-grace kick-off.
+    BeginNext,
+}
+
+/// `sweep_expired`'s inputs for `abandon_current_join`/
+/// `try_begin_next_join`, cloneable into a spawned task.
+struct JoinFanoutContext {
+    registry: Registry,
+    current_join: CurrentJoin,
+    auth_secret: Option<Bytes>,
+    tls_connector: Option<TlsConnector>,
+    replication: usize,
+    joins_ready_at: Instant,
+}
+
+impl JoinFanoutContext {
+    /// Starts `action` on `fanouts`. The caller guarantees `fanouts` is
+    /// empty (see `sweep_expired`): at most one runs at a time, so they
+    /// stay as serialized as they were when the sweep awaited them inline.
+    fn spawn(&self, fanouts: &mut JoinSet<()>, action: JoinFanout) {
+        let registry = Arc::clone(&self.registry);
+        let current_join = Arc::clone(&self.current_join);
+        let auth_secret = self.auth_secret.clone();
+        let tls_connector = self.tls_connector.clone();
+        let (replication, joins_ready_at) = (self.replication, self.joins_ready_at);
+        fanouts.spawn(async move {
+            match action {
+                JoinFanout::Abandon(reason) => {
+                    abandon_current_join(
+                        &registry,
+                        &current_join,
+                        &auth_secret,
+                        &tls_connector,
+                        replication,
+                        joins_ready_at,
+                        reason,
+                    )
+                    .await;
+                }
+                JoinFanout::BeginNext => {
+                    try_begin_next_join(
+                        &registry,
+                        &current_join,
+                        &auth_secret,
+                        &tls_connector,
+                        replication,
+                        joins_ready_at,
+                    )
+                    .await;
+                }
+            }
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sweep_expired(
     registry: Registry,
@@ -3685,10 +3748,41 @@ async fn sweep_expired(
     let mut ticker = interval(sweep_interval);
     let mut grace_joins_kicked = false;
 
+    // The join fan-outs (`abandon_current_join`'s `X`s, `try_begin_next_join`'s
+    // `M`s with their retries) used to be awaited right here, which parked
+    // this — the sole task doing liveness eviction, proxy reaping and the
+    // migration-timeout reaper — for up to ~40 s (X) or ~120 s (M, three
+    // attempts) per batch of `MAX_FANOUT_CONCURRENCY` unresponsive nodes:
+    // exactly when nodes are failing, nothing was being evicted or reaped.
+    // They now run on this `JoinSet` instead, at most one at a time (a new
+    // one starts only once `fanouts` is empty), so sweep-initiated fan-outs
+    // stay serialized with each other exactly as before and cannot pile up;
+    // only the rest of the tick no longer waits on them. A state-based
+    // trigger skipped because one is still running simply fires again on
+    // the next tick; the one edge-based trigger (a member evicted this tick)
+    // is remembered in `evicted_members` until it can be acted on.
+    let fanout_context = JoinFanoutContext {
+        registry: Arc::clone(&registry),
+        current_join: Arc::clone(&current_join),
+        auth_secret: auth_secret.clone(),
+        tls_connector: tls_connector.clone(),
+        replication,
+        joins_ready_at,
+    };
+    let mut fanouts: JoinSet<()> = JoinSet::new();
+    let mut evicted_members: HashSet<String> = HashSet::new();
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let now = Instant::now();
+                // Reap finished fan-outs: frees the slot, and surfaces a
+                // panic the way the old inline call's would have (loudly).
+                while let Some(finished) = fanouts.try_join_next() {
+                    if let Err(error) = finished {
+                        eprintln!("WARN a join fan-out task failed: {error}");
+                    }
+                }
                 // Joined nodes are reaped on missed heartbeats. Joining
                 // nodes hold one long-lived connection open instead of
                 // heartbeating (see NodeInfo::promoted) and are bounded
@@ -3770,25 +3864,32 @@ async fn sweep_expired(
                 // still strictly better than waiting on the timeout for a
                 // member that is provably gone. A no-op if none of the
                 // evicted names are part of the current join.
-                let ready_member_evicted_mid_join = lock_current_join(&current_join)
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        heartbeat_evicted.iter().any(|name| {
-                            pending.expected.contains_key(name)
-                                && !pending.completed.contains(name)
-                        })
-                    });
-                if ready_member_evicted_mid_join {
-                    abandon_current_join(
-                        &registry,
-                        &current_join,
-                        &auth_secret,
-                        &tls_connector,
-                        replication,
-                        joins_ready_at,
-                        "ready member evicted mid-join",
-                    )
-                    .await;
+                //
+                // Edge-triggered (the names exist only in this tick's
+                // `heartbeat_evicted`), so they're kept in `evicted_members`
+                // until the abandon is actually started — a fan-out still
+                // running from an earlier tick can occupy the slot — and
+                // dropped once the current join no longer involves any of
+                // them (the abandon in flight already took it, or it never
+                // did).
+                evicted_members.extend(heartbeat_evicted.iter().cloned());
+                let ready_member_evicted_mid_join = !evicted_members.is_empty()
+                    && lock_current_join(&current_join)
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            evicted_members.iter().any(|name| {
+                                pending.expected.contains_key(name)
+                                    && !pending.completed.contains(name)
+                            })
+                        });
+                if !ready_member_evicted_mid_join {
+                    evicted_members.clear();
+                } else if fanouts.is_empty() {
+                    evicted_members.clear();
+                    fanout_context.spawn(
+                        &mut fanouts,
+                        JoinFanout::Abandon("ready member evicted mid-join"),
+                    );
                 }
 
                 for (name, promoted) in waiting_evicted {
@@ -3814,8 +3915,10 @@ async fn sweep_expired(
                         pending.started_at.elapsed() >= migration_timeout_for(pending.max_entries)
                     });
 
-                if timed_out {
-                    abandon_current_join(&registry, &current_join, &auth_secret, &tls_connector, replication, joins_ready_at, "migration timeout").await;
+                // State-based: still true on the next tick if a fan-out in
+                // flight kept this one from starting now.
+                if timed_out && fanouts.is_empty() {
+                    fanout_context.spawn(&mut fanouts, JoinFanout::Abandon("migration timeout"));
                 }
 
                 // Issue #63: a `J` accepted during the startup grace was
@@ -3825,20 +3928,22 @@ async fn sweep_expired(
                 // joins are started by `J`/`C`/abandon exactly as before.
                 // (No join can have started during the grace, so there's
                 // nothing for this one call to collide with.)
-                if !grace_joins_kicked && Instant::now() >= joins_ready_at {
+                if !grace_joins_kicked && fanouts.is_empty() && Instant::now() >= joins_ready_at {
                     grace_joins_kicked = true;
-                    try_begin_next_join(
-                        &registry,
-                        &current_join,
-                        &auth_secret,
-                        &tls_connector,
-                        replication,
-                        joins_ready_at,
-                    )
-                    .await;
+                    fanout_context.spawn(&mut fanouts, JoinFanout::BeginNext);
                 }
             }
-            _ = shutdown_rx.changed() => return,
+            _ = shutdown_rx.changed() => {
+                // A fan-out in flight used to finish before the sweep could
+                // observe the shutdown (it was awaited inline); dropping
+                // `fanouts` here would instead abort it mid-`X`/`M`. Give it
+                // the same bound `run` gives the sweep task as a whole.
+                let _ = timeout(SHUTDOWN_TIMEOUT, async {
+                    while fanouts.join_next().await.is_some() {}
+                })
+                .await;
+                return;
+            }
         }
     }
 }
@@ -3916,6 +4021,13 @@ async fn handle_connection(
     // below — so the tighter pre-first-command bound from
     // `UNIDENTIFIED_CONNECTION_TIMEOUT` still applies.
     let mut deadline = Instant::now() + config.idle_timeout;
+    // Set when a command was just parsed (and so handled): the handler may
+    // have awaited far longer than `idle_timeout` — a `J` parked in
+    // `wait_for_promotion` for the whole join queue, a `C`/`V` running an
+    // `M`/`X` fan-out — so the budget for the *next* command is re-anchored
+    // to the moment the handler finished, just before waiting for it. See
+    // the read below.
+    let mut handled_a_command = false;
 
     loop {
         let parsed = parse(&mut received);
@@ -3928,6 +4040,7 @@ async fn handle_connection(
         if parsed.is_ok() {
             identified = true;
             deadline = Instant::now() + config.idle_timeout;
+            handled_a_command = true;
         }
         match parsed {
             Ok(DiscoveryCommand::Auth { secret, tagging }) => {
@@ -4656,6 +4769,20 @@ async fn handle_connection(
         }
 
         received.reserve(READ_CHUNK_SIZE);
+
+        // The deadline above was set when the last command was parsed, but
+        // its handler may have run past it: a node that sat in the join
+        // queue for over `idle_timeout` is promoted, answered `R`, and then
+        // would have been closed here as idle before its first `H` could
+        // possibly arrive (it self-heals by redialing and sending `P`,
+        // costing a reconnect and a WARN). The idle clock for the next
+        // command starts when this one's handler is done. Once, per
+        // handled command — never on a bare read, so trickling bytes of the
+        // *next* command still can't push the deadline out.
+        if handled_a_command {
+            deadline = Instant::now() + config.idle_timeout;
+            handled_a_command = false;
+        }
 
         // Issue (slowloris): bound this read by whichever of the ordinary
         // per-read idle timeout and the connection's total unidentified
@@ -7745,11 +7872,18 @@ mod tests {
     async fn registry_with_a_joined_and_b_waiting(
         shutdown_rx: watch::Receiver<bool>,
     ) -> (TcpStream, TcpStream, Registry, CurrentJoin) {
+        registry_with_a_joined_and_b_waiting_idle(shutdown_rx, IDLE_TIMEOUT).await
+    }
+
+    async fn registry_with_a_joined_and_b_waiting_idle(
+        shutdown_rx: watch::Receiver<bool>,
+        idle_timeout: Duration,
+    ) -> (TcpStream, TcpStream, Registry, CurrentJoin) {
         let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
 
         let config = || ConnectionConfig {
-            idle_timeout: IDLE_TIMEOUT,
+            idle_timeout,
             list_ready_at: Instant::now(),
             replication: 2,
             auth_secret: None,
@@ -7839,6 +7973,46 @@ mod tests {
             "expected the connection to close, not data"
         );
         assert!(!lock(&registry).contains_key("node-b"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_promoted_after_waiting_longer_than_idle_timeout_keeps_its_connection() {
+        // The idle deadline used to be anchored when `J` was parsed, so a
+        // node that waited longer than the idle timeout in the join queue
+        // was promoted, answered `R`, and then closed as idle before its
+        // first `H` could arrive. The clock for the next command now starts
+        // when the `J` handler (the whole wait) is done.
+        //
+        // Real time with a short idle timeout, not a paused clock: with
+        // real sockets a paused runtime auto-advances the clock whenever
+        // every task is parked on I/O, which fired the server's fresh idle
+        // timer while the `H` was still in flight (about one run in three).
+        let idle_timeout = Duration::from_millis(400);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_node_a, mut node_b, registry, _current_join) =
+            registry_with_a_joined_and_b_waiting_idle(shutdown_rx, idle_timeout).await;
+
+        // Outwait the idle timeout while parked in `wait_for_promotion`
+        // (which has none), then promote node-b the way a completed
+        // handoff does.
+        tokio::time::sleep(idle_timeout + Duration::from_millis(200)).await;
+        {
+            let mut guard = lock(&registry);
+            let info = guard.get_mut("node-b").expect("node-b is registered");
+            info.state = NodeState::Joined;
+            info.promoted.notify_one();
+        }
+        assert_eq!(read_exactly(&mut node_b, 2).await, b"R\n");
+
+        // The first heartbeat, sent promptly after `R`, must be answered
+        // on the same connection rather than find it closed.
+        node_b.write_all(b"H 6 2 9\nnode-btk-node-b").await.unwrap();
+        let mut ack = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), node_b.read_exact(&mut ack))
+            .await
+            .expect("no heartbeat ack arrived on the same connection")
+            .expect("the promoted node's connection was closed as idle");
+        assert_eq!(&ack, b"A ");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10701,6 +10875,277 @@ mod tests {
         expected_cancel.extend_from_slice(b"tk-node-a");
         expected_cancel.extend_from_slice(b"node-b");
         assert_eq!(*received.lock().unwrap(), expected_cancel);
+    }
+
+    /// A stand-in ready node for `send_cancel`: accepts each connection,
+    /// reads the `X` frame, waits `delay`, then acks. Returns its address,
+    /// a count of the connections it has accepted, and a count of the acks
+    /// it has sent.
+    async fn slow_cancel_node(delay: Duration) -> (String, Arc<AtomicU64>, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let acked = Arc::new(AtomicU64::new(0));
+        let (accept_counter, ack_counter) = (Arc::clone(&accepted), Arc::clone(&acked));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                accept_counter.fetch_add(1, Ordering::SeqCst);
+                let ack_counter = Arc::clone(&ack_counter);
+                tokio::spawn(async move {
+                    let mut chunk = [0u8; 256];
+                    let _ = stream.read(&mut chunk).await;
+                    tokio::time::sleep(delay).await;
+                    if stream.write_all(b"A\n").await.is_ok() {
+                        ack_counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        (address, accepted, acked)
+    }
+
+    /// Keeps `name`'s heartbeat fresh, standing in for a live node.
+    fn keep_heartbeating(registry: &Registry, name: &'static str) -> tokio::task::JoinHandle<()> {
+        let registry = Arc::clone(registry);
+        tokio::spawn(async move {
+            loop {
+                if let Some(info) = lock(&registry).get_mut(name) {
+                    info.last_heartbeat = Instant::now();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+    }
+
+    async fn wait_until(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + limit;
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn timed_out_join_of_node_b_awaiting_node_a() -> PendingJoin {
+        PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            // Already past `MIGRATION_TIMEOUT_BASE`: the first sweep tick
+            // abandons it.
+            started_at: Instant::now()
+                .checked_sub(MIGRATION_TIMEOUT_BASE + Duration::from_secs(1))
+                .expect("the clock has run long enough to backdate"),
+            max_entries: 0,
+            generation: 1,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stuck_cancel_fan_out_does_not_stop_the_sweep_from_evicting_dead_nodes() {
+        // The sweep used to await `abandon_current_join` inline: an `X` to a
+        // ready member that accepts and never answers parked it for
+        // `OUTBOUND_IO_TIMEOUT` (per batch), so liveness eviction paused
+        // exactly while nodes were failing. Here node-a's `X` hangs for far
+        // longer than this test runs, and node-c — which stops
+        // heartbeating — must still be evicted in the meantime.
+        let (node_a_addr, accepted, _acked) = slow_cancel_node(Duration::from_secs(30)).await;
+        let registry: Registry = Arc::new(RegistryState::default());
+        for (name, address, state) in [
+            ("node-a", node_a_addr.as_str(), NodeState::Joined),
+            ("node-b", "127.0.0.1:2", NodeState::Joining),
+            ("node-c", "127.0.0.1:3", NodeState::Joined),
+        ] {
+            lock(&registry).insert(
+                name.to_string(),
+                NodeInfo::new(address.to_string(), state, format!("tk-{name}")),
+            );
+        }
+        let _node_a_alive = keep_heartbeating(&registry, "node-a");
+        let current_join: CurrentJoin =
+            Arc::new(Mutex::new(Some(timed_out_join_of_node_b_awaiting_node_a())));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let started = Instant::now();
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            None,
+            None,
+            2,
+            Instant::now(),
+            Duration::from_millis(600),
+            shutdown_rx,
+        ));
+
+        // The abandon is under way: join taken, `X` sent and hanging.
+        wait_until(
+            "the abandon's X to reach node-a",
+            Duration::from_secs(3),
+            || accepted.load(Ordering::SeqCst) == 1,
+        )
+        .await;
+        assert!(lock_current_join(&current_join).is_none());
+
+        // ...and node-c is evicted anyway, well before that `X` could
+        // time out (10 s) — the sweep was not parked behind it.
+        wait_until("node-c's eviction", Duration::from_secs(4), || {
+            !lock(&registry).contains_key("node-c")
+        })
+        .await;
+        assert!(
+            started.elapsed() < OUTBOUND_IO_TIMEOUT / 2,
+            "evicted only after {:?}",
+            started.elapsed()
+        );
+        assert!(lock(&registry).contains_key("node-a"));
+
+        // The stuck `X` would hold a graceful shutdown for up to
+        // `SHUTDOWN_TIMEOUT` (see the test below), so don't wait for it.
+        drop(shutdown_tx);
+        sweep_task.abort();
+        let _ = sweep_task.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_mid_join_eviction_seen_while_a_fan_out_runs_is_acted_on_once_it_finishes() {
+        // At most one sweep-initiated fan-out runs at a time, so an
+        // abandon the sweep wants to start while another is still in flight
+        // must wait for it — but it must not be lost: a member evicted
+        // mid-join is an edge, seen on one tick only.
+        //
+        // J1 (timed out) is abandoned first; its `X` to node-a takes 1.5 s.
+        // Meanwhile J2 is installed with node-c as a ready member, and
+        // node-c stops heartbeating. node-c's eviction (~0.6 s) happens
+        // during J1's fan-out, so J2's abandon is deferred (still current
+        // at ~1 s), then performed after the fan-out is done.
+        let (node_a_addr, accepted, _acked) = slow_cancel_node(Duration::from_millis(1500)).await;
+        let registry: Registry = Arc::new(RegistryState::default());
+        for (name, address, state) in [
+            ("node-a", node_a_addr.as_str(), NodeState::Joined),
+            ("node-b", "127.0.0.1:2", NodeState::Joining),
+            ("node-c", "127.0.0.1:3", NodeState::Joined),
+        ] {
+            lock(&registry).insert(
+                name.to_string(),
+                NodeInfo::new(address.to_string(), state, format!("tk-{name}")),
+            );
+        }
+        let _node_a_alive = keep_heartbeating(&registry, "node-a");
+        let current_join: CurrentJoin =
+            Arc::new(Mutex::new(Some(timed_out_join_of_node_b_awaiting_node_a())));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            None,
+            None,
+            2,
+            Instant::now(),
+            Duration::from_millis(600),
+            shutdown_rx,
+        ));
+
+        wait_until("J1's X to reach node-a", Duration::from_secs(3), || {
+            accepted.load(Ordering::SeqCst) == 1 && lock_current_join(&current_join).is_none()
+        })
+        .await;
+        lock(&registry).insert(
+            "node-d".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:4".to_string(),
+                NodeState::Joining,
+                "tk-node-d".to_string(),
+            ),
+        );
+        *lock_current_join(&current_join) = Some(PendingJoin {
+            joining_name: "node-d".to_string(),
+            expected: [("node-c".to_string(), "tk-node-c".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation: 2,
+        });
+
+        // node-c is evicted while J1's X is still outstanding...
+        wait_until("node-c's eviction", Duration::from_secs(4), || {
+            !lock(&registry).contains_key("node-c")
+        })
+        .await;
+        // ...and J2's abandon is held back behind that fan-out.
+        assert!(
+            lock_current_join(&current_join).is_some(),
+            "J2 was abandoned while the previous fan-out was still running"
+        );
+
+        // Once J1's fan-out is done, J2 is abandoned after all.
+        wait_until("J2's abandon", Duration::from_secs(5), || {
+            lock_current_join(&current_join).is_none()
+        })
+        .await;
+        assert!(!lock(&registry).contains_key("node-d"));
+
+        shutdown_tx.send_replace(true);
+        sweep_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_lets_an_in_flight_fan_out_finish_instead_of_aborting_it() {
+        // Awaited inline, a fan-out used to finish before the sweep could
+        // even observe the shutdown. On a `JoinSet`, dropping it on return
+        // would abort the `X` mid-exchange; the sweep drains it first.
+        let (node_a_addr, accepted, acked) = slow_cancel_node(Duration::from_millis(800)).await;
+        let registry: Registry = Arc::new(RegistryState::default());
+        for (name, address, state) in [
+            ("node-a", node_a_addr.as_str(), NodeState::Joined),
+            ("node-b", "127.0.0.1:2", NodeState::Joining),
+        ] {
+            lock(&registry).insert(
+                name.to_string(),
+                NodeInfo::new(address.to_string(), state, format!("tk-{name}")),
+            );
+        }
+        let _node_a_alive = keep_heartbeating(&registry, "node-a");
+        let current_join: CurrentJoin =
+            Arc::new(Mutex::new(Some(timed_out_join_of_node_b_awaiting_node_a())));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            current_join,
+            None,
+            None,
+            2,
+            Instant::now(),
+            Duration::from_secs(60),
+            shutdown_rx,
+        ));
+
+        wait_until(
+            "the abandon's X to reach node-a",
+            Duration::from_secs(3),
+            || accepted.load(Ordering::SeqCst) == 1,
+        )
+        .await;
+        assert_eq!(acked.load(Ordering::SeqCst), 0, "the X is still in flight");
+
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), sweep_task)
+            .await
+            .expect("the sweep did not stop after draining its fan-out")
+            .unwrap();
+        assert_eq!(
+            acked.load(Ordering::SeqCst),
+            1,
+            "the in-flight X was cut off by the shutdown"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
