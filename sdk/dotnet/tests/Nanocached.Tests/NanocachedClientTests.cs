@@ -4912,16 +4912,41 @@ public class TolerantBootstrapTests
 
     // ── bounded dial fan-out ─────────────────────────────────────────
 
-    /// <summary>A listener that accepts connections and never answers the
-    /// handshake, recording how many of its connections were open at once
-    /// — a blackholed address, as far as a dialing client can tell.</summary>
+    /// <summary>Listeners that accept a connection and never answer, so
+    /// every dial to one runs to the client's connect deadline. Each accept
+    /// is timestamped.
+    ///
+    /// How many dials overlapped is read off those timestamps, not off how
+    /// many connections the listeners hold open at once: a listener only
+    /// learns a client gave up when its read returns EOF, and that
+    /// thread-pool hop can lag behind the client freeing its slot and the
+    /// next dial being accepted, which counted one dial too many (4 with a
+    /// cap of 3) on a loaded runner.</summary>
     private sealed class SilentListeners : IDisposable
     {
         private readonly List<System.Net.Sockets.TcpListener> _listeners = new();
-        private int _open;
-        private int _maxOpen;
+        private readonly System.Collections.Concurrent.ConcurrentQueue<long> _acceptedAt = new();
 
-        internal int MaxConcurrent => Volatile.Read(ref _maxOpen);
+        /// <summary>The most accepts that fall inside any window of this
+        /// length. A dial lasts at least the connect deadline (nothing ever
+        /// answers it), so with a window comfortably shorter than the
+        /// deadline every accept in one window belongs to a dial that was
+        /// still running when the others started: this is a lower bound on
+        /// the dials in flight at once, immune to how fast a listener
+        /// notices a close.</summary>
+        internal int MaxAcceptsWithin(TimeSpan window)
+        {
+            long[] times = _acceptedAt.ToArray();
+            Array.Sort(times);
+            long span = (long)(window.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
+            int best = 0;
+            for (int i = 0, j = 0; i < times.Length; i++)
+            {
+                while (times[i] - times[j] >= span) j++;
+                best = Math.Max(best, i - j + 1);
+            }
+            return best;
+        }
 
         internal string StartOne()
         {
@@ -4945,14 +4970,9 @@ public class TolerantBootstrapTests
                 {
                     return;
                 }
+                _acceptedAt.Enqueue(System.Diagnostics.Stopwatch.GetTimestamp());
                 _ = Task.Run(async () =>
                 {
-                    int now = Interlocked.Increment(ref _open);
-                    int seen;
-                    while (now > (seen = Volatile.Read(ref _maxOpen))
-                           && Interlocked.CompareExchange(ref _maxOpen, now, seen) != seen)
-                    {
-                    }
                     try
                     {
                         // Drain until the client gives up and closes.
@@ -4968,7 +4988,6 @@ public class TolerantBootstrapTests
                     }
                     finally
                     {
-                        Interlocked.Decrement(ref _open);
                         client.Close();
                     }
                 });
@@ -4997,7 +5016,7 @@ public class TolerantBootstrapTests
         int originalCap = NanocachedClient.MaxConcurrentDials;
         TimeSpan originalDeadline = Identify.ConnectDeadline;
         NanocachedClient.MaxConcurrentDials = cap;
-        Identify.ConnectDeadline = TimeSpan.FromMilliseconds(150);
+        Identify.ConnectDeadline = TimeSpan.FromMilliseconds(400);
         try
         {
             await Assert.ThrowsAsync<ConnectionLostException>(() => NanocachedClient.ConnectAsync(
@@ -5009,9 +5028,10 @@ public class TolerantBootstrapTests
             Identify.ConnectDeadline = originalDeadline;
         }
 
-        Assert.True(silent.MaxConcurrent <= cap,
-            $"{silent.MaxConcurrent} dials were in flight at once with a cap of {cap}");
-        Assert.True(silent.MaxConcurrent >= 2, "the capped dials should still overlap, not run one at a time");
+        int overlapped = silent.MaxAcceptsWithin(TimeSpan.FromMilliseconds(200));
+        Assert.True(overlapped <= cap,
+            $"{overlapped} dials were in flight at once with a cap of {cap}");
+        Assert.True(overlapped >= 2, "the capped dials should still overlap, not run one at a time");
     }
 
     [Fact]
@@ -5031,7 +5051,7 @@ public class TolerantBootstrapTests
         int originalCap = NanocachedClient.MaxConcurrentDials;
         TimeSpan originalDeadline = Identify.ConnectDeadline;
         NanocachedClient.MaxConcurrentDials = cap;
-        Identify.ConnectDeadline = TimeSpan.FromMilliseconds(150);
+        Identify.ConnectDeadline = TimeSpan.FromMilliseconds(400);
         try
         {
             await ForceRefreshAsync(client);
@@ -5042,9 +5062,10 @@ public class TolerantBootstrapTests
             Identify.ConnectDeadline = originalDeadline;
         }
 
-        Assert.True(silent.MaxConcurrent <= cap,
-            $"{silent.MaxConcurrent} dials were in flight at once with a cap of {cap}");
-        Assert.True(silent.MaxConcurrent >= 2, "the capped dials should still overlap, not run one at a time");
+        int overlapped = silent.MaxAcceptsWithin(TimeSpan.FromMilliseconds(200));
+        Assert.True(overlapped <= cap,
+            $"{overlapped} dials were in flight at once with a cap of {cap}");
+        Assert.True(overlapped >= 2, "the capped dials should still overlap, not run one at a time");
         for (int i = 0; i < 12; i++) Assert.True(HasMember(client, $"node-{i}"));
     }
 
