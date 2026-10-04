@@ -296,6 +296,22 @@ const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_millis(600);
 /// the view can get while nothing is being rerouted.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The least time between two roster fetches when the second is
+/// `force_refresh`-triggered. Every `W` path nudges the refresher, and
+/// each fetch is a full `L` round plus a `Y` announce to every discovery
+/// replica — so without a floor, a burst of `W`s (a node mid-handoff
+/// answers `W` for every key it no longer owns) drove one fetch-and-
+/// announce per nudge, back to back, against discovery. Nudges inside the
+/// window are coalesced into one fetch at its end; short enough that the
+/// first refresh after a genuine ring change is still prompt (a retry
+/// waits `UPSTREAM_IO_TIMEOUT`).
+#[cfg(not(test))]
+const MIN_FORCED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// Shrunk under test like `UPSTREAM_IO_TIMEOUT`, so the many tests that
+/// force a refresh don't each pay a second.
+#[cfg(test)]
+const MIN_FORCED_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Issue #110: how many requests may sit written-but-unanswered on one
 /// shared backend connection. The writer stalls (backpressuring every
 /// client queued behind it) once this many replies are outstanding, so
@@ -509,6 +525,13 @@ impl RingView {
         top.into_iter()
             .map(|(_, index)| self.nodes[index].1.clone())
             .collect()
+    }
+
+    /// Whether `other` describes the same cluster: the same members in
+    /// the same order and the same replication factor. Everything else
+    /// in a `RingView` is derived from these.
+    fn same_roster(&self, other: &RingView) -> bool {
+        self.replication == other.replication && self.nodes == other.nodes
     }
 
     /// Every member address — `c`/`F`'s fan-out set.
@@ -749,6 +772,10 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 type ServerStream = infra::MaybeTls<TcpStream, tokio_rustls::server::TlsStream<TcpStream>>;
 type UpstreamStream = infra::MaybeTls<TcpStream, tokio_rustls::client::TlsStream<TcpStream>>;
 
+/// What `force_refresh` hands the refresher: completed (by sending `()`)
+/// once a roster fetch that began after the nudge succeeded.
+type RefreshWaiter = oneshot::Sender<()>;
+
 /// Everything the per-connection tasks need, shared once.
 struct ProxyContext {
     secret: Option<Bytes>,
@@ -757,9 +784,11 @@ struct ProxyContext {
     /// fetch (connections arriving before that answer `B` — the same
     /// "not ready yet, retry" clients already handle from discovery).
     ring: watch::Receiver<Option<Arc<RingView>>>,
-    /// Nudges the refresher for an immediate re-fetch (a `W` was seen or
-    /// a clear fan-out failed) instead of waiting out the interval.
-    refresh_now: mpsc::Sender<()>,
+    /// Nudges the refresher for a prompt re-fetch (a `W` was seen or a
+    /// clear fan-out failed) instead of waiting out the interval. Carries
+    /// a `RefreshWaiter` that the refresher completes once a fetch that
+    /// started after the nudge has landed — see `force_refresh`.
+    refresh_now: mpsc::Sender<RefreshWaiter>,
     /// Issue #110: the proxy-wide shared backend connections — one
     /// tagged, pipelined connection per node, multiplexing every client
     /// connection's traffic. This is what collapses the node-side
@@ -1035,7 +1064,7 @@ struct RefresherConfig {
 async fn run_refresher(
     config: RefresherConfig,
     ring_tx: watch::Sender<Option<Arc<RingView>>>,
-    mut refresh_rx: mpsc::Receiver<()>,
+    mut refresh_rx: mpsc::Receiver<RefreshWaiter>,
     backends: Arc<SharedBackends>,
 ) {
     let RefresherConfig {
@@ -1045,6 +1074,12 @@ async fn run_refresher(
         announce,
         mut drain,
     } = config;
+
+    // `force_refresh` callers waiting on the next successful fetch. Kept
+    // across a failed fetch (the old wait was for "the view changes", which
+    // a failed fetch never did, so a caller still got the next periodic
+    // refresh's chance), and dropped when the caller gives up.
+    let mut waiters: Vec<RefreshWaiter> = Vec::new();
 
     loop {
         if *drain.borrow() {
@@ -1058,12 +1093,26 @@ async fn run_refresher(
                 // an address that dropped off the ring stops accumulating
                 // map entries from this point on.
                 backends.prune(&ring);
-                let _ = ring_tx.send(Some(ring));
+                // An identical roster is not republished: `send` would
+                // wake every `ring` subscriber for nothing.
+                ring_tx.send_if_modified(|current| {
+                    if current.as_ref().is_some_and(|held| held.same_roster(&ring)) {
+                        false
+                    } else {
+                        *current = Some(ring);
+                        true
+                    }
+                });
+                for waiter in waiters.drain(..) {
+                    let _ = waiter.send(());
+                }
             }
             Err(error) => {
                 eprintln!("WARN roster refresh failed: {error}");
+                waiters.retain(|waiter| !waiter.is_closed());
             }
         }
+        let fetched_at = tokio::time::Instant::now();
 
         // Issue #122: (re-)announce this proxy on the same cadence, to
         // every replica — each keeps its own proxy map (they don't
@@ -1097,15 +1146,27 @@ async fn run_refresher(
             join_all(futs).await;
         }
 
-        tokio::select! {
-            _ = sleep(REFRESH_INTERVAL) => {}
-            () = drained(&mut drain) => {}
-            received = refresh_rx.recv() => {
-                if received.is_none() {
-                    return;
+        let nudged = tokio::select! {
+            _ = sleep(REFRESH_INTERVAL) => false,
+            () = drained(&mut drain) => false,
+            received = refresh_rx.recv() => match received {
+                None => return,
+                Some(waiter) => {
+                    waiters.push(waiter);
+                    true
                 }
-                // Coalesce a burst of W-triggered nudges into one fetch.
-                while refresh_rx.try_recv().is_ok() {}
+            },
+        };
+        if nudged {
+            // Coalesce a burst of W-triggered nudges into one fetch, and
+            // hold it to `MIN_FORCED_REFRESH_INTERVAL` after the last one
+            // — a nudge arriving later than that is served at once.
+            tokio::select! {
+                () = tokio::time::sleep_until(fetched_at + MIN_FORCED_REFRESH_INTERVAL) => {}
+                () = drained(&mut drain) => {}
+            }
+            while let Ok(waiter) = refresh_rx.try_recv() {
+                waiters.push(waiter);
             }
         }
     }
@@ -3211,14 +3272,21 @@ fn current_ring(context: &ProxyContext) -> Option<Arc<RingView>> {
     context.ring.borrow().clone()
 }
 
-/// Nudges the refresher and waits for the view to change (or a short
+/// Nudges the refresher and waits for a fresh fetch to land (or a short
 /// deadline) — a `W` means the current view is stale, so retrying on the
-/// same view would just get the same `W`.
+/// same view would just get the same `W`. The refresher spaces forced
+/// fetches by `MIN_FORCED_REFRESH_INTERVAL` and coalesces the nudges in
+/// between, and it does not republish a roster identical to the current
+/// one — so this waits on the fetch completing, not on the ring watch
+/// changing, which would never fire for an unchanged roster.
 async fn force_refresh(context: &ProxyContext) {
-    let mut ring = context.ring.clone();
-    ring.mark_unchanged();
-    let _ = context.refresh_now.send(()).await;
-    let _ = timeout(UPSTREAM_IO_TIMEOUT, ring.changed()).await;
+    let (waiter, done) = oneshot::channel();
+    let _ = timeout(UPSTREAM_IO_TIMEOUT, async {
+        if context.refresh_now.send(waiter).await.is_ok() {
+            let _ = done.await;
+        }
+    })
+    .await;
 }
 
 /// What a driver hands back for the writer to send: the full client-form
@@ -6443,17 +6511,40 @@ mod tests {
         roster: Vec<(String, String)>,
         replication: usize,
     ) -> (String, Arc<StdMutex<Vec<String>>>) {
+        let discovery = start_mock_discovery_handle(roster, replication).await;
+        (discovery.addr, discovery.deregistered)
+    }
+
+    /// A mock discovery with its observation points exposed: how many `L`
+    /// roster fetches it has answered, and the live roster (replace its
+    /// contents to change what the next fetch returns).
+    struct MockDiscoveryHandle {
+        addr: String,
+        deregistered: Arc<StdMutex<Vec<String>>>,
+        roster_fetches: Arc<AtomicUsize>,
+        roster: Arc<StdMutex<Vec<(String, String)>>>,
+    }
+
+    async fn start_mock_discovery_handle(
+        roster: Vec<(String, String)>,
+        replication: usize,
+    ) -> MockDiscoveryHandle {
+        let live_roster = Arc::new(StdMutex::new(roster));
+        let roster_cell = Arc::clone(&live_roster);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let deregistered: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let record = Arc::clone(&deregistered);
+        let roster_fetches = Arc::new(AtomicUsize::new(0));
+        let fetch_counter = Arc::clone(&roster_fetches);
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                let roster = roster.clone();
+                let roster_cell = Arc::clone(&roster_cell);
                 let record = Arc::clone(&record);
+                let fetch_counter = Arc::clone(&fetch_counter);
                 tokio::spawn(async move {
                     let mut buf = BytesMut::new();
                     loop {
@@ -6477,6 +6568,8 @@ mod tests {
                                 let _ = stream.write_all(b"Od\n").await;
                             }
                             "L" => {
+                                fetch_counter.fetch_add(1, Ordering::SeqCst);
+                                let roster = roster_cell.lock().unwrap().clone();
                                 let mut response =
                                     format!("N {} {replication}\n", roster.len()).into_bytes();
                                 for (name, addr) in &roster {
@@ -6517,7 +6610,12 @@ mod tests {
                 });
             }
         });
-        (addr, deregistered)
+        MockDiscoveryHandle {
+            addr,
+            deregistered,
+            roster_fetches,
+            roster: live_roster,
+        }
     }
 
     async fn start_mock_discovery(roster: Vec<(String, String)>, replication: usize) -> String {
@@ -7597,6 +7695,115 @@ mod tests {
             "closed only after {:?}",
             started.elapsed()
         );
+    }
+
+    /// Every `W` path nudges the refresher, and each fetch is a full `L`
+    /// plus announce round. A burst of forced refreshes used to drive one
+    /// fetch per nudge back to back; now they are spaced by
+    /// `MIN_FORCED_REFRESH_INTERVAL` and the nudges in between coalesce —
+    /// while every caller still gets its refresh.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_burst_of_forced_refreshes_is_coalesced_into_few_roster_fetches() {
+        let node = MockNode::start().await;
+        let discovery =
+            start_mock_discovery_handle(vec![("node-a".to_string(), node.addr.clone())], 1).await;
+        let (_proxy, _drain, context) =
+            start_proxy_with_drain(&discovery.addr, None, 64, None).await;
+        let baseline = discovery.roster_fetches.load(Ordering::SeqCst);
+
+        let window = MIN_FORCED_REFRESH_INTERVAL * 10;
+        let started = std::time::Instant::now();
+        let mut callers = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let context = Arc::clone(&context);
+            callers.spawn(async move {
+                let mut calls = 0usize;
+                while started.elapsed() < window {
+                    force_refresh(&context).await;
+                    calls += 1;
+                }
+                calls
+            });
+        }
+        let mut calls = 0;
+        while let Some(done) = callers.join_next().await {
+            calls += done.unwrap();
+        }
+
+        let fetches = discovery.roster_fetches.load(Ordering::SeqCst) - baseline;
+        // One fetch per interval at most (plus slack for the window's
+        // edges); unthrottled, a localhost mock answers hundreds.
+        assert!(fetches <= 13, "{fetches} roster fetches in {window:?}");
+        assert!(
+            calls > fetches,
+            "{calls} forced refreshes should outnumber the {fetches} fetches they were coalesced into"
+        );
+    }
+
+    /// An identical roster is not republished (a `ring` subscriber isn't
+    /// woken for nothing), yet `force_refresh` still returns as soon as
+    /// the fetch completes rather than waiting out `UPSTREAM_IO_TIMEOUT`
+    /// for a change that will never come.
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_refresh_of_an_identical_roster_returns_promptly_without_republishing() {
+        let node = MockNode::start().await;
+        let discovery =
+            start_mock_discovery_handle(vec![("node-a".to_string(), node.addr.clone())], 1).await;
+        let (_proxy, _drain, context) =
+            start_proxy_with_drain(&discovery.addr, None, 64, None).await;
+        let mut ring = context.ring.clone();
+        ring.mark_unchanged();
+        let before = discovery.roster_fetches.load(Ordering::SeqCst);
+
+        let started = std::time::Instant::now();
+        force_refresh(&context).await;
+
+        assert!(
+            started.elapsed() < UPSTREAM_IO_TIMEOUT / 2,
+            "force_refresh took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            discovery.roster_fetches.load(Ordering::SeqCst),
+            before + 1,
+            "the forced refresh did fetch"
+        );
+        assert!(
+            !ring.has_changed().unwrap(),
+            "an identical roster must not wake ring subscribers"
+        );
+    }
+
+    /// The other side of the same change: a roster that did change is
+    /// published, and the first forced refresh after the change is not
+    /// delayed past the minimum interval.
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_refresh_publishes_a_changed_roster_promptly() {
+        let node_a = MockNode::start().await;
+        let node_b = MockNode::start().await;
+        let discovery =
+            start_mock_discovery_handle(vec![("node-a".to_string(), node_a.addr.clone())], 1).await;
+        let (_proxy, _drain, context) =
+            start_proxy_with_drain(&discovery.addr, None, 64, None).await;
+        let mut ring = context.ring.clone();
+        ring.mark_unchanged();
+        assert_eq!(current_ring(&context).unwrap().nodes.len(), 1);
+
+        discovery
+            .roster
+            .lock()
+            .unwrap()
+            .push(("node-b".to_string(), node_b.addr.clone()));
+        let started = std::time::Instant::now();
+        force_refresh(&context).await;
+
+        assert!(
+            started.elapsed() < UPSTREAM_IO_TIMEOUT / 2,
+            "force_refresh took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(current_ring(&context).unwrap().nodes.len(), 2);
+        assert!(ring.has_changed().unwrap());
     }
 
     /// No-secret mode is untouched by the pre-auth bounds: a connection

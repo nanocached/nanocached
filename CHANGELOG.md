@@ -39,6 +39,12 @@ framework adapters at one version, whether or not a component changed.
   worker). Each key now keeps only its top owners in one pass, and keys are
   grouped by node without cloning an address per key. Key placement is
   unchanged.
+- `nanocached-proxy`: a burst of `W` replies (a node mid-handoff answers `W`
+  for every key it no longer owns) no longer drives one roster fetch and
+  `Y` announce to every discovery replica per reply, back to back. Forced
+  refreshes are now spaced at least 1 s apart and the nudges in between are
+  coalesced into one fetch, and a fetched roster identical to the current
+  one is no longer republished to the proxy's connections.
 
 ### Security
 
