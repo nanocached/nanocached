@@ -111,7 +111,6 @@ struct WriteState {
     /// `dead()`, which never opened a socket) — further requests fail
     /// as connection-lost rather than reusing a torn-down half.
     write_half: Option<WriteHalf<Stream>>,
-    pending: VecDeque<PendingSlot>,
     /// Echoed response tags: this connection's tag counter, a u32 wrapping at its
     /// width — claimed under this same lock, in the same critical section
     /// that enqueues the pending slot and writes the frame, so tag order
@@ -121,7 +120,20 @@ struct WriteState {
 }
 
 struct Shared {
+    /// Held by a request for its whole write, which can block for as long
+    /// as the server isn't reading. It therefore must not guard anything
+    /// the read task needs to dispatch a response — that is `pending`
+    /// below, in its own lock. With one lock for both, a large write
+    /// blocked on a server that is itself blocked writing responses to a
+    /// read task waiting for that lock deadlocked until the request
+    /// timeout poisoned the connection.
     write_state: Mutex<WriteState>,
+    /// Requests written (or being written) and awaiting their response,
+    /// oldest first — the read task pops, writers push (always while
+    /// holding `write_state`, so queue order is wire order). A plain
+    /// `std` mutex: every critical section is a push or a pop, never
+    /// held across an `.await`.
+    pending: std::sync::Mutex<VecDeque<PendingSlot>>,
     closed: AtomicBool,
     /// Milliseconds since `epoch` of the last request — what the
     /// keep-alive timer checks against its interval.
@@ -131,6 +143,9 @@ struct Shared {
     /// "the connection is making progress" (issue #488). Zero until the
     /// first response.
     last_response_ms: AtomicU64,
+    /// Whether a keep-alive ping is outstanding on this connection — see
+    /// `Connection::begin_keepalive_ping`.
+    keepalive_ping_in_flight: AtomicBool,
     epoch: Instant,
     /// The open-targets key this connection was counted against (see
     /// `open_targets`) — `None` for the pre-poisoned `dead()` placeholder,
@@ -279,6 +294,20 @@ impl Drop for WriteGuard<'_> {
     }
 }
 
+/// An outstanding keep-alive ping's claim on its connection — see
+/// `Connection::begin_keepalive_ping`.
+pub(crate) struct KeepalivePing {
+    shared: Arc<Shared>,
+}
+
+impl Drop for KeepalivePing {
+    fn drop(&mut self) {
+        self.shared
+            .keepalive_ping_in_flight
+            .store(false, Ordering::SeqCst);
+    }
+}
+
 /// Safety net for a `Connection` discarded without `close()`: the read
 /// task only exits on the shutdown signal, so without this it — and the
 /// socket it holds — would outlive the handle for as long as the server
@@ -322,12 +351,13 @@ impl Connection {
         let shared = Arc::new(Shared {
             write_state: Mutex::new(WriteState {
                 write_half: Some(write_half),
-                pending: VecDeque::new(),
                 next_tag: 0,
             }),
+            pending: std::sync::Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
             last_used_ms: AtomicU64::new(0),
             last_response_ms: AtomicU64::new(0),
+            keepalive_ping_in_flight: AtomicBool::new(false),
             epoch: Instant::now(),
             tracking_key: Some(tracking_key),
             tagged,
@@ -361,12 +391,13 @@ impl Connection {
             shared: Arc::new(Shared {
                 write_state: Mutex::new(WriteState {
                     write_half: None,
-                    pending: VecDeque::new(),
                     next_tag: 0,
                 }),
+                pending: std::sync::Mutex::new(VecDeque::new()),
                 closed: AtomicBool::new(true),
                 last_used_ms: AtomicU64::new(0),
                 last_response_ms: AtomicU64::new(0),
+                keepalive_ping_in_flight: AtomicBool::new(false),
                 epoch: Instant::now(),
                 tracking_key: None,
                 tagged: false,
@@ -393,6 +424,24 @@ impl Connection {
             .epoch
             .elapsed()
             .saturating_sub(Duration::from_millis(last))
+    }
+
+    /// Claims this connection's single keep-alive ping slot: `None` while
+    /// an earlier ping is still outstanding (a half-open node, whose ping
+    /// blocks until the request timeout) so the keep-alive loop doesn't
+    /// stack pings behind it. The returned guard releases the slot when it
+    /// is dropped, however the ping task ends.
+    pub(crate) fn begin_keepalive_ping(&self) -> Option<KeepalivePing> {
+        if self
+            .shared
+            .keepalive_ping_in_flight
+            .swap(true, Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(KeepalivePing {
+            shared: Arc::clone(&self.shared),
+        })
     }
 
     /// `namespace` empty means the default namespace — see `encode_get`
@@ -749,7 +798,11 @@ impl Connection {
             };
             let frame = build(tag);
 
-            state.pending.push_back(PendingSlot { tag, tx });
+            self.shared
+                .pending
+                .lock()
+                .unwrap()
+                .push_back(PendingSlot { tag, tx });
             let write_half = state.write_half.as_mut().expect("checked above");
 
             let mut guard = WriteGuard {
@@ -1139,13 +1192,11 @@ async fn read_loop(
         };
 
         let (was_empty, slot) = {
-            let mut state = shared.write_state.lock().await;
-            let was_empty = state.pending.is_empty();
-            let slot = if was_empty {
-                None
-            } else {
-                state.pending.pop_front()
-            };
+            // Not `write_state`: a request blocked mid-write holds that,
+            // and must not stall dispatching the responses already read.
+            let mut pending = shared.pending.lock().unwrap();
+            let was_empty = pending.is_empty();
+            let slot = if was_empty { None } else { pending.pop_front() };
             (was_empty, slot)
         };
 
@@ -1232,23 +1283,27 @@ async fn read_loop(
 /// with no parseable cause of its own) rather than having failed a read
 /// itself — there is no specific cause to attribute, so every request
 /// still falls back to the generic "connection closed".
+///
+/// The queue is rejected before `write_state` is taken: a request blocked
+/// mid-write holds that lock, and waiting for it first would leave every
+/// queued request unanswered until that write ended. A request that
+/// enqueues in the window between the first rejection and the lock (it
+/// was already past its closed check) is rejected by the second one.
 async fn drain_pending(shared: &Shared, first_error: Option<Error>) {
+    reject_pending(shared, first_error.as_ref());
     let mut state = shared.write_state.lock().await;
     state.write_half = None;
-    let pending = state.pending.drain(..);
-    match first_error {
-        Some(error) => {
-            for slot in pending {
-                let _ = slot.tx.send(Err(error.clone()));
-            }
-        }
-        None => {
-            for slot in pending {
-                let _ = slot.tx.send(Err(Error::ConnectionLost(
-                    "nanocached: connection closed".to_string(),
-                )));
-            }
-        }
+    reject_pending(shared, first_error.as_ref());
+}
+
+fn reject_pending(shared: &Shared, first_error: Option<&Error>) {
+    let pending: Vec<PendingSlot> = shared.pending.lock().unwrap().drain(..).collect();
+    for slot in pending {
+        let error = match first_error {
+            Some(error) => error.clone(),
+            None => Error::ConnectionLost("nanocached: connection closed".to_string()),
+        };
+        let _ = slot.tx.send(Err(error));
     }
 }
 
