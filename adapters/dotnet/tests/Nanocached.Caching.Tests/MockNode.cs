@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Net.Security;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 
 namespace Nanocached.Caching.Tests;
@@ -32,8 +34,13 @@ internal sealed class MockNode : IDisposable
     private int _setCount;
     private int _casCount;
 
-    internal MockNode()
+    // When set, every accepted connection is wrapped in an SslStream
+    // presenting this certificate before the wire protocol starts.
+    private readonly X509Certificate2? _serverCertificate;
+
+    internal MockNode(X509Certificate2? serverCertificate = null)
     {
+        _serverCertificate = serverCertificate;
         _listener = new TcpListener(IPAddress.Loopback, 0);
         _listener.Start();
         _acceptLoop = Task.Run(AcceptLoopAsync);
@@ -118,10 +125,17 @@ internal sealed class MockNode : IDisposable
     private async Task ServeAsync(TcpClient client)
     {
         using TcpClient owned = client;
-        NetworkStream stream = owned.GetStream();
+        Stream stream = owned.GetStream();
         bool tagged = false;
         try
         {
+            if (_serverCertificate is not null)
+            {
+                var ssl = new SslStream(stream, leaveInnerStreamOpen: false);
+                await ssl.AuthenticateAsServerAsync(_serverCertificate, clientCertificateRequired: false,
+                    checkCertificateRevocation: false).ConfigureAwait(false);
+                stream = ssl;
+            }
             while (true)
             {
                 string[] parts = (await ReadLineAsync(stream).ConfigureAwait(false)).Split(' ');
@@ -236,7 +250,7 @@ internal sealed class MockNode : IDisposable
         }
     }
 
-    private async Task GetAsync(NetworkStream stream, string ns, int keyLength, string tagSuffix)
+    private async Task GetAsync(Stream stream, string ns, int keyLength, string tagSuffix)
     {
         byte[] key = await ReadExactlyAsync(stream, keyLength).ConfigureAwait(false);
         Entry? entry = EntryFor(ns, key);
@@ -253,7 +267,7 @@ internal sealed class MockNode : IDisposable
     }
 
     private async Task SetAsync(
-        NetworkStream stream, string ns, string[] parts, int firstLengthIndex, bool tagged, string tagSuffix)
+        Stream stream, string ns, string[] parts, int firstLengthIndex, bool tagged, string tagSuffix)
     {
         int keyLength = int.Parse(parts[firstLengthIndex]);
         int valueLength = int.Parse(parts[firstLengthIndex + 1]);
@@ -268,7 +282,7 @@ internal sealed class MockNode : IDisposable
         await ReplyAsync(stream, "S" + tagSuffix + "\n").ConfigureAwait(false);
     }
 
-    private async Task DeleteAsync(NetworkStream stream, string ns, int keyLength, string tagSuffix)
+    private async Task DeleteAsync(Stream stream, string ns, int keyLength, string tagSuffix)
     {
         byte[] key = await ReadExactlyAsync(stream, keyLength).ConfigureAwait(false);
         bool existed = Store(ns).TryRemove(EncodeKey(key), out _);
@@ -277,13 +291,13 @@ internal sealed class MockNode : IDisposable
 
     private static string Ns(byte[] namespaceBytes) => Encoding.UTF8.GetString(namespaceBytes);
 
-    private static async Task ReplyAsync(NetworkStream stream, string line)
+    private static async Task ReplyAsync(Stream stream, string line)
     {
         await stream.WriteAsync(Encoding.ASCII.GetBytes(line)).ConfigureAwait(false);
         await stream.FlushAsync().ConfigureAwait(false);
     }
 
-    private static async Task<byte[]> ReadExactlyAsync(NetworkStream stream, int length)
+    private static async Task<byte[]> ReadExactlyAsync(Stream stream, int length)
     {
         byte[] buffer = new byte[length];
         int offset = 0;
@@ -296,7 +310,7 @@ internal sealed class MockNode : IDisposable
         return buffer;
     }
 
-    private static async Task<string> ReadLineAsync(NetworkStream stream)
+    private static async Task<string> ReadLineAsync(Stream stream)
     {
         var line = new StringBuilder();
         var one = new byte[1];

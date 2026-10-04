@@ -72,7 +72,14 @@ public static class ServiceCollectionExtensions
 
     private static NanocachedClient.Options BuildClientOptions(NanocachedCacheOptions options)
     {
-        var clientOptions = new NanocachedClient.Options { AuthSecret = options.Secret };
+        var clientOptions = new NanocachedClient.Options
+        {
+            AuthSecret = options.Secret,
+            Tls = options.Tls,
+            Ca = options.Ca,
+            Compress = options.Compress,
+            CompressionThreshold = options.CompressionThreshold,
+        };
         foreach (string address in options.Addresses)
         {
             clientOptions.Addresses.Add(ParseAddress(address));
