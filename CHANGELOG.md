@@ -132,6 +132,12 @@ framework adapters at one version, whether or not a component changed.
   when nodes were failing. They now run in the background, one at a time
   (as serialized with each other as before), and an eviction noticed while
   one is running is acted on as soon as it finishes.
+- `nanocached-node`: once the cache is at `--max-memory`, each write no longer
+  scans every namespace to find the one holding the oldest entry. A lazily
+  kept min-heap of each namespace's oldest entry replaces the scan, so the
+  cost per eviction no longer grows with the number of namespaces (with
+  200,000 namespaces, an evicting write went from about 7.6 ms to about
+  14 us). Which entry is evicted is unchanged.
 
 ### Security
 

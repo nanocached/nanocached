@@ -3,8 +3,9 @@ use bytes::Bytes;
 use lru::LruCache;
 use nanocached::infra::constant_time_eq;
 use rustc_hash::FxHashMap;
+use std::cmp::Reverse;
 use std::collections::hash_map::RandomState;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Caps how many entries a single `sweep` call removes. Scanning for
@@ -42,6 +43,10 @@ struct Entry {
 /// CPU-exhaustion DoS. This is the same reason std's HashMap defaults to
 /// SipHash.
 type Entries = LruCache<Bytes, Entry, RandomState>;
+
+/// Headroom before `Cache::tails` is rebuilt: it is rebuilt when it holds
+/// more than twice the live namespaces plus this many items.
+const TAILS_SLACK: usize = 64;
 
 /// Charged to `Cache::used_bytes` once per live *non-default* namespace,
 /// on top of the namespace name's own length: the slot, the index entry
@@ -161,6 +166,21 @@ pub struct Cache {
     /// namespace. Ids are sequential, not attacker-chosen, so a fast
     /// non-randomized hasher is safe here.
     slots: FxHashMap<u64, Namespace>,
+    /// Which namespace holds the globally least-recently-used entry, so
+    /// `evict_one` doesn't scan every namespace. A min-heap of
+    /// `(last_used of a namespace's LRU entry, slot id)`, kept lazily.
+    ///
+    /// The invariant is that every live namespace has an item whose key is
+    /// *no later than* its LRU entry's `last_used`. That is cheap to keep
+    /// because a namespace's LRU entry only ever moves later: it leaves
+    /// by being evicted, removed or promoted, and its successor was
+    /// touched no earlier than it, since every write and read stamps the
+    /// monotonic `clock` and promotes. So only a *new* namespace needs an
+    /// item (key 0, "no later than anything"), and `evict_one` corrects a
+    /// stale item when it surfaces: it re-pushes the real key instead of
+    /// evicting. Items of dropped namespaces linger until they surface or
+    /// until `ensure_namespace` rebuilds the heap (see `TAILS_SLACK`).
+    tails: BinaryHeap<Reverse<(u64, u64)>>,
     next_slot_id: u64,
     /// The slot `find_namespace` resolved last. A lookup first checks
     /// whether the incoming name *is* that slot's own allocation (same
@@ -345,6 +365,7 @@ impl Cache {
         Self {
             namespaces: HashMap::with_hasher(RandomState::new()),
             slots: FxHashMap::default(),
+            tails: BinaryHeap::new(),
             next_slot_id: 0,
             last_slot: std::cell::Cell::new(0),
             marked: 0,
@@ -628,7 +649,32 @@ impl Cache {
         self.namespaces.insert(name.clone(), id);
         self.slots.insert(id, Namespace::new(name, budget));
         self.last_slot.set(id);
+        // Items of dropped namespaces are only discarded when they
+        // surface in `evict_one`, which never happens without memory
+        // pressure: rebuild when they outnumber the live ones, so churning
+        // namespaces cannot grow the heap without bound.
+        if self.tails.len() > 2 * self.slots.len() + TAILS_SLACK {
+            self.rebuild_tails();
+        } else {
+            self.tails.push(Reverse((0, id)));
+        }
         id
+    }
+
+    /// Replaces the lazily-kept `tails` heap with exactly one item per
+    /// live namespace, keyed by its real LRU entry (0 if it has none yet).
+    fn rebuild_tails(&mut self) {
+        self.tails = self
+            .slots
+            .iter()
+            .map(|(id, namespace)| {
+                let key = namespace
+                    .entries
+                    .peek_lru()
+                    .map_or(0, |(_, entry)| entry.last_used);
+                Reverse((key, *id))
+            })
+            .collect();
     }
 
     /// Removes the (empty) sub-map in slot `id` and releases its name
@@ -810,8 +856,57 @@ impl Cache {
     /// costs its name plus `NAMESPACE_OVERHEAD_BYTES` against that bound,
     /// so the count is itself bounded by `--max-memory`.
     fn evict_one(&mut self) {
-        let victim = self
-            .slots
+        // Pop until an item is current. See `tails` for why the first
+        // current one is the globally oldest entry.
+        let mut empty_namespaces = Vec::new();
+        let (key, victim) = loop {
+            let Reverse((key, id)) = self
+                .tails
+                .pop()
+                .expect("entry_count > 1 guarantees an entry to evict");
+            let Some(namespace) = self.slots.get(&id) else {
+                continue; // dropped since this item was pushed
+            };
+            match namespace.entries.peek_lru() {
+                Some((_, entry)) if entry.last_used == key => break (key, id),
+                Some((_, entry)) => self.tails.push(Reverse((entry.last_used, id))),
+                // Live but still empty (just created, about to be
+                // written): it keeps its "no later than anything" item.
+                None => empty_namespaces.push(id),
+            }
+        };
+        for id in empty_namespaces {
+            self.tails.push(Reverse((0, id)));
+        }
+
+        // The heap must pick exactly what scanning every namespace would
+        // (ticks are unique, so there are no ties to break differently).
+        // Skipped for very large states so a test with many namespaces
+        // doesn't pay the scan this heap exists to avoid.
+        #[cfg(test)]
+        if self.slots.len() <= 4096 {
+            assert_eq!(
+                Some(victim),
+                self.scan_victim(),
+                "tails heap picked a different victim"
+            );
+        }
+
+        self.evict_one_from(victim);
+
+        // The victim's next LRU entry is no earlier than the one just
+        // evicted, so the old key still satisfies the invariant.
+        if self.slots.contains_key(&victim) {
+            self.tails.push(Reverse((key, victim)));
+        }
+    }
+
+    /// What `evict_one` used to compute by scanning every namespace: the
+    /// one whose LRU entry is the globally oldest. Test-only oracle for the
+    /// `tails` heap.
+    #[cfg(test)]
+    fn scan_victim(&self) -> Option<u64> {
+        self.slots
             .iter()
             .filter_map(|(id, namespace)| {
                 namespace
@@ -821,9 +916,6 @@ impl Cache {
             })
             .min_by_key(|(last_used, _)| *last_used)
             .map(|(_, id)| id)
-            .expect("entry_count > 1 guarantees an entry to evict");
-
-        self.evict_one_from(victim);
     }
 
     /// Removes namespace `id`'s least-recently-used entry — the shared
@@ -1180,6 +1272,7 @@ impl Cache {
         let removed = self.entry_count;
         self.namespaces.clear();
         self.slots.clear();
+        self.tails.clear();
         self.entry_count = 0;
         self.used_bytes = 0;
         self.marked = 0;
@@ -1284,6 +1377,78 @@ mod tests {
     }
 
     const UNBOUNDED: usize = usize::MAX;
+
+    // The global victim comes from the lazily-kept `tails` heap, not a scan
+    // of every namespace. `evict_one` itself asserts (under test) that the
+    // heap picked what a scan would; this drives it through a mixed
+    // workload so that assertion sees promotions, overwrites, deletes,
+    // namespaces emptying and being recreated, and a namespace budget.
+    #[test]
+    fn eviction_picks_the_globally_oldest_entry_under_a_mixed_workload() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+
+        let mut cache = Cache::with_budgets(
+            40 * (ENTRY_OVERHEAD_BYTES + 16),
+            vec![(
+                Bytes::from_static(b"budgeted"),
+                6 * (ENTRY_OVERHEAD_BYTES + 16),
+            )],
+        );
+        for _ in 0..20_000 {
+            let namespace = format!("ns{}", next(25));
+            let namespace: &[u8] = if next(10) == 0 {
+                b"budgeted"
+            } else {
+                namespace.as_bytes()
+            };
+            let name = format!("k{}", next(12));
+            let target = namespaced(namespace, name.as_bytes());
+            match next(10) {
+                0..=4 => cache.set(target, Bytes::from(vec![b'v'; 4 + next(8) as usize])),
+                5..=7 => {
+                    cache.get(&target);
+                }
+                8 => {
+                    cache.delete(&target);
+                }
+                _ => {
+                    cache.clear(namespace);
+                }
+            }
+        }
+        assert!(
+            cache.evictions > 0,
+            "the workload never hit memory pressure"
+        );
+    }
+
+    // Items of dropped namespaces are only discarded when they surface in
+    // `evict_one`, so without memory pressure (no evictions at all) the
+    // heap must still be rebuilt rather than grow with every namespace ever
+    // created.
+    #[test]
+    fn the_tails_heap_stays_bounded_when_namespaces_churn_without_evictions() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let (mut peak, mut live) = (0, 0);
+        for round in 0..5_000 {
+            let target = namespaced(format!("tmp-{round}").as_bytes(), b"k");
+            cache.set(target.clone(), Bytes::from_static(b"v"));
+            live = live.max(cache.slots.len());
+            peak = peak.max(cache.tails.len());
+            assert!(cache.delete(&target));
+        }
+        assert_eq!(cache.evictions, 0);
+        assert!(
+            peak <= 2 * live + TAILS_SLACK + 1,
+            "tails grew to {peak} with at most {live} live namespaces"
+        );
+    }
 
     #[test]
     fn gets_a_previously_set_value() {
