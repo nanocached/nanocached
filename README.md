@@ -548,8 +548,9 @@ loud `WARN` if that disagrees with its own configured value.
 - Maximum concurrent connections: 1,024 by default, configurable with
   `--max-connections <n>`, and at most 256 from any one source IP by
   default, configurable with `--max-connections-per-ip <n>` (never above
-  the total; an unset per-IP cap shrinks to match a lowered total) —
-  anything that collapses source addresses (Docker Desktop's port
+  the total; an unset per-IP cap shrinks to match a lowered total; an
+  IPv6 source counts per /64 prefix, so one allocation can't multiply its
+  share) — anything that collapses source addresses (Docker Desktop's port
   publishing, a NAT gateway, Kubernetes pods behind one egress, a load
   balancer without proxy protocol) makes the per-IP cap the effective
   limit for everything behind it, so raise it in those deployments. A
@@ -594,7 +595,8 @@ loud `WARN` if that disagrees with its own configured value.
 - Maximum request size: 4 KiB
 - Maximum concurrent connections: 1,024, and at most 256 from any one
   source IP (fixed — the node's `--max-connections*` flags don't exist
-  here; discovery serves only brief roster fetches and heartbeats)
+  here; discovery serves only brief roster fetches and heartbeats; an
+  IPv6 source counts per /64 prefix, as on the node)
 - Idle connection timeout: 60 seconds
 
 ## License
