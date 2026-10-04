@@ -47,12 +47,33 @@ framework adapters at one version, whether or not a component changed.
 - `nanocached-proxy` and `nanocached-discovery`: a panic while serving a
   metrics scrape is now logged (`WARN metrics connection task failed`)
   instead of going unobserved, like the node's metrics endpoint.
+- `nanocached-proxy`: routing the keys of a large `m`/`o` frame no longer
+  scores, sorts and copies the whole roster once per key (O(nodes log nodes)
+  per key, hundreds of thousands of times for a ~1 MiB frame, on a tokio
+  worker). Each key now keeps only its top owners in one pass, and keys are
+  grouped by node without cloning an address per key. Key placement is
+  unchanged.
+- `nanocached-proxy`: a burst of `W` replies (a node mid-handoff answers `W`
+  for every key it no longer owns) no longer drives one roster fetch and
+  `Y` announce to every discovery replica per reply, back to back. Forced
+  refreshes are now spaced at least 1 s apart and the nudges in between are
+  coalesced into one fetch, and a fetched roster identical to the current
+  one is no longer republished to the proxy's connections.
 
 ### Security
 
 - Updated `rustls` to 0.23.45 in the node, proxy and discovery binaries
   (RUSTSEC-2026-0285: TLS 1.3 handshake messages were accepted across
   encryption-level boundaries).
+- `nanocached-proxy`: with an auth secret configured, a connection that has
+  not yet authenticated is now held to the same bounds discovery applies. It
+  may buffer at most 4096 bytes (only an `A` frame is acceptable before the
+  secret is checked; a larger declared frame is refused from its header) and
+  must authenticate within a fixed 60 s of being accepted. Before, it could
+  declare an `A` of up to 1 MiB and trickle it in a byte per 59 s, holding
+  1-2 MiB indefinitely per connection (about 1 GiB across the default 1024
+  connections) because the 60 s idle timeout restarts on every read. A
+  proxy with no secret is unchanged.
 
 ## [0.4.4] - 2026-09-09
 

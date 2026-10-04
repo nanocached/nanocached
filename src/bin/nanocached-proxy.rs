@@ -199,6 +199,32 @@ const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 256;
 /// themselves alive instead (`BACKEND_KEEPALIVE_INTERVAL`).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Pre-auth bound on buffered bytes (only when an auth secret is
+/// configured): until a connection authenticates, the only frame it may
+/// send is `A`, so it may never make the proxy buffer more than this —
+/// header and secret together. Without it the read loop buffered up to
+/// `MAX_REQUEST_SIZE` (1 MiB) per unauthenticated connection before any
+/// secret check, ~1 GiB across `--max-connections`. Mirrors discovery's
+/// own 4096-byte request cap, which already makes this the fleet-wide
+/// ceiling on a secret (all three binaries share one
+/// `NANOCACHED_AUTH_SECRET`).
+const PREAUTH_MAX_BYTES: usize = 4096;
+
+/// Pre-auth bound on time (only when an auth secret is configured): the
+/// fixed deadline, measured from when the connection was accepted, by
+/// which it must have completed its `A`. Not reset by reads, unlike
+/// `IDLE_TIMEOUT` — a peer that trickles one byte per 59 s resets that
+/// forever without finishing a frame. A well-behaved client sends `A` in
+/// its first write, so this only ever fires on a connection already
+/// behaving like an attack; equal to `IDLE_TIMEOUT` like discovery's
+/// `UNIDENTIFIED_CONNECTION_TIMEOUT`.
+#[cfg(not(test))]
+const AUTH_DEADLINE: Duration = IDLE_TIMEOUT;
+/// Shrunk under test like `CLIENT_WRITE_TIMEOUT`, so a test that
+/// trickles bytes pre-auth doesn't pay out 60 real seconds.
+#[cfg(test)]
+const AUTH_DEADLINE: Duration = Duration::from_millis(600);
+
 /// Issue #514: how long a shared backend connection may sit with nothing
 /// written before `run_backend` sends a keep-alive probe on it. SDK
 /// keep-alives only reach a node while a client is connected to the
@@ -269,6 +295,22 @@ const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_millis(600);
 /// force an immediate refresh regardless, so this only bounds how stale
 /// the view can get while nothing is being rerouted.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The least time between two roster fetches when the second is
+/// `force_refresh`-triggered. Every `W` path nudges the refresher, and
+/// each fetch is a full `L` round plus a `Y` announce to every discovery
+/// replica — so without a floor, a burst of `W`s (a node mid-handoff
+/// answers `W` for every key it no longer owns) drove one fetch-and-
+/// announce per nudge, back to back, against discovery. Nudges inside the
+/// window are coalesced into one fetch at its end; short enough that the
+/// first refresh after a genuine ring change is still prompt (a retry
+/// waits `UPSTREAM_IO_TIMEOUT`).
+#[cfg(not(test))]
+const MIN_FORCED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// Shrunk under test like `UPSTREAM_IO_TIMEOUT`, so the many tests that
+/// force a refresh don't each pay a second.
+#[cfg(test)]
+const MIN_FORCED_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Issue #110: how many requests may sit written-but-unanswered on one
 /// shared backend connection. The writer stalls (backpressuring every
@@ -389,6 +431,10 @@ fn key_hash(namespace: &[u8], key: &[u8]) -> u64 {
 struct RingView {
     nodes: Vec<(String, String)>,
     node_hashes: Vec<u64>,
+    /// Per node, the index of the first node with the same address — the
+    /// identity batch grouping uses (`AddrGroups`), so two names sharing
+    /// an address still land in one backend sub-frame.
+    addr_slot: Vec<usize>,
     replication: usize,
 }
 
@@ -398,35 +444,147 @@ impl RingView {
             .iter()
             .map(|(name, _)| fnv1a(name.as_bytes()))
             .collect();
+        let mut first_with_addr: HashMap<&str, usize> = HashMap::new();
+        let addr_slot = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, (_, addr))| *first_with_addr.entry(addr.as_str()).or_insert(index))
+            .collect();
         Self {
             nodes,
             node_hashes,
+            addr_slot,
             replication,
         }
     }
 
-    /// The key's owner *addresses*, primary first — top-R by the same
-    /// total order every implementation uses (descending score, ties to
-    /// the lexicographically smaller name).
-    fn owners(&self, namespace: &[u8], key: &[u8]) -> Vec<String> {
+    /// Whether `a` outranks `b` in the one total order every
+    /// implementation uses: descending score, ties to the
+    /// lexicographically smaller name. Entries are `(score, node index)`.
+    fn outranks(&self, a: (u64, usize), b: (u64, usize)) -> bool {
+        a.0 > b.0 || (a.0 == b.0 && self.nodes[a.1].0 < self.nodes[b.1].0)
+    }
+
+    /// Fills `top` with the key's top-`limit` owners as `(score, node
+    /// index)`, best first — `limit` capped at the replication factor and
+    /// the roster size, so `0` replication or an empty roster leave it
+    /// empty. Each member's score is computed once, and only the `limit`
+    /// best are ever kept (no per-key sort of the whole roster, no
+    /// per-key allocation once `top` has grown): a large `m`/`o` frame
+    /// calls this once per key, on a tokio worker, so the old sort-everything
+    /// `owners` was O(N log N) per key — hundreds of thousands of times.
+    /// `top` is caller-owned scratch so a loop reuses one buffer.
+    fn rank_owners(&self, namespace: &[u8], key: &[u8], limit: usize, top: &mut Vec<(u64, usize)>) {
+        top.clear();
+        let limit = limit.min(self.replication).min(self.nodes.len());
+        if limit == 0 {
+            return;
+        }
         let key_hash = key_hash(namespace, key);
-        let mut scored: Vec<(u64, &(String, String))> = self
+        let scores = self
             .node_hashes
             .iter()
-            .zip(&self.nodes)
-            .map(|(node_hash, node)| (fmix64(node_hash ^ key_hash), node))
-            .collect();
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0)));
-        scored.truncate(self.replication.min(scored.len()));
-        scored
-            .into_iter()
-            .map(|(_, (_, addr))| addr.clone())
+            .enumerate()
+            .map(|(index, node_hash)| (fmix64(node_hash ^ key_hash), index));
+
+        // A large replication factor makes the insertion below O(N * R);
+        // past a handful, sorting everything is the cheaper shape (and
+        // it is the degenerate configuration anyway).
+        if limit > 8 {
+            top.extend(scores);
+            top.sort_unstable_by(|a, b| {
+                if self.outranks(*a, *b) {
+                    std::cmp::Ordering::Less
+                } else if self.outranks(*b, *a) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            });
+            top.truncate(limit);
+            return;
+        }
+
+        for candidate in scores {
+            if top.len() == limit && !self.outranks(candidate, top[limit - 1]) {
+                continue;
+            }
+            let position = top.partition_point(|&held| self.outranks(held, candidate));
+            if top.len() == limit {
+                top.pop();
+            }
+            top.insert(position, candidate);
+        }
+    }
+
+    /// The key's owner *addresses*, primary first — top-R by the same
+    /// total order every implementation uses (see `outranks`).
+    fn owners(&self, namespace: &[u8], key: &[u8]) -> Vec<String> {
+        let mut top = Vec::new();
+        self.rank_owners(namespace, key, self.replication, &mut top);
+        top.into_iter()
+            .map(|(_, index)| self.nodes[index].1.clone())
             .collect()
+    }
+
+    /// Whether `other` describes the same cluster: the same members in
+    /// the same order and the same replication factor. Everything else
+    /// in a `RingView` is derived from these.
+    fn same_roster(&self, other: &RingView) -> bool {
+        self.replication == other.replication && self.nodes == other.nodes
     }
 
     /// Every member address — `c`/`F`'s fan-out set.
     fn all_addresses(&self) -> Vec<String> {
         self.nodes.iter().map(|(_, addr)| addr.clone()).collect()
+    }
+}
+
+/// Groups a batch's items by the backend address that must receive them,
+/// in first-appearance order, without cloning an address per item or
+/// string-comparing against every earlier group: items are filed by node
+/// index and the address `String` is cloned once per *group*
+/// (`into_named`). A large `m`/`o` frame files hundreds of thousands of
+/// keys through this on a tokio worker.
+struct AddrGroups<'r, T> {
+    ring: &'r RingView,
+    /// By `RingView::addr_slot`: where that address's group lives in
+    /// `groups`, or `usize::MAX`.
+    slot_of: Vec<usize>,
+    /// `(addr_slot index, items)` per group.
+    groups: Vec<(usize, T)>,
+}
+
+impl<'r, T: Default> AddrGroups<'r, T> {
+    fn new(ring: &'r RingView) -> Self {
+        Self {
+            ring,
+            slot_of: vec![usize::MAX; ring.nodes.len()],
+            groups: Vec::new(),
+        }
+    }
+
+    /// The group for `node`'s address, created on first use.
+    fn group_for(&mut self, node: usize) -> &mut T {
+        let canonical = self.ring.addr_slot[node];
+        let slot = &mut self.slot_of[canonical];
+        if *slot == usize::MAX {
+            *slot = self.groups.len();
+            self.groups.push((canonical, T::default()));
+        }
+        &mut self.groups[*slot].1
+    }
+
+    fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// The groups with their addresses, in first-appearance order.
+    fn into_named(self) -> Vec<(String, T)> {
+        self.groups
+            .into_iter()
+            .map(|(node, items)| (self.ring.nodes[node].1.clone(), items))
+            .collect()
     }
 }
 
@@ -614,6 +772,10 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 type ServerStream = infra::MaybeTls<TcpStream, tokio_rustls::server::TlsStream<TcpStream>>;
 type UpstreamStream = infra::MaybeTls<TcpStream, tokio_rustls::client::TlsStream<TcpStream>>;
 
+/// What `force_refresh` hands the refresher: completed (by sending `()`)
+/// once a roster fetch that began after the nudge succeeded.
+type RefreshWaiter = oneshot::Sender<()>;
+
 /// Everything the per-connection tasks need, shared once.
 struct ProxyContext {
     secret: Option<Bytes>,
@@ -622,9 +784,11 @@ struct ProxyContext {
     /// fetch (connections arriving before that answer `B` — the same
     /// "not ready yet, retry" clients already handle from discovery).
     ring: watch::Receiver<Option<Arc<RingView>>>,
-    /// Nudges the refresher for an immediate re-fetch (a `W` was seen or
-    /// a clear fan-out failed) instead of waiting out the interval.
-    refresh_now: mpsc::Sender<()>,
+    /// Nudges the refresher for a prompt re-fetch (a `W` was seen or a
+    /// clear fan-out failed) instead of waiting out the interval. Carries
+    /// a `RefreshWaiter` that the refresher completes once a fetch that
+    /// started after the nudge has landed — see `force_refresh`.
+    refresh_now: mpsc::Sender<RefreshWaiter>,
     /// Issue #110: the proxy-wide shared backend connections — one
     /// tagged, pipelined connection per node, multiplexing every client
     /// connection's traffic. This is what collapses the node-side
@@ -900,7 +1064,7 @@ struct RefresherConfig {
 async fn run_refresher(
     config: RefresherConfig,
     ring_tx: watch::Sender<Option<Arc<RingView>>>,
-    mut refresh_rx: mpsc::Receiver<()>,
+    mut refresh_rx: mpsc::Receiver<RefreshWaiter>,
     backends: Arc<SharedBackends>,
 ) {
     let RefresherConfig {
@@ -910,6 +1074,12 @@ async fn run_refresher(
         announce,
         mut drain,
     } = config;
+
+    // `force_refresh` callers waiting on the next successful fetch. Kept
+    // across a failed fetch (the old wait was for "the view changes", which
+    // a failed fetch never did, so a caller still got the next periodic
+    // refresh's chance), and dropped when the caller gives up.
+    let mut waiters: Vec<RefreshWaiter> = Vec::new();
 
     loop {
         if *drain.borrow() {
@@ -923,12 +1093,26 @@ async fn run_refresher(
                 // an address that dropped off the ring stops accumulating
                 // map entries from this point on.
                 backends.prune(&ring);
-                let _ = ring_tx.send(Some(ring));
+                // An identical roster is not republished: `send` would
+                // wake every `ring` subscriber for nothing.
+                ring_tx.send_if_modified(|current| {
+                    if current.as_ref().is_some_and(|held| held.same_roster(&ring)) {
+                        false
+                    } else {
+                        *current = Some(ring);
+                        true
+                    }
+                });
+                for waiter in waiters.drain(..) {
+                    let _ = waiter.send(());
+                }
             }
             Err(error) => {
                 eprintln!("WARN roster refresh failed: {error}");
+                waiters.retain(|waiter| !waiter.is_closed());
             }
         }
+        let fetched_at = tokio::time::Instant::now();
 
         // Issue #122: (re-)announce this proxy on the same cadence, to
         // every replica — each keeps its own proxy map (they don't
@@ -962,15 +1146,27 @@ async fn run_refresher(
             join_all(futs).await;
         }
 
-        tokio::select! {
-            _ = sleep(REFRESH_INTERVAL) => {}
-            () = drained(&mut drain) => {}
-            received = refresh_rx.recv() => {
-                if received.is_none() {
-                    return;
+        let nudged = tokio::select! {
+            _ = sleep(REFRESH_INTERVAL) => false,
+            () = drained(&mut drain) => false,
+            received = refresh_rx.recv() => match received {
+                None => return,
+                Some(waiter) => {
+                    waiters.push(waiter);
+                    true
                 }
-                // Coalesce a burst of W-triggered nudges into one fetch.
-                while refresh_rx.try_recv().is_ok() {}
+            },
+        };
+        if nudged {
+            // Coalesce a burst of W-triggered nudges into one fetch, and
+            // hold it to `MIN_FORCED_REFRESH_INTERVAL` after the last one
+            // — a nudge arriving later than that is served at once.
+            tokio::select! {
+                () = tokio::time::sleep_until(fetched_at + MIN_FORCED_REFRESH_INTERVAL) => {}
+                () = drained(&mut drain) => {}
+            }
+            while let Ok(waiter) = refresh_rx.try_recv() {
+                waiters.push(waiter);
             }
         }
     }
@@ -1300,13 +1496,29 @@ fn lf_scan_bytes() -> usize {
 /// `Incomplete`), mirroring the node's own grammar for the client-facing
 /// commands. `M`/`X` and anything unknown error — the proxy is not a
 /// cluster member (see the module docs). `scan` carries the header `\n`
-/// scan's progress across calls — see `RequestScanState`.
+/// scan's progress across calls — see `RequestScanState`. Production code
+/// goes through `parse_request_limited` directly; this is the
+/// full-size-bound form the unit tests use.
+#[cfg(test)]
 fn parse_request(
     input: &mut BytesMut,
     tagged: bool,
     scan: &mut RequestScanState,
 ) -> io::Result<ParseOutcome> {
-    let result = parse_request_body(input, tagged, scan);
+    parse_request_limited(input, tagged, scan, MAX_REQUEST_SIZE)
+}
+
+/// `parse_request` with the frame bound lowered to `max_frame` (header
+/// plus body) — the pre-auth form (`PREAUTH_MAX_BYTES`). A frame whose
+/// header already declares more than the bound is rejected as soon as the
+/// header is parsed, before its body is buffered.
+fn parse_request_limited(
+    input: &mut BytesMut,
+    tagged: bool,
+    scan: &mut RequestScanState,
+    max_frame: usize,
+) -> io::Result<ParseOutcome> {
+    let result = parse_request_body(input, tagged, scan, max_frame);
     if !matches!(result, Ok(ParseOutcome::Incomplete)) {
         *scan = RequestScanState::default();
     }
@@ -1317,9 +1529,10 @@ fn parse_request_body(
     input: &mut BytesMut,
     tagged: bool,
     scan: &mut RequestScanState,
+    max_frame: usize,
 ) -> io::Result<ParseOutcome> {
     let Some(header_end) = find_header_end(input, scan) else {
-        if input.len() > MAX_REQUEST_SIZE {
+        if input.len() > max_frame {
             return Err(invalid("header exceeds the request-size limit"));
         }
         return Ok(ParseOutcome::Incomplete);
@@ -1363,7 +1576,7 @@ fn parse_request_body(
                 .checked_add(1)
                 .and_then(|start| start.checked_add(body_length))
                 .ok_or_else(|| invalid("frame length overflow"))?;
-            if frame_end > MAX_REQUEST_SIZE {
+            if frame_end > max_frame {
                 return Err(invalid("request exceeds the request-size limit"));
             }
             if input.len() < frame_end {
@@ -3059,14 +3272,21 @@ fn current_ring(context: &ProxyContext) -> Option<Arc<RingView>> {
     context.ring.borrow().clone()
 }
 
-/// Nudges the refresher and waits for the view to change (or a short
+/// Nudges the refresher and waits for a fresh fetch to land (or a short
 /// deadline) — a `W` means the current view is stale, so retrying on the
-/// same view would just get the same `W`.
+/// same view would just get the same `W`. The refresher spaces forced
+/// fetches by `MIN_FORCED_REFRESH_INTERVAL` and coalesces the nudges in
+/// between, and it does not republish a roster identical to the current
+/// one — so this waits on the fetch completing, not on the ring watch
+/// changing, which would never fire for an unchanged roster.
 async fn force_refresh(context: &ProxyContext) {
-    let mut ring = context.ring.clone();
-    ring.mark_unchanged();
-    let _ = context.refresh_now.send(()).await;
-    let _ = timeout(UPSTREAM_IO_TIMEOUT, ring.changed()).await;
+    let (waiter, done) = oneshot::channel();
+    let _ = timeout(UPSTREAM_IO_TIMEOUT, async {
+        if context.refresh_now.send(waiter).await.is_ok() {
+            let _ = done.await;
+        }
+    })
+    .await;
 }
 
 /// What a driver hands back for the writer to send: the full client-form
@@ -3411,22 +3631,20 @@ async fn dispatch_request(
         // like `retry_get_on` does for single-key `Get`, instead of
         // giving up after the fresh primary alone.
         Request::MultiGet { namespace, keys } => {
-            let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
+            let mut groups: AddrGroups<(Vec<usize>, Vec<Bytes>)> = AddrGroups::new(&ring);
             let mut missing = Vec::new();
+            let mut top = Vec::new();
 
             for (position, key) in keys.iter().enumerate() {
-                let mut owners = ring.owners(&namespace, key).into_iter();
-                let Some(primary) = owners.next() else {
+                ring.rank_owners(&namespace, key, 1, &mut top);
+                let Some(&(_, primary)) = top.first() else {
                     missing.push(position);
                     continue;
                 };
 
-                if let Some(group) = groups.iter_mut().find(|(owner, ..)| *owner == primary) {
-                    group.1.push(position);
-                    group.2.push(key.clone());
-                } else {
-                    groups.push((primary, vec![position], vec![key.clone()]));
-                }
+                let (positions, group_keys) = groups.group_for(primary);
+                positions.push(position);
+                group_keys.push(key.clone());
             }
 
             if groups.is_empty() {
@@ -3434,7 +3652,8 @@ async fn dispatch_request(
                 return result_rx;
             }
 
-            let requests = groups.iter().map(|(owner, _, group_keys)| {
+            let groups = groups.into_named();
+            let requests = groups.iter().map(|(owner, (_, group_keys))| {
                 (owner.as_str(), frame_multi_get(&namespace, group_keys))
             });
             let pending = context
@@ -3443,7 +3662,7 @@ async fn dispatch_request(
                 .await;
             let positions: Vec<Vec<usize>> = groups
                 .into_iter()
-                .map(|(_, positions, _)| positions)
+                .map(|(_, (positions, _))| positions)
                 .collect();
 
             tokio::spawn(async move {
@@ -3469,22 +3688,18 @@ async fn dispatch_request(
             values,
             ttl,
         } => {
-            let mut groups: Vec<(String, Vec<(usize, bool)>)> = Vec::new();
+            let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(&ring);
             let mut missing = Vec::new();
+            let mut top = Vec::new();
 
             for (position, key) in keys.iter().enumerate() {
-                let owners = ring.owners(&namespace, key);
-                if owners.is_empty() {
+                ring.rank_owners(&namespace, key, ring.replication, &mut top);
+                if top.is_empty() {
                     missing.push(position);
                     continue;
                 }
-                for (rank, owner) in owners.iter().enumerate() {
-                    let leg = (position, rank == 0);
-                    if let Some(group) = groups.iter_mut().find(|(addr, _)| addr == owner) {
-                        group.1.push(leg);
-                    } else {
-                        groups.push((owner.clone(), vec![leg]));
-                    }
+                for (rank, &(_, owner)) in top.iter().enumerate() {
+                    groups.group_for(owner).push((position, rank == 0));
                 }
             }
 
@@ -3493,6 +3708,7 @@ async fn dispatch_request(
                 return result_rx;
             }
 
+            let groups = groups.into_named();
             let requests = groups.iter().map(|(owner, legs)| {
                 let group_keys: Vec<Bytes> = legs
                     .iter()
@@ -3721,55 +3937,53 @@ async fn retry_multi_get(
         return;
     };
 
-    let mut owners_by_position: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut owners_by_position: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut unresolved: Vec<usize> = Vec::new();
+    let mut top = Vec::new();
     for &position in retry_positions {
         let key = &keys[position];
-        let owners = ring.owners(namespace, key);
-        if owners.is_empty() {
+        ring.rank_owners(namespace, key, ring.replication, &mut top);
+        if top.is_empty() {
             entries[position] = Some(ProxyMultiEntry::WrongNode);
             continue;
         }
-        owners_by_position.insert(position, owners);
+        owners_by_position.insert(position, top.iter().map(|&(_, node)| node).collect());
         unresolved.push(position);
     }
 
     let mut rank = 0;
     while !unresolved.is_empty() {
-        let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
+        let mut groups: AddrGroups<(Vec<usize>, Vec<Bytes>)> = AddrGroups::new(&ring);
         let mut still_unresolved = Vec::new();
 
         for position in unresolved {
             let owner = match owners_by_position[&position].get(rank) {
-                Some(owner) => owner.clone(),
+                Some(&owner) => owner,
                 None => {
                     // Every owner for this key has now been tried once.
                     entries[position] = Some(ProxyMultiEntry::WrongNode);
                     continue;
                 }
             };
-            let key = keys[position].clone();
-            if let Some(group) = groups.iter_mut().find(|(addr, ..)| *addr == owner) {
-                group.1.push(position);
-                group.2.push(key);
-            } else {
-                groups.push((owner, vec![position], vec![key]));
-            }
+            let (positions, group_keys) = groups.group_for(owner);
+            positions.push(position);
+            group_keys.push(keys[position].clone());
         }
 
         if groups.is_empty() {
             break;
         }
 
-        let requests = groups
-            .iter()
-            .map(|(owner, _, group_keys)| (owner.as_str(), frame_multi_get(namespace, group_keys)));
+        let groups = groups.into_named();
+        let requests = groups.iter().map(|(owner, (_, group_keys))| {
+            (owner.as_str(), frame_multi_get(namespace, group_keys))
+        });
         let replies = context
             .backends
             .call_each(context, requests, Expect::Multi)
             .await;
 
-        for ((_, group_positions, _), reply) in groups.into_iter().zip(replies) {
+        for ((_, (group_positions, _)), reply) in groups.into_iter().zip(replies) {
             match reply {
                 Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
                     for (position, entry) in group_positions.into_iter().zip(results) {
@@ -3907,23 +4121,20 @@ async fn retry_multi_set(
         return;
     };
 
-    let mut groups: Vec<(String, Vec<(usize, bool)>)> = Vec::new();
+    let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(&ring);
+    let mut top = Vec::new();
     for &position in retry_positions {
         let key = &keys[position];
-        let owners = ring.owners(namespace, key);
-        if owners.is_empty() {
+        ring.rank_owners(namespace, key, ring.replication, &mut top);
+        if top.is_empty() {
             entries[position] = Some(ProxyAckEntry::WrongNode);
             continue;
         }
-        for (rank, owner) in owners.iter().enumerate() {
-            let leg = (position, rank == 0);
-            if let Some(group) = groups.iter_mut().find(|(addr, _)| addr == owner) {
-                group.1.push(leg);
-            } else {
-                groups.push((owner.clone(), vec![leg]));
-            }
+        for (rank, &(_, owner)) in top.iter().enumerate() {
+            groups.group_for(owner).push((position, rank == 0));
         }
     }
+    let groups = groups.into_named();
 
     // Issue #177: same concurrent fan-out as `retry_multi_get` above.
     let requests = groups.iter().map(|(owner, legs)| {
@@ -4519,11 +4730,23 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
     let mut retry_capable = false;
     let mut drain = context.drain.clone();
     let mut scan = RequestScanState::default();
+    // The fixed pre-auth deadline (`AUTH_DEADLINE`): never moved, so no
+    // amount of slow trickling extends it. Irrelevant in no-secret mode,
+    // where `authenticated` starts true and is never consulted.
+    let auth_deadline = tokio::time::Instant::now() + AUTH_DEADLINE;
 
     let result: io::Result<()> = 'connection: loop {
         // Parse everything already buffered before reading more.
         loop {
-            match parse_request(&mut buf, tagged, &mut scan) {
+            // Until the secret is checked the only acceptable frame is a
+            // small `A` (`PREAUTH_MAX_BYTES`); anything bigger is a parse
+            // error here, before its body is ever buffered.
+            let max_frame = if authenticated {
+                MAX_REQUEST_SIZE
+            } else {
+                PREAUTH_MAX_BYTES
+            };
+            match parse_request_limited(&mut buf, tagged, &mut scan, max_frame) {
                 Ok(ParseOutcome::Incomplete) => break,
                 Ok(ParseOutcome::Auth {
                     secret,
@@ -4596,8 +4819,13 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
         }
 
         let mut chunk = [0u8; 4096];
+        let read_deadline = if authenticated {
+            tokio::time::Instant::now() + IDLE_TIMEOUT
+        } else {
+            auth_deadline
+        };
         let read = tokio::select! {
-            read = timeout(IDLE_TIMEOUT, read_half.read(&mut chunk)) => read,
+            read = tokio::time::timeout_at(read_deadline, read_half.read(&mut chunk)) => read,
             () = drained(&mut drain) => break 'connection Ok(()),
         };
         match read {
@@ -5537,6 +5765,88 @@ mod tests {
         );
     }
 
+    /// The pre-top-R implementation, verbatim: score every member, sort
+    /// them all, truncate. `owners` must stay byte-identical to it.
+    fn owners_reference(ring: &RingView, namespace: &[u8], key: &[u8]) -> Vec<String> {
+        let key_hash = key_hash(namespace, key);
+        let mut scored: Vec<(u64, &(String, String))> = ring
+            .node_hashes
+            .iter()
+            .zip(&ring.nodes)
+            .map(|(node_hash, node)| (fmix64(node_hash ^ key_hash), node))
+            .collect();
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0)));
+        scored.truncate(ring.replication.min(scored.len()));
+        scored
+            .into_iter()
+            .map(|(_, (_, addr))| addr.clone())
+            .collect()
+    }
+
+    #[test]
+    fn top_r_owners_match_the_sort_everything_reference_over_many_rosters() {
+        let namespaces: [&[u8]; 3] = [b"", b"users", b"\xff\x00"];
+        for node_count in [1usize, 2, 3, 5, 8, 9, 10, 17, 40, 64] {
+            // Names that don't sort in creation order, so the
+            // name tie-break and the insertion order are both exercised.
+            let nodes: Vec<(String, String)> = (0..node_count)
+                .map(|index| {
+                    let name = format!("node-{}", (index * 7919 + 13) % 10_007);
+                    let addr = format!("10.0.{}.{}:8356", index / 200, index % 200);
+                    (name, addr)
+                })
+                .collect();
+            for replication in 0..=node_count + 1 {
+                let ring = RingView::new(nodes.clone(), replication);
+                for namespace in namespaces {
+                    for key_number in 0..150u32 {
+                        let key = format!("key-{key_number}-{node_count}");
+                        let expected = owners_reference(&ring, namespace, key.as_bytes());
+                        assert_eq!(
+                            ring.owners(namespace, key.as_bytes()),
+                            expected,
+                            "nodes={node_count} replication={replication} key={key}"
+                        );
+                        // The primary-only selection the batch paths use is
+                        // the head of the same order.
+                        let mut top = Vec::new();
+                        ring.rank_owners(namespace, key.as_bytes(), 1, &mut top);
+                        assert_eq!(
+                            top.first().map(|&(_, index)| &ring.nodes[index].1),
+                            expected.first()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn addr_groups_keep_first_appearance_order_and_merge_shared_addresses() {
+        // node-a and node-c share an address: one group, as when the
+        // groups were found by comparing address strings.
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), "addr-1".to_string()),
+                ("node-b".to_string(), "addr-2".to_string()),
+                ("node-c".to_string(), "addr-1".to_string()),
+            ],
+            2,
+        );
+        let mut groups: AddrGroups<Vec<usize>> = AddrGroups::new(&ring);
+        assert!(groups.is_empty());
+        for (item, node) in [(0, 1), (1, 2), (2, 0), (3, 1)] {
+            groups.group_for(node).push(item);
+        }
+        assert_eq!(
+            groups.into_named(),
+            vec![
+                ("addr-2".to_string(), vec![0, 3]),
+                ("addr-1".to_string(), vec![1, 2]),
+            ]
+        );
+    }
+
     // ── mock cluster ─────────────────────────────────────────────────
 
     type Store = Arc<StdMutex<StdHashMap<(Vec<u8>, Vec<u8>), Vec<u8>>>>;
@@ -6201,17 +6511,40 @@ mod tests {
         roster: Vec<(String, String)>,
         replication: usize,
     ) -> (String, Arc<StdMutex<Vec<String>>>) {
+        let discovery = start_mock_discovery_handle(roster, replication).await;
+        (discovery.addr, discovery.deregistered)
+    }
+
+    /// A mock discovery with its observation points exposed: how many `L`
+    /// roster fetches it has answered, and the live roster (replace its
+    /// contents to change what the next fetch returns).
+    struct MockDiscoveryHandle {
+        addr: String,
+        deregistered: Arc<StdMutex<Vec<String>>>,
+        roster_fetches: Arc<AtomicUsize>,
+        roster: Arc<StdMutex<Vec<(String, String)>>>,
+    }
+
+    async fn start_mock_discovery_handle(
+        roster: Vec<(String, String)>,
+        replication: usize,
+    ) -> MockDiscoveryHandle {
+        let live_roster = Arc::new(StdMutex::new(roster));
+        let roster_cell = Arc::clone(&live_roster);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let deregistered: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let record = Arc::clone(&deregistered);
+        let roster_fetches = Arc::new(AtomicUsize::new(0));
+        let fetch_counter = Arc::clone(&roster_fetches);
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                let roster = roster.clone();
+                let roster_cell = Arc::clone(&roster_cell);
                 let record = Arc::clone(&record);
+                let fetch_counter = Arc::clone(&fetch_counter);
                 tokio::spawn(async move {
                     let mut buf = BytesMut::new();
                     loop {
@@ -6235,6 +6568,8 @@ mod tests {
                                 let _ = stream.write_all(b"Od\n").await;
                             }
                             "L" => {
+                                fetch_counter.fetch_add(1, Ordering::SeqCst);
+                                let roster = roster_cell.lock().unwrap().clone();
                                 let mut response =
                                     format!("N {} {replication}\n", roster.len()).into_bytes();
                                 for (name, addr) in &roster {
@@ -6275,7 +6610,12 @@ mod tests {
                 });
             }
         });
-        (addr, deregistered)
+        MockDiscoveryHandle {
+            addr,
+            deregistered,
+            roster_fetches,
+            roster: live_roster,
+        }
     }
 
     async fn start_mock_discovery(roster: Vec<(String, String)>, replication: usize) -> String {
@@ -7274,6 +7614,212 @@ mod tests {
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1");
+    }
+
+    /// Pre-auth bound: with a secret configured, a frame that declares
+    /// more than `PREAUTH_MAX_BYTES` is refused from its header alone —
+    /// before any of its body is buffered — and so is a header that runs
+    /// past the bound without ever ending its line.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unauthenticated_connection_cannot_make_the_proxy_buffer_more_than_the_preauth_bound()
+     {
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let proxy = start_proxy(&discovery, Some("s3cret"), 64).await;
+
+        // A huge declared secret: answered `E` on the header, with none of
+        // the body sent.
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let mut buf = BytesMut::new();
+        stream.write_all(b"A 1000000\n").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+
+        // Same for a big request frame sent before authenticating.
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let mut buf = BytesMut::new();
+        stream.write_all(b"S 1 500000\n").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+
+        // A header that never ends its line.
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let mut buf = BytesMut::new();
+        stream
+            .write_all(&vec![b'x'; PREAUTH_MAX_BYTES + 1])
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+
+        // The bound is pre-auth only: once authenticated, a frame well
+        // past it is served.
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let mut buf = BytesMut::new();
+        let mut frame = b"A 6\ns3cretS 1 10000\nk".to_vec();
+        frame.extend_from_slice(&vec![b'v'; 10_000]);
+        stream.write_all(&frame).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+    }
+
+    /// Pre-auth deadline: `IDLE_TIMEOUT` resets on every read, so a peer
+    /// trickling bytes of an `A` frame just under it never finished
+    /// authenticating and was never dropped. The fixed `AUTH_DEADLINE`
+    /// closes it no matter how steadily it trickles.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unauthenticated_connection_that_trickles_is_closed_at_the_auth_deadline() {
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let proxy = start_proxy(&discovery, Some("s3cret"), 64).await;
+
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let started = std::time::Instant::now();
+        stream.write_all(b"A 1000\n").await.unwrap();
+        let mut closed = false;
+        while started.elapsed() < AUTH_DEADLINE * 5 {
+            sleep(AUTH_DEADLINE / 4).await;
+            // One byte at a time, well inside any per-read idle bound.
+            if stream.write_all(b"x").await.is_err() {
+                closed = true;
+                break;
+            }
+            let mut probe = [0u8; 1];
+            if let Ok(Ok(0)) = timeout(Duration::from_millis(5), stream.read(&mut probe)).await {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the trickling connection was never closed");
+        assert!(
+            started.elapsed() < AUTH_DEADLINE * 4,
+            "closed only after {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Every `W` path nudges the refresher, and each fetch is a full `L`
+    /// plus announce round. A burst of forced refreshes used to drive one
+    /// fetch per nudge back to back; now they are spaced by
+    /// `MIN_FORCED_REFRESH_INTERVAL` and the nudges in between coalesce —
+    /// while every caller still gets its refresh.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_burst_of_forced_refreshes_is_coalesced_into_few_roster_fetches() {
+        let node = MockNode::start().await;
+        let discovery =
+            start_mock_discovery_handle(vec![("node-a".to_string(), node.addr.clone())], 1).await;
+        let (_proxy, _drain, context) =
+            start_proxy_with_drain(&discovery.addr, None, 64, None).await;
+        let baseline = discovery.roster_fetches.load(Ordering::SeqCst);
+
+        let window = MIN_FORCED_REFRESH_INTERVAL * 10;
+        let started = std::time::Instant::now();
+        let mut callers = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let context = Arc::clone(&context);
+            callers.spawn(async move {
+                let mut calls = 0usize;
+                while started.elapsed() < window {
+                    force_refresh(&context).await;
+                    calls += 1;
+                }
+                calls
+            });
+        }
+        let mut calls = 0;
+        while let Some(done) = callers.join_next().await {
+            calls += done.unwrap();
+        }
+
+        let fetches = discovery.roster_fetches.load(Ordering::SeqCst) - baseline;
+        // One fetch per interval at most (plus slack for the window's
+        // edges); unthrottled, a localhost mock answers hundreds.
+        assert!(fetches <= 13, "{fetches} roster fetches in {window:?}");
+        assert!(
+            calls > fetches,
+            "{calls} forced refreshes should outnumber the {fetches} fetches they were coalesced into"
+        );
+    }
+
+    /// An identical roster is not republished (a `ring` subscriber isn't
+    /// woken for nothing), yet `force_refresh` still returns as soon as
+    /// the fetch completes rather than waiting out `UPSTREAM_IO_TIMEOUT`
+    /// for a change that will never come.
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_refresh_of_an_identical_roster_returns_promptly_without_republishing() {
+        let node = MockNode::start().await;
+        let discovery =
+            start_mock_discovery_handle(vec![("node-a".to_string(), node.addr.clone())], 1).await;
+        let (_proxy, _drain, context) =
+            start_proxy_with_drain(&discovery.addr, None, 64, None).await;
+        let mut ring = context.ring.clone();
+        ring.mark_unchanged();
+        let before = discovery.roster_fetches.load(Ordering::SeqCst);
+
+        let started = std::time::Instant::now();
+        force_refresh(&context).await;
+
+        assert!(
+            started.elapsed() < UPSTREAM_IO_TIMEOUT / 2,
+            "force_refresh took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            discovery.roster_fetches.load(Ordering::SeqCst),
+            before + 1,
+            "the forced refresh did fetch"
+        );
+        assert!(
+            !ring.has_changed().unwrap(),
+            "an identical roster must not wake ring subscribers"
+        );
+    }
+
+    /// The other side of the same change: a roster that did change is
+    /// published, and the first forced refresh after the change is not
+    /// delayed past the minimum interval.
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_refresh_publishes_a_changed_roster_promptly() {
+        let node_a = MockNode::start().await;
+        let node_b = MockNode::start().await;
+        let discovery =
+            start_mock_discovery_handle(vec![("node-a".to_string(), node_a.addr.clone())], 1).await;
+        let (_proxy, _drain, context) =
+            start_proxy_with_drain(&discovery.addr, None, 64, None).await;
+        let mut ring = context.ring.clone();
+        ring.mark_unchanged();
+        assert_eq!(current_ring(&context).unwrap().nodes.len(), 1);
+
+        discovery
+            .roster
+            .lock()
+            .unwrap()
+            .push(("node-b".to_string(), node_b.addr.clone()));
+        let started = std::time::Instant::now();
+        force_refresh(&context).await;
+
+        assert!(
+            started.elapsed() < UPSTREAM_IO_TIMEOUT / 2,
+            "force_refresh took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(current_ring(&context).unwrap().nodes.len(), 2);
+        assert!(ring.has_changed().unwrap());
+    }
+
+    /// No-secret mode is untouched by the pre-auth bounds: a connection
+    /// that has sent nothing for longer than `AUTH_DEADLINE` still works,
+    /// and may send frames past `PREAUTH_MAX_BYTES` without an `A`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn without_a_secret_the_preauth_bounds_do_not_apply() {
+        let (_nodes, proxy) = cluster(1).await;
+
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let mut buf = BytesMut::new();
+        sleep(AUTH_DEADLINE + AUTH_DEADLINE / 2).await;
+        let mut frame = b"S 1 10000\nk".to_vec();
+        frame.extend_from_slice(&vec![b'v'; 10_000]);
+        stream.write_all(&frame).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
     }
 
     #[tokio::test(flavor = "current_thread")]
