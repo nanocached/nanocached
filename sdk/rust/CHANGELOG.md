@@ -6,6 +6,27 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+### Fixed
+
+- Large requests and large responses on one pipelined connection could
+  deadlock. A request blocked mid-write (the server was not reading) held
+  the lock the read task needs to dispatch each response, so a server
+  blocked writing 1 MB values to a client that had stopped reading never got
+  to read the next request: nothing moved until the request timeout closed
+  the connection, failing everything pending on it, non-idempotent calls
+  included, as possibly sent. The pending queue now has its own lock, which
+  the read task takes without waiting for a write. A mixed batch of 96
+  concurrent 1 MB gets and sets, which failed after the 5 s test timeout,
+  now finishes in about 30 ms.
+- Keep-alive pings no longer run one after another. A half-open node, whose
+  ping blocks until the request timeout, used to keep every node after it
+  from being pinged until those had sat idle for about 60 s, the server's
+  idle limit. Each ping now runs as its own task (as in the Go SDK), and a
+  connection whose last ping is still outstanding is not pinged again.
+- `connect()` no longer dials a whole roster at once. A discovery server can
+  list up to 65536 nodes, which opened that many sockets together; at most
+  64 dials are now in flight at a time. Outcomes are unchanged.
+
 ## [0.4.4] - 2026-09-09
 
 No changes. Version aligned with the rest of the project: from 0.4.4 on,

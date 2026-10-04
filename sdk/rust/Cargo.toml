@@ -18,8 +18,9 @@ categories = ["caching", "asynchronous"]
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "macros"] }
-# `join_all`, used to dial every node discovery lists concurrently at
-# bootstrap (issue #67) instead of one after another. `default-features =
+# `join_all` and `StreamExt::buffered`, used to dial the nodes discovery
+# lists concurrently at bootstrap (issue #67, at most 64 at a time) instead
+# of one after another. `default-features =
 # false` plus `alloc` keeps this to the plain future combinator — no extra
 # runtime, no proc-macro `async-await` support this crate doesn't need.
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }

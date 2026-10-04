@@ -351,6 +351,17 @@ const MAX_MULTIGET_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 #[doc(hidden)]
 pub static MAX_INFLIGHT_HEDGE_LOSER_LEGS: AtomicUsize = AtomicUsize::new(32);
 
+/// How many of a roster's nodes `connect`'s bootstrap dials at once.
+/// Discovery may list up to 65536 nodes; polling every dial together
+/// opens that many sockets in one go, past most processes' file-descriptor
+/// limit. Bounded rather than serialized (issue #67 made it concurrent on
+/// purpose): 64 keeps a typical roster fully parallel while capping the
+/// burst. (The Java SDK bounds its bootstrap dialers too, at 16 threads.)
+/// Read once per `connect`; public-but-hidden purely as a test hook,
+/// mirroring `MAX_INFLIGHT_HEDGE_LOSER_LEGS`.
+#[doc(hidden)]
+pub static MAX_CONCURRENT_DIALS: AtomicUsize = AtomicUsize::new(64);
+
 /// Monotonic counters for failures this SDK deliberately swallows
 /// (client-side replication / fire-and-forget replica writes / read repair) — observability for silently degrading
 /// replication or a stuck node-list refresh that would otherwise have no
@@ -1194,12 +1205,16 @@ impl NanocachedClient {
                         let nodes = dedupe_discovered_nodes(nodes);
 
                         // Dials every listed node concurrently (issue #67):
-                        // `join_all` polls every dial together instead of one
-                        // after another, so bootstrap's worst-case latency
-                        // stays one `CONNECT_DEADLINE` regardless of cluster
-                        // size, not `nodes.len()` of them in sequence.
-                        let outcomes =
-                            futures_util::future::join_all(nodes.iter().map(|node| async {
+                        // polling the dials together instead of one after
+                        // another keeps bootstrap's worst-case latency at
+                        // about one `CONNECT_DEADLINE` per
+                        // `MAX_CONCURRENT_DIALS` nodes, not `nodes.len()` of
+                        // them in sequence. `buffered` keeps at most that
+                        // many in flight and yields outcomes in node order,
+                        // exactly as `join_all` did.
+                        use futures_util::StreamExt;
+                        let outcomes = futures_util::stream::iter(nodes.iter())
+                            .map(|node| async {
                                 let (node_host, node_port) = split_host_port(&node.address)?;
                                 connect_and_identify(
                                     &node_host,
@@ -1210,7 +1225,9 @@ impl NanocachedClient {
                                     DiscoveryQuery::Nodes,
                                 )
                                 .await
-                            }))
+                            })
+                            .buffered(MAX_CONCURRENT_DIALS.load(Ordering::SeqCst).max(1))
+                            .collect::<Vec<_>>()
                             .await;
 
                         let mut members = HashMap::new();
@@ -1405,6 +1422,14 @@ impl NanocachedClient {
         let keepalive = Some({
             let weak_inner = Arc::downgrade(&inner);
             Arc::new(tokio::spawn(async move {
+                // One task per connection's ping, not awaited by this
+                // loop: pings run concurrently, and a half-open node whose
+                // ping blocks until the request timeout no longer holds the
+                // others back — pinged in turn (or just joined each round),
+                // the healthy nodes' next ping slid out to about 60s idle,
+                // the server's idle limit. Owned by this task, so closing
+                // the client (which aborts it) aborts them too.
+                let mut pings = tokio::task::JoinSet::<()>::new();
                 loop {
                     tokio::time::sleep(interval).await;
                     let inner = match weak_inner.upgrade() {
@@ -1426,15 +1451,28 @@ impl NanocachedClient {
                                 .collect(),
                         }
                     };
+                    // Reap pings that have finished; the rest are still
+                    // waiting on their node.
+                    while pings.try_join_next().is_some() {}
                     for connection in connections {
                         if connection.is_closed() || connection.idle() < interval {
                             continue; // dead ones stay lazy; busy ones don't need a ping
                         }
-                        // Any parseable reply proves liveness — `N`, or `W`
-                        // from a non-owner — and resets the idle timer.
-                        // Always the default namespace: the keep-alive key
-                        // is reserved wire-wide, not per-namespace.
-                        let _ = connection.get(DEFAULT_NAMESPACE, KEEPALIVE_KEY).await;
+                        // The previous ping on this connection is still
+                        // outstanding (a hung node): don't stack another.
+                        let Some(ping) = connection.begin_keepalive_ping() else {
+                            continue;
+                        };
+                        pings.spawn(async move {
+                            // Released when this task ends, however it ends.
+                            let _ping = ping;
+                            // Any parseable reply proves liveness — `N`, or
+                            // `W` from a non-owner — and resets the idle
+                            // timer. Always the default namespace: the
+                            // keep-alive key is reserved wire-wide, not
+                            // per-namespace.
+                            let _ = connection.get(DEFAULT_NAMESPACE, KEEPALIVE_KEY).await;
+                        });
                     }
                 }
             }))

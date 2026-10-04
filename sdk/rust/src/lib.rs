@@ -16,6 +16,8 @@ pub use cas::{content_digest, CasToken};
 #[doc(hidden)]
 pub use client::KEEPALIVE_INTERVAL_MS;
 #[doc(hidden)]
+pub use client::MAX_CONCURRENT_DIALS;
+#[doc(hidden)]
 pub use client::MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES;
 #[doc(hidden)]
 pub use client::MAX_INFLIGHT_HEDGE_LOSER_LEGS;

@@ -5987,3 +5987,177 @@ async fn connect_rejects_ca_without_tls() {
     }
     node.stop();
 }
+
+/// The keep-alive loop used to await each connection's ping in turn: a
+/// half-open node (its ping blocks until the request timeout) kept every
+/// node after it from being pinged, until they sat idle for the server's
+/// own 60s limit. Go fixed the same thing in #192.
+#[tokio::test]
+async fn a_hung_node_does_not_delay_the_other_nodes_keep_alive_pings() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(
+        options(discovery.port).keep_alive_interval(Duration::from_millis(40)),
+    )
+    .await
+    .unwrap();
+    // Reads every request but never answers: a half-open server. Its
+    // ping stays outstanding for the whole (default 30s) request timeout.
+    nodes[0].1.state.silent.store(true, Ordering::SeqCst);
+
+    let healthy = &nodes[1].1.state;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while healthy.gets.load(Ordering::SeqCst) < 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the healthy node was pinged {} time(s) in 3s while its sibling hung",
+            healthy.gets.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    client.close().await;
+    discovery.stop();
+    for (_, node) in &nodes {
+        node.stop();
+    }
+}
+
+/// A roster of up to 65536 nodes used to be dialed all at once. Every
+/// roster entry below points at the same slow-to-handshake server, which
+/// records how many handshakes it has in flight at the same moment.
+#[tokio::test]
+async fn bootstrap_dials_a_big_roster_with_bounded_concurrency() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let (in_flight, peak, accepted) = (
+            Arc::clone(&in_flight),
+            Arc::clone(&peak),
+            Arc::clone(&accepted),
+        );
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                let in_flight = Arc::clone(&in_flight);
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(socket);
+                    let Ok(header) = read_line(&mut stream).await else {
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        return;
+                    };
+                    let secret_len: usize = header.split(' ').nth(1).unwrap().parse().unwrap();
+                    read_exact(&mut stream, secret_len).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let _ = stream.get_mut().write_all(b"On\n").await;
+                    // Stay open until the client closes it.
+                    let mut sink = Vec::new();
+                    let _ = stream.read_to_end(&mut sink).await;
+                });
+            }
+        })
+    };
+
+    const ROSTER_SIZE: usize = 30;
+    let roster: Vec<(String, String)> = (0..ROSTER_SIZE)
+        .map(|i| (format!("node-{i:03}"), format!("127.0.0.1:{port}")))
+        .collect();
+    let discovery = MockDiscovery::start(roster, 2).await;
+
+    // Read once per connect: restored right after it. Every other test's
+    // roster is far smaller than 4, so it can't be affected meanwhile.
+    nanocached::MAX_CONCURRENT_DIALS.store(4, Ordering::SeqCst);
+    let client = NanocachedClient::connect(options(discovery.port)).await;
+    nanocached::MAX_CONCURRENT_DIALS.store(64, Ordering::SeqCst);
+    let client = client.unwrap();
+
+    assert_eq!(client.member_names().await.len(), ROSTER_SIZE);
+    assert_eq!(accepted.load(Ordering::SeqCst), ROSTER_SIZE);
+    let peak = peak.load(Ordering::SeqCst);
+    assert!(
+        peak <= 4,
+        "{peak} dials were in flight at once, want at most 4"
+    );
+    assert!(
+        peak >= 2,
+        "peak concurrency was {peak}; the bound must still leave dials concurrent"
+    );
+    client.close().await;
+    discovery.stop();
+    server.abort();
+}
+
+/// A request frame blocked mid-write (the server isn't reading) used to
+/// hold `write_state`, which the read task needs to pop each response's
+/// pending slot. With big values in both directions on one pipelined
+/// connection that deadlocks: the server stops reading requests while it
+/// is itself blocked writing responses, the read task (holding a full
+/// response, waiting for the lock) stops reading them, and nothing moves
+/// until the request timeout poisons the connection — failing every
+/// request pending on it, non-idempotent ones included, as possibly sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_requests_and_responses_pipelined_together_do_not_deadlock() {
+    let node = MockNode::start().await;
+    let big = vec![b'x'; 1000 * 1000];
+    for i in 0..4 {
+        node.state
+            .store
+            .lock()
+            .unwrap()
+            .insert(store_key(b"", format!("big-{i}").as_bytes()), big.clone());
+    }
+    let timeout = Duration::from_secs(5);
+    let client = NanocachedClient::connect(options(node.port).request_timeout(timeout))
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    let mut tasks = Vec::new();
+    for i in 0..48 {
+        let getter = client.clone();
+        tasks.push(tokio::spawn(async move {
+            getter
+                .get_bytes(format!("big-{}", i % 4))
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("get: {error}"))
+        }));
+        let setter = client.clone();
+        let value = big.clone();
+        tasks.push(tokio::spawn(async move {
+            setter
+                .set(format!("set-{i}"), value, 0)
+                .await
+                .map_err(|error| format!("set: {error}"))
+        }));
+    }
+    let mut failures = Vec::new();
+    for task in tasks {
+        if let Err(message) = task.await.unwrap() {
+            failures.push(message);
+        }
+    }
+    let elapsed = started.elapsed();
+
+    assert!(
+        failures.is_empty(),
+        "{} of 96 requests failed, first: {:?}",
+        failures.len(),
+        failures.first()
+    );
+    // Loopback moves 96 MB in well under a second; a stall lasts until
+    // the request timeout.
+    assert!(
+        elapsed < timeout / 2,
+        "96 large requests took {elapsed:?}, want far less than the {timeout:?} request timeout"
+    );
+    client.close().await;
+    node.stop();
+}
