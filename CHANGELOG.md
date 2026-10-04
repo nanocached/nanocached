@@ -33,6 +33,12 @@ framework adapters at one version, whether or not a component changed.
 - `nanocached-proxy` and `nanocached-discovery`: a panic while serving a
   metrics scrape is now logged (`WARN metrics connection task failed`)
   instead of going unobserved, like the node's metrics endpoint.
+- `nanocached-proxy`: routing the keys of a large `m`/`o` frame no longer
+  scores, sorts and copies the whole roster once per key (O(nodes log nodes)
+  per key, hundreds of thousands of times for a ~1 MiB frame, on a tokio
+  worker). Each key now keeps only its top owners in one pass, and keys are
+  grouped by node without cloning an address per key. Key placement is
+  unchanged.
 
 ### Security
 

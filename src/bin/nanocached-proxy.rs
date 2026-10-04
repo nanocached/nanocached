@@ -415,6 +415,10 @@ fn key_hash(namespace: &[u8], key: &[u8]) -> u64 {
 struct RingView {
     nodes: Vec<(String, String)>,
     node_hashes: Vec<u64>,
+    /// Per node, the index of the first node with the same address — the
+    /// identity batch grouping uses (`AddrGroups`), so two names sharing
+    /// an address still land in one backend sub-frame.
+    addr_slot: Vec<usize>,
     replication: usize,
 }
 
@@ -424,35 +428,140 @@ impl RingView {
             .iter()
             .map(|(name, _)| fnv1a(name.as_bytes()))
             .collect();
+        let mut first_with_addr: HashMap<&str, usize> = HashMap::new();
+        let addr_slot = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, (_, addr))| *first_with_addr.entry(addr.as_str()).or_insert(index))
+            .collect();
         Self {
             nodes,
             node_hashes,
+            addr_slot,
             replication,
         }
     }
 
-    /// The key's owner *addresses*, primary first — top-R by the same
-    /// total order every implementation uses (descending score, ties to
-    /// the lexicographically smaller name).
-    fn owners(&self, namespace: &[u8], key: &[u8]) -> Vec<String> {
+    /// Whether `a` outranks `b` in the one total order every
+    /// implementation uses: descending score, ties to the
+    /// lexicographically smaller name. Entries are `(score, node index)`.
+    fn outranks(&self, a: (u64, usize), b: (u64, usize)) -> bool {
+        a.0 > b.0 || (a.0 == b.0 && self.nodes[a.1].0 < self.nodes[b.1].0)
+    }
+
+    /// Fills `top` with the key's top-`limit` owners as `(score, node
+    /// index)`, best first — `limit` capped at the replication factor and
+    /// the roster size, so `0` replication or an empty roster leave it
+    /// empty. Each member's score is computed once, and only the `limit`
+    /// best are ever kept (no per-key sort of the whole roster, no
+    /// per-key allocation once `top` has grown): a large `m`/`o` frame
+    /// calls this once per key, on a tokio worker, so the old sort-everything
+    /// `owners` was O(N log N) per key — hundreds of thousands of times.
+    /// `top` is caller-owned scratch so a loop reuses one buffer.
+    fn rank_owners(&self, namespace: &[u8], key: &[u8], limit: usize, top: &mut Vec<(u64, usize)>) {
+        top.clear();
+        let limit = limit.min(self.replication).min(self.nodes.len());
+        if limit == 0 {
+            return;
+        }
         let key_hash = key_hash(namespace, key);
-        let mut scored: Vec<(u64, &(String, String))> = self
+        let scores = self
             .node_hashes
             .iter()
-            .zip(&self.nodes)
-            .map(|(node_hash, node)| (fmix64(node_hash ^ key_hash), node))
-            .collect();
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0)));
-        scored.truncate(self.replication.min(scored.len()));
-        scored
-            .into_iter()
-            .map(|(_, (_, addr))| addr.clone())
+            .enumerate()
+            .map(|(index, node_hash)| (fmix64(node_hash ^ key_hash), index));
+
+        // A large replication factor makes the insertion below O(N * R);
+        // past a handful, sorting everything is the cheaper shape (and
+        // it is the degenerate configuration anyway).
+        if limit > 8 {
+            top.extend(scores);
+            top.sort_unstable_by(|a, b| {
+                if self.outranks(*a, *b) {
+                    std::cmp::Ordering::Less
+                } else if self.outranks(*b, *a) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            });
+            top.truncate(limit);
+            return;
+        }
+
+        for candidate in scores {
+            if top.len() == limit && !self.outranks(candidate, top[limit - 1]) {
+                continue;
+            }
+            let position = top.partition_point(|&held| self.outranks(held, candidate));
+            if top.len() == limit {
+                top.pop();
+            }
+            top.insert(position, candidate);
+        }
+    }
+
+    /// The key's owner *addresses*, primary first — top-R by the same
+    /// total order every implementation uses (see `outranks`).
+    fn owners(&self, namespace: &[u8], key: &[u8]) -> Vec<String> {
+        let mut top = Vec::new();
+        self.rank_owners(namespace, key, self.replication, &mut top);
+        top.into_iter()
+            .map(|(_, index)| self.nodes[index].1.clone())
             .collect()
     }
 
     /// Every member address — `c`/`F`'s fan-out set.
     fn all_addresses(&self) -> Vec<String> {
         self.nodes.iter().map(|(_, addr)| addr.clone()).collect()
+    }
+}
+
+/// Groups a batch's items by the backend address that must receive them,
+/// in first-appearance order, without cloning an address per item or
+/// string-comparing against every earlier group: items are filed by node
+/// index and the address `String` is cloned once per *group*
+/// (`into_named`). A large `m`/`o` frame files hundreds of thousands of
+/// keys through this on a tokio worker.
+struct AddrGroups<'r, T> {
+    ring: &'r RingView,
+    /// By `RingView::addr_slot`: where that address's group lives in
+    /// `groups`, or `usize::MAX`.
+    slot_of: Vec<usize>,
+    /// `(addr_slot index, items)` per group.
+    groups: Vec<(usize, T)>,
+}
+
+impl<'r, T: Default> AddrGroups<'r, T> {
+    fn new(ring: &'r RingView) -> Self {
+        Self {
+            ring,
+            slot_of: vec![usize::MAX; ring.nodes.len()],
+            groups: Vec::new(),
+        }
+    }
+
+    /// The group for `node`'s address, created on first use.
+    fn group_for(&mut self, node: usize) -> &mut T {
+        let canonical = self.ring.addr_slot[node];
+        let slot = &mut self.slot_of[canonical];
+        if *slot == usize::MAX {
+            *slot = self.groups.len();
+            self.groups.push((canonical, T::default()));
+        }
+        &mut self.groups[*slot].1
+    }
+
+    fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// The groups with their addresses, in first-appearance order.
+    fn into_named(self) -> Vec<(String, T)> {
+        self.groups
+            .into_iter()
+            .map(|(node, items)| (self.ring.nodes[node].1.clone(), items))
+            .collect()
     }
 }
 
@@ -3454,22 +3563,20 @@ async fn dispatch_request(
         // like `retry_get_on` does for single-key `Get`, instead of
         // giving up after the fresh primary alone.
         Request::MultiGet { namespace, keys } => {
-            let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
+            let mut groups: AddrGroups<(Vec<usize>, Vec<Bytes>)> = AddrGroups::new(&ring);
             let mut missing = Vec::new();
+            let mut top = Vec::new();
 
             for (position, key) in keys.iter().enumerate() {
-                let mut owners = ring.owners(&namespace, key).into_iter();
-                let Some(primary) = owners.next() else {
+                ring.rank_owners(&namespace, key, 1, &mut top);
+                let Some(&(_, primary)) = top.first() else {
                     missing.push(position);
                     continue;
                 };
 
-                if let Some(group) = groups.iter_mut().find(|(owner, ..)| *owner == primary) {
-                    group.1.push(position);
-                    group.2.push(key.clone());
-                } else {
-                    groups.push((primary, vec![position], vec![key.clone()]));
-                }
+                let (positions, group_keys) = groups.group_for(primary);
+                positions.push(position);
+                group_keys.push(key.clone());
             }
 
             if groups.is_empty() {
@@ -3477,7 +3584,8 @@ async fn dispatch_request(
                 return result_rx;
             }
 
-            let requests = groups.iter().map(|(owner, _, group_keys)| {
+            let groups = groups.into_named();
+            let requests = groups.iter().map(|(owner, (_, group_keys))| {
                 (owner.as_str(), frame_multi_get(&namespace, group_keys))
             });
             let pending = context
@@ -3486,7 +3594,7 @@ async fn dispatch_request(
                 .await;
             let positions: Vec<Vec<usize>> = groups
                 .into_iter()
-                .map(|(_, positions, _)| positions)
+                .map(|(_, (positions, _))| positions)
                 .collect();
 
             tokio::spawn(async move {
@@ -3512,22 +3620,18 @@ async fn dispatch_request(
             values,
             ttl,
         } => {
-            let mut groups: Vec<(String, Vec<(usize, bool)>)> = Vec::new();
+            let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(&ring);
             let mut missing = Vec::new();
+            let mut top = Vec::new();
 
             for (position, key) in keys.iter().enumerate() {
-                let owners = ring.owners(&namespace, key);
-                if owners.is_empty() {
+                ring.rank_owners(&namespace, key, ring.replication, &mut top);
+                if top.is_empty() {
                     missing.push(position);
                     continue;
                 }
-                for (rank, owner) in owners.iter().enumerate() {
-                    let leg = (position, rank == 0);
-                    if let Some(group) = groups.iter_mut().find(|(addr, _)| addr == owner) {
-                        group.1.push(leg);
-                    } else {
-                        groups.push((owner.clone(), vec![leg]));
-                    }
+                for (rank, &(_, owner)) in top.iter().enumerate() {
+                    groups.group_for(owner).push((position, rank == 0));
                 }
             }
 
@@ -3536,6 +3640,7 @@ async fn dispatch_request(
                 return result_rx;
             }
 
+            let groups = groups.into_named();
             let requests = groups.iter().map(|(owner, legs)| {
                 let group_keys: Vec<Bytes> = legs
                     .iter()
@@ -3764,55 +3869,53 @@ async fn retry_multi_get(
         return;
     };
 
-    let mut owners_by_position: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut owners_by_position: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut unresolved: Vec<usize> = Vec::new();
+    let mut top = Vec::new();
     for &position in retry_positions {
         let key = &keys[position];
-        let owners = ring.owners(namespace, key);
-        if owners.is_empty() {
+        ring.rank_owners(namespace, key, ring.replication, &mut top);
+        if top.is_empty() {
             entries[position] = Some(ProxyMultiEntry::WrongNode);
             continue;
         }
-        owners_by_position.insert(position, owners);
+        owners_by_position.insert(position, top.iter().map(|&(_, node)| node).collect());
         unresolved.push(position);
     }
 
     let mut rank = 0;
     while !unresolved.is_empty() {
-        let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
+        let mut groups: AddrGroups<(Vec<usize>, Vec<Bytes>)> = AddrGroups::new(&ring);
         let mut still_unresolved = Vec::new();
 
         for position in unresolved {
             let owner = match owners_by_position[&position].get(rank) {
-                Some(owner) => owner.clone(),
+                Some(&owner) => owner,
                 None => {
                     // Every owner for this key has now been tried once.
                     entries[position] = Some(ProxyMultiEntry::WrongNode);
                     continue;
                 }
             };
-            let key = keys[position].clone();
-            if let Some(group) = groups.iter_mut().find(|(addr, ..)| *addr == owner) {
-                group.1.push(position);
-                group.2.push(key);
-            } else {
-                groups.push((owner, vec![position], vec![key]));
-            }
+            let (positions, group_keys) = groups.group_for(owner);
+            positions.push(position);
+            group_keys.push(keys[position].clone());
         }
 
         if groups.is_empty() {
             break;
         }
 
-        let requests = groups
-            .iter()
-            .map(|(owner, _, group_keys)| (owner.as_str(), frame_multi_get(namespace, group_keys)));
+        let groups = groups.into_named();
+        let requests = groups.iter().map(|(owner, (_, group_keys))| {
+            (owner.as_str(), frame_multi_get(namespace, group_keys))
+        });
         let replies = context
             .backends
             .call_each(context, requests, Expect::Multi)
             .await;
 
-        for ((_, group_positions, _), reply) in groups.into_iter().zip(replies) {
+        for ((_, (group_positions, _)), reply) in groups.into_iter().zip(replies) {
             match reply {
                 Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
                     for (position, entry) in group_positions.into_iter().zip(results) {
@@ -3950,23 +4053,20 @@ async fn retry_multi_set(
         return;
     };
 
-    let mut groups: Vec<(String, Vec<(usize, bool)>)> = Vec::new();
+    let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(&ring);
+    let mut top = Vec::new();
     for &position in retry_positions {
         let key = &keys[position];
-        let owners = ring.owners(namespace, key);
-        if owners.is_empty() {
+        ring.rank_owners(namespace, key, ring.replication, &mut top);
+        if top.is_empty() {
             entries[position] = Some(ProxyAckEntry::WrongNode);
             continue;
         }
-        for (rank, owner) in owners.iter().enumerate() {
-            let leg = (position, rank == 0);
-            if let Some(group) = groups.iter_mut().find(|(addr, _)| addr == owner) {
-                group.1.push(leg);
-            } else {
-                groups.push((owner.clone(), vec![leg]));
-            }
+        for (rank, &(_, owner)) in top.iter().enumerate() {
+            groups.group_for(owner).push((position, rank == 0));
         }
     }
+    let groups = groups.into_named();
 
     // Issue #177: same concurrent fan-out as `retry_multi_get` above.
     let requests = groups.iter().map(|(owner, legs)| {
@@ -5594,6 +5694,88 @@ mod tests {
         assert_eq!(
             names(ring.owners(b"users", b"alpha")),
             vec!["node-a", "node-c", "node-b"]
+        );
+    }
+
+    /// The pre-top-R implementation, verbatim: score every member, sort
+    /// them all, truncate. `owners` must stay byte-identical to it.
+    fn owners_reference(ring: &RingView, namespace: &[u8], key: &[u8]) -> Vec<String> {
+        let key_hash = key_hash(namespace, key);
+        let mut scored: Vec<(u64, &(String, String))> = ring
+            .node_hashes
+            .iter()
+            .zip(&ring.nodes)
+            .map(|(node_hash, node)| (fmix64(node_hash ^ key_hash), node))
+            .collect();
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0)));
+        scored.truncate(ring.replication.min(scored.len()));
+        scored
+            .into_iter()
+            .map(|(_, (_, addr))| addr.clone())
+            .collect()
+    }
+
+    #[test]
+    fn top_r_owners_match_the_sort_everything_reference_over_many_rosters() {
+        let namespaces: [&[u8]; 3] = [b"", b"users", b"\xff\x00"];
+        for node_count in [1usize, 2, 3, 5, 8, 9, 10, 17, 40, 64] {
+            // Names that don't sort in creation order, so the
+            // name tie-break and the insertion order are both exercised.
+            let nodes: Vec<(String, String)> = (0..node_count)
+                .map(|index| {
+                    let name = format!("node-{}", (index * 7919 + 13) % 10_007);
+                    let addr = format!("10.0.{}.{}:8356", index / 200, index % 200);
+                    (name, addr)
+                })
+                .collect();
+            for replication in 0..=node_count + 1 {
+                let ring = RingView::new(nodes.clone(), replication);
+                for namespace in namespaces {
+                    for key_number in 0..150u32 {
+                        let key = format!("key-{key_number}-{node_count}");
+                        let expected = owners_reference(&ring, namespace, key.as_bytes());
+                        assert_eq!(
+                            ring.owners(namespace, key.as_bytes()),
+                            expected,
+                            "nodes={node_count} replication={replication} key={key}"
+                        );
+                        // The primary-only selection the batch paths use is
+                        // the head of the same order.
+                        let mut top = Vec::new();
+                        ring.rank_owners(namespace, key.as_bytes(), 1, &mut top);
+                        assert_eq!(
+                            top.first().map(|&(_, index)| &ring.nodes[index].1),
+                            expected.first()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn addr_groups_keep_first_appearance_order_and_merge_shared_addresses() {
+        // node-a and node-c share an address: one group, as when the
+        // groups were found by comparing address strings.
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), "addr-1".to_string()),
+                ("node-b".to_string(), "addr-2".to_string()),
+                ("node-c".to_string(), "addr-1".to_string()),
+            ],
+            2,
+        );
+        let mut groups: AddrGroups<Vec<usize>> = AddrGroups::new(&ring);
+        assert!(groups.is_empty());
+        for (item, node) in [(0, 1), (1, 2), (2, 0), (3, 1)] {
+            groups.group_for(node).push(item);
+        }
+        assert_eq!(
+            groups.into_named(),
+            vec![
+                ("addr-2".to_string(), vec![0, 3]),
+                ("addr-1".to_string(), vec![1, 2]),
+            ]
         );
     }
 
