@@ -39,6 +39,7 @@
 //!   `config`) onto the same nodes.
 
 use crate::key::Key;
+use bytes::Bytes;
 use std::collections::HashSet;
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -51,6 +52,8 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// Feeds `bytes` into an in-progress FNV-1a state, so a multi-part
 /// input hashes exactly as its concatenation would, with no allocation.
 fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
+    #[cfg(test)]
+    HASHED_BYTES.with(|count| count.set(count.get() + bytes.len()));
     for &byte in bytes {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
@@ -58,22 +61,87 @@ fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The canonical key-side hash — see the module docs for the two forms.
-fn key_hash(key: &Key) -> u64 {
-    if !key.is_namespaced() {
-        return fnv1a(&key.name);
+// Test-only: bytes fed through FNV on this thread, to assert that per-key
+// work does not scale with the namespace length (a thread-local because
+// tests run in parallel).
+#[cfg(test)]
+thread_local! {
+    static HASHED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: bytes fed through FNV on this thread so far.
+#[cfg(test)]
+pub(crate) fn hashed_bytes() -> usize {
+    HASHED_BYTES.with(|count| count.get())
+}
+
+/// The FNV-1a state after the namespace part of a key's canonical hash
+/// input (see the module docs): `be32(len(ns)) || ns` for a non-empty
+/// namespace, the plain offset basis for the default one. FNV-1a is a
+/// byte stream, so continuing this with each key's name gives exactly
+/// the one-shot hash — which lets a frame or loop over many keys of one
+/// namespace pay for the namespace (up to ~1 MiB) once rather than per
+/// key.
+fn namespace_state(namespace: &[u8]) -> u64 {
+    if namespace.is_empty() {
+        return FNV_OFFSET_BASIS;
     }
 
     // Namespaces are bounded by the request-size limit (1 MiB), so the
     // length always fits; the `u32` cast is the canonical encoding width
     // every implementation uses, not a truncation that could ever occur.
-    let namespace_length = u32::try_from(key.namespace.len())
+    let namespace_length = u32::try_from(namespace.len())
         .expect("a namespace is bounded by the request-size limit")
         .to_be_bytes();
 
     let hash = fnv1a(&namespace_length);
-    let hash = fnv1a_continue(hash, &key.namespace);
-    fnv1a_continue(hash, &key.name)
+    fnv1a_continue(hash, namespace)
+}
+
+/// A key's canonical hash (see the module docs for the two forms),
+/// computed once and then reusable across every `HashRing` lookup for the
+/// key (`is_owner_hashed`/`owners_hashed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyHash(u64);
+
+impl KeyHash {
+    pub fn of(key: &Key) -> Self {
+        Self(fnv1a_continue(namespace_state(&key.namespace), &key.name))
+    }
+}
+
+/// Hashes many keys, paying for each *distinct* namespace once: the state
+/// after the last namespace seen is kept, keyed by the identity (pointer
+/// and length) of its `Bytes`, so consecutive keys that share a namespace
+/// allocation — a multi-key frame's keys, or `Cache::keys()`'s, which
+/// arrive grouped by namespace — skip straight to hashing their own name.
+/// A key whose namespace is a different allocation just recomputes, so
+/// the result is always the one-shot hash, whatever the key order.
+#[derive(Default)]
+pub struct KeyHasher {
+    /// Holds the namespace itself so its allocation, and so the pointer
+    /// compared against, cannot be freed and reused while remembered.
+    last: Option<(Bytes, u64)>,
+}
+
+impl KeyHasher {
+    pub fn hash(&mut self, key: &Key) -> KeyHash {
+        let state = match &self.last {
+            Some((namespace, state))
+                if namespace.as_ptr() == key.namespace.as_ptr()
+                    && namespace.len() == key.namespace.len() =>
+            {
+                *state
+            }
+            _ => {
+                let state = namespace_state(&key.namespace);
+                self.last = Some((key.namespace.clone(), state));
+                state
+            }
+        };
+
+        KeyHash(fnv1a_continue(state, &key.name))
+    }
 }
 
 /// MurmurHash3's 64-bit finalizer: a full-avalanche bijective mix, which
@@ -127,7 +195,12 @@ impl HashRing {
     /// The key's owners: the `replicas` highest-scoring nodes, primary
     /// first. Returns fewer than `replicas` when the cluster is smaller.
     pub fn owners(&self, key: &Key, replicas: usize) -> Vec<&str> {
-        let key_hash = key_hash(key);
+        self.owners_hashed(KeyHash::of(key), replicas)
+    }
+
+    /// `owners` for a key whose hash is already known.
+    pub fn owners_hashed(&self, key_hash: KeyHash, replicas: usize) -> Vec<&str> {
+        let key_hash = key_hash.0;
 
         let mut scored: Vec<(u64, &str)> = self
             .node_hashes
@@ -157,8 +230,15 @@ impl HashRing {
         scored.into_iter().map(|(_, node)| node).collect()
     }
 
-    /// Whether `name` is one of the key's `replicas` owners.
+    /// Whether `name` is one of the key's `replicas` owners. Production
+    /// code hashes once and uses `is_owner_hashed`; this stays for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_owner(&self, key: &Key, name: &str, replicas: usize) -> bool {
+        self.is_owner_hashed(KeyHash::of(key), name, replicas)
+    }
+
+    /// `is_owner` for a key whose hash is already known.
+    pub fn is_owner_hashed(&self, key_hash: KeyHash, name: &str, replicas: usize) -> bool {
         if replicas == 0 {
             return false;
         }
@@ -173,7 +253,7 @@ impl HashRing {
         // by, which this can count directly and — unlike building and
         // sorting the whole scored list — give up on as soon as that
         // count is reached, without scoring the rest of the cluster.
-        let key_hash = key_hash(key);
+        let key_hash = key_hash.0;
         let name_score = fmix64(self.node_hashes[name_index] ^ key_hash);
 
         let mut better_ranked = 0usize;
@@ -276,6 +356,115 @@ mod tests {
                 .collect();
             assert_eq!(old, new, "relative order changed for {key}");
         }
+    }
+
+    /// The original one-shot key hash (the form `KeyHash` replaced),
+    /// kept as the reference the streaming forms must equal byte for byte.
+    fn key_hash(key: &Key) -> u64 {
+        if !key.is_namespaced() {
+            return fnv1a(&key.name);
+        }
+
+        let namespace_length = u32::try_from(key.namespace.len()).unwrap().to_be_bytes();
+        let hash = fnv1a(&namespace_length);
+        let hash = fnv1a_continue(hash, &key.namespace);
+        fnv1a_continue(hash, &key.name)
+    }
+
+    #[test]
+    fn the_streaming_key_hash_equals_the_one_shot_hash() {
+        let big = vec![0xa5u8; 5_000];
+        let cases: [(&[u8], &[u8]); 7] = [
+            (b"", b""),
+            (b"", b"alpha"),
+            (b"users", b""),
+            (b"users", b"alpha"),
+            (b"\xff\x00", b"be\x00ta"),
+            (&big, b"k"),
+            (b"a", &big),
+        ];
+
+        let mut hasher = KeyHasher::default();
+        for (namespace, name) in cases {
+            let k = namespaced(namespace, name);
+            assert_eq!(KeyHash::of(&k).0, key_hash(&k), "{namespace:?}/{name:?}");
+            assert_eq!(hasher.hash(&k).0, key_hash(&k), "{namespace:?}/{name:?}");
+        }
+        // The pinned vectors, through the new paths as well.
+        assert_eq!(
+            KeyHash::of(&namespaced(b"users", b"alpha")).0,
+            NS_USERS_ALPHA
+        );
+        assert_eq!(KeyHash::of(&namespaced(b"users", b"")).0, NS_USERS_EMPTY);
+        assert_eq!(
+            KeyHash::of(&namespaced(b"\xff\x00", b"beta")).0,
+            NS_BINARY_BETA
+        );
+    }
+
+    #[test]
+    fn hashed_lookups_agree_with_the_key_lookups() {
+        let ring = ring(&["a", "b", "c", "d"]);
+        let mut hasher = KeyHasher::default();
+
+        for i in 0..200 {
+            let k = namespaced(
+                format!("ns-{}", i % 3).as_bytes(),
+                format!("k{i}").as_bytes(),
+            );
+            let hash = hasher.hash(&k);
+            assert_eq!(ring.owners_hashed(hash, 2), ring.owners(&k, 2));
+            for node in ["a", "b", "c", "d", "e"] {
+                assert_eq!(
+                    ring.is_owner_hashed(hash, node, 2),
+                    ring.is_owner(&k, node, 2)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn per_key_hash_work_does_not_scale_with_the_namespace_length() {
+        // Count-based, not wall-clock: bytes fed through FNV for N keys of
+        // one L-byte namespace must be L + sum(|name|) + the 4-byte
+        // prefix, not N x L.
+        const NAMESPACE_LEN: usize = 100_000;
+        const KEYS: usize = 500;
+        let namespace = Bytes::from(vec![b'n'; NAMESPACE_LEN]);
+        let names: Vec<Bytes> = (0..KEYS)
+            .map(|i| Bytes::from(format!("{i:04}").into_bytes()))
+            .collect();
+        let names_len: usize = names.iter().map(Bytes::len).sum();
+
+        let start = hashed_bytes();
+        let mut hasher = KeyHasher::default();
+        for name in &names {
+            hasher.hash(&Key::new(namespace.clone(), name.clone()));
+        }
+        assert_eq!(hashed_bytes() - start, 4 + NAMESPACE_LEN + names_len);
+
+        // The per-key form pays the namespace every time — the cost the
+        // hasher exists to avoid.
+        let start = hashed_bytes();
+        for name in &names {
+            KeyHash::of(&Key::new(namespace.clone(), name.clone()));
+        }
+        assert_eq!(
+            hashed_bytes() - start,
+            KEYS * (4 + NAMESPACE_LEN) + names_len
+        );
+    }
+
+    #[test]
+    fn the_hasher_recomputes_when_the_namespace_changes() {
+        let mut hasher = KeyHasher::default();
+        let a = namespaced(b"aaa", b"k");
+        let b = namespaced(b"bbb", b"k");
+
+        assert_eq!(hasher.hash(&a).0, key_hash(&a));
+        assert_eq!(hasher.hash(&b).0, key_hash(&b));
+        assert_eq!(hasher.hash(&a).0, key_hash(&a));
+        assert_ne!(hasher.hash(&a), hasher.hash(&b));
     }
 
     #[test]

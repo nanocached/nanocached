@@ -28,6 +28,24 @@ framework adapters at one version, whether or not a component changed.
   before. Because an `A` frame must now fit in 4096 bytes, the node refuses
   to start with a `NANOCACHED_AUTH_SECRET` longer than about 4080 bytes
   (discovery's identical cap already ruled such a secret out in a cluster).
+- `nanocached-node`: a multi-key `m`/`o` frame no longer costs (keys x
+  namespace length) on the node's single thread. A namespace can be about
+  1 MiB, and the ownership checks (FNV over the whole namespace) and the
+  cache lookups (SipHash over it) ran once per key, so one frame of 1-byte keys
+  under a ~500 KB namespace hashed tens of gigabytes. The namespace's
+  share of the key hash and its cache entry are now resolved once per
+  frame, and the migration, decommission and re-replication loops hash
+  each distinct namespace once. Placement is unchanged (the hash is
+  byte-identical) and there is no new limit on namespace length.
+- `nanocached-node`: a namespace's name is now charged to `--max-memory`
+  (its length plus a fixed 256-byte overhead, released when the namespace
+  empties or is cleared; the default namespace is not charged). Before, a
+  stream of `s`/`o` writes naming fresh large namespaces with 1-byte keys
+  and values was accounted about 100 bytes apiece while the process held
+  every name, so the memory bound never evicted. Per-namespace
+  `--namespace-budget` accounting and the `/metrics` per-namespace rows are
+  unchanged; the namespace rows now sum to `used_bytes` minus these name
+  charges.
 - `nanocached-node` and `nanocached-proxy`: an `m`/`o` frame whose body arrives
   a few bytes at a time no longer has its (O(keys)) header re-parsed on every
   read. This ran before authentication, so a large header followed by a

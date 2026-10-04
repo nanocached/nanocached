@@ -2,6 +2,7 @@ use crate::key::Key;
 use bytes::Bytes;
 use lru::LruCache;
 use nanocached::infra::constant_time_eq;
+use rustc_hash::FxHashMap;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -42,10 +43,34 @@ struct Entry {
 /// SipHash.
 type Entries = LruCache<Bytes, Entry, RandomState>;
 
+/// Charged to `Cache::used_bytes` once per live *non-default* namespace,
+/// on top of the namespace name's own length: the slot, the index entry
+/// and the `LruCache`'s own allocations, invisible to per-entry
+/// accounting. Without it a stream of `s`/`o` frames naming fresh large
+/// namespaces (a name may be ~1 MiB) with a 1-byte key and value was
+/// accounted ~102 bytes apiece while RSS grew by the whole name, so
+/// `--max-memory` never evicted. A rough, documented estimate like
+/// `ENTRY_OVERHEAD_BYTES`. The default (empty) namespace is a single
+/// process-lifetime sub-map nobody can multiply, so it is not charged.
+pub(crate) const NAMESPACE_OVERHEAD_BYTES: usize = 256;
+
+/// What a live namespace named `name` costs `Cache::used_bytes`.
+fn name_charge(name: &[u8]) -> usize {
+    if name.is_empty() {
+        0
+    } else {
+        name.len() + NAMESPACE_OVERHEAD_BYTES
+    }
+}
+
 /// One namespace's sub-map plus its own byte accounting, so `clear`
 /// (issue #106) can drop the whole thing and credit `Cache::used_bytes`
 /// in O(1) without walking the entries.
 struct Namespace {
+    /// The namespace's own allocation (never a slice of a request frame,
+    /// issue #406). Shared with the `Cache::namespaces` index key by a
+    /// refcount bump, so the name is stored — and charged — once.
+    name: Bytes,
     entries: Entries,
     /// This namespace's share of `Cache::used_bytes`: key + value +
     /// `ENTRY_OVERHEAD_BYTES` per entry, plus the duplicate key bytes of
@@ -53,15 +78,28 @@ struct Namespace {
     /// (`mark_migrated`/`clear_migrated_mark` credit/debit this alongside
     /// the global `Cache::used_bytes`, so the per-namespace rows stay
     /// consistent with the total mid-migration — see `mark_migrated`'s
-    /// own doc comment).
+    /// own doc comment). Excludes the name charge (`name_charge`), so
+    /// `--namespace-budget` semantics are unchanged.
     used_bytes: usize,
+    /// Issue #127: this namespace's `--namespace-budget`, resolved once at
+    /// creation (budgets never change after construction) so the
+    /// per-write budget check needs no lookup keyed by the name.
+    budget: Option<usize>,
+    /// This namespace's entries handed off during a staged join, by key
+    /// name, awaiting `sweep`. Kept per namespace rather than in one
+    /// global `HashSet<Key>` so no mark lookup ever hashes the (up to
+    /// ~1 MiB) namespace name.
+    migrated: HashSet<Bytes, RandomState>,
 }
 
 impl Namespace {
-    fn new() -> Self {
+    fn new(name: Bytes, budget: Option<usize>) -> Self {
         Self {
+            name,
             entries: LruCache::unbounded_with_hasher(RandomState::new()),
             used_bytes: 0,
+            budget,
+            migrated: HashSet::with_hasher(RandomState::new()),
         }
     }
 }
@@ -104,14 +142,34 @@ pub struct NamespaceStats {
 }
 
 pub struct Cache {
-    /// One sub-map per namespace — the default namespace lives under the
-    /// empty key (issue #105). A sub-map exists exactly while it holds at
-    /// least one entry, so the per-eviction scan over namespaces
-    /// (`evict_one`) is bounded by the number of *live* namespaces, and
-    /// `CLEAR <ns>` (issue #106) is a single O(1) sub-map drop. Same
-    /// `RandomState` reasoning as `Entries`: namespace names are
-    /// attacker-controlled too.
-    namespaces: HashMap<Bytes, Namespace, RandomState>,
+    /// Index from namespace name to its slot in `slots`. One sub-map per
+    /// namespace — the default namespace lives under the empty key (issue
+    /// #105). A sub-map exists exactly while it holds at least one entry,
+    /// so the per-eviction scan over namespaces (`evict_one`) is bounded
+    /// by the number of *live* namespaces, and `CLEAR <ns>` (issue #106)
+    /// is a single O(1) sub-map drop. Same `RandomState` reasoning as
+    /// `Entries`: namespace names are attacker-controlled too.
+    ///
+    /// Namespaces are addressed by slot index once resolved, because a
+    /// name can be ~1 MiB and every lookup *by name* hashes and compares
+    /// all of it: a multi-key frame (`m`/`o`) resolves its namespace once
+    /// (`find_namespace`) and then works by index.
+    namespaces: HashMap<Bytes, u64, RandomState>,
+    /// Namespace storage, addressed by the ids in `namespaces`. Ids are
+    /// handed out from `next_slot_id` and never reused, so an id held
+    /// across a namespace's removal can only miss, never alias another
+    /// namespace. Ids are sequential, not attacker-chosen, so a fast
+    /// non-randomized hasher is safe here.
+    slots: FxHashMap<u64, Namespace>,
+    next_slot_id: u64,
+    /// The slot `find_namespace` resolved last. A lookup first checks
+    /// whether the incoming name *is* that slot's own allocation (same
+    /// pointer and length — only keys cloned out of this cache, such as
+    /// `keys()`'s, can be), which makes the loops that walk those keys
+    /// (migration, sweep) hash nothing.
+    last_slot: std::cell::Cell<u64>,
+    /// Total `migrated` marks across namespaces.
+    marked: usize,
     entry_count: usize,
     used_bytes: usize,
     max_memory_bytes: usize,
@@ -151,15 +209,17 @@ pub struct Cache {
     cas_sets: u64,
     /// Issue #141: successful `x` removals — see `CacheStats::cas_deletes`.
     cas_deletes: u64,
-    /// Keys handed off to another node during an staged node join migration this
-    /// node was the source for, awaiting `sweep`'s next pass.
-    migrated: HashSet<Key>,
     /// Expired/marked keys queued for removal by `sweep`, in
-    /// `SWEEP_BUDGET`-sized bites. Refilled (by scanning `namespaces` for
-    /// expired keys and draining `migrated`) only once this drains empty,
+    /// `SWEEP_BUDGET`-sized bites. Refilled (by scanning the namespaces for
+    /// expired keys and collecting their `migrated` marks) only once this drains empty,
     /// so an in-progress sweep pass isn't rescanned from scratch every
     /// call.
     pending_removal: VecDeque<Key>,
+    /// Test-only: how many namespace lookups went by name (hash + compare
+    /// of the whole name) — what a multi-key frame must do once, not per
+    /// key.
+    #[cfg(test)]
+    name_lookups: std::cell::Cell<usize>,
 }
 
 impl Entry {
@@ -284,6 +344,10 @@ impl Cache {
     pub fn with_budgets(max_memory_bytes: usize, budgets: Vec<(Bytes, usize)>) -> Self {
         Self {
             namespaces: HashMap::with_hasher(RandomState::new()),
+            slots: FxHashMap::default(),
+            next_slot_id: 0,
+            last_slot: std::cell::Cell::new(0),
+            marked: 0,
             entry_count: 0,
             used_bytes: 0,
             max_memory_bytes,
@@ -298,8 +362,9 @@ impl Cache {
             incrs: 0,
             cas_sets: 0,
             cas_deletes: 0,
-            migrated: HashSet::new(),
             pending_removal: VecDeque::new(),
+            #[cfg(test)]
+            name_lookups: std::cell::Cell::new(0),
         }
     }
 
@@ -519,11 +584,79 @@ impl Cache {
         self.clock
     }
 
+    /// The slot of `name`'s sub-map, if it is live. A lookup by name hashes
+    /// and compares the whole name (up to ~1 MiB), so it is done once per
+    /// frame by the multi-key paths and never per key; the check against
+    /// `last_slot` keeps loops over keys cloned out of this cache
+    /// (`keys()`) from paying it either.
+    fn find_namespace(&self, name: &Bytes) -> Option<u64> {
+        let hint = self.last_slot.get();
+        if self.slots.get(&hint).is_some_and(|namespace| {
+            // Same allocation and length means the same bytes.
+            namespace.name.as_ptr() == name.as_ptr() && namespace.name.len() == name.len()
+        }) {
+            return Some(hint);
+        }
+
+        #[cfg(test)]
+        self.name_lookups.set(self.name_lookups.get() + 1);
+        let id = self.namespaces.get(&name[..]).copied()?;
+        self.last_slot.set(id);
+        Some(id)
+    }
+
+    /// `find_namespace`, creating the (empty) sub-map if there is none yet
+    /// and charging its name to `used_bytes` (see `NAMESPACE_OVERHEAD_BYTES`).
+    fn ensure_namespace(&mut self, name: &Bytes) -> u64 {
+        if let Some(id) = self.find_namespace(name) {
+            return id;
+        }
+
+        // Issue #406: `name` is sliced zero-copy out of the request frame by
+        // the parser (like the key name and value), so using it as-is for a
+        // *fresh* namespace would pin the whole pipelined receive-buffer
+        // chunk alive for as long as the namespace exists — uncharged to
+        // `used_bytes`, same class of bug the value/key re-copies in
+        // `insert_into` avoid. An already-known namespace is looked up
+        // first so the common case doesn't pay for a copy it doesn't need.
+        let name = Bytes::copy_from_slice(name);
+        let budget = self.budgets.get(&name).copied();
+        let id = self.next_slot_id;
+        self.next_slot_id += 1;
+
+        self.used_bytes += name_charge(&name);
+        self.namespaces.insert(name.clone(), id);
+        self.slots.insert(id, Namespace::new(name, budget));
+        self.last_slot.set(id);
+        id
+    }
+
+    /// Removes the (empty) sub-map in slot `id` and releases its name
+    /// charge.
+    fn drop_namespace(&mut self, id: u64) {
+        let namespace = self
+            .slots
+            .remove(&id)
+            .expect("the namespace being dropped is live");
+        self.namespaces.remove(&namespace.name[..]);
+        self.used_bytes -= name_charge(&namespace.name);
+    }
+
     /// The shared accounting-safe overwrite path for every write: `set`/
     /// `set_with_ttl` (which bump `self.sets`) and `incr_at` (which bumps
     /// `self.incrs` instead — see its own doc comment for why counting an
     /// INCR as a `sets_total` GET/SET-shaped write would be misleading).
     fn insert(&mut self, key: Key, value: Bytes, expires_at: Option<Instant>) {
+        let id = self.ensure_namespace(&key.namespace);
+        self.insert_into(id, key.name, value, expires_at);
+    }
+
+    /// `insert` into an already-resolved namespace (`ensure_namespace`):
+    /// what a multi-key frame calls per key so the namespace name is
+    /// resolved once for the whole frame. Eviction can never remove
+    /// namespace `id` itself here — it always holds the entry just written,
+    /// which is its most-recently-used and so never the one evicted.
+    fn insert_into(&mut self, id: u64, name: Bytes, value: Bytes, expires_at: Option<Instant>) {
         // Entries stored long-term must not keep a shared receive-buffer
         // chunk (which may span an entire pipelined batch) alive just to
         // retain a few bytes of it, so re-copy into right-sized allocations
@@ -538,37 +671,26 @@ impl Cache {
             last_used,
         };
 
+        let namespace = self
+            .slots
+            .get_mut(&id)
+            .expect("the namespace was resolved just before this write");
+
         // A fresh write is not the value a handoff transferred: a stale
         // `migrated` mark left over from an earlier value must not condemn
         // this one to the next sweep (it would silently delete it).
-        self.clear_migrated_mark(&key);
-
-        // Issue #406: `key.namespace` is sliced zero-copy out of the
-        // request frame by the parser (like `key.name` and `value` above),
-        // so using it as-is for a *fresh* namespace's map key would pin
-        // the whole pipelined receive-buffer chunk alive for as long as
-        // the namespace exists — uncharged to `used_bytes`, same class of
-        // bug `value`/`key.name` are re-copied above to avoid. An
-        // already-known namespace is looked up first so the common case
-        // (an existing namespace) doesn't pay for a copy it doesn't need.
-        let namespace = if let Some(namespace) = self.namespaces.get_mut(&key.namespace) {
-            namespace
-        } else {
-            self.namespaces
-                .entry(Bytes::copy_from_slice(&key.namespace))
-                .or_insert_with(Namespace::new)
-        };
+        Self::release_mark(namespace, &name, &mut self.used_bytes, &mut self.marked);
 
         // An overwrite keeps the stored key (`LruCache::put` would too, and
         // discard the copy), so only copy the key for a genuinely new
         // entry. `get_mut` promotes to most-recently-used like `put`.
-        if let Some(existing) = namespace.entries.get_mut(&key.name[..]) {
+        if let Some(existing) = namespace.entries.get_mut(&name[..]) {
             let replaced = std::mem::replace(existing, entry);
             let delta = value_len as isize - replaced.value.len() as isize;
             namespace.used_bytes = namespace.used_bytes.wrapping_add_signed(delta);
             self.used_bytes = self.used_bytes.wrapping_add_signed(delta);
         } else {
-            let name = Bytes::copy_from_slice(&key.name);
+            let name = Bytes::copy_from_slice(&name);
             let entry_bytes = name.len() + value_len + ENTRY_OVERHEAD_BYTES;
             namespace.entries.put(name, entry);
             namespace.used_bytes += entry_bytes;
@@ -581,7 +703,7 @@ impl Cache {
         // never has to make an innocent namespace pay for this one's
         // churn. Runs on overwrites too (a grown value can breach the
         // budget just like a new entry).
-        self.enforce_namespace_budget(&key.namespace);
+        self.enforce_namespace_budget(id);
 
         // Evict least-recently-used entries until the cache fits its memory
         // budget, but never evict the entry just inserted above: it is
@@ -592,25 +714,90 @@ impl Cache {
         }
     }
 
+    /// Batched `set`/`set_with_ttl` for one namespace (a multi-key `o`
+    /// frame): the namespace's name is hashed once for the whole batch
+    /// instead of once per key, which for a ~1 MiB name made one frame of
+    /// tiny keys cost gigabytes of hashing on the single cache actor. Each
+    /// item is otherwise exactly one `set`/`set_with_ttl` (same counters,
+    /// accounting and eviction).
+    pub fn set_many(
+        &mut self,
+        namespace: &Bytes,
+        items: impl IntoIterator<Item = (Bytes, Bytes)>,
+        ttl: Option<Duration>,
+    ) {
+        // Same TTL-overflow stance as `set_with_ttl`.
+        let expires_at = ttl.and_then(|ttl| Instant::now().checked_add(ttl));
+        let mut id = None;
+
+        for (name, value) in items {
+            self.sets += 1;
+            // Re-validated per key, as a stale id would otherwise panic;
+            // a slot id is never reused, so this is one integer lookup.
+            let live = match id {
+                Some(id) if self.slots.contains_key(&id) => id,
+                _ => self.ensure_namespace(namespace),
+            };
+            id = Some(live);
+            self.insert_into(live, name, value, expires_at);
+        }
+    }
+
+    /// Batched `get` for one namespace (a multi-key `m` frame), resolving
+    /// the namespace once — see `set_many`. Replies in `names` order.
+    /// Once the values returned so far reach `max_value_bytes`, the
+    /// remaining names are answered `None` without being looked up (no
+    /// recency or hit/miss effect), and a hit that would push the total
+    /// past it is answered `None` too (but is still counted as a hit).
+    pub fn get_many(
+        &mut self,
+        namespace: &Bytes,
+        names: &[Bytes],
+        max_value_bytes: usize,
+    ) -> Vec<Option<Bytes>> {
+        let now = Instant::now();
+        let id = self.find_namespace(namespace);
+        let mut value_bytes: usize = 0;
+        let mut results = Vec::with_capacity(names.len());
+
+        for name in names {
+            if value_bytes >= max_value_bytes {
+                results.push(None);
+                continue;
+            }
+
+            let last_used = self.tick();
+            let value = self.get_in(id, name, now, last_used);
+            match value {
+                Some(value) if value_bytes + value.len() <= max_value_bytes => {
+                    value_bytes += value.len();
+                    results.push(Some(value));
+                }
+                Some(_) | None => results.push(None),
+            }
+        }
+
+        results
+    }
+
     /// Issue #127: evicts this namespace's least-recently-used entries
     /// until it fits its `--namespace-budget`, if it has one. Mirrors the
     /// global loop's one-entry floor: the entry just inserted is its
     /// namespace's most-recently-used, so it survives even when it alone
     /// exceeds the budget (exactly how a single oversized entry is
     /// allowed to exceed `--max-memory`).
-    fn enforce_namespace_budget(&mut self, namespace_name: &Bytes) {
-        let Some(&budget) = self.budgets.get(namespace_name) else {
-            return;
-        };
-
+    fn enforce_namespace_budget(&mut self, id: u64) {
         loop {
-            let Some(namespace) = self.namespaces.get(namespace_name) else {
+            let Some(namespace) = self.slots.get(&id) else {
+                return;
+            };
+            let Some(budget) = namespace.budget else {
                 return;
             };
             if namespace.used_bytes <= budget || namespace.entries.len() <= 1 {
                 return;
             }
-            self.evict_one_from(namespace_name.clone());
+            self.evict_one_from(id);
         }
     }
 
@@ -619,33 +806,35 @@ impl Cache {
     /// the oldest of the sub-maps' tails by `Entry::last_used`. O(number
     /// of live namespaces) per eviction — a handful for the framework
     /// named-cache workloads namespaces exist for (issue #105), and only
-    /// ever paid while over the memory bound.
+    /// ever paid while over the memory bound. Each live namespace now
+    /// costs its name plus `NAMESPACE_OVERHEAD_BYTES` against that bound,
+    /// so the count is itself bounded by `--max-memory`.
     fn evict_one(&mut self) {
-        let victim_namespace = self
-            .namespaces
+        let victim = self
+            .slots
             .iter()
-            .filter_map(|(name, namespace)| {
+            .filter_map(|(id, namespace)| {
                 namespace
                     .entries
                     .peek_lru()
-                    .map(|(_, entry)| (entry.last_used, name))
+                    .map(|(_, entry)| (entry.last_used, *id))
             })
             .min_by_key(|(last_used, _)| *last_used)
-            .map(|(_, namespace)| namespace.clone())
+            .map(|(_, id)| id)
             .expect("entry_count > 1 guarantees an entry to evict");
 
-        self.evict_one_from(victim_namespace);
+        self.evict_one_from(victim);
     }
 
-    /// Removes `namespace_name`'s least-recently-used entry — the shared
+    /// Removes namespace `id`'s least-recently-used entry — the shared
     /// tail of the global `evict_one` (which picks the victim namespace
     /// first) and the per-namespace budget loop (issue #127, where the
     /// victim namespace is the one over its budget).
-    fn evict_one_from(&mut self, namespace_name: Bytes) {
+    fn evict_one_from(&mut self, id: u64) {
         self.evictions += 1;
         let namespace = self
-            .namespaces
-            .get_mut(&namespace_name)
+            .slots
+            .get_mut(&id)
             .expect("the victim namespace exists");
         let (evicted_name, evicted_entry) = namespace
             .entries
@@ -653,30 +842,47 @@ impl Cache {
             .expect("the victim namespace is non-empty");
         let entry_bytes = evicted_name.len() + evicted_entry.value.len() + ENTRY_OVERHEAD_BYTES;
         namespace.used_bytes -= entry_bytes;
-        if namespace.entries.is_empty() {
-            self.namespaces.remove(&namespace_name);
-        }
-
         self.entry_count -= 1;
         self.used_bytes -= entry_bytes;
         // The marked value is gone; a future entry under this key is a
         // different value and must not inherit the mark.
-        self.clear_migrated_mark(&Key::new(namespace_name, evicted_name));
+        Self::release_mark(
+            namespace,
+            &evicted_name,
+            &mut self.used_bytes,
+            &mut self.marked,
+        );
+        if namespace.entries.is_empty() {
+            self.drop_namespace(id);
+        }
     }
 
     fn get_at(&mut self, key: &Key, now: Instant) -> Option<Bytes> {
         let last_used = self.tick();
-        let Some(entry) = self
-            .namespaces
-            .get_mut(&key.namespace)
-            .and_then(|namespace| namespace.entries.get_mut(&key.name[..]))
+        let id = self.find_namespace(&key.namespace);
+        self.get_in(id, &key.name, now, last_used)
+    }
+
+    /// `get_at` against an already-resolved namespace (`None`: no such
+    /// namespace, so a miss). `last_used` is the tick the caller took for
+    /// this lookup.
+    fn get_in(
+        &mut self,
+        id: Option<u64>,
+        name: &[u8],
+        now: Instant,
+        last_used: u64,
+    ) -> Option<Bytes> {
+        let Some(entry) = id
+            .and_then(|id| self.slots.get_mut(&id))
+            .and_then(|namespace| namespace.entries.get_mut(name))
         else {
             self.misses += 1;
             return None;
         };
 
         if entry.is_expired_at(now) {
-            self.remove_entry(key);
+            self.remove_entry_in(id.expect("an entry was found in it"), name);
             self.expirations += 1;
             self.misses += 1;
             return None;
@@ -700,47 +906,71 @@ impl Cache {
 
     /// `LruCache::peek` through the namespace: no recency change.
     fn peek(&self, key: &Key) -> Option<&Entry> {
-        self.namespaces
-            .get(&key.namespace)?
-            .entries
-            .peek(&key.name[..])
+        let id = self.find_namespace(&key.namespace)?;
+        self.slots.get(&id)?.entries.peek(&key.name[..])
     }
 
+    #[cfg(test)]
     fn contains(&self, key: &Key) -> bool {
         self.peek(key).is_some()
     }
 
     fn remove_entry(&mut self, key: &Key) -> Option<Entry> {
-        let namespace = self.namespaces.get_mut(&key.namespace)?;
-        let entry = namespace.entries.pop(&key.name[..])?;
-        let entry_bytes = key.name.len() + entry.value.len() + ENTRY_OVERHEAD_BYTES;
+        let id = self.find_namespace(&key.namespace)?;
+        self.remove_entry_in(id, &key.name)
+    }
+
+    fn remove_entry_in(&mut self, id: u64, name: &[u8]) -> Option<Entry> {
+        let namespace = self.slots.get_mut(&id)?;
+        let entry = namespace.entries.pop(name)?;
+        let entry_bytes = name.len() + entry.value.len() + ENTRY_OVERHEAD_BYTES;
         namespace.used_bytes -= entry_bytes;
-        if namespace.entries.is_empty() {
-            self.namespaces.remove(&key.namespace);
-        }
         self.entry_count -= 1;
         self.used_bytes -= entry_bytes;
         // The mark referred to this entry's value; whatever is stored
         // under the key later is a different value.
-        self.clear_migrated_mark(key);
+        Self::release_mark(namespace, name, &mut self.used_bytes, &mut self.marked);
+        if namespace.entries.is_empty() {
+            self.drop_namespace(id);
+        }
         Some(entry)
     }
 
-    /// Removes any mark for `key` from `migrated`, crediting `used_bytes`
-    /// back for the duplicate key copy `mark_migrated` stored there — a
-    /// no-op, memory accounting included, if `key` wasn't marked.
+    /// Removes any mark for `name` from `namespace`, crediting `used_bytes`
+    /// (and the namespace's own share) back for the duplicate key copy
+    /// `mark_migrated` stored there — a no-op, memory accounting included,
+    /// if `name` wasn't marked.
+    fn release_mark(
+        namespace: &mut Namespace,
+        name: &[u8],
+        used_bytes: &mut usize,
+        marked: &mut usize,
+    ) {
+        if namespace.migrated.is_empty() {
+            return;
+        }
+        if namespace.migrated.remove(name) {
+            let mark_bytes = namespace.name.len() + name.len();
+            namespace.used_bytes -= mark_bytes;
+            *used_bytes -= mark_bytes;
+            *marked -= 1;
+        }
+    }
+
+    /// Whether `key` is currently `migrated`-marked.
+    fn is_marked(&self, key: &Key) -> bool {
+        self.find_namespace(&key.namespace)
+            .and_then(|id| self.slots.get(&id))
+            .is_some_and(|namespace| namespace.migrated.contains(&key.name[..]))
+    }
+
+    /// Removes any mark for `key` — see `release_mark`.
     fn clear_migrated_mark(&mut self, key: &Key) {
-        if self.migrated.remove(key) {
-            let mark_bytes = key.namespace.len() + key.name.len();
-            self.used_bytes -= mark_bytes;
-            // Mirror `mark_migrated`'s per-namespace credit. The sub-map is
-            // absent only when this same removal just emptied it — the
-            // eviction/removal callers drop the namespace (which still held
-            // this mark's bytes) before calling here, so there is nothing
-            // left to subtract in that case.
-            if let Some(namespace) = self.namespaces.get_mut(&key.namespace) {
-                namespace.used_bytes -= mark_bytes;
-            }
+        if let Some(namespace) = self
+            .find_namespace(&key.namespace)
+            .and_then(|id| self.slots.get_mut(&id))
+        {
+            Self::release_mark(namespace, &key.name, &mut self.used_bytes, &mut self.marked);
         }
     }
 
@@ -797,14 +1027,14 @@ impl Cache {
     }
 
     fn keys_at(&self, now: Instant) -> Vec<Key> {
-        self.namespaces
-            .iter()
-            .flat_map(|(namespace, sub_map)| {
+        self.slots
+            .values()
+            .flat_map(|sub_map| {
                 sub_map
                     .entries
                     .iter()
                     .filter(move |(_, entry)| !entry.is_expired_at(now))
-                    .map(move |(name, _)| Key::new(namespace.clone(), name.clone()))
+                    .map(move |(name, _)| Key::new(sub_map.name.clone(), name.clone()))
             })
             .collect()
     }
@@ -837,23 +1067,29 @@ impl Cache {
 
     /// Marks `key` as handed off during an staged node join migration this node
     /// was the source for. A no-op if the key is already marked or no
-    /// longer present; `sweep` reclaims marked entries later. `migrated`
-    /// holds its own copy of the key bytes (see its field docs), so a
-    /// freshly marked key costs `used_bytes` an extra namespace+name
-    /// length — the audit behind issue #19 flagged this duplicate as
-    /// otherwise invisible to the memory limit.
+    /// longer present; `sweep` reclaims marked entries later. The
+    /// namespace's `migrated` set holds its own copy of the key name (see
+    /// its field docs), and a freshly marked key is charged an extra
+    /// namespace+name length — the audit behind issue #19 flagged this
+    /// duplicate as otherwise invisible to the memory limit.
     pub fn mark_migrated(&mut self, key: &Key) {
-        if self.contains(key) && self.migrated.insert(key.clone()) {
-            let mark_bytes = key.namespace.len() + key.name.len();
+        let Some(namespace) = self
+            .find_namespace(&key.namespace)
+            .and_then(|id| self.slots.get_mut(&id))
+        else {
+            return;
+        };
+
+        if namespace.entries.contains(&key.name[..]) && namespace.migrated.insert(key.name.clone())
+        {
+            let mark_bytes = namespace.name.len() + key.name.len();
             self.used_bytes += mark_bytes;
+            self.marked += 1;
             // Credit the owning namespace too, so per-namespace accounting
             // (`stats`'s `/metrics` rows and `--namespace-budget`) stays
             // consistent with the global total mid-migration instead of the
-            // namespace rows summing to less than `used_bytes`. `contains`
-            // above guarantees the sub-map exists here.
-            if let Some(namespace) = self.namespaces.get_mut(&key.namespace) {
-                namespace.used_bytes += mark_bytes;
-            }
+            // namespace rows summing to less than `used_bytes`.
+            namespace.used_bytes += mark_bytes;
         }
     }
 
@@ -873,13 +1109,13 @@ impl Cache {
     /// namespaces) — never a walk over entries.
     pub fn stats(&self) -> CacheStats {
         let mut namespaces: Vec<NamespaceStats> = self
-            .namespaces
-            .iter()
-            .map(|(name, sub_map)| NamespaceStats {
-                namespace: name.clone(),
+            .slots
+            .values()
+            .map(|sub_map| NamespaceStats {
+                namespace: sub_map.name.clone(),
                 entries: sub_map.entries.len(),
                 used_bytes: sub_map.used_bytes,
-                budget_bytes: self.budgets.get(name).copied(),
+                budget_bytes: sub_map.budget,
             })
             .collect();
         // Deterministic output order (HashMap iteration isn't), largest
@@ -912,27 +1148,28 @@ impl Cache {
     /// rather than scanning and unlinking entries one by one (which would
     /// stall every other command on the single-threaded cache actor for
     /// the whole walk, the Redis `KEYS` foot-gun). Returns how many
-    /// entries went. The namespace's `migrated` marks go with it — the
-    /// values they referred to no longer exist, and a mark must never
-    /// outlive its value (a later write under the same key would
-    /// otherwise inherit it and be swept, see `insert`). That retain is
-    /// O(marks), and marks only exist while a handoff is in flight.
+    /// entries went. The namespace's `migrated` marks go with it (they
+    /// live in the sub-map) — the values they referred to no longer exist,
+    /// and a mark must never outlive its value (a later write under the
+    /// same key would otherwise inherit it and be swept, see `insert`).
     pub fn clear(&mut self, namespace: &[u8]) -> usize {
-        let Some(dropped) = self.namespaces.remove(namespace) else {
+        let Some(id) = self.namespaces.remove(namespace) else {
             return 0;
         };
+        let dropped = self
+            .slots
+            .remove(&id)
+            .expect("an indexed namespace has a slot");
 
         let removed = dropped.entries.len();
         self.entry_count -= removed;
         // `dropped.used_bytes` already includes this namespace's `migrated`
         // mark bytes (`mark_migrated` credits them to the sub-map), so this
-        // one subtraction covers entries and marks alike. The marks are then
-        // dropped from the set directly — crediting `used_bytes` per mark
-        // here would double-subtract bytes this line already reclaimed. That
-        // retain is O(marks), and marks only exist while a handoff is in
-        // flight.
-        self.used_bytes -= dropped.used_bytes;
-        self.migrated.retain(|key| &key.namespace[..] != namespace);
+        // one subtraction covers entries and marks alike — crediting
+        // `used_bytes` per mark here would double-subtract bytes this line
+        // already reclaimed. The name's own charge is released alongside.
+        self.used_bytes -= dropped.used_bytes + name_charge(&dropped.name);
+        self.marked -= dropped.migrated.len();
 
         removed
     }
@@ -942,11 +1179,12 @@ impl Cache {
     pub fn clear_all(&mut self) -> usize {
         let removed = self.entry_count;
         self.namespaces.clear();
+        self.slots.clear();
         self.entry_count = 0;
         self.used_bytes = 0;
-        self.migrated.clear();
-        // `used_bytes` is already 0; the marks' duplicate bytes went with
-        // everything else.
+        self.marked = 0;
+        // `used_bytes` is already 0; the marks' duplicate bytes and the
+        // namespace name charges went with everything else.
         removed
     }
 
@@ -978,19 +1216,25 @@ impl Cache {
     fn sweep_at(&mut self, now: Instant, include_marked: bool) -> usize {
         if self.pending_removal.is_empty() {
             self.pending_removal
-                .extend(self.namespaces.iter().flat_map(|(namespace, sub_map)| {
+                .extend(self.slots.values().flat_map(|sub_map| {
                     sub_map
                         .entries
                         .iter()
                         .filter(move |(_, entry)| entry.is_expired_at(now))
-                        .map(move |(name, _)| Key::new(namespace.clone(), name.clone()))
+                        .map(move |(name, _)| Key::new(sub_map.name.clone(), name.clone()))
                 }));
             // Marks stay in `migrated` until the moment of removal (not
             // drained here): the queue is only a snapshot of candidates,
             // and a key rewritten after this point clears its mark, which
             // the removability re-check below must still observe.
             if include_marked {
-                self.pending_removal.extend(self.migrated.iter().cloned());
+                self.pending_removal
+                    .extend(self.slots.values().flat_map(|sub_map| {
+                        sub_map
+                            .migrated
+                            .iter()
+                            .map(move |name| Key::new(sub_map.name.clone(), name.clone()))
+                    }));
             }
         }
 
@@ -1005,7 +1249,7 @@ impl Cache {
             // the key may have been rewritten (mark cleared, or no longer
             // expired) since it was queued, and a fresh value must never
             // be swept on the strength of an old candidate entry.
-            let marked = include_marked && self.migrated.contains(&key);
+            let marked = include_marked && self.is_marked(&key);
             let expired = self
                 .peek(&key)
                 .is_some_and(|entry| entry.is_expired_at(now));
@@ -1895,7 +2139,7 @@ mod tests {
         // namespace's oldest entry is still the global victim when the
         // whole cache is over --max-memory.
         let mut cache = Cache::with_budgets(
-            2 * SMALL_ENTRY,
+            2 * SMALL_ENTRY + name_charge(b"hot") + name_charge(b"cold"),
             vec![(Bytes::from_static(b"hot"), 10 * SMALL_ENTRY)],
         );
 
@@ -1931,8 +2175,10 @@ mod tests {
     #[test]
     fn eviction_is_least_recently_used_across_namespaces() {
         // Each entry: 2-byte key + 4-byte value + overhead = 106; room for
-        // exactly three.
-        let mut cache = Cache::new(3 * 106);
+        // exactly three, plus the three non-default namespaces' name
+        // charges.
+        let mut cache =
+            Cache::new(3 * 106 + name_charge(b"x") + name_charge(b"y") + name_charge(b"z"));
 
         cache.set(namespaced(b"x", b"k1"), Bytes::from_static(b"vvvv"));
         cache.set(namespaced(b"y", b"k2"), Bytes::from_static(b"vvvv"));
@@ -1959,7 +2205,7 @@ mod tests {
 
     #[test]
     fn eviction_follows_recency_within_a_namespace_too() {
-        let mut cache = Cache::new(3 * 106);
+        let mut cache = Cache::new(3 * 106 + name_charge(b"x") + name_charge(b"y"));
 
         cache.set(namespaced(b"x", b"k1"), Bytes::from_static(b"vvvv"));
         cache.set(namespaced(b"x", b"k2"), Bytes::from_static(b"vvvv"));
@@ -2030,7 +2276,10 @@ mod tests {
         assert_eq!(cache.namespaces.len(), 1);
         assert_eq!(
             cache.used_bytes,
-            before - (1 + 2 + ENTRY_OVERHEAD_BYTES) - (1 + 3 + ENTRY_OVERHEAD_BYTES)
+            before
+                - (1 + 2 + ENTRY_OVERHEAD_BYTES)
+                - (1 + 3 + ENTRY_OVERHEAD_BYTES)
+                - name_charge(b"users")
         );
         assert_eq!(cache.get(&namespaced(b"users", b"a")), None);
         assert_eq!(cache.get(&key(b"a")), Some(Bytes::from_static(b"1")));
@@ -2066,7 +2315,7 @@ mod tests {
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.used_bytes, 0);
         assert!(cache.namespaces.is_empty());
-        assert!(cache.migrated.is_empty());
+        assert_eq!(cache.marked, 0);
         assert_eq!(cache.get(&key(b"a")), None);
     }
 
@@ -2084,7 +2333,7 @@ mod tests {
         // entry's own.
         assert_eq!(
             cache.used_bytes,
-            marked_bytes - (5 + 1) - (1 + 3 + ENTRY_OVERHEAD_BYTES)
+            marked_bytes - (5 + 1) - (1 + 3 + ENTRY_OVERHEAD_BYTES) - name_charge(b"users")
         );
 
         cache.set(namespaced(b"users", b"a"), Bytes::from_static(b"new"));
@@ -2109,7 +2358,7 @@ mod tests {
             Bytes::from_static(b"much-longer-value"),
         );
         cache.set(namespaced(b"y", b"k"), Bytes::from_static(b"vvvv"));
-        let y_bytes = 1 + 4 + ENTRY_OVERHEAD_BYTES;
+        let y_bytes = 1 + 4 + ENTRY_OVERHEAD_BYTES + name_charge(b"y");
 
         cache.clear(b"x");
         assert_eq!(cache.used_bytes, y_bytes);
@@ -2278,10 +2527,14 @@ mod tests {
         // lifecycle: mark, unmark, overwrite, eviction, and CLEAR.
         let consistent = |cache: &Cache| {
             let stats = cache.stats();
-            let per_ns: usize = stats.namespaces.iter().map(|n| n.used_bytes).sum();
+            let per_ns: usize = stats
+                .namespaces
+                .iter()
+                .map(|n| n.used_bytes + name_charge(&n.namespace))
+                .sum();
             assert_eq!(
                 per_ns, stats.used_bytes,
-                "namespace rows must sum to the global used_bytes"
+                "namespace rows (plus their name charges) must sum to the global used_bytes"
             );
         };
 
@@ -2313,7 +2566,7 @@ mod tests {
         // clearing the mark, so the per-namespace credit must not be
         // double-subtracted. A budget tight enough to force an eviction of
         // a marked, still-present entry exercises exactly that ordering.
-        let mut cache = Cache::new(2 * (2 + ENTRY_OVERHEAD_BYTES));
+        let mut cache = Cache::new(2 * (2 + ENTRY_OVERHEAD_BYTES) + name_charge(b"ns"));
         cache.set(namespaced(b"ns", b"a"), Bytes::from_static(b"1"));
         cache.mark_migrated(&namespaced(b"ns", b"a"));
         // Inserting past the budget evicts the marked "a".
@@ -2321,7 +2574,7 @@ mod tests {
 
         let stats = cache.stats();
         let per_ns: usize = stats.namespaces.iter().map(|n| n.used_bytes).sum();
-        assert_eq!(per_ns, stats.used_bytes);
+        assert_eq!(per_ns + name_charge(b"ns"), stats.used_bytes);
         assert_eq!(cache.get(&namespaced(b"ns", b"a")), None);
     }
 
@@ -2612,5 +2865,351 @@ mod tests {
         let elapsed = start.elapsed();
 
         eprintln!("scanned 1_000_000 non-expired TTL'd entries, removed {removed}, in {elapsed:?}");
+    }
+
+    // Issue: namespace-length cost. A namespace name may be ~1 MiB, so
+    // anything that resolves it per key makes one frame of tiny keys cost
+    // (keys x name length) bytes of hashing on the single cache actor.
+
+    fn big_namespace(len: usize) -> Bytes {
+        Bytes::from(vec![b'n'; len])
+    }
+
+    fn names(count: usize) -> Vec<Bytes> {
+        (0..count)
+            .map(|i| Bytes::from(format!("k{i}").into_bytes()))
+            .collect()
+    }
+
+    #[test]
+    fn set_many_resolves_the_namespace_once_however_many_keys() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = big_namespace(64 * 1024);
+        let names = names(2_000);
+
+        cache.set_many(
+            &namespace,
+            names
+                .iter()
+                .cloned()
+                .map(|name| (name, Bytes::from_static(b"v"))),
+            None,
+        );
+
+        // One lookup to find (and then create) the namespace — not one per
+        // key, which would be 2_000.
+        assert_eq!(cache.name_lookups.get(), 1);
+        assert_eq!(cache.len(), 2_000);
+    }
+
+    #[test]
+    fn get_many_resolves_the_namespace_once_however_many_keys() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = big_namespace(64 * 1024);
+        let names = names(2_000);
+        cache.set_many(
+            &namespace,
+            names
+                .iter()
+                .cloned()
+                .map(|name| (name, Bytes::from_static(b"v"))),
+            None,
+        );
+        let before = cache.name_lookups.get();
+
+        let results = cache.get_many(&namespace, &names, UNBOUNDED);
+
+        assert_eq!(cache.name_lookups.get() - before, 1);
+        assert!(
+            results
+                .iter()
+                .all(|value| value.as_deref() == Some(&b"v"[..]))
+        );
+    }
+
+    #[test]
+    fn set_many_resolves_once_even_while_evicting_and_budget_trimming() {
+        // The evicting steady state is where a re-resolve-after-eviction
+        // design would pay per key: every write here evicts, and the
+        // namespace is budgeted too.
+        let namespace = big_namespace(4 * 1024);
+        let mut cache = Cache::with_budgets(
+            10 * (3 + 1 + ENTRY_OVERHEAD_BYTES) + name_charge(&namespace),
+            vec![(namespace.clone(), 5 * (3 + 1 + ENTRY_OVERHEAD_BYTES))],
+        );
+        let names = names(500);
+
+        cache.set_many(
+            &namespace,
+            names
+                .iter()
+                .cloned()
+                .map(|name| (name, Bytes::from_static(b"v"))),
+            None,
+        );
+
+        assert_eq!(cache.name_lookups.get(), 1);
+        assert!(cache.evictions >= 400);
+        assert!(cache.len() <= 5);
+    }
+
+    #[test]
+    fn keys_walks_do_not_hash_the_namespace_per_key() {
+        // Migration, decommission and sweep loops work over `keys()`,
+        // whose namespaces are clones of the stored allocation; peeking
+        // and marking them must not hash the name each time.
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = big_namespace(64 * 1024);
+        cache.set_many(
+            &namespace,
+            names(1_000)
+                .into_iter()
+                .map(|name| (name, Bytes::from_static(b"v"))),
+            None,
+        );
+        let before = cache.name_lookups.get();
+
+        for key in cache.keys() {
+            assert!(cache.peek_entry(&key).is_some());
+            cache.mark_migrated(&key);
+        }
+
+        assert_eq!(cache.name_lookups.get(), before);
+        assert_eq!(cache.marked, 1_000);
+    }
+
+    #[test]
+    fn sweep_does_not_hash_the_namespace_per_key() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = big_namespace(64 * 1024);
+        cache.set_many(
+            &namespace,
+            names(1_000)
+                .into_iter()
+                .map(|name| (name, Bytes::from_static(b"v"))),
+            None,
+        );
+        for key in cache.keys() {
+            cache.mark_migrated(&key);
+        }
+        let before = cache.name_lookups.get();
+
+        let removed = cache.sweep();
+
+        assert_eq!(removed, 1_000);
+        assert_eq!(cache.name_lookups.get(), before);
+        assert_eq!(cache.used_bytes, 0);
+    }
+
+    #[test]
+    fn batched_writes_and_reads_match_the_per_key_path() {
+        // Differential: same results, counters and accounting as the same
+        // operations one key at a time, across a mark, an overwrite, a
+        // TTL, a tight memory bound and a budget.
+        let namespace = Bytes::from_static(b"users");
+        let build = || {
+            Cache::with_budgets(
+                6 * (3 + 2 + ENTRY_OVERHEAD_BYTES) + name_charge(&namespace),
+                vec![(namespace.clone(), 4 * (3 + 2 + ENTRY_OVERHEAD_BYTES))],
+            )
+        };
+        let mut batched = build();
+        let mut single = build();
+        let items: Vec<(Bytes, Bytes)> = (0..12)
+            .map(|i| {
+                (
+                    Bytes::from(format!("k{}", i % 9).into_bytes()),
+                    Bytes::from(format!("v{}", i % 10).into_bytes()),
+                )
+            })
+            .collect();
+
+        for cache in [&mut batched, &mut single] {
+            cache.set(
+                Key::new(namespace.clone(), Bytes::from_static(b"k0")),
+                Bytes::from_static(b"zz"),
+            );
+            cache.mark_migrated(&Key::new(namespace.clone(), Bytes::from_static(b"k0")));
+        }
+        batched.set_many(
+            &namespace,
+            items.iter().cloned(),
+            Some(Duration::from_secs(60)),
+        );
+        for (name, value) in &items {
+            single.set_with_ttl(
+                Key::new(namespace.clone(), name.clone()),
+                value.clone(),
+                Duration::from_secs(60),
+            );
+        }
+
+        let probe: Vec<Bytes> = (0..10)
+            .map(|i| Bytes::from(format!("k{i}").into_bytes()))
+            .collect();
+        let batched_reads = batched.get_many(&namespace, &probe, UNBOUNDED);
+        let single_reads: Vec<Option<Bytes>> = probe
+            .iter()
+            .map(|name| single.get(&Key::new(namespace.clone(), name.clone())))
+            .collect();
+
+        assert_eq!(batched_reads, single_reads);
+        assert_eq!(batched.used_bytes, single.used_bytes);
+        assert_eq!(batched.entry_count, single.entry_count);
+        assert_eq!(batched.marked, single.marked);
+        let (a, b) = (batched.stats(), single.stats());
+        assert_eq!(
+            (a.hits, a.misses, a.sets, a.evictions),
+            (b.hits, b.misses, b.sets, b.evictions)
+        );
+        assert_eq!(a.namespaces, b.namespaces);
+    }
+
+    #[test]
+    fn get_many_caps_the_values_it_returns_and_skips_lookups_past_the_cap() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = Bytes::from_static(b"ns");
+        cache.set_many(
+            &namespace,
+            names(4)
+                .into_iter()
+                .map(|name| (name, Bytes::from_static(b"vvvv"))),
+            None,
+        );
+        let hits_before = cache.hits;
+
+        // Room for two 4-byte values: the third is skipped unlooked-up.
+        let results = cache.get_many(&namespace, &names(4), 8);
+
+        assert_eq!(results.iter().filter(|value| value.is_some()).count(), 2);
+        assert_eq!(cache.hits - hits_before, 2);
+    }
+
+    #[test]
+    fn get_many_on_a_missing_namespace_is_all_misses() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        let results = cache.get_many(&Bytes::from_static(b"nope"), &names(3), UNBOUNDED);
+
+        assert_eq!(results, vec![None, None, None]);
+        assert_eq!(cache.misses, 3);
+    }
+
+    #[test]
+    fn get_many_survives_its_namespace_emptying_on_lazy_expiry() {
+        // The first key's lazy expiry removes the namespace's only entry,
+        // dropping the sub-map mid-batch; later names must simply miss.
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = Bytes::from_static(b"ns");
+        cache.set_with_ttl(
+            Key::new(namespace.clone(), Bytes::from_static(b"k0")),
+            Bytes::from_static(b"v"),
+            Duration::from_millis(1),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+
+        let results = cache.get_many(&namespace, &names(3), UNBOUNDED);
+
+        assert_eq!(results, vec![None, None, None]);
+        assert!(cache.namespaces.is_empty());
+        assert_eq!(cache.used_bytes, 0);
+    }
+
+    #[test]
+    fn a_namespace_name_is_charged_to_used_bytes_and_released_with_it() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = big_namespace(10_000);
+        let name = Bytes::from_static(b"k");
+
+        cache.set(
+            Key::new(namespace.clone(), name.clone()),
+            Bytes::from_static(b"v"),
+        );
+        let entry = 1 + 1 + ENTRY_OVERHEAD_BYTES;
+        assert_eq!(cache.used_bytes, entry + 10_000 + NAMESPACE_OVERHEAD_BYTES);
+
+        // A second entry in the same namespace is not charged the name
+        // again.
+        cache.set(
+            Key::new(namespace.clone(), Bytes::from_static(b"j")),
+            Bytes::from_static(b"v"),
+        );
+        assert_eq!(
+            cache.used_bytes,
+            2 * entry + 10_000 + NAMESPACE_OVERHEAD_BYTES
+        );
+
+        // The per-namespace row (and so `--namespace-budget`) stays
+        // entries only.
+        assert_eq!(cache.stats().namespaces[0].used_bytes, 2 * entry);
+
+        cache.delete(&Key::new(namespace.clone(), name));
+        cache.delete(&Key::new(namespace, Bytes::from_static(b"j")));
+        assert_eq!(cache.used_bytes, 0);
+    }
+
+    #[test]
+    fn the_default_namespace_is_not_charged_a_name() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(key(b"k"), Bytes::from_static(b"v"));
+
+        assert_eq!(cache.used_bytes, 1 + 1 + ENTRY_OVERHEAD_BYTES);
+    }
+
+    #[test]
+    fn namespace_charge_is_released_by_clear_clear_all_and_eviction() {
+        let namespace = big_namespace(1_000);
+        let one = |cache: &mut Cache, ns: &Bytes| {
+            cache.set(
+                Key::new(ns.clone(), Bytes::from_static(b"k")),
+                Bytes::from_static(b"v"),
+            );
+        };
+
+        let mut cache = Cache::new(UNBOUNDED);
+        one(&mut cache, &namespace);
+        assert_eq!(cache.clear(&namespace), 1);
+        assert_eq!(cache.used_bytes, 0);
+
+        one(&mut cache, &namespace);
+        one(&mut cache, &Bytes::from_static(b"other"));
+        assert_eq!(cache.clear_all(), 2);
+        assert_eq!(cache.used_bytes, 0);
+
+        // Eviction: the big namespace's one entry is the global LRU victim.
+        let mut cache = Cache::new(500);
+        one(&mut cache, &namespace);
+        one(&mut cache, &Bytes::from_static(b"other"));
+        assert_eq!(cache.evictions, 1);
+        assert_eq!(cache.namespaces.len(), 1);
+        assert_eq!(
+            cache.used_bytes,
+            1 + 1 + ENTRY_OVERHEAD_BYTES + name_charge(b"other")
+        );
+    }
+
+    #[test]
+    fn a_stream_of_fresh_large_namespaces_with_tiny_entries_is_bounded_by_max_memory() {
+        // Before the name was charged, each of these cost ~102 bytes of
+        // accounting while the process held the whole 20 KB name, so
+        // `--max-memory` never evicted.
+        let max_memory = 200_000;
+        let mut cache = Cache::new(max_memory);
+
+        for i in 0..100u32 {
+            let mut namespace = vec![b'n'; 20_000];
+            namespace[..4].copy_from_slice(&i.to_be_bytes());
+            cache.set(
+                Key::new(Bytes::from(namespace), Bytes::from_static(b"k")),
+                Bytes::from_static(b"v"),
+            );
+        }
+
+        assert!(cache.evictions > 0);
+        assert!(cache.namespaces.len() < 15);
+        let held: usize = cache.namespaces.keys().map(Bytes::len).sum();
+        assert!(held <= max_memory, "{held} bytes of namespace names kept");
+        assert!(cache.used_bytes <= max_memory + 20_000 + NAMESPACE_OVERHEAD_BYTES);
     }
 }
