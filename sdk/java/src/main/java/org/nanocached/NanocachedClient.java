@@ -485,6 +485,13 @@ public final class NanocachedClient implements AutoCloseable {
     // once.
     private static final int MAX_BOOTSTRAP_DIALER_THREADS = 16;
 
+    // Threads available to the keep-alive scheduler: one runs the periodic
+    // tick, the rest ping idle connections concurrently (see
+    // startKeepAlive). A ping that hangs holds its thread until the request
+    // timeout, so this is also how many hung nodes can be tolerated before
+    // pings to healthy ones queue behind them.
+    private static final int MAX_KEEPALIVE_THREADS = 16;
+
     // Tracks, per connect() target (not per instance — mirrors
     // sdk/typescript/src/client.ts's openTargets), how many open sockets
     // this process still holds for a given "host:port". Purely a
@@ -1011,6 +1018,21 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
+     * {@link #dialBootstrapNode} for a node a refresh just discovered, but
+     * honoring the per-address reconnect cooldown ({@link
+     * #dialWithCooldown}'s rule): an address whose dial failed within the
+     * cooldown window is not dialed again, it fails with the error that
+     * armed the cooldown.
+     */
+    private DialOutcome dialRefreshNode(DiscoveredNode node) {
+        CooldownEntry cooldown = reconnectCooldowns.get(node.address());
+        if (cooldown != null && System.nanoTime() < cooldown.untilNanos) {
+            return DialOutcome.tolerable(cooldown.error);
+        }
+        return dialBootstrapNode(node);
+    }
+
+    /**
      * Dials every node discovery listed, concurrently, on a short-lived
      * pool capped at {@link #MAX_BOOTSTRAP_DIALER_THREADS} —
      * {@link #replicaWriters} doesn't exist yet at this point, since
@@ -1064,9 +1086,20 @@ public final class NanocachedClient implements AutoCloseable {
         return deduped;
     }
 
-    private void openCluster(Identify.ClusterTarget cluster) {
-        List<DiscoveredNode> nodes = dedupeDiscoveredNodes(cluster.nodes());
-
+    /**
+     * Runs {@code dial} for every node in {@code nodes} on a short-lived
+     * pool capped at {@link #MAX_BOOTSTRAP_DIALER_THREADS} and returns the
+     * outcomes in input order. Shared by {@link #openCluster} and {@link
+     * #refreshNodeList}: both dial a whole roster (or the part of it that is
+     * new) in waves rather than one node at a time, so k unreachable nodes
+     * cost about one connect timeout per wave instead of k of them.
+     */
+    private List<DialOutcome> dialConcurrently(
+            List<DiscoveredNode> nodes, java.util.function.Function<DiscoveredNode, DialOutcome> dial) {
+        List<DialOutcome> outcomes = new ArrayList<>(nodes.size());
+        if (nodes.isEmpty()) {
+            return outcomes;
+        }
         ExecutorService dialers = Executors.newFixedThreadPool(
                 Math.max(1, Math.min(nodes.size(), MAX_BOOTSTRAP_DIALER_THREADS)), runnable -> {
                     Thread thread = new Thread(runnable, "nanocached-bootstrap-dial");
@@ -1074,10 +1107,9 @@ public final class NanocachedClient implements AutoCloseable {
                     return thread;
                 });
         List<CompletableFuture<DialOutcome>> futures = new ArrayList<>(nodes.size());
-        List<DialOutcome> outcomes = new ArrayList<>(nodes.size());
         try {
             for (DiscoveredNode node : nodes) {
-                futures.add(CompletableFuture.supplyAsync(() -> dialBootstrapNode(node), dialers));
+                futures.add(CompletableFuture.supplyAsync(() -> dial.apply(node), dialers));
             }
             for (CompletableFuture<DialOutcome> future : futures) {
                 outcomes.add(future.join());
@@ -1085,6 +1117,13 @@ public final class NanocachedClient implements AutoCloseable {
         } finally {
             dialers.shutdown();
         }
+        return outcomes;
+    }
+
+    private void openCluster(Identify.ClusterTarget cluster) {
+        List<DiscoveredNode> nodes = dedupeDiscoveredNodes(cluster.nodes());
+
+        List<DialOutcome> outcomes = dialConcurrently(nodes, this::dialBootstrapNode);
 
         RuntimeException hardError = null;
         for (DialOutcome outcome : outcomes) {
@@ -3674,24 +3713,44 @@ public final class NanocachedClient implements AutoCloseable {
         // awaited. A leg that passes the check is added to hedgedReads
         // before the lock is released, so the drain's next locked snapshot
         // sees it.
+        //
+        // Only the check and the registration are under the lock; the leg is
+        // submitted after it is released. replicaWriters' overflow policy runs
+        // a task on the submitting thread when its queue is full, and a hedge
+        // leg is a whole read round trip (up to requestTimeoutMillis): run
+        // under the lock, that would block every other startHedgeLeg and
+        // close()'s drain for as long. The future is therefore created
+        // up front and completed by the leg itself, so the drain, which
+        // waits on registered futures, still waits for a leg that has been
+        // registered but not yet submitted.
+        CompletableFuture<Void> future = new CompletableFuture<>();
         synchronized (hedgedReadsLock) {
             if (closed) {
                 throw new NanocachedException.AlreadyClosed();
             }
-            CompletableFuture<Void> started;
-            try {
-                started = CompletableFuture.runAsync(task, replicaWriters);
-            } catch (RejectedExecutionException rejected) {
-                // close() shut replicaWriters down concurrently: run it inline
-                // rather than losing it (mirrors submitReplicaWrite).
-                task.run();
-                started = CompletableFuture.completedFuture(null);
-            }
-            CompletableFuture<Void> future = started;
             hedgedReads.add(future);
-            future.whenComplete((ignoredResult, ignoredError) -> hedgedReads.remove(future));
-            return future;
         }
+        future.whenComplete((ignoredResult, ignoredError) -> hedgedReads.remove(future));
+        Runnable tracked = () -> {
+            try {
+                task.run();
+                future.complete(null);
+            } catch (Throwable error) {
+                future.completeExceptionally(error);
+            }
+        };
+        try {
+            replicaWriters.execute(tracked);
+        } catch (RejectedExecutionException rejected) {
+            // close() shut replicaWriters down concurrently: run it inline
+            // rather than losing it (mirrors submitReplicaWrite).
+            tracked.run();
+        } catch (RuntimeException | Error error) {
+            // Never leave a registered future incomplete: the drain would wait on it forever.
+            future.completeExceptionally(error);
+            throw error;
+        }
+        return future;
     }
 
     private <T> T write(byte[] namespace, byte[] key, ConnectionOp<T> op) {
@@ -4592,28 +4651,61 @@ public final class NanocachedClient implements AutoCloseable {
             }
         }
 
-        for (DiscoveredNode node : toOpen) {
-            try {
-                Connection connection = openNodeConnection(node.address());
-                synchronized (stateLock) {
-                    if (closed) {
-                        // close() ran while we were dialing (issue #10):
-                        // installing this socket now would leak it.
-                        connection.close();
-                        return;
-                    }
-                    members.put(node.name(), new Member(node.address(), connection));
+        // Dial the new nodes concurrently (issue #227, as in the .NET SDK), in
+        // waves of at most MAX_BOOTSTRAP_DIALER_THREADS, as openCluster does: this runs under
+        // refreshLock, which every caller of beforeOperation can end up
+        // waiting on, so k blackholed new nodes dialed one at a time (each up
+        // to CONNECT_TIMEOUT_MS) would block them for k connect timeouts.
+        // Every outcome is gathered first and installed under one lock.
+        List<DialOutcome> outcomes = dialConcurrently(toOpen, this::dialRefreshNode);
+
+        synchronized (stateLock) {
+            if (closed) {
+                // close() ran while we were dialing (issue #10):
+                // installing these sockets now would leak them.
+                for (DialOutcome outcome : outcomes) {
+                    if (outcome.connection != null) outcome.connection.close();
                 }
-            } catch (IOException | RuntimeException error) {
-                // Left out of the ring for now; the next refresh
-                // retries it. Silent by design: the stderr narration
-                // this once had was removed by the #25/#27
-                // API-unification work — not issue #12, which is only
-                // the redial-gate pruning above — since a per-node
-                // connect failure here changes no behavior and isn't
-                // worth a warning on every refresh. Counted via
+                return;
+            }
+            for (int i = 0; i < toOpen.size(); i++) {
+                DiscoveredNode node = toOpen.get(i);
+                DialOutcome outcome = outcomes.get(i);
+                if (outcome.connection != null) {
+                    members.put(node.name(), new Member(node.address(), outcome.connection));
+                    continue;
+                }
+                // Silent by design: the stderr narration this once had was
+                // removed by the #25/#27 API-unification work — not issue
+                // #12, which is only the redial-gate pruning above — since
+                // a per-node connect failure here changes no behavior and
+                // isn't worth a warning on every refresh. Counted via
                 // stats().refreshFailures instead.
                 refreshFailures.incrementAndGet();
+                if (outcome.hard) {
+                    // An unparseable address, or one that is not a cache
+                    // node: nothing a later redial could fix, so it stays
+                    // out of the ring (as before) rather than becoming a
+                    // member whose redial throws a non-failover error.
+                    continue;
+                }
+                // Install the just-discovered node without a connection and
+                // arm its cooldown instead of leaving it out of the ring
+                // (issue #67, matching openCluster and the Go/Rust/.NET/
+                // Python/TS SDKs): the ring ranks by the full candidate set,
+                // so dropping a new node on a transient dial failure would
+                // make this client's primary/replica choice for keys near it
+                // disagree with every peer that did reach it until the next
+                // refresh (extra W answers and refreshes); kept, its keys
+                // fail over per request and its next use redials it.
+                members.put(node.name(), new Member(node.address(), null));
+                // A dial skipped by dialRefreshNode comes back carrying the
+                // error that armed the cooldown; re-arming it would only
+                // restart the same window.
+                CooldownEntry armed = reconnectCooldowns.get(node.address());
+                if (armed == null || armed.error != outcome.error) {
+                    armReconnectCooldown(node.address(), outcome.error);
+                }
             }
         }
 
@@ -4663,11 +4755,20 @@ public final class NanocachedClient implements AutoCloseable {
         // client. Package-visible only so tests can shorten it.
         Duration interval = Duration.ofMillis(keepAliveIntervalMillis);
 
-        keepAlive = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        // A small pool, not a single thread: the tick below only decides
+        // which connections need a ping and hands each to the pool, so one
+        // half-open node, whose ping blocks for the whole request timeout
+        // (30s), can't delay the pings to every other member until ~60s
+        // idle, which is the server's idle limit (issue #192, as fixed in
+        // the Go SDK). pingsInFlight keeps a hung node to one pinned
+        // thread: later ticks skip a connection whose last ping hasn't
+        // returned. Threads are created on demand and are daemons.
+        keepAlive = Executors.newScheduledThreadPool(MAX_KEEPALIVE_THREADS, runnable -> {
             Thread thread = new Thread(runnable, "nanocached-keepalive");
             thread.setDaemon(true);
             return thread;
         });
+        Set<Connection> pingsInFlight = ConcurrentHashMap.newKeySet();
         keepAlive.scheduleAtFixedRate(() -> {
             List<Connection> connections = new ArrayList<>();
             synchronized (stateLock) {
@@ -4682,12 +4783,23 @@ public final class NanocachedClient implements AutoCloseable {
             for (Connection connection : connections) {
                 if (connection.isClosed()) continue; // dead ones stay lazy
                 if (connection.idleNanos() < interval.toNanos()) continue;
+                if (!pingsInFlight.add(connection)) continue;
                 try {
-                    // Any parseable reply proves liveness — N, or W from a
-                    // non-owner — and resets the server's idle timer.
-                    connection.get(KEEPALIVE_KEY);
-                } catch (RuntimeException ignored) {
-                    // Keep-alive failures never surface; use redials lazily.
+                    keepAlive.execute(() -> {
+                        try {
+                            // Any parseable reply proves liveness — N, or W from a
+                            // non-owner — and resets the server's idle timer.
+                            connection.get(KEEPALIVE_KEY);
+                        } catch (RuntimeException ignored) {
+                            // Keep-alive failures never surface; use redials lazily.
+                        } finally {
+                            pingsInFlight.remove(connection);
+                        }
+                    });
+                } catch (RejectedExecutionException shutDown) {
+                    // close() is tearing the pool down; nothing left to ping for.
+                    pingsInFlight.remove(connection);
+                    return;
                 }
             }
         }, interval.toNanos(), interval.toNanos(), TimeUnit.NANOSECONDS);
