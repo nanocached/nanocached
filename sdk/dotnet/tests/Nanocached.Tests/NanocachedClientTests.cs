@@ -8,6 +8,21 @@ using Xunit;
 
 namespace Nanocached.Tests;
 
+/// <summary>Tests that dial a node share process-wide settings with tests that
+/// change them: <c>Identify.ConnectDeadline</c> and
+/// <c>NanocachedClient.MaxConcurrentDials</c> are statics, and several tests
+/// shorten them for a while. xUnit runs different test classes in parallel,
+/// so a test that shortened the deadline to 100 ms made a dial in another
+/// class (one whose mock answers after 300 ms) time out and fail. Every
+/// class that dials, and so every class that can see or change those
+/// statics, belongs to this one collection and so runs one test at a
+/// time.</summary>
+public static class DialSettings
+{
+    public const string CollectionName = "process-wide dial settings";
+}
+
+[Collection(DialSettings.CollectionName)]
 public class NanocachedClientTests
 {
     private static readonly string[] Names =
@@ -4387,6 +4402,7 @@ public class NanocachedClientTests
 /// failing the whole connect — and fail only when no listed node is
 /// reachable.
 /// </summary>
+[Collection(DialSettings.CollectionName)]
 public class TolerantBootstrapTests
 {
     private static readonly string[] Names =
