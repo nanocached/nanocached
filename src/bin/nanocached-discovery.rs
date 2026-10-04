@@ -3129,9 +3129,10 @@ async fn run(
             // Issue #421(a): sweep_task's JoinHandle used to be joined only
             // at shutdown (see the `timeout(SHUTDOWN_TIMEOUT, sweep_task)`
             // below) — unlike connection_tasks above, nothing in this loop
-            // ever polled it, so a panic anywhere in sweep_expired's call
-            // graph (dead-node eviction, stalled-join reaping, post-grace
-            // join kickoff) silently killed just that task while the
+            // ever polled it, so a panic anywhere in sweep_expired's own
+            // body (dead-node eviction, stalled-join reaping — the join
+            // fan-outs it starts run on their own tasks and report a
+            // panic themselves) silently killed just that task while the
             // process kept serving normally, with no signal that
             // membership maintenance had gone dark. Watch it here and
             // respawn on exit so it comes back with a loud WARN instead.
@@ -3932,7 +3933,17 @@ async fn sweep_expired(
                     fanout_context.spawn(&mut fanouts, JoinFanout::BeginNext);
                 }
             }
-            _ = shutdown_rx.changed() => return,
+            _ = shutdown_rx.changed() => {
+                // A fan-out in flight used to finish before the sweep could
+                // observe the shutdown (it was awaited inline); dropping
+                // `fanouts` here would instead abort it mid-`X`/`M`. Give it
+                // the same bound `run` gives the sweep task as a whole.
+                let _ = timeout(SHUTDOWN_TIMEOUT, async {
+                    while fanouts.join_next().await.is_some() {}
+                })
+                .await;
+                return;
+            }
         }
     }
 }
@@ -7861,20 +7872,11 @@ mod tests {
     async fn registry_with_a_joined_and_b_waiting(
         shutdown_rx: watch::Receiver<bool>,
     ) -> (TcpStream, TcpStream, Registry, CurrentJoin) {
-        registry_with_a_joined_and_b_waiting_idle(shutdown_rx, IDLE_TIMEOUT).await
-    }
-
-    /// `registry_with_a_joined_and_b_waiting`, with both connections held
-    /// to `idle_timeout` — a short one lets a real-time test outwait it.
-    async fn registry_with_a_joined_and_b_waiting_idle(
-        shutdown_rx: watch::Receiver<bool>,
-        idle_timeout: Duration,
-    ) -> (TcpStream, TcpStream, Registry, CurrentJoin) {
         let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
 
         let config = || ConnectionConfig {
-            idle_timeout,
+            idle_timeout: IDLE_TIMEOUT,
             list_ready_at: Instant::now(),
             replication: 2,
             auth_secret: None,
@@ -7966,22 +7968,21 @@ mod tests {
         assert!(!lock(&registry).contains_key("node-b"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_node_promoted_after_waiting_longer_than_idle_timeout_keeps_its_connection() {
         // The idle deadline used to be anchored when `J` was parsed, so a
-        // node that waited longer than `idle_timeout` in the join queue was
+        // node that waited longer than `IDLE_TIMEOUT` in the join queue was
         // promoted, answered `R`, and then closed as idle before its first
         // `H` could arrive. The clock for the next command now starts when
         // the `J` handler (the whole wait) is done.
-        let idle = Duration::from_millis(400);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_node_a, mut node_b, registry, _current_join) =
-            registry_with_a_joined_and_b_waiting_idle(shutdown_rx, idle).await;
+            registry_with_a_joined_and_b_waiting(shutdown_rx).await;
 
         // Outwait the idle timeout while parked in `wait_for_promotion`
         // (which has none), then promote node-b the way a completed
         // handoff does.
-        tokio::time::sleep(idle * 2).await;
+        tokio::time::advance(IDLE_TIMEOUT + Duration::from_secs(5)).await;
         {
             let mut guard = lock(&registry);
             let info = guard.get_mut("node-b").expect("node-b is registered");
@@ -7991,12 +7992,18 @@ mod tests {
         assert_eq!(read_exactly(&mut node_b, 2).await, b"R\n");
 
         // The first heartbeat, sent promptly after `R`, must be answered
-        // on the same connection rather than find it closed.
+        // on the same connection rather than find it closed. (Driven with
+        // explicit `yield_now`s, like the slowloris tests below: on a
+        // paused clock a loopback read doesn't reliably re-poll the
+        // server's task on its own.)
         node_b.write_all(b"H 6 2 9\nnode-btk-node-b").await.unwrap();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
         let mut ack = [0u8; 2];
-        tokio::time::timeout(Duration::from_secs(5), node_b.read_exact(&mut ack))
+        node_b
+            .read_exact(&mut ack)
             .await
-            .expect("no heartbeat ack")
             .expect("the promoted node's connection was closed as idle");
         assert_eq!(&ack, b"A ");
     }
@@ -10864,28 +10871,33 @@ mod tests {
     }
 
     /// A stand-in ready node for `send_cancel`: accepts each connection,
-    /// reads the `X` frame, waits `delay`, then acks. Returns its address
-    /// and a count of the connections it has accepted.
-    async fn slow_cancel_node(delay: Duration) -> (String, Arc<AtomicU64>) {
+    /// reads the `X` frame, waits `delay`, then acks. Returns its address,
+    /// a count of the connections it has accepted, and a count of the acks
+    /// it has sent.
+    async fn slow_cancel_node(delay: Duration) -> (String, Arc<AtomicU64>, Arc<AtomicU64>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let accepted = Arc::new(AtomicU64::new(0));
-        let counter = Arc::clone(&accepted);
+        let acked = Arc::new(AtomicU64::new(0));
+        let (accept_counter, ack_counter) = (Arc::clone(&accepted), Arc::clone(&acked));
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                counter.fetch_add(1, Ordering::SeqCst);
+                accept_counter.fetch_add(1, Ordering::SeqCst);
+                let ack_counter = Arc::clone(&ack_counter);
                 tokio::spawn(async move {
                     let mut chunk = [0u8; 256];
                     let _ = stream.read(&mut chunk).await;
                     tokio::time::sleep(delay).await;
-                    let _ = stream.write_all(b"A\n").await;
+                    if stream.write_all(b"A\n").await.is_ok() {
+                        ack_counter.fetch_add(1, Ordering::SeqCst);
+                    }
                 });
             }
         });
-        (address, accepted)
+        (address, accepted, acked)
     }
 
     /// Keeps `name`'s heartbeat fresh, standing in for a live node.
@@ -10934,7 +10946,7 @@ mod tests {
         // exactly while nodes were failing. Here node-a's `X` hangs for far
         // longer than this test runs, and node-c — which stops
         // heartbeating — must still be evicted in the meantime.
-        let (node_a_addr, accepted) = slow_cancel_node(Duration::from_secs(30)).await;
+        let (node_a_addr, accepted, _acked) = slow_cancel_node(Duration::from_secs(30)).await;
         let registry: Registry = Arc::new(RegistryState::default());
         for (name, address, state) in [
             ("node-a", node_a_addr.as_str(), NodeState::Joined),
@@ -10985,8 +10997,11 @@ mod tests {
         );
         assert!(lock(&registry).contains_key("node-a"));
 
-        shutdown_tx.send_replace(true);
-        sweep_task.await.unwrap();
+        // The stuck `X` would hold a graceful shutdown for up to
+        // `SHUTDOWN_TIMEOUT` (see the test below), so don't wait for it.
+        drop(shutdown_tx);
+        sweep_task.abort();
+        let _ = sweep_task.await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11001,7 +11016,7 @@ mod tests {
         // node-c stops heartbeating. node-c's eviction (~0.6 s) happens
         // during J1's fan-out, so J2's abandon is deferred (still current
         // at ~1 s), then performed after the fan-out is done.
-        let (node_a_addr, accepted) = slow_cancel_node(Duration::from_millis(1500)).await;
+        let (node_a_addr, accepted, _acked) = slow_cancel_node(Duration::from_millis(1500)).await;
         let registry: Registry = Arc::new(RegistryState::default());
         for (name, address, state) in [
             ("node-a", node_a_addr.as_str(), NodeState::Joined),
@@ -11072,6 +11087,58 @@ mod tests {
 
         shutdown_tx.send_replace(true);
         sweep_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_lets_an_in_flight_fan_out_finish_instead_of_aborting_it() {
+        // Awaited inline, a fan-out used to finish before the sweep could
+        // even observe the shutdown. On a `JoinSet`, dropping it on return
+        // would abort the `X` mid-exchange; the sweep drains it first.
+        let (node_a_addr, accepted, acked) = slow_cancel_node(Duration::from_millis(800)).await;
+        let registry: Registry = Arc::new(RegistryState::default());
+        for (name, address, state) in [
+            ("node-a", node_a_addr.as_str(), NodeState::Joined),
+            ("node-b", "127.0.0.1:2", NodeState::Joining),
+        ] {
+            lock(&registry).insert(
+                name.to_string(),
+                NodeInfo::new(address.to_string(), state, format!("tk-{name}")),
+            );
+        }
+        let _node_a_alive = keep_heartbeating(&registry, "node-a");
+        let current_join: CurrentJoin =
+            Arc::new(Mutex::new(Some(timed_out_join_of_node_b_awaiting_node_a())));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            current_join,
+            None,
+            None,
+            2,
+            Instant::now(),
+            Duration::from_secs(60),
+            shutdown_rx,
+        ));
+
+        wait_until(
+            "the abandon's X to reach node-a",
+            Duration::from_secs(3),
+            || accepted.load(Ordering::SeqCst) == 1,
+        )
+        .await;
+        assert_eq!(acked.load(Ordering::SeqCst), 0, "the X is still in flight");
+
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), sweep_task)
+            .await
+            .expect("the sweep did not stop after draining its fan-out")
+            .unwrap();
+        assert_eq!(
+            acked.load(Ordering::SeqCst),
+            1,
+            "the in-flight X was cut off by the shutdown"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
