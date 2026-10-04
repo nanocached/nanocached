@@ -41,6 +41,9 @@ services.AddNanocachedDistributedCache(options =>
 {
     options.Addresses.Add("10.0.0.1:8357");
     // options.Secret = "change-me";     // NANOCACHED_AUTH_SECRET, if configured
+    // options.Tls = true;               // connect over TLS (default: plaintext)
+    // options.Ca = "/etc/nanocached/ca.pem"; // private CA root; requires Tls
+    // options.Compress = true;          // all clients of these keys must agree
     // options.Namespace = "my-app-cache"; // default: "distributed-cache"
 });
 ```
@@ -74,8 +77,8 @@ services.AddNanocachedDistributedCache("my-app-cache"); // namespace; defaults t
 This overload dials nothing and owns nothing — the client's lifecycle,
 disposal included, stays whoever registered it's responsibility. Use this
 form when the application also talks to nanocached directly (or needs a
-client-level option — compression, hedged reads, TLS, read repair — none of
-which `NanocachedCacheOptions` exposes; those are configured on
+client-level option beyond TLS, CA and compression — hedged reads, read
+repair — which `NanocachedCacheOptions` does not expose; those are configured on
 `NanocachedClient.Options` itself).
 
 Neither overload does anything by itself beyond registering the service —
