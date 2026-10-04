@@ -25,6 +25,15 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
   list up to 65536 nodes, which started that many goroutines and sockets
   together; at most 64 dials are now in flight at a time. Outcomes are
   unchanged.
+- Nodes and proxies registered with an IPv6 address were unreachable.
+  Discovery lists them as `{ip}:{port}` without brackets
+  (`2001:db8::1:8356`), and `net.Dial` rejects that with "too many colons
+  in address". Roster addresses are now split on the last `:` and rebuilt
+  with `net.JoinHostPort`, as the other SDKs effectively do by using the
+  host verbatim; an already-bracketed `[::1]:8356` is accepted too. IPv4
+  and hostnames are unchanged, and the TLS server name is still the bare
+  host. This covers every dial: bootstrap, refresh, lazy redial, proxy
+  rosters and the seed addresses.
 
 ## [0.4.4] - 2026-09-09
 

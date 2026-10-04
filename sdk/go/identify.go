@@ -204,11 +204,38 @@ func isLegacyServerSignal(err error) bool {
 		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
+// dialAddress turns a roster address into one net.Dial accepts. Discovery
+// registers a node as `{ip}:{port}` with no brackets around an IPv6 host
+// (`2001:db8::1:8356`), which net.Dial rejects as "too many colons" — every
+// other SDK splits on the last ':' and uses the host as is. So split the
+// same way and rebuild with net.JoinHostPort, which brackets a host that
+// contains ':'. An already-bracketed `[::1]:8356` loses its brackets first
+// so they aren't doubled. IPv4 and hostnames come out unchanged; anything
+// without a ':' (or a bare `[::1]`) is returned as is, for Dial to reject
+// with its own error.
+func dialAddress(address string) string {
+	if strings.HasSuffix(address, "]") {
+		return address
+	}
+	i := strings.LastIndexByte(address, ':')
+	if i < 0 {
+		return address
+	}
+	host, port := address[:i], address[i+1:]
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	return net.JoinHostPort(host, port)
+}
+
 // open dials (and, with TLS, handshakes) within the attempt's shared
 // absolute deadline — see connectDeadline. tls.DialWithDialer applies
 // the dialer's deadline to the TLS handshake too, so the whole attempt
-// stays inside one budget.
+// stays inside one budget. address may be a roster entry with an
+// unbracketed IPv6 host (see dialAddress); the TLS ServerName derived from
+// it below is the bare host, without brackets.
 func open(address string, tlsConfig *tls.Config, deadline time.Time) (net.Conn, error) {
+	address = dialAddress(address)
 	dialer := net.Dialer{Deadline: deadline}
 	if tlsConfig == nil {
 		conn, err := dialer.Dial("tcp", address)
