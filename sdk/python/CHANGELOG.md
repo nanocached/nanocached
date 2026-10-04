@@ -11,6 +11,23 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ### Fixed
 
+- A malformed roster address (no `:port`, port above 65535) now counts as
+  one unreachable node during `connect()`, as it already did during
+  node-list refresh, instead of failing the whole bootstrap. A dial round
+  that is abandoned for any other reason (an unexpected exception, a
+  cancellation) now closes the sockets its sibling dials had opened rather
+  than leaving them to the garbage collector.
+- `connect()` and node-list refresh no longer dial a whole roster at once.
+  A discovery server can list up to 65536 nodes, which opened that many
+  sockets together; at most 64 dials are now in flight at a time. Outcomes
+  (which nodes are installed, which count as unreachable) are unchanged,
+  and refresh still dials new nodes eagerly.
+- Keep-alive pings no longer run one after another. A half-open node, whose
+  ping blocks until the 30 s request timeout, used to keep every node after
+  it from being pinged until those had sat idle for about 60 s, the
+  server's idle limit. Each connection now has its own ping task (as in the
+  Go SDK), and a connection whose last ping is still outstanding is not
+  pinged again.
 - Routing a key no longer sorts every node: `HashRing.owners()` keeps only
   the best `replicas` candidates, like the Go, Rust, Java and .NET SDKs,
   and skips building a tuple for any node scoring below the worst one
