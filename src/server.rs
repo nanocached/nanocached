@@ -1,6 +1,6 @@
 use crate::cache::{Cache, SWEEP_BUDGET};
 use crate::command::{Command, MigrateProgress, ParseError, parse_resumable};
-use crate::hash_ring::HashRing;
+use crate::hash_ring::{HashRing, KeyHash, KeyHasher};
 use crate::key::Key;
 use crate::response::{MultiAckEntry, MultiEntry, Response};
 use bytes::{Bytes, BytesMut};
@@ -630,14 +630,25 @@ impl LeaveState {
     /// `None` when this node wasn't an owner (nothing moves) or the
     /// cluster is too small for a replacement (the survivors are all
     /// owners already).
-    fn entrant_for(&self, key: &Key, self_name: &str) -> Option<String> {
-        if !self.before_ring.is_owner(key, self_name, self.replication) {
+    ///
+    /// Takes the key's precomputed hash: this runs per key of a
+    /// multi-key frame and hashes the key's (up to ~1 MiB) namespace
+    /// otherwise, once per ring query.
+    fn entrant_for(&self, key_hash: KeyHash, self_name: &str) -> Option<String> {
+        if !self
+            .before_ring
+            .is_owner_hashed(key_hash, self_name, self.replication)
+        {
             return None;
         }
         self.after_ring
-            .owners(key, self.replication)
+            .owners_hashed(key_hash, self.replication)
             .into_iter()
-            .find(|owner| !self.before_ring.is_owner(key, owner, self.replication))
+            .find(|owner| {
+                !self
+                    .before_ring
+                    .is_owner_hashed(key_hash, owner, self.replication)
+            })
             .map(|owner| owner.to_string())
     }
 }
@@ -2004,10 +2015,15 @@ async fn handle_connection(
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
+                // The namespace is shared by every key of the frame and may
+                // be ~1 MiB, so its share of the key hash is computed once
+                // (`KeyHasher`), not per key.
+                let mut hasher = KeyHasher::default();
 
                 for (position, name) in keys.into_iter().enumerate() {
                     let wrong = config.node_context.as_ref().is_some_and(|node_context| {
-                        wrong_node(node_context, &Key::new(namespace.clone(), name.clone()))
+                        let key_hash = hasher.hash(&Key::new(namespace.clone(), name.clone()));
+                        wrong_node_hashed(node_context, key_hash)
                     });
 
                     if wrong {
@@ -2067,10 +2083,14 @@ async fn handle_connection(
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
                 let mut owned_values = Vec::with_capacity(keys.len());
+                // See `MultiGet`'s arm: the namespace's share of each key's
+                // hash is computed once per frame.
+                let mut hasher = KeyHasher::default();
 
                 for (position, (name, value)) in keys.into_iter().zip(values).enumerate() {
                     let wrong = config.node_context.as_ref().is_some_and(|node_context| {
-                        wrong_node(node_context, &Key::new(namespace.clone(), name.clone()))
+                        let key_hash = hasher.hash(&Key::new(namespace.clone(), name.clone()));
+                        wrong_node_hashed(node_context, key_hash)
                     });
 
                     if wrong {
@@ -2149,9 +2169,12 @@ async fn handle_connection(
                                 continue;
                             }
                             let key = Key::new(namespace.clone(), name);
+                            let key_hash = hasher.hash(&key);
 
                             // Staged node join — see `migration_target_for`.
-                            if let Some(target) = migration_target_for(node_context, &key) {
+                            if let Some(target) =
+                                migration_target_for_hashed(node_context, key_hash)
+                            {
                                 spawn_forward(
                                     &config,
                                     node_context.clone(),
@@ -2165,7 +2188,7 @@ async fn handle_connection(
                             }
 
                             // Decommission drain — see `leave_target_for`.
-                            if let Some(target) = leave_target_for(node_context, &key) {
+                            if let Some(target) = leave_target_for_hashed(node_context, key_hash) {
                                 spawn_forward(
                                     &config,
                                     node_context.clone(),
@@ -4263,10 +4286,12 @@ fn entries_to_send_count(
     joining_name: &str,
     replication: usize,
 ) -> usize {
+    let mut hasher = KeyHasher::default();
     keys.iter()
         .filter(|key| {
-            after_ring.is_owner(key, joining_name, replication)
-                && before_ring.is_owner(key, self_name, replication)
+            let key_hash = hasher.hash(key);
+            after_ring.is_owner_hashed(key_hash, joining_name, replication)
+                && before_ring.is_owner_hashed(key_hash, self_name, replication)
         })
         .count()
 }
@@ -4386,14 +4411,20 @@ async fn run_migration(
 
     let self_name = node_context.name.as_str();
 
+    // `keys` arrive grouped by namespace, and a namespace can be ~1 MiB:
+    // hash each distinct one once rather than per key.
+    let mut hasher = KeyHasher::default();
+
     for key in keys {
         if migration_guard.abort_requested.load(Ordering::SeqCst) {
             break;
         }
 
+        let key_hash = hasher.hash(&key);
+
         // A key is affected only if the joiner cracks its top-R (HRW
         // insertion can't change the set any other way).
-        if !after_ring.is_owner(&key, &joining_name, replication) {
+        if !after_ring.is_owner_hashed(key_hash, &joining_name, replication) {
             continue;
         }
 
@@ -4402,13 +4433,13 @@ async fn run_migration(
         // ("the old primary") is no longer safe. A key this node was
         // never an old owner of is neither this node's to send nor to
         // mark: skip it outright.
-        if !before_ring.is_owner(&key, self_name, replication) {
+        if !before_ring.is_owner_hashed(key_hash, self_name, replication) {
             continue;
         }
         // The (at most one) node the joiner displaced from rank R: its
         // copy is dead once the join completes — marked for the sweep
         // below, but only once this node's own send actually succeeds.
-        let displaced = !after_ring.is_owner(&key, self_name, replication);
+        let displaced = !after_ring.is_owner_hashed(key_hash, self_name, replication);
 
         // Re-checked live rather than trusting `entries()`'s snapshot: a
         // concurrent client write racing this key's turn (see
@@ -4853,13 +4884,13 @@ enum DecommissionKeyOutcome {
 }
 
 fn classify_decommission_key(
-    key: &Key,
+    key_hash: KeyHash,
     before_ring: &HashRing,
     self_name: &str,
     replication: usize,
     deadline_passed: bool,
 ) -> DecommissionKeyOutcome {
-    if !before_ring.is_owner(key, self_name, replication) {
+    if !before_ring.is_owner_hashed(key_hash, self_name, replication) {
         return DecommissionKeyOutcome::NotOwned;
     }
     if deadline_passed {
@@ -5069,20 +5100,27 @@ async fn run_decommission(
     // same accounting a key whose deadline had already passed gets below
     // — instead of just vanishing from both counters.
     let mut keys_iter = keys.into_iter();
+    // `keys` arrive grouped by namespace, and a namespace can be ~1 MiB:
+    // hash each distinct one once rather than per key.
+    let mut hasher = KeyHasher::default();
     while let Some(key) = keys_iter.next() {
         if *shutdown_rx.borrow() {
             println!(
                 "INFO decommission: second shutdown signal received during key transfer — \
                  stopping early"
             );
+            let mut hasher = KeyHasher::default();
             left_behind += std::iter::once(key)
                 .chain(keys_iter)
-                .filter(|key| before_ring.is_owner(key, &self_name, replication))
+                .filter(|key| {
+                    before_ring.is_owner_hashed(hasher.hash(key), &self_name, replication)
+                })
                 .count();
             break;
         }
+        let key_hash = hasher.hash(&key);
         match classify_decommission_key(
-            &key,
+            key_hash,
             &before_ring,
             &self_name,
             replication,
@@ -5096,9 +5134,9 @@ async fn run_decommission(
             DecommissionKeyOutcome::Owned => {}
         }
         let Some(entrant) = after_ring
-            .owners(&key, replication)
+            .owners_hashed(key_hash, replication)
             .into_iter()
-            .find(|owner| !before_ring.is_owner(&key, owner, replication))
+            .find(|owner| !before_ring.is_owner_hashed(key_hash, owner, replication))
             .map(str::to_string)
         else {
             continue;
@@ -5190,9 +5228,12 @@ async fn run_decommission(
                 "INFO decommission: second shutdown signal received mid-handoff — stopping \
                  early"
             );
+            let mut hasher = KeyHasher::default();
             left_behind += std::iter::once(key)
                 .chain(keys_iter)
-                .filter(|key| before_ring.is_owner(key, &self_name, replication))
+                .filter(|key| {
+                    before_ring.is_owner_hashed(hasher.hash(key), &self_name, replication)
+                })
                 .count();
             break;
         }
@@ -5663,20 +5704,20 @@ async fn wait_for_migration_to_clear(node_context: &NodeContext) {
 fn rereplication_targets(
     before: &HashRing,
     after: &HashRing,
-    key: &Key,
+    key_hash: KeyHash,
     replication: usize,
     self_name: &str,
 ) -> Vec<String> {
-    if !before.is_owner(key, self_name, replication) {
+    if !before.is_owner_hashed(key_hash, self_name, replication) {
         return Vec::new();
     }
     if !after.nodes().iter().any(|node| node.as_str() == self_name) {
         return Vec::new();
     }
 
-    let old_owners = before.owners(key, replication);
+    let old_owners = before.owners_hashed(key_hash, replication);
     after
-        .owners(key, replication)
+        .owners_hashed(key_hash, replication)
         .into_iter()
         .filter(|owner| !old_owners.contains(owner))
         .map(str::to_string)
@@ -5909,12 +5950,22 @@ async fn run_rereplication(
     let mut skipped = 0usize;
     let mut owners_reached: HashSet<String> = HashSet::new();
 
+    // `keys` arrive grouped by namespace, and a namespace can be ~1 MiB:
+    // hash each distinct one once rather than per key.
+    let mut hasher = KeyHasher::default();
+
     for key in keys {
         if abort_requested.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
             break;
         }
 
-        let targets = rereplication_targets(before_ring, after_ring, &key, replication, self_name);
+        let targets = rereplication_targets(
+            before_ring,
+            after_ring,
+            hasher.hash(&key),
+            replication,
+            self_name,
+        );
         if targets.is_empty() {
             continue;
         }
@@ -6971,6 +7022,13 @@ async fn forward_with_retries(
 /// rest of the forwarding window missed (`N`) once the sweep had run.
 /// Write forwarding keeps going for the whole window regardless.
 fn wrong_node(node_context: &NodeContext, key: &Key) -> bool {
+    wrong_node_hashed(node_context, KeyHash::of(key))
+}
+
+/// `wrong_node` for a key whose hash is already known — what the
+/// multi-key arms use so a frame's (potentially huge) shared namespace is
+/// hashed once, not once per key.
+fn wrong_node_hashed(node_context: &NodeContext, key_hash: KeyHash) -> bool {
     let displaced = node_context
         .known_ring
         .lock()
@@ -6981,17 +7039,17 @@ fn wrong_node(node_context: &NodeContext, key: &Key) -> bool {
             // key's top-R, not only when it's the primary.
             !membership
                 .ring
-                .is_owner(key, &node_context.name, membership.replication)
+                .is_owner_hashed(key_hash, &node_context.name, membership.replication)
         });
 
-    displaced && !serving_locally_for_unconfirmed_join(node_context, key)
+    displaced && !serving_locally_for_unconfirmed_join(node_context, key_hash)
 }
 
 /// `wrong_node`'s exception: a handoff this node ran is still forwarding
 /// `key` to a joiner discovery hasn't confirmed yet (see
 /// `ActiveMigration::confirmed`), so this node is the only owner a
 /// client's `L` can name and must keep serving the key itself.
-fn serving_locally_for_unconfirmed_join(node_context: &NodeContext, key: &Key) -> bool {
+fn serving_locally_for_unconfirmed_join(node_context: &NodeContext, key_hash: KeyHash) -> bool {
     let mut slot = node_context
         .active_migration
         .lock()
@@ -7005,7 +7063,7 @@ fn serving_locally_for_unconfirmed_join(node_context: &NodeContext, key: &Key) -
             && active.forwarding_open()
             && active
                 .after_ring
-                .is_owner(key, &active.joining_name, active.replication)
+                .is_owner_hashed(key_hash, &active.joining_name, active.replication)
     })
 }
 
@@ -7015,6 +7073,15 @@ fn serving_locally_for_unconfirmed_join(node_context: &NodeContext, key: &Key) -
 /// joining node doesn't end up serving a stale value once promoted (see
 /// the staged-join handoff design).
 fn migration_target_for(node_context: &NodeContext, key: &Key) -> Option<ForwardTarget> {
+    migration_target_for_hashed(node_context, KeyHash::of(key))
+}
+
+/// `migration_target_for` for a key whose hash is already known — see
+/// `wrong_node_hashed`.
+fn migration_target_for_hashed(
+    node_context: &NodeContext,
+    key_hash: KeyHash,
+) -> Option<ForwardTarget> {
     let mut slot = node_context
         .active_migration
         .lock()
@@ -7037,7 +7104,7 @@ fn migration_target_for(node_context: &NodeContext, key: &Key) -> Option<Forward
             // entered the key's top-R, not only as its new primary.
             active
                 .after_ring
-                .is_owner(key, &active.joining_name, active.replication)
+                .is_owner_hashed(key_hash, &active.joining_name, active.replication)
         })
         .map(|active| ForwardTarget {
             addr: active.joining_addr.clone(),
@@ -7054,12 +7121,18 @@ fn migration_target_for(node_context: &NodeContext, key: &Key) -> Option<Forward
 /// stale the moment discovery publishes the post-leave roster (the
 /// exact mirror of `migration_target_for`'s join-side reasoning).
 fn leave_target_for(node_context: &NodeContext, key: &Key) -> Option<ForwardTarget> {
+    leave_target_for_hashed(node_context, KeyHash::of(key))
+}
+
+/// `leave_target_for` for a key whose hash is already known — see
+/// `wrong_node_hashed`.
+fn leave_target_for_hashed(node_context: &NodeContext, key_hash: KeyHash) -> Option<ForwardTarget> {
     let leaving = node_context
         .leaving
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let leave = leaving.as_ref()?;
-    let entrant = leave.entrant_for(key, &node_context.name)?;
+    let entrant = leave.entrant_for(key_hash, &node_context.name)?;
     let addr = leave.addresses.get(&entrant)?.clone();
     let token = leave.tokens.get(&entrant)?.clone();
 
@@ -11119,7 +11192,7 @@ mod tests {
         for index in 0..200 {
             let key = key(format!("key-{index}").as_bytes());
             let owned = before.is_owner(&key, "node-a", 2);
-            match leave.entrant_for(&key, "node-a") {
+            match leave.entrant_for(KeyHash::of(&key), "node-a") {
                 Some(entrant) => {
                     promoted += 1;
                     assert!(owned, "entrant only exists for owned keys");
@@ -11167,7 +11240,8 @@ mod tests {
                 .find(|owner| after.nodes().iter().any(|node| node == *owner))
                 .copied();
 
-            let targets = rereplication_targets(&before, &after, &key, replication, "node-a");
+            let targets =
+                rereplication_targets(&before, &after, KeyHash::of(&key), replication, "node-a");
 
             if !owned_before || elected_sender != Some("node-a") {
                 assert!(
@@ -11227,7 +11301,8 @@ mod tests {
             }
             found = true;
 
-            let targets = rereplication_targets(&before, &after, &key, replication, "node-a");
+            let targets =
+                rereplication_targets(&before, &after, KeyHash::of(&key), replication, "node-a");
             assert!(
                 !targets.is_empty(),
                 "key-{index}: node-a should have been elected sender after node-b (rank 1) \
@@ -11291,7 +11366,13 @@ mod tests {
             found = true;
 
             for survivor in &survivors {
-                let targets = rereplication_targets(&before, &after, &key, replication, survivor);
+                let targets = rereplication_targets(
+                    &before,
+                    &after,
+                    KeyHash::of(&key),
+                    replication,
+                    survivor,
+                );
                 assert!(
                     !targets.is_empty(),
                     "key-{index}: surviving old owner {survivor} should be an eligible \
@@ -11429,21 +11510,21 @@ mod tests {
 
         // Not owned: `NotOwned` regardless of the deadline.
         assert_eq!(
-            classify_decommission_key(&unowned_key, &before, "leaver", 1, false),
+            classify_decommission_key(KeyHash::of(&unowned_key), &before, "leaver", 1, false),
             DecommissionKeyOutcome::NotOwned
         );
         assert_eq!(
-            classify_decommission_key(&unowned_key, &before, "leaver", 1, true),
+            classify_decommission_key(KeyHash::of(&unowned_key), &before, "leaver", 1, true),
             DecommissionKeyOutcome::NotOwned
         );
 
         // Owned: `Owned` before the deadline, `DeadlinePassed` after.
         assert_eq!(
-            classify_decommission_key(&owned_key, &before, "leaver", 1, false),
+            classify_decommission_key(KeyHash::of(&owned_key), &before, "leaver", 1, false),
             DecommissionKeyOutcome::Owned
         );
         assert_eq!(
-            classify_decommission_key(&owned_key, &before, "leaver", 1, true),
+            classify_decommission_key(KeyHash::of(&owned_key), &before, "leaver", 1, true),
             DecommissionKeyOutcome::DeadlinePassed
         );
     }
@@ -12549,8 +12630,14 @@ mod tests {
         let expected_keys: Vec<Key> = (0..KEY_COUNT)
             .map(|index| key(format!("key-{index}").as_bytes()))
             .filter(|key| {
-                rereplication_targets(&stale_belief, &after_join, key, replication, "node-x")
-                    .contains(&"node-y".to_string())
+                rereplication_targets(
+                    &stale_belief,
+                    &after_join,
+                    KeyHash::of(key),
+                    replication,
+                    "node-x",
+                )
+                .contains(&"node-y".to_string())
             })
             .collect();
         assert!(
@@ -15013,6 +15100,109 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_key_frames_hash_the_namespace_once_not_once_per_key() {
+        // A namespace may be ~1 MiB and every key of an `m`/`o` frame
+        // shares it. The ownership checks (`wrong_node`,
+        // `migration_target_for`, `leave_target_for`) used to FNV the
+        // whole namespace per key, so one frame of tiny keys cost
+        // (keys x namespace length) of hashing on the single thread.
+        // Counted in FNV'd bytes, not wall-clock.
+        const NAMESPACE_LEN: usize = 20_000;
+        const KEYS: usize = 200;
+
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        // A known ring (so `wrong_node` really consults it) and a join
+        // handoff in flight whose joiner is in every key's top-R (so the
+        // forwarding checks run for every stored key too).
+        let known_ring: KnownRing = Arc::new(Mutex::new(Some(Arc::new(Membership {
+            ring: Arc::new(HashRing::new(vec!["test-node".to_string()])),
+            replication: 1,
+        }))));
+        let mut active = test_active_migration(None);
+        active.acked_entries = None;
+        let node_context = test_node_context(
+            "test-node",
+            "tok-test-node",
+            known_ring,
+            Arc::new(Mutex::new(Some(active))),
+        );
+
+        let namespace = vec![b'n'; NAMESPACE_LEN];
+        let names: Vec<String> = (0..KEYS).map(|index| format!("k{index:03}")).collect();
+        let names_len: usize = names.iter().map(String::len).sum();
+
+        let mut frames = Vec::new();
+        let key_lens: Vec<String> = names.iter().map(|name| name.len().to_string()).collect();
+        frames.extend_from_slice(
+            format!("m {NAMESPACE_LEN} {KEYS} {}\n", key_lens.join(" ")).as_bytes(),
+        );
+        frames.extend_from_slice(&namespace);
+        for name in &names {
+            frames.extend_from_slice(name.as_bytes());
+        }
+        let pair_lens: Vec<String> = names
+            .iter()
+            .map(|name| format!("{} 1", name.len()))
+            .collect();
+        frames.extend_from_slice(
+            format!("o {NAMESPACE_LEN} {KEYS} {}\n", pair_lens.join(" ")).as_bytes(),
+        );
+        frames.extend_from_slice(&namespace);
+        for name in &names {
+            frames.extend_from_slice(name.as_bytes());
+            frames.push(b'v');
+        }
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Large enough to take every forward, never drained.
+        let (forward_tx, _forward_rx) = mpsc::channel::<MigrationTask>(2 * KEYS);
+
+        let before = crate::hash_ring::hashed_bytes();
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+            },
+            shutdown_rx,
+        ));
+        client.write_all(&frames).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        connection_task.await.unwrap().unwrap();
+        let hashed = crate::hash_ring::hashed_bytes() - before;
+        drop(request_tx);
+        cache_task.await.unwrap();
+
+        // Both frames were served (the `o` acked every key as stored).
+        assert!(response.starts_with(b"M "), "unexpected reply to the `m`");
+        assert!(
+            response.windows(3).any(|window| window == b"O 2"),
+            "unexpected reply to the `o`"
+        );
+
+        // Two frames, each paying the namespace once plus the key names,
+        // with slack; per-key hashing would be at least KEYS x NAMESPACE_LEN.
+        let per_frame = 4 + NAMESPACE_LEN + names_len;
+        assert!(hashed >= NAMESPACE_LEN, "the ring was never consulted");
+        assert!(
+            hashed <= 2 * per_frame * 2,
+            "{hashed} bytes hashed for two frames of {KEYS} keys under a {NAMESPACE_LEN}-byte \
+             namespace"
+        );
+    }
+
     fn test_active_migration(completed_at: Option<Instant>) -> ActiveMigration {
         ActiveMigration {
             joining_name: "joiner-0".to_string(),
@@ -15879,7 +16069,14 @@ mod tests {
         let expected_keys: Vec<Key> = (0..KEY_COUNT)
             .map(|index| key(format!("key-{index}").as_bytes()))
             .filter(|key| {
-                !rereplication_targets(&before_ring, &after_ring, key, replication, "n1").is_empty()
+                !rereplication_targets(
+                    &before_ring,
+                    &after_ring,
+                    KeyHash::of(key),
+                    replication,
+                    "n1",
+                )
+                .is_empty()
             })
             .collect();
         assert!(

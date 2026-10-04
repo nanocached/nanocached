@@ -339,25 +339,15 @@ impl Command {
                 None => Response::NotFound,
             },
 
+            // Both resolve the namespace once for the whole frame
+            // (`Cache::get_many`/`set_many`): a namespace name can be
+            // ~1 MiB, and resolving it per key made one frame of tiny keys
+            // cost gigabytes of hashing on this single thread.
             Self::MultiGet { namespace, keys } => {
-                let mut value_bytes: usize = 0;
-                let entries = keys
+                let entries = cache
+                    .get_many(&namespace, &keys, MAX_MULTI_REPLY_VALUE_BYTES)
                     .into_iter()
-                    .map(|name| {
-                        if value_bytes >= MAX_MULTI_REPLY_VALUE_BYTES {
-                            return MultiEntry::Miss;
-                        }
-                        let key = Key::new(namespace.clone(), name);
-                        match cache.get(&key) {
-                            Some(value)
-                                if value_bytes + value.len() <= MAX_MULTI_REPLY_VALUE_BYTES =>
-                            {
-                                value_bytes += value.len();
-                                MultiEntry::Value(value)
-                            }
-                            Some(_) | None => MultiEntry::Miss,
-                        }
-                    })
+                    .map(|value| value.map_or(MultiEntry::Miss, MultiEntry::Value))
                     .collect();
                 Response::Multi(entries)
             }
@@ -367,16 +357,9 @@ impl Command {
                 values,
                 ttl,
             } => {
-                let mut entries = Vec::with_capacity(keys.len());
-                for (name, value) in keys.into_iter().zip(values) {
-                    let key = Key::new(namespace.clone(), name);
-                    match ttl {
-                        Some(ttl) => cache.set_with_ttl(key, value, ttl),
-                        None => cache.set(key, value),
-                    }
-                    entries.push(MultiAckEntry::Stored);
-                }
-                Response::MultiAck(entries)
+                let stored = vec![MultiAckEntry::Stored; keys.len()];
+                cache.set_many(&namespace, keys.into_iter().zip(values), ttl);
+                Response::MultiAck(stored)
             }
 
             Self::Set { key, value, ttl } => {
