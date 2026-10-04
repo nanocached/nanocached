@@ -505,6 +505,49 @@ async function dialClusterNode(
   return { node, kind: "ok", socket: identified.socket, tagged: identified.tagged };
 }
 
+/** How many of a roster's nodes a dial round (`connect()`'s bootstrap,
+ * `refreshNodeList`) has in flight at once. A discovery server may list up
+ * to 65536 nodes; dialing them all at once opens that many sockets (and
+ * identify timers) in one tick, past most processes' file-descriptor
+ * limit. Dials are bounded rather than serialized (issue #226): 64 keeps a
+ * typical roster fully parallel while capping the burst. (The Java SDK
+ * bounds its bootstrap dialers too, at 16 threads.) */
+const MAX_CONCURRENT_DIALS = 64;
+
+/** `Promise.all(items.map(fn))`, except that at most `limit` calls to `fn`
+ * are in flight at a time (started in `items` order); results come back in
+ * `items` order. `fn` must not reject — like `dialClusterNode`, which
+ * reports every outcome as a value (see `allSettledBounded` for one that
+ * may). */
+async function mapBounded<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/** `Promise.allSettled(items.map(fn))` with `mapBounded`'s concurrency
+ * bound. */
+function allSettledBounded<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  return mapBounded(items, limit, async (item): Promise<PromiseSettledResult<R>> => {
+    try {
+      return { status: "fulfilled", value: await fn(item) };
+    } catch (reason) {
+      return { status: "rejected", reason };
+    }
+  });
+}
+
 /** Drops repeated node names from discovery's raw list, first occurrence
  * winning (issue #461) — mirrors Go's `dedupeDiscoveredNodes` (issue #389)
  * and the same stance `HashRing`'s constructor takes (issues #328/#360).
@@ -872,8 +915,8 @@ export class NanocachedClient {
       // same node list, so don't try one; another address would hand back
       // the same node list either way. Only a cluster with *no* reachable
       // node at all fails connect(), with the last dial error.
-      const outcomes = await Promise.all(
-        nodes.map((node) => dialClusterNode(node, options.authSecret, options.tls, ca)),
+      const outcomes = await mapBounded(nodes, MAX_CONCURRENT_DIALS, (node) =>
+        dialClusterNode(node, options.authSecret, options.tls, ca),
       );
 
       const hard = outcomes.find((outcome) => outcome.kind === "hard");
@@ -2983,10 +3026,11 @@ export class NanocachedClient {
     // that one node's rejection — treated as unreachable below — rather
     // than a synchronous throw out of this `.map` that would skip
     // allSettled and orphan the dials already started for earlier nodes.
-    const dialResults = await Promise.allSettled(
-      newNodes.map(async (node) =>
-        connectAndIdentify({ ...splitHostPort(node.address), authSecret: this.authSecret, tls: this.tls, ca: this.ca }),
-      ),
+    //
+    // At most MAX_CONCURRENT_DIALS at a time, though: a roster of tens of
+    // thousands of new nodes must not open that many sockets at once.
+    const dialResults = await allSettledBounded(newNodes, MAX_CONCURRENT_DIALS, async (node) =>
+      connectAndIdentify({ ...splitHostPort(node.address), authSecret: this.authSecret, tls: this.tls, ca: this.ca }),
     );
 
     if (this.closed) {

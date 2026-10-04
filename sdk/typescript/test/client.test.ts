@@ -6279,3 +6279,95 @@ describe("a malformed roster address is one unreachable node, not a failed round
     });
   }
 });
+
+describe("a big roster is dialed with bounded concurrency", () => {
+  // A discovery server may list up to 65536 nodes; dialing them all at
+  // once opened that many sockets in one tick. Every roster entry below
+  // points at the same slow-to-handshake server, which records how many
+  // identify handshakes it has in flight at once.
+  async function startCountingNode(): Promise<{
+    address: string;
+    maxInFlight: () => number;
+    accepted: () => number;
+    close: () => Promise<void>;
+  }> {
+    let inFlight = 0;
+    let max = 0;
+    let accepted = 0;
+    const sockets = new Set<import("node:net").Socket>();
+    const server: Server = createServer((socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+      socket.on("error", () => {});
+      accepted++;
+      inFlight++;
+      max = Math.max(max, inFlight);
+      socket.once("data", () => {
+        setTimeout(() => {
+          inFlight--;
+          socket.write("OnT\n");
+        }, 25);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("bad address");
+    return {
+      address: `127.0.0.1:${address.port}`,
+      maxInFlight: () => max,
+      accepted: () => accepted,
+      close: () =>
+        new Promise<void>((resolve) => {
+          for (const socket of sockets) socket.destroy();
+          server.close(() => resolve());
+        }),
+    };
+  }
+
+  const rosterOf = (count: number, address: string) =>
+    Array.from({ length: count }, (_, i) => ({ name: `node-${String(i).padStart(4, "0")}`, address }));
+
+  it("connect(): dials a 300-node roster at most 64 at a time, and still installs every node", async () => {
+    const counting = await startCountingNode();
+    const discovery = await startMockDiscovery(rosterOf(300, counting.address));
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        const members = (client as any).target.members as Map<string, { connection: unknown }>;
+        assert.equal(members.size, 300);
+        for (const [name, member] of members) assert.notEqual(member.connection, null, `${name} has no connection`);
+        assert.equal(counting.accepted(), 300);
+        assert.ok(counting.maxInFlight() <= 64, `${counting.maxInFlight()} dials were in flight at once`);
+        assert.ok(counting.maxInFlight() > 1, "the bound must still leave the dials concurrent");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), counting.close()]);
+    }
+  });
+
+  it("refreshNodeList(): the same bound applies to a round of newly listed nodes", async () => {
+    const bootNode = await startMockNode();
+    const counting = await startCountingNode();
+    const discovery = await startMockDiscovery([{ name: "boot", address: bootNode.address }]);
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        discovery.setNodes([{ name: "boot", address: bootNode.address }, ...rosterOf(300, counting.address)]);
+        await (client as any).refreshNodeList();
+
+        const members = (client as any).target.members as Map<string, { connection: unknown }>;
+        assert.equal(members.size, 301);
+        for (const [name, member] of members) assert.notEqual(member.connection, null, `${name} has no connection`);
+        assert.equal(counting.accepted(), 300);
+        assert.ok(counting.maxInFlight() <= 64, `${counting.maxInFlight()} dials were in flight at once`);
+        assert.ok(counting.maxInFlight() > 1, "the bound must still leave the dials concurrent");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), bootNode.close(), counting.close()]);
+    }
+  });
+});

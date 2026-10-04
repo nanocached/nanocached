@@ -31,6 +31,11 @@ tag: 0.4.3 was a server-only release.
   scoring on 32-bit halves. A lookup takes about 3 us at 100 nodes (was
   22 us) and 31 us at 1000 nodes (was 278 us). The owner order, ties
   included, is unchanged.
+- `connect()` and node-list refresh no longer dial a whole roster at once.
+  A discovery server can list up to 65536 nodes, which opened that many
+  sockets in a single tick; at most 64 dials are now in flight at a time.
+  Outcomes (which nodes are installed, which count as unreachable) are
+  unchanged.
 
 ## [0.4.4] - 2026-09-09
 
