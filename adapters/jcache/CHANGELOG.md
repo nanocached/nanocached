@@ -16,6 +16,10 @@ changed. What 1.0.0 will promise is described on the
   `CacheException` naming the entry, instead of escaping as an
   `ArrayIndexOutOfBoundsException`. The last colon splits the entry, so a
   bracketed IPv6 host works (PR #531).
+- The static thread pool behind `removeAll(Set)` no longer keeps up to 256
+  idle threads alive for the life of the JVM after one large call: its core
+  threads now exit after 2 seconds idle, so the pool drains back to zero
+  threads (and stops pinning the adapter's classloader across redeploys).
 
 ## [0.4.4] - 2026-09-09
 
