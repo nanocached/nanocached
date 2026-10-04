@@ -10,6 +10,25 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- A TLS certificate or handshake failure (`AuthenticationException`) on a
+  node dial is now treated like any other unreachable node, as in the other
+  SDKs. Before, it escaped the dial paths, so one new node with a bad
+  certificate faulted a node-list refresh (breaking its "never throws"
+  contract and orphaning the connections its sibling dials had opened) and
+  aborted `ConnectAsync` for the whole cluster; and a bad-certificate first
+  address ended `ConnectAsync` instead of trying the next one. A bad-certificate
+  node is now installed without a connection and fails over per request, and a
+  connect to a single address still reports the `AuthenticationException`.
+- Keep-alive pings now run concurrently, one per idle connection, instead of
+  one after another. A single half-open node held its ping for the 30 s request
+  timeout and delayed the pings to every other node until about 60 s idle,
+  which is the server's idle limit (issue #192).
+- Dialing a discovered roster is now bounded to 64 nodes at a time, both at
+  connect and on a node-list refresh. A roster of up to 65536 nodes used to be
+  dialed all at once.
+
 ## [0.4.4] - 2026-09-09
 
 No changes. Version aligned with the rest of the project: from 0.4.4 on,
