@@ -46,20 +46,18 @@ framework adapters at one version, whether or not a component changed.
   `--namespace-budget` accounting and the `/metrics` per-namespace rows are
   unchanged; the namespace rows now sum to `used_bytes` minus these name
   charges.
-- `nanocached-node`: a large `o` (multi-set) during a join migration or a
-  decommission no longer loses forwards. Each matching key was handed to
-  the forward queue separately in a loop that never yields, so past about
-  4350 keys the excess was dropped (with a warning) and the joiner or
-  entrant never received those writes. A frame's keys for one target now
-  go out as a single forwarded unit, sent in order on the target's shared
-  connection; a retry resumes after the last acknowledged key instead of
-  starting over.
-- `nanocached-node`: the number of forward tasks in flight is now bounded
-  (256). Every forward leaving the queue became a task parked, without a
-  timeout, on its target's connection lock, so the queue and waiter limits
-  bounded only forwards still waiting: a target that stopped answering left
-  an ever-growing pile of parked tasks. Past the bound, forwards wait in
-  the (bounded) queue as the existing documentation describes.
+- `nanocached-node`: client writes to keys being handed to a joining node (or
+  to the entrants of a decommission) are no longer dropped when the target
+  is slow. Each write was its own task behind a bounded channel, so while
+  the target was busy (for example a replacement node receiving its
+  handoff) the backlog passed about 4350 and the rest were dropped with a
+  warning: under chaos load, 10,000 to 35,000 per node, leaving the joiner
+  with older values than the cluster had acknowledged. Writes now wait in a
+  per-target queue and a later write to a key replaces one still waiting
+  for it, so the queue is bounded by the number of distinct keys, not by
+  the number of writes, and nothing is dropped for want of room. A clear
+  and a put-if-absent relay keep their place in the order. One drainer per
+  target sends in order, so a large `o` costs one queue insert per key.
 - `nanocached-node`: a `U` or `u` carrying the wrong membership token on a
   connection that negotiated tagged mode no longer panics the connection
   task. The rejection is now answered `R <tag>` (the tagged form of the
@@ -70,10 +68,9 @@ framework adapters at one version, whether or not a component changed.
   took an unbounded `u64`) overflowed the `Instant` the drain deadline is
   computed from, so the first SIGTERM panicked instead of shutting down.
 - `nanocached-node`: forwarding a client write to a joining node (or a
-  decommission entrant) no longer `Debug`-formats the whole key for the
-  log message on every forward; it is rendered only when a forward is
-  actually dropped. A key can be about 1 MiB, so this was a per-write
-  allocation and format on the node's single thread.
+  decommission entrant) no longer `Debug`-formats the whole key on every
+  forward. A key can be about 1 MiB, so this was a per-write allocation
+  and format on the node's single thread.
 - `nanocached-node`: shutdown no longer waits out an unresponsive peer
   during an in-flight re-replication. The dial/auth and send legs are now
   interrupted by the shutdown signal (before, only the gaps between
