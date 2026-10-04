@@ -199,6 +199,32 @@ const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 256;
 /// themselves alive instead (`BACKEND_KEEPALIVE_INTERVAL`).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Pre-auth bound on buffered bytes (only when an auth secret is
+/// configured): until a connection authenticates, the only frame it may
+/// send is `A`, so it may never make the proxy buffer more than this —
+/// header and secret together. Without it the read loop buffered up to
+/// `MAX_REQUEST_SIZE` (1 MiB) per unauthenticated connection before any
+/// secret check, ~1 GiB across `--max-connections`. Mirrors discovery's
+/// own 4096-byte request cap, which already makes this the fleet-wide
+/// ceiling on a secret (all three binaries share one
+/// `NANOCACHED_AUTH_SECRET`).
+const PREAUTH_MAX_BYTES: usize = 4096;
+
+/// Pre-auth bound on time (only when an auth secret is configured): the
+/// fixed deadline, measured from when the connection was accepted, by
+/// which it must have completed its `A`. Not reset by reads, unlike
+/// `IDLE_TIMEOUT` — a peer that trickles one byte per 59 s resets that
+/// forever without finishing a frame. A well-behaved client sends `A` in
+/// its first write, so this only ever fires on a connection already
+/// behaving like an attack; equal to `IDLE_TIMEOUT` like discovery's
+/// `UNIDENTIFIED_CONNECTION_TIMEOUT`.
+#[cfg(not(test))]
+const AUTH_DEADLINE: Duration = IDLE_TIMEOUT;
+/// Shrunk under test like `CLIENT_WRITE_TIMEOUT`, so a test that
+/// trickles bytes pre-auth doesn't pay out 60 real seconds.
+#[cfg(test)]
+const AUTH_DEADLINE: Duration = Duration::from_millis(600);
+
 /// Issue #514: how long a shared backend connection may sit with nothing
 /// written before `run_backend` sends a keep-alive probe on it. SDK
 /// keep-alives only reach a node while a client is connected to the
@@ -1300,13 +1326,29 @@ fn lf_scan_bytes() -> usize {
 /// `Incomplete`), mirroring the node's own grammar for the client-facing
 /// commands. `M`/`X` and anything unknown error — the proxy is not a
 /// cluster member (see the module docs). `scan` carries the header `\n`
-/// scan's progress across calls — see `RequestScanState`.
+/// scan's progress across calls — see `RequestScanState`. Production code
+/// goes through `parse_request_limited` directly; this is the
+/// full-size-bound form the unit tests use.
+#[cfg(test)]
 fn parse_request(
     input: &mut BytesMut,
     tagged: bool,
     scan: &mut RequestScanState,
 ) -> io::Result<ParseOutcome> {
-    let result = parse_request_body(input, tagged, scan);
+    parse_request_limited(input, tagged, scan, MAX_REQUEST_SIZE)
+}
+
+/// `parse_request` with the frame bound lowered to `max_frame` (header
+/// plus body) — the pre-auth form (`PREAUTH_MAX_BYTES`). A frame whose
+/// header already declares more than the bound is rejected as soon as the
+/// header is parsed, before its body is buffered.
+fn parse_request_limited(
+    input: &mut BytesMut,
+    tagged: bool,
+    scan: &mut RequestScanState,
+    max_frame: usize,
+) -> io::Result<ParseOutcome> {
+    let result = parse_request_body(input, tagged, scan, max_frame);
     if !matches!(result, Ok(ParseOutcome::Incomplete)) {
         *scan = RequestScanState::default();
     }
@@ -1317,9 +1359,10 @@ fn parse_request_body(
     input: &mut BytesMut,
     tagged: bool,
     scan: &mut RequestScanState,
+    max_frame: usize,
 ) -> io::Result<ParseOutcome> {
     let Some(header_end) = find_header_end(input, scan) else {
-        if input.len() > MAX_REQUEST_SIZE {
+        if input.len() > max_frame {
             return Err(invalid("header exceeds the request-size limit"));
         }
         return Ok(ParseOutcome::Incomplete);
@@ -1363,7 +1406,7 @@ fn parse_request_body(
                 .checked_add(1)
                 .and_then(|start| start.checked_add(body_length))
                 .ok_or_else(|| invalid("frame length overflow"))?;
-            if frame_end > MAX_REQUEST_SIZE {
+            if frame_end > max_frame {
                 return Err(invalid("request exceeds the request-size limit"));
             }
             if input.len() < frame_end {
@@ -4519,11 +4562,23 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
     let mut retry_capable = false;
     let mut drain = context.drain.clone();
     let mut scan = RequestScanState::default();
+    // The fixed pre-auth deadline (`AUTH_DEADLINE`): never moved, so no
+    // amount of slow trickling extends it. Irrelevant in no-secret mode,
+    // where `authenticated` starts true and is never consulted.
+    let auth_deadline = tokio::time::Instant::now() + AUTH_DEADLINE;
 
     let result: io::Result<()> = 'connection: loop {
         // Parse everything already buffered before reading more.
         loop {
-            match parse_request(&mut buf, tagged, &mut scan) {
+            // Until the secret is checked the only acceptable frame is a
+            // small `A` (`PREAUTH_MAX_BYTES`); anything bigger is a parse
+            // error here, before its body is ever buffered.
+            let max_frame = if authenticated {
+                MAX_REQUEST_SIZE
+            } else {
+                PREAUTH_MAX_BYTES
+            };
+            match parse_request_limited(&mut buf, tagged, &mut scan, max_frame) {
                 Ok(ParseOutcome::Incomplete) => break,
                 Ok(ParseOutcome::Auth {
                     secret,
@@ -4596,8 +4651,13 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
         }
 
         let mut chunk = [0u8; 4096];
+        let read_deadline = if authenticated {
+            tokio::time::Instant::now() + IDLE_TIMEOUT
+        } else {
+            auth_deadline
+        };
         let read = tokio::select! {
-            read = timeout(IDLE_TIMEOUT, read_half.read(&mut chunk)) => read,
+            read = tokio::time::timeout_at(read_deadline, read_half.read(&mut chunk)) => read,
             () = drained(&mut drain) => break 'connection Ok(()),
         };
         match read {
@@ -7274,6 +7334,103 @@ mod tests {
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1");
+    }
+
+    /// Pre-auth bound: with a secret configured, a frame that declares
+    /// more than `PREAUTH_MAX_BYTES` is refused from its header alone —
+    /// before any of its body is buffered — and so is a header that runs
+    /// past the bound without ever ending its line.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unauthenticated_connection_cannot_make_the_proxy_buffer_more_than_the_preauth_bound()
+     {
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let proxy = start_proxy(&discovery, Some("s3cret"), 64).await;
+
+        // A huge declared secret: answered `E` on the header, with none of
+        // the body sent.
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let mut buf = BytesMut::new();
+        stream.write_all(b"A 1000000\n").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+
+        // Same for a big request frame sent before authenticating.
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let mut buf = BytesMut::new();
+        stream.write_all(b"S 1 500000\n").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+
+        // A header that never ends its line.
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let mut buf = BytesMut::new();
+        stream
+            .write_all(&vec![b'x'; PREAUTH_MAX_BYTES + 1])
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+
+        // The bound is pre-auth only: once authenticated, a frame well
+        // past it is served.
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let mut buf = BytesMut::new();
+        let mut frame = b"A 6\ns3cretS 1 10000\nk".to_vec();
+        frame.extend_from_slice(&vec![b'v'; 10_000]);
+        stream.write_all(&frame).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+    }
+
+    /// Pre-auth deadline: `IDLE_TIMEOUT` resets on every read, so a peer
+    /// trickling bytes of an `A` frame just under it never finished
+    /// authenticating and was never dropped. The fixed `AUTH_DEADLINE`
+    /// closes it no matter how steadily it trickles.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unauthenticated_connection_that_trickles_is_closed_at_the_auth_deadline() {
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let proxy = start_proxy(&discovery, Some("s3cret"), 64).await;
+
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let started = std::time::Instant::now();
+        stream.write_all(b"A 1000\n").await.unwrap();
+        let mut closed = false;
+        while started.elapsed() < AUTH_DEADLINE * 5 {
+            sleep(AUTH_DEADLINE / 4).await;
+            // One byte at a time, well inside any per-read idle bound.
+            if stream.write_all(b"x").await.is_err() {
+                closed = true;
+                break;
+            }
+            let mut probe = [0u8; 1];
+            if let Ok(Ok(0)) = timeout(Duration::from_millis(5), stream.read(&mut probe)).await {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the trickling connection was never closed");
+        assert!(
+            started.elapsed() < AUTH_DEADLINE * 4,
+            "closed only after {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// No-secret mode is untouched by the pre-auth bounds: a connection
+    /// that has sent nothing for longer than `AUTH_DEADLINE` still works,
+    /// and may send frames past `PREAUTH_MAX_BYTES` without an `A`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn without_a_secret_the_preauth_bounds_do_not_apply() {
+        let (_nodes, proxy) = cluster(1).await;
+
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        let mut buf = BytesMut::new();
+        sleep(AUTH_DEADLINE + AUTH_DEADLINE / 2).await;
+        let mut frame = b"S 1 10000\nk".to_vec();
+        frame.extend_from_slice(&vec![b'v'; 10_000]);
+        stream.write_all(&frame).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -39,6 +39,15 @@ framework adapters at one version, whether or not a component changed.
 - Updated `rustls` to 0.23.45 in the node, proxy and discovery binaries
   (RUSTSEC-2026-0285: TLS 1.3 handshake messages were accepted across
   encryption-level boundaries).
+- `nanocached-proxy`: with an auth secret configured, a connection that has
+  not yet authenticated is now held to the same bounds discovery applies. It
+  may buffer at most 4096 bytes (only an `A` frame is acceptable before the
+  secret is checked; a larger declared frame is refused from its header) and
+  must authenticate within a fixed 60 s of being accepted. Before, it could
+  declare an `A` of up to 1 MiB and trickle it in a byte per 59 s, holding
+  1-2 MiB indefinitely per connection (about 1 GiB across the default 1024
+  connections) because the 60 s idle timeout restarts on every read. A
+  proxy with no secret is unchanged.
 
 ## [0.4.4] - 2026-09-09
 
