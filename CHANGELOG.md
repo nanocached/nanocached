@@ -14,6 +14,20 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: with an auth secret configured, a connection that has
+  not authenticated yet is now held to what an unauthenticated peer can
+  legitimately do. The node used to parse and buffer a whole request (up to
+  1 MiB, and for an `M` a 32-byte span per roster entry) before checking
+  `authenticated`, so each of up to 1024 unauthenticated connections could
+  pin that much. Now only an `A` frame is accepted first: anything else is
+  answered `En` and closed on its first byte without being buffered, an `A`
+  frame (header plus secret) is capped at 4096 bytes while incomplete
+  (matching discovery's pre-identification cap; a longer secret field no
+  longer makes the node keep reading). Commands pipelined behind a complete
+  `A` frame are unaffected, and a node with no secret behaves exactly as
+  before. Because an `A` frame must now fit in 4096 bytes, the node refuses
+  to start with a `NANOCACHED_AUTH_SECRET` longer than about 4080 bytes
+  (discovery's identical cap already ruled such a secret out in a cluster).
 - `nanocached-node` and `nanocached-proxy`: an `m`/`o` frame whose body arrives
   a few bytes at a time no longer has its (O(keys)) header re-parsed on every
   read. This ran before authentication, so a large header followed by a

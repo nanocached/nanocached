@@ -83,6 +83,29 @@ pub(crate) const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 /// in full within this long of the previous one completing, not merely
 /// send *some* bytes that often.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// While a connection to a node that requires a secret has not yet
+/// authenticated, the most it may have buffered without completing its
+/// `A` frame (mirrors `nanocached-discovery`'s own 4096-byte request cap
+/// before a peer is identified). Before this, an unauthenticated
+/// connection could make the node buffer — and, for an `M`, span-index —
+/// up to `MAX_REQUEST_SIZE` (1 MiB) before the `authenticated` check ever
+/// ran, times up to `DEFAULT_MAX_CONNECTIONS` connections. Only an `A`
+/// frame is acceptable first (every legitimate peer — SDKs, the proxy,
+/// discovery, other nodes — authenticates before anything else), so this
+/// only bounds `A`'s own header and secret; once it completes, whatever
+/// the client pipelined after it is subject to `MAX_REQUEST_SIZE` as
+/// usual. Does not apply when no secret is configured.
+pub(crate) const UNAUTHENTICATED_MAX_REQUEST_SIZE: usize = 4096;
+
+/// Whether an `A` frame carrying a secret of `secret_len` bytes fits
+/// `UNAUTHENTICATED_MAX_REQUEST_SIZE` (header sized for the longest form,
+/// `A <len> T R`). `main` refuses to start with a secret that doesn't: no
+/// peer could authenticate against it any more. (The discovery server
+/// has always had the same 4096-byte request cap, so a secret that long
+/// could not be shared with it either.)
+pub(crate) fn auth_frame_fits(secret_len: usize) -> bool {
+    format!("A {secret_len} T R\n").len() + secret_len <= UNAUTHENTICATED_MAX_REQUEST_SIZE
+}
 /// Bounds a response write (issue #4) — see `write_response`. Shorter
 /// than `IDLE_TIMEOUT`: that one tolerates a normal gap between a
 /// client's requests, but a peer that has simply stopped draining its
@@ -1639,6 +1662,12 @@ async fn handle_connection(
     // specifically, rather than on every byte read.
     let mut deadline = Instant::now() + config.idle_timeout;
 
+    // Note for the pre-authentication phase: `deadline` is only ever
+    // re-anchored by a fully parsed command, and before authenticating the
+    // only one that doesn't end the connection is the `A` that
+    // authenticates — so the accept-time deadline above is already a fixed,
+    // non-resetting bound on authentication; trickling bytes cannot renew it.
+
     // Echoed response tags: set once an `A ... T` is accepted. From then on every
     // request must carry a trailing tag (`parse_tagged`) and every
     // `G`/`S`/`D` response echoes it, so the client's read loop can
@@ -1650,6 +1679,19 @@ async fn handle_connection(
     let mut parse_progress = MigrateProgress::default();
 
     loop {
+        // Before authenticating, only an `A` frame is acceptable, so
+        // anything else is turned away on its first byte — without
+        // parsing it or buffering the rest of it. (A client that
+        // authenticates and pipelines commands behind the `A` in one
+        // write is unaffected: it leads with `A`.)
+        if !authenticated && received.first().is_some_and(|lead| *lead != b'A') {
+            write_response(&mut stream, &Response::Unauthorized.encode()).await?;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "command sent before authenticating",
+            ));
+        }
+
         let parsed = parse_resumable(&mut received, tagged, &mut parse_progress);
 
         // Only a fully parsed command extends the deadline — an
@@ -2623,7 +2665,17 @@ async fn handle_connection(
 
                 continue;
             }
-            Err(ParseError::Incomplete) => {}
+            Err(ParseError::Incomplete) => {
+                // An `A` frame still short of complete: its header line
+                // and secret together must fit — see
+                // `UNAUTHENTICATED_MAX_REQUEST_SIZE`.
+                if !authenticated && received.len() > UNAUTHENTICATED_MAX_REQUEST_SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unauthenticated request is too large",
+                    ));
+                }
+            }
             Err(error) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -9209,6 +9261,175 @@ mod tests {
 
         let error = connection_task.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// The pieces of a `spawn_secret_connection`: the connection task, the
+    /// cache task, and the senders that must outlive the connection (a
+    /// dropped shutdown sender reads as a shutdown signal).
+    type SecretConnection = (
+        tokio::task::JoinHandle<io::Result<()>>,
+        tokio::task::JoinHandle<()>,
+        (mpsc::Sender<CacheRequest>, watch::Sender<bool>),
+    );
+
+    /// A connection to a node that requires `secret`, with a live cache
+    /// behind it.
+    fn spawn_secret_connection(
+        server: TcpStream,
+        secret: &'static [u8],
+        idle_timeout: Duration,
+    ) -> SecretConnection {
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout,
+                auth_secret: Some(Bytes::from_static(secret)),
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+        (connection_task, cache_task, (request_tx, shutdown_tx))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unauthenticated_connection_is_turned_away_on_its_first_byte_not_buffered() {
+        // Before this, the node parsed and buffered a whole frame (up to
+        // MAX_REQUEST_SIZE) before it ever checked `authenticated`, so an
+        // unauthenticated connection could sit on ~1 MiB (and, for an `M`,
+        // a 32-byte span per roster entry). A frame that is still far from
+        // complete — the case that used to wait for more bytes — is now
+        // answered `En` and closed immediately.
+        for partial in [
+            &b"S 1 1000000\nk"[..],
+            &b"M 4 5 1 1 1 1 1\nxx"[..],
+            &b"o 0 100000 1 1"[..],
+        ] {
+            let (mut client, server) = tcp_pair().await;
+            let (connection_task, cache_task, senders) =
+                spawn_secret_connection(server, b"correct-secret", IDLE_TIMEOUT);
+
+            client.write_all(partial).await.unwrap();
+
+            let mut response = [0u8; 3];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"En\n", "{partial:?}");
+            let error = connection_task.await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{partial:?}");
+
+            drop(senders);
+            cache_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_a_frame_cannot_make_the_node_buffer_past_the_unauthenticated_cap() {
+        // `A`'s secret length field is attacker-controlled: declaring a
+        // huge secret must not keep the node reading and buffering it.
+        let (mut client, server) = tcp_pair().await;
+        let (connection_task, cache_task, senders) =
+            spawn_secret_connection(server, b"correct-secret", IDLE_TIMEOUT);
+
+        client.write_all(b"A 1000000\n").await.unwrap();
+        client
+            .write_all(&vec![b'x'; UNAUTHENTICATED_MAX_REQUEST_SIZE])
+            .await
+            .unwrap();
+
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        drop(senders);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pipelined_auth_and_large_command_still_works_under_the_unauthenticated_cap() {
+        // The cap covers only the `A` frame: a client that writes `A`
+        // plus a command bigger than the cap in one go (here a 6000-byte
+        // value) is unaffected, as is a secret well under the cap.
+        let secret: &'static [u8] = Box::leak(vec![b's'; 3000].into_boxed_slice());
+        let (mut client, server) = tcp_pair().await;
+        let (connection_task, cache_task, senders) =
+            spawn_secret_connection(server, secret, IDLE_TIMEOUT);
+
+        let mut request = b"A 3000\n".to_vec();
+        request.extend_from_slice(secret);
+        request.extend_from_slice(b"S 4 6000\nname");
+        request.extend_from_slice(&[b'v'; 6000]);
+        request.extend_from_slice(b"G 4\nname");
+        client.write_all(&request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"On\nS\nV 6000\n"), "{response:?}");
+
+        connection_task.await.unwrap().unwrap();
+        drop(senders);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn without_a_secret_a_large_first_frame_is_accepted_as_before() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        let mut request = b"S 4 100000\nname".to_vec();
+        request.extend_from_slice(&[b'v'; 100_000]);
+        client.write_all(&request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"S\n");
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[test]
+    fn auth_frame_fits_only_while_the_a_frame_stays_under_the_unauthenticated_cap() {
+        assert!(auth_frame_fits(1));
+        assert!(auth_frame_fits(3000));
+        // 4096 total, minus the longest header `A <len> T R\n`.
+        let longest = (1..UNAUTHENTICATED_MAX_REQUEST_SIZE)
+            .rev()
+            .find(|len| auth_frame_fits(*len))
+            .unwrap();
+        assert!(longest > 4000 && longest < UNAUTHENTICATED_MAX_REQUEST_SIZE);
+        assert!(!auth_frame_fits(longest + 1));
+        assert!(!auth_frame_fits(UNAUTHENTICATED_MAX_REQUEST_SIZE));
+        assert!(!auth_frame_fits(1_000_000));
+
+        // The longest accepted secret really does authenticate in one
+        // maximal `A` frame under the cap.
+        let frame = format!("A {longest} T R\n").len() + longest;
+        assert!(frame <= UNAUTHENTICATED_MAX_REQUEST_SIZE);
     }
 
     #[tokio::test(flavor = "current_thread")]
