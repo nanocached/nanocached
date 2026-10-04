@@ -1,6 +1,7 @@
 import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { createServer, type Server } from "node:net";
 import {
   AlreadyClosedError,
   AuthenticationError,
@@ -6141,4 +6142,140 @@ describe("NanocachedClient refreshNodeList dials new nodes concurrently (issue #
       await Promise.all([discovery.close(), bootNode.close(), nodeA.close(), nodeB.close()]);
     }
   });
+});
+
+describe("identified sockets waiting on sibling dials survive a peer RST (orphaned error listener)", () => {
+  // A socket that finished connectAndIdentify sat with no `error`
+  // listener until `new Connection(...)` attached one, which a bootstrap
+  // or refresh round only does after its *slowest* dial finishes (up to
+  // the 5 s dial deadline). A peer RST in that window was an uncaught
+  // ECONNRESET and killed the process.
+
+  /** A "node" that completes the identify handshake, then RSTs the
+   * connection shortly after — while the other dial in the round is still
+   * pending. */
+  async function startResettingNode(): Promise<{ address: string; close: () => Promise<void> }> {
+    const server: Server = createServer((socket) => {
+      socket.on("error", () => {});
+      socket.once("data", () => {
+        socket.write("OnT\n");
+        setTimeout(() => socket.resetAndDestroy(), 30);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("bad address");
+    return {
+      address: `127.0.0.1:${address.port}`,
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  /** Collects uncaught exceptions for the duration of `body`, so a
+   * regression is an assertion failure here rather than a crashed runner. */
+  async function collectingUncaught(body: () => Promise<void>): Promise<Error[]> {
+    const uncaught: Error[] = [];
+    const listener = (error: Error) => uncaught.push(error);
+    process.on("uncaughtException", listener);
+    try {
+      await body();
+      await delay(100);
+    } finally {
+      process.off("uncaughtException", listener);
+    }
+    return uncaught;
+  }
+
+  it("connect(): a node that resets while a slower sibling is still dialing does not crash the process", async () => {
+    const resetting = await startResettingNode();
+    const slow = await startMockNode({ authDelayMs: 400 });
+    const discovery = await startMockDiscovery([
+      { name: "a-resetting", address: resetting.address },
+      { name: "b-slow", address: slow.address },
+    ]);
+    try {
+      const uncaught = await collectingUncaught(async () => {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        client.close();
+      });
+      assert.deepEqual(uncaught.map((error) => error.message), []);
+    } finally {
+      await Promise.all([discovery.close(), resetting.close(), slow.close()]);
+    }
+  });
+
+  it("refreshNodeList(): a new node that resets while a slower sibling is still dialing does not crash the process", async () => {
+    const bootNode = await startMockNode();
+    const resetting = await startResettingNode();
+    const slow = await startMockNode({ authDelayMs: 400 });
+    const discovery = await startMockDiscovery([{ name: "boot", address: bootNode.address }]);
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        discovery.setNodes([
+          { name: "boot", address: bootNode.address },
+          { name: "a-resetting", address: resetting.address },
+          { name: "b-slow", address: slow.address },
+        ]);
+        const uncaught = await collectingUncaught(async () => {
+          await (client as any).refreshNodeList();
+        });
+        assert.deepEqual(uncaught.map((error) => error.message), []);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), bootNode.close(), resetting.close(), slow.close()]);
+    }
+  });
+});
+
+describe("a malformed roster address is one unreachable node, not a failed round", () => {
+  for (const bad of ["no-port-here", "127.0.0.1:99999"]) {
+    it(`connect(): "${bad}" is installed as an unreachable member and siblings stay connected`, async () => {
+      const good = await startMockNode();
+      const discovery = await startMockDiscovery([
+        { name: "a-good", address: good.address },
+        { name: "b-bad", address: bad },
+      ]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          const members = (client as any).target.members as Map<string, { connection: unknown }>;
+          assert.notEqual(members.get("a-good")?.connection, null);
+          assert.equal(members.get("b-bad")?.connection, null);
+        } finally {
+          client.close();
+        }
+      } finally {
+        await Promise.all([discovery.close(), good.close()]);
+      }
+    });
+
+    it(`refreshNodeList(): "${bad}" after a good new node does not abort the round or orphan its dial`, async () => {
+      const bootNode = await startMockNode();
+      const good = await startMockNode();
+      const discovery = await startMockDiscovery([{ name: "boot", address: bootNode.address }]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          discovery.setNodes([
+            { name: "boot", address: bootNode.address },
+            { name: "a-good", address: good.address },
+            { name: "b-bad", address: bad },
+          ]);
+          await (client as any).refreshNodeList();
+
+          const members = (client as any).target.members as Map<string, { connection: unknown }>;
+          assert.notEqual(members.get("a-good")?.connection, null);
+          assert.equal(members.get("b-bad")?.connection, null);
+          assert.equal(client.stats().refreshFailures, 1);
+        } finally {
+          client.close();
+        }
+      } finally {
+        await Promise.all([discovery.close(), bootNode.close(), good.close()]);
+      }
+    });
+  }
 });
