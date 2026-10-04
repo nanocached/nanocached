@@ -7,8 +7,11 @@ collide even when they share a node (issue #105/#106; see
 ``nanocached.Namespace``).
 
 The sync/async bridge: Django's cache SPI is sync, the SDK is
-asyncio-only. Each backend instance owns a dedicated daemon-thread event
-loop, started lazily on first use and driven from any calling thread via
+asyncio-only. Backend instances with the same connection options share
+one dedicated daemon-thread event loop and client (a ``_Bridge``; Django
+builds a fresh instance per thread or ASGI request context, so a bridge
+per instance would leak a thread and its sockets per request), started
+lazily on first use and driven from any calling thread via
 ``asyncio.run_coroutine_threadsafe`` — never ``asyncio.run()`` per call,
 which would reconnect the SDK client (and redo its handshake) on every
 single cache operation instead of reusing one persistent connection.
@@ -26,20 +29,22 @@ would tear down and re-open this backend's loop thread and SDK connection
 defeating the persistent connections the whole client design is built
 around. So, like django-redis, ``close()`` is a no-op by default; opt in
 to per-request teardown with ``OPTIONS: {"CLOSE_ON_REQUEST": True}`` if
-short-lived processes matter more than connection reuse, and use
-``shutdown()`` for the explicit, unconditional teardown (process exit,
-tests).
+short-lived processes matter more than connection reuse (such an instance
+keeps a private bridge, so closing it can't disturb other threads), and
+use ``shutdown()`` for the explicit, unconditional teardown (tests; it
+applies to every instance sharing the bridge). Shared bridges are also
+shut down at interpreter exit.
 """
 
 from __future__ import annotations
 
 import asyncio
+import atexit
 import math
 import os
 import pickle
 import re
 import threading
-import weakref
 
 from django.core.cache.backends.base import DEFAULT_TIMEOUT, BaseCache
 from django.core.exceptions import ImproperlyConfigured
@@ -266,33 +271,207 @@ def _parse_addresses(location) -> list[tuple[str, int]]:
     return [_split_host_port(entry.strip()) for entry in entries]
 
 
+class _Bridge:
+    """One event-loop thread plus one ``NanocachedClient`` (and so one set
+    of node sockets and keepalive tasks), shared by every
+    ``NanocachedCache`` built with the same connection options.
+
+    Django's ``CacheHandler`` keeps backend instances in an asgiref
+    ``Local``, so every short-lived thread (``runserver``, thread-per-
+    request WSGI) or ASGI request context constructs a fresh
+    ``NanocachedCache``. When each instance owned its own bridge, every
+    such instance left a loop thread, N sockets and keepalive tasks behind
+    (``close()`` is a no-op by default, and the keepalive pings stop the
+    server's 60 s idle timeout from ever reclaiming the connections) until
+    the node connection limit was hit. Instances now look their bridge up
+    in ``_bridges`` instead, so the process holds one per distinct
+    connection configuration, whatever number of threads touched the
+    cache. The lifecycle logic below is what ``NanocachedCache`` itself
+    used to carry (issues #185, #393, #414), unchanged.
+
+    ``NAMESPACE`` is deliberately not part of the key: a namespace is just
+    a cheap handle over the shared client, kept per namespace in
+    ``handles``."""
+
+    def __init__(self, addresses, secret, connect_kwargs) -> None:
+        self.addresses = addresses
+        self.secret = secret
+        self.connect_kwargs = connect_kwargs
+        # All None until ensure_started() first runs (lazily, on the
+        # first cache operation, not at construction: NanocachedCache's
+        # __init__ runs synchronously wherever Django constructs it, e.g.
+        # while importing settings, and must not block on network I/O or
+        # spin up a thread nothing has asked for yet).
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.thread: threading.Thread | None = None
+        self.client: NanocachedClient | None = None
+        self.handles: dict[str, object] = {}
+        # The PID that started (and whose thread drives) self.loop — see
+        # ensure_started's fork check (issue #393).
+        self.pid: int | None = None
+        # Guards start/close against concurrent callers on different
+        # Django worker threads racing to lazily start (or to close) the
+        # same bridge — the loop and client themselves are otherwise only
+        # ever touched from the loop's single background thread.
+        self.lock = threading.Lock()
+
+    def ensure_started(self) -> None:
+        if self.loop is not None and self.pid == os.getpid():
+            return
+        with self.lock:
+            if self.loop is not None:
+                if self.pid == os.getpid():
+                    return
+                # issue #393: this process is a fork() child (preforking
+                # WSGI servers with preload — Gunicorn preload_app, uWSGI
+                # without lazy-apps — where a warm-up cache touch in the
+                # master started the loop before workers forked). Only the
+                # forking thread survives fork(), so the thread driving
+                # this loop does not exist here: every
+                # run_coroutine_threadsafe(...).result() against it would
+                # block forever. Drop the inherited bridge state and start
+                # a fresh loop/thread/client for this process; the
+                # parent's objects (and its now-shared sockets) are the
+                # parent's to close — touching them from the child could
+                # corrupt the parent's live connections mid-frame.
+                self.loop = None
+                self.thread = None
+                self.client = None
+                self.handles = {}
+            loop = asyncio.new_event_loop()
+            started = threading.Event()
+
+            def run_loop() -> None:
+                asyncio.set_event_loop(loop)
+                started.set()
+                loop.run_forever()
+
+            thread = threading.Thread(
+                target=run_loop, name="nanocached-django-loop", daemon=True
+            )
+            thread.start()
+            started.wait()
+            # Assigned before the connect below (not after) so a second
+            # caller blocked on self.lock still sees a loop/thread to
+            # submit its own coroutine to once this connect completes;
+            # self.client is what actually gates a request going out
+            # before the connection exists (it stays None until connect()
+            # finishes).
+            self.loop = loop
+            self.thread = thread
+            self.pid = os.getpid()
+            try:
+                asyncio.run_coroutine_threadsafe(self.connect(), loop).result()
+            except BaseException:
+                # A failed connect must not leave a half-started loop
+                # thread behind for the next call to trip over.
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join()
+                loop.close()
+                self.loop = None
+                self.thread = None
+                raise
+
+    async def connect(self) -> None:
+        self.client = await NanocachedClient.connect(
+            self.addresses,
+            auth_secret=self.secret,
+            **self.connect_kwargs,
+        )
+        self.handles = {}
+
+    def snapshot(self, namespace: str):
+        """``(loop, namespace handle)``, read together under ``lock`` —
+        ``(None, None)`` if a shutdown has the bridge torn down (see
+        ``NanocachedCache._run``, issue #185)."""
+        with self.lock:
+            loop, client = self.loop, self.client
+            if loop is None or client is None:
+                return None, None
+            handle = self.handles.get(namespace)
+            if handle is None:
+                handle = self.handles[namespace] = client.namespace(namespace)
+            return loop, handle
+
+    def shutdown(self) -> None:
+        with self.lock:
+            loop, thread, client = self.loop, self.thread, self.client
+            self.loop = None
+            self.thread = None
+            self.client = None
+            self.handles = {}
+        if loop is None:
+            return
+        try:
+            if client is not None:
+                asyncio.run_coroutine_threadsafe(client.close(), loop).result()
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join()
+            loop.close()
+
+
+# Bridges shared per connection configuration (see _Bridge). Strong
+# references on purpose: a bridge is exactly what must outlive the
+# short-lived instances (and threads) that use it. Bounded by the number
+# of distinct CACHES configurations, not by thread or request count.
+_bridges: dict[tuple, _Bridge] = {}
+_bridges_lock = threading.Lock()
+
+
+def _get_bridge(addresses, secret, connect_kwargs, *, shared: bool) -> _Bridge:
+    if not shared:
+        return _Bridge(addresses, secret, connect_kwargs)
+    key = (tuple(addresses), secret, repr(sorted(connect_kwargs.items())))
+    with _bridges_lock:
+        bridge = _bridges.get(key)
+        if bridge is None:
+            bridge = _bridges[key] = _Bridge(addresses, secret, connect_kwargs)
+    return bridge
+
+
 # issue #414: os.register_at_fork's after_in_child hook resets every
-# live instance's _lifecycle_lock in the forked child. A plain
+# bridge's lock (and the registry's) in the forked child. A plain
 # threading.Lock is *not* automatically reinitialized by CPython after
 # fork the way the interpreter's own import lock is — if some other
 # thread happened to hold this lock at fork time (a threaded warm-up
 # cache touch racing gunicorn ``preload_app``'s fork, or uWSGI without
 # ``lazy-apps``), the child inherits it already locked with no thread
-# that could ever release it, so every subsequent ``with
-# self._lifecycle_lock`` in _ensure_started()/_run()/shutdown() blocks
-# forever in that child — before it even reaches the issue #393
-# fork-PID check above that would otherwise rebuild the loop/thread/
-# client. Swapping in a fresh, unlocked Lock() per instance clears
-# that regardless of whether the inherited lock happened to be held.
+# that could ever release it, so every subsequent ``with bridge.lock`` in
+# ensure_started()/snapshot()/shutdown() blocks forever in that child —
+# before it even reaches the issue #393 fork-PID check that would
+# otherwise rebuild the loop/thread/client. Swapping in a fresh, unlocked
+# Lock() clears that regardless of whether the inherited lock happened to
+# be held.
 #
 # Registered once per process (not once per instance — register_at_fork
 # has no matching unregister, so a repeated call would pile up one more
 # no-op hook per instance ever constructed) the first time any
-# NanocachedCache is built. A WeakSet, not a strong list, so tracking an
-# instance here never keeps it alive past its own last real reference.
-_live_instances: "weakref.WeakSet[NanocachedCache]" = weakref.WeakSet()
+# NanocachedCache is built.
 _fork_hook_registration_lock = threading.Lock()
 _fork_hook_registered = False
 
 
 def _reset_lifecycle_locks_in_child() -> None:
-    for instance in list(_live_instances):
-        instance._lifecycle_lock = threading.Lock()
+    global _bridges_lock
+    _bridges_lock = threading.Lock()
+    for bridge in list(_bridges.values()):
+        bridge.lock = threading.Lock()
+
+
+def _shutdown_bridges_at_exit() -> None:
+    # Best-effort: closes the sockets politely instead of leaving the
+    # server to notice the drop. Skips bridges inherited from a parent
+    # (fork child: not this process's loop, and the parent owns the
+    # sockets — issue #393) and never lets one failure keep the rest, or
+    # interpreter exit, from proceeding.
+    for bridge in list(_bridges.values()):
+        if bridge.pid != os.getpid():
+            continue
+        try:
+            bridge.shutdown()
+        except Exception:
+            pass
 
 
 def _ensure_fork_hook_registered() -> None:
@@ -307,6 +486,7 @@ def _ensure_fork_hook_registered() -> None:
         # this module still loads there.
         if hasattr(os, "register_at_fork"):
             os.register_at_fork(after_in_child=_reset_lifecycle_locks_in_child)
+        atexit.register(_shutdown_bridges_at_exit)
         _fork_hook_registered = True
 
 
@@ -337,102 +517,56 @@ class NanocachedCache(BaseCache):
             if option_key in options
         }
 
-        # The sync/async bridge's state — all None until _ensure_started()
-        # first runs (lazily, on the first cache operation, not here:
-        # __init__ runs synchronously wherever Django constructs this
-        # backend, e.g. while importing settings, and must not block on
-        # network I/O or spin up a thread nothing has asked for yet).
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._loop_thread: threading.Thread | None = None
-        self._client: NanocachedClient | None = None
-        self._namespace_handle = None
-        # The PID that started (and whose thread drives) self._loop —
-        # see _ensure_started's fork check (issue #393).
-        self._loop_pid: int | None = None
-        # Guards start/close against concurrent callers on different
-        # Django worker threads racing to lazily start (or to close) the
-        # same backend instance — the loop and client themselves are
-        # otherwise only ever touched from _run()'s single background
-        # thread.
-        self._lifecycle_lock = threading.Lock()
-        # issue #414: track this instance so a fork() elsewhere in the
-        # process can reset its lock in the child — see
-        # _reset_lifecycle_locks_in_child() above.
-        _live_instances.add(self)
+        # The loop thread and client are shared with every other instance
+        # built from the same connection options (see _Bridge) — except
+        # under CLOSE_ON_REQUEST, whose whole point is that close() tears
+        # the connection down: on a shared bridge that would pull it out
+        # from under other threads' in-flight calls, so such an instance
+        # keeps a private one (the pre-sharing behavior of that option).
+        self._bridge = _get_bridge(
+            self._addresses,
+            self._secret,
+            self._connect_kwargs,
+            shared=not self._close_on_request,
+        )
         _ensure_fork_hook_registered()
+
+    # The bridge's state, under the names this class (and its tests) have
+    # always used for it.
+    @property
+    def _loop(self) -> asyncio.AbstractEventLoop | None:
+        return self._bridge.loop
+
+    @property
+    def _loop_thread(self) -> threading.Thread | None:
+        return self._bridge.thread
+
+    @property
+    def _client(self) -> NanocachedClient | None:
+        return self._bridge.client
+
+    @property
+    def _loop_pid(self) -> int | None:
+        return self._bridge.pid
+
+    @property
+    def _lifecycle_lock(self) -> threading.Lock:
+        return self._bridge.lock
+
+    @property
+    def _namespace_handle(self):
+        return self._bridge.snapshot(self._namespace)[1]
 
     # ── the sync/async bridge ───────────────────────────────────────
 
     def _ensure_started(self) -> None:
-        if self._loop is not None and self._loop_pid == os.getpid():
-            return
-        with self._lifecycle_lock:
-            if self._loop is not None:
-                if self._loop_pid == os.getpid():
-                    return
-                # issue #393: this process is a fork() child (preforking
-                # WSGI servers with preload — Gunicorn preload_app,
-                # uWSGI without lazy-apps — where a warm-up cache touch
-                # in the master started the loop before workers forked).
-                # Only the forking thread survives fork(), so the thread
-                # driving this loop does not exist here: every
-                # run_coroutine_threadsafe(...).result() against it would
-                # block forever. Drop the inherited bridge state and
-                # start a fresh loop/thread/client for this process; the
-                # parent's objects (and its now-shared sockets) are the
-                # parent's to close — touching them from the child could
-                # corrupt the parent's live connections mid-frame.
-                self._loop = None
-                self._loop_thread = None
-                self._client = None
-                self._namespace_handle = None
-            loop = asyncio.new_event_loop()
-            started = threading.Event()
-
-            def run_loop() -> None:
-                asyncio.set_event_loop(loop)
-                started.set()
-                loop.run_forever()
-
-            thread = threading.Thread(
-                target=run_loop, name="nanocached-django-loop", daemon=True
-            )
-            thread.start()
-            started.wait()
-            # Assigned before the connect below (not after) so a second
-            # caller blocked on _lifecycle_lock still sees a loop/thread
-            # to submit its own coroutine to once this connect completes;
-            # self._client/_namespace_handle are what actually gate a
-            # request going out before the connection exists (they stay
-            # None until _connect() finishes).
-            self._loop = loop
-            self._loop_thread = thread
-            self._loop_pid = os.getpid()
-            try:
-                asyncio.run_coroutine_threadsafe(self._connect(), loop).result()
-            except BaseException:
-                # A failed connect must not leave a half-started loop
-                # thread behind for the next call to trip over.
-                loop.call_soon_threadsafe(loop.stop)
-                thread.join()
-                loop.close()
-                self._loop = None
-                self._loop_thread = None
-                raise
-
-    async def _connect(self) -> None:
-        self._client = await NanocachedClient.connect(
-            self._addresses,
-            auth_secret=self._secret,
-            **self._connect_kwargs,
-        )
-        self._namespace_handle = self._client.namespace(self._namespace)
+        self._bridge.ensure_started()
 
     def _run(self, make_coro):
         """Runs ``make_coro(handle)`` — a one-argument callable that
         builds the coroutine to await from the namespace handle, e.g.
-        ``lambda handle: handle.get_bytes(key)`` — on this instance's
-        loop thread and blocks the calling thread for its result.
+        ``lambda handle: handle.get_bytes(key)`` — on the bridge's loop
+        thread and blocks the calling thread for its result.
         Taking a *callable* rather than an already-built coroutine
         matters: building the coroutine touches the namespace handle,
         which is only set once ``_ensure_started()`` below has
@@ -443,12 +577,12 @@ class NanocachedCache(BaseCache):
         than the one running its loop, which is what every sync SPI
         method here needs.
 
-        issue #185: ``self._loop`` and the namespace handle are
-        snapshotted *together*, under ``_lifecycle_lock``, instead of
+        issue #185: the loop and the namespace handle are
+        snapshotted *together*, under the bridge's lock, instead of
         being read as two separate unguarded attribute accesses (one of
         them buried inside the caller's ``make_coro``). A concurrent
-        ``shutdown()`` (or ``close()`` with ``CLOSE_ON_REQUEST``) sets
-        both to ``None`` under that same lock, so without this the two
+        ``shutdown()`` (or ``close()`` with ``CLOSE_ON_REQUEST``) clears
+        both under that same lock, so without this the two
         reads could straddle a shutdown and hand a coroutine either a
         ``None`` loop or a ``None`` handle — surfacing as a raw
         ``AttributeError`` instead of a clean outcome. Snapshotting
@@ -465,8 +599,7 @@ class NanocachedCache(BaseCache):
         attempt fails loudly instead of spinning forever."""
         for _ in range(_RUN_RECONNECT_ATTEMPTS):
             self._ensure_started()
-            with self._lifecycle_lock:
-                loop, handle = self._loop, self._namespace_handle
+            loop, handle = self._bridge.snapshot(self._namespace)
             if loop is not None and handle is not None:
                 return asyncio.run_coroutine_threadsafe(make_coro(handle), loop).result()
         raise RuntimeError(
@@ -487,26 +620,17 @@ class NanocachedCache(BaseCache):
         (safe to call twice, or before any use); the next cache operation
         lazily reconnects.
 
+        The loop thread and client are shared by every instance with the
+        same connection options (see ``_Bridge``), so this tears them
+        down for all of those instances, not just this one; each
+        reconnects lazily on its next operation.
+
         issue #185: the loop-stop/thread-join/loop-close teardown runs in
         a ``finally`` so it always happens even if ``client.close()``
         raises (e.g. the connection was already dead) — before this fix,
         such a raise skipped the teardown entirely and leaked the loop
         thread (and whatever socket it still held open)."""
-        with self._lifecycle_lock:
-            loop, thread, client = self._loop, self._loop_thread, self._client
-            self._loop = None
-            self._loop_thread = None
-            self._client = None
-            self._namespace_handle = None
-        if loop is None:
-            return
-        try:
-            if client is not None:
-                asyncio.run_coroutine_threadsafe(client.close(), loop).result()
-        finally:
-            loop.call_soon_threadsafe(loop.stop)
-            thread.join()
-            loop.close()
+        self._bridge.shutdown()
 
     # ── timeout translation ─────────────────────────────────────────
 

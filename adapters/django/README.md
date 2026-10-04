@@ -94,8 +94,11 @@ matters when `TLS` is also true. `READ_HEDGE_AFTER` and
 ## The sync/async bridge
 
 The Python SDK is asyncio-only; Django's cache SPI is sync-first. Each
-`NanocachedCache` instance owns a dedicated daemon-thread event loop,
-started lazily on first use, and every sync call (`get`/`set`/...) is
+connection configuration owns a dedicated daemon-thread event loop and
+client, started lazily on first use and shared by every `NanocachedCache`
+instance built from the same `LOCATION`/`SECRET`/connection `OPTIONS`
+(Django builds a fresh instance per thread or ASGI request context, so
+per-instance loops and sockets would pile up). Every sync call (`get`/`set`/...) is
 dispatched onto it with `asyncio.run_coroutine_threadsafe(...).result()` —
 never `asyncio.run()` per call, which would redo the SDK's connect
 handshake on every single cache operation instead of reusing one
@@ -119,9 +122,11 @@ connection survive the request cycle.
 
 - `OPTIONS: {"CLOSE_ON_REQUEST": True}` opts into real per-request
   teardown, if short-lived processes matter more than connection reuse.
+  Such an instance keeps its own private loop and client rather than the
+  shared one, so closing it never disturbs other threads.
 - `backend.shutdown()` always tears down (loop thread stopped, client
-  closed); the next operation lazily reconnects. Use it at process exit
-  or in tests.
+  closed) for every instance sharing it; each reconnects lazily on its
+  next operation. Shared loops are also closed at interpreter exit.
 
 ### Preforking servers (Gunicorn `preload_app`, uWSGI)
 
