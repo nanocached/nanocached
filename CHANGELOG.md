@@ -14,6 +14,10 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node` and `nanocached-proxy`: an `m`/`o` frame whose body arrives
+  a few bytes at a time no longer has its (O(keys)) header re-parsed on every
+  read. This ran before authentication, so a large header followed by a
+  trickled body could keep the node's single thread busy.
 - `nanocached-node`: reporting a finished migration to discovery (`C`) is now
   bounded by one 10 s budget for the whole call. Before, the auth leg and the
   `C`/`A` exchange each had their own 10 s, so a slow discovery could hold the
