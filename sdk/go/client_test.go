@@ -6330,3 +6330,137 @@ func TestClusterCasRunsOnlyOnThePrimaryAndReplicatesTheLiteralResult(t *testing.
 		t.Fatal("replica still has the key — the delete result must have been fanned out as an ordinary Delete")
 	}
 }
+
+// A roster of up to 65536 nodes used to be dialed with one goroutine and
+// socket each, all at once. Every roster entry below points at the same
+// slow-to-handshake server, which records how many handshakes it has in
+// flight at the same moment.
+func TestConnectBoundsRosterDialConcurrency(t *testing.T) {
+	original := maxConcurrentDials
+	maxConcurrentDials = 4
+	defer func() { maxConcurrentDials = original }()
+
+	listener := listenLoopback(t)
+	var inFlight, peak atomic.Int32
+	var accepted atomic.Int32
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			now := inFlight.Add(1)
+			for {
+				seen := peak.Load()
+				if now <= seen || peak.CompareAndSwap(seen, now) {
+					break
+				}
+			}
+			go func() {
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				header, err := reader.ReadString('\n')
+				if err != nil {
+					inFlight.Add(-1)
+					return
+				}
+				parts := strings.Split(strings.TrimSuffix(header, "\n"), " ")
+				mustRead(reader, atoiOrPanic(parts[1]))
+				time.Sleep(20 * time.Millisecond)
+				inFlight.Add(-1)
+				_, _ = conn.Write([]byte("On\n"))
+				// Stay open until the client closes it.
+				_, _ = io.Copy(io.Discard, reader)
+			}()
+		}
+	}()
+
+	const rosterSize = 30
+	roster := make([]discoveredNode, rosterSize)
+	for i := range roster {
+		roster[i] = discoveredNode{Name: fmt.Sprintf("node-%03d", i), Address: listener.Addr().String()}
+	}
+	discovery := startMockDiscovery(t, roster, 2)
+
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatalf("Connect = %v", err)
+	}
+	defer client.Close()
+
+	if got := len(client.members); got != rosterSize {
+		t.Fatalf("members = %d, want %d", got, rosterSize)
+	}
+	for name, m := range client.members {
+		if m.connection.isClosed() {
+			t.Fatalf("member %s has no live connection", name)
+		}
+	}
+	if got := int(accepted.Load()); got != rosterSize {
+		t.Fatalf("server accepted %d connections, want %d", got, rosterSize)
+	}
+	if got := peak.Load(); got > 4 {
+		t.Fatalf("%d dials were in flight at once, want at most 4", got)
+	}
+	if got := peak.Load(); got < 2 {
+		t.Fatalf("peak concurrency = %d, the bound must still leave dials concurrent", got)
+	}
+}
+
+// A request frame blocked mid-write (the server isn't reading) used to
+// hold connection.mu, which readLoop needs to dispatch every response.
+// With big values in both directions on one pipelined connection that
+// deadlocks: the server stops reading requests while it is itself blocked
+// writing responses, readLoop (holding a full response, waiting for mu)
+// stops reading them, and nothing moves until the request deadline
+// poisons the connection — failing every request pending on it,
+// including non-idempotent ones, as "possibly sent".
+func TestLargeRequestsAndResponsesPipelinedTogetherDoNotDeadlock(t *testing.T) {
+	node := startMockNode(t, nil)
+	big := bytes.Repeat([]byte("x"), 1000*1000)
+	for i := 0; i < 4; i++ {
+		node.store.Store(storeKey{"", fmt.Sprintf("big-%d", i)}, big)
+	}
+	original := requestTimeout
+	requestTimeout = 5 * time.Second
+	defer func() { requestTimeout = original }()
+
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	value := string(big)
+	start := time.Now()
+	var wg sync.WaitGroup
+	errs := make(chan error, 200)
+	for i := 0; i < 48; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			if _, _, err := client.Get(fmt.Sprintf("big-%d", i%4)); err != nil {
+				errs <- fmt.Errorf("Get: %w", err)
+			}
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			if err := client.Set(fmt.Sprintf("set-%d", i), value, 0); err != nil {
+				errs <- fmt.Errorf("Set: %w", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("request failed: %v", err)
+	}
+	// Loopback moves 96 MB in well under a second; a stall lasts until
+	// requestTimeout.
+	if elapsed := time.Since(start); elapsed > requestTimeout/2 {
+		t.Fatalf("96 large requests took %v, want far less than requestTimeout (%v)", elapsed, requestTimeout)
+	}
+}

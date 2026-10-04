@@ -10,6 +10,22 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Large requests and large responses on one pipelined connection could
+  deadlock. A request blocked mid-write (the server was not reading) held
+  the lock the reader needs to dispatch each response, so a server blocked
+  writing 1 MB values to a client that had stopped reading never got to read
+  the next request: nothing moved until the request deadline (30 s) closed
+  the connection, failing everything pending on it, non-idempotent calls
+  included, as possibly sent. Writers now serialize on their own lock; the
+  reader never waits for a write. A mixed batch of 96 concurrent 1 MB gets
+  and sets, which stalled for 12 s and failed, now finishes in about 25 ms.
+- `Connect` no longer dials a whole roster at once. A discovery server can
+  list up to 65536 nodes, which started that many goroutines and sockets
+  together; at most 64 dials are now in flight at a time. Outcomes are
+  unchanged.
+
 ## [0.4.4] - 2026-09-09
 
 No changes. Version aligned with the rest of the project: from 0.4.4 on,

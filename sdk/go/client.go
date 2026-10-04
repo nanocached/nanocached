@@ -349,6 +349,15 @@ var maxInFlightBackgroundReplicaWrites = 32
 // it, mirroring maxInFlightBackgroundReplicaWrites.
 var maxInFlightHedgeReadLosers = 32
 
+// maxConcurrentDials bounds how many of a roster's nodes openCluster dials
+// at once. Discovery may list up to 65536 nodes; one goroutine and socket
+// each, all at once, runs past most processes' file-descriptor limit.
+// Bounded rather than serialized (see openCluster): 64 keeps a typical
+// roster fully parallel while capping the burst. (The Java SDK bounds its
+// bootstrap dialers too, at 16 threads.) A variable only so tests can
+// shrink it.
+var maxConcurrentDials = 64
+
 // keepAliveInterval is the always-on keep-alive cadence (issue #27):
 // half the server's 60s idle timeout, so it never severs a healthy
 // client. A variable only so tests can shorten it.
@@ -755,10 +764,15 @@ func (c *Client) openCluster(result *identified) error {
 	nodes := dedupeDiscoveredNodes(result.nodes)
 	outcomes := make([]clusterDialOutcome, len(nodes))
 	var wg sync.WaitGroup
+	// At most maxConcurrentDials dials (goroutines and sockets) in
+	// flight: discovery may list up to 65536 nodes.
+	slots := make(chan struct{}, maxConcurrentDials)
 	wg.Add(len(nodes))
 	for i, node := range nodes {
+		slots <- struct{}{}
 		go func(i int, address string) {
 			defer wg.Done()
+			defer func() { <-slots }()
 			ident, err := connectAndIdentify(address, c.authSecret, c.tlsConfig)
 			outcomes[i] = clusterDialOutcome{result: ident, err: err}
 		}(i, node.Address)
