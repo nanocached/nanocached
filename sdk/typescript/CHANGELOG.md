@@ -25,6 +25,12 @@ tag: 0.4.3 was a server-only release.
   waits until the frame's declared length is buffered and concatenates once,
   and the discovery reader parses each roster entry once and drops it.
   Wire behavior is unchanged.
+- Routing a key no longer scores every node with BigInt arithmetic and then
+  sorts them all: `HashRing.owners` keeps only the best `replicas`
+  candidates, like the Go, Rust, Java and .NET SDKs, and does the 64-bit
+  scoring on 32-bit halves. A lookup takes about 3 us at 100 nodes (was
+  22 us) and 31 us at 1000 nodes (was 278 us). The owner order, ties
+  included, is unchanged.
 
 ## [0.4.4] - 2026-09-09
 

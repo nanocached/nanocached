@@ -84,6 +84,93 @@ export function fmix64(hash: bigint): bigint {
   return hash;
 }
 
+// ---------------------------------------------------------------------
+// BigInt-free scoring for `HashRing.owners`' hot loop. A 64-bit value is
+// carried as two u32 halves (`hi`, `lo`) in the module scratch pair below
+// (JS is single-threaded and none of these re-enter, so one pair is safe);
+// every function here computes exactly what its BigInt counterpart above
+// does, and hashRing.test.ts checks them against those over many inputs.
+// ---------------------------------------------------------------------
+let partsHi = 0;
+let partsLo = 0;
+
+/** The high 32 bits of the 64-bit product of two u32 values. */
+function mulHi32(a: number, b: number): number {
+  const a0 = a & 0xffff;
+  const a1 = a >>> 16;
+  const b0 = b & 0xffff;
+  const b1 = b >>> 16;
+  const low = a0 * b0;
+  const mid1 = a1 * b0 + (low >>> 16);
+  const mid2 = a0 * b1 + (mid1 & 0xffff);
+  return (a1 * b1 + (mid1 >>> 16) + (mid2 >>> 16)) >>> 0;
+}
+
+/** `keyHash(key, namespace)` into `partsHi`/`partsLo` — FNV-1a fed the
+ * `be32(len(ns))`, namespace and key bytes one after the other, which is
+ * the same stream `keyHash` concatenates (see its doc comment). */
+function keyHashParts(key: Uint8Array, namespace: Uint8Array): void {
+  let hi = 0xcbf29ce4;
+  let lo = 0x84222325;
+  const feed = (byte: number): void => {
+    lo = (lo ^ byte) >>> 0;
+    // Multiply by the FNV prime 0x100000001b3 = 2^40 + 0x1b3 (mod 2^64):
+    // `h << 40` only reaches the high word, as `lo << 8`.
+    const product = lo * 0x1b3; // < 2^41, exact in a double
+    const carry = Math.floor(product / 4294967296);
+    hi = (Math.imul(hi, 0x1b3) + carry + (lo << 8)) >>> 0;
+    lo = product >>> 0;
+  };
+  if (namespace.length > 0) {
+    const length = namespace.length;
+    feed(length >>> 24);
+    feed((length >>> 16) & 0xff);
+    feed((length >>> 8) & 0xff);
+    feed(length & 0xff);
+    for (let i = 0; i < namespace.length; i++) feed(namespace[i]);
+  }
+  for (let i = 0; i < key.length; i++) feed(key[i]);
+  partsHi = hi;
+  partsLo = lo;
+}
+
+/** `fmix64` of the value `hi:lo` (each taken mod 2^32), into
+ * `partsHi`/`partsLo`. */
+function scoreParts(hiIn: number, loIn: number): void {
+  let hi = hiIn >>> 0;
+  let lo = loIn >>> 0;
+  // x ^= x >> 33 touches only the low word: (x >> 33) is `hi >>> 1`.
+  lo = (lo ^ (hi >>> 1)) >>> 0;
+  // x *= 0xff51afd7ed558ccd (mod 2^64)
+  let nextLo = Math.imul(lo, 0xed558ccd) >>> 0;
+  hi = (mulHi32(lo, 0xed558ccd) + Math.imul(lo, 0xff51afd7) + Math.imul(hi, 0xed558ccd)) >>> 0;
+  lo = nextLo;
+  lo = (lo ^ (hi >>> 1)) >>> 0;
+  // x *= 0xc4ceb9fe1a85ec53 (mod 2^64)
+  nextLo = Math.imul(lo, 0x1a85ec53) >>> 0;
+  hi = (mulHi32(lo, 0x1a85ec53) + Math.imul(lo, 0xc4ceb9fe) + Math.imul(hi, 0x1a85ec53)) >>> 0;
+  lo = nextLo;
+  lo = (lo ^ (hi >>> 1)) >>> 0;
+  partsHi = hi;
+  partsLo = lo;
+}
+
+/** Whether candidate `a` ranks strictly ahead of `b` in owner order:
+ * higher score first; ties toward the lexicographically smaller name — a
+ * total order, so every implementation agrees. */
+function outranks(aHi: number, aLo: number, aNode: string, bHi: number, bLo: number, bNode: string): boolean {
+  if (aHi !== bHi) return aHi > bHi;
+  if (aLo !== bLo) return aLo > bLo;
+  return aNode < bNode;
+}
+
+// Above this many requested owners, `owners` sorts every node instead of
+// keeping a best-first prefix: the bounded insertion is O(n * replicas),
+// which only beats an O(n log n) sort while `replicas` stays small (the
+// replication factor rides in from discovery and is not capped on the
+// wire).
+const MAX_BOUNDED_SELECTION = 32;
+
 /**
  * A rendezvous-hash ranking over a fixed node list, built once from a
  * discovery server's node list. Ranking a key never changes once built —
@@ -91,7 +178,11 @@ export function fmix64(hash: bigint): bigint {
  */
 export class HashRing {
   private readonly nodes: readonly string[];
-  private readonly nodeHashes: readonly bigint[];
+  // Each node's `fnv1a(name)` as two u32 halves: `owners` scores every
+  // node for every lookup, and BigInt arithmetic there cost more than
+  // everything else in it (see `scoreParts`).
+  private readonly nodeHashHi: Uint32Array;
+  private readonly nodeHashLo: Uint32Array;
 
   /**
    * Issue #461 (mirrors src/hash_ring.rs's `HashRing::new` dedupe from
@@ -113,7 +204,13 @@ export class HashRing {
       deduped.push(node);
     }
     this.nodes = deduped;
-    this.nodeHashes = deduped.map((node) => fnv1a(Buffer.from(node, "utf8")));
+    this.nodeHashHi = new Uint32Array(deduped.length);
+    this.nodeHashLo = new Uint32Array(deduped.length);
+    deduped.forEach((node, index) => {
+      const hash = fnv1a(Buffer.from(node, "utf8"));
+      this.nodeHashHi[index] = Number(hash >> 32n);
+      this.nodeHashLo[index] = Number(hash & 0xffffffffn);
+    });
   }
 
   /** The key's owners: the `replicas` highest-scoring nodes, primary
@@ -122,21 +219,54 @@ export class HashRing {
    * which scores exactly as it did before namespaces existed — see
    * `keyHash`. */
   owners(key: Uint8Array, replicas: number, namespace: Uint8Array = EMPTY_NAMESPACE): string[] {
-    const hash = keyHash(key, namespace);
+    const count = this.nodes.length;
+    if (count === 0 || replicas === 0) return [];
+    keyHashParts(key, namespace);
+    const keyHi = partsHi;
+    const keyLo = partsLo;
 
-    const scored = this.nodes.map((node, index) => ({
-      score: fmix64(this.nodeHashes[index] ^ hash),
-      node,
-    }));
+    // `replicas` is typically a handful next to the cluster size, so
+    // instead of sorting every node (O(n log n)), keep just the best
+    // `replicas` seen so far in best-first order and insert into it —
+    // O(n * replicas), the same bounded insertion the Go/Rust/Java/.NET
+    // SDKs use. A large (or odd — negative, fractional) `replicas` takes
+    // the plain sort below, which also keeps `slice`'s own handling of
+    // such values; both produce the same order.
+    if (!Number.isInteger(replicas) || replicas < 0 || replicas > MAX_BOUNDED_SELECTION) {
+      const scored: { hi: number; lo: number; node: string }[] = [];
+      for (let i = 0; i < count; i++) {
+        scoreParts(this.nodeHashHi[i] ^ keyHi, this.nodeHashLo[i] ^ keyLo);
+        scored.push({ hi: partsHi, lo: partsLo, node: this.nodes[i] });
+      }
+      scored.sort((a, b) => (outranks(a.hi, a.lo, a.node, b.hi, b.lo, b.node) ? -1 : 1));
+      return scored.slice(0, replicas).map(({ node }) => node);
+    }
 
-    // Descending by score; ties toward the lexicographically smaller
-    // name — a total order, so every implementation agrees.
-    scored.sort((a, b) => {
-      if (a.score !== b.score) return a.score < b.score ? 1 : -1;
-      return a.node < b.node ? -1 : 1;
-    });
-
-    return scored.slice(0, replicas).map(({ node }) => node);
+    const topHi = new Uint32Array(replicas);
+    const topLo = new Uint32Array(replicas);
+    const topNode: string[] = new Array(replicas);
+    let kept = 0;
+    for (let i = 0; i < count; i++) {
+      scoreParts(this.nodeHashHi[i] ^ keyHi, this.nodeHashLo[i] ^ keyLo);
+      const hi = partsHi;
+      const lo = partsLo;
+      const node = this.nodes[i];
+      if (kept === replicas && !outranks(hi, lo, node, topHi[kept - 1], topLo[kept - 1], topNode[kept - 1])) {
+        continue; // no better than the worst candidate currently kept
+      }
+      let pos = kept;
+      while (pos > 0 && outranks(hi, lo, node, topHi[pos - 1], topLo[pos - 1], topNode[pos - 1])) pos--;
+      if (kept < replicas) kept++;
+      for (let j = kept - 1; j > pos; j--) {
+        topHi[j] = topHi[j - 1];
+        topLo[j] = topLo[j - 1];
+        topNode[j] = topNode[j - 1];
+      }
+      topHi[pos] = hi;
+      topLo[pos] = lo;
+      topNode[pos] = node;
+    }
+    return topNode.slice(0, kept);
   }
 
   /** The key's primary — `owners(key, 1, namespace)[0]`. */
