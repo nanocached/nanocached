@@ -4,6 +4,17 @@ use crate::response::{MultiAckEntry, MultiEntry, Response};
 use bytes::{Buf, Bytes, BytesMut};
 use std::time::Duration;
 
+/// Upper bound on the summed value bytes one `M` reply carries. A key can
+/// be listed any number of times in an `m` request and every listing of a
+/// hit returns the whole value again, so without this a ~1 MiB request
+/// naming one 4 KiB key 350k times asks `encode_multi` for a ~1.4 GiB
+/// buffer, on the node's single thread. Hits past the budget are answered
+/// as misses — always a legal answer from a cache — and the rest of the
+/// batch is unaffected. The proxy mirrors this constant
+/// (`MAX_MULTI_REPLY_VALUE_BYTES` in `nanocached-proxy.rs`), and it stays
+/// well under the SDKs' 64 MiB multi-get response cap.
+pub const MAX_MULTI_REPLY_VALUE_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Auth {
@@ -329,13 +340,22 @@ impl Command {
             },
 
             Self::MultiGet { namespace, keys } => {
+                let mut value_bytes: usize = 0;
                 let entries = keys
                     .into_iter()
                     .map(|name| {
+                        if value_bytes >= MAX_MULTI_REPLY_VALUE_BYTES {
+                            return MultiEntry::Miss;
+                        }
                         let key = Key::new(namespace.clone(), name);
                         match cache.get(&key) {
-                            Some(value) => MultiEntry::Value(value),
-                            None => MultiEntry::Miss,
+                            Some(value)
+                                if value_bytes + value.len() <= MAX_MULTI_REPLY_VALUE_BYTES =>
+                            {
+                                value_bytes += value.len();
+                                MultiEntry::Value(value)
+                            }
+                            Some(_) | None => MultiEntry::Miss,
                         }
                     })
                     .collect();
@@ -3242,6 +3262,33 @@ mod tests {
                 MultiEntry::Value(Bytes::from_static(b"3")),
             ])
         );
+    }
+
+    // A key listed many times must not make the reply grow without bound:
+    // hits past MAX_MULTI_REPLY_VALUE_BYTES come back as misses.
+    #[test]
+    fn multi_get_caps_the_summed_value_bytes_of_the_reply() {
+        let mut cache = Cache::new(usize::MAX);
+        let value = Bytes::from(vec![b'x'; 1024 * 1024]);
+        cache.set(key(b"big"), value);
+
+        let listings = MAX_MULTI_REPLY_VALUE_BYTES / (1024 * 1024) + 5;
+        let command = Command::MultiGet {
+            namespace: Bytes::new(),
+            keys: vec![Bytes::from_static(b"big"); listings],
+        };
+
+        let Response::Multi(entries) = command.execute(&mut cache) else {
+            panic!("MultiGet answers with Response::Multi");
+        };
+        let hits = entries
+            .iter()
+            .filter(|entry| matches!(entry, MultiEntry::Value(_)))
+            .count();
+        assert_eq!(entries.len(), listings);
+        assert_eq!(hits, MAX_MULTI_REPLY_VALUE_BYTES / (1024 * 1024));
+        // The overflow is a miss, in place, not a shortened reply.
+        assert!(matches!(entries.last(), Some(MultiEntry::Miss)));
     }
 
     #[test]

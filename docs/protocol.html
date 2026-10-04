@@ -267,6 +267,11 @@ Issue #125's <code>R</code> and the fatal <code>E</code> still apply to
 the whole frame, but <code>W</code> never does — a <code>&lt;key-length&gt;</code>
 being wrong for one key out of a thousand doesn't invalidate the other
 999.</p>
+<p>The hit values in one <code>M</code> reply total at most 16 MiB (the
+reply may therefore be larger than the 1 MiB request limit). Hits past
+that budget are answered <code>-</code> (a miss), in place, so a batch
+that names the same large key many times, or many large keys, degrades
+to misses instead of growing the reply without bound.</p>
 <pre><code>o &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; &lt;value-length-1&gt; ... &lt;key-length-n&gt; &lt;value-length-n&gt; [&lt;ttl-seconds&gt;]\n&lt;namespace&gt;&lt;key-1&gt;&lt;value-1&gt;...&lt;key-n&gt;&lt;value-n&gt;</code></pre>
 <p>Sets <code>n</code> keys the same way, and
 <code>&lt;ttl-seconds&gt;</code> means exactly what it means for
