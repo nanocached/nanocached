@@ -113,9 +113,18 @@ type pendingRequest struct {
 }
 
 type connection struct {
-	mu     sync.Mutex
-	conn   net.Conn // nil only for the pre-poisoned placeholder
-	reader *bufio.Reader
+	// writeMu serializes request writers: the tag claim, the pending-queue
+	// append and the socket write of one request happen under it together,
+	// so tag order, queue order and wire order can never skew. It is
+	// deliberately separate from mu, which readLoop needs to dispatch each
+	// response: a large write blocked on a server that has stopped reading
+	// (because it is itself blocked writing responses nobody is reading)
+	// must not hold up the reader, or neither side can ever make progress.
+	// Lock order is writeMu, then mu.
+	writeMu sync.Mutex
+	mu      sync.Mutex
+	conn    net.Conn // nil only for the pre-poisoned placeholder
+	reader  *bufio.Reader
 	// tagged (echoed response tags): negotiated during identify — when true,
 	// every request carries a tag the server echoes, and readLoop verifies
 	// the echo against the oldest pending request before dispatching it.
@@ -739,10 +748,12 @@ func (c *connection) request(build func(tag uint32) []byte) (byte, []byte, int64
 func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte, int64, []multiEntry, error) {
 	resultCh := make(chan roundTripResult, 1)
 
+	c.writeMu.Lock()
 	c.mu.Lock()
 	if c.closed {
 		err := c.lastErr
 		c.mu.Unlock()
+		c.writeMu.Unlock()
 		if err == nil {
 			err = connectionLost("connection is closed", nil)
 		}
@@ -768,8 +779,13 @@ func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte
 	if len(c.pending) == 1 {
 		_ = c.conn.SetDeadline(time.Now().Add(requestTimeout))
 	}
-	_, writeErr := c.conn.Write(frame)
+	// The write happens outside mu (but still under writeMu, so frames
+	// reach the wire in queue order): it can block for as long as the
+	// server isn't reading, and readLoop must keep taking mu to pop
+	// responses meanwhile — see writeMu.
 	c.mu.Unlock()
+	_, writeErr := c.conn.Write(frame)
+	c.writeMu.Unlock()
 
 	if writeErr != nil {
 		err := connectionLost("connection failed", writeErr)
