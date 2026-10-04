@@ -18,6 +18,14 @@ framework adapters at one version, whether or not a component changed.
   bounded by one 10 s budget for the whole call. Before, the auth leg and the
   `C`/`A` exchange each had their own 10 s, so a slow discovery could hold the
   report for up to 20 s.
+- `nanocached-node` and `nanocached-proxy`: an `M` (multi-get) reply is now
+  bounded to 16 MiB of values. A request that named one key many times could
+  make the node allocate a reply of (key count x value size), over a gigabyte
+  from a ~1 MiB request; hits past the budget are now answered as misses. The
+  proxy used to reject any backend `M` reply over 1 MiB of values as a
+  protocol error, dropping the shared backend connection and failing every
+  other client's in-flight requests on it; it now accepts up to the node's
+  16 MiB and holds its own reassembled reply to the same figure.
 - `nanocached-proxy` and `nanocached-discovery`: a panic while serving a
   metrics scrape is now logged (`WARN metrics connection task failed`)
   instead of going unobserved, like the node's metrics endpoint.
