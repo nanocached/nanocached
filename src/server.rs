@@ -10,8 +10,8 @@ use nanocached::infra::{
     read_http_request_path, reject_over_limit, should_backoff_after_accept_error, shutdown_signal,
     try_acquire_per_ip, write_http_response,
 };
-use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -189,45 +189,27 @@ const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// bounds instead, since it already retries per `KEY_TRANSFER_ATTEMPTS`
 /// and stalling it doesn't hold a client's connection open.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
-/// Capacity of `ConnectionConfig::forward_tx`, the channel every per-write
-/// forward (`forward_with_retries`, spawned from the `S`/`D`/`U`/`u`/
-/// `MultiSet`/`Incr`/`k`/`x`/`c`/`F` handling in `handle_connection`) is
-/// handed to (issue #219). Unlike `migration_tx` — reserved for the one
-/// singleton bulk-migration task and so never needs more than a handful of
-/// slots — an arbitrary number of connections can each be forwarding a
-/// write to a migrating key at once, and each forward can run for up to
-/// `KEY_TRANSFER_ATTEMPTS` x `FORWARD_TIMEOUT` before it gives up. A
-/// generous fixed capacity keeps a burst of concurrent forwards from
-/// spilling into `spawn_forward`'s waiter path (see
-/// `MAX_PENDING_FORWARD_WAITERS`) under ordinary load, while still
-/// bounding the total number of forward tasks `run` will ever have in
-/// flight at once.
+/// Capacity of `ConnectionConfig::forward_tx`, the channel the per-target
+/// forward drainers (`drain_forward_queue`) are handed to `run` through
+/// (issue #219). A drainer is only handed over when a target's queue goes
+/// from idle to active, so this channel carries a handful of items — one
+/// per target being forwarded to, which is the joiner of the current
+/// handoff or the entrants of a decommission — not one per write. The
+/// capacity is generous for that; it is the channel `spawn_forward`'s
+/// waiter path (see `MAX_PENDING_FORWARD_WAITERS`) backs up if a burst of
+/// activations ever finds it full.
 const FORWARD_CHANNEL_CAPACITY: usize = 256;
 /// Caps the number of detached "waiter" tasks `spawn_forward` may have
-/// outstanding at once — see `PENDING_FORWARD_WAITERS` and issue #219's
-/// follow-up discussion. A forward that finds `forward_tx` full is never
-/// simply dropped (that would lose the write on the joiner/entrant, the
-/// same class of silent data loss issue #176 fixed for `MultiSet`);
-/// instead a waiter task blocks on the channel's ordinary
-/// `send(...).await` in the background until a slot frees up, so the
-/// connection that triggered the forward still never blocks. This bound
-/// exists only to cap unbounded task/memory growth in the pathological
-/// case where `forward_tx` stays saturated for a long time — past it, a
-/// forward is finally dropped (logged). `4096` is generous relative to
-/// `FORWARD_CHANNEL_CAPACITY` (16x) precisely because dropping here is
-/// the fallback of last resort, not the normal backpressure path.
+/// outstanding at once — see `PENDING_FORWARD_WAITERS`. A drainer that
+/// finds `forward_tx` full is not simply dropped (the target's queued
+/// writes would then never be sent): a waiter task blocks on the channel's
+/// ordinary `send(...).await` in the background until a slot frees up, so
+/// the connection that triggered the forward still never blocks. This
+/// bound exists only to cap task growth in a pathological case; past it
+/// the queue is marked idle again (`ForwardQueues::deactivate`) so the
+/// next forward to that target re-activates it, rather than leaving a
+/// queue that nothing drains.
 const MAX_PENDING_FORWARD_WAITERS: usize = 4096;
-/// How many forward tasks `run` lets be spawned (and so parked on their
-/// target's connection lock, with no timeout — see `forward_with_retries`)
-/// at once. Without it `run` spawned a task for every message the moment
-/// it left `forward_tx`, so the channel and waiter limits above only
-/// bounded forwards still *queued*: a target that stopped answering left
-/// every later forward as a fresh parked task, unbounded. Equal to
-/// `FORWARD_CHANNEL_CAPACITY` — forwards to one target are serialized by
-/// its connection lock anyway, so more concurrent tasks only queue. Past
-/// this, `run` stops draining `forward_tx` until one finishes, and the
-/// channel/waiter/drop behavior documented above applies.
-const MAX_IN_FLIGHT_FORWARDS: usize = FORWARD_CHANNEL_CAPACITY;
 const READ_CHUNK_SIZE: usize = 1024;
 /// How many times `run_migration` tries to transfer a single key to the
 /// joining node (reconnecting between tries) before giving up on the
@@ -328,12 +310,15 @@ struct ConnectionConfig {
     /// `try_send`, never `.await`, so the connection that triggered a
     /// forward never blocks on this channel either way.
     ///
-    /// The guarantee this channel's consumer (and `spawn_forward`) upholds
-    /// is that a forward is never silently dropped just because
-    /// `forward_tx` was momentarily full — see `spawn_forward` and
-    /// `MAX_PENDING_FORWARD_WAITERS` for how a full channel is handled
-    /// without either blocking the caller or losing the write.
+    /// What travels through it is a per-target drainer
+    /// (`drain_forward_queue`), not an individual write: the writes
+    /// themselves wait in `forward_queues`, coalesced by key, so a burst of
+    /// them can never overflow this channel and nothing is dropped for
+    /// want of room — see `ForwardQueues`.
     forward_tx: mpsc::Sender<MigrationTask>,
+    /// The writes waiting to be forwarded to each target, one coalescing
+    /// queue per target connection — see `ForwardQueues`.
+    forward_queues: Arc<ForwardQueues>,
 }
 
 /// Count of `spawn_forward` waiter tasks currently blocked on
@@ -405,107 +390,69 @@ fn clear_forward_failure(addr: &str, token: &str) {
         .remove(&(addr.to_string(), token.to_string()));
 }
 
-/// Hands a per-write forward (`forward_with_retries`, wrapping a `Set`/
-/// `Delete`/`Clear` racing a migration or decommission drain) to `run`'s
-/// dedicated `forward_tx` consumer loop via `try_send` — never `.await`,
-/// unlike `ConnectionConfig::migration_tx`. See `forward_tx`'s own doc
-/// comment (issue #219) for why blocking here would reintroduce the exact
-/// head-of-line stall `forward_with_retries` itself exists to avoid: this
-/// call happens *after* `handle_connection` has already written the
-/// client's response for the command that triggered it, so the only thing
-/// waiting on it is that same connection's ability to read its *next*
-/// request.
-///
-/// **Guarantee**: a forward is never dropped short of
-/// `MAX_PENDING_FORWARD_WAITERS`. Dropping a forward outright on a full
-/// channel would lose that write on the joiner/entrant — the same class
-/// of silent data loss issue #176 fixed for `MultiSet` — which is a much
-/// worse failure than merely delaying it (the old, pre-#219 shared-channel
-/// behavior did exactly that: it stalled the caller rather than dropping,
-/// just on the wrong channel). So a `TrySendError::Full` doesn't drop the
-/// task — it spawns a detached "waiter" that blocks on the channel's
-/// ordinary `send(...).await` in the background, bounded by
-/// `PENDING_FORWARD_WAITERS`/`MAX_PENDING_FORWARD_WAITERS` so a channel
-/// saturated for a long time can't grow waiter tasks (and their captured
-/// `NodeContext`/`Bytes` state) without limit. Only past that bound does a
-/// forward actually get dropped, logged with the key (or clear scope) it
-/// was for.
-///
-/// A `TrySendError::Closed` (the consumer — `run`'s own loop — is gone,
-/// e.g. mid-shutdown past the point `forward_tx` itself is dropped) is
-/// different: nothing will ever drain the channel again regardless of how
-/// long a waiter waited, so that case drops immediately without spawning
-/// one.
+/// Queues a per-write forward (a `Set`/`Delete`/`Clear` racing a migration
+/// or decommission drain) for `target` and makes sure a drainer is running
+/// for it. Never blocks and never drops the write, so the connection that
+/// triggered it (which has already written the client's response; see
+/// issue #219) is not held up and the joiner/entrant does not miss it.
 fn spawn_forward(
     config: &ConnectionConfig,
     node_context: NodeContext,
     target: ForwardTarget,
     write: OwnedForwardedWrite,
 ) {
-    // Captured before `write` moves into `forward_with_retries` below —
-    // only actually rendered (`Display`) if the rare drop path at the
-    // bottom needs it, so this costs refcount bumps, not a `Debug` format
-    // of a key that can be ~1 MiB.
-    let description = write.describe();
-    let task: MigrationTask = Box::pin(forward_with_retries(node_context, target, write));
+    enqueue_forwards(config, node_context, target, std::iter::once(write));
+}
 
-    match config.forward_tx.try_send(task) {
+/// `spawn_forward` for many writes to one target, under a single hold of
+/// the queue lock (a `MultiSet` can carry hundreds of thousands of keys).
+fn enqueue_forwards(
+    config: &ConnectionConfig,
+    node_context: NodeContext,
+    target: ForwardTarget,
+    writes: impl IntoIterator<Item = OwnedForwardedWrite>,
+) {
+    let Some(id) = config.forward_queues.push(&node_context, target, writes) else {
+        return; // a drainer is already running for this target
+    };
+
+    let drainer: MigrationTask =
+        Box::pin(drain_forward_queue(Arc::clone(&config.forward_queues), id));
+    match config.forward_tx.try_send(drainer) {
         Ok(()) => {}
-        // The consumer (`run`'s own loop) is gone — nothing will ever
-        // drain this channel again regardless of how long a waiter
-        // waited, so there's no point spawning one.
+        // The consumer (`run`'s own loop) is gone: nothing will ever drain
+        // this channel again regardless of how long a waiter waited.
         Err(mpsc::error::TrySendError::Closed(_)) => {}
-        Err(mpsc::error::TrySendError::Full(task)) => {
+        Err(mpsc::error::TrySendError::Full(drainer)) => {
             if PENDING_FORWARD_WAITERS.fetch_add(1, Ordering::SeqCst) < MAX_PENDING_FORWARD_WAITERS
             {
                 let forward_tx = config.forward_tx.clone();
+                let queues = Arc::clone(&config.forward_queues);
                 tokio::spawn(async move {
-                    // Best-effort: if the send itself fails (the consumer
-                    // closed the channel while this waiter was queued),
-                    // there's nothing left to do — same as the
-                    // `TrySendError::Closed` case above. Issue #502: `run`'s
-                    // shutdown drain keeps receiving while any waiter is
-                    // pending, so this only happens once the drain's own
-                    // `SHUTDOWN_TIMEOUT` ran out; say so rather than lose
-                    // the write silently.
-                    if forward_tx.send(task).await.is_err() {
+                    // Issue #502: `run`'s shutdown drain keeps receiving
+                    // while any waiter is pending, so a failed send only
+                    // happens once the drain's own `SHUTDOWN_TIMEOUT` ran
+                    // out; say so rather than lose the writes silently.
+                    if forward_tx.send(drainer).await.is_err() {
+                        queues.deactivate(id);
                         eprintln!(
-                            "WARN dropped a concurrent write forward for {description}: the node \
-                             shut down before forward_tx was drained"
+                            "WARN dropped queued write forwards: the node shut down before \
+                             forward_tx was drained"
                         );
                     }
                     PENDING_FORWARD_WAITERS.fetch_sub(1, Ordering::SeqCst);
                 });
             } else {
                 PENDING_FORWARD_WAITERS.fetch_sub(1, Ordering::SeqCst);
+                // Nothing will drain this queue until the next forward to
+                // the same target hands in a fresh drainer.
+                config.forward_queues.deactivate(id);
                 eprintln!(
-                    "WARN dropped a concurrent write forward for {description}: forward_tx is \
-                     full and {MAX_PENDING_FORWARD_WAITERS} waiters are already queued behind it"
+                    "WARN could not hand a forward drainer to run: forward_tx is full and \
+                     {MAX_PENDING_FORWARD_WAITERS} waiters are already queued behind it; the \
+                     queued writes wait for the next forward to that target"
                 );
             }
-        }
-    }
-}
-
-/// Spawns a forward received from `forward_rx` into `connection_tasks`,
-/// holding one of `slots` for as long as it runs (`MAX_IN_FLIGHT_FORWARDS`).
-/// `run` only receives while a slot is free and nothing else takes one,
-/// so the acquire cannot fail; if it somehow did, the forward still runs
-/// (unbounded) rather than being lost.
-fn spawn_forward_task(
-    connection_tasks: &mut JoinSet<()>,
-    slots: &Arc<Semaphore>,
-    task: MigrationTask,
-) {
-    match Arc::clone(slots).try_acquire_owned() {
-        Ok(permit) => {
-            connection_tasks.spawn(async move {
-                task.await;
-                drop(permit);
-            });
-        }
-        Err(_) => {
-            connection_tasks.spawn(task);
         }
     }
 }
@@ -866,9 +813,6 @@ pub(crate) async fn run(
     // or, before this split, block an unrelated client connection's
     // `spawn_forward` call outright. See `ConnectionConfig::forward_tx`.
     let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(FORWARD_CHANNEL_CAPACITY);
-    // Bounds the forward tasks spawned out of `forward_rx` — see
-    // `MAX_IN_FLIGHT_FORWARDS`.
-    let forward_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_FORWARDS));
 
     let connection_config = ConnectionConfig {
         idle_timeout: IDLE_TIMEOUT,
@@ -877,6 +821,7 @@ pub(crate) async fn run(
         node_context: node_context.clone(),
         migration_tx,
         forward_tx,
+        forward_queues: Arc::new(ForwardQueues::default()),
     };
 
     // Issue #407: boxed and reassignable (rather than `tokio::pin!`'d
@@ -1048,11 +993,8 @@ pub(crate) async fn run(
                 connection_tasks.spawn(task);
             }
 
-            // Not received from while every slot is taken: the forward then
-            // waits in `forward_tx` (and `spawn_forward`'s waiters), which
-            // is bounded, instead of becoming one more parked task.
-            Some(task) = forward_rx.recv(), if forward_slots.available_permits() > 0 => {
-                spawn_forward_task(&mut connection_tasks, &forward_slots, task);
+            Some(task) = forward_rx.recv() => {
+                connection_tasks.spawn(task);
             }
 
             result = listener.accept() => {
@@ -2232,18 +2174,12 @@ async fn handle_connection(
                     // (`execute` only ever answers `Stored` for an owned
                     // key, but check anyway rather than assume it).
                     //
-                    // The matching keys are gathered per target and each
-                    // target gets ONE forwarded unit for all of them
-                    // (`OwnedForwardedWrite::SetMany`), not one forward per
-                    // key. A frame can carry >100k keys, and this loop never
-                    // yields, so per-key `spawn_forward` calls overflowed
-                    // `forward_tx` plus its waiters (~4.3k) before `run`'s
-                    // consumer could drain a single one — the excess was
-                    // dropped and the joiner/entrant never saw those writes.
-                    // One unit sends its keys in order on the target's shared
-                    // connection under one lock acquisition, so the
-                    // per-target ordering `forward_with_retries` relies on
-                    // is unchanged.
+                    // The matching keys are gathered per target and queued
+                    // for it in one go (`enqueue_forwards`). Each one lands
+                    // in the target's coalescing queue, so a frame with
+                    // >100k keys costs one map insert per key and nothing is
+                    // dropped for want of room: a later write to a key
+                    // replaces an earlier one still waiting.
                     if let (Some(node_context), Some((forward_names, forward_values))) =
                         (&config.node_context, forward)
                     {
@@ -2281,17 +2217,24 @@ async fn handle_connection(
 
                         for (batches, handoff) in [(join_batches, false), (leave_batches, true)] {
                             for batch in batches {
-                                spawn_forward(
+                                let writes = batch.items.into_iter().map(|(name, value)| {
+                                    let key = Key::new(namespace.clone(), name);
+                                    if handoff {
+                                        OwnedForwardedWrite::HandoffSet {
+                                            key,
+                                            value,
+                                            ttl,
+                                            if_absent: false,
+                                        }
+                                    } else {
+                                        OwnedForwardedWrite::Set { key, value, ttl }
+                                    }
+                                });
+                                enqueue_forwards(
                                     &config,
                                     node_context.clone(),
                                     batch.target,
-                                    OwnedForwardedWrite::SetMany {
-                                        namespace: namespace.clone(),
-                                        items: batch.items,
-                                        ttl,
-                                        handoff,
-                                        sent: AtomicUsize::new(0),
-                                    },
+                                    writes,
                                 );
                             }
                         }
@@ -6735,7 +6678,7 @@ impl ForwardedWrite<'_> {
 }
 
 /// The keys (and values) of one `MultiSet` bound for a single forward
-/// target — gathered so they go out as one `OwnedForwardedWrite::SetMany`.
+/// target — gathered so they are queued for it under one lock hold.
 struct ForwardBatch {
     target: ForwardTarget,
     items: Vec<(Bytes, Bytes)>,
@@ -6790,22 +6733,6 @@ enum OwnedForwardedWrite {
     },
     HandoffDelete {
         key: Key,
-    },
-    /// A `MultiSet`'s keys for one target, forwarded as a single unit
-    /// (see `handle_connection`'s `MultiSet` arm): `S` frames when
-    /// `handoff` is `false` (a join), `U` frames when it is `true` (a
-    /// decommission drain). Sent in order, one acked round trip each, on
-    /// the target's shared connection while `forward_with_retries` holds
-    /// its lock. `sent` counts the leading items already acknowledged, so
-    /// a retry resumes where the failed attempt stopped instead of
-    /// re-sending (and possibly overwriting a later write with) earlier
-    /// ones. Atomic only because the forward future must be `Send`.
-    SetMany {
-        namespace: Bytes,
-        items: Vec<(Bytes, Bytes)>,
-        ttl: Option<Duration>,
-        handoff: bool,
-        sent: AtomicUsize,
     },
     Clear(ClearScope),
 }
@@ -6896,65 +6823,6 @@ impl OwnedForwardedWrite {
                 )
                 .await
             }
-            OwnedForwardedWrite::SetMany {
-                namespace,
-                items,
-                ttl,
-                handoff,
-                sent,
-            } => {
-                // A failure after some progress is retried on the spot
-                // (the failed send already cleared the connection, so the
-                // next item re-dials): only an attempt that gets nowhere
-                // is handed back to `forward_with_retries`, which counts
-                // it against `KEY_TRANSFER_ATTEMPTS`. Otherwise one long
-                // unit would spend a budget meant for a single write on
-                // unrelated blips spread over its whole run.
-                let mut progress_mark = sent.load(Ordering::SeqCst);
-                loop {
-                    let index = sent.load(Ordering::SeqCst);
-                    let Some((name, value)) = items.get(index) else {
-                        return Ok(());
-                    };
-                    let key = Key::new(namespace.clone(), name.clone());
-                    let write = if *handoff {
-                        ForwardedWrite::HandoffSet {
-                            key: &key,
-                            value,
-                            ttl: *ttl,
-                            if_absent: false,
-                            token: &target.token,
-                        }
-                    } else {
-                        ForwardedWrite::Set {
-                            key: &key,
-                            value,
-                            ttl: *ttl,
-                        }
-                    };
-                    // Each item gets its own `FORWARD_TIMEOUT`, like a lone
-                    // forward would.
-                    let item_deadline = tokio::time::Instant::now() + FORWARD_TIMEOUT;
-                    match forward_on_locked_connection(
-                        node_context,
-                        &target.addr,
-                        connection,
-                        write,
-                        item_deadline,
-                    )
-                    .await
-                    {
-                        Ok(()) => sent.store(index + 1, Ordering::SeqCst),
-                        Err(error) => {
-                            if sent.load(Ordering::SeqCst) > progress_mark {
-                                progress_mark = sent.load(Ordering::SeqCst);
-                                continue;
-                            }
-                            return Err(error);
-                        }
-                    }
-                }
-            }
             OwnedForwardedWrite::Clear(scope) => {
                 forward_on_locked_connection(
                     node_context,
@@ -6973,86 +6841,214 @@ impl OwnedForwardedWrite {
     /// not the actual `S`/`D` protocol bytes.
     fn kind(&self) -> &'static str {
         match self {
-            OwnedForwardedWrite::Set { .. }
-            | OwnedForwardedWrite::HandoffSet { .. }
-            | OwnedForwardedWrite::SetMany { .. } => "SET",
+            OwnedForwardedWrite::Set { .. } | OwnedForwardedWrite::HandoffSet { .. } => "SET",
             OwnedForwardedWrite::Delete { .. } | OwnedForwardedWrite::HandoffDelete { .. } => {
                 "DELETE"
             }
             OwnedForwardedWrite::Clear(_) => "CLEAR",
         }
     }
+}
 
-    /// Names what this write was for, for `spawn_forward`'s WARN when it
-    /// must actually drop a forward past `MAX_PENDING_FORWARD_WAITERS` —
-    /// enough for an operator to tell which entry (or namespace) may now
-    /// be stale on the joiner/entrant. Cheap to call (refcount bumps
-    /// only): the text is rendered by `Display`, i.e. only on the rare
-    /// path that prints it — a key or namespace can be ~1 MiB, and
-    /// `Debug`-formatting that on every forward stalled the single thread.
-    fn describe(&self) -> ForwardDescription {
-        let subject = match self {
-            OwnedForwardedWrite::Set { key, .. }
-            | OwnedForwardedWrite::HandoffSet { key, .. }
-            | OwnedForwardedWrite::Delete { key }
-            | OwnedForwardedWrite::HandoffDelete { key } => ForwardSubject::Key(key.clone()),
-            OwnedForwardedWrite::SetMany {
-                namespace, items, ..
-            } => ForwardSubject::KeyBatch {
-                namespace: namespace.clone(),
-                keys: items.len(),
-            },
-            OwnedForwardedWrite::Clear(ClearScope::Namespace(namespace)) => {
-                ForwardSubject::Namespace(namespace.clone())
-            }
-            OwnedForwardedWrite::Clear(ClearScope::All) => ForwardSubject::AllNamespaces,
-        };
-        ForwardDescription {
-            kind: self.kind(),
-            subject,
+/// Combines writes waiting for the same target. `Some(key)` for the
+/// unconditional single-key writes (`Set`, `Delete`, and the leave-forward
+/// `HandoffSet`/`HandoffDelete`): each overwrites whatever the target holds
+/// for `key`, so of several waiting for the same key only the last matters.
+/// `None` for the ones that must keep their place in the order: a
+/// put-if-absent relay (its effect depends on what the target holds when it
+/// arrives) and a clear.
+fn coalescing_key(write: &OwnedForwardedWrite) -> Option<&Key> {
+    match write {
+        OwnedForwardedWrite::Set { key, .. }
+        | OwnedForwardedWrite::Delete { key }
+        | OwnedForwardedWrite::HandoffSet {
+            key,
+            if_absent: false,
+            ..
+        }
+        | OwnedForwardedWrite::HandoffDelete { key } => Some(key),
+        OwnedForwardedWrite::HandoffSet {
+            if_absent: true, ..
+        }
+        | OwnedForwardedWrite::Clear(_) => None,
+    }
+}
+
+impl ForwardTarget {
+    fn duplicate(&self) -> ForwardTarget {
+        ForwardTarget {
+            addr: self.addr.clone(),
+            connection: Arc::clone(&self.connection),
+            token: self.token.clone(),
+            revoked: Arc::clone(&self.revoked),
         }
     }
 }
 
-/// What `OwnedForwardedWrite::describe` captured, rendered only when
-/// displayed.
-struct ForwardDescription {
-    kind: &'static str,
-    subject: ForwardSubject,
+/// The writes waiting to be forwarded to one target, in the order they
+/// must be sent. A write to a key that already has one waiting *replaces*
+/// it (see `coalescing_key`), so the queue is bounded by the number of
+/// distinct keys written while the target is slow or busy, never by the
+/// number of writes: forwarding a burst to a slow target loses nothing and
+/// does not grow without bound.
+///
+/// Why replacing is safe: only the last write to a key decides what the
+/// target ends up holding, and the entry keeps the *position* of the first
+/// one, which is no later than where the new write would have gone. The
+/// two things that would make that wrong both break the slot instead of
+/// being coalesced across: a clear (it empties `slots`, so nothing queued
+/// before it is replaced by something after it) and a put-if-absent relay
+/// (it removes its own key's slot, since replacing an earlier `Set` with a
+/// later `Delete` across it would let the relay store its older value).
+struct TargetQueue {
+    node_context: NodeContext,
+    target: ForwardTarget,
+    ops: BTreeMap<u64, OwnedForwardedWrite>,
+    next_seq: u64,
+    /// For each key, the sequence number of the write in `ops` that a new
+    /// write to it replaces.
+    slots: HashMap<Key, u64>,
+    /// A drainer (`drain_forward_queue`) is running or has been handed to
+    /// `run`; at most one runs per queue, which is what keeps the order.
+    draining: bool,
 }
 
-enum ForwardSubject {
-    Key(Key),
-    /// A `SetMany`: how many keys, and the namespace they share.
-    KeyBatch {
-        namespace: Bytes,
-        keys: usize,
-    },
-    Namespace(Bytes),
-    AllNamespaces,
-}
-
-impl std::fmt::Display for ForwardDescription {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.subject {
-            ForwardSubject::Key(key) => write!(f, "{} {key:?}", self.kind),
-            ForwardSubject::KeyBatch { namespace, keys } => {
-                // A preview, not the whole namespace name: it can be ~1 MiB.
-                let preview = &namespace[..namespace.len().min(64)];
-                let ellipsis = if namespace.len() > preview.len() {
-                    "..."
-                } else {
-                    ""
-                };
-                write!(
-                    f,
-                    "{} of {keys} keys in namespace {preview:?}{ellipsis}",
-                    self.kind
-                )
-            }
-            ForwardSubject::Namespace(namespace) => write!(f, "CLEAR namespace {namespace:?}"),
-            ForwardSubject::AllNamespaces => f.write_str("CLEAR (all namespaces)"),
+impl TargetQueue {
+    fn new(node_context: NodeContext, target: ForwardTarget) -> Self {
+        Self {
+            node_context,
+            target,
+            ops: BTreeMap::new(),
+            next_seq: 0,
+            slots: HashMap::new(),
+            draining: false,
         }
+    }
+
+    fn append(&mut self, write: OwnedForwardedWrite) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.ops.insert(seq, write);
+        seq
+    }
+
+    fn push(&mut self, write: OwnedForwardedWrite) {
+        if let Some(key) = coalescing_key(&write) {
+            if let Some(waiting) = self.slots.get(key).and_then(|seq| self.ops.get_mut(seq)) {
+                *waiting = write;
+                return;
+            }
+            let key = key.clone();
+            let seq = self.append(write);
+            self.slots.insert(key, seq);
+            return;
+        }
+        match &write {
+            OwnedForwardedWrite::Clear(_) => self.slots.clear(),
+            OwnedForwardedWrite::HandoffSet { key, .. } => {
+                self.slots.remove(key);
+            }
+            _ => {}
+        }
+        self.append(write);
+    }
+
+    fn pop(&mut self) -> Option<OwnedForwardedWrite> {
+        let (seq, write) = self.ops.pop_first()?;
+        if let Some(key) = coalescing_key(&write)
+            && self.slots.get(key) == Some(&seq)
+        {
+            self.slots.remove(key);
+        }
+        Some(write)
+    }
+}
+
+/// Every target's `TargetQueue`, by the address of its shared connection
+/// (`ForwardTarget::connection`; the queue holds a clone of the target, so
+/// the address cannot be reused while the entry exists). An entry exists
+/// only while it has writes waiting or a drainer working on it.
+#[derive(Default)]
+struct ForwardQueues {
+    targets: Mutex<HashMap<usize, TargetQueue>>,
+}
+
+impl ForwardQueues {
+    /// Queues `writes` for `target`. Returns the queue's id if the caller
+    /// must now start a drainer for it, `None` if one is already running.
+    fn push(
+        &self,
+        node_context: &NodeContext,
+        target: ForwardTarget,
+        writes: impl IntoIterator<Item = OwnedForwardedWrite>,
+    ) -> Option<usize> {
+        let id = Arc::as_ptr(&target.connection) as usize;
+        let mut targets = self
+            .targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let queue = targets
+            .entry(id)
+            .or_insert_with(|| TargetQueue::new(node_context.clone(), target));
+        for write in writes {
+            queue.push(write);
+        }
+        if std::mem::replace(&mut queue.draining, true) {
+            None
+        } else {
+            Some(id)
+        }
+    }
+
+    /// The next write for queue `id`, with what is needed to send it; when
+    /// there is none the queue is removed (under the same lock a `push`
+    /// takes, so a write cannot slip in between and be left undrained).
+    fn next(&self, id: usize) -> Option<(NodeContext, ForwardTarget, OwnedForwardedWrite)> {
+        let mut targets = self
+            .targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let queue = targets.get_mut(&id)?;
+        match queue.pop() {
+            Some(write) => Some((queue.node_context.clone(), queue.target.duplicate(), write)),
+            None => {
+                targets.remove(&id);
+                None
+            }
+        }
+    }
+
+    /// Marks queue `id` as having no drainer, so the next `push` starts
+    /// one. Used when a drainer could not be handed over or died.
+    fn deactivate(&self, id: usize) {
+        let mut targets = self
+            .targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(queue) = targets.get_mut(&id) {
+            queue.draining = false;
+            if queue.ops.is_empty() {
+                targets.remove(&id);
+            }
+        }
+    }
+}
+
+/// Sends queue `id`'s writes, one at a time in order, until it is empty.
+/// One of these runs per target with writes waiting, spawned by `run`.
+async fn drain_forward_queue(queues: Arc<ForwardQueues>, id: usize) {
+    // Whatever ends this task early (a panic, or `run` dropping it at
+    // shutdown) must not leave the queue marked as being drained.
+    struct Deactivate(Arc<ForwardQueues>, usize);
+    impl Drop for Deactivate {
+        fn drop(&mut self) {
+            self.0.deactivate(self.1);
+        }
+    }
+    let _guard = Deactivate(Arc::clone(&queues), id);
+
+    while let Some((node_context, target, write)) = queues.next(id) {
+        forward_with_retries(node_context, target, write).await;
     }
 }
 
@@ -7565,6 +7561,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -7611,6 +7608,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -7667,6 +7665,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -7766,6 +7765,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -7803,6 +7803,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -8583,6 +8584,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -8711,6 +8713,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9162,6 +9165,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx.clone(),
             &mut connection_tasks,
@@ -9189,6 +9193,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
             &mut connection_tasks,
@@ -9251,6 +9256,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx.clone(),
             &mut connection_tasks,
@@ -9282,6 +9288,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
             &mut connection_tasks,
@@ -9363,6 +9370,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9390,6 +9398,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9434,6 +9443,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9479,6 +9489,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9523,6 +9534,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9571,6 +9583,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9602,6 +9615,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9646,6 +9660,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9747,6 +9762,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9803,6 +9819,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9858,6 +9875,7 @@ mod tests {
                     node_context: Some(node_context),
                     migration_tx: mpsc::channel(1).0,
                     forward_tx: mpsc::channel(1).0,
+                    forward_queues: Arc::new(ForwardQueues::default()),
                 },
                 shutdown_rx,
             ));
@@ -9894,6 +9912,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9935,6 +9954,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -9970,6 +9990,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -10002,6 +10023,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -10112,6 +10134,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -10171,6 +10194,7 @@ mod tests {
                 node_context: None,
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -10581,6 +10605,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -10646,6 +10671,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -10738,6 +10764,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -10818,6 +10845,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -10907,13 +10935,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_large_multi_set_during_a_join_forwards_every_key_not_just_the_first_few_thousand() {
-        // The `MultiSet` arm used to call `spawn_forward` once per
-        // matching key in a loop that never yields. With the runtime
-        // single-threaded, `run`'s consumer cannot drain `forward_tx`
-        // meanwhile, so everything past `FORWARD_CHANNEL_CAPACITY` +
-        // `MAX_PENDING_FORWARD_WAITERS` (4352) hit the drop branch and
-        // never reached the joiner. The keys now go out as one unit.
-        const KEYS: usize = FORWARD_CHANNEL_CAPACITY + MAX_PENDING_FORWARD_WAITERS + 1_500;
+        // The `MultiSet` arm used to hand each matching key to `forward_tx`
+        // as its own task in a loop that never yields. With the runtime
+        // single-threaded, `run`'s consumer cannot drain the channel
+        // meanwhile, so everything past 4352 keys hit the drop branch and
+        // never reached the joiner. The keys are now queued for the target
+        // (coalesced by key), and one drainer sends them.
+        const KEYS: usize = 256 + 4096 + 1_500;
 
         let (request_tx, request_rx) = mpsc::channel(4);
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
@@ -10960,6 +10988,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -10989,7 +11018,7 @@ mod tests {
 
         let received = received.lock().unwrap().clone();
         assert_eq!(received.len(), KEYS, "no key may be delivered twice");
-        // One unit: one connection, keys in frame order.
+        // One drainer: one connection, keys in frame order.
         assert!(received.iter().all(|(connection, _, _)| *connection == 0));
         for (index, (_, key, value)) in received.iter().enumerate() {
             assert_eq!(key, format!("k{index:04}").as_bytes());
@@ -11001,12 +11030,228 @@ mod tests {
         cache_task.await.unwrap();
     }
 
+    // ---- coalescing forward queues (the fix for forwards dropped when a
+    // target is slow: the queue is bounded by distinct keys, not by writes) --
+
+    fn forward_set(name: &str, value: &'static str) -> OwnedForwardedWrite {
+        OwnedForwardedWrite::Set {
+            key: Key::new(
+                Bytes::from_static(b"ns"),
+                Bytes::copy_from_slice(name.as_bytes()),
+            ),
+            value: Bytes::from_static(value.as_bytes()),
+            ttl: None,
+        }
+    }
+
+    fn forward_delete(name: &str) -> OwnedForwardedWrite {
+        OwnedForwardedWrite::Delete {
+            key: Key::new(
+                Bytes::from_static(b"ns"),
+                Bytes::copy_from_slice(name.as_bytes()),
+            ),
+        }
+    }
+
+    fn forward_put_if_absent(name: &str, value: &'static str) -> OwnedForwardedWrite {
+        OwnedForwardedWrite::HandoffSet {
+            key: Key::new(
+                Bytes::from_static(b"ns"),
+                Bytes::copy_from_slice(name.as_bytes()),
+            ),
+            value: Bytes::from_static(value.as_bytes()),
+            ttl: None,
+            if_absent: true,
+        }
+    }
+
+    fn test_forward_target(addr: &str) -> ForwardTarget {
+        ForwardTarget {
+            addr: addr.to_string(),
+            connection: Arc::new(AsyncMutex::new(None)),
+            token: "tok-joiner-0".to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn test_target_queue() -> TargetQueue {
+        TargetQueue::new(
+            test_node_context(
+                "ready-node",
+                "tk-ready-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            ),
+            test_forward_target("127.0.0.1:9"),
+        )
+    }
+
+    /// What a drainer would send, in order, as `(kind, name, value)`.
+    fn drain_all(queue: &mut TargetQueue) -> Vec<String> {
+        let mut sent = Vec::new();
+        while let Some(write) = queue.pop() {
+            sent.push(match write {
+                OwnedForwardedWrite::Set { key, value, .. } => {
+                    format!(
+                        "set {} {}",
+                        String::from_utf8_lossy(&key.name),
+                        String::from_utf8_lossy(&value)
+                    )
+                }
+                OwnedForwardedWrite::Delete { key } => {
+                    format!("del {}", String::from_utf8_lossy(&key.name))
+                }
+                OwnedForwardedWrite::HandoffSet {
+                    key,
+                    value,
+                    if_absent,
+                    ..
+                } => format!(
+                    "pia{} {} {}",
+                    if if_absent { "" } else { "(overwrite)" },
+                    String::from_utf8_lossy(&key.name),
+                    String::from_utf8_lossy(&value)
+                ),
+                OwnedForwardedWrite::HandoffDelete { key } => {
+                    format!("hdel {}", String::from_utf8_lossy(&key.name))
+                }
+                OwnedForwardedWrite::Clear(_) => "clear".to_string(),
+            });
+        }
+        sent
+    }
+
+    #[test]
+    fn a_later_write_to_a_key_replaces_the_one_still_waiting() {
+        let mut queue = test_target_queue();
+        queue.push(forward_set("a", "1"));
+        queue.push(forward_set("b", "1"));
+        queue.push(forward_set("a", "2"));
+        queue.push(forward_delete("b"));
+        queue.push(forward_set("a", "3"));
+
+        // One entry per key, each the last write to it, in the order the
+        // keys first appeared.
+        assert_eq!(drain_all(&mut queue), ["set a 3", "del b"]);
+    }
+
+    #[test]
+    fn the_queue_is_bounded_by_distinct_keys_not_by_writes() {
+        let mut queue = test_target_queue();
+        for round in 0..200 {
+            for key in 0..100 {
+                queue.push(forward_set(
+                    &format!("k{key}"),
+                    if round % 2 == 0 { "even" } else { "odd" },
+                ));
+            }
+        }
+        assert_eq!(queue.ops.len(), 100);
+        assert_eq!(queue.slots.len(), 100);
+    }
+
+    #[test]
+    fn a_clear_is_a_barrier_that_nothing_is_coalesced_across() {
+        let mut queue = test_target_queue();
+        queue.push(forward_set("a", "before"));
+        queue.push(OwnedForwardedWrite::Clear(ClearScope::All));
+        queue.push(forward_set("a", "after"));
+        queue.push(forward_set("a", "after2"));
+
+        // Replacing "before" with "after" would apply it ahead of the clear
+        // and the clear would then wipe it.
+        assert_eq!(
+            drain_all(&mut queue),
+            ["set a before", "clear", "set a after2"]
+        );
+    }
+
+    #[test]
+    fn a_put_if_absent_relay_is_not_coalesced_across() {
+        let mut queue = test_target_queue();
+        queue.push(forward_set("a", "client"));
+        queue.push(forward_put_if_absent("a", "relayed"));
+        queue.push(forward_delete("a"));
+
+        // Folding the delete into the first entry would send delete, then
+        // the relay, which would store its older value on the target.
+        assert_eq!(
+            drain_all(&mut queue),
+            ["set a client", "pia a relayed", "del a"]
+        );
+    }
+
+    #[test]
+    fn a_write_after_the_waiting_one_was_taken_is_queued_behind_it() {
+        let mut queue = test_target_queue();
+        queue.push(forward_set("a", "1"));
+        let in_flight = queue.pop();
+        assert!(in_flight.is_some());
+        assert!(queue.slots.is_empty(), "the taken write's slot is released");
+
+        // The first write may already be on the wire: the new one must
+        // follow it, not replace something that has left the queue.
+        queue.push(forward_set("a", "2"));
+        assert_eq!(drain_all(&mut queue), ["set a 2"]);
+    }
+
+    #[test]
+    fn exactly_one_drainer_is_started_per_queue_until_it_is_deactivated() {
+        let queues = ForwardQueues::default();
+        let node_context = test_node_context(
+            "ready-node",
+            "tk-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let target = test_forward_target("127.0.0.1:9");
+        let connection = Arc::clone(&target.connection);
+
+        let id = queues
+            .push(&node_context, target.duplicate(), [forward_set("a", "1")])
+            .expect("the first write starts a drainer");
+        assert_eq!(id, Arc::as_ptr(&connection) as usize);
+        assert!(
+            queues
+                .push(&node_context, target.duplicate(), [forward_set("b", "1")])
+                .is_none(),
+            "a drainer is already running"
+        );
+
+        // A drainer that could not be handed over leaves the writes queued
+        // and lets the next write start one.
+        queues.deactivate(id);
+        assert!(
+            queues
+                .push(&node_context, target.duplicate(), [forward_set("c", "1")])
+                .is_some()
+        );
+        let mut drained = 0;
+        while queues.next(id).is_some() {
+            drained += 1;
+        }
+        assert_eq!(drained, 3);
+        assert!(
+            queues.targets.lock().unwrap().is_empty(),
+            "an empty queue is removed"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn a_multi_set_forward_resumes_after_a_dropped_connection_without_resending_acked_keys() {
+    async fn forwards_to_a_stalled_target_are_all_delivered_once_it_answers_none_dropped() {
+        // Before: every forward was its own task behind a bounded channel,
+        // and past 256 + 4096 outstanding the rest were dropped, so a
+        // joiner that was busy receiving its handoff missed thousands of
+        // writes (observed under chaos load: ~10k dropped per node while a
+        // killed node's replacement joined). Now the writes wait in a queue
+        // bounded by distinct keys, and each key is delivered once, with
+        // its last value.
+        const KEYS: usize = 256 + 4096 + 3_000;
+        const REWRITES: usize = 3;
+
         let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let joining_addr = joining_listener.local_addr().unwrap().to_string();
-        // Connection 0 reads its 4th frame and closes without acking it.
-        let received = spawn_s_frame_joiner(joining_listener, Some(4));
+        let received = spawn_s_frame_joiner(joining_listener, None);
 
         let node_context = test_node_context(
             "ready-node",
@@ -11014,85 +11259,71 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
         );
-        let target = ForwardTarget {
-            addr: joining_addr,
-            connection: Arc::new(AsyncMutex::new(None)),
-            token: "tok-joiner-0".to_string(),
-            revoked: Arc::new(AtomicBool::new(false)),
+        // `run`'s consumer, stalled: the drainer sits in the channel until
+        // the test takes it out, so everything below queues.
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(1);
+        let config = ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            auth_secret: None,
+            tls_acceptor: None,
+            node_context: None,
+            migration_tx: mpsc::channel(1).0,
+            forward_tx,
+            forward_queues: Arc::new(ForwardQueues::default()),
         };
-        let items: Vec<(Bytes, Bytes)> = (0..8)
-            .map(|index| {
-                (
-                    Bytes::from(format!("k{index}").into_bytes()),
-                    Bytes::from_static(b"v"),
-                )
-            })
-            .collect();
+        let target = test_forward_target(&joining_addr);
 
-        forward_with_retries(
-            node_context,
-            target,
-            OwnedForwardedWrite::SetMany {
-                namespace: Bytes::from_static(b"ns"),
-                items,
-                ttl: None,
-                handoff: false,
-                sent: AtomicUsize::new(0),
-            },
-        )
-        .await;
-
-        let received: Vec<(usize, String)> = received
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(connection, key, _)| (*connection, String::from_utf8(key.clone()).unwrap()))
-            .collect();
-        let expected: Vec<(usize, String)> = [
-            (0, "k0"),
-            (0, "k1"),
-            (0, "k2"),
-            // Read but never acked, so sent again on the new connection —
-            // and nothing before it is.
-            (0, "k3"),
-            (1, "k3"),
-            (1, "k4"),
-            (1, "k5"),
-            (1, "k6"),
-            (1, "k7"),
-        ]
-        .into_iter()
-        .map(|(connection, key)| (connection, key.to_string()))
-        .collect();
-        assert_eq!(received, expected);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn forward_slots_bound_the_spawned_forward_tasks_and_free_up_as_they_finish() {
-        // `run` only receives from `forward_rx` while a slot is free, so
-        // the number of forward tasks that have left the channel can never
-        // exceed the semaphore's size.
-        let slots = Arc::new(Semaphore::new(2));
-        let mut tasks: JoinSet<()> = JoinSet::new();
-        let release = Arc::new(tokio::sync::Notify::new());
-
-        for _ in 0..2 {
-            assert!(slots.available_permits() > 0, "a free slot gates receiving");
-            let release = Arc::clone(&release);
-            let task: MigrationTask = Box::pin(async move { release.notified().await });
-            spawn_forward_task(&mut tasks, &slots, task);
+        for round in 0..REWRITES {
+            for key in 0..KEYS {
+                let value: &'static str = ["v0", "v1", "v2"][round];
+                spawn_forward(
+                    &config,
+                    node_context.clone(),
+                    target.duplicate(),
+                    forward_set(&format!("k{key:05}"), value),
+                );
+            }
         }
+        assert_eq!(
+            config
+                .forward_queues
+                .targets
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .ops
+                .len(),
+            KEYS,
+            "writes to the same key coalesce while the target is stalled"
+        );
 
-        assert_eq!(slots.available_permits(), 0);
-        assert_eq!(tasks.len(), 2);
+        let drainer = forward_rx
+            .recv()
+            .await
+            .expect("one drainer was handed to run");
+        assert!(forward_rx.try_recv().is_err(), "and only one");
+        drainer.await;
 
-        // Let both tasks start waiting before releasing them
-        // (`notify_waiters` only wakes tasks already waiting).
-        tokio::task::yield_now().await;
-        release.notify_waiters();
-        while tasks.join_next().await.is_some() {}
-
-        assert_eq!(slots.available_permits(), 2);
+        let received = received.lock().unwrap().clone();
+        assert_eq!(
+            received.len(),
+            KEYS,
+            "every key reaches the target exactly once"
+        );
+        assert!(
+            received.iter().all(|(_, _, value)| value == b"v2"),
+            "with its last value"
+        );
+        for (index, (_, key, _)) in received.iter().enumerate() {
+            assert_eq!(
+                key,
+                format!("k{index:05}").as_bytes(),
+                "in first-write order"
+            );
+        }
+        assert!(config.forward_queues.targets.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11193,6 +11424,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -11308,6 +11540,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -11429,6 +11662,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -11584,6 +11818,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -11706,6 +11941,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -14228,6 +14464,7 @@ mod tests {
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx.clone(),
         ));
@@ -14370,6 +14607,7 @@ mod tests {
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx.clone(),
         ));
@@ -14500,6 +14738,7 @@ mod tests {
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx.clone(),
         ));
@@ -14623,6 +14862,7 @@ mod tests {
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx.clone(),
         ));
@@ -14919,6 +15159,7 @@ mod tests {
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx.clone(),
         ));
@@ -15075,6 +15316,7 @@ mod tests {
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx.clone(),
         ));
@@ -15260,6 +15502,7 @@ mod tests {
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx.clone(),
         ));
@@ -15395,6 +15638,7 @@ mod tests {
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx.clone(),
         ));
@@ -15756,6 +16000,7 @@ mod tests {
                 node_context: Some(node_context),
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
             },
             shutdown_rx,
         ));
@@ -15950,51 +16195,6 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("heartbeat task failed"));
-    }
-
-    #[test]
-    fn a_forward_description_renders_the_same_text_only_when_displayed() {
-        // `spawn_forward` captures this for every forward but prints it only
-        // when it drops one; capturing must not format (a key can be ~1 MiB
-        // of `Debug` output). The text itself is what the drop WARN has
-        // always said.
-        let set = OwnedForwardedWrite::Set {
-            key: key(b"alpha"),
-            value: Bytes::from_static(b"v"),
-            ttl: None,
-        };
-        assert_eq!(
-            set.describe().to_string(),
-            format!("SET {:?}", key(b"alpha"))
-        );
-        let delete = OwnedForwardedWrite::HandoffDelete { key: key(b"alpha") };
-        assert_eq!(
-            delete.describe().to_string(),
-            format!("DELETE {:?}", key(b"alpha"))
-        );
-        assert_eq!(
-            OwnedForwardedWrite::Clear(ClearScope::Namespace(Bytes::from_static(b"ns")))
-                .describe()
-                .to_string(),
-            format!("CLEAR namespace {:?}", Bytes::from_static(b"ns"))
-        );
-        assert_eq!(
-            OwnedForwardedWrite::Clear(ClearScope::All)
-                .describe()
-                .to_string(),
-            "CLEAR (all namespaces)"
-        );
-
-        // Capturing shares the key's bytes instead of copying or rendering
-        // them.
-        let big = key(&vec![b'k'; 1024 * 1024]);
-        let ptr = big.name.as_ptr();
-        let write = OwnedForwardedWrite::Delete { key: big };
-        let description = write.describe();
-        let ForwardSubject::Key(captured) = &description.subject else {
-            panic!("a key forward is described by its key");
-        };
-        assert_eq!(captured.name.as_ptr(), ptr);
     }
 
     fn test_active_migration(completed_at: Option<Instant>) -> ActiveMigration {
@@ -17706,6 +17906,7 @@ mod tests {
             node_context: None,
             migration_tx: mpsc::channel(1).0,
             forward_tx: mpsc::channel(1).0,
+            forward_queues: Arc::new(ForwardQueues::default()),
         };
 
         let server_task = tokio::spawn(async move {
