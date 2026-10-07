@@ -442,8 +442,8 @@ since these are exactly the frames that skip the wrong-node check.
 a survivor re-replicating a key after a membership change dropped a
 member (an eviction, or a leave it did not itself hand off for — see
 <a href="architecture.html">Architecture</a>) sends it instead of a
-plain overwrite, so a re-replication racing a newer client write can
-never regress it — the receiver stores the entry only if it was absent,
+plain overwrite, so a re-replication racing a newer client write on the
+receiver can never regress it — the receiver stores the entry only if it was absent,
 and acks <code>S\n</code> either way, since a key already present there
 is a success for the sender, not a conflict. An ordinary decommission
 handoff never sets it. These are versioned with the

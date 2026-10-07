@@ -5015,9 +5015,12 @@ async fn drain_pending_clears(
 /// other leaver can be dropped outright — the recipient's own snapshot
 /// predates this node's `V`, so it classifies the key `NotOwned`).
 /// Accepted because the failure mode is bounded by cache semantics:
-/// handoffs are put-if-absent so nothing regresses, reads keep landing
-/// on the surviving copies via `W`-refresh, and a key that does lose
-/// its last copy is a miss, not corruption. There is no full
+/// a put-if-absent handoff never overwrites a newer value the receiver
+/// already holds, reads keep landing on the surviving copies via
+/// `W`-refresh, and a key that does lose its last copy is a miss. (It
+/// carries no version, though: when two survivors hold different
+/// copies and both re-replicate, the first to arrive is kept — issue
+/// #563.) There is no full
 /// anti-entropy: the gap closes per key as a later ring change re-ranks
 /// it, a client rewrites it, or its TTL turns it over. Operators avoid
 /// the window entirely by scaling in one node at a time — see

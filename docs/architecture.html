@@ -97,7 +97,7 @@ unreachable.</p>
   surviving old owner of each affected key streams it to the newly
   promoted owner(s) as a put-if-absent handoff (<code>U</code>'s
   trailing <code>A</code> token — see <a href="protocol.html">Protocol</a>),
-  so a re-replication racing a newer client write can never regress it.
+  so a re-replication racing a newer client write on the receiver can never regress it.
   This runs independently of, and is ordered against, a join in
   progress: a join's sweep of its own dead-copy marks waits for any
   in-flight re-replication to finish first (so it can't reclaim a
@@ -114,12 +114,41 @@ landing inside one drain window — two nodes scaled in at once, or an
 eviction while a third drains — can therefore leave keys transiently
 below R: each leaver picks entrants from a roster that still lists the
 other, so a key whose owners included both comes out of the double-leave
-one handoff short. Nothing regresses (handoffs are put-if-absent) and
-reads keep landing on the surviving copies; a key that does lose its
-last copy is a cache miss, not corruption. There is no anti-entropy
-sweep: the gap closes per key as a later ring change re-ranks it, a
-client rewrites it, or its TTL turns it over — and it never opens at all
-when scale-in retires one node at a time.</p>
+one handoff short, and that double-leave case never arises when scale-in
+retires one node at a time. A put-if-absent handoff cannot overwrite a
+newer value that the receiver already holds, so reads keep landing on
+the surviving copies, and a key that does lose its last copy is a cache
+miss. But the handoff carries no version either: if two survivors hold
+different copies of a key and both re-replicate it to a fresh node, the
+first to arrive is kept and the other is refused, newer or not, so a key
+whose surviving copies disagree can be served with its older value.
+There is no anti-entropy sweep: the gap closes per key when a client
+rewrites it or its TTL turns it over, and a key that is only read stays
+as it is.</p>
+<p>Two more ways copies come to disagree or go missing were measured in
+chaos runs that join, decommission and kill nodes back to back (issues
+<a href="https://github.com/nanocached/nanocached/issues/563">#563</a> and
+<a href="https://github.com/nanocached/nanocached/issues/565">#565</a>; both
+are open):</p>
+<ul>
+  <li>A client write that reaches a node a join has displaced releases that
+  copy's dead-copy mark, so the sweep never reclaims it (the release is
+  deliberate: a mark that outlives its value once deleted fresh writes). The node keeps more
+  entries than its share of the keys, and if a later eviction makes it an owner
+  again the old copy comes back and can be served or re-replicated. These
+  leftover copies built up in every run, including runs with the changes spread
+  out.</li>
+  <li>A replica write refused by a live node (<code>WrongNodeError</code>, while the
+  client's node list and the nodes' views of the ring disagree) is swallowed by
+  the SDK, so the key sits on one copy until its next write. If the node holding
+  that copy is decommissioned or killed first, the newest value is lost and the
+  surviving owners serve the older one. In those runs (Python SDK, Docker) about
+  15&ndash;17&nbsp;% of writes had a replica leg refused.</li>
+</ul>
+<p>Both are repaired by the next write to the key; a key that is only read is
+not. Spreading the membership changes out does not remove the leftover copies
+of the first case, and how often a refused replica write happens when the
+changes are spread out has not been measured.</p>
 <p>Liveness is binary, though: a node that is slow but still answering is
 never evicted, and every request that touches it waits out its round
 trip — with <em>R</em> copies on <em>N</em> nodes, about <em>R/N</em> of
@@ -154,7 +183,8 @@ the forwarding window stays open past completion to cover clients still
 routing with the older node list. Joins are serialized — one handoff at a
 time, cluster-wide — so a fleet started at once simply queues; a source
 that has finished one handoff accepts the next join's request while it is
-still forwarding for the previous one.</p>
+still forwarding for the previous one, and keeps forwarding to the earlier
+joiner until its own window ends.</p>
 
 <h2>Discovery without a single point of failure</h2>
 <p>The registry is deliberately soft state: nodes announce themselves and
