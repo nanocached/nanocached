@@ -14,6 +14,26 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a join no longer ends the forwarding window of the join
+  before it. A node holds one handoff slot, and a new `M` used to replace
+  it and revoke its forwards even though the earlier joiner was confirmed
+  and its forwarding grace (100+ seconds) was still open. A client whose
+  node list had not caught up kept writing to the old owners, which from
+  then on forwarded only to the newest joiner, so an earlier joiner that
+  owned the key stopped receiving the writes and stayed behind (later a
+  stale read once the other copies left). The superseded handoff now moves
+  to a `lingering` list on the new slot, keeps its connection and its
+  forwards, and receives a write for every key it owns under the current
+  ring (and every `CLEAR`) until its grace ends. It is dropped and its
+  forwards are revoked, as before, when its join was abandoned, when the
+  same name joins again at a new generation, and when discovery evicts or
+  removes it (issues #267 and #474: its address may belong to another node
+  by then). Observed in a join-then-decommission-then-kill chaos run: the
+  restarted node that had joined just before the next join was behind its
+  peers on 4–285 keys right before the last kill (median 139) and is now
+  behind on 0–47 (median 6.5); the end-to-end count of stale reads in that
+  run did not change measurably because other causes dominate it (#563,
+  #565). Issue #564.
 - `nanocached-node`: with an auth secret configured, a connection that has
   not authenticated yet is now held to what an unauthenticated peer can
   legitimately do. The node used to parse and buffer a whole request (up to
