@@ -2087,7 +2087,7 @@ mod tests {
                 owner: check(owner)
             }
             .execute(&mut cache),
-            Response::Swept(0)
+            Response::Swept(1), // the stale mark is dropped, nothing removed
         );
         assert_eq!(cache.get(&name), Some(Bytes::from_static(b"Alice")));
 

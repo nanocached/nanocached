@@ -1309,7 +1309,11 @@ impl Cache {
     /// `sweep`, except that a marked entry `owned` says this node still owns
     /// is kept and its mark dropped (issue #563). The mark says "this copy
     /// is dead"; ownership is the authority, so a mark on a key the node
-    /// owns can only be stale and must not cost it the copy.
+    /// owns can only be stale and must not cost it the copy. Returns the
+    /// entries removed plus the stale marks dropped: both are a candidate
+    /// this call spent its budget on, and a caller reading `>= SWEEP_BUDGET`
+    /// as "more may be waiting" must not be told otherwise because a few
+    /// candidates were kept (it would sleep a whole interval per batch).
     pub fn sweep_unowned(&mut self, owned: &dyn Fn(&Key) -> bool) -> usize {
         self.sweep_checked(Instant::now(), true, Some(owned))
     }
@@ -1349,6 +1353,7 @@ impl Cache {
         }
 
         let mut removed = 0;
+        let mut unmarked = 0;
 
         for _ in 0..SWEEP_BUDGET {
             let Some(key) = self.pending_removal.pop_front() else {
@@ -1363,6 +1368,7 @@ impl Cache {
             if marked && owned.is_some_and(|owned| owned(&key)) {
                 self.clear_migrated_mark(&key);
                 marked = false;
+                unmarked += 1;
             }
             let expired = self
                 .peek(&key)
@@ -1378,7 +1384,7 @@ impl Cache {
             }
         }
 
-        removed
+        removed + unmarked
     }
 }
 
@@ -2943,7 +2949,8 @@ mod tests {
         let used_marked = cache.used_bytes;
 
         let owned = |k: &Key| &k.name[..] == b"owned";
-        assert_eq!(cache.sweep_unowned(&owned), 1);
+        // One removed, one stale mark dropped.
+        assert_eq!(cache.sweep_unowned(&owned), 2);
         assert_eq!(cache.get(&key(b"owned")), Some(Bytes::from_static(b"live")));
         assert_eq!(cache.get(&key(b"dead")), None);
 
@@ -2955,6 +2962,23 @@ mod tests {
         // The mark is gone: even a sweep that owns nothing leaves it alone.
         assert_eq!(cache.sweep_unowned(&|_| false), 0);
         assert_eq!(cache.get(&key(b"owned")), Some(Bytes::from_static(b"live")));
+    }
+
+    #[test]
+    fn sweep_unowned_reports_a_full_budget_when_the_backlog_is_kept_not_removed() {
+        // A node that owns every marked key (an abandoned join's leftovers)
+        // spends the budget on dropping marks, removing nothing. The caller
+        // loops again only on a full budget, so that must still read as one.
+        let mut cache = Cache::new(UNBOUNDED);
+        for i in 0..SWEEP_BUDGET * 2 {
+            let k = key(format!("owned-{i}").as_bytes());
+            cache.set(k.clone(), Bytes::from_static(b"v"));
+            cache.mark_migrated(&k);
+        }
+
+        assert_eq!(cache.sweep_unowned(&|_| true), SWEEP_BUDGET);
+        assert_eq!(cache.sweep_unowned(&|_| true), SWEEP_BUDGET);
+        assert_eq!(cache.sweep_unowned(&|_| true), 0, "drained");
     }
 
     #[test]
