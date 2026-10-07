@@ -1,5 +1,5 @@
 use crate::cache::{Cache, SWEEP_BUDGET};
-use crate::command::{Command, MigrateProgress, ParseError, parse_resumable};
+use crate::command::{Command, MigrateProgress, OwnerCheck, ParseError, parse_resumable};
 use crate::hash_ring::{HashRing, KeyHash, KeyHasher};
 use crate::key::Key;
 use crate::response::{MultiAckEntry, MultiEntry, Response};
@@ -720,12 +720,6 @@ pub(crate) async fn run(
     // running standalone never touches this beyond the initial `None`.
     let active_migration: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
 
-    let sweep_task = tokio::spawn(run_sweep(
-        request_tx.clone(),
-        Arc::clone(&active_migration),
-        shutdown_rx.clone(),
-    ));
-
     // Shared with `node_context` so the heartbeat tasks can report the
     // replication factor half of this node's belief to discovery (issue
     // #30), the same belief `wrong_node` rejects client requests against.
@@ -765,6 +759,19 @@ pub(crate) async fn run(
         rereplication_tx: rereplication_tx.clone(),
         shutdown_rx: shutdown_rx.clone(),
     });
+    // Issue #563: the sweep rechecks ownership against this node's own
+    // ring view before it removes a marked copy.
+    let sweep_task = tokio::spawn(run_sweep(
+        request_tx.clone(),
+        Arc::clone(&active_migration),
+        node_context.as_ref().map(|node_context| {
+            (
+                Arc::clone(&node_context.known_ring),
+                node_context.name.clone(),
+            )
+        }),
+        shutdown_rx.clone(),
+    ));
     // This function's own copy must go, or `send_heartbeats`'s drain of
     // `rereplication_rx` would never see the channel close — every real
     // producer holds its own clone via `NodeContext` (or a clone of it),
@@ -2133,15 +2140,22 @@ async fn handle_connection(
                 // hash is computed once per frame.
                 let mut hasher = KeyHasher::default();
 
+                // Issue #563: keys this node serves only as a displaced node
+                // (join unconfirmed); marked as dead copies after the write.
+                let mut displaced_serving: Vec<Key> = Vec::new();
+
                 for (position, (name, value)) in keys.into_iter().zip(values).enumerate() {
-                    let wrong = config.node_context.as_ref().is_some_and(|node_context| {
+                    let stance = config.node_context.as_ref().map(|node_context| {
                         let key_hash = hasher.hash(&Key::new(namespace.clone(), name.clone()));
-                        wrong_node_hashed(node_context, key_hash)
+                        ownership_hashed(node_context, key_hash)
                     });
 
-                    if wrong {
+                    if stance == Some(Ownership::Displaced) {
                         entries[position] = Some(MultiAckEntry::WrongNode);
                     } else {
+                        if stance == Some(Ownership::DisplacedServing) {
+                            displaced_serving.push(Key::new(namespace.clone(), name.clone()));
+                        }
                         owned_positions.push(position);
                         owned_keys.push(name);
                         owned_values.push(value);
@@ -2194,6 +2208,16 @@ async fn handle_connection(
                     let Response::MultiAck(results) = response else {
                         unreachable!("Command::MultiSet always answers with Response::MultiAck");
                     };
+
+                    if !displaced_serving.is_empty() {
+                        let _ = execute_command(
+                            &request_tx,
+                            Command::MarkMigratedMany {
+                                keys: std::mem::take(&mut displaced_serving),
+                            },
+                        )
+                        .await;
+                    }
 
                     // Issue #176: `Set` (below) forwards a write on a key
                     // caught mid-handoff (staged join) or mid-drain
@@ -2286,9 +2310,11 @@ async fn handle_connection(
                 continue;
             }
             Ok((Command::Set { key, value, ttl }, tag)) => {
-                if let Some(node_context) = &config.node_context
-                    && wrong_node(node_context, &key)
-                {
+                let stance = config
+                    .node_context
+                    .as_ref()
+                    .map(|node_context| ownership(node_context, &key));
+                if stance == Some(Ownership::Displaced) {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
                     continue;
@@ -2304,6 +2330,7 @@ async fn handle_connection(
                 )
                 .await?;
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
+                mark_if_displaced_serving(&request_tx, stance, &key).await;
 
                 // Staged node join: this key may be one an in-progress handoff is
                 // moving to a joining node — see `migration_targets_for`.
@@ -2582,9 +2609,11 @@ async fn handle_connection(
                 continue;
             }
             Ok((Command::Incr { key, delta }, tag)) => {
-                if let Some(node_context) = &config.node_context
-                    && wrong_node(node_context, &key)
-                {
+                let stance = config
+                    .node_context
+                    .as_ref()
+                    .map(|node_context| ownership(node_context, &key));
+                if stance == Some(Ownership::Displaced) {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
                     continue;
@@ -2599,6 +2628,7 @@ async fn handle_connection(
                 )
                 .await?;
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
+                mark_if_displaced_serving(&request_tx, stance, &key).await;
 
                 // Issue #129: only a `Response::Incremented` — i.e. INCR
                 // actually wrote a new value — needs forwarding;
@@ -2654,9 +2684,11 @@ async fn handle_connection(
                 },
                 tag,
             )) => {
-                if let Some(node_context) = &config.node_context
-                    && wrong_node(node_context, &key)
-                {
+                let stance = config
+                    .node_context
+                    .as_ref()
+                    .map(|node_context| ownership(node_context, &key));
+                if stance == Some(Ownership::Displaced) {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
                     continue;
@@ -2673,6 +2705,7 @@ async fn handle_connection(
                 )
                 .await?;
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
+                mark_if_displaced_serving(&request_tx, stance, &key).await;
 
                 // Issue #141: only `Response::Stored` — i.e. the condition
                 // held and CAS actually wrote — needs forwarding; a
@@ -6787,6 +6820,7 @@ async fn wait_for_migration_slot_to_clear(node_context: &NodeContext, joining_na
 async fn run_sweep(
     request_tx: mpsc::Sender<CacheRequest>,
     active_migration: Arc<Mutex<Option<ActiveMigration>>>,
+    ownership: Option<(KnownRing, String)>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -6815,8 +6849,23 @@ async fn run_sweep(
                 break;
             }
 
+            // The ring is read per pass, not once: an adopted membership
+            // replaces it. Without a ring view (no discovery) there are no
+            // marks to check.
+            let owner = ownership.as_ref().and_then(|(known_ring, name)| {
+                let membership = known_ring
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()?;
+                Some(OwnerCheck {
+                    ring: Arc::clone(&membership.ring),
+                    name: name.clone(),
+                    replication: membership.replication,
+                })
+            });
+
             tokio::select! {
-                result = sweep(&request_tx, !marks_held) => match result {
+                result = sweep(&request_tx, !marks_held, owner) => match result {
                     Some(removed) if removed >= SWEEP_BUDGET => continue,
                     _ => break,
                 },
@@ -6826,12 +6875,20 @@ async fn run_sweep(
     }
 }
 
-async fn sweep(request_tx: &mpsc::Sender<CacheRequest>, marked: bool) -> Option<usize> {
+async fn sweep(
+    request_tx: &mpsc::Sender<CacheRequest>,
+    marked: bool,
+    owner: Option<OwnerCheck>,
+) -> Option<usize> {
     let (response_tx, response_rx) = oneshot::channel();
 
+    let command = match owner {
+        Some(owner) if marked => Command::SweepOwned { owner },
+        _ => Command::Sweep { marked },
+    };
     request_tx
         .send(CacheRequest {
-            command: Command::Sweep { marked },
+            command,
             response_tx,
         })
         .await
@@ -7866,8 +7923,34 @@ fn wrong_node(node_context: &NodeContext, key: &Key) -> bool {
 /// multi-key arms use so a frame's (potentially huge) shared namespace is
 /// hashed once, not once per key.
 fn wrong_node_hashed(node_context: &NodeContext, key_hash: KeyHash) -> bool {
+    ownership_hashed(node_context, key_hash) == Ownership::Displaced
+}
+
+/// How this node stands towards a key, by its own view of the ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ownership {
+    /// The node is in the key's top-R (or has no ring view yet).
+    Owner,
+    /// The node is not an owner but serves the key anyway, because the
+    /// join that displaced it is not yet confirmed (see
+    /// `serving_locally_for_unconfirmed_join`). Whatever it stores for the
+    /// key now is a dead copy: the joiner gets the write by forwarding, and
+    /// the key is the sweep's to reclaim once the join is confirmed (#563).
+    DisplacedServing,
+    /// The node is not an owner and must answer `W`.
+    Displaced,
+}
+
+fn ownership(node_context: &NodeContext, key: &Key) -> Ownership {
+    ownership_hashed(node_context, KeyHash::of(key))
+}
+
+/// `ownership` for a key whose hash is already known.
+fn ownership_hashed(node_context: &NodeContext, key_hash: KeyHash) -> Ownership {
+    // Issue #570: not promoted yet (a restart under a dead name) — every
+    // key is someone else's until discovery says otherwise.
     if !node_context.promoted.load(Ordering::SeqCst) {
-        return true;
+        return Ownership::Displaced;
     }
     let displaced = node_context
         .known_ring
@@ -7882,7 +7965,28 @@ fn wrong_node_hashed(node_context: &NodeContext, key_hash: KeyHash) -> bool {
                 .is_owner_hashed(key_hash, &node_context.name, membership.replication)
         });
 
-    displaced && !serving_locally_for_unconfirmed_join(node_context, key_hash)
+    if !displaced {
+        Ownership::Owner
+    } else if serving_locally_for_unconfirmed_join(node_context, key_hash) {
+        Ownership::DisplacedServing
+    } else {
+        Ownership::Displaced
+    }
+}
+
+/// Issue #563: marks `key` as a dead copy after a write this node served
+/// only as a displaced node. `Cache::set` drops a key's mark (a fresh write
+/// is not the value a handoff transferred, #2), so without this a key
+/// written during the unconfirmed-join window — one the handoff had already
+/// marked, or one it never saw — kept a copy nothing would ever reclaim.
+async fn mark_if_displaced_serving(
+    request_tx: &mpsc::Sender<CacheRequest>,
+    ownership: Option<Ownership>,
+    key: &Key,
+) {
+    if ownership == Some(Ownership::DisplacedServing) {
+        mark_migrated(request_tx, key).await;
+    }
 }
 
 /// `wrong_node`'s exception: a handoff this node ran is still forwarding
@@ -14550,6 +14654,190 @@ mod tests {
         y_task.abort();
         discovery_task.abort();
         drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    // ── issue #563: copies written to a displaced node are reclaimed ───
+
+    #[test]
+    fn ownership_tells_an_owner_from_a_displaced_node_serving_an_unconfirmed_join() {
+        // `key-3` is displaced from ready-node by joiner-0; `key-0` is not.
+        let (node_context, _after_ring, _pre) = completed_unconfirmed_context(&[]);
+
+        assert_eq!(ownership(&node_context, &key(b"key-0")), Ownership::Owner);
+        assert_eq!(
+            ownership(&node_context, &key(b"key-3")),
+            Ownership::DisplacedServing
+        );
+
+        // Once discovery confirms the join the node must answer `W`.
+        node_context
+            .active_migration
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .confirmed = true;
+        assert_eq!(
+            ownership(&node_context, &key(b"key-3")),
+            Ownership::Displaced
+        );
+        assert!(wrong_node(&node_context, &key(b"key-3")));
+    }
+
+    /// Serves `request` on a connection to a displaced node whose join is
+    /// unconfirmed (`completed_unconfirmed_context`) over a real cache
+    /// actor, and returns the actor's channel so the caller can sweep it.
+    async fn serve_on_displaced_node(
+        request: &[u8],
+        expected_reply: Option<&[u8]>,
+    ) -> (mpsc::Sender<CacheRequest>, tokio::task::JoinHandle<()>) {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let (mut node_context, _after_ring, _pre) = completed_unconfirmed_context(&[]);
+        node_context.request_tx = request_tx.clone();
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).await.unwrap();
+        if let Some(expected_reply) = expected_reply {
+            assert_eq!(reply, expected_reply);
+        }
+        connection_task.await.unwrap().unwrap();
+
+        (request_tx, cache_task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_served_by_a_displaced_node_is_marked_and_an_owned_write_is_not() {
+        // Issue #563: while the join is unconfirmed this node still serves
+        // `key-3` (and forwards the write to the joiner). Its own copy is
+        // dead from then on, but `Cache::set` released the mark the handoff
+        // put on it (or the key never had one), so nothing would ever
+        // reclaim it. `key-0`, which the node owns, must stay unmarked.
+        let (request_tx, cache_task) =
+            serve_on_displaced_node(b"S 5 1\nkey-3xS 5 1\nkey-0y", Some(b"S\nS\n")).await;
+
+        assert_eq!(
+            send_command(&request_tx, Command::Sweep { marked: true }).await,
+            Response::Swept(1),
+            "exactly the displaced key is reclaimed"
+        );
+        assert_eq!(
+            send_command(&request_tx, Command::Get { key: key(b"key-3") }).await,
+            Response::NotFound
+        );
+        assert_eq!(
+            send_command(&request_tx, Command::Get { key: key(b"key-0") }).await,
+            Response::Value(Bytes::from_static(b"y"))
+        );
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_incr_or_cas_served_by_a_displaced_node_leaves_the_key_marked() {
+        // `S` marks `key-3`; the INCR / CAS that follows rewrites the value
+        // and must leave the copy marked too, not quietly drop the mark.
+        for (follow_up, expected_value) in [
+            (&b"i 0 5 3\nkey-3"[..], &b"4"[..]),
+            (&b"k 0 5 1 P\nkey-35"[..], &b"5"[..]),
+        ] {
+            let mut request = b"S 5 1\nkey-31".to_vec();
+            request.extend_from_slice(follow_up);
+            let (request_tx, cache_task) = serve_on_displaced_node(&request, None).await;
+
+            // The follow-up really rewrote the value.
+            assert_eq!(
+                send_command(&request_tx, Command::Get { key: key(b"key-3") }).await,
+                Response::Value(Bytes::copy_from_slice(expected_value))
+            );
+            assert_eq!(
+                send_command(&request_tx, Command::Sweep { marked: true }).await,
+                Response::Swept(1),
+                "{:?} left the dead copy unmarked",
+                String::from_utf8_lossy(follow_up)
+            );
+
+            drop(request_tx);
+            cache_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_set_marks_only_the_keys_a_displaced_node_served() {
+        // The `o` frame: `ns` + `key-3`/`key-0`, but the namespace changes
+        // the hash, so pick the names by what this ring says about them.
+        let (probe, after_ring, _pre) = completed_unconfirmed_context(&[]);
+        drop(probe);
+        let ns = Bytes::from_static(b"ns");
+        let owned = |name: &Bytes| {
+            after_ring.is_owner_hashed(
+                KeyHash::of(&Key::new(ns.clone(), name.clone())),
+                "ready-node",
+                2,
+            )
+        };
+        let names: Vec<Bytes> = (0..64)
+            .map(|i| Bytes::from(format!("key-{i:02}")))
+            .collect();
+        let dead = names.iter().find(|name| !owned(name)).unwrap().clone();
+        let live = names.iter().find(|name| owned(name)).unwrap().clone();
+
+        let mut request = b"o 2 2 6 1 6 1\nns".to_vec();
+        request.extend_from_slice(&dead);
+        request.push(b'x');
+        request.extend_from_slice(&live);
+        request.push(b'y');
+        let (request_tx, cache_task) = serve_on_displaced_node(&request, Some(b"O 2 S S\n")).await;
+
+        assert_eq!(
+            send_command(&request_tx, Command::Sweep { marked: true }).await,
+            Response::Swept(1)
+        );
+        assert_eq!(
+            send_command(
+                &request_tx,
+                Command::Get {
+                    key: Key::new(ns.clone(), dead)
+                }
+            )
+            .await,
+            Response::NotFound
+        );
+        assert_eq!(
+            send_command(
+                &request_tx,
+                Command::Get {
+                    key: Key::new(ns.clone(), live)
+                }
+            )
+            .await,
+            Response::Value(Bytes::from_static(b"y"))
+        );
+
         drop(request_tx);
         cache_task.await.unwrap();
     }

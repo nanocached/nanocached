@@ -1,7 +1,9 @@
 use crate::cache::{Cache, CasCondition, CasResult, IncrResult, parse_decimal_i64};
+use crate::hash_ring::{HashRing, KeyHash};
 use crate::key::Key;
 use crate::response::{MultiAckEntry, MultiEntry, Response};
 use bytes::{Buf, Bytes, BytesMut};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Upper bound on the summed value bytes one `M` reply carries. A key can
@@ -14,6 +16,43 @@ use std::time::Duration;
 /// (`MAX_MULTI_REPLY_VALUE_BYTES` in `nanocached-proxy.rs`), and it stays
 /// well under the SDKs' 64 MiB multi-get response cap.
 pub const MAX_MULTI_REPLY_VALUE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The node's current view of the ring, handed to a sweep so it can tell a
+/// dead copy (a key this node no longer owns) from a live one before it
+/// removes anything. Compared by ring identity, not contents: two checks
+/// are equal only if they share the same ring allocation.
+#[derive(Clone)]
+pub struct OwnerCheck {
+    pub ring: Arc<HashRing>,
+    pub name: String,
+    pub replication: usize,
+}
+
+impl OwnerCheck {
+    fn owns(&self, key: &Key) -> bool {
+        self.ring
+            .is_owner_hashed(KeyHash::of(key), &self.name, self.replication)
+    }
+}
+
+impl std::fmt::Debug for OwnerCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnerCheck")
+            .field("name", &self.name)
+            .field("replication", &self.replication)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for OwnerCheck {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ring, &other.ring)
+            && self.name == other.name
+            && self.replication == other.replication
+    }
+}
+
+impl Eq for OwnerCheck {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -180,6 +219,12 @@ pub enum Command {
     MarkMigrated {
         key: Key,
     },
+    /// Internal-only (issue #563): `MarkMigrated` for every key of a
+    /// multi-key write this node served only as a displaced node, in one
+    /// round trip.
+    MarkMigratedMany {
+        keys: Vec<Key>,
+    },
     /// Internal-only (staged node join): reverses `MarkMigrated` for a key whose
     /// migration was cancelled (see `Command::CancelMigration`), so
     /// `Sweep` doesn't reclaim it after all.
@@ -245,6 +290,15 @@ pub enum Command {
     /// is still undecided, see `run_sweep` in `server.rs`.
     Sweep {
         marked: bool,
+    },
+    /// Internal-only (issue #563): `Sweep { marked: true }`, except that a
+    /// marked entry this node owns under `owner`'s ring is *kept* and its
+    /// mark dropped instead of removed. A mark is only ever meant for a
+    /// copy of a key the node no longer owns, so one on an owned key is
+    /// stale (a join was abandoned, or an eviction made the node an owner
+    /// again) and must never cost the node its live copy.
+    SweepOwned {
+        owner: OwnerCheck,
     },
     /// Staged node join: sent by discovery to a `Joined` node when a new node is
     /// joining, so this node can compute (via `HashRing`) how each of its
@@ -457,6 +511,13 @@ impl Command {
                 Response::Marked
             }
 
+            Self::MarkMigratedMany { keys } => {
+                for key in &keys {
+                    cache.mark_migrated(key);
+                }
+                Response::Marked
+            }
+
             Self::UnmarkMigrated { key } => {
                 cache.unmark_migrated(&key);
                 Response::Unmarked
@@ -466,6 +527,9 @@ impl Command {
 
             Self::Sweep { marked: true } => Response::Swept(cache.sweep()),
             Self::Sweep { marked: false } => Response::Swept(cache.sweep_expired()),
+            Self::SweepOwned { owner } => {
+                Response::Swept(cache.sweep_unowned(&|key| owner.owns(key)))
+            }
         }
     }
 }
@@ -1994,6 +2058,48 @@ mod tests {
             Command::Sweep { marked: true }.execute(&mut cache),
             Response::Swept(1)
         );
+    }
+
+    #[test]
+    fn sweep_owned_keeps_a_marked_key_the_ring_says_this_node_owns() {
+        // Issue #563. Over {a, b} with R=1 each key has exactly one owner:
+        // the marked copy is reclaimed on the node that is not its owner and
+        // kept (mark dropped) on the node that is.
+        let ring = Arc::new(HashRing::new(vec!["a".to_string(), "b".to_string()]));
+        let name = key(b"name");
+        let owner = if ring.is_owner_hashed(KeyHash::of(&name), "a", 1) {
+            "a"
+        } else {
+            "b"
+        };
+        let other = if owner == "a" { "b" } else { "a" };
+        let check = |node: &str| OwnerCheck {
+            ring: Arc::clone(&ring),
+            name: node.to_string(),
+            replication: 1,
+        };
+
+        let mut cache = Cache::new(usize::MAX);
+        cache.set(name.clone(), Bytes::from_static(b"Alice"));
+        cache.mark_migrated(&name);
+        assert_eq!(
+            Command::SweepOwned {
+                owner: check(owner)
+            }
+            .execute(&mut cache),
+            Response::Swept(0)
+        );
+        assert_eq!(cache.get(&name), Some(Bytes::from_static(b"Alice")));
+
+        cache.mark_migrated(&name);
+        assert_eq!(
+            Command::SweepOwned {
+                owner: check(other)
+            }
+            .execute(&mut cache),
+            Response::Swept(1)
+        );
+        assert_eq!(cache.get(&name), None);
     }
 
     #[test]

@@ -1306,7 +1306,24 @@ impl Cache {
         self.sweep_at(Instant::now(), false)
     }
 
+    /// `sweep`, except that a marked entry `owned` says this node still owns
+    /// is kept and its mark dropped (issue #563). The mark says "this copy
+    /// is dead"; ownership is the authority, so a mark on a key the node
+    /// owns can only be stale and must not cost it the copy.
+    pub fn sweep_unowned(&mut self, owned: &dyn Fn(&Key) -> bool) -> usize {
+        self.sweep_checked(Instant::now(), true, Some(owned))
+    }
+
     fn sweep_at(&mut self, now: Instant, include_marked: bool) -> usize {
+        self.sweep_checked(now, include_marked, None)
+    }
+
+    fn sweep_checked(
+        &mut self,
+        now: Instant,
+        include_marked: bool,
+        owned: Option<&dyn Fn(&Key) -> bool>,
+    ) -> usize {
         if self.pending_removal.is_empty() {
             self.pending_removal
                 .extend(self.slots.values().flat_map(|sub_map| {
@@ -1342,7 +1359,11 @@ impl Cache {
             // the key may have been rewritten (mark cleared, or no longer
             // expired) since it was queued, and a fresh value must never
             // be swept on the strength of an old candidate entry.
-            let marked = include_marked && self.is_marked(&key);
+            let mut marked = include_marked && self.is_marked(&key);
+            if marked && owned.is_some_and(|owned| owned(&key)) {
+                self.clear_migrated_mark(&key);
+                marked = false;
+            }
             let expired = self
                 .peek(&key)
                 .is_some_and(|entry| entry.is_expired_at(now));
@@ -2894,6 +2915,46 @@ mod tests {
 
         assert_eq!(cache.sweep(), 1);
         assert_eq!(cache.get(&key(b"name")), None);
+    }
+
+    #[test]
+    fn sweep_unowned_removes_a_marked_copy_the_node_does_not_own() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(key(b"dead"), Bytes::from_static(b"old"));
+        cache.mark_migrated(&key(b"dead"));
+
+        assert_eq!(cache.sweep_unowned(&|_| false), 1);
+        assert_eq!(cache.get(&key(b"dead")), None);
+    }
+
+    #[test]
+    fn sweep_unowned_keeps_a_marked_entry_the_node_owns_and_drops_its_mark() {
+        // Issue #563: a mark is only ever meant for a copy of a key the node
+        // no longer owns. One on an owned key (a join was abandoned, or an
+        // eviction made the node an owner again) is stale and must not cost
+        // the node its live copy — nor linger to be rechecked every pass.
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(key(b"owned"), Bytes::from_static(b"live"));
+        cache.set(key(b"dead"), Bytes::from_static(b"old"));
+        cache.mark_migrated(&key(b"owned"));
+        cache.mark_migrated(&key(b"dead"));
+        let used_marked = cache.used_bytes;
+
+        let owned = |k: &Key| &k.name[..] == b"owned";
+        assert_eq!(cache.sweep_unowned(&owned), 1);
+        assert_eq!(cache.get(&key(b"owned")), Some(Bytes::from_static(b"live")));
+        assert_eq!(cache.get(&key(b"dead")), None);
+
+        assert!(!cache.is_marked(&key(b"owned")));
+        assert!(
+            cache.used_bytes < used_marked,
+            "the mark bytes are credited back"
+        );
+        // The mark is gone: even a sweep that owns nothing leaves it alone.
+        assert_eq!(cache.sweep_unowned(&|_| false), 0);
+        assert_eq!(cache.get(&key(b"owned")), Some(Bytes::from_static(b"live")));
     }
 
     #[test]
