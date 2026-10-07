@@ -142,8 +142,12 @@ are open):</p>
   client's node list and the nodes' views of the ring disagree) is swallowed by
   the SDK, so the key sits on one copy until its next write. If the node holding
   that copy is decommissioned or killed first, the newest value is lost and the
-  surviving owners serve the older one. In those runs (Python SDK, Docker) about
-  15&ndash;17&nbsp;% of writes had a replica leg refused.</li>
+  surviving owners serve the older one. How often this happens varies: earlier
+  runs (Python SDK, Docker) saw about 15&ndash;17&nbsp;% of writes with a
+  replica leg refused, a later run on current <code>main</code> about
+  1.5&nbsp;%, and the difference is not explained. Refreshing the node list
+  and retrying does not cure it: with a freshly fetched list the same node
+  refused again in over 99&nbsp;% of the cases.</li>
 </ul>
 <p>Both are repaired by the next write to the key; a key that is only read is
 not. Spreading the membership changes out does not remove the leftover copies
