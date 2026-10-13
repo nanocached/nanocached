@@ -1670,6 +1670,7 @@ fn route_clear(node_context: &NodeContext, scope: &ClearScope) -> ClearRoute {
         connection: Arc::clone(&active.forward_connection),
         token: active.joining_token.clone(),
         revoked: Arc::clone(&active.forward_revoked),
+        as_handoff: false,
     })
 }
 
@@ -3938,6 +3939,10 @@ impl LingeringForward {
             connection: Arc::clone(&self.forward_connection),
             token: self.joining_token.clone(),
             revoked: Arc::clone(&self.forward_revoked),
+            // A lingering joiner is a confirmed member with a ring view
+            // of its own, which may lag the slot's — see
+            // `ForwardTarget::as_handoff`.
+            as_handoff: true,
         }
     }
 }
@@ -6559,7 +6564,10 @@ async fn send_set(
         if &ack != b"S\n" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "joining node did not acknowledge the transferred key",
+                format!(
+                    "joining node did not acknowledge the transferred key (answered {:?})",
+                    String::from_utf8_lossy(&ack)
+                ),
             ));
         }
         io::Result::Ok(())
@@ -6579,10 +6587,11 @@ struct ForwardTarget {
     connection: Arc<AsyncMutex<Option<ClientStream>>>,
     /// Issue #295: the target's own membership token — carried on any
     /// `U`/`u` this forward sends (see `Command::HandoffSet::token`).
-    /// Unused for a plain `Set`/`Delete` forward (`migration_target_for`'s
-    /// join-side target also serves those), but always populated:
-    /// `migration_target_for` sources it from `ActiveMigration::
-    /// joining_token`, `leave_target_for` from `LeaveState::tokens`.
+    /// Unused for a plain `Set`/`Delete` forward (the slot's own joiner
+    /// gets those), but always populated: `migration_targets_for` sources
+    /// it from `ActiveMigration::joining_token` (and a lingering joiner's
+    /// from `LingeringForward::joining_token`, which sends `U`/`u` — see
+    /// `as_handoff`), `leave_target_for` from `LeaveState::tokens`.
     token: String,
     /// Issue #474: set once the handoff this target was resolved from is
     /// no longer the one this node is forwarding for — its joiner was
@@ -6604,6 +6613,41 @@ struct ForwardTarget {
     /// (`forward_revoked`); `leave_target_for` hands out a fresh `false`
     /// — a leaver's own targets are not recycled under it.
     revoked: Arc<AtomicBool>,
+    /// Send a forwarded client `Set`/`Delete` to this target as a `U`/`u`
+    /// (unconditional handoff frame) rather than a plain `S`/`D`. Set for
+    /// a lingering joiner's target (`LingeringForward::target`), never for
+    /// the slot's own joiner or a decommission's entrant (those forwards
+    /// already pick the frame themselves). Applied at the one place every
+    /// forward passes through, `ForwardQueues::push`.
+    ///
+    /// Why: a plain `S` is subject to the receiver's own `wrong_node`
+    /// check. The slot's own joiner has no `known_ring` until discovery
+    /// promotes it (it is set only by `adopt_membership` from a heartbeat
+    /// ack, which starts after promotion, and by `run_migration`'s flip,
+    /// which only an old owner runs), so it accepts whatever it is sent;
+    /// and afterwards it can only *gain* ownership until the next `M`
+    /// moves it into `lingering`. A lingering joiner is different: it is a
+    /// confirmed member whose `known_ring` follows its own heartbeat acks,
+    /// up to a heartbeat interval behind. The sender picks it as a target
+    /// by the current slot's ring (the latest `M`'s roster), and in the
+    /// window between a membership change and the joiner's next ack —
+    /// seen as a kill, its eviction, and a restart whose `M` lands within
+    /// a second — the joiner's ring still names the evicted node above it
+    /// for some keys, so it answers `W` and the forward is dropped after
+    /// its retries (all within the same second, so none can outlast the
+    /// lag). Like the decommission's leave-forward (issue #124), a `U`
+    /// skips that check: the sender's ring is the one that decided the
+    /// joiner owns the key, and the `U` handler stores it as is.
+    ///
+    /// Why that cannot plant a copy the joiner does not own: the slot's
+    /// ring is from the latest `M`, which every join delivers to every
+    /// ready node before it starts; anything the joiner can have learned
+    /// *sooner* than the sender arrives over heartbeat acks and is a
+    /// removal (an eviction or a leave), and a removal never takes a key
+    /// away from a surviving owner. The only way the joiner stops owning
+    /// a key the sender's ring says it owns is a later join — and that
+    /// join's `M` reaches the sender too, replacing the slot's ring.
+    as_handoff: bool,
 }
 
 /// Bounded by `FORWARD_TIMEOUT` as a single whole — see that constant's
@@ -6956,6 +7000,25 @@ impl OwnedForwardedWrite {
         }
     }
 
+    /// The same write as the frame a target with
+    /// `ForwardTarget::as_handoff` set must receive: a plain `Set` becomes
+    /// an unconditional `U` (a concurrent client write wins, exactly like
+    /// the decommission's leave-forward), a `Delete` a `u`. A put-if-absent
+    /// relay, a handoff frame already, and a clear (not subject to the
+    /// wrong-node check) are unchanged.
+    fn into_handoff_frame(self) -> Self {
+        match self {
+            OwnedForwardedWrite::Set { key, value, ttl } => OwnedForwardedWrite::HandoffSet {
+                key,
+                value,
+                ttl,
+                if_absent: false,
+            },
+            OwnedForwardedWrite::Delete { key } => OwnedForwardedWrite::HandoffDelete { key },
+            other => other,
+        }
+    }
+
     /// Names the write kind for the WARN logs `forward_with_retries`
     /// emits — mirrors the `SET`/`DELETE` wire command letters informally,
     /// not the actual `S`/`D` protocol bytes.
@@ -7001,6 +7064,7 @@ impl ForwardTarget {
             connection: Arc::clone(&self.connection),
             token: self.token.clone(),
             revoked: Arc::clone(&self.revoked),
+            as_handoff: self.as_handoff,
         }
     }
 }
@@ -7107,11 +7171,19 @@ impl ForwardQueues {
             .targets
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Decided by the target this push resolved, not the one the queue
+        // was created with: the same connection serves a joiner first as
+        // the slot's own and later as a lingering one.
+        let as_handoff = target.as_handoff;
         let queue = targets
             .entry(id)
             .or_insert_with(|| TargetQueue::new(node_context.clone(), target));
         for write in writes {
-            queue.push(write);
+            queue.push(if as_handoff {
+                write.into_handoff_frame()
+            } else {
+                write
+            });
         }
         if std::mem::replace(&mut queue.draining, true) {
             None
@@ -7517,6 +7589,7 @@ fn migration_targets_for_hashed(
             connection: Arc::clone(&active.forward_connection),
             token: active.joining_token.clone(),
             revoked: Arc::clone(&active.forward_revoked),
+            as_handoff: false,
         });
     }
     for lingering in &active.lingering {
@@ -7590,6 +7663,7 @@ fn leave_target_for_hashed(node_context: &NodeContext, key_hash: KeyHash) -> Opt
         connection,
         token,
         revoked: Arc::new(AtomicBool::new(false)),
+        as_handoff: false,
     })
 }
 
@@ -8035,6 +8109,7 @@ mod tests {
             connection: Arc::new(AsyncMutex::new(None)),
             token: "tok-target".to_string(),
             revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
         };
 
         let forward_task = tokio::spawn(async move {
@@ -8126,6 +8201,7 @@ mod tests {
             connection: Arc::new(AsyncMutex::new(None)),
             token: "tok-target".to_string(),
             revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
         };
 
         set_on_joining_node(&node_context, &target, &key(b"name"), b"Alice", None)
@@ -8202,6 +8278,7 @@ mod tests {
             connection: Arc::new(AsyncMutex::new(None)),
             token: "tok-target".to_string(),
             revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
         });
 
         let first_forward = tokio::spawn({
@@ -8279,6 +8356,7 @@ mod tests {
             connection: Arc::new(AsyncMutex::new(None)),
             token: "tok-target".to_string(),
             revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
         };
 
         // If this never retried, the joining task would hang forever
@@ -8349,6 +8427,7 @@ mod tests {
             connection: Arc::clone(&connection),
             token: "tok-target".to_string(),
             revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
         };
         let write = || OwnedForwardedWrite::Set {
             key: key(b"name"),
@@ -8378,6 +8457,7 @@ mod tests {
             connection: Arc::clone(&connection),
             token: "tok-target-restarted".to_string(),
             revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
         };
         forward_with_retries(node_context.clone(), restarted_target, write()).await;
         assert_eq!(
@@ -8443,6 +8523,7 @@ mod tests {
             connection: Arc::clone(&connection),
             token: "tok-target".to_string(),
             revoked: Arc::clone(&revoked),
+            as_handoff: false,
         };
         let write = || OwnedForwardedWrite::Set {
             key: key(b"name"),
@@ -8570,6 +8651,7 @@ mod tests {
                 connection: Arc::clone(&connection),
                 token: "tok-target".to_string(),
                 revoked: Arc::new(AtomicBool::new(false)),
+                as_handoff: false,
             },
             OwnedForwardedWrite::Set {
                 key: key(b"name"),
@@ -8589,6 +8671,7 @@ mod tests {
                 connection: Arc::clone(&connection),
                 token: "tok-target".to_string(),
                 revoked: Arc::new(AtomicBool::new(false)),
+                as_handoff: false,
             },
             OwnedForwardedWrite::Set {
                 key: key(b"name"),
@@ -8720,6 +8803,7 @@ mod tests {
                         connection: Arc::new(AsyncMutex::new(None)),
                         token: "tok-target".to_string(),
                         revoked: Arc::new(AtomicBool::new(false)),
+                        as_handoff: false,
                     },
                     OwnedForwardedWrite::Set {
                         key: key(name),
@@ -11235,6 +11319,7 @@ mod tests {
             connection: Arc::new(AsyncMutex::new(None)),
             token: "tok-joiner-0".to_string(),
             revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
         }
     }
 
@@ -11297,6 +11382,90 @@ mod tests {
         // One entry per key, each the last write to it, in the order the
         // keys first appeared.
         assert_eq!(drain_all(&mut queue), ["set a 3", "del b"]);
+    }
+
+    #[test]
+    fn forwards_to_a_lingering_joiner_are_queued_into_handoff_frames() {
+        // A lingering joiner's target (`ForwardTarget::as_handoff`) answers
+        // a plain `S` with `W` while its own ring lags the slot's, so its
+        // forwards go out as `U`/`u`; a put-if-absent relay and a clear are
+        // what they were. The slot's own joiner still gets plain frames.
+        let node_context = test_node_context(
+            "ready-node",
+            "tk-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let queues = ForwardQueues::default();
+
+        let lingering = ForwardTarget {
+            as_handoff: true,
+            ..test_forward_target("127.0.0.1:9")
+        };
+        let id = queues
+            .push(
+                &node_context,
+                lingering,
+                [
+                    forward_set("a", "1"),
+                    forward_delete("b"),
+                    forward_put_if_absent("c", "1"),
+                    OwnedForwardedWrite::Clear(ClearScope::All),
+                    forward_set("a", "2"),
+                ],
+            )
+            .expect("first push starts a drainer");
+        let sent = drain_all(queues.targets.lock().unwrap().get_mut(&id).unwrap());
+        assert_eq!(
+            sent,
+            [
+                "pia(overwrite) a 1",
+                "hdel b",
+                "pia c 1",
+                "clear",
+                "pia(overwrite) a 2"
+            ]
+        );
+
+        let own_joiner = test_forward_target("127.0.0.1:11");
+        let id = queues
+            .push(
+                &node_context,
+                own_joiner,
+                [forward_set("a", "1"), forward_delete("b")],
+            )
+            .expect("first push starts a drainer");
+        let sent = drain_all(queues.targets.lock().unwrap().get_mut(&id).unwrap());
+        assert_eq!(sent, ["set a 1", "del b"]);
+    }
+
+    #[test]
+    fn a_lingering_joiner_target_sends_handoff_frames_once_it_stops_being_the_slots_own() {
+        // The same connection serves a joiner first as the slot's own and
+        // later as a lingering one; the frame is decided per push, by the
+        // target that resolved it, not by the queue's first target.
+        let node_context = test_node_context(
+            "ready-node",
+            "tk-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let queues = ForwardQueues::default();
+        let own = test_forward_target("127.0.0.1:9");
+        let lingering = ForwardTarget {
+            as_handoff: true,
+            ..own.duplicate()
+        };
+        let id = queues
+            .push(&node_context, own, [forward_set("a", "1")])
+            .expect("first push starts a drainer");
+        assert!(
+            queues
+                .push(&node_context, lingering, [forward_set("b", "1")])
+                .is_none()
+        );
+        let sent = drain_all(queues.targets.lock().unwrap().get_mut(&id).unwrap());
+        assert_eq!(sent, ["set a 1", "pia(overwrite) b 1"]);
     }
 
     #[test]
@@ -14594,24 +14763,30 @@ mod tests {
             .into_iter()
             .find(|candidate| !ring_two.is_owner_hashed(KeyHash::of(candidate), "joiner-1", 2))
             .expect("a key owned by joiner-0 alone");
-        let addrs: Vec<String> = migration_targets_for(&node_context, &only_old)
+        // As `U`/`u` frames: the lingering joiner is a confirmed member
+        // whose own ring may lag the slot's (`ForwardTarget::as_handoff`).
+        let targets: Vec<(String, bool)> = migration_targets_for(&node_context, &only_old)
             .into_iter()
-            .map(|target| target.addr)
+            .map(|target| (target.addr, target.as_handoff))
             .collect();
-        assert_eq!(addrs, vec!["127.0.0.1:9".to_string()]);
+        assert_eq!(targets, vec![("127.0.0.1:9".to_string(), true)]);
 
-        // A key both own goes to both, the slot's own joiner first.
+        // A key both own goes to both, the slot's own joiner first — and
+        // as plain frames, it has no ring of its own yet.
         let both = keys_owned_by(&ring_two, "joiner-0")
             .into_iter()
             .find(|candidate| ring_two.is_owner_hashed(KeyHash::of(candidate), "joiner-1", 2))
             .expect("a key owned by both joiners");
-        let addrs: Vec<String> = migration_targets_for(&node_context, &both)
+        let targets: Vec<(String, bool)> = migration_targets_for(&node_context, &both)
             .into_iter()
-            .map(|target| target.addr)
+            .map(|target| (target.addr, target.as_handoff))
             .collect();
         assert_eq!(
-            addrs,
-            vec!["127.0.0.1:11".to_string(), "127.0.0.1:9".to_string()]
+            targets,
+            vec![
+                ("127.0.0.1:11".to_string(), false),
+                ("127.0.0.1:9".to_string(), true)
+            ]
         );
 
         // The earlier joiner's forwards are not revoked by the takeover.

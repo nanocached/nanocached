@@ -34,6 +34,22 @@ framework adapters at one version, whether or not a component changed.
   behind on 0–47 (median 6.5); the end-to-end count of stale reads in that
   run did not change measurably because other causes dominate it (#563,
   #565). Issue #564.
+- `nanocached-node`: a write forwarded to an earlier joiner that is still
+  inside its forwarding window (the `lingering` list above) is now sent as
+  an unconditional handoff frame (`U`/`u`, the frames a decommission's
+  leave-forward already uses) instead of a plain `S`/`D`. That joiner is a
+  confirmed member with a ring view of its own, which follows its heartbeat
+  acks and can lag the ring the sender forwards by. Seen in the same chaos
+  run after a kill, its eviction and a restart whose `M` landed one second
+  later, before the survivors had adopted the eviction: the sender picked
+  the earlier joiner as a target by the new ring, the joiner still ranked
+  the evicted node above itself for those keys and answered `W`, and the
+  three retries all fell inside the same second, so 408 writes were dropped
+  as "permanently failed to forward" (five runs of a shorter reproduction:
+  123–256 per run, none after the change). The slot's own joiner is not
+  affected: it has no ring of its own until discovery promotes it and only
+  gains ownership until the next `M` moves it into `lingering`. The WARN
+  for a refused forward now says what the peer answered.
 - `nanocached-node`: with an auth secret configured, a connection that has
   not authenticated yet is now held to what an unauthenticated peer can
   legitimately do. The node used to parse and buffer a whole request (up to
