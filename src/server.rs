@@ -2955,14 +2955,72 @@ fn heartbeat_message(
 /// `read_pending_joiner_verdict`). `None` for a running transfer (the
 /// joiner is Waiting; an abandon arrives as `X`), for a confirmed slot and
 /// for lingering entries (confirmed by construction).
-fn unconfirmed_completed_joiner(node_context: &NodeContext) -> Option<String> {
+///
+/// Returned with the slot's identity (its `forward_revoked` flag, unique
+/// per `M`), so the answer is applied to this slot and no other: an `X`
+/// can abandon it and a same-name retry's `M` install a new one while
+/// the heartbeat is in flight, and the old `G` must not touch that one.
+fn unconfirmed_completed_joiner(node_context: &NodeContext) -> Option<(String, Arc<AtomicBool>)> {
     node_context
         .active_migration
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
         .filter(|active| active.completed_at.is_some() && !active.confirmed)
-        .map(|active| active.joining_name.clone())
+        .map(|active| {
+            (
+                active.joining_name.clone(),
+                Arc::clone(&active.forward_revoked),
+            )
+        })
+}
+
+/// `abandon_migration` for a `G` verdict (issue #571): takes the slot only
+/// if it is still the very instance the heartbeat asked about
+/// (`identity`, see `unconfirmed_completed_joiner`) and still a completed
+/// handoff — never a transfer that a same-name retry started meanwhile.
+/// Returns its dead copies to restore and the post-join ring it was
+/// built on, for the re-replication the caller schedules.
+fn abandon_departed_slot(
+    node_context: &NodeContext,
+    identity: &Arc<AtomicBool>,
+) -> Option<(Vec<Key>, Arc<HashRing>)> {
+    let taken = {
+        let mut slot = node_context
+            .active_migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_ref() {
+            Some(active)
+                if Arc::ptr_eq(&active.forward_revoked, identity)
+                    && active.completed_at.is_some() =>
+            {
+                active.abort_requested.store(true, Ordering::SeqCst);
+                active.forward_revoked.store(true, Ordering::SeqCst);
+                slot.take()
+            }
+            _ => return None,
+        }
+    };
+    let taken = taken.expect("the matched arm above always took a `Some` slot");
+    revert_known_ring_after_abandon(node_context, &taken);
+    Some((taken.marked_keys, taken.after_ring))
+}
+
+/// Issue #93: a handoff's flip of `known_ring` to its post-join ring is
+/// undone when the handoff is abandoned — but only if `known_ring` still
+/// holds *this* handoff's ring (a later membership update wins).
+fn revert_known_ring_after_abandon(node_context: &NodeContext, taken: &ActiveMigration) {
+    let mut guard = node_context
+        .known_ring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(&current.ring, &taken.after_ring))
+    {
+        *guard = taken.pre_completion_ring.clone();
+    }
 }
 
 enum PendingJoinerVerdict {
@@ -2995,33 +3053,33 @@ async fn read_pending_joiner_verdict<S: AsyncBufReadExt + Unpin>(
 }
 
 /// Issue #571: discovery answered `G` for `joining_name` — the same
-/// abandon this node runs for an `X` (`abandon_migration`): the slot's
-/// forwards are revoked, its dead copies restored (this node owns those
-/// keys again; a leaver's drain handoff already re-sent them, an abandon
-/// never moved them) and `known_ring` reverted if it still holds the
-/// abandoned post-join ring.
+/// abandon this node runs for an `X` (`abandon_departed_slot`): the
+/// slot's forwards are revoked, its dead copies restored (this node owns
+/// those keys again; a leaver's drain handoff already re-sent them, an
+/// abandon never moved them) and `known_ring` reverted if it still holds
+/// the abandoned post-join ring. Returns that post-join ring so the caller
+/// can schedule the re-replication the roster path will not: with
+/// `known_ring` reverted, the next roster shows no dropped member, yet a
+/// key written while the joiner was an owner now has one copy fewer if it
+/// was evicted rather than drained (a leave re-sent every key, and the
+/// put-if-absent pass is then a no-op).
 async fn abandon_departed_joiner(
     node_context: &NodeContext,
     joining_name: &str,
+    identity: &Arc<AtomicBool>,
     discovery_addr: &str,
-) {
-    match abandon_migration(node_context, joining_name) {
-        AbandonOutcome::Completed(restore) => {
-            eprintln!(
-                "WARN joiner {joining_name} left the cluster before this node saw it in a \
-                 roster from discovery at {discovery_addr}; closing its forwarding window and \
-                 restoring {} dead copies",
-                restore.len()
-            );
-            for key in &restore {
-                unmark_migrated(&node_context.request_tx, key).await;
-            }
-        }
-        AbandonOutcome::Aborting => {
-            wait_for_migration_slot_to_clear(node_context, joining_name).await;
-        }
-        AbandonOutcome::NoMatch => {}
+) -> Option<Arc<HashRing>> {
+    let (restore, after_ring) = abandon_departed_slot(node_context, identity)?;
+    eprintln!(
+        "WARN joiner {joining_name} left the cluster before this node saw it in a roster from \
+         discovery at {discovery_addr}; closing its forwarding window and restoring {} dead \
+         copies",
+        restore.len()
+    );
+    for key in &restore {
+        unmark_migrated(&node_context.request_tx, key).await;
     }
+    Some(after_ring)
 }
 
 fn auth_message(secret: &[u8]) -> Vec<u8> {
@@ -3312,7 +3370,7 @@ async fn register_with_discovery(
                                 &node_context.name,
                                 replication,
                                 &node_context.token,
-                                pending_joiner.as_deref(),
+                                pending_joiner.as_ref().map(|(name, _)| name.as_str()),
                             );
 
                             if !matches!(
@@ -3339,8 +3397,12 @@ async fn register_with_discovery(
                             };
 
                             // Issue #571: one more line whenever the
-                            // heartbeat asked, grace or not.
-                            if let Some(joiner) = pending_joiner.as_deref() {
+                            // heartbeat asked, grace or not. A `G` abandons
+                            // the slot now; the re-replication it calls for
+                            // is scheduled below, once this ack's roster
+                            // has been adopted.
+                            let mut departed_ring: Option<Arc<HashRing>> = None;
+                            if let Some((joiner, identity)) = pending_joiner.as_ref() {
                                 let verdict = tokio::select! {
                                     _ = shutdown_rx.changed() => return,
                                     result = timeout(OUTBOUND_IO_TIMEOUT, read_pending_joiner_verdict(&mut stream)) => result,
@@ -3348,9 +3410,10 @@ async fn register_with_discovery(
                                 match verdict {
                                     Ok(Ok(PendingJoinerVerdict::Known)) => {}
                                     Ok(Ok(PendingJoinerVerdict::Gone)) => {
-                                        abandon_departed_joiner(
+                                        departed_ring = abandon_departed_joiner(
                                             &node_context,
                                             joiner,
+                                            identity,
                                             &discovery_addr,
                                         )
                                         .await;
@@ -3411,6 +3474,43 @@ async fn register_with_discovery(
                                              under-replicated"
                                         );
                                     }
+                                }
+                            }
+
+                            // Issue #571: the departed joiner's keys are
+                            // re-ranked from its post-join ring to the
+                            // membership this node holds now (this ack's
+                            // roster, or the pre-join ring the abandon
+                            // reverted to) — the drop the roster path
+                            // above could not see.
+                            if let Some(before_ring) = departed_ring {
+                                let after = node_context
+                                    .known_ring
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .clone();
+                                match after {
+                                    Some(after) => {
+                                        let task: RereplicationTask =
+                                            Box::pin(spawn_or_supersede_rereplication(
+                                                node_context.clone(),
+                                                discovery_addr.clone(),
+                                                before_ring,
+                                                after,
+                                                shutdown_rx.clone(),
+                                            ));
+                                        if node_context.rereplication_tx.send(task).await.is_err() {
+                                            eprintln!(
+                                                "WARN re-replication: could not queue the task \
+                                                 for a departed joiner (shutting down)"
+                                            );
+                                        }
+                                    }
+                                    None => eprintln!(
+                                        "WARN re-replication for a departed joiner skipped: no \
+                                         membership view yet; the next ring change picks up \
+                                         any key it left under-replicated"
+                                    ),
                                 }
                             }
 
@@ -6499,20 +6599,7 @@ fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> AbandonO
         }
     };
     let taken = taken.expect("the matched arm above always took a `Some` slot");
-
-    {
-        let mut guard = node_context
-            .known_ring
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(&current.ring, &taken.after_ring))
-        {
-            *guard = taken.pre_completion_ring;
-        }
-    }
-
+    revert_known_ring_after_abandon(node_context, &taken);
     AbandonOutcome::Completed(taken.marked_keys)
 }
 
@@ -18866,6 +18953,9 @@ mod tests {
         )
         .await;
         send_command(&request_tx, Command::MarkMigrated { key: key(b"key-3") }).await;
+        // Held by the test, not drained: the re-replication the `G`
+        // schedules is asserted queued, never run.
+        let (rereplication_tx, mut rereplication_rx) = mpsc::channel::<RereplicationTask>(4);
 
         let before_ring = Arc::new(HashRing::new(vec![
             "ready-node".to_string(),
@@ -18913,7 +19003,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
-            rereplication_tx: mpsc::channel(1).0,
+            rereplication_tx,
             shutdown_rx: watch::channel(false).1,
         };
         let revoked = Arc::clone(
@@ -18970,6 +19060,14 @@ mod tests {
             node_context.known_ring.lock().unwrap().as_ref().unwrap(),
             &pre_completion_ring
         ));
+        // The departed joiner's keys are re-replicated from its post-join
+        // ring (the drop the roster path cannot see once `known_ring` is
+        // reverted).
+        assert!(
+            rereplication_rx.try_recv().is_ok(),
+            "a G must queue a re-replication for the departed joiner's keys"
+        );
+        assert!(rereplication_rx.try_recv().is_err(), "exactly one");
         // The mark is gone and the copy is still there.
         assert_eq!(
             send_command(&request_tx, Command::Sweep { marked: true }).await,
@@ -18982,6 +19080,59 @@ mod tests {
         drop(request_tx);
         drop(node_context);
         cache_task.await.unwrap();
+    }
+
+    #[test]
+    fn a_gone_verdict_only_abandons_the_very_slot_the_heartbeat_asked_about() {
+        // Issue #571: an `X` can abandon the slot and a same-name retry's
+        // `M` install a new one while the heartbeat is in flight; the old
+        // `G` must leave that one alone — and never abort a transfer.
+        let (node_context, after_ring, pre_completion_ring) =
+            completed_unconfirmed_context(&["key-3"]);
+        let (asked_name, asked_identity) = unconfirmed_completed_joiner(&node_context).unwrap();
+        assert_eq!(asked_name, "joiner-0");
+
+        // The retry's slot: same name, a different instance, still moving keys.
+        let superseded_identity = Arc::clone(&asked_identity);
+        {
+            let mut slot = node_context.active_migration.lock().unwrap();
+            let active = slot.as_mut().unwrap();
+            active.forward_revoked = Arc::new(AtomicBool::new(false));
+            active.completed_at = None;
+        }
+        assert!(abandon_departed_slot(&node_context, &superseded_identity).is_none());
+        let slot = node_context.active_migration.lock().unwrap();
+        let active = slot.as_ref().unwrap();
+        assert_eq!(active.joining_name, "joiner-0");
+        assert!(!active.abort_requested.load(Ordering::SeqCst));
+        assert!(!active.forward_revoked.load(Ordering::SeqCst));
+        drop(slot);
+        // Nor is a running transfer of the asked-about instance aborted.
+        let running_identity = {
+            let mut slot = node_context.active_migration.lock().unwrap();
+            Arc::clone(&slot.as_mut().unwrap().forward_revoked)
+        };
+        assert!(abandon_departed_slot(&node_context, &running_identity).is_none());
+        assert!(node_context.active_migration.lock().unwrap().is_some());
+
+        // The matching, completed instance is taken, with its ring.
+        {
+            let mut slot = node_context.active_migration.lock().unwrap();
+            slot.as_mut().unwrap().completed_at = Some(Instant::now());
+        }
+        *node_context.known_ring.lock().unwrap() = Some(Arc::new(Membership {
+            ring: Arc::clone(&after_ring),
+            replication: 2,
+        }));
+        let (restore, ring) = abandon_departed_slot(&node_context, &running_identity).unwrap();
+        assert_eq!(restore, vec![key(b"key-3")]);
+        assert!(Arc::ptr_eq(&ring, &after_ring));
+        assert!(node_context.active_migration.lock().unwrap().is_none());
+        assert!(running_identity.load(Ordering::SeqCst), "forwards revoked");
+        assert!(Arc::ptr_eq(
+            node_context.known_ring.lock().unwrap().as_ref().unwrap(),
+            &pre_completion_ring
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

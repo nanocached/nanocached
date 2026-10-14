@@ -30,7 +30,10 @@ framework adapters at one version, whether or not a component changed.
   slot; discovery answers the ack with one more line, `K` (still
   registered, or not known to be gone) or `G` (on record as having left,
   been evicted or abandoned, and not registered since), and on `G` the
-  node abandons the slot as it does for an `X`. Discovery reports a name
+  node abandons the slot as it does for an `X` — only that very slot, not
+  one a same-name retry installed meanwhile — and re-replicates the keys
+  the departed joiner owned from its post-join ring, since the reverted
+  membership view hides that drop from the usual trigger. Discovery reports a name
   gone only from that record — never from mere absence, which is what a
   restarted replica's empty registry looks like — and forgets it when the
   name registers again. **Upgrade discovery before the nodes**: an older
