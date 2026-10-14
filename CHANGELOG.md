@@ -24,8 +24,12 @@ framework adapters at one version, whether or not a component changed.
   joiner inside its grace and that joiner fell behind. All three now leave
   the still-open lingering forwards behind in a closed remnant of the slot
   (own window shut, confirmed, no marks) that clears once their windows
-  end, and the eviction check only closes a window that is actually open,
-  so the remnant is not re-evicted on every ack. Found by a review of
+  end. The remnant is never taken for the handoff it was cut from (a
+  retried `M` starts a new transfer rather than being acked as a
+  duplicate), and the eviction check still revokes a departed joiner's
+  queued forwards whatever the state of its window but only closes a
+  window that is actually open, so the remnant is not re-evicted on every
+  ack. Found by a review of
   #569–#572; not reproduced in Docker (it needs a second join to be
   abandoned, or its joiner to leave unseen or be evicted, inside the first
   joiner's grace).
