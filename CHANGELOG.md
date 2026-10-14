@@ -14,6 +14,31 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node` / `nanocached-discovery`: a sender no longer keeps
+  forwarding to a joiner that left within one heartbeat interval of its
+  promotion (#571). The heartbeat ack lists the members discovery knows, so
+  a joiner that was promoted and decommissioned between two of a sender's
+  heartbeats never appeared in a roster that sender saw; its handoff slot
+  stayed completed but unconfirmed, which the node read as "not promoted
+  yet", and it forwarded every concurrent write for those keys to the
+  departed node until the forwarding grace ran out (2,515 refused forwards
+  over 65 s in a Docker reproduction) and held the slot's dead-copy marks
+  until the next join. No data was lost: the marks were held back from the
+  sweep, the leaver's drain handoff had re-sent the keys, and the next `M`
+  restored the rest. The heartbeat (`H`) now carries a trailing
+  `<joiner-len>` field and the joiner's name while the node has such a
+  slot; discovery answers the ack with one more line, `K` (still
+  registered, or not known to be gone) or `G` (on record as having left,
+  been evicted or abandoned, and not registered since), and on `G` the
+  node abandons the slot as it does for an `X` — only that very slot, not
+  one a same-name retry installed meanwhile — and re-replicates the keys
+  the departed joiner owned from its post-join ring, since the reverted
+  membership view hides that drop from the usual trigger. Discovery reports a name
+  gone only from that record — never from mere absence, which is what a
+  restarted replica's empty registry looks like — and forgets it when the
+  name registers again. **Upgrade discovery before the nodes**: an older
+  discovery rejects the extra heartbeat field, and a node in that state
+  would be evicted for missing heartbeats.
 - `nanocached-node`: a node answers `W` to every client key request until
   discovery has promoted it. Before, a request that reached a node still in
   its join handoff was served from whatever the migration had delivered so
