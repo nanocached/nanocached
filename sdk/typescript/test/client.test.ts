@@ -1,7 +1,7 @@
 import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { createServer, type Server } from "node:net";
+import { createServer, Socket, type Server } from "node:net";
 import {
   AlreadyClosedError,
   AuthenticationError,
@@ -21,7 +21,7 @@ import {
 } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
 import { FIRE_AND_FORGET_TUNING, HEDGE_READ_TUNING, KEEPALIVE_TUNING, MAX_BATCH_KEYS } from "../src/client.js";
-import { REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
+import { Connection, REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
 import { MAX_REQUEST_BYTES, MULTI_GET_TUNING } from "../src/protocol.js";
 import { maxMultiGetDecompressedBytes, setMaxMultiGetDecompressedBytesForTest } from "../src/compression.js";
 import { startMockDiscovery, startMockNode, unreachablePort, unusedPort, type MockNode } from "./mockServers.js";
@@ -53,7 +53,7 @@ describe("NanocachedClient against a single node", () => {
         assert.equal(await client.get("greeting"), null);
         assert.equal(await client.delete("greeting"), false);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -74,7 +74,7 @@ describe("NanocachedClient against a single node", () => {
         assert.deepEqual(await client.getBytes("empty"), Buffer.alloc(0));
         assert.equal(await client.get("empty"), "");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -93,7 +93,7 @@ describe("NanocachedClient against a single node", () => {
         assert.deepEqual(await client.getBytes("garbage"), Buffer.from(invalid));
         await assert.rejects(client.get("garbage"), TypeError);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -112,7 +112,7 @@ describe("NanocachedClient against a single node", () => {
         // The rejected set must not have poisoned the shared connection.
         assert.equal(await client.get("k"), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -142,7 +142,7 @@ describe("NanocachedClient against a single node", () => {
         assert.equal(results[2], "v");
         assert.equal(node.connectionCount(), 1, "an empty-key rejection triggered a reconnect");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -159,7 +159,7 @@ describe("NanocachedClient against a single node", () => {
         assert.equal(await client.get("no-ttl-explicit"), "v");
         assert.equal(await client.get("no-ttl-default"), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -184,7 +184,7 @@ describe("NanocachedClient against a single node", () => {
         await client.set("k", "v");
         assert.equal(await client.get("k"), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -200,7 +200,7 @@ describe("NanocachedClient against a single node", () => {
         const values = await Promise.all(Array.from({ length: 20 }, (_, i) => client.get(`key-${i}`)));
         values.forEach((value, i) => assert.equal(value, `value-${i}`));
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -218,7 +218,7 @@ describe("NanocachedClient against a single node", () => {
         await client.set("k", "v");
         assert.equal(await client.get("k"), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -256,7 +256,7 @@ describe("NanocachedClient against a single node", () => {
         node.answerWrongNodeOnce();
         await assert.rejects(client.get("k"), WrongNodeError);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -267,7 +267,7 @@ describe("NanocachedClient against a single node", () => {
     const node = await startMockNode();
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
-      client.close();
+      await client.close();
       assert.equal(client.isClosed(), true);
       await assert.rejects(client.get("k"), AlreadyClosedError);
       await assert.rejects(client.set("k", "v"), AlreadyClosedError);
@@ -282,9 +282,9 @@ describe("NanocachedClient against a single node", () => {
     const warn = mock.method(console, "warn", () => {});
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
-      client.close();
-      client.close();
-      client.close();
+      await client.close();
+      await client.close();
+      await client.close();
 
       const messages = warn.mock.calls.map((call) => String(call.arguments[0]));
       const closeWarnings = messages.filter((message) =>
@@ -312,10 +312,10 @@ describe("NanocachedClient against a single node", () => {
             `expected a forgotten-close warning, got: ${JSON.stringify(messages)}`,
           );
         } finally {
-          second.close();
+          await second.close();
         }
       } finally {
-        first.close();
+        await first.close();
       }
     } finally {
       warn.mock.restore();
@@ -362,7 +362,7 @@ describe("NanocachedClient value compression (value compression)", () => {
         assert.deepEqual(node.store.get("k"), Buffer.from(value, "utf8"));
         assert.equal(await client.get("k"), value);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -388,7 +388,7 @@ describe("NanocachedClient value compression (value compression)", () => {
         assert.equal(await client.get("k"), value);
         assert.deepEqual(await client.getBytes("k"), Buffer.from(value, "utf8"));
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -431,7 +431,7 @@ describe("NanocachedClient value compression (value compression)", () => {
         assert.equal(await client.replace("k", result!.token, "replacement"), true);
         assert.equal(await client.get("k"), "replacement");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -459,7 +459,7 @@ describe("NanocachedClient value compression (value compression)", () => {
         // raw uncompressed bytes with a stray marker.
         assert.equal(await client.get("k"), value);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -491,7 +491,7 @@ describe("NanocachedClient value compression (value compression)", () => {
         await client.set("k", "v");
         assert.equal(await client.get("k"), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -512,7 +512,7 @@ describe("NanocachedClient value compression (value compression)", () => {
         assert.deepEqual(stored, Buffer.concat([Buffer.from([0x00]), Buffer.from("short", "utf8")]));
         assert.equal(await client.get("k"), "short");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -534,7 +534,7 @@ describe("NanocachedClient value compression (value compression)", () => {
         assert.deepEqual(stored, Buffer.concat([Buffer.from([0x00]), value]));
         assert.deepEqual(await client.getBytes("k"), value);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -552,7 +552,7 @@ describe("NanocachedClient value compression (value compression)", () => {
         // clients still touch without it.
         await writer.set("k", Uint8Array.from([0x01, 2, 3, 4]));
       } finally {
-        writer.close();
+        await writer.close();
       }
 
       const reader = await NanocachedClient.connect({
@@ -562,7 +562,7 @@ describe("NanocachedClient value compression (value compression)", () => {
       try {
         await assert.rejects(() => reader.getBytes("k"), /decompress|marker/);
       } finally {
-        reader.close();
+        await reader.close();
       }
     } finally {
       await node.close();
@@ -603,7 +603,7 @@ describe("NanocachedClient discovery addresses", () => {
         await client.set("k", "v");
         assert.equal(await client.get("k"), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), node.close()]);
@@ -629,7 +629,7 @@ describe("NanocachedClient discovery addresses", () => {
         await client.set("k", "v");
         assert.equal(await client.get("k"), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([warming.close(), healthy.close(), node.close()]);
@@ -666,7 +666,7 @@ describe("NanocachedClient discovery addresses", () => {
           { host: "127.0.0.1", port: deadPort },
         ],
       });
-      client.close();
+      await client.close();
 
       const messages = warn.mock.calls.map((call) => String(call.arguments[0]));
       assert.ok(
@@ -684,7 +684,7 @@ describe("NanocachedClient discovery addresses", () => {
     const warn = mock.method(console, "warn", () => {});
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
-      client.close();
+      await client.close();
       assert.equal(warn.mock.calls.length, 0, JSON.stringify(warn.mock.calls.map((c) => c.arguments)));
     } finally {
       warn.mock.restore();
@@ -720,7 +720,7 @@ describe("NanocachedClient discovery addresses", () => {
 
         assert.equal(await client.get(key), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([primary.close(), standby.close(), nodeA.close(), nodeB.close()]);
@@ -743,7 +743,7 @@ describe("NanocachedClient reconnect-on-use", () => {
         assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -763,7 +763,7 @@ describe("NanocachedClient reconnect-on-use", () => {
         for (const value of values) assert.equal(value, "v");
         assert.equal(node.connectionCount(), 2, "concurrent requests dialed more than one reconnect");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -786,7 +786,7 @@ describe("NanocachedClient reconnect-on-use", () => {
         assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1072,7 +1072,7 @@ describe("NanocachedClient reconnect-on-use", () => {
         assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1104,7 +1104,7 @@ describe("NanocachedClient reconnect-on-use", () => {
         assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1129,7 +1129,7 @@ describe("NanocachedClient reconnect-on-use", () => {
         assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1155,7 +1155,7 @@ describe("NanocachedClient reconnect-on-use", () => {
         assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1173,7 +1173,7 @@ describe("NanocachedClient reconnect-on-use", () => {
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
       const before = node.connectionCount();
-      client.close();
+      await client.close();
       await (client as any).refreshNodeList();
       assert.equal(node.connectionCount(), before, "refresh after close dialed a node");
     } finally {
@@ -1189,7 +1189,7 @@ describe("NanocachedClient reconnect-on-use", () => {
       await waitFor(() => singleConnectionClosed(client), "the client to see the FIN");
       await assert.rejects(client.get("k"), /ECONNREFUSED/);
     } finally {
-      client.close();
+      await client.close();
     }
   });
 
@@ -1255,7 +1255,7 @@ describe("NanocachedClient reconnect-on-use", () => {
         await new Promise<void>((resolve) => garbage.close(() => resolve()));
       }
     } finally {
-      client.close();
+      await client.close();
     }
   });
 
@@ -1284,7 +1284,7 @@ describe("NanocachedClient reconnect-on-use", () => {
         assert.equal(owner.connectionCount(), 2);
         assert.equal(other.connectionCount(), 1, "reconnected a member whose connection never died");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
@@ -1312,7 +1312,7 @@ describe("NanocachedClient keep-alive", () => {
         // The pings rode the original connection — no reconnects happened.
         assert.equal(node.connectionCount(), 1);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1327,7 +1327,7 @@ describe("NanocachedClient keep-alive", () => {
         addresses: [{ host: "127.0.0.1", port: node.port }],
       });
       await waitFor(() => node.getCount() >= 1, "a keep-alive ping to arrive");
-      client.close();
+      await client.close();
 
       const pingsAtClose = node.getCount();
       await delay(100);
@@ -1353,7 +1353,7 @@ describe("NanocachedClient keep-alive", () => {
         // interval, so no ping should ever have fired: no `G` at all.
         assert.equal(node.getCount(), 0);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1625,7 +1625,7 @@ describe("NanocachedClient request timeout (issue #42)", () => {
         );
         assert.ok(Date.now() - started < 2_000, "get() should fail well under 2s");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1663,7 +1663,7 @@ describe("NanocachedClient request timeout (issue #42)", () => {
           clearInterval(ticker);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1680,7 +1680,7 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
         assert.equal(await client.incr("missing"), null);
         assert.equal(await client.decr("missing"), null);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1695,7 +1695,7 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
         await client.set("greeting", "hello");
         await assert.rejects(client.incr("greeting"), NotNumericError);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1712,7 +1712,7 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
         assert.equal(await client.incr("counter", 5), 16);
         assert.equal(await client.get("counter"), "16");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1729,7 +1729,7 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
         assert.equal(await client.decr("a", 7), await client.incr("b", -7));
         assert.equal(await client.get("a"), await client.get("b"));
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1744,7 +1744,7 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
         await client.set("counter", "3");
         assert.equal(await client.incr("counter", -10), -7);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1762,7 +1762,7 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
         assert.equal(await client.incr("hits"), null); // default namespace is untouched
         assert.equal(node.namespacedStore("counters").get("hits")?.toString("ascii"), "2");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1786,7 +1786,7 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
         // report the value back to this call.
         assert.equal(node.store.get("counter")?.toString("ascii"), String(Number.MAX_SAFE_INTEGER + 1));
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1806,7 +1806,7 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
         // 2^53 (JS's ties-to-even rule on the first unsafe integer).
         assert.equal(node.store.get("counter")?.toString("ascii"), (twoToThe53 + 1n).toString());
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1827,7 +1827,7 @@ describe("NanocachedClient incr/decr checks closed before compression (issue #41
         addresses: [{ host: "127.0.0.1", port: node.port }],
         compress: true,
       });
-      client.close();
+      await client.close();
       await assert.rejects(client.incr("counter"), AlreadyClosedError);
       await assert.rejects(client.decr("counter"), AlreadyClosedError);
     } finally {
@@ -1848,7 +1848,7 @@ describe("NanocachedClient incr/decr rejects on a compress-enabled client (issue
         await assert.rejects(client.incr("counter"), CompressionIncompatibleError);
         await assert.rejects(client.decr("counter"), CompressionIncompatibleError);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1867,7 +1867,7 @@ describe("NanocachedClient incr/decr rejects on a compress-enabled client (issue
         await assert.rejects(ns.incr("counter"), CompressionIncompatibleError);
         await assert.rejects(ns.decr("counter"), CompressionIncompatibleError);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1884,7 +1884,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         assert.equal(await client.putIfAbsent("k", "v1"), true);
         assert.equal(await client.get("k"), "v1");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1900,7 +1900,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         assert.equal(await client.putIfAbsent("k", "v2"), false);
         assert.equal(await client.get("k"), "original");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1916,7 +1916,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         assert.equal(await client.replaceIfPresent("k", "updated"), true);
         assert.equal(await client.get("k"), "updated");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1931,7 +1931,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         assert.equal(await client.replaceIfPresent("missing", "v"), false);
         assert.equal(await client.get("missing"), null);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1957,7 +1957,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         assert.equal(await client.replace("k", fresh!.token, "v2"), true);
         assert.equal(await client.get("k"), "v2");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1973,7 +1973,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         assert.equal(await client.replace("missing", token, "v"), false);
         assert.equal(await client.get("missing"), null);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -1990,7 +1990,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         assert.equal(await client.deleteIfMatches("k", token), true);
         assert.equal(await client.get("k"), null);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2010,7 +2010,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         const missingToken = contentDigest(Buffer.from("anything", "utf8"));
         assert.equal(await client.deleteIfMatches("missing", missingToken), false);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2024,7 +2024,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
       try {
         assert.equal(await client.getWithToken("missing"), null);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2042,7 +2042,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         assert.deepEqual(result!.value, Buffer.from("hello world", "utf8"));
         assert.equal(result!.token, contentDigest(Buffer.from("hello world", "utf8")));
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2064,7 +2064,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         assert.equal(await ns.deleteIfMatches("k", contentDigest(Buffer.from("v2", "utf8"))), true);
         assert.equal(await ns.getBytes("k"), null);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2082,7 +2082,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         await client.replaceIfPresent("k", "v2", 60);
         assert.equal(node.lastSetTtl(), 60);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2138,7 +2138,7 @@ describe("NanocachedClient replication (client-side replication, R=2)", () => {
           }
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -2159,7 +2159,7 @@ describe("NanocachedClient replication (client-side replication, R=2)", () => {
 
       assert.equal(await client.get(key), "still here");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -2178,7 +2178,7 @@ describe("NanocachedClient replication (client-side replication, R=2)", () => {
       assert.ok(primary.mock.store.has(key));
       assert.equal(await client.get(key), "v");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -2201,7 +2201,7 @@ describe("NanocachedClient replication (client-side replication, R=2)", () => {
       assert.equal(await client.get(key), "v");
       assert.ok(replica.mock.store.has(key));
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -2220,7 +2220,7 @@ describe("NanocachedClient replication (client-side replication, R=2)", () => {
           assert.ok(!mock.store.has(key), `${key} still present on ${name}`);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -2234,7 +2234,7 @@ describe("NanocachedClient replication (client-side replication, R=2)", () => {
       try {
         assert.equal(client.replication, 1);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2295,7 +2295,7 @@ describe("NanocachedClient incr/decr cluster replication (issue #129) — primar
       assert.equal(primary.mock.store.get(key)?.toString("ascii"), "15");
       assert.equal(replica.mock.store.get(key)?.toString("ascii"), "15");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -2315,7 +2315,7 @@ describe("NanocachedClient incr/decr cluster replication (issue #129) — primar
       assert.equal(replica.mock.lastCommand(), "S");
       assert.equal(replica.mock.lastSetTtl(), 120, "the replica's set must carry the primary's remaining TTL");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -2341,7 +2341,7 @@ describe("NanocachedClient incr/decr cluster replication (issue #129) — primar
       assert.equal(replica.mock.lastSetTtl(), Number.MAX_SAFE_INTEGER, "the replica's set must carry the clamped TTL");
       assert.equal(await client.get(key), "11", "the primary's connection must not have been poisoned");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -2374,7 +2374,7 @@ describe("NanocachedClient incr/decr cluster replication (issue #129) — primar
       // a request nothing was actually written by.
       assert.equal(owners.replica.mock.store.get(nonNumericKey)?.toString("ascii"), "not-a-number");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -2394,7 +2394,7 @@ describe("NanocachedClient incr/decr cluster replication (issue #129) — primar
       assert.equal(replica.mock.lastCommand(), "S");
       assert.equal(replica.mock.store.get(key)?.toString("ascii"), "7");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -2426,7 +2426,7 @@ describe("NanocachedClient incr/decr cluster replication (issue #129) — primar
       assert.equal(primary.mock.store.get(key)?.toString("ascii"), expected);
       assert.equal(replica.mock.store.get(key)?.toString("ascii"), expected);
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -2449,7 +2449,7 @@ describe("NanocachedClient incr/decr cluster replication (issue #129) — primar
       assert.equal(client.stats().replicaWriteFailures, 1);
       assert.equal(primary.mock.store.get(key)?.toString("ascii"), "11");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -2471,7 +2471,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         assert.equal(values.has("b"), false);
         assert.equal(node.multiGetCount(), 1);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2496,7 +2496,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         await client.setMany({ k: "v" }, Number.MAX_SAFE_INTEGER);
         assert.equal(await client.get("k"), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2516,7 +2516,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         assert.equal(values.get("a"), "1");
         assert.equal(values.get("b"), "2");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2540,7 +2540,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         await client.set("c", "34");
         await assert.rejects(client.getManyBytes(["a", "c"]), DecompressionError);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       setMaxMultiGetDecompressedBytesForTest(saved);
@@ -2567,7 +2567,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         await client.set("a", "12");
         await assert.rejects(client.getManyBytes(["a"]), DecompressionError);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       setMaxMultiGetDecompressedBytesForTest(saved);
@@ -2593,7 +2593,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         assert.deepEqual(values.get("a"), Buffer.from("12"));
         assert.deepEqual(values.get("c"), Buffer.from("34"));
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       setMaxMultiGetDecompressedBytesForTest(saved);
@@ -2610,7 +2610,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         const values = await client.getManyBytes(["a"]);
         assert.deepEqual(values.get("a"), Buffer.from([1, 2, 3]));
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2627,7 +2627,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         await assert.rejects(client.setMany({}), RangeError);
         await assert.rejects(client.setManyBytes({}), RangeError);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2658,7 +2658,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
           assert.equal(got.get(key), want);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2678,7 +2678,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         // The default namespace is untouched.
         assert.equal((await client.getMany(["1", "2"])).size, 0);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2703,7 +2703,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
           assert.equal((error as PartialWrongNodeError<Map<string, string>>).partialValues.get("b"), "2");
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2732,7 +2732,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         const values = await client.getManyBytes(["a"]);
         assert.deepEqual(values.get("a"), value);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2757,7 +2757,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         const values = await client.getMany(["a"]);
         assert.equal(values.get("a"), value);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2784,7 +2784,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         assert.equal(values.get("big"), big);
         assert.equal(values.get("small"), small);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2831,7 +2831,7 @@ describe("NanocachedClient batch chunking cumulative byte bound (issue #222)", (
           assert.deepEqual(got.get(key), values[key]);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2867,7 +2867,7 @@ describe("NanocachedClient batch chunking cumulative byte bound (issue #222)", (
           assert.equal(got.get(key), values[key]);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2916,7 +2916,7 @@ describe("NanocachedClient batch chunking cumulative byte bound (issue #222)", (
           assert.deepEqual(got.get(key), values[key]);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -2981,7 +2981,7 @@ describe("NanocachedClient chunked batch partial success on connection loss (iss
         }
         assert.equal(calls, 2, "test setup: expected exactly chunk 1 (through) and chunk 2 (rejected) to run");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -3029,7 +3029,7 @@ describe("NanocachedClient chunked batch partial success on connection loss (iss
         }
         assert.equal(calls, 2, "test setup: expected exactly chunk 1 (through) and chunk 2 (rejected) to run");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -3071,7 +3071,7 @@ describe("NanocachedClient chunked batch partial success on connection loss (iss
           for (const [key, value] of partial) assert.equal(value, values[key]);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -3094,7 +3094,7 @@ describe("NanocachedClient chunked batch partial success on connection loss (iss
           return true;
         });
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -3132,7 +3132,7 @@ describe("NanocachedClient getManyBytes cumulative response size bound (issue #2
         assert.deepEqual(await client.getBytes("a"), Buffer.from([1, 2]));
         assert.equal(node.connectionCount(), 2);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -3151,7 +3151,7 @@ describe("NanocachedClient getManyBytes cumulative response size bound (issue #2
         assert.deepEqual(values.get("a"), Buffer.from([1, 2]));
         assert.deepEqual(values.get("b"), Buffer.from([3, 4]));
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -3247,7 +3247,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
         assert.ok(mock.multiGetCount() > 0, "expected every node to receive at least one m frame");
       }
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3271,7 +3271,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
         }
       }
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3290,7 +3290,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
         assert.ok(mock.store.has(keyA) && mock.store.has(keyB));
       }
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3311,7 +3311,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
       assert.equal(values.get(wrongKey), "w");
       assert.equal(values.get(okKey), "ok");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3339,7 +3339,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
         assert.equal(partial.has(wrongKey), false);
       }
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3358,7 +3358,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
       assert.ok(owner.mock.store.has(wrongKey));
       assert.ok(owner.mock.store.has(okKey));
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3377,7 +3377,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
         return true;
       });
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3415,7 +3415,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
         assert.equal(got.get(key), want);
       }
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3471,7 +3471,7 @@ describe("NanocachedClient compare-and-set cluster replication (issue #141) — 
       assert.equal(primary.mock.store.get(key)?.toString("utf8"), "v1");
       assert.equal(replica.mock.store.get(key)?.toString("utf8"), "v1");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3495,7 +3495,7 @@ describe("NanocachedClient compare-and-set cluster replication (issue #141) — 
       assert.equal(primary.mock.store.get(key)?.toString("utf8"), "v2");
       assert.equal(replica.mock.store.get(key)?.toString("utf8"), "v2");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3518,7 +3518,7 @@ describe("NanocachedClient compare-and-set cluster replication (issue #141) — 
       assert.ok(!primary.mock.store.has(key));
       assert.ok(!replica.mock.store.has(key));
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3546,7 +3546,7 @@ describe("NanocachedClient compare-and-set cluster replication (issue #141) — 
       assert.equal(owners.replica.mock.store.get(key)?.toString("utf8"), "original");
       assert.equal(owners.primary.mock.store.get(key)?.toString("utf8"), "original");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3568,7 +3568,7 @@ describe("NanocachedClient compare-and-set cluster replication (issue #141) — 
       assert.equal(client.stats().replicaWriteFailures, 1);
       assert.equal(primary.mock.store.get(key)?.toString("utf8"), "v1");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -3624,7 +3624,7 @@ describe("NanocachedClient non-idempotent retry on connection loss (issue #225)"
       assert.equal(await client.incr(key, 5), 15, "incr must redial and succeed instead of surfacing the dead connection");
       assert.equal(primary.mock.incrCount(), 1, "only the redialed attempt should ever reach the primary");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -3648,7 +3648,7 @@ describe("NanocachedClient non-idempotent retry on connection loss (issue #225)"
       assert.equal(await client.incr(key, 5), 15);
       assert.equal(replica.mock.incrCount(), 1);
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -3676,7 +3676,7 @@ describe("NanocachedClient non-idempotent retry on connection loss (issue #225)"
       // describes.
       assert.equal(await client.get(key), "15");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -3699,7 +3699,7 @@ describe("NanocachedClient non-idempotent retry on connection loss (issue #225)"
       // asserted via a subsequent read, on a fresh connection.
       assert.equal(await client.get(key), "v2");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -3762,7 +3762,7 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
         "set() should have waited for the replica",
       );
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3783,7 +3783,7 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
 
       await waitFor(() => replica.mock.store.has("k"), "the background write to land on the replica");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -3817,7 +3817,7 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
         `expected at least one call to return fast, got ${elapsed}`,
       );
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -4040,7 +4040,7 @@ describe("NanocachedClient cluster-leg chunked partial success on connection los
         assert.ok(nodeA.mock.store.has(key), `expected ${key} (chunk 1, replica-role) to actually be stored on node A`);
       }
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -4111,7 +4111,7 @@ describe("fire-and-forget replica leg errors surface when the primary also fails
         return true;
       });
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -4153,7 +4153,7 @@ describe("fire-and-forget replica leg errors surface when the primary also fails
         "the replica's ordinary connection failure must still be counted as a swallow",
       );
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -4197,7 +4197,7 @@ describe("fire-and-forget replica leg errors surface when the primary also fails
         return true;
       });
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -4244,7 +4244,7 @@ describe("NanocachedClient read repair (read repair)", () => {
       assert.equal(await client.get("k"), null);
       assert.ok(!primary.mock.store.has("k"), "primary was repaired despite readRepair being off");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -4266,7 +4266,7 @@ describe("NanocachedClient read repair (read repair)", () => {
       // already-expired data — see READ_REPAIR_TTL_SECONDS in client.ts.
       assert.equal(primary.mock.lastSetTtl(), 60);
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -4280,7 +4280,7 @@ describe("NanocachedClient read repair (read repair)", () => {
     try {
       assert.equal(await client.get("nowhere"), null);
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -4473,7 +4473,7 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
       }
       assert.equal(replica.mock.getCount(), 0);
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -4502,7 +4502,7 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
       // answered it too.
       assert.equal(await client.get("absent"), null);
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -4523,7 +4523,7 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
       assert.ok(elapsed >= 200 - TIMING_TOLERANCE_MS, `elapsed was ${elapsed}`);
       assert.equal(replica.mock.getCount(), 0);
     } finally {
-      client.close();
+      await client.close();
       await cluster.close();
     }
   });
@@ -4545,7 +4545,7 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
       assert.equal(value, "v");
       assert.ok(elapsed < 500 - TIMING_TOLERANCE_MS, `elapsed was ${elapsed}`);
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -4589,7 +4589,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
       try {
         assert.deepEqual(client.stats(), { replicaWriteFailures: 0, readRepairFailures: 0, refreshFailures: 0, transientRetries: 0 });
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -4611,7 +4611,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
       assert.ok(primary.mock.store.has(key));
       assert.equal(client.stats().replicaWriteFailures, 1);
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -4638,7 +4638,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
       assert.equal(await client.get(key), null);
       assert.equal(client.stats().readRepairFailures, 0);
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -4664,7 +4664,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
       assert.equal(await client.get(key), "from-replica");
       await waitFor(() => client.stats().readRepairFailures >= 1, "the failed repair write-back to be counted");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -4687,7 +4687,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
         await (client as any).refreshNodeList();
         assert.equal(client.stats().refreshFailures, 1);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), node.close()]);
@@ -4710,7 +4710,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
         await (client as any).refreshNodeList();
         assert.equal(client.stats().refreshFailures, 1);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), node.close()]);
@@ -4741,7 +4741,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
       assert.equal(client.stats().replicaWriteFailures, 0, "a programming error must not be counted as a swallow");
       assert.equal(await client.get(key), "v2", "the primary's successful write must still have taken effect");
     } finally {
-      client.close();
+      await client.close();
       await cluster.close().catch(() => {});
     }
   });
@@ -4792,7 +4792,7 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
         assert.equal(a + b, keys.length);
         assert.ok(a > 0 && b > 0, `keys were not spread across nodes (${a}/${b})`);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -4813,7 +4813,7 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
           assert.ok(owner?.mock.store.has(key), `${key} did not land on ${ring.route(Buffer.from(key))}`);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -4834,7 +4834,7 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
         owner.mock.answerWrongNodeOnce();
         assert.equal(await client.get(key), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -4854,7 +4854,7 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
         owner.mock.answerWrongNodeOnce();
         await assert.rejects(client.get(key), WrongNodeError);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -4887,7 +4887,7 @@ describe("NanocachedClient response tags (echoed response tags)", () => {
         assert.equal(await client.delete("key-0"), true);
         assert.equal(await client.delete("key-0"), false);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -4917,7 +4917,7 @@ describe("NanocachedClient response tags (echoed response tags)", () => {
         assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -4932,7 +4932,7 @@ describe("NanocachedClient response tags (echoed response tags)", () => {
         node.answerWrongTagOnce();
         await assert.rejects(client.get("k"), /desynced/);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -4955,7 +4955,7 @@ describe("NanocachedClient response tags (echoed response tags)", () => {
         // stuck.
         assert.equal(node.connectionCount(), 3);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -4971,7 +4971,7 @@ describe("NanocachedClient retryable-error status (issue #125)", () => {
       try {
         assert.equal(node.lastAuthHeader(), "A 1 T R");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -4993,7 +4993,7 @@ describe("NanocachedClient retryable-error status (issue #125)", () => {
         assert.equal(node.connectionCount(), 2);
         assert.equal(node.lastAuthHeader(), "A 1 T");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5019,7 +5019,7 @@ describe("NanocachedClient retryable-error status (issue #125)", () => {
         assert.equal(node.connectionCount(), 1);
         assert.equal(client.stats().transientRetries, 1);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5042,7 +5042,7 @@ describe("NanocachedClient retryable-error status (issue #125)", () => {
         assert.equal(await client.get("k"), "v");
         assert.equal(client.stats().transientRetries, 3);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5068,7 +5068,7 @@ describe("NanocachedClient retryable-error status (issue #125)", () => {
         assert.equal(node.connectionCount(), 1);
         assert.equal(client.stats().transientRetries, 1);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5091,7 +5091,7 @@ describe("NanocachedClient retryable-error status (issue #125)", () => {
         assert.equal(proxy.connectionCount(), 1);
         assert.equal(client.stats().transientRetries, 1);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), proxy.close()]);
@@ -5170,7 +5170,7 @@ describe("NanocachedClient tolerant bootstrap (issue #67)", () => {
         assert.equal(await client.get(other), "replica copy");
         assert.ok(Date.now() - start < 500, "fallback to the live replica was not fast");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -5209,7 +5209,7 @@ describe("NanocachedClient tolerant bootstrap (issue #67)", () => {
         assert.ok(revived.store.has(key));
         assert.ok((client as any).target.members.get(dead).connection !== null);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -5241,7 +5241,7 @@ describe("NanocachedClient tolerant bootstrap (issue #67)", () => {
         assert.ok(!(client as any).target.members.has(dead), "departed node still in members");
         assert.ok(!cooldowns.has(deadAddress), "cooldown for departed address was not purged");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -5284,7 +5284,7 @@ describe("NanocachedClient dedupes discovery's duplicated node names (issue #461
             assert.equal(new Set(owners).size, owners.length, `replicas=${replicas}: duplicate in ${owners}`);
           }
         } finally {
-          client.close();
+          await client.close();
         }
       } finally {
         await discovery.close();
@@ -5326,7 +5326,7 @@ describe("NanocachedClient dedupes discovery's duplicated node names (issue #461
           const members: Map<string, unknown> = (client as any).target.members;
           assert.deepEqual(new Set(members.keys()), new Set(names));
         } finally {
-          client.close();
+          await client.close();
         }
       } finally {
         await discovery.close();
@@ -5353,7 +5353,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
         assert.equal(await users.get("alice"), null);
         assert.equal(await users.delete("alice"), false);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5382,7 +5382,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
         assert.equal(node.namespacedStore("users").get("k")?.toString("utf8"), "users value");
         assert.equal(node.namespacedStore("orders").get("k")?.toString("utf8"), "orders value");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5407,7 +5407,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
         assert.equal(await root.delete("k"), true);
         assert.equal(node.lastCommand(), "D", "the empty namespace must send the legacy D frame, not d");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5430,7 +5430,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
         await users.delete("k");
         assert.equal(node.lastCommand(), "d");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5449,7 +5449,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
         assert.equal(await byBytes.get("k"), "v", "a string namespace and its UTF-8 encoding must address the same namespace");
         assert.deepEqual(byBytes.namespace, Buffer.from("日本", "utf8"));
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5461,7 +5461,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       const users = client.namespace("users");
-      client.close();
+      await client.close();
 
       await assert.rejects(users.get("k"), AlreadyClosedError);
       await assert.rejects(users.getBytes("k"), AlreadyClosedError);
@@ -5498,7 +5498,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
         assert.ok(owner.mock.namespacedStore("users").has(key), `${key} did not land on ${namespacedOwner} in namespace "users"`);
         assert.ok(!other.mock.namespacedStore("users").has(key), `${key} unexpectedly landed on the non-owner ${other.name}`);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
@@ -5526,7 +5526,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
         owner.mock.answerWrongNodeOnce();
         assert.equal(await users.get(key), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
@@ -5552,7 +5552,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
         assert.equal(await client.get("k"), "default value", "the default namespace must survive");
         assert.equal(await orders.get("k"), "orders value", "the other namespace must survive");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5568,7 +5568,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
         await client.namespace("").clear();
         assert.equal(await client.get("k"), null);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5589,7 +5589,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
         assert.equal(await client.get("k"), null);
         assert.equal(await users.get("k"), null);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5601,7 +5601,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       const users = client.namespace("users");
-      client.close();
+      await client.close();
 
       await assert.rejects(users.clear(), AlreadyClosedError);
       await assert.rejects(client.clearAll(), AlreadyClosedError);
@@ -5620,7 +5620,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
         assert.equal(node.clearCount(), 1);
         assert.equal(await client.get("k"), null);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await node.close();
@@ -5654,7 +5654,7 @@ describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
           assert.equal(mock.clearCount(), 1, `${name} did not receive the clear`);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -5671,7 +5671,7 @@ describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
           assert.equal(mock.clearCount(), 1, `${name} did not receive the flush`);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -5697,7 +5697,7 @@ describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
           assert.equal(mock.clearCount(), 2, `${name} did not see both the first pass and the retry`);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -5721,7 +5721,7 @@ describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
           return true;
         });
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -5749,7 +5749,7 @@ describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
           assert.equal(mock.namespacedStore("users").has("k"), false);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await cluster.close();
@@ -5792,7 +5792,7 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
         assert.equal(node.connectionCount(), 0);
         assert.equal(proxy.connectionCount(), 1);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), proxy.close(), node.close()]);
@@ -5842,7 +5842,7 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
         await client.set("k", "v");
         assert.equal(await client.get("k"), "v");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), live.close()]);
@@ -5866,7 +5866,7 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
         assert.equal(proxyAddressOf(client), proxy.address);
         assert.equal(await client.get("missing"), null);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([warming.close(), healthy.close(), proxy.close()]);
@@ -5949,7 +5949,7 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
         assert.equal(proxyAddressOf(client), survivorAddress);
         assert.ok(survivor.connectionCount() > 0);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), proxyA.close().catch(() => {}), proxyB.close().catch(() => {})]);
@@ -5995,7 +5995,7 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
         const cooldowns: Map<string, unknown> = (client as any).reconnectCooldowns;
         assert.ok(!cooldowns.has(landedAddress), "cooldown for the departed proxy was not pruned");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), proxyA.close().catch(() => {}), proxyB.close().catch(() => {})]);
@@ -6042,7 +6042,7 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
         assert.equal(values.has("missing"), false);
         assert.equal(proxy.multiGetCount(), 1);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), proxy.close()]);
@@ -6094,7 +6094,7 @@ describe("NanocachedClient refreshNodeList dials new nodes concurrently (issue #
           assert.ok(members.get(`new-${i}`)?.connection !== null, `new-${i} was not installed with a live connection`);
         }
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), bootNode.close(), ...newNodes.map((node) => node.close())]);
@@ -6136,10 +6136,84 @@ describe("NanocachedClient refreshNodeList dials new nodes concurrently (issue #
         const cooldowns = (client as any).reconnectCooldowns as Map<string, unknown>;
         assert.ok(cooldowns.has(`127.0.0.1:${deadPort}`), "its reconnect cooldown must be armed");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), bootNode.close(), nodeA.close(), nodeB.close()]);
+    }
+  });
+});
+
+describe("a Connection built over a socket that already closed (issue #574)", () => {
+  // The window the peer-RST tests above exercise: a round builds its
+  // Connections only once the slowest dial is done, so a socket reset in
+  // between has emitted "close" before the Connection listens for it.
+  async function closedSocket(): Promise<{ socket: Socket; close: () => Promise<void> }> {
+    const server: Server = createServer((peer) => {
+      peer.on("error", () => {});
+      peer.resetAndDestroy();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("bad address");
+    const socket = new Socket();
+    socket.on("error", () => {});
+    await new Promise<void>((resolve) => {
+      socket.once("close", () => resolve());
+      socket.connect(address.port, "127.0.0.1");
+    });
+    assert.equal(socket.closed, true);
+    return { socket, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+  }
+
+  it("is closed at once and whenClosed() resolves instead of waiting for a close that never comes", async () => {
+    const { socket, close } = await closedSocket();
+    try {
+      const connection = new Connection(socket);
+      assert.equal(connection.isClosed(), true);
+      await Promise.race([
+        connection.whenClosed(),
+        delay(5000).then(() => {
+          throw new Error("whenClosed() did not resolve");
+        }),
+      ]);
+      await assert.rejects(connection.get("k"));
+    } finally {
+      await close();
+    }
+  });
+
+  it("close() returns when a member was reset between identify and the end of the dial round", async () => {
+    // Same shape as the peer-RST tests below, awaited: this used to hang.
+    const resetting = createServer((peer) => {
+      peer.on("error", () => {});
+      peer.once("data", () => {
+        peer.write("OnT\n");
+        setTimeout(() => peer.resetAndDestroy(), 30);
+      });
+    });
+    await new Promise<void>((resolve) => resetting.listen(0, "127.0.0.1", resolve));
+    const resettingAddress = resetting.address();
+    if (resettingAddress === null || typeof resettingAddress === "string") throw new Error("bad address");
+    const slow = await startMockNode({ authDelayMs: 400 });
+    const discovery = await startMockDiscovery([
+      { name: "a-resetting", address: `127.0.0.1:${resettingAddress.port}` },
+      { name: "b-slow", address: slow.address },
+    ]);
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      await Promise.race([
+        client.close(),
+        delay(5000).then(() => {
+          throw new Error("close() did not resolve");
+        }),
+      ]);
+    } finally {
+      await Promise.all([
+        discovery.close(),
+        new Promise<void>((resolve) => resetting.close(() => resolve())),
+        slow.close(),
+      ]);
     }
   });
 });
@@ -6196,7 +6270,7 @@ describe("identified sockets waiting on sibling dials survive a peer RST (orphan
     try {
       const uncaught = await collectingUncaught(async () => {
         const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
-        client.close();
+        await client.close();
       });
       assert.deepEqual(uncaught.map((error) => error.message), []);
     } finally {
@@ -6222,7 +6296,7 @@ describe("identified sockets waiting on sibling dials survive a peer RST (orphan
         });
         assert.deepEqual(uncaught.map((error) => error.message), []);
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), bootNode.close(), resetting.close(), slow.close()]);
@@ -6245,7 +6319,7 @@ describe("a malformed roster address is one unreachable node, not a failed round
           assert.notEqual(members.get("a-good")?.connection, null);
           assert.equal(members.get("b-bad")?.connection, null);
         } finally {
-          client.close();
+          await client.close();
         }
       } finally {
         await Promise.all([discovery.close(), good.close()]);
@@ -6271,7 +6345,7 @@ describe("a malformed roster address is one unreachable node, not a failed round
           assert.equal(members.get("b-bad")?.connection, null);
           assert.equal(client.stats().refreshFailures, 1);
         } finally {
-          client.close();
+          await client.close();
         }
       } finally {
         await Promise.all([discovery.close(), bootNode.close(), good.close()]);
@@ -6340,7 +6414,7 @@ describe("a big roster is dialed with bounded concurrency", () => {
         assert.ok(counting.maxInFlight() <= 64, `${counting.maxInFlight()} dials were in flight at once`);
         assert.ok(counting.maxInFlight() > 1, "the bound must still leave the dials concurrent");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), counting.close()]);
@@ -6364,7 +6438,7 @@ describe("a big roster is dialed with bounded concurrency", () => {
         assert.ok(counting.maxInFlight() <= 64, `${counting.maxInFlight()} dials were in flight at once`);
         assert.ok(counting.maxInFlight() > 1, "the bound must still leave the dials concurrent");
       } finally {
-        client.close();
+        await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), bootNode.close(), counting.close()]);
