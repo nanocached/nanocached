@@ -2912,18 +2912,19 @@ fn registration_message(letter: char, name: &str, port: u16, token: &str) -> Vec
     message
 }
 
-/// Only valid once this node has been promoted to `Joined` (staged node join); the
-/// address was already established by `join_message` on this connection,
-/// so a heartbeat only needs to carry `name` to refresh liveness.
-/// `replication` is this node's current belief about the cluster's
-/// replication factor (issue #30), encoded as `0` when it doesn't have
-/// one yet — never a real replication factor (discovery validates every
-/// `--replication-factor` is at least 1), so it's an unambiguous "unknown"
-/// sentinel on the wire.
 /// `H <name-len> <replication> <token-len> [<joiner-len>]\n<name><token>[<joiner>]`.
-/// The trailing field (issue #571) names the joiner of a handoff this node
-/// completed but has not seen in a roster yet, and asks discovery to
-/// follow the ack with a verdict line — see `read_pending_joiner_verdict`.
+///
+/// Only valid once this node has been promoted to `Joined` (staged node
+/// join); the address was already established by `join_message` on this
+/// connection, so a heartbeat only needs to carry `name` to refresh
+/// liveness. `replication` is this node's current belief about the
+/// cluster's replication factor (issue #30), encoded as `0` when it doesn't
+/// have one yet — never a real replication factor (discovery validates
+/// every `--replication-factor` is at least 1), so it's an unambiguous
+/// "unknown" sentinel on the wire. The trailing field (issue #571) names
+/// the joiner of a handoff this node completed but has not seen in a
+/// roster yet, and asks discovery to follow the ack with a verdict line —
+/// see `read_pending_joiner_verdict`.
 fn heartbeat_message(
     name: &str,
     replication: Option<usize>,
@@ -2985,26 +2986,109 @@ fn abandon_departed_slot(
     node_context: &NodeContext,
     identity: &Arc<AtomicBool>,
 ) -> Option<(Vec<Key>, Arc<HashRing>)> {
-    let taken = {
-        let mut slot = node_context
-            .active_migration
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match slot.as_ref() {
-            Some(active)
-                if Arc::ptr_eq(&active.forward_revoked, identity)
-                    && active.completed_at.is_some() =>
-            {
-                active.abort_requested.store(true, Ordering::SeqCst);
-                active.forward_revoked.store(true, Ordering::SeqCst);
-                slot.take()
-            }
-            _ => return None,
+    match take_abandoned_slot(node_context, |active| {
+        Arc::ptr_eq(&active.forward_revoked, identity) && active.completed_at.is_some()
+    }) {
+        TakenSlot::Completed(taken) => {
+            revert_known_ring_after_abandon(node_context, &taken);
+            Some((taken.marked_keys, taken.after_ring))
         }
-    };
-    let taken = taken.expect("the matched arm above always took a `Some` slot");
-    revert_known_ring_after_abandon(node_context, &taken);
-    Some((taken.marked_keys, taken.after_ring))
+        // The predicate requires a completed handoff, so `Aborting` cannot
+        // occur; treated like no match either way.
+        TakenSlot::Aborting | TakenSlot::NoMatch => None,
+    }
+}
+
+enum TakenSlot {
+    NoMatch,
+    /// Still transferring: `run_migration` will notice the abort and roll
+    /// back its own marks; it hasn't flipped `known_ring` yet, so there is
+    /// nothing to revert — but the slot is also not free yet, so an `X`'s
+    /// caller must wait rather than ack immediately.
+    Aborting,
+    /// The completed handoff, taken out (`take_slot_keeping_lingering`).
+    Completed(Box<ActiveMigration>),
+}
+
+/// The one abandon core behind `abandon_migration` (an `X`) and
+/// `abandon_departed_slot` (a `G`, issue #571): the slot that satisfies
+/// `matches` is told to stop and its forwards are revoked; a completed
+/// handoff is taken out, a running transfer is left to unwind.
+fn take_abandoned_slot(
+    node_context: &NodeContext,
+    matches: impl Fn(&ActiveMigration) -> bool,
+) -> TakenSlot {
+    let mut slot = node_context
+        .active_migration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match slot.as_ref() {
+        Some(active) if matches(active) => {
+            active.abort_requested.store(true, Ordering::SeqCst);
+            active.forward_revoked.store(true, Ordering::SeqCst);
+            if active.completed_at.is_none() {
+                return TakenSlot::Aborting;
+            }
+        }
+        _ => return TakenSlot::NoMatch,
+    }
+    TakenSlot::Completed(Box::new(
+        take_slot_keeping_lingering(&mut slot)
+            .expect("the matched arm above saw a `Some` completed slot"),
+    ))
+}
+
+/// Takes the slot's own handoff out — for an abandon, an eviction or an
+/// aborted transfer — without taking the earlier joiners' forwarding
+/// windows with it (issue #564): a lingering joiner is a confirmed member
+/// still owed its grace, and a client whose node list has not caught up
+/// keeps writing to the old owners for it. The still-open `lingering`
+/// entries stay behind in a closed remnant of the slot — own window shut
+/// (`forwarding_grace` zero), `confirmed`, no marks, its ring the slot's
+/// minus the departed joiner — which `expired()` clears once their
+/// windows end and the next `M` carries them over as it does for any
+/// slot. Closed entries are revoked here. Returns the taken slot with
+/// its `lingering` drained.
+fn take_slot_keeping_lingering(slot: &mut Option<ActiveMigration>) -> Option<ActiveMigration> {
+    let mut taken = slot.take()?;
+    let mut lingering = Vec::new();
+    for older in std::mem::take(&mut taken.lingering) {
+        if older.forwarding_open() {
+            lingering.push(older);
+        } else {
+            older.forward_revoked.store(true, Ordering::SeqCst);
+        }
+    }
+    if !lingering.is_empty() {
+        let nodes: Vec<String> = taken
+            .after_ring
+            .nodes()
+            .iter()
+            .filter(|name| **name != taken.joining_name)
+            .cloned()
+            .collect();
+        *slot = Some(ActiveMigration {
+            joining_name: taken.joining_name.clone(),
+            joining_addr: taken.joining_addr.clone(),
+            joining_token: taken.joining_token.clone(),
+            after_ring: Arc::new(HashRing::new(nodes)),
+            replication: taken.replication,
+            generation: taken.generation,
+            completed_at: Some(Instant::now()),
+            forwarding_grace: Duration::ZERO,
+            acked_entries: taken.acked_entries,
+            abort_requested: Arc::clone(&taken.abort_requested),
+            marked_keys: Vec::new(),
+            confirmed: true,
+            pre_completion_ring: None,
+            pending_clears: PendingClears::default(),
+            forward_connection: Arc::clone(&taken.forward_connection),
+            forward_revoked: Arc::clone(&taken.forward_revoked),
+            lingering,
+            remnant: true,
+        });
+    }
+    Some(taken)
 }
 
 /// Issue #93: a handoff's flip of `known_ring` to its post-join ring is
@@ -3733,9 +3817,22 @@ fn adopt_membership(
                 // forwarding window that outlives the join must not hide
                 // that eviction (the doc comment above), so only an
                 // unconfirmed join keeps the roster at bay.
+                // A confirmed joiner missing from the roster was evicted;
+                // closing its window early only means something while it
+                // is open — a slot whose own window has ended (or a
+                // remnant left by `take_slot_keeping_lingering`) just
+                // waits for `expired()`.
+                let joiner_gone = active.confirmed && !joiner_listed;
+                if joiner_gone {
+                    // Issue #474: whatever is still queued for it must not
+                    // reach whoever answers at its address next — queued
+                    // forwards can outlive the grace, and the drainer
+                    // checks this flag, not the window.
+                    active.forward_revoked.store(true, Ordering::SeqCst);
+                }
                 (
                     active.forwarding_open() && !joiner_listed && !active.confirmed,
-                    active.confirmed && !joiner_listed,
+                    joiner_gone && active.forwarding_open(),
                 )
             }
             None => (false, false),
@@ -3762,7 +3859,7 @@ fn adopt_membership(
                 false
             });
         }
-        if joiner_evicted && let Some(taken) = slot.take() {
+        if joiner_evicted && let Some(taken) = take_slot_keeping_lingering(&mut slot) {
             // Issue #474: forwards already queued for the evicted joiner
             // must not land on whoever gets its address next.
             taken.forward_revoked.store(true, Ordering::SeqCst);
@@ -4177,6 +4274,14 @@ struct ActiveMigration {
     /// whose node list still routes to the old owners keeps reaching them
     /// — see `LingeringForward`.
     lingering: Vec<LingeringForward>,
+    /// Left by `take_slot_keeping_lingering`: not a handoff at all any
+    /// more, only the carrier of `lingering` until their windows end. An
+    /// `M` must never mistake it for the handoff it was cut from — the
+    /// name, generation and `acked_entries` it still carries would answer
+    /// a retried `M` with a duplicate ack for a transfer nobody is
+    /// running — so `MigrationGuard::new` skips its duplicate check for
+    /// one and replaces it like any superseded slot.
+    remnant: bool,
 }
 
 /// Issue #564: the forwarding half of an `ActiveMigration` that a later `M`
@@ -4426,7 +4531,7 @@ impl MigrationGuard {
                 _ => true,
             };
 
-            if same_name && same_generation {
+            if same_name && same_generation && !existing.remnant {
                 // Same-name, same-generation retry: re-ack idempotently
                 // once the original `M` has computed what to ack,
                 // otherwise ask the caller to reject — the next retry
@@ -4564,6 +4669,7 @@ impl MigrationGuard {
             forward_connection: Arc::new(AsyncMutex::new(None)),
             forward_revoked: Arc::new(AtomicBool::new(false)),
             lingering,
+            remnant: false,
         });
         drop(guard);
 
@@ -4647,10 +4753,13 @@ impl Drop for MigrationGuard {
         if self.completed {
             return;
         }
-        *self
+        // An aborted or failed transfer clears its slot — but not the
+        // earlier joiners' windows the `M` carried into it (issue #564).
+        let mut slot = self
             .slot
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = take_slot_keeping_lingering(&mut slot);
     }
 }
 
@@ -6575,30 +6684,12 @@ enum AbandonOutcome {
 /// so a newer membership update (e.g. a heartbeat that adopted a fresh
 /// roster once the grace lapsed) is never clobbered.
 fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> AbandonOutcome {
-    let taken = {
-        let mut slot = node_context
-            .active_migration
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match slot.as_ref() {
-            Some(active) if active.joining_name == joining_name => {
-                active.abort_requested.store(true, Ordering::SeqCst);
-                active.forward_revoked.store(true, Ordering::SeqCst);
-                if active.completed_at.is_some() {
-                    slot.take()
-                } else {
-                    // Still transferring: `run_migration` will notice the
-                    // abort and roll back its own marks; it hasn't flipped
-                    // `known_ring` yet, so there is nothing to revert —
-                    // but the slot is also not free yet, so the caller
-                    // must wait rather than ack immediately.
-                    return AbandonOutcome::Aborting;
-                }
-            }
-            _ => return AbandonOutcome::NoMatch,
-        }
-    };
-    let taken = taken.expect("the matched arm above always took a `Some` slot");
+    let taken =
+        match take_abandoned_slot(node_context, |active| active.joining_name == joining_name) {
+            TakenSlot::NoMatch => return AbandonOutcome::NoMatch,
+            TakenSlot::Aborting => return AbandonOutcome::Aborting,
+            TakenSlot::Completed(taken) => taken,
+        };
     revert_known_ring_after_abandon(node_context, &taken);
     AbandonOutcome::Completed(taken.marked_keys)
 }
@@ -6652,7 +6743,9 @@ async fn wait_for_migration_slot_to_clear(node_context: &NodeContext, joining_na
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .is_some_and(|active| active.joining_name == joining_name);
+            .is_some_and(|active| {
+                active.joining_name == joining_name && active.completed_at.is_none()
+            });
         if !still_present {
             return;
         }
@@ -9068,6 +9161,7 @@ mod tests {
                 forward_connection: Arc::new(AsyncMutex::new(None)),
                 forward_revoked: Arc::new(AtomicBool::new(false)),
                 lingering: Vec::new(),
+                remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(None)),
             promoted: Arc::new(AtomicBool::new(true)),
@@ -9214,6 +9308,7 @@ mod tests {
                 forward_connection: Arc::new(AsyncMutex::new(None)),
                 forward_revoked: Arc::new(AtomicBool::new(false)),
                 lingering: Vec::new(),
+                remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(None)),
             promoted: Arc::new(AtomicBool::new(true)),
@@ -10791,6 +10886,7 @@ mod tests {
                 forward_connection: Arc::new(AsyncMutex::new(None)),
                 forward_revoked: Arc::new(AtomicBool::new(false)),
                 lingering: Vec::new(),
+                remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(None)),
             promoted: Arc::new(AtomicBool::new(true)),
@@ -12038,6 +12134,7 @@ mod tests {
                 forward_connection: Arc::new(AsyncMutex::new(None)),
                 forward_revoked: Arc::new(AtomicBool::new(false)),
                 lingering: Vec::new(),
+                remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(None)),
             promoted: Arc::new(AtomicBool::new(true)),
@@ -12166,6 +12263,7 @@ mod tests {
                 forward_connection: Arc::new(AsyncMutex::new(None)),
                 forward_revoked: Arc::new(AtomicBool::new(false)),
                 lingering: Vec::new(),
+                remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(None)),
             promoted: Arc::new(AtomicBool::new(true)),
@@ -12580,6 +12678,7 @@ mod tests {
                         forward_connection: Arc::new(AsyncMutex::new(None)),
                         forward_revoked: Arc::new(AtomicBool::new(false)),
                         lingering: Vec::new(),
+                        remnant: false,
                     });
                 }
                 if real_tx.send(request).await.is_err() {
@@ -13508,6 +13607,7 @@ mod tests {
                     forward_connection: Arc::new(AsyncMutex::new(None)),
                     forward_revoked: Arc::new(AtomicBool::new(false)),
                     lingering: Vec::new(),
+                    remnant: false,
                 });
                 sleep(Duration::from_millis(10)).await;
             }
@@ -14508,6 +14608,7 @@ mod tests {
                 forward_connection: Arc::new(AsyncMutex::new(None)),
                 forward_revoked: Arc::new(AtomicBool::new(false)),
                 lingering: Vec::new(),
+                remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
                 ring: Arc::clone(&after_ring),
@@ -14818,6 +14919,7 @@ mod tests {
             forward_connection: Arc::new(AsyncMutex::new(None)),
             forward_revoked: Arc::new(AtomicBool::new(false)),
             lingering: Vec::new(),
+            remnant: false,
         });
 
         assert!(migration_targets_for(&node_context, &key(b"key-0")).is_empty());
@@ -14855,6 +14957,7 @@ mod tests {
             forward_connection: Arc::new(AsyncMutex::new(None)),
             forward_revoked: Arc::new(AtomicBool::new(false)),
             lingering: Vec::new(),
+            remnant: false,
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![
@@ -14907,6 +15010,7 @@ mod tests {
             forward_connection: Arc::new(AsyncMutex::new(None)),
             forward_revoked: Arc::new(AtomicBool::new(false)),
             lingering: Vec::new(),
+            remnant: false,
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![
@@ -14965,6 +15069,7 @@ mod tests {
             forward_connection: Arc::new(AsyncMutex::new(None)),
             forward_revoked: Arc::new(AtomicBool::new(false)),
             lingering: Vec::new(),
+            remnant: false,
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![
@@ -15030,6 +15135,7 @@ mod tests {
             forward_connection: Arc::new(AsyncMutex::new(None)),
             forward_revoked: Arc::new(AtomicBool::new(false)),
             lingering: Vec::new(),
+            remnant: false,
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![
@@ -15115,6 +15221,7 @@ mod tests {
             forward_connection: Arc::new(AsyncMutex::new(None)),
             forward_revoked: Arc::new(AtomicBool::new(false)),
             lingering: Vec::new(),
+            remnant: false,
         })));
 
         // `M` for joiner-0 again at generation 2 (a fresh join after a
@@ -15189,6 +15296,7 @@ mod tests {
             forward_connection: Arc::new(AsyncMutex::new(None)),
             forward_revoked: Arc::new(AtomicBool::new(false)),
             lingering: Vec::new(),
+            remnant: false,
         }
     }
 
@@ -15497,6 +15605,7 @@ mod tests {
             forward_connection: Arc::new(AsyncMutex::new(None)),
             forward_revoked: Arc::new(AtomicBool::new(false)),
             lingering: Vec::new(),
+            remnant: false,
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![
@@ -16108,6 +16217,7 @@ mod tests {
             forward_connection: Arc::new(AsyncMutex::new(None)),
             forward_revoked: Arc::new(AtomicBool::new(false)),
             lingering: Vec::new(),
+            remnant: false,
         }
     }
 
@@ -17448,6 +17558,7 @@ mod tests {
             forward_connection: Arc::new(AsyncMutex::new(None)),
             forward_revoked: Arc::new(AtomicBool::new(false)),
             lingering: Vec::new(),
+            remnant: false,
         }
     }
 
@@ -18992,6 +19103,7 @@ mod tests {
                 forward_connection: Arc::new(AsyncMutex::new(None)),
                 forward_revoked: Arc::new(AtomicBool::new(false)),
                 lingering: Vec::new(),
+                remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
                 ring: Arc::clone(&after_ring),
@@ -19133,6 +19245,256 @@ mod tests {
             node_context.known_ring.lock().unwrap().as_ref().unwrap(),
             &pre_completion_ring
         ));
+    }
+
+    /// A slot whose own joiner is `joiner-0` (completed, unconfirmed,
+    /// marks `key-3`) with an earlier joiner `joiner-prev` lingering in it,
+    /// both in the slot's ring.
+    fn context_with_a_lingering_joiner() -> (NodeContext, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let (node_context, _after_ring, _pre) = completed_unconfirmed_context(&["key-3"]);
+        let lingering_revoked = Arc::new(AtomicBool::new(false));
+        let own_revoked = {
+            let mut slot = node_context.active_migration.lock().unwrap();
+            let active = slot.as_mut().unwrap();
+            active.after_ring = Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "other-node".to_string(),
+                "joiner-prev".to_string(),
+                "joiner-0".to_string(),
+            ]));
+            active.lingering.push(LingeringForward {
+                joining_name: "joiner-prev".to_string(),
+                joining_addr: "127.0.0.1:11".to_string(),
+                joining_token: "tok-joiner-prev".to_string(),
+                completed_at: Instant::now(),
+                forwarding_grace: Duration::from_secs(60),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::clone(&lingering_revoked),
+            });
+            Arc::clone(&active.forward_revoked)
+        };
+        (node_context, own_revoked, lingering_revoked)
+    }
+
+    fn lingering_targets(node_context: &NodeContext) -> Vec<(String, bool)> {
+        let ring = HashRing::new(vec![
+            "ready-node".to_string(),
+            "other-node".to_string(),
+            "joiner-prev".to_string(),
+        ]);
+        let owned = keys_owned_by(&ring, "joiner-prev")
+            .into_iter()
+            .next()
+            .expect("a key joiner-prev owns");
+        migration_targets_for(node_context, &owned)
+            .into_iter()
+            .map(|target| (target.addr, target.as_handoff))
+            .collect()
+    }
+
+    #[test]
+    fn abandoning_a_slot_keeps_the_lingering_joiners_forwards() {
+        // Issue #564 / #571 review: an `X` or `G` for the slot's own
+        // joiner must not end an earlier joiner's forwarding window.
+        let (node_context, own_revoked, lingering_revoked) = context_with_a_lingering_joiner();
+
+        let AbandonOutcome::Completed(restore) = abandon_migration(&node_context, "joiner-0")
+        else {
+            panic!("a completed handoff is abandoned");
+        };
+        assert_eq!(restore, vec![key(b"key-3")]);
+        assert!(own_revoked.load(Ordering::SeqCst));
+        assert!(!lingering_revoked.load(Ordering::SeqCst));
+
+        // The remnant: nothing left to ask discovery about or to serve
+        // locally for, no marks held, own window shut — only the lingering
+        // joiner's forwards, as `U`/`u`.
+        assert!(unconfirmed_completed_joiner(&node_context).is_none());
+        {
+            let slot = node_context.active_migration.lock().unwrap();
+            let active = slot.as_ref().expect("the lingering entry keeps a remnant");
+            assert!(active.confirmed);
+            assert!(!active.forwarding_open());
+            assert!(active.marked_keys.is_empty());
+            assert!(
+                !active.expired(),
+                "not expired while a lingering window is open"
+            );
+            assert!(!active.after_ring.nodes().contains(&"joiner-0".to_string()));
+        }
+        assert_eq!(
+            lingering_targets(&node_context),
+            vec![("127.0.0.1:11".to_string(), true)]
+        );
+
+        // A roster without the departed joiner leaves the remnant alone
+        // (no eviction churn), and one without the lingering joiner closes
+        // its window as before.
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        adopt_membership(
+            &known_ring,
+            &node_context.active_migration,
+            "disc",
+            vec![
+                "ready-node".to_string(),
+                "other-node".to_string(),
+                "joiner-prev".to_string(),
+            ],
+            2,
+        );
+        assert!(node_context.active_migration.lock().unwrap().is_some());
+        assert!(!lingering_revoked.load(Ordering::SeqCst));
+        adopt_membership(
+            &known_ring,
+            &node_context.active_migration,
+            "disc",
+            vec!["ready-node".to_string(), "other-node".to_string()],
+            2,
+        );
+        assert!(lingering_revoked.load(Ordering::SeqCst));
+        assert!(
+            node_context
+                .active_migration
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(ActiveMigration::expired),
+            "with every window closed the remnant is ready to be cleared"
+        );
+    }
+
+    #[test]
+    fn an_evicted_joiners_slot_keeps_the_lingering_joiners_forwards() {
+        // The same for the roster path: the slot's own joiner confirmed and
+        // then evicted while an earlier joiner still lingers.
+        let (node_context, own_revoked, lingering_revoked) = context_with_a_lingering_joiner();
+        node_context
+            .active_migration
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .confirmed = true;
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        adopt_membership(
+            &known_ring,
+            &node_context.active_migration,
+            "disc",
+            vec![
+                "ready-node".to_string(),
+                "other-node".to_string(),
+                "joiner-prev".to_string(),
+            ],
+            2,
+        );
+        assert!(own_revoked.load(Ordering::SeqCst));
+        assert!(!lingering_revoked.load(Ordering::SeqCst));
+        assert_eq!(
+            lingering_targets(&node_context),
+            vec![("127.0.0.1:11".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn a_remnant_does_not_answer_a_retried_m_as_a_duplicate_ack() {
+        // Codex review of #573: the remnant keeps the cut handoff's name,
+        // generation and `acked_entries`; a retry of that very `M` (its ack
+        // lost, the transfer failed meanwhile) must start a new transfer —
+        // and carry the lingering joiner along — not be acked as a
+        // duplicate of a handoff nobody is running.
+        let (node_context, _own, lingering_revoked) = context_with_a_lingering_joiner();
+        {
+            let mut slot = node_context.active_migration.lock().unwrap();
+            slot.as_mut().unwrap().acked_entries = Some(7);
+        }
+        let _ = abandon_migration(&node_context, "joiner-0");
+        assert!(
+            node_context
+                .active_migration
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|active| active.remnant && active.acked_entries == Some(7))
+        );
+
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "other-node".to_string(),
+            "joiner-prev".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let outcome = MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            "joiner-0".to_string(),
+            "127.0.0.1:9".to_string(),
+            "tok-joiner-0".to_string(),
+            after_ring,
+            2,
+            None,
+            &[],
+            &node_context.known_ring,
+        );
+        let guard = outcome.unwrap_new();
+        {
+            let slot = node_context.active_migration.lock().unwrap();
+            let active = slot.as_ref().unwrap();
+            assert!(!active.remnant);
+            assert!(active.completed_at.is_none(), "a fresh transfer");
+            assert_eq!(
+                active.lingering.len(),
+                1,
+                "the lingering joiner is carried over"
+            );
+            assert_eq!(active.lingering[0].joining_name, "joiner-prev");
+        }
+        assert!(!lingering_revoked.load(Ordering::SeqCst));
+        drop(guard);
+    }
+
+    #[test]
+    fn an_eviction_after_the_window_closed_still_revokes_the_queued_forwards() {
+        // Codex review of #573: the eviction check only *takes* the slot
+        // while its window is open, but a joiner gone from the roster has
+        // its queued forwards revoked regardless — they can outlive the
+        // grace, and the drainer checks the flag, not the window.
+        let (node_context, _after_ring, _pre) = completed_unconfirmed_context(&["key-3"]);
+        let own_revoked = {
+            let mut slot = node_context.active_migration.lock().unwrap();
+            let active = slot.as_mut().unwrap();
+            active.confirmed = true;
+            active.forwarding_grace = Duration::ZERO;
+            Arc::clone(&active.forward_revoked)
+        };
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        adopt_membership(
+            &known_ring,
+            &node_context.active_migration,
+            "disc",
+            vec!["ready-node".to_string(), "other-node".to_string()],
+            2,
+        );
+        assert!(own_revoked.load(Ordering::SeqCst));
+        // Not taken (nothing to close early); `expired()` clears it.
+        assert!(
+            node_context
+                .active_migration
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(ActiveMigration::expired)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_abandon_wait_does_not_wait_on_a_remnant_under_the_same_name() {
+        // `wait_for_migration_slot_to_clear` is for a transfer still
+        // unwinding; the remnant an abort leaves (same joiner name,
+        // completed) must not hold the `X` ack for the whole drain wait.
+        let (node_context, _own, _lingering) = context_with_a_lingering_joiner();
+        let _ = abandon_migration(&node_context, "joiner-0");
+        let started = tokio::time::Instant::now();
+        wait_for_migration_slot_to_clear(&node_context, "joiner-0").await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test(flavor = "current_thread")]

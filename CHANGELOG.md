@@ -14,6 +14,25 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: abandoning a handoff no longer ends the forwarding
+  windows of the joiners before it. Since #564 a superseded handoff keeps
+  forwarding from the new slot's `lingering` list, but the three ways a slot
+  is dropped — an `X` (or a `G`, #571) for its joiner, that joiner's
+  eviction read from a heartbeat roster, and a transfer that aborts or
+  fails — took the whole slot with it, lingering entries included, so a
+  client that still wrote to the old owners stopped reaching an earlier
+  joiner inside its grace and that joiner fell behind. All three now leave
+  the still-open lingering forwards behind in a closed remnant of the slot
+  (own window shut, confirmed, no marks) that clears once their windows
+  end. The remnant is never taken for the handoff it was cut from (a
+  retried `M` starts a new transfer rather than being acked as a
+  duplicate), and the eviction check still revokes a departed joiner's
+  queued forwards whatever the state of its window but only closes a
+  window that is actually open, so the remnant is not re-evicted on every
+  ack. Found by a review of
+  #569–#572; not reproduced in Docker (it needs a second join to be
+  abandoned, or its joiner to leave unseen or be evicted, inside the first
+  joiner's grace).
 - `nanocached-node` / `nanocached-discovery`: a sender no longer keeps
   forwarding to a joiner that left within one heartbeat interval of its
   promotion (#571). The heartbeat ack lists the members discovery knows, so
