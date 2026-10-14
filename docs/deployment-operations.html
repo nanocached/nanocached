@@ -134,6 +134,19 @@ the budget are logged and left to the surviving replicas. The default
 25&nbsp;s fits inside a spot interruption's 2-minute warning with room
 to spare.</p>
 
+<h2 id="upgrade">Upgrading a cluster</h2>
+<p>Roll a new server version out <strong>discovery first, then the
+nodes, then the proxies</strong>, one component at a time. The frames
+nodes, discovery servers and proxies exchange with each other are
+versioned with the server and may change in any release (see the
+<a href="compatibility.html#internal">compatibility policy</a>); a
+newer discovery accepts what an older node sends, but the reverse does
+not hold. In 0.4.5 a node's heartbeat gained an optional field that an
+older discovery rejects, so a node upgraded ahead of its discovery
+servers could lose its heartbeats and be evicted. A mixed-version
+cluster is only ever the transient state of such a roll-out; each
+release's changelog notes any exception to this order.</p>
+
 <h2>Verifying a deployment</h2>
 <p>The repository ships runnable scale-in scenarios under
 <a href="https://github.com/nanocached/nanocached/tree/main/tests/e2e"><code>tests/e2e</code></a>:

@@ -175,12 +175,21 @@ are orchestrated by discovery in stages:</p>
   forward concurrent writes to the joiner, so no update is lost.</li>
   <li>When every node reports completion, discovery promotes the joiner
   into the served node list; clients pick it up on their next
-  refresh.</li>
+  refresh. Until it is promoted, the joiner answers <code>W</code> to
+  any client request that reaches it — no node list names it yet, but a
+  connection a client dialed to the previous occupant of the same
+  address can land on it — so the client refreshes and retries on an
+  owner that has the key, instead of reading a miss from a node still
+  being filled.</li>
   <li>A source keeps the copies it handed off, marked dead, until
   discovery confirms the join (the joiner shows up in its heartbeat
   acknowledgment, or in the roster of the next join's migrate request);
   an abandoned join restores them instead, so no key is lost to a
-  half-finished handoff.</li>
+  half-finished handoff. A joiner that is promoted and gone again
+  between two of a source's heartbeats never appears in a roster that
+  source sees, so the heartbeat names such a joiner and discovery
+  answers whether it has left; if it has, the source restores the copies
+  and closes the window the same way.</li>
 </ol>
 <p>Migrated-away entries are swept only after the join is confirmed, and
 the forwarding window stays open past completion to cover clients still
@@ -188,7 +197,8 @@ routing with the older node list. Joins are serialized — one handoff at a
 time, cluster-wide — so a fleet started at once simply queues; a source
 that has finished one handoff accepts the next join's request while it is
 still forwarding for the previous one, and keeps forwarding to the earlier
-joiner until its own window ends.</p>
+joiner until its own window ends — also when that later handoff is
+abandoned, its joiner evicted, or its transfer cut short.</p>
 
 <h2>Discovery without a single point of failure</h2>
 <p>The registry is deliberately soft state: nodes announce themselves and

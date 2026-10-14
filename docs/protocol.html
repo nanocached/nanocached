@@ -446,7 +446,16 @@ plain overwrite, so a re-replication racing a newer client write on the
 receiver can never regress it — the receiver stores the entry only if it was absent,
 and acks <code>S\n</code> either way, since a key already present there
 is a success for the sender, not a conflict. An ordinary decommission
-handoff never sets it. These are versioned with the
+handoff never sets it. <code>H</code> takes an optional trailing
+<code>&lt;joiner-len&gt;</code> header field, with the joiner's name
+after the token in the body, naming a node whose handoff the sender
+completed but has not yet seen in any roster; discovery then follows its
+acknowledgment — the roster, or the bare <code>A\n</code> — with exactly
+one more line, <code>K\n</code> (still registered, or not known to be
+gone) or <code>G\n</code> (on record as having left, been evicted or
+abandoned, and not registered since), and on <code>G</code> the node
+abandons that handoff. A sender that put the field in must read that
+line. These are versioned with the
 server and not part of
 the public caching API, so the
 <a href="compatibility.html#internal">compatibility policy</a> does not
