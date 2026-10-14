@@ -11,6 +11,16 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `close()` no longer hangs when a node reset its connection between the
+  identify handshake and the end of the dial round (#574). A `Connection`
+  is built only once the round's slowest dial is done, so a socket reset
+  in between had already emitted its `close` event; the connection then
+  waited for that event forever and `close()` with it. Such a connection
+  is now closed on construction, and the per-target open-connection guard
+  no longer counts it, so a later single-address `connect()` to the same
+  address is not told a `close()` was forgotten. The same guard was what
+  made the client test suite flaky: its tests did not await `close()`, and
+  an ephemeral port reused by the next test's mock node tripped it.
 - A peer reset on a node socket that had finished identify but was still
   waiting on slower sibling dials in the same bootstrap or refresh round
   was an uncaught `ECONNRESET` that crashed the process; identified

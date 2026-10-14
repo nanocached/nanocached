@@ -221,6 +221,13 @@ export class Connection {
     this.socket.on("data", (chunk: Buffer) => this.onData(chunk));
     this.socket.on("error", (error: Error) => this.onError(error));
     this.socket.on("close", () => this.onClose());
+    // A socket whose "close" has already been emitted never emits it
+    // again (issue #574): a peer RST that lands between a dial's identify
+    // handshake and the end of its round — the round only builds
+    // Connections once its slowest dial is done — closes the socket
+    // before this listener exists. Without this, `whenClosed()` would
+    // wait forever and `NanocachedClient.close()` with it.
+    if (socket.closed) this.onClose();
   }
 
   /** Deferred wiring for the `onTransientRetry` callback — see its own

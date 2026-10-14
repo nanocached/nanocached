@@ -437,6 +437,11 @@ function nextChunkEnd(namespace: Uint8Array, count: number, start: number, entry
 const openTargets = new Map<string, number>();
 
 function trackOpenTarget(key: string, sockets: Array<Socket | TLSSocket>): void {
+  // A socket already closed (a peer RST during the dial round, issue #574)
+  // would never emit the "close" that releases it, and would pin `key` as
+  // open for the rest of the process.
+  sockets = sockets.filter((socket) => !socket.closed);
+  if (sockets.length === 0) return;
   openTargets.set(key, (openTargets.get(key) ?? 0) + sockets.length);
 
   for (const socket of sockets) {
