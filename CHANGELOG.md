@@ -49,7 +49,12 @@ framework adapters at one version, whether or not a component changed.
   123–256 per run, none after the change). The slot's own joiner is not
   affected: it has no ring of its own until discovery promotes it and only
   gains ownership until the next `M` moves it into `lingering`. The WARN
-  for a refused forward now says what the peer answered.
+  for a refused forward now says what the peer answered. A node receiving
+  a `U`/`u` while it is itself decommissioning now mirrors that write to
+  the decommission's entrant the way it already did for a plain `S`/`D`;
+  before, a handoff frame landing after the drain snapshot (from a
+  lingering joiner's old owner, a chained drain-out, or a re-replication)
+  stayed on the departing node and left with it.
 - `nanocached-node`: with an auth secret configured, a connection that has
   not authenticated yet is now held to what an unauthenticated peer can
   legitimately do. The node used to parse and buffer a whole request (up to

@@ -2431,6 +2431,30 @@ async fn handle_connection(
                     }
                 }
 
+                // And to the entrant of a decommission this node is
+                // running, exactly as the `S` arm does: a `U` reaches a
+                // draining node from a lingering joiner's old owner
+                // (`ForwardTarget::as_handoff`), from a peer whose own
+                // drain-out chains into this one, or from a survivor
+                // re-replicating after an eviction, and in each case a
+                // write landing after this node's drain snapshot would
+                // otherwise stay here and leave with it. Same frame
+                // onward (`if_absent` kept), same reasoning as the join
+                // relay above.
+                if let Some(target) = leave_target_for(&node_context, &key) {
+                    spawn_forward(
+                        &config,
+                        node_context.clone(),
+                        target,
+                        OwnedForwardedWrite::HandoffSet {
+                            key: key.clone(),
+                            value: value.clone(),
+                            ttl,
+                            if_absent,
+                        },
+                    );
+                }
+
                 continue;
             }
             Ok((Command::HandoffDelete { key, token }, tag)) => {
@@ -2483,6 +2507,18 @@ async fn handle_connection(
                             OwnedForwardedWrite::Delete { key: key.clone() },
                         );
                     }
+                }
+
+                // Decommission mirror, as for `U` above and the `D` arm
+                // below: a delete that lands after this node's drain
+                // snapshot must reach the entrant too, or it comes back.
+                if let Some(target) = leave_target_for(&node_context, &key) {
+                    spawn_forward(
+                        &config,
+                        node_context.clone(),
+                        target,
+                        OwnedForwardedWrite::HandoffDelete { key: key.clone() },
+                    );
                 }
 
                 continue;
@@ -12038,6 +12074,134 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn decommission_forwards_handoff_frames_it_receives_to_the_entrant() {
+        // A draining node can be handed a key by `U`/`u` rather than `S`/`D`:
+        // by a lingering joiner's old owner (`ForwardTarget::as_handoff`),
+        // by a peer whose own drain-out chains into this one, or by a
+        // survivor re-replicating after an eviction. Those arms used to
+        // relay only to a join in progress, never to the decommission's
+        // entrant, so a write landing after this node's drain snapshot
+        // stayed here and left with it (an old value on the entrant, or a
+        // deleted key coming back). Same mirror as the `S`/`D` arms, same
+        // frame onward — a put-if-absent `U` stays put-if-absent.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let before_ring = Arc::new(HashRing::new(vec![
+            "leaver".to_string(),
+            "peer".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec!["peer".to_string()]));
+
+        let mut owned_keys = Vec::new();
+        let mut index = 0u32;
+        while owned_keys.len() < 3 {
+            let name = format!("key-{index}");
+            if before_ring.is_owner(&key(name.as_bytes()), "leaver", 1) {
+                owned_keys.push(name);
+            }
+            index += 1;
+            assert!(index < 1000, "expected at least three owned keys in range");
+        }
+
+        let mut addresses = HashMap::new();
+        addresses.insert("peer".to_string(), peer_addr);
+        let mut tokens = HashMap::new();
+        tokens.insert("peer".to_string(), "tok-peer".to_string());
+
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(Some(LeaveState {
+                before_ring,
+                after_ring,
+                replication: 1,
+                addresses,
+                tokens,
+                connections: Mutex::new(HashMap::new()),
+            }))),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+            },
+            shutdown_rx,
+        ));
+
+        // The leaver's own token ("tk-leaver") authorizes each inbound
+        // frame (issue #295): an unconditional `U`, a put-if-absent `U`,
+        // and a `u` for a key this node never held.
+        let name_a = &owned_keys[0];
+        let name_b = &owned_keys[1];
+        let name_c = &owned_keys[2];
+        let request = format!(
+            "U 0 {} 2 9\ntk-leaver{name_a}v1U 0 {} 2 9 A\ntk-leaver{name_b}v2u 0 {} 9\ntk-leaver{name_c}",
+            name_a.len(),
+            name_b.len(),
+            name_c.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"S\nS\nN\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+        peer_task.abort();
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(
+            frames.len(),
+            3,
+            "every handoff frame must forward to the entrant: {frames:?}"
+        );
+        let expected_a = format!("U 0 {} 2 8\ntok-peer{name_a}v1", name_a.len()).into_bytes();
+        let expected_b = format!("U 0 {} 2 8 A\ntok-peer{name_b}v2", name_b.len()).into_bytes();
+        let expected_c = format!("u 0 {} 8\ntok-peer{name_c}", name_c.len()).into_bytes();
+        assert!(frames.contains(&expected_a), "unconditional U: {frames:?}");
+        assert!(frames.contains(&expected_b), "put-if-absent U: {frames:?}");
+        assert!(frames.contains(&expected_c), "u: {frames:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn multi_set_forwards_when_a_join_migration_starts_between_the_snapshot_and_the_write() {
         // Tenth-pass audit (2026-09-02), issue #408 regression: `MultiSet`
         // used to decide whether to keep a clone for the forwarding loop
@@ -13462,10 +13626,12 @@ mod tests {
                             continue;
                         };
                         let header = String::from_utf8(buf[..header_end].to_vec()).unwrap();
+                        // The length fields; a `U`'s trailing ` A`
+                        // (put-if-absent) is not one.
                         let fields: Vec<usize> = header
                             .split(' ')
                             .skip(1)
-                            .map(|field| field.parse().unwrap())
+                            .filter_map(|field| field.parse().ok())
                             .collect();
                         if header.starts_with("A ") {
                             // Auth handshake: consume the secret, ack as a
@@ -13486,9 +13652,17 @@ mod tests {
                             let _ = connection.write_all(b"On\n").await;
                             continue;
                         }
-                        assert!(header.starts_with("U "), "unexpected frame {header:?}");
-                        // Issue #295: `fields[3]` is `<token-len>`.
-                        let body_length = fields[0] + fields[1] + fields[2] + fields[3];
+                        // `U` carries `<ns-len> <key-len> <value-len>
+                        // <token-len>`, `u` carries `<ns-len> <key-len>
+                        // <token-len>` (issue #295: the token is a body
+                        // field too).
+                        let (body_length, reply): (usize, &[u8]) = if header.starts_with("U ") {
+                            (fields[0] + fields[1] + fields[2] + fields[3], b"S\n")
+                        } else if header.starts_with("u ") {
+                            (fields[0] + fields[1] + fields[2], b"D\n")
+                        } else {
+                            panic!("unexpected frame {header:?}");
+                        };
                         let frame_end = header_end + 1 + body_length;
                         while buf.len() < frame_end {
                             let mut chunk = [0u8; 1024];
@@ -13504,7 +13678,7 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(buf.split_to(frame_end).to_vec());
-                        let _ = connection.write_all(b"S\n").await;
+                        let _ = connection.write_all(reply).await;
                     }
                 });
             }
