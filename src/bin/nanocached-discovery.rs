@@ -13,7 +13,8 @@
 //! Protocol (ASCII header line, terminated by `\n`; a command may repeat
 //! on the same connection):
 //!
-//!   H <name-length> <r> <token-length>\n<name><token>   Heartbeat,
+//!   H <name-length> <r> <token-length> [<joiner-length>]\n<name><token>[<joiner>]
+//!                             Heartbeat,
 //!                             identified by name (a random per-process
 //!                             identity, node identity decoupled from address — not the node's
 //!                             address, which carries no identity
@@ -57,7 +58,21 @@
 //!                             roster would make nodes reject keys they do
 //!                             own) and while a strict majority of voting
 //!                             nodes dispute this replica's replication
-//!                             factor.
+//!                             factor. The optional trailing
+//!                             `<joiner-length>` / `<joiner>` (issue #571)
+//!                             names a node whose handoff the sender
+//!                             completed but which it has not yet seen in
+//!                             any roster; the ack (withheld or not) is
+//!                             then followed by exactly one more line —
+//!                             `K\n` (still registered, or not known to be
+//!                             gone) or `G\n` (on record as having left,
+//!                             been evicted or abandoned, and not
+//!                             registered since) — so a joiner that was
+//!                             promoted and gone again between two of the
+//!                             sender's heartbeats does not keep its
+//!                             forwarding window open for the whole grace.
+//!                             A reader that sent the field must consume
+//!                             that line.
 //!
 //!   L\n                       List currently `Joined` nodes. Response:
 //!                             `N <count> <replication>\n` (the replication
