@@ -14,6 +14,23 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a node answers `W` to every client key request until
+  discovery has promoted it. Before, a request that reached a node still in
+  its join handoff was served from whatever the migration had delivered so
+  far, so a key that was live elsewhere read as a miss (`N`). No client's
+  node list names such a node, but a client can hold a connection to it
+  under another name: an SDK's connect dials every listed member and waits
+  for all of them, so after a kill the dial to the dead member's address
+  stays pending until its deadline, and when the replacement process starts
+  listening on the same address within that time (a same-host restart) the
+  dial completes, labelled with the evicted name. Every read on that
+  connection missed until promotion — a few hundred in the half second
+  before it in a Docker reproduction (kill, eviction, immediate restart),
+  none afterwards. The `W` makes the client refresh its list, which no
+  longer names the evicted node, and retry on a surviving owner. Concurrent
+  writes a sender forwards to the joiner during the handoff now go as
+  `U`/`u` frames, which the check does not apply to, as a lingering
+  joiner's already did.
 - `nanocached-node`: a join no longer ends the forwarding window of the join
   before it. A node holds one handoff slot, and a new `M` used to replace
   it and revoke its forwards even though the earlier joiner was confirmed

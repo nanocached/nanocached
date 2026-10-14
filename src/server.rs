@@ -551,8 +551,26 @@ struct NodeContext {
     /// which is how it follows liveness *evictions* — `M` only ever
     /// carries joins. `None` until the first of either — a lone or
     /// freshly-bootstrapped node has no membership to reject against
-    /// yet.
+    /// yet (a joiner before promotion rejects everything regardless, see
+    /// `promoted`).
     known_ring: KnownRing,
+    /// Whether discovery has promoted this node (the `R` to its `J`, see
+    /// `register_with_discovery`). Until then no client's `L` names this
+    /// node, so a key request that reaches it anyway arrived on a
+    /// connection meant for someone else — in practice the previous
+    /// occupant of this address: a member killed and evicted while a
+    /// client's bootstrap dial to it was still pending (an SDK's connect
+    /// dials every listed member and waits for all of them), with this
+    /// process starting to listen on the same IP (a same-host restart)
+    /// before that dial's deadline. The dial then completes, labelled with
+    /// the evicted name. A node in its join handoff holds only what the
+    /// migration has delivered so far, so answering locally returns `N`
+    /// for a key that is live elsewhere; `wrong_node` answers `W` instead,
+    /// and the client's forced refresh — `L` no longer lists the evicted
+    /// name — lands the retry on a surviving owner. Set once, never
+    /// cleared: a later re-registration (`P`) is of a member that already
+    /// holds its share.
+    promoted: Arc<AtomicBool>,
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     request_tx: mpsc::Sender<CacheRequest>,
@@ -738,6 +756,7 @@ pub(crate) async fn run(
         discovery_addr: config.discovery_addrs[0].clone(),
         active_migration: Arc::clone(&active_migration),
         known_ring: Arc::clone(&known_ring),
+        promoted: Arc::new(AtomicBool::new(false)),
         auth_secret: config.auth_secret.clone(),
         tls_connector: config.tls_connector.clone(),
         request_tx: request_tx.clone(),
@@ -3170,6 +3189,11 @@ async fn register_with_discovery(
 
                         if let DiscoveryRole::Primary(promoted_tx) = &role {
                             promoted_tx.send_replace(true);
+                            // From here on client key requests are served
+                            // (`wrong_node`); the membership view that
+                            // check needs follows with the first ack
+                            // below.
+                            node_context.promoted.store(true, Ordering::SeqCst);
                         }
 
                         loop {
@@ -6651,18 +6675,19 @@ struct ForwardTarget {
     revoked: Arc<AtomicBool>,
     /// Send a forwarded client `Set`/`Delete` to this target as a `U`/`u`
     /// (unconditional handoff frame) rather than a plain `S`/`D`. Set for
-    /// a lingering joiner's target (`LingeringForward::target`), never for
-    /// the slot's own joiner or a decommission's entrant (those forwards
-    /// already pick the frame themselves). Applied at the one place every
-    /// forward passes through, `ForwardQueues::push`.
+    /// a join's targets — the slot's own joiner (`migration_targets_for`)
+    /// and a lingering one (`LingeringForward::target`) — not for a
+    /// decommission's entrant (`leave_target_for`'s callers pick the frame
+    /// themselves) or a clear (not subject to the wrong-node check).
+    /// Applied at the one place every forward passes through,
+    /// `ForwardQueues::push`.
     ///
     /// Why: a plain `S` is subject to the receiver's own `wrong_node`
-    /// check. The slot's own joiner has no `known_ring` until discovery
-    /// promotes it (it is set only by `adopt_membership` from a heartbeat
-    /// ack, which starts after promotion, and by `run_migration`'s flip,
-    /// which only an old owner runs), so it accepts whatever it is sent;
-    /// and afterwards it can only *gain* ownership until the next `M`
-    /// moves it into `lingering`. A lingering joiner is different: it is a
+    /// check, and each kind of joiner answers `W` to one at some point of
+    /// the forwarding window. The slot's own joiner refuses every plain
+    /// client frame until discovery promotes it (`NodeContext::promoted`),
+    /// which comes after the handoff — so a plain `S` forwarded during the
+    /// transfer would be refused outright. A lingering joiner is a
     /// confirmed member whose `known_ring` follows its own heartbeat acks,
     /// up to a heartbeat interval behind. The sender picks it as a target
     /// by the current slot's ring (the latest `M`'s roster), and in the
@@ -7525,6 +7550,12 @@ async fn forward_with_retries(
 /// joiner no longer update): every read that reached this node in the
 /// rest of the forwarding window missed (`N`) once the sweep had run.
 /// Write forwarding keeps going for the whole window regardless.
+///
+/// And every key is the wrong node's until discovery has promoted this
+/// node (`NodeContext::promoted`): a request that arrives before then came
+/// over a connection a client opened to this address under an evicted
+/// member's name, and a `W` — not a local `N` for a key the handoff hasn't
+/// delivered yet — is what sends it to refresh and retry elsewhere.
 fn wrong_node(node_context: &NodeContext, key: &Key) -> bool {
     wrong_node_hashed(node_context, KeyHash::of(key))
 }
@@ -7533,6 +7564,9 @@ fn wrong_node(node_context: &NodeContext, key: &Key) -> bool {
 /// multi-key arms use so a frame's (potentially huge) shared namespace is
 /// hashed once, not once per key.
 fn wrong_node_hashed(node_context: &NodeContext, key_hash: KeyHash) -> bool {
+    if !node_context.promoted.load(Ordering::SeqCst) {
+        return true;
+    }
     let displaced = node_context
         .known_ring
         .lock()
@@ -7625,7 +7659,9 @@ fn migration_targets_for_hashed(
             connection: Arc::clone(&active.forward_connection),
             token: active.joining_token.clone(),
             revoked: Arc::clone(&active.forward_revoked),
-            as_handoff: false,
+            // The joiner refuses plain frames until it is promoted — see
+            // `ForwardTarget::as_handoff`.
+            as_handoff: true,
         });
     }
     for lingering in &active.lingering {
@@ -7996,6 +8032,7 @@ mod tests {
             discovery_addr,
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: Some(Bytes::from_static(b"shared-secret")),
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -8131,6 +8168,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: Some(Bytes::from_static(b"shared-secret")),
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -8220,6 +8258,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -8301,6 +8340,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -8378,6 +8418,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -8449,6 +8490,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -8544,6 +8586,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -8669,6 +8712,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -8817,6 +8861,7 @@ mod tests {
                 lingering: Vec::new(),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -8962,6 +9007,7 @@ mod tests {
                 lingering: Vec::new(),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -9038,7 +9084,7 @@ mod tests {
         let received = joining_task.await.unwrap();
         assert_eq!(
             received,
-            set_message(&key(b"name"), b"Alice", None),
+            handoff_message(&key(b"name"), b"Alice", None, false, "tok-joiner-0"),
             "a forward queued behind a full channel must still reach the peer once drained, \
              not be dropped"
         );
@@ -10538,6 +10584,7 @@ mod tests {
                 lingering: Vec::new(),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -10766,6 +10813,7 @@ mod tests {
             discovery_addr,
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -10869,6 +10917,7 @@ mod tests {
                 ring: Arc::new(HashRing::new(vec!["other".to_string()])),
                 replication: 1,
             })))),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -10935,6 +10984,7 @@ mod tests {
                 ring: Arc::new(HashRing::new(vec!["other".to_string()])),
                 replication: 1,
             })))),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -11019,6 +11069,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(Some(active_migration))),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -11107,6 +11158,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -11161,8 +11213,10 @@ mod tests {
     type JoinerFrames = Arc<std::sync::Mutex<Vec<(usize, Vec<u8>, Vec<u8>)>>>;
 
     /// A fake joining node: accepts connections and, on each, reads
-    /// namespaced `s` frames (`s <ns> <key> <value>\n<ns><key><value>`),
-    /// recording `(connection index, key, value)` and acking `S` — until
+    /// namespaced `s` frames (`s <ns> <key> <value>\n<ns><key><value>`) or
+    /// the `U` handoff frames a join's forwards are sent as
+    /// (`handoff_message`), recording `(connection index, key, value)` and
+    /// acking `S` — until
     /// `unacked_after` frames have been read on connection 0, after which
     /// it closes that connection *without* acking the frame just read.
     fn spawn_s_frame_joiner(listener: TcpListener, unacked_after: Option<usize>) -> JoinerFrames {
@@ -11199,11 +11253,30 @@ mod tests {
                             .skip(1)
                             .map(|field| field.parse().unwrap())
                             .collect();
-                        assert!(header.starts_with("s "), "unexpected frame {header:?}");
-                        let mut body = vec![0u8; fields[0] + fields[1] + fields[2]];
+                        // `(body length, key start, value start)`: a `U`
+                        // body leads with the token, then namespace, key,
+                        // value (`handoff_message`).
+                        let (body_length, key_start, value_start) = if header.starts_with("s ") {
+                            (
+                                fields[0] + fields[1] + fields[2],
+                                fields[0],
+                                fields[0] + fields[1],
+                            )
+                        } else if header.starts_with("U ") {
+                            let (namespace, key, value, token) =
+                                (fields[0], fields[1], fields[2], fields[3]);
+                            (
+                                token + namespace + key + value,
+                                token + namespace,
+                                token + namespace + key,
+                            )
+                        } else {
+                            panic!("unexpected frame {header:?}");
+                        };
+                        let mut body = vec![0u8; body_length];
                         reader.read_exact(&mut body).await.unwrap();
-                        let key = body[fields[0]..fields[0] + fields[1]].to_vec();
-                        let value = body[fields[0] + fields[1]..].to_vec();
+                        let key = body[key_start..value_start].to_vec();
+                        let value = body[value_start..].to_vec();
                         recorded.lock().unwrap().push((this_connection, key, value));
                         on_this_connection += 1;
                         if this_connection == 0 && unacked_after == Some(on_this_connection) {
@@ -11758,6 +11831,7 @@ mod tests {
                 lingering: Vec::new(),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -11818,7 +11892,11 @@ mod tests {
         let received = joining_task.await.unwrap();
         assert_eq!(
             received,
-            b"S 5 2\nkey-av1S 5 2\nkey-bv2".to_vec(),
+            [
+                handoff_message(&key(b"key-a"), b"v1", None, false, "tok-joiner-0"),
+                handoff_message(&key(b"key-b"), b"v2", None, false, "tok-joiner-0"),
+            ]
+            .concat(),
             "both owned keys from the MultiSet must be forwarded to the joining node"
         );
     }
@@ -11881,6 +11959,7 @@ mod tests {
                 lingering: Vec::new(),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -11992,6 +12071,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -12119,6 +12199,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -12248,6 +12329,7 @@ mod tests {
             // the `MultiSet` has already left `handle_connection`.
             active_migration: Arc::clone(&active_migration),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: real_tx.clone(),
@@ -12343,7 +12425,11 @@ mod tests {
         let received = joining_task.await.unwrap();
         assert_eq!(
             received,
-            b"S 5 2\nkey-av1S 5 2\nkey-bv2".to_vec(),
+            [
+                handoff_message(&key(b"key-a"), b"v1", None, false, "tok-joiner-0"),
+                handoff_message(&key(b"key-b"), b"v2", None, false, "tok-joiner-0"),
+            ]
+            .concat(),
             "both keys must still forward to the joining node even though no migration was \
              active when the MultiSet left handle_connection"
         );
@@ -12391,6 +12477,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: real_tx.clone(),
@@ -12722,6 +12809,7 @@ mod tests {
             discovery_addr: "127.0.0.1:1".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -12887,6 +12975,7 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -12977,6 +13066,7 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -13070,6 +13160,7 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -13165,6 +13256,7 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::clone(&active_migration),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -13303,6 +13395,7 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -13563,6 +13656,7 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: Some(Bytes::from_static(b"shared-secret")),
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -13759,6 +13853,7 @@ mod tests {
             discovery_addr,
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -14048,6 +14143,7 @@ mod tests {
                 ring: Arc::new(stale_belief),
                 replication,
             })))),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -14208,6 +14304,7 @@ mod tests {
                 ring: Arc::clone(&after_ring),
                 replication: 2,
             })))),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx,
@@ -14217,6 +14314,31 @@ mod tests {
             shutdown_rx: watch::channel(false).1,
         };
         (node_context, after_ring, pre_completion_ring)
+    }
+
+    #[test]
+    fn every_key_is_the_wrong_nodes_until_discovery_promotes_this_node() {
+        let (node_context, _after_ring, _pre_completion_ring) =
+            completed_unconfirmed_context(&["key-3"]);
+        // A ring that names this node for both keys, so only the flag
+        // decides.
+        *node_context.known_ring.lock().unwrap() = Some(Arc::new(Membership {
+            ring: Arc::new(HashRing::new(vec![node_context.name.clone()])),
+            replication: 1,
+        }));
+
+        node_context.promoted.store(false, Ordering::SeqCst);
+        assert!(wrong_node(&node_context, &key(b"key-0")));
+        assert!(wrong_node(&node_context, &key(b"key-3")));
+
+        // Nor does having no membership view at all serve anything: that
+        // is exactly the state a joiner is in before promotion.
+        *node_context.known_ring.lock().unwrap() = None;
+        assert!(wrong_node(&node_context, &key(b"key-0")));
+
+        node_context.promoted.store(true, Ordering::SeqCst);
+        assert!(!wrong_node(&node_context, &key(b"key-0")));
+        assert!(!wrong_node(&node_context, &key(b"key-3")));
     }
 
     #[test]
@@ -14456,6 +14578,7 @@ mod tests {
             discovery_addr: "127.0.0.1:1".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx,
@@ -14867,6 +14990,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: slot,
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -14945,8 +15069,9 @@ mod tests {
             .collect();
         assert_eq!(targets, vec![("127.0.0.1:9".to_string(), true)]);
 
-        // A key both own goes to both, the slot's own joiner first — and
-        // as plain frames, it has no ring of its own yet.
+        // A key both own goes to both, the slot's own joiner first — both
+        // as `U`/`u` frames: the slot's own joiner refuses plain frames
+        // until it is promoted.
         let both = keys_owned_by(&ring_two, "joiner-0")
             .into_iter()
             .find(|candidate| ring_two.is_owner_hashed(KeyHash::of(candidate), "joiner-1", 2))
@@ -14958,7 +15083,7 @@ mod tests {
         assert_eq!(
             targets,
             vec![
-                ("127.0.0.1:11".to_string(), false),
+                ("127.0.0.1:11".to_string(), true),
                 ("127.0.0.1:9".to_string(), true)
             ]
         );
@@ -15277,6 +15402,7 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
@@ -15420,6 +15546,7 @@ mod tests {
                     discovery_addr: "127.0.0.1:1".to_string(),
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
@@ -15551,6 +15678,7 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
@@ -15675,6 +15803,7 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
@@ -15855,6 +15984,7 @@ mod tests {
             discovery_addr: "127.0.0.1:1".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx,
@@ -15973,6 +16103,7 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::clone(&active_migration),
                     known_ring: Arc::new(Mutex::new(None)),
+                    promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
@@ -16130,6 +16261,7 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
@@ -16316,6 +16448,7 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
@@ -16452,6 +16585,7 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
@@ -17194,6 +17328,7 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration,
             known_ring,
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
@@ -17447,6 +17582,7 @@ mod tests {
                 discovery_addr: discovery_addr.clone(),
                 active_migration: Arc::new(Mutex::new(None)),
                 known_ring: Arc::new(Mutex::new(None)),
+                promoted: Arc::new(AtomicBool::new(true)),
                 auth_secret: None,
                 tls_connector: None,
                 request_tx: mpsc::channel(1).0,
@@ -17998,6 +18134,7 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
@@ -18445,6 +18582,88 @@ mod tests {
             "expected at least one heartbeat reporting the newly known replication factor \
              (3) after known_ring was set, got {heartbeats:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_key_is_refused_while_the_join_is_parked_and_served_once_promoted() {
+        // `NodeContext::promoted`: a node whose `J` is still parked (an
+        // earlier join in progress, or its own handoff running) answers
+        // `W` to any client that reaches it — the only way one can is a
+        // connection labelled with an evicted member's name — and starts
+        // serving the moment `R` arrives, before the first heartbeat ack
+        // gives it a membership view.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let fake_discovery = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 128];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            assert!(buffer[..bytes_read].starts_with(b"J "));
+            // Parked, as a staged join is until its handoff completes.
+            release_rx.await.unwrap();
+            connection.write_all(b"R\n").await.unwrap();
+            loop {
+                match connection.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        if connection.write_all(b"A\n").await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let node_context = test_node_context(
+            "test-node",
+            "tk-test-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.promoted.store(false, Ordering::SeqCst);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            node_context.clone(),
+            mpsc::channel::<RereplicationTask>(4).1,
+            shutdown_rx,
+        ));
+
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !node_context.promoted.load(Ordering::SeqCst),
+            "a parked J is not a promotion"
+        );
+        assert!(wrong_node(&node_context, &key(b"key-0")));
+
+        release_tx.send(()).unwrap();
+        for _ in 0..500 {
+            if node_context.promoted.load(Ordering::SeqCst) {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            node_context.promoted.load(Ordering::SeqCst),
+            "R must flip the flag"
+        );
+        // No membership view yet (the ack above carries no roster), and
+        // still served: the flag alone decides until the first roster.
+        assert!(node_context.known_ring.lock().unwrap().is_none());
+        assert!(!wrong_node(&node_context, &key(b"key-0")));
+
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        fake_discovery.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
