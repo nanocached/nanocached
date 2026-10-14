@@ -2920,17 +2920,108 @@ fn registration_message(letter: char, name: &str, port: u16, token: &str) -> Vec
 /// one yet — never a real replication factor (discovery validates every
 /// `--replication-factor` is at least 1), so it's an unambiguous "unknown"
 /// sentinel on the wire.
-fn heartbeat_message(name: &str, replication: Option<usize>, token: &str) -> Vec<u8> {
-    let mut message = format!(
-        "H {} {} {}\n",
+/// `H <name-len> <replication> <token-len> [<joiner-len>]\n<name><token>[<joiner>]`.
+/// The trailing field (issue #571) names the joiner of a handoff this node
+/// completed but has not seen in a roster yet, and asks discovery to
+/// follow the ack with a verdict line — see `read_pending_joiner_verdict`.
+fn heartbeat_message(
+    name: &str,
+    replication: Option<usize>,
+    token: &str,
+    pending_joiner: Option<&str>,
+) -> Vec<u8> {
+    let mut header = format!(
+        "H {} {} {}",
         name.len(),
         replication.unwrap_or(0),
         token.len()
-    )
-    .into_bytes();
+    );
+    if let Some(joiner) = pending_joiner {
+        header.push_str(&format!(" {}", joiner.len()));
+    }
+    header.push('\n');
+    let mut message = header.into_bytes();
     message.extend_from_slice(name.as_bytes());
     message.extend_from_slice(token.as_bytes());
+    if let Some(joiner) = pending_joiner {
+        message.extend_from_slice(joiner.as_bytes());
+    }
     message
+}
+
+/// Issue #571: the joiner of this node's handoff slot if the handoff is
+/// done but discovery has not listed the joiner in any roster this node
+/// saw — the one state a sender cannot resolve on its own (see
+/// `read_pending_joiner_verdict`). `None` for a running transfer (the
+/// joiner is Waiting; an abandon arrives as `X`), for a confirmed slot and
+/// for lingering entries (confirmed by construction).
+fn unconfirmed_completed_joiner(node_context: &NodeContext) -> Option<String> {
+    node_context
+        .active_migration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|active| active.completed_at.is_some() && !active.confirmed)
+        .map(|active| active.joining_name.clone())
+}
+
+enum PendingJoinerVerdict {
+    Known,
+    Gone,
+}
+
+/// Issue #571: the line discovery appends to its ack when the heartbeat
+/// named a pending joiner. `K` — still registered, or at least not known
+/// to have gone: keep waiting for the roster. `G` — on record as having
+/// left, been evicted or abandoned, and not registered since. A joiner
+/// promoted and gone again between two of this node's heartbeats never
+/// appears in a roster this node sees, so `adopt_membership` reads its
+/// absence as "not promoted yet" and the slot would otherwise keep
+/// forwarding to it for the whole grace and hold its marks until the
+/// next `M`.
+async fn read_pending_joiner_verdict<S: AsyncBufReadExt + Unpin>(
+    stream: &mut S,
+) -> io::Result<PendingJoinerVerdict> {
+    let mut line = Vec::new();
+    read_line_capped(stream, 2, &mut line).await?;
+    match line.as_slice() {
+        b"K\n" => Ok(PendingJoinerVerdict::Known),
+        b"G\n" => Ok(PendingJoinerVerdict::Gone),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed pending-joiner verdict",
+        )),
+    }
+}
+
+/// Issue #571: discovery answered `G` for `joining_name` — the same
+/// abandon this node runs for an `X` (`abandon_migration`): the slot's
+/// forwards are revoked, its dead copies restored (this node owns those
+/// keys again; a leaver's drain handoff already re-sent them, an abandon
+/// never moved them) and `known_ring` reverted if it still holds the
+/// abandoned post-join ring.
+async fn abandon_departed_joiner(
+    node_context: &NodeContext,
+    joining_name: &str,
+    discovery_addr: &str,
+) {
+    match abandon_migration(node_context, joining_name) {
+        AbandonOutcome::Completed(restore) => {
+            eprintln!(
+                "WARN joiner {joining_name} left the cluster before this node saw it in a \
+                 roster from discovery at {discovery_addr}; closing its forwarding window and \
+                 restoring {} dead copies",
+                restore.len()
+            );
+            for key in &restore {
+                unmark_migrated(&node_context.request_tx, key).await;
+            }
+        }
+        AbandonOutcome::Aborting => {
+            wait_for_migration_slot_to_clear(node_context, joining_name).await;
+        }
+        AbandonOutcome::NoMatch => {}
+    }
 }
 
 fn auth_message(secret: &[u8]) -> Vec<u8> {
@@ -3208,10 +3299,20 @@ async fn register_with_discovery(
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .as_ref()
                                 .map(|membership| membership.replication);
+                            // Issue #571: asked of the primary only — a
+                            // standby never sees a Waiting joiner, so its
+                            // answer would mean nothing.
+                            let pending_joiner = match &role {
+                                DiscoveryRole::Primary(_) => {
+                                    unconfirmed_completed_joiner(&node_context)
+                                }
+                                DiscoveryRole::Standby(_) => None,
+                            };
                             let heartbeat = heartbeat_message(
                                 &node_context.name,
                                 replication,
                                 &node_context.token,
+                                pending_joiner.as_deref(),
                             );
 
                             if !matches!(
@@ -3236,6 +3337,27 @@ async fn register_with_discovery(
                                 Ok(Ok(roster)) => roster,
                                 _ => break,
                             };
+
+                            // Issue #571: one more line whenever the
+                            // heartbeat asked, grace or not.
+                            if let Some(joiner) = pending_joiner.as_deref() {
+                                let verdict = tokio::select! {
+                                    _ = shutdown_rx.changed() => return,
+                                    result = timeout(OUTBOUND_IO_TIMEOUT, read_pending_joiner_verdict(&mut stream)) => result,
+                                };
+                                match verdict {
+                                    Ok(Ok(PendingJoinerVerdict::Known)) => {}
+                                    Ok(Ok(PendingJoinerVerdict::Gone)) => {
+                                        abandon_departed_joiner(
+                                            &node_context,
+                                            joiner,
+                                            &discovery_addr,
+                                        )
+                                        .await;
+                                    }
+                                    _ => break,
+                                }
+                            }
 
                             // Issue #61: only the primary's view is
                             // adopted — replicas never reconcile with each
@@ -14495,7 +14617,7 @@ mod tests {
     #[test]
     fn heartbeat_message_declares_the_name_length_before_the_name() {
         assert_eq!(
-            heartbeat_message("some-name", Some(2), "tk-some-name"),
+            heartbeat_message("some-name", Some(2), "tk-some-name", None),
             b"H 9 2 12\nsome-nametk-some-name".to_vec()
         );
     }
@@ -14503,7 +14625,7 @@ mod tests {
     #[test]
     fn heartbeat_message_encodes_an_unknown_replication_belief_as_zero() {
         assert_eq!(
-            heartbeat_message("some-name", None, "tk-some-name"),
+            heartbeat_message("some-name", None, "tk-some-name", None),
             b"H 9 0 12\nsome-nametk-some-name".to_vec()
         );
     }
@@ -18664,6 +18786,202 @@ mod tests {
         shutdown_tx.send_replace(true);
         heartbeat_task.await.unwrap();
         fake_discovery.abort();
+    }
+
+    #[test]
+    fn heartbeat_message_names_a_pending_joiner_in_a_trailing_field() {
+        // Issue #571.
+        assert_eq!(
+            heartbeat_message("some-name", Some(2), "tk-some-name", Some("joiner-0")),
+            b"H 9 2 12 8\nsome-nametk-some-namejoiner-0".to_vec()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pending_joiner_discovery_reports_gone_is_abandoned_and_its_marks_restored() {
+        // Issue #571: a joiner promoted and gone again between two of this
+        // node's heartbeats is never in a roster this node sees. The
+        // heartbeat names it, discovery answers `G`, and the slot is
+        // abandoned exactly as for an `X`: forwards revoked, dead copies
+        // restored, `known_ring` reverted.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+        let headers: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&headers);
+
+        let fake_discovery = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(connection);
+            let mut line = String::new();
+            // `J <name-len> <port> <token-len>`: read it whole, promote.
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+                .await
+                .unwrap();
+            let fields: Vec<usize> = line
+                .trim_end()
+                .split(' ')
+                .skip(1)
+                .map(|field| field.parse().unwrap())
+                .collect();
+            let mut body = vec![0u8; fields[0] + fields[2]];
+            reader.read_exact(&mut body).await.unwrap();
+            reader.get_mut().write_all(b"R\n").await.unwrap();
+            loop {
+                line.clear();
+                match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                // `H <name-len> <repl> <token-len> [<joiner-len>]`.
+                let fields: Vec<usize> = line
+                    .trim_end()
+                    .split(' ')
+                    .skip(1)
+                    .map(|field| field.parse().unwrap())
+                    .collect();
+                let mut body =
+                    vec![0u8; fields[0] + fields[2] + fields.get(3).copied().unwrap_or(0)];
+                reader.read_exact(&mut body).await.unwrap();
+                seen.lock().unwrap().push(line.trim_end().to_string());
+                let mut reply = b"A\n".to_vec();
+                if fields.len() == 4 {
+                    reply.extend_from_slice(b"G\n");
+                }
+                if reader.get_mut().write_all(&reply).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: key(b"key-3"),
+                value: Bytes::from_static(b"v3"),
+                ttl: None,
+            },
+        )
+        .await;
+        send_command(&request_tx, Command::MarkMigrated { key: key(b"key-3") }).await;
+
+        let before_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "other-node".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "other-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let pre_completion_ring = Arc::new(Membership {
+            ring: before_ring,
+            replication: 2,
+        });
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: discovery_addr.clone(),
+            active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
+                joining_name: "joiner-0".to_string(),
+                joining_addr: "127.0.0.1:9".to_string(),
+                joining_token: "tok-joiner-0".to_string(),
+                after_ring: Arc::clone(&after_ring),
+                replication: 2,
+                generation: None,
+                completed_at: Some(Instant::now()),
+                forwarding_grace: Duration::from_secs(60),
+                acked_entries: Some(0),
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: vec![key(b"key-3")],
+                confirmed: false,
+                pre_completion_ring: Some(Arc::clone(&pre_completion_ring)),
+                pending_clears: PendingClears::default(),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
+                lingering: Vec::new(),
+            }))),
+            known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
+                ring: Arc::clone(&after_ring),
+                replication: 2,
+            })))),
+            promoted: Arc::new(AtomicBool::new(false)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+        let revoked = Arc::clone(
+            &node_context
+                .active_migration
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .forward_revoked,
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            node_context.clone(),
+            mpsc::channel::<RereplicationTask>(4).1,
+            shutdown_rx,
+        ));
+
+        for _ in 0..500 {
+            if node_context.active_migration.lock().unwrap().is_none() {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        // Let a heartbeat or two go out without the slot.
+        sleep(Duration::from_millis(60)).await;
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        fake_discovery.abort();
+
+        let headers = headers.lock().unwrap().clone();
+        assert!(
+            headers.first().is_some_and(|header| header.ends_with(" 8")),
+            "the first heartbeat must name the 8-byte joiner, got {headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .skip(1)
+                .all(|header| header.split(' ').count() == 4),
+            "once the slot is gone the heartbeat must stop asking, got {headers:?}"
+        );
+        assert!(node_context.active_migration.lock().unwrap().is_none());
+        assert!(revoked.load(Ordering::SeqCst));
+        assert!(Arc::ptr_eq(
+            node_context.known_ring.lock().unwrap().as_ref().unwrap(),
+            &pre_completion_ring
+        ));
+        // The mark is gone and the copy is still there.
+        assert_eq!(
+            send_command(&request_tx, Command::Sweep { marked: true }).await,
+            Response::Swept(0)
+        );
+        assert_eq!(
+            send_command(&request_tx, Command::Get { key: key(b"key-3") }).await,
+            Response::Value(Bytes::from_static(b"v3"))
+        );
+        drop(request_tx);
+        drop(node_context);
+        cache_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

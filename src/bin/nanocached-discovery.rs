@@ -740,7 +740,26 @@ struct RegistryState {
     /// `bump_roster`) — the Waiting/Joining-only mutations that never
     /// mattered to the other two caches included.
     roster_cache: Mutex<Option<CachedResponse>>,
+    /// Issue #571: names that left (`V`), were evicted (`sweep_expired`)
+    /// or whose join was abandoned, with when. What a heartbeat's
+    /// pending-joiner question (`DiscoveryCommand::Heartbeat::
+    /// pending_joiner`) is answered from: a name is reported gone only
+    /// on this positive record, never on mere absence from `nodes` —
+    /// which is empty after a restart until nodes re-announce, and on a
+    /// standby never holds a Waiting joiner. A name registering again
+    /// (`J` or `P`) is taken out, so an abandoned joiner retrying under
+    /// its own name is not reported gone. Pruned by age
+    /// (`DEPARTED_RETENTION`) on every insert and capped
+    /// (`MAX_DEPARTED`).
+    departed: Mutex<FxHashMap<String, Instant>>,
 }
+
+/// How long a departure stays answerable — comfortably past the longest
+/// forwarding grace a sender can hold a slot open for, after which the
+/// question is moot (issue #571).
+const DEPARTED_RETENTION: Duration = Duration::from_secs(3600);
+/// Upper bound on remembered departures; the oldest goes first.
+const MAX_DEPARTED: usize = 4096;
 
 impl Default for RegistryState {
     fn default() -> Self {
@@ -753,6 +772,7 @@ impl Default for RegistryState {
             heartbeat_ack: Mutex::new(None),
             list_cache: Mutex::new(None),
             roster_cache: Mutex::new(None),
+            departed: Mutex::new(FxHashMap::default()),
         }
     }
 }
@@ -1155,6 +1175,15 @@ enum DiscoveryCommand {
         name: String,
         replication: Option<usize>,
         token: String,
+        /// Issue #571: the joiner of a handoff this node completed but
+        /// has not seen in any roster yet, if there is one — an optional
+        /// trailing `<joiner-len>` header field and a trailing body
+        /// field. The ack is then followed by one more line, `K\n` or
+        /// `G\n` (`pending_joiner_verdict`): a joiner that was promoted
+        /// and left again between two of this node's heartbeats is never
+        /// listed in a roster it sees, and without this answer it would
+        /// keep forwarding to it for the whole grace.
+        pending_joiner: Option<String>,
     },
     List,
     /// Issue #122: a client asking for the registered proxies — `L`'s
@@ -1422,6 +1451,9 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let replication = parts.next().ok_or(ParseError::InvalidLength)?;
             let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            // Issue #571: optional trailing field, same backward-compat
+            // idiom as `C`'s generation.
+            let joiner_length = parts.next();
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -1436,19 +1468,38 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
                 r => Some(r),
             };
             let token_length = parse_length(token_length)?;
-            let [name, token] = parse_string_fields(
-                input,
-                header_end,
-                [
-                    (name_length, MAX_NAME_LENGTH),
-                    (token_length, MAX_TOKEN_LENGTH),
-                ],
-            )?;
+            let (name, token, pending_joiner) = match joiner_length {
+                Some(joiner_length) => {
+                    let joiner_length = parse_length(joiner_length)?;
+                    let [name, token, joiner] = parse_string_fields(
+                        input,
+                        header_end,
+                        [
+                            (name_length, MAX_NAME_LENGTH),
+                            (token_length, MAX_TOKEN_LENGTH),
+                            (joiner_length, MAX_NAME_LENGTH),
+                        ],
+                    )?;
+                    (name, token, Some(joiner))
+                }
+                None => {
+                    let [name, token] = parse_string_fields(
+                        input,
+                        header_end,
+                        [
+                            (name_length, MAX_NAME_LENGTH),
+                            (token_length, MAX_TOKEN_LENGTH),
+                        ],
+                    )?;
+                    (name, token, None)
+                }
+            };
 
             Ok(DiscoveryCommand::Heartbeat {
                 name,
                 replication,
                 token,
+                pending_joiner,
             })
         }
 
@@ -1742,6 +1793,55 @@ async fn serve_metrics_connection(
     };
 
     write_http_response(&mut stream, status, &body).await
+}
+
+/// Issue #571: remembers that `name` left the cluster, was evicted, or
+/// had its join abandoned — see `RegistryState::departed`.
+fn record_departed(registry: &Registry, name: &str) {
+    let mut departed = registry
+        .departed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    departed.retain(|_, at| now.duration_since(*at) < DEPARTED_RETENTION);
+    if departed.len() >= MAX_DEPARTED
+        && !departed.contains_key(name)
+        && let Some(oldest) = departed
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(name, _)| name.clone())
+    {
+        departed.remove(&oldest);
+    }
+    departed.insert(name.to_string(), now);
+}
+
+/// Issue #571: `name` registered (again) — it is no longer gone.
+fn forget_departed(registry: &Registry, name: &str) {
+    registry
+        .departed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(name);
+}
+
+/// Issue #571: the answer to a heartbeat's pending-joiner question —
+/// `G\n` (gone) only when `joiner` is on record as departed and has not
+/// registered since, `K\n` (known, or simply not known to be gone)
+/// otherwise. Takes the two locks one after the other, never nested.
+fn pending_joiner_verdict(registry: &Registry, joiner: &str) -> &'static [u8] {
+    let registered = lock(registry).contains_key(joiner);
+    let departed = registry
+        .departed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(joiner)
+        .is_some_and(|at| at.elapsed() < DEPARTED_RETENTION);
+    if departed && !registered {
+        b"G\n"
+    } else {
+        b"K\n"
+    }
 }
 
 fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, NodeInfo>> {
@@ -2566,6 +2666,7 @@ async fn start_join(
             .filter(|info| info.state != NodeState::Joined)
             .count()
             + 1;
+        forget_departed(registry, name);
         let info = guard.entry(name.to_string()).or_insert_with(|| {
             NodeInfo::with_queue_position(
                 address.clone(),
@@ -2890,6 +2991,7 @@ async fn abandon_current_join(
     let stranded = {
         let mut guard = lock(registry);
         let stranded = guard.remove(&pending.joining_name);
+        record_departed(registry, &pending.joining_name);
         // Issue #356: a `Joining` entry leaving the registry is invisible
         // to `L`/`H` but not to `T`'s every-state roster — bumped under
         // `guard`, per `bump_roster`'s invariant.
@@ -3859,6 +3961,7 @@ async fn sweep_expired(
                         "WARN node evicted: {name} (no heartbeat within {}s)",
                         liveness_timeout.as_secs()
                     );
+                    record_departed(&registry, name);
                 }
 
                 // Issue #34 forged-completion fix, other half (see
@@ -3905,6 +4008,7 @@ async fn sweep_expired(
                 }
 
                 for (name, promoted) in waiting_evicted {
+                    record_departed(&registry, &name);
                     eprintln!(
                         "WARN node evicted: {name} (never promoted; waiting-to-join timeout \
                          elapsed — see MAX_WAITING_PER_SOURCE_IP/waiting_timeout_for)"
@@ -4093,6 +4197,7 @@ async fn handle_connection(
                 name,
                 replication,
                 token,
+                pending_joiner,
             }) => {
                 // Checked before anything is refreshed (issue #34): a
                 // heartbeat presenting the wrong token must not keep an
@@ -4177,6 +4282,11 @@ async fn handle_connection(
                 } else {
                     let ack = cached_heartbeat_ack(&registry, config.replication);
                     write_response(&mut stream, &ack).await?;
+                }
+                // Issue #571: answered whenever asked, grace or not, so
+                // the node's read count is deterministic.
+                if let Some(joiner) = pending_joiner.as_deref() {
+                    write_response(&mut stream, pending_joiner_verdict(&registry, joiner)).await?;
                 }
                 continue;
             }
@@ -4326,6 +4436,7 @@ async fn handle_connection(
                             // Issue #279: bumped here, still under `reg`,
                             // rather than after it drops below.
                             bump_roster(&registry);
+                            record_departed(&registry, &name);
                             Ok(Some(removed.state))
                         }
                         Some(_) => Err(()),
@@ -4710,6 +4821,7 @@ async fn handle_connection(
                     }
 
                     println!("INFO node announced: {name} at {addr} (re-registered)");
+                    forget_departed(&registry, &name);
                     guard.insert(name.clone(), NodeInfo::new(addr, NodeState::Joined, token));
                     // A newly (re-)admitted `Joined` node changes the roster.
                     bump_roster(&registry);
@@ -4957,6 +5069,7 @@ mod tests {
                 name: "some-name".to_string(),
                 replication: Some(2),
                 token: "tok-a".to_string(),
+                pending_joiner: None,
             }
         );
         assert_eq!(&input[..], b"L\n");
@@ -4974,6 +5087,7 @@ mod tests {
                 name: "some-name".to_string(),
                 replication: None,
                 token: "tok-a".to_string(),
+                pending_joiner: None,
             }
         );
     }
@@ -5032,6 +5146,7 @@ mod tests {
                 name,
                 replication: None,
                 token,
+                pending_joiner: None,
             })
         );
     }
@@ -5047,8 +5162,48 @@ mod tests {
 
     #[test]
     fn parse_rejects_a_heartbeat_with_trailing_arguments() {
-        let mut input = BytesMut::from(&b"H 9 2 5 extra\nsome-nametok-a"[..]);
+        let mut input = BytesMut::from(&b"H 9 2 5 8 extra\nsome-nametok-ajoiner-0"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn parse_reads_a_heartbeat_with_a_pending_joiner() {
+        // Issue #571: the optional fourth header field and trailing body
+        // field name the joiner this node is waiting to see in a roster.
+        let mut input = BytesMut::from(&b"H 9 2 5 8\nsome-nametok-ajoiner-0L\n"[..]);
+        assert_eq!(
+            parse(&mut input).unwrap(),
+            DiscoveryCommand::Heartbeat {
+                name: "some-name".to_string(),
+                replication: Some(2),
+                token: "tok-a".to_string(),
+                pending_joiner: Some("joiner-0".to_string()),
+            }
+        );
+        assert_eq!(&input[..], b"L\n");
+    }
+
+    #[test]
+    fn a_pending_joiner_is_gone_only_while_recorded_departed_and_not_registered_again() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        // Never heard of: not known to be gone (a restarted replica's
+        // empty registry must not abandon live joins).
+        assert_eq!(pending_joiner_verdict(&registry, "joiner-0"), b"K\n");
+        record_departed(&registry, "joiner-0");
+        assert_eq!(pending_joiner_verdict(&registry, "joiner-0"), b"G\n");
+        // Registered again under the same name (an abandoned join retrying).
+        lock(&registry).insert(
+            "joiner-0".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Waiting,
+                "tok".to_string(),
+            ),
+        );
+        assert_eq!(pending_joiner_verdict(&registry, "joiner-0"), b"K\n");
+        forget_departed(&registry, "joiner-0");
+        lock(&registry).remove("joiner-0");
+        assert_eq!(pending_joiner_verdict(&registry, "joiner-0"), b"K\n");
     }
 
     #[test]
