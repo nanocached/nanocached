@@ -11,6 +11,12 @@
 # keyspace, no deletes), and the untouched range k20000..k29999 verifies
 # with 0 miss / 0 corrupt / 0 err at the end. err_total is printed, not
 # asserted (in-flight ops on a killed node's connections fail once).
+# Printed, not asserted (#563 / #565 / #582): a versioned writer
+# (stalewrite.py, s0..s19999) is stopped the moment the last round ends and
+# reports how many keys read back older than their last acknowledged
+# write ("stale"), and every node's nanocached_node_entries is sampled
+# after each round into $L/entries.txt (a displaced node holding far more
+# than its share is #563's leftover copies).
 #   docker build --target node -t nanocached-node:dev .
 #   docker build --target discovery -t nanocached-discovery:dev .
 #   NODE=nanocached-node:dev DISC=nanocached-discovery:dev ROUNDS=6 ./chaos.sh
@@ -34,10 +40,17 @@ disc_up $P-disc --replication-factor 2; sleep 1
 live=()   # container names of live nodes, oldest first
 seq_no=0
 # Sets $spawned (no command substitution: a subshell would lose live/seq_no).
-spawn(){ seq_no=$((seq_no+1)); spawned=$P-n$seq_no; node_up $spawned $D --drain-timeout 20; live+=("$spawned"); echo "$spawned $(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $spawned)" >> "$L/ipmap.txt"; }
+spawn(){ seq_no=$((seq_no+1)); spawned=$P-n$seq_no; node_up $spawned $D --drain-timeout 20 --metrics-port 9100; live+=("$spawned"); echo "$spawned $(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $spawned)" >> "$L/ipmap.txt"; }
 for _ in 1 2 3; do spawn; wait_members ${#live[@]} $D 120 || { T "FAIL: bootstrap member $spawned"; cleanup; exit 1; }; done
 T "seed 30000 keys (R=2): k0..k19999 is the load's keyspace, k20000..k29999 stays untouched"
 docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1
+# nanocached_node_entries of every live node, one line per node: "<label> <node> <entries>".
+entries_snapshot(){ for n in "${live[@]}"; do echo "$1 $n $(docker run --rm --network $NET e2e-client python -c "import urllib.request,sys;print([l.split()[1] for l in urllib.request.urlopen('http://$n:9100/metrics',timeout=5).read().decode().splitlines() if l.startswith('nanocached_node_entries ')][0])" 2>/dev/null || echo "?")"; done >> "$L/entries.txt"; }
+T "start the versioned writer (4 workers over s0..s19999; stopped when the last round ends)"
+docker run -d --name $P-swriter --network $NET -v "$E:/w" -w /w e2e-client python stalewrite.py --addr $D --n 20000 --workers 4 --prefix s --size 256 --settle 15 --report-every 30 >/dev/null
+for _ in $(seq 1 120); do docker logs $P-swriter 2>&1 | grep -q '"phase": "seeded"' && break; sleep 1; done
+docker logs $P-swriter 2>&1 | grep -q '"phase": "seeded"' || { T "FAIL: versioned writer did not finish seeding"; fail=1; }
+entries_snapshot seeded
 T "start ${LOAD_SECS}s mixed load (8 conns, get 70%, hedge 10ms, reconnect on error)"
 docker run -d --name $P-load --network $NET -v "$E:/w" -w /w e2e-client python load.py --addr $D --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label chaos --reconnect-on-error --hedge 0.01 --report-every 30 >/dev/null
 sleep 5
@@ -73,7 +86,14 @@ for r in $(seq 1 $ROUNDS); do
       ;;
   esac
   T "round $r done in $(( $(date +%s)-t0 ))s; live=[${live[*]}]"
+  entries_snapshot "round$r-$a"
 done
+T "stop the versioned writer (settle 15s, then read back every key)"
+tmo 300 docker stop -t 240 $P-swriter >/dev/null
+versioned=$(docker logs $P-swriter 2>&1 | grep '"phase": "checked"' | tail -1)
+echo "=== versioned: ${versioned:-NO RESULT}"
+docker logs $P-swriter > "$L/swriter.log" 2>&1
+sleep 20; entries_snapshot final
 T "waiting for the load to finish (<= $LOAD_SECS s total)"
 tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
 load=$(docker logs $P-load 2>&1 | tail -1)
@@ -82,6 +102,7 @@ docker logs $P-load > "$L/load.log" 2>&1
 T "verify the 10000 untouched keys (loss/corruption check)"
 check=$(tmo 300 docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
 echo "=== check: $check"
+entries_snapshot end
 echo "=== discovery: abandoned=$(docker logs $P-disc 2>&1 | grep -c 'join abandoned') evicted=$(docker logs $P-disc 2>&1 | grep -ci 'evict')"
 warns $P-disc "${live[@]}"
 for f in "$L"/"$P"-n*.log; do [ -f "$f" ] && { echo "== $(basename "$f")"; grep -i "warn\|error\|panic" "$f" | sed 's/[0-9.]*:[0-9]*/X/g' | sort | uniq -c | sort -rn | head -5; }; done
@@ -89,6 +110,7 @@ echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { T "FAIL: untouc
 echo "$load" | grep -q '"corrupt": 0' || { T "FAIL: load saw corrupt reads"; fail=1; }
 echo "$load" | grep -q '"miss": 0' || { T "FAIL: load saw misses"; fail=1; }
 for c in $(docker ps -aq --filter name=$P-); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); ip=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $c); echo "$n $ip" >> "$L/ipmap.txt"; [ -f "$L/$n.log" ] || docker logs -t $c > "$L/$n.log" 2>&1; done
+echo "=== entries:"; cat "$L/entries.txt"
 echo "=== logs in $L"; cat "$L/ipmap.txt"
 cleanup
 if [ $fail = 0 ]; then T "DONE (PASS)"; else T "DONE (FAIL)"; exit 1; fi
