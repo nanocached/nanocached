@@ -52,7 +52,7 @@ for _ in $(seq 1 120); do docker logs $P-swriter 2>&1 | grep -q '"phase": "seede
 docker logs $P-swriter 2>&1 | grep -q '"phase": "seeded"' || { T "FAIL: versioned writer did not finish seeding"; fail=1; }
 entries_snapshot seeded
 T "start ${LOAD_SECS}s mixed load (8 conns, get 70%, hedge 10ms, reconnect on error)"
-docker run -d --name $P-load --network $NET -v "$E:/w" -w /w e2e-client python load.py --addr $D --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label chaos --reconnect-on-error --hedge 0.01 --report-every 30 >/dev/null
+docker run -d --name $P-load --network $NET -v "$E:/w" -w /w e2e-client python ${LOADER:-load.py} --addr $D --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label chaos --reconnect-on-error --hedge 0.01 --report-every 30 >/dev/null
 sleep 5
 actions=(join decommission kill)
 for r in $(seq 1 $ROUNDS); do
