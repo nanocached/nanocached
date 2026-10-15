@@ -180,7 +180,7 @@ namespace can take a minute to appear there).</p>
 <p><code>td-discovery.json</code>:</p>
 <pre><code>[{
   "name": "nanocached-discovery",
-  "image": "ghcr.io/nanocached/nanocached-discovery@sha256:f3368f0d35fdac03264915bdfe6818b458f14c25068f069aa79bcb2c22805288",
+  "image": "ghcr.io/nanocached/nanocached-discovery@sha256:2128603c51ef9390861d0dd85b2f555a0ce6e9584c9b47f084332d7b250ddc1b",
   "essential": true,
   "command": ["--host", "0.0.0.0", "--port", "8357", "--replication-factor", "2",
               "--metrics-port", "9357"],
@@ -195,7 +195,7 @@ namespace can take a minute to appear there).</p>
 <p><code>td-node.json</code>:</p>
 <pre><code>[{
   "name": "nanocached-node",
-  "image": "ghcr.io/nanocached/nanocached-node@sha256:7ca62b477976620b9a81d8d903683187fa901a4ef09d74f23ab8371b0b147623",
+  "image": "ghcr.io/nanocached/nanocached-node@sha256:3da39708c70ac59d182d17f2486dd96c4de30d86b34b3c433fcc23192881d235",
   "essential": true,
   "command": ["--host", "0.0.0.0", "--port", "8356", "--discovery", "disc.nanocached.local:8357",
               "--drain-timeout", "20", "--metrics-port", "9356", "--max-memory", "536870912"],
