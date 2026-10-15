@@ -9,6 +9,8 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-15
+
 ### Fixed
 
 - Every short-lived thread or ASGI request context used to build its own

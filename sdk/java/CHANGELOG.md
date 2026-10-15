@@ -11,6 +11,8 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-15
+
 ### Fixed
 
 - A request blocked mid-write no longer stalls the reader thread. The writer
@@ -380,7 +382,8 @@ without a deprecation cycle and are listed below.
 - First tag-driven release of the aligned SDK line (see the repository
   release history for earlier changes).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.4...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.5...HEAD
+[0.4.5]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.4...sdk/java/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.2...sdk/java/v0.4.4
 [0.4.2]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.1...sdk/java/v0.4.2
 [0.4.1]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.0...sdk/java/v0.4.1

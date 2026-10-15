@@ -8,7 +8,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
 
     <PackageId>Nanocached.Caching</PackageId>
-    <Version>0.4.4</Version>
+    <Version>0.4.5</Version>
     <Authors>Takashi Yamashina</Authors>
     <Description>IDistributedCache adapter for nanocached, on top of the Nanocached .NET SDK.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

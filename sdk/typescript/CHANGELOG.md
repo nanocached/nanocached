@@ -9,6 +9,8 @@ tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-15
+
 ### Fixed
 
 - `close()` no longer hangs when a node reset its connection between the
@@ -347,7 +349,8 @@ changes ship without a deprecation cycle and are listed below.
 0.1.x were pipeline-validation releases: 0.1.1 failed to publish, and
 0.1.2 is the first release published by CI.
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.4...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.5...HEAD
+[0.4.5]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.4...sdk/typescript/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.2...sdk/typescript/v0.4.4
 [0.4.2]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.1...sdk/typescript/v0.4.2
 [0.4.1]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.0...sdk/typescript/v0.4.1

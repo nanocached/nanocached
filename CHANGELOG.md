@@ -12,6 +12,8 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-15
+
 ### Fixed
 
 - `nanocached-node`: abandoning a handoff no longer ends the forwarding
@@ -566,7 +568,8 @@ without a deprecation cycle and are listed here.
 - Container images for `nanocached-node` and `nanocached-discovery`
   (separate Dockerfile targets).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/server/v0.4.4...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/server/v0.4.5...HEAD
+[0.4.5]: https://github.com/nanocached/nanocached/compare/server/v0.4.4...server/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/server/v0.4.3...server/v0.4.4
 [0.4.3]: https://github.com/nanocached/nanocached/compare/server/v0.4.2...server/v0.4.3
 [0.4.2]: https://github.com/nanocached/nanocached/compare/server/v0.4.1...server/v0.4.2

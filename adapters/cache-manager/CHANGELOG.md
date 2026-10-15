@@ -9,6 +9,12 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-15
+
+No changes. Version aligned with the rest of the project: every release
+ships the server, the six SDKs and the seven framework adapters at one
+version, whether or not a component changed.
+
 ## [0.4.4] - 2026-09-09
 
 First release: a `cache-manager` v5 `Store` (`nanocachedStore`) for the TypeScript SDK.

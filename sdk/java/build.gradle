@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'org.nanocached'
-version = '0.4.4'
+version = '0.4.5'
 
 mavenPublishing {
     publishToMavenCentral(true)
