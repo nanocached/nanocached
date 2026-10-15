@@ -6864,9 +6864,20 @@ async fn run_sweep(
                 })
             });
 
+            let ownership_checked = owner.is_some();
             tokio::select! {
                 result = sweep(&request_tx, !marks_held, owner) => match result {
-                    Some(removed) if removed >= SWEEP_BUDGET => continue,
+                    Some(removed) if removed >= SWEEP_BUDGET => {
+                        // Issue #582 (diagnostic build only): one line per
+                        // sweep call that did work, so a removal burst can be
+                        // placed against a client's miss.
+                        eprintln!("INFO sweep call reclaimed {removed} (ownership-checked: {ownership_checked}, marks held: {marks_held})");
+                        continue
+                    }
+                    Some(removed) if removed > 0 => {
+                        eprintln!("INFO sweep call reclaimed {removed} (ownership-checked: {ownership_checked}, marks held: {marks_held})");
+                        break
+                    }
                     _ => break,
                 },
                 _ = shutdown_rx.changed() => return,
@@ -7985,6 +7996,12 @@ async fn mark_if_displaced_serving(
     key: &Key,
 ) {
     if ownership == Some(Ownership::DisplacedServing) {
+        // Issue #582 (diagnostic build only): NANOCACHED_LOG_MARKS=1 logs
+        // every copy a displaced-serving write marks dead.
+        static LOG_MARKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LOG_MARKS.get_or_init(|| std::env::var_os("NANOCACHED_LOG_MARKS").is_some()) {
+            eprintln!("INFO mark-on-write {}", String::from_utf8_lossy(&key.name));
+        }
         mark_migrated(request_tx, key).await;
     }
 }
