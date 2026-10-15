@@ -6,3 +6,4 @@ sdk/dotnet/out/
 __pycache__/
 .pnpm-store/
 .claude/
+/tests/e2e/logs/
