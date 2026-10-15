@@ -33,7 +33,9 @@ T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
 # Portable `timeout` (macOS has none): kill the command after N seconds.
 tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
-RUN=${RUN:-$(date +%H%M%S)}; L="$E/logs/chaos-$RUN"; mkdir -p "$L"
+# A reused RUN name must not keep the previous run's node logs: the end-of-run
+# capture skips files that already exist (a leaver's log is saved when it leaves).
+RUN=${RUN:-$(date +%H%M%S)}; L="$E/logs/chaos-$RUN"; rm -rf "$L"; mkdir -p "$L"
 cleanup; docker network create $NET >/dev/null
 fail=0
 disc_up $P-disc --replication-factor 2; sleep 1
