@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nanocached-django"
-version = "0.4.4"
+version = "0.4.5"
 description = "Django cache backend for nanocached, a tiny distributed cache with client-side replication"
 readme = "README.md"
 license = "MIT"
@@ -23,7 +23,7 @@ classifiers = [
 # Spring adapter is on top of the Java SDK. Released at the project's one
 # shared version (server, SDKs and adapters move together), pinned to the
 # SDK release of the same cycle.
-dependencies = ["nanocached>=0.4.4", "Django>=4.2"]
+dependencies = ["nanocached>=0.4.5", "Django>=4.2"]
 
 [project.urls]
 Homepage = "https://nanocached.org"

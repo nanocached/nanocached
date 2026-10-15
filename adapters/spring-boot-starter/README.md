@@ -8,14 +8,14 @@ this dependency and setting `nanocached.addresses` is the whole setup.
 ## Install
 
 ```groovy
-implementation 'org.nanocached:nanocached-spring-boot-starter:0.4.4'
+implementation 'org.nanocached:nanocached-spring-boot-starter:0.4.5'
 ```
 
 ```xml
 <dependency>
   <groupId>org.nanocached</groupId>
   <artifactId>nanocached-spring-boot-starter</artifactId>
-  <version>0.4.4</version>
+  <version>0.4.5</version>
 </dependency>
 ```
 

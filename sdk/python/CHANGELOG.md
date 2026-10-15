@@ -9,6 +9,8 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-15
+
 ### Fixed
 
 - A malformed roster address (no `:port`, port above 65535) now counts as
@@ -349,7 +351,8 @@ without a deprecation cycle and are listed below.
 - First tag-driven release of the aligned SDK line (see the repository
   release history for earlier changes).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.4...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.5...HEAD
+[0.4.5]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.4...sdk/python/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.2...sdk/python/v0.4.4
 [0.4.2]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.1...sdk/python/v0.4.2
 [0.4.1]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.0...sdk/python/v0.4.1

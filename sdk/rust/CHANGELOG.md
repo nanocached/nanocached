@@ -6,6 +6,8 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-15
+
 ### Fixed
 
 - Large requests and large responses on one pipelined connection could

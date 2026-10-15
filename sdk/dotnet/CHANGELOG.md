@@ -10,6 +10,8 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-15
+
 ### Fixed
 
 - A TLS certificate or handshake failure (`AuthenticationException`) on a
@@ -397,7 +399,8 @@ changes ship without a deprecation cycle and are listed below.
   pipeline-validation releases (see the repository release history for
   earlier changes).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.4...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.5...HEAD
+[0.4.5]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.4...sdk/dotnet/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.2...sdk/dotnet/v0.4.4
 [0.4.2]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.1...sdk/dotnet/v0.4.2
 [0.4.1]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.0...sdk/dotnet/v0.4.1
