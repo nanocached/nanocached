@@ -6189,5 +6189,61 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
                 await node.close()
 
 
+class IdentifyFailureRetiresTheSocketTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_reset_on_the_a_ack_leaves_no_unretrieved_close_waiter(self):
+        # A node that exits mid-handshake (a decommissioning node's listener
+        # closing with this dial still in its accept backlog) resets the
+        # connection before the `A` ack. asyncio records that error on the
+        # protocol's close waiter as well as raising it from the read; a
+        # dial that only `close()`s the writer never retrieves it there,
+        # and whenever cyclic GC finalizes the waiter before the protocol
+        # asyncio logs "Future exception was never retrieved" at ERROR
+        # (seen at interpreter exit in the scale-in E2E, 2026-10-16). The
+        # failure path has to wait for the close so the error is retrieved;
+        # `_log_traceback` is the flag asyncio's finalizer checks before
+        # logging, cleared by any retrieval.
+        import socket
+        import struct
+
+        from nanocached._identify import connect_and_identify
+
+        async def reset_after_reading_the_a_frame(reader, writer):
+            with contextlib.suppress(Exception):
+                await reader.readuntil(b"\n")
+            sock = writer.get_extra_info("socket")
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            writer.close()
+
+        server = await asyncio.start_server(reset_after_reading_the_a_frame, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        writers = []
+        real_open_connection = asyncio.open_connection
+
+        async def spying_open_connection(*args, **kwargs):
+            reader, writer = await real_open_connection(*args, **kwargs)
+            writers.append(writer)
+            return reader, writer
+
+        try:
+            with (
+                mock.patch("asyncio.open_connection", spying_open_connection),
+                self.assertRaises(ConnectionResetError),
+            ):
+                await connect_and_identify("127.0.0.1", port, None, None)
+            # Every stage of the handshake fallback (`T R`, `T`, plain) was
+            # reset: three sockets, each closed with its connection_lost
+            # error already retrieved by the time the dial has failed.
+            self.assertEqual(len(writers), 3)
+            for writer in writers:
+                waiter = writer._protocol._get_close_waiter(writer)
+                self.assertTrue(waiter.done())
+                retrieved = not waiter._log_traceback
+                self.assertIsInstance(waiter.exception(), ConnectionResetError)
+                self.assertTrue(retrieved, "connection_lost error left unretrieved on the close waiter")
+        finally:
+            server.close()
+            await server.wait_closed()
+
+
 if __name__ == "__main__":
     unittest.main()

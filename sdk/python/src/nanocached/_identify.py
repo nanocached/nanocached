@@ -205,6 +205,24 @@ async def _connect_and_identify_with_deadline(
         ) from error
 
 
+async def _retire(writer: asyncio.StreamWriter) -> None:
+    """Waits for a writer whose transport is already closing (connection
+    reset or closed by the peer) to finish, so the connection_lost error
+    — typically an RST on the `A` ack from a node that is exiting
+    mid-handshake — is retrieved from the protocol's close waiter. Without
+    this the error sits un-retrieved on that future and asyncio logs
+    "Future exception was never retrieved" (at ERROR, through the asyncio
+    logger) whenever cyclic GC happens to finalize the future before the
+    protocol. The caller's own error is what propagates: a close-time error
+    is dropped here. Since connection_lost has run or is scheduled by the
+    time the transport reports closing, the wait is at most one loop turn.
+    Only called for such a transport — see _connect_and_identify."""
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
 async def _connect_and_identify(
     host: str,
     port: int,
@@ -297,7 +315,16 @@ async def _connect_and_identify(
         writer.close()
         return result
     except BaseException:
+        # Only a transport that is already closing on its own — the peer
+        # reset or closed the connection, which is what put an error on
+        # the close waiter — is waited for; a live connection that failed
+        # for another reason (auth refused, malformed ack, the deadline)
+        # is closed as before, with no wait that could outlast the deadline
+        # (a TLS close handshake, for one).
+        already_closing = writer.transport.is_closing()
         writer.close()
+        if already_closing:
+            await _retire(writer)
         raise
 
 
