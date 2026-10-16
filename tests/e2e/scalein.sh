@@ -38,7 +38,7 @@ T "leaver exited rc=$rc after $(( $(date +%s)-t0 ))s (want rc=0, well under 40s)
 wait_members 2 $D 30
 T "waiting for the load to finish"
 docker wait $P-load >/dev/null
-load=$(docker logs $P-load 2>&1 | tail -1)
+load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)
 echo "=== load: $load"
 T "verify the 10000 untouched keys post-drain (loss/corruption check)"
 check=$(docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)

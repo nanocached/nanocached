@@ -51,7 +51,7 @@ case $MODE in
 esac
 docker wait $P-load >/dev/null
 fi
-docker logs $P-load > "$L/load.log" 2>&1; load=$(tail -1 "$L/load.log"); echo "=== load: $load"
+docker logs $P-load > "$L/load.log" 2>&1; load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1); echo "=== load: $load"
 check=$(docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
 echo "=== check: $check"
 echo "=== entries per node (metrics)"; for c in $(docker ps --filter name=$P-n --format '{{.Names}}' | sort); do printf "%s " $c; docker run --rm --network $NET e2e-client python -c "import urllib.request,re,sys;t=urllib.request.urlopen('http://$c:9100/metrics',timeout=3).read().decode();print(' '.join(l for l in t.splitlines() if re.search('entries|marked',l) and not l.startswith('#')))"; done

@@ -82,7 +82,7 @@ versioned=$(docker logs $P-swriter 2>&1 | grep '"phase": "checked"' | tail -1)
 echo "writer: $(echo "$versioned" | cut -c1-300)"
 T "wait for the load to end"
 tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
-load=$(docker logs $P-load 2>&1 | tail -1)
+load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)
 echo "load: $(echo "$load" | cut -c1-300)"
 T "read back k0..k19999 (load keyspace, miss only) and k20000..k29999 (untouched, exact value)"
 seq 0 19999 | sed 's/^/k/' > "$L/kload.txt"

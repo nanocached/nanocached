@@ -98,7 +98,7 @@ docker logs $P-swriter > "$L/swriter.log" 2>&1
 sleep 20; entries_snapshot final
 T "waiting for the load to finish (<= $LOAD_SECS s total)"
 tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
-load=$(docker logs $P-load 2>&1 | tail -1)
+load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)
 echo "=== load: $load"
 docker logs $P-load > "$L/load.log" 2>&1
 T "verify the 10000 untouched keys (loss/corruption check)"

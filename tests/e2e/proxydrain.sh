@@ -51,7 +51,7 @@ rc=$(docker inspect -f '{{.State.ExitCode}}' $P-p1)
 T "proxy exited rc=$rc after $(( ($(date +%s%N)-t0)/1000000 ))ms (want rc=0, well under 30s)"
 T "waiting for the load to finish"
 docker wait $P-load >/dev/null
-load=$(docker logs $P-load 2>&1 | tail -1)
+load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)
 echo "=== load: $load"
 T "verify the 5000 untouched keys post-drain (loss/corruption check)"
 check=$(docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py check --addr $D,$D --start 10000 --n 5000 --size 256 | tail -1)
