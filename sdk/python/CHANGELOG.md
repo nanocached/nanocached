@@ -9,6 +9,18 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- A dial that fails during the `A` handshake — typically a node exiting
+  mid-handshake and resetting the connection — now waits for its socket
+  to finish closing, which retrieves the connection error asyncio had
+  recorded on the protocol's close waiter. Before, that error sat
+  unretrieved and asyncio logged `Future exception was never retrieved`
+  (an ERROR through the `asyncio` logger) whenever the garbage collector
+  happened to finalize the waiter before the protocol — seen as a
+  spurious ERROR at interpreter exit after a node scale-in. No socket was
+  leaked; the error the caller sees is unchanged.
+
 ## [0.4.5] - 2026-10-15
 
 ### Fixed
