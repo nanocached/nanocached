@@ -3752,18 +3752,27 @@ class NanocachedClientTest {
      * every name in {@code deadNames} is listed with an address nobody
      * listens on, and every other name gets a real {@link MockNode}. */
     private static TolerantCluster startClusterWithDeadNodes(List<String> deadNames) throws Exception {
+        // unusedPort() frees the port the instant it returns it, and on
+        // Linux that port can be handed straight back out to the very
+        // next bind — so it must be the last socket operation here,
+        // after every real listener (MockNode, MockDiscovery) is already
+        // bound. Doing it earlier let the discovery listener land on a
+        // "dead" port, turning an intentionally-unreachable node into a
+        // live non-node one (the Java twin of #527).
         Map<String, MockNode> liveNodes = new java.util.LinkedHashMap<>();
-        List<DiscoveredNode> entries = new ArrayList<>();
         for (String name : NAMES) {
-            if (deadNames.contains(name)) {
-                entries.add(new DiscoveredNode(name, "127.0.0.1:" + MockServers.unusedPort()));
-            } else {
-                MockNode node = new MockNode();
-                liveNodes.put(name, node);
-                entries.add(new DiscoveredNode(name, node.address()));
+            if (!deadNames.contains(name)) {
+                liveNodes.put(name, new MockNode());
             }
         }
-        MockDiscovery discovery = new MockDiscovery(entries, 2);
+        MockDiscovery discovery = new MockDiscovery(List.of(), 2);
+        List<DiscoveredNode> entries = new ArrayList<>();
+        for (String name : NAMES) {
+            MockNode node = liveNodes.get(name);
+            String address = node == null ? "127.0.0.1:" + MockServers.unusedPort() : node.address();
+            entries.add(new DiscoveredNode(name, address));
+        }
+        discovery.nodes = entries;
         return new TolerantCluster(liveNodes, discovery);
     }
 
