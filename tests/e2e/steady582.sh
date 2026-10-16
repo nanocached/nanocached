@@ -92,4 +92,5 @@ save_logs
 echo "=== entries:"; cat "$L/entries.txt"
 echo "=== reclaim WARN/ERROR lines:"; grep -h "WARN\|ERROR" "$L"/n?.log | grep -v "accepted connection" | sed 's/[0-9.]*:[0-9]*:/X:/' | sort | uniq -c | sort -rn | head -8
 cleanup
-T "DONE (logs in $L)"
+if [ "$fail" = 0 ]; then T "DONE (logs in $L)"; else T "DONE with a FAIL above (logs in $L)"; fi
+exit "$fail"
