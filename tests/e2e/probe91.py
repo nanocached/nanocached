@@ -59,9 +59,9 @@ async def one(i, host, port):
     torn = {"at": None}
     post_io = {"n": 0}
     orig_teardown = client._teardown
-    def teardown_spy():
+    async def teardown_spy():
         torn["at"] = time.monotonic()
-        orig_teardown()
+        await orig_teardown()
     client._teardown = teardown_spy
     # a leg doing connection work after teardown is the actual harm
     orig_mc = client._member_connection

@@ -19,5 +19,5 @@ for n in a b c; do
     sh -c 'apk add --no-cache iproute2-tc >/dev/null 2>&1 && tc qdisc add dev eth0 root netem delay 40ms' >/dev/null 2>&1
 done
 T "cluster up (R=2, 3 nodes, +40ms netem each)"
-docker run --rm --name $P-probe --network $NET -v $E:/w -w /w e2e-client python probe91.py $D $ITERS 40
-T DONE; cleanup
+docker run --rm --name $P-probe --network $NET -v $E:/w -w /w e2e-client python probe91.py $D $ITERS 40; rc=$?
+[ $rc = 0 ] && T "DONE" || T "DONE (FAIL: probe exited $rc)"; cleanup; exit $rc
