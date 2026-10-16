@@ -3539,6 +3539,7 @@ async fn register_with_discovery(
                             if let Some((members, replication)) = roster
                                 && matches!(role, DiscoveryRole::Primary(_))
                             {
+                                let published = members.clone();
                                 let change = adopt_membership(
                                     &node_context.known_ring,
                                     &node_context.active_migration,
@@ -3548,9 +3549,20 @@ async fn register_with_discovery(
                                 );
                                 // Issue #582: this is the only place a
                                 // discovery-published membership enters
-                                // the reclaim pass's history.
-                                if let Some(change) = &change {
-                                    node_context.ring_history.record(Arc::clone(&change.after));
+                                // the reclaim pass's history. No change
+                                // means either the roster is what this
+                                // node already holds — usually the ring a
+                                // handoff it ran installed at completion,
+                                // which discovery has now published — or
+                                // it was withheld while this node's own
+                                // join is pending; only the former counts.
+                                if let Some(membership) = published_membership(
+                                    change.as_ref(),
+                                    &node_context.known_ring,
+                                    &published,
+                                    replication,
+                                ) {
+                                    node_context.ring_history.record_if_new(membership);
                                 }
 
                                 // Issue #266: a ring change that dropped a
@@ -3922,13 +3934,9 @@ fn adopt_membership(
     let mut guard = known_ring
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let unchanged = guard.as_ref().is_some_and(|current| {
-        current.replication == replication && {
-            let mut known: Vec<&String> = current.ring.nodes().iter().collect();
-            known.sort_unstable();
-            known.len() == members.len() && known.iter().zip(&members).all(|(a, b)| *a == b)
-        }
-    });
+    let unchanged = guard
+        .as_ref()
+        .is_some_and(|current| same_members(current, &members, replication));
     if unchanged {
         return None;
     }
@@ -3948,6 +3956,46 @@ fn adopt_membership(
     );
 
     Some(RingChange { before, after })
+}
+
+/// True if `membership` is exactly the roster `members` (any order,
+/// duplicates ignored) at `replication`: `adopt_membership`'s "nothing to
+/// change" test, and how the heartbeat ack tells a roster that merely
+/// confirms the ring a handoff already installed from one it withheld
+/// (issue #582).
+fn same_members(membership: &Membership, members: &[String], replication: usize) -> bool {
+    if membership.replication != replication {
+        return false;
+    }
+    let mut known: Vec<&String> = membership.ring.nodes().iter().collect();
+    known.sort_unstable();
+    let mut wanted: Vec<&String> = members.iter().collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    known == wanted
+}
+
+/// Issue #582: the membership a heartbeat ack just published, as the
+/// reclaim history should see it — `change.after` when `adopt_membership`
+/// applied the roster, else the membership this node already holds when
+/// the roster merely repeats it (the ring a handoff this node ran
+/// installed at completion, now published), and `None` when the roster
+/// was withheld because this node's own join is still pending (it then
+/// differs from what the node holds) or the node has no ring yet.
+fn published_membership(
+    change: Option<&RingChange>,
+    known_ring: &KnownRing,
+    roster: &[String],
+    replication: usize,
+) -> Option<Arc<Membership>> {
+    if let Some(change) = change {
+        return Some(Arc::clone(&change.after));
+    }
+    let current = known_ring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()?;
+    same_members(&current, roster, replication).then_some(current)
 }
 
 /// What `adopt_membership` actually applied — see its own doc comment.
@@ -4127,10 +4175,29 @@ struct RingHistoryInner {
 }
 
 impl RingHistory {
-    fn record(&self, membership: Arc<Membership>) {
-        self.record_at(membership, Instant::now());
+    /// Records `membership` as in force from now — unless it is the
+    /// newest epoch already (same members, same replication): every
+    /// heartbeat ack re-reports the ring, and a repeat is not a change.
+    fn record_if_new(&self, membership: Arc<Membership>) {
+        self.record_if_new_at(membership, Instant::now());
     }
 
+    fn record_if_new_at(&self, membership: Arc<Membership>, now: Instant) {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, newest)) = inner.epochs.last()
+            && (Arc::ptr_eq(newest, &membership)
+                || same_members(newest, membership.ring.nodes(), membership.replication))
+        {
+            return;
+        }
+        inner.epochs.push((now, membership));
+        inner.generation += 1;
+    }
+
+    #[cfg(test)]
     fn record_at(&self, membership: Arc<Membership>, now: Instant) {
         let mut inner = self
             .0
@@ -14859,6 +14926,78 @@ mod tests {
             1,
             "memberships older than the one in force at the window's start are dropped"
         );
+    }
+
+    #[test]
+    fn ring_history_records_a_republished_ring_once_and_a_changed_one_again() {
+        let history = RingHistory::default();
+        let t0 = Instant::now();
+        let a = membership_of(&["a", "b"], 1);
+        let a_again = membership_of(&["b", "a"], 1);
+        let a_r2 = membership_of(&["a", "b"], 2);
+        let b = membership_of(&["a"], 1);
+
+        history.record_if_new_at(Arc::clone(&a), t0);
+        history.record_if_new_at(Arc::clone(&a), t0 + Duration::from_secs(5));
+        history.record_if_new_at(a_again, t0 + Duration::from_secs(10));
+        assert_eq!(
+            history.0.lock().unwrap().epochs.len(),
+            1,
+            "a heartbeat repeat is not an epoch"
+        );
+        assert_eq!(history.0.lock().unwrap().generation, 1);
+
+        history.record_if_new_at(a_r2, t0 + Duration::from_secs(15));
+        history.record_if_new_at(b, t0 + Duration::from_secs(20));
+        history.record_if_new_at(a, t0 + Duration::from_secs(25));
+        assert_eq!(
+            history.0.lock().unwrap().epochs.len(),
+            4,
+            "replication and member changes are"
+        );
+    }
+
+    #[test]
+    fn published_membership_takes_the_change_or_a_repeat_of_the_held_ring_only() {
+        let names = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let held = membership_of(&["a", "b", "c"], 2);
+        let known_ring: KnownRing = Arc::new(Mutex::new(Some(Arc::clone(&held))));
+
+        // The ack changed the ring: what it installed.
+        let after = membership_of(&["a", "b"], 2);
+        let change = RingChange {
+            before: Some(Arc::clone(&held)),
+            after: Arc::clone(&after),
+        };
+        let got = published_membership(Some(&change), &known_ring, &names(&["a", "b"]), 2).unwrap();
+        assert!(Arc::ptr_eq(&got, &after));
+
+        // No change because the roster repeats the held ring (a handoff
+        // installed it first): the held ring, so the history learns it.
+        let got = published_membership(None, &known_ring, &names(&["c", "b", "a"]), 2).unwrap();
+        assert!(Arc::ptr_eq(&got, &held));
+
+        // No change because the roster was withheld (own join pending):
+        // it differs from the held ring and must not enter the history.
+        assert!(
+            published_membership(None, &known_ring, &names(&["a", "b", "c", "d"]), 2).is_none()
+        );
+        assert!(published_membership(None, &known_ring, &names(&["a", "b", "c"]), 3).is_none());
+
+        // No ring yet: nothing to record.
+        let empty: KnownRing = Arc::new(Mutex::new(None));
+        assert!(published_membership(None, &empty, &names(&["a"]), 1).is_none());
+    }
+
+    #[test]
+    fn same_members_ignores_order_and_duplicates_but_not_replication() {
+        let m = membership_of(&["x", "y"], 2);
+        let names = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(same_members(&m, &names(&["y", "x"]), 2));
+        assert!(same_members(&m, &names(&["x", "y", "x"]), 2));
+        assert!(!same_members(&m, &names(&["x", "y"]), 1));
+        assert!(!same_members(&m, &names(&["x"]), 2));
+        assert!(!same_members(&m, &names(&["x", "y", "z"]), 2));
     }
 
     /// A promoted node named `me` with no handoff in flight, over a real
