@@ -235,6 +235,12 @@ pub struct Cache {
     /// so an in-progress sweep pass isn't rescanned from scratch every
     /// call.
     pending_removal: VecDeque<Key>,
+    /// Issue #582: when the last `U` handoff write (`handoff_set` /
+    /// `handoff_set_if_absent`) landed. `reclaim_unowned` refuses to run
+    /// while one is recent: a handoff is the one way a copy this node will
+    /// own under a ring it has not adopted yet can arrive, and the
+    /// ownership rings the pass is given cannot see that ring.
+    last_handoff_at: Option<Instant>,
     /// Test-only: how many namespace lookups went by name (hash + compare
     /// of the whole name) — what a multi-key frame must do once, not per
     /// key.
@@ -384,6 +390,7 @@ impl Cache {
             cas_sets: 0,
             cas_deletes: 0,
             pending_removal: VecDeque::new(),
+            last_handoff_at: None,
             #[cfg(test)]
             name_lookups: std::cell::Cell::new(0),
         }
@@ -497,7 +504,9 @@ impl Cache {
     pub fn handoff_set(&mut self, key: Key, value: Bytes, ttl: Option<Duration>) {
         // Same TTL-overflow stance as `set_with_ttl`: too far out to
         // represent is "never expires", not a panic.
-        let expires_at = ttl.and_then(|ttl| Instant::now().checked_add(ttl));
+        let now = Instant::now();
+        let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
+        self.last_handoff_at = Some(now);
         self.insert(key, value, expires_at);
     }
 
@@ -512,12 +521,56 @@ impl Cache {
         ttl: Option<Duration>,
     ) -> CasResult {
         let now = Instant::now();
+        self.last_handoff_at = Some(now);
         if !self.condition_holds_at(key, CasCondition::Absent, now) {
             return CasResult::Mismatch;
         }
         let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
         self.insert(key.clone(), value, expires_at);
         CasResult::Stored
+    }
+
+    /// Issue #582: removes every listed key this node holds that `owned`
+    /// says it does not own — the caller answers that from every
+    /// membership discovery published during a grace period, so a copy
+    /// that was live under any ring of that period is kept. Returns
+    /// `(removed, paused)`; `paused` is `true` and nothing is touched when
+    /// a handoff write landed within `handoff_quiet_for`: such a write can
+    /// carry a key this node is about to own under a ring it has not
+    /// adopted yet (a leaver's handoff reaches the entrant before the
+    /// roster without the leaver does), which no ownership check the
+    /// caller holds can see. Ownership is evaluated per key at removal, so
+    /// a stale key list is harmless; marks and expiry are not consulted,
+    /// the plain sweep handles those.
+    pub fn reclaim_unowned(
+        &mut self,
+        keys: &[Key],
+        owned: &dyn Fn(&Key) -> bool,
+        handoff_quiet_for: Duration,
+    ) -> (usize, bool) {
+        self.reclaim_unowned_at(keys, owned, handoff_quiet_for, Instant::now())
+    }
+
+    fn reclaim_unowned_at(
+        &mut self,
+        keys: &[Key],
+        owned: &dyn Fn(&Key) -> bool,
+        handoff_quiet_for: Duration,
+        now: Instant,
+    ) -> (usize, bool) {
+        if self
+            .last_handoff_at
+            .is_some_and(|at| now.saturating_duration_since(at) < handoff_quiet_for)
+        {
+            return (0, true);
+        }
+        let mut removed = 0;
+        for key in keys {
+            if self.peek(key).is_some() && !owned(key) && self.remove_entry(key).is_some() {
+                removed += 1;
+            }
+        }
+        (removed, false)
     }
 
     fn cas_set_at(
@@ -2894,6 +2947,73 @@ mod tests {
 
         assert_eq!(cache.sweep(), 1);
         assert_eq!(cache.get(&key(b"name")), None);
+    }
+
+    #[test]
+    fn reclaim_unowned_removes_only_present_keys_the_node_does_not_own() {
+        // Issue #582: ownership decides, not marks — a marked owned key
+        // stays, an unmarked unowned key goes, a listed key that is not
+        // here is not counted.
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"mine"), Bytes::from_static(b"1"));
+        cache.set(key(b"theirs"), Bytes::from_static(b"2"));
+        cache.mark_migrated(&key(b"mine"));
+
+        let owned = |k: &Key| &k.name[..] == b"mine";
+        let keys = [key(b"mine"), key(b"theirs"), key(b"absent")];
+        assert_eq!(
+            cache.reclaim_unowned(&keys, &owned, Duration::from_secs(60)),
+            (1, false)
+        );
+        assert_eq!(cache.get(&key(b"mine")), Some(Bytes::from_static(b"1")));
+        assert_eq!(cache.get(&key(b"theirs")), None);
+        assert_eq!(
+            cache.reclaim_unowned(&keys, &owned, Duration::from_secs(60)),
+            (0, false),
+            "idempotent"
+        );
+    }
+
+    #[test]
+    fn reclaim_unowned_pauses_after_a_recent_handoff_write_and_resumes_later() {
+        // Issue #582: a `U` write may carry a key this node is about to
+        // own under a roster it has not adopted; nothing is reclaimed
+        // until the quiet period after the last one has passed.
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"theirs"), Bytes::from_static(b"2"));
+        let t0 = Instant::now();
+        cache.handoff_set(key(b"handed"), Bytes::from_static(b"h"), None);
+        let keys = [key(b"theirs"), key(b"handed")];
+        let none = |_: &Key| false;
+
+        assert_eq!(
+            cache.reclaim_unowned_at(
+                &keys,
+                &none,
+                Duration::from_secs(60),
+                t0 + Duration::from_secs(30)
+            ),
+            (0, true)
+        );
+        assert_eq!(cache.get(&key(b"theirs")), Some(Bytes::from_static(b"2")));
+
+        assert_eq!(
+            cache.reclaim_unowned_at(
+                &keys,
+                &none,
+                Duration::from_secs(60),
+                t0 + Duration::from_secs(61)
+            ),
+            (2, false)
+        );
+        assert_eq!(cache.get(&key(b"handed")), None);
+
+        // The put-if-absent form (re-replication) pauses the same way.
+        cache.handoff_set_if_absent(&key(b"again"), Bytes::from_static(b"a"), None);
+        assert_eq!(
+            cache.reclaim_unowned(&[key(b"again")], &none, Duration::from_secs(60)),
+            (0, true)
+        );
     }
 
     #[test]
