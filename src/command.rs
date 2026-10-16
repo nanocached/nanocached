@@ -1,7 +1,9 @@
 use crate::cache::{Cache, CasCondition, CasResult, IncrResult, parse_decimal_i64};
+use crate::hash_ring::{HashRing, KeyHash};
 use crate::key::Key;
 use crate::response::{MultiAckEntry, MultiEntry, Response};
 use bytes::{Buf, Bytes, BytesMut};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Upper bound on the summed value bytes one `M` reply carries. A key can
@@ -14,6 +16,43 @@ use std::time::Duration;
 /// (`MAX_MULTI_REPLY_VALUE_BYTES` in `nanocached-proxy.rs`), and it stays
 /// well under the SDKs' 64 MiB multi-get response cap.
 pub const MAX_MULTI_REPLY_VALUE_BYTES: usize = 16 * 1024 * 1024;
+
+/// One membership this node's ownership of a key is judged against
+/// (issue #582): the ring, this node's name in it and the replication
+/// factor it came with. Compared by ring identity, not contents: two
+/// checks are equal only if they share the same ring allocation.
+#[derive(Clone)]
+pub struct OwnerCheck {
+    pub ring: Arc<HashRing>,
+    pub name: String,
+    pub replication: usize,
+}
+
+impl OwnerCheck {
+    pub fn owns(&self, key: &Key) -> bool {
+        self.ring
+            .is_owner_hashed(KeyHash::of(key), &self.name, self.replication)
+    }
+}
+
+impl std::fmt::Debug for OwnerCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnerCheck")
+            .field("name", &self.name)
+            .field("replication", &self.replication)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for OwnerCheck {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ring, &other.ring)
+            && self.name == other.name
+            && self.replication == other.replication
+    }
+}
+
+impl Eq for OwnerCheck {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -246,6 +285,16 @@ pub enum Command {
     Sweep {
         marked: bool,
     },
+    /// Internal-only (issue #582): one chunk of the ownership reclaim
+    /// pass, see `run_reclaim` in `server.rs`. Removes each of `keys` this
+    /// node holds but owns under none of `checks` — every membership
+    /// discovery published during the reclaim grace — unless a handoff
+    /// write landed within `handoff_quiet_for` (`Cache::reclaim_unowned`).
+    ReclaimUnowned {
+        keys: Vec<Key>,
+        checks: Vec<OwnerCheck>,
+        handoff_quiet_for: Duration,
+    },
     /// Staged node join: sent by discovery to a `Joined` node when a new node is
     /// joining, so this node can compute (via `HashRing`) how each of its
     /// own keys' top-R owner set changes (client-side replication). `joining_name`/
@@ -466,6 +515,15 @@ impl Command {
 
             Self::Sweep { marked: true } => Response::Swept(cache.sweep()),
             Self::Sweep { marked: false } => Response::Swept(cache.sweep_expired()),
+            Self::ReclaimUnowned {
+                keys,
+                checks,
+                handoff_quiet_for,
+            } => {
+                let owned = |key: &Key| checks.iter().any(|check| check.owns(key));
+                let (removed, paused) = cache.reclaim_unowned(&keys, &owned, handoff_quiet_for);
+                Response::Reclaimed { removed, paused }
+            }
         }
     }
 }
@@ -1994,6 +2052,50 @@ mod tests {
             Command::Sweep { marked: true }.execute(&mut cache),
             Response::Swept(1)
         );
+    }
+
+    #[test]
+    fn reclaim_unowned_keeps_a_key_any_listed_ring_gives_this_node() {
+        // Issue #582. Over {a, b} with R=1 each key has one owner. The
+        // key's owner under either ring keeps it; a node that owns it
+        // under neither loses it.
+        let ring = Arc::new(HashRing::new(vec!["a".to_string(), "b".to_string()]));
+        let name = key(b"name");
+        let owner = if ring.is_owner_hashed(KeyHash::of(&name), "a", 1) {
+            "a"
+        } else {
+            "b"
+        };
+        let other = if owner == "a" { "b" } else { "a" };
+        let check = |node: &str| OwnerCheck {
+            ring: Arc::clone(&ring),
+            name: node.to_string(),
+            replication: 1,
+        };
+        let reclaim = |node: &str| Command::ReclaimUnowned {
+            keys: vec![name.clone()],
+            checks: vec![check(node)],
+            handoff_quiet_for: Duration::from_secs(60),
+        };
+
+        let mut cache = Cache::new(usize::MAX);
+        cache.set(name.clone(), Bytes::from_static(b"Alice"));
+        assert_eq!(
+            reclaim(owner).execute(&mut cache),
+            Response::Reclaimed {
+                removed: 0,
+                paused: false
+            }
+        );
+        assert_eq!(cache.get(&name), Some(Bytes::from_static(b"Alice")));
+        assert_eq!(
+            reclaim(other).execute(&mut cache),
+            Response::Reclaimed {
+                removed: 1,
+                paused: false
+            }
+        );
+        assert_eq!(cache.get(&name), None);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::cache::{Cache, SWEEP_BUDGET};
-use crate::command::{Command, MigrateProgress, ParseError, parse_resumable};
+use crate::command::{Command, MigrateProgress, OwnerCheck, ParseError, parse_resumable};
 use crate::hash_ring::{HashRing, KeyHash, KeyHasher};
 use crate::key::Key;
 use crate::response::{MultiAckEntry, MultiEntry, Response};
@@ -135,6 +135,16 @@ fn forwarding_grace(entries_sent: usize) -> Duration {
 }
 /// How often the staged node join active-deletion sweep runs. See `run_sweep`.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+/// Issue #582: how often `run_reclaim` looks for copies this node no
+/// longer owns, and how long a copy must have been unowned — under every
+/// membership discovery published in that time, see `RingHistory` — before
+/// it goes. The grace is above the liveness eviction window (15 s), the
+/// heartbeat (5 s) and a decommission drain budget, so a membership that
+/// flips back (a joiner evicted, a leave that never completed) keeps the
+/// copy live; a forwarding window still open on this node postpones the
+/// pass altogether (`reclaim_checks`).
+const RECLAIM_INTERVAL: Duration = Duration::from_secs(30);
+const RECLAIM_GRACE: Duration = Duration::from_secs(120);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Outer bound on how long `run` waits, after the connections are drained,
 /// for the heartbeat task to finish — it also carries any in-flight
@@ -589,6 +599,10 @@ struct NodeContext {
     /// ring's newly promoted owner yet — see both functions' doc
     /// comments.
     active_rereplication: Arc<Mutex<Option<Arc<ActiveRereplication>>>>,
+    /// Issue #582: every membership discovery published to this node and
+    /// when, for the ownership reclaim pass. Only `adopt_membership`'s
+    /// result goes in — never the ring a handoff predicts at completion.
+    ring_history: RingHistory,
     /// Issue #266: how a task that spawns a re-replication (either
     /// `register_with_discovery`, on an eviction-driven ring change, or
     /// `run_migration`, on the join-flip gap below) hands it to
@@ -762,9 +776,14 @@ pub(crate) async fn run(
         request_tx: request_tx.clone(),
         leaving: Arc::new(Mutex::new(None)),
         active_rereplication: Arc::new(Mutex::new(None)),
+        ring_history: RingHistory::default(),
         rereplication_tx: rereplication_tx.clone(),
         shutdown_rx: shutdown_rx.clone(),
     });
+    // Issue #582: the ownership reclaim pass, cluster mode only.
+    let reclaim_task = node_context
+        .as_ref()
+        .map(|node_context| tokio::spawn(run_reclaim(node_context.clone(), shutdown_rx.clone())));
     // This function's own copy must go, or `send_heartbeats`'s drain of
     // `rereplication_rx` would never see the channel close — every real
     // producer holds its own clone via `NodeContext` (or a clone of it),
@@ -1104,6 +1123,12 @@ pub(crate) async fn run(
     sweep_task
         .await
         .map_err(|error| io::Error::other(format!("sweep task failed: {error}")))?;
+
+    if let Some(reclaim_task) = reclaim_task {
+        reclaim_task
+            .await
+            .map_err(|error| io::Error::other(format!("reclaim task failed: {error}")))?;
+    }
 
     if let Some(heartbeat_task) = heartbeat_task {
         join_heartbeat_task(heartbeat_task, HEARTBEAT_SHUTDOWN_WAIT).await?;
@@ -3514,6 +3539,7 @@ async fn register_with_discovery(
                             if let Some((members, replication)) = roster
                                 && matches!(role, DiscoveryRole::Primary(_))
                             {
+                                let published = members.clone();
                                 let change = adopt_membership(
                                     &node_context.known_ring,
                                     &node_context.active_migration,
@@ -3521,6 +3547,23 @@ async fn register_with_discovery(
                                     members,
                                     replication,
                                 );
+                                // Issue #582: this is the only place a
+                                // discovery-published membership enters
+                                // the reclaim pass's history. No change
+                                // means either the roster is what this
+                                // node already holds — usually the ring a
+                                // handoff it ran installed at completion,
+                                // which discovery has now published — or
+                                // it was withheld while this node's own
+                                // join is pending; only the former counts.
+                                if let Some(membership) = published_membership(
+                                    change.as_ref(),
+                                    &node_context.known_ring,
+                                    &published,
+                                    replication,
+                                ) {
+                                    node_context.ring_history.record_if_new(membership);
+                                }
 
                                 // Issue #266: a ring change that dropped a
                                 // member — an eviction, or a leave this
@@ -3891,13 +3934,9 @@ fn adopt_membership(
     let mut guard = known_ring
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let unchanged = guard.as_ref().is_some_and(|current| {
-        current.replication == replication && {
-            let mut known: Vec<&String> = current.ring.nodes().iter().collect();
-            known.sort_unstable();
-            known.len() == members.len() && known.iter().zip(&members).all(|(a, b)| *a == b)
-        }
-    });
+    let unchanged = guard
+        .as_ref()
+        .is_some_and(|current| same_members(current, &members, replication));
     if unchanged {
         return None;
     }
@@ -3917,6 +3956,46 @@ fn adopt_membership(
     );
 
     Some(RingChange { before, after })
+}
+
+/// True if `membership` is exactly the roster `members` (any order,
+/// duplicates ignored) at `replication`: `adopt_membership`'s "nothing to
+/// change" test, and how the heartbeat ack tells a roster that merely
+/// confirms the ring a handoff already installed from one it withheld
+/// (issue #582).
+fn same_members(membership: &Membership, members: &[String], replication: usize) -> bool {
+    if membership.replication != replication {
+        return false;
+    }
+    let mut known: Vec<&String> = membership.ring.nodes().iter().collect();
+    known.sort_unstable();
+    let mut wanted: Vec<&String> = members.iter().collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    known == wanted
+}
+
+/// Issue #582: the membership a heartbeat ack just published, as the
+/// reclaim history should see it — `change.after` when `adopt_membership`
+/// applied the roster, else the membership this node already holds when
+/// the roster merely repeats it (the ring a handoff this node ran
+/// installed at completion, now published), and `None` when the roster
+/// was withheld because this node's own join is still pending (it then
+/// differs from what the node holds) or the node has no ring yet.
+fn published_membership(
+    change: Option<&RingChange>,
+    known_ring: &KnownRing,
+    roster: &[String],
+    replication: usize,
+) -> Option<Arc<Membership>> {
+    if let Some(change) = change {
+        return Some(Arc::clone(&change.after));
+    }
+    let current = known_ring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()?;
+    same_members(&current, roster, replication).then_some(current)
 }
 
 /// What `adopt_membership` actually applied — see its own doc comment.
@@ -4074,6 +4153,101 @@ struct Membership {
 /// tasks so they can report the replication factor half of it to
 /// discovery (issue #30).
 type KnownRing = Arc<Mutex<Option<Arc<Membership>>>>;
+
+/// Issue #582: the memberships discovery published to this node, each
+/// with the instant it was adopted. The ownership reclaim pass judges a
+/// key against every ring that was in force at any point during
+/// `RECLAIM_GRACE`, so a copy that any of them gave this node is kept —
+/// a join that displaced it may be followed within the grace by a leave or
+/// an eviction that hands it back, and the chaos trace behind the issue
+/// was exactly a key owned under R0, not under R1 for eight seconds, and
+/// owned again under R2.
+#[derive(Clone, Default)]
+struct RingHistory(Arc<Mutex<RingHistoryInner>>);
+
+#[derive(Default)]
+struct RingHistoryInner {
+    /// Oldest first.
+    epochs: Vec<(Instant, Arc<Membership>)>,
+    /// Bumped on every `record`, so a pass can tell the membership moved
+    /// under it and stop rather than finish against a view that is gone.
+    generation: u64,
+}
+
+impl RingHistory {
+    /// Records `membership` as in force from now — unless it is the
+    /// newest epoch already (same members, same replication): every
+    /// heartbeat ack re-reports the ring, and a repeat is not a change.
+    fn record_if_new(&self, membership: Arc<Membership>) {
+        self.record_if_new_at(membership, Instant::now());
+    }
+
+    fn record_if_new_at(&self, membership: Arc<Membership>, now: Instant) {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, newest)) = inner.epochs.last()
+            && (Arc::ptr_eq(newest, &membership)
+                || same_members(newest, membership.ring.nodes(), membership.replication))
+        {
+            return;
+        }
+        inner.epochs.push((now, membership));
+        inner.generation += 1;
+    }
+
+    #[cfg(test)]
+    fn record_at(&self, membership: Arc<Membership>, now: Instant) {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.epochs.push((now, membership));
+        inner.generation += 1;
+    }
+
+    /// One `OwnerCheck` per membership in force at some point during the
+    /// last `grace`, plus the generation they were read at — or `None`
+    /// when the history does not reach back that far (a fresh node, or a
+    /// first roster that arrived less than `grace` ago): with no ring known
+    /// for part of the window nothing can be called unowned. Memberships
+    /// older than the one in force at the window's start are dropped.
+    fn checks_within(&self, grace: Duration, name: &str) -> Option<(Vec<OwnerCheck>, u64)> {
+        self.checks_within_at(grace, name, Instant::now())
+    }
+
+    fn checks_within_at(
+        &self,
+        grace: Duration,
+        name: &str,
+        now: Instant,
+    ) -> Option<(Vec<OwnerCheck>, u64)> {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cutoff = now.checked_sub(grace)?;
+        // The newest membership adopted at or before the cutoff is the one
+        // in force when the window opened; without one, the window is not
+        // covered.
+        let start = inner
+            .epochs
+            .iter()
+            .rposition(|(since, _)| *since <= cutoff)?;
+        inner.epochs.drain(..start);
+        let checks = inner
+            .epochs
+            .iter()
+            .map(|(_, membership)| OwnerCheck {
+                ring: Arc::clone(&membership.ring),
+                name: name.to_string(),
+                replication: membership.replication,
+            })
+            .collect();
+        Some((checks, inner.generation))
+    }
+}
 
 /// Tenth-pass audit (2026-09-02): `ActiveMigration::pending_clears`,
 /// collapsed rather than a plain queue so an authenticated client issuing
@@ -6767,6 +6941,124 @@ async fn wait_for_migration_slot_to_clear(node_context: &NodeContext, joining_na
     }
 }
 
+/// Issue #582: the ownership reclaim pass. A join leaves the displaced
+/// node holding copies it no longer owns; the mark sweep (`run_sweep`)
+/// reclaims the ones a client never rewrote, but a rewrite releases the
+/// mark (issue #2) and that copy stayed for good — more memory than the
+/// node's share, and an old value that comes back as authoritative when a
+/// later eviction makes the node an owner again (issue #563). This pass
+/// removes, every `RECLAIM_INTERVAL`, each key this node has owned under
+/// no membership discovery published during the last `RECLAIM_GRACE`
+/// (`RingHistory::checks_within`); the cache refuses while a handoff write
+/// is more recent than that (`Cache::reclaim_unowned`), and the pass does
+/// not run at all while this node is unpromoted, leaving, mid-handoff or
+/// still forwarding for a join (`reclaim_checks`). Marking a copy dead at
+/// write time instead was tried and lost live copies when a decommission
+/// overlapped the join (issue #582): the ring a handoff predicts is not
+/// the ring discovery ends up publishing, and only the published ones
+/// count here.
+async fn run_reclaim(node_context: NodeContext, mut shutdown_rx: watch::Receiver<bool>) {
+    loop {
+        if wait_or_shutdown(RECLAIM_INTERVAL, &mut shutdown_rx).await {
+            return;
+        }
+        if let Some(removed) = reclaim_pass(&node_context, &shutdown_rx).await
+            && removed > 0
+        {
+            println!(
+                "INFO reclaimed {removed} entr(ies) this node has owned under no membership \
+                 of the last {}s",
+                RECLAIM_GRACE.as_secs()
+            );
+        }
+    }
+}
+
+/// One pass of `run_reclaim`: `None` when it could not run (see
+/// `reclaim_checks`), else how many entries it removed. Works from a
+/// snapshot of the keys in `SWEEP_BUDGET` chunks, yielding between them,
+/// and stops early if the membership moves under it (the history's
+/// generation changed) or the cache reports a recent handoff; what is
+/// left waits for the next interval. Ownership is re-evaluated per key at
+/// removal, so the snapshot being stale is harmless.
+async fn reclaim_pass(
+    node_context: &NodeContext,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Option<usize> {
+    let (checks, generation) = reclaim_checks(node_context)?;
+    let keys = list_keys(&node_context.request_tx).await?;
+    let mut removed = 0;
+    for chunk in keys.chunks(SWEEP_BUDGET) {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        if reclaim_checks(node_context).map(|(_, generation)| generation) != Some(generation) {
+            break;
+        }
+        match execute_command(
+            &node_context.request_tx,
+            Command::ReclaimUnowned {
+                keys: chunk.to_vec(),
+                checks: checks.clone(),
+                handoff_quiet_for: RECLAIM_GRACE,
+            },
+        )
+        .await
+        {
+            Ok(Response::Reclaimed {
+                removed: count,
+                paused: false,
+            }) => removed += count,
+            _ => break,
+        }
+        tokio::task::yield_now().await;
+    }
+    Some(removed)
+}
+
+/// The ownership checks a reclaim pass may use right now, with the
+/// history generation they came from — or `None` while reclaiming is not
+/// safe: this node is not promoted (a restart under a dead name serves
+/// nothing yet), it is leaving (a draining node adopts rosters without
+/// itself and would reclaim what it is still forwarding), a handoff it
+/// runs is in flight or unconfirmed, a forwarding window is still open
+/// (its own slot's or an earlier joiner's: the system's own definition of
+/// "this join is still settling"), or the history does not cover the
+/// grace.
+fn reclaim_checks(node_context: &NodeContext) -> Option<(Vec<OwnerCheck>, u64)> {
+    if !node_context.promoted.load(Ordering::SeqCst) {
+        return None;
+    }
+    if node_context
+        .leaving
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
+    {
+        return None;
+    }
+    {
+        let slot = node_context
+            .active_migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(active) = slot.as_ref()
+            && (active.completed_at.is_none()
+                || !active.confirmed
+                || active.forwarding_open()
+                || active
+                    .lingering
+                    .iter()
+                    .any(LingeringForward::forwarding_open))
+        {
+            return None;
+        }
+    }
+    node_context
+        .ring_history
+        .checks_within(RECLAIM_GRACE, &node_context.name)
+}
+
 /// Staged node join's active-deletion background task: every `SWEEP_INTERVAL`,
 /// reclaims migrated-marked and TTL-expired entries. `Cache::sweep`
 /// removes at most `SWEEP_BUDGET` entries per call so it can't stall other
@@ -8340,6 +8632,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -8476,6 +8769,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -8566,6 +8860,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -8648,6 +8943,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         });
@@ -8726,6 +9022,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -8798,6 +9095,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -8894,6 +9192,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -9020,6 +9319,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -9170,6 +9470,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -9317,6 +9618,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -10895,6 +11197,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -11124,6 +11427,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -11228,6 +11532,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -11295,6 +11600,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -11380,6 +11686,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -11469,6 +11776,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -12143,6 +12451,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -12272,6 +12581,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -12391,6 +12701,7 @@ mod tests {
                 connections: Mutex::new(HashMap::new()),
             }))),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -12519,6 +12830,7 @@ mod tests {
                 connections: Mutex::new(HashMap::new()),
             }))),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -12642,6 +12954,7 @@ mod tests {
             request_tx: real_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -12792,6 +13105,7 @@ mod tests {
             // Empty at construction — installed by the relay below.
             leaving: Arc::clone(&leaving),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -13123,6 +13437,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -13289,6 +13604,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -13380,6 +13696,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx,
         };
@@ -13474,6 +13791,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx,
         };
@@ -13570,6 +13888,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx,
         };
@@ -13710,6 +14029,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx,
         };
@@ -13971,6 +14291,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -14168,6 +14489,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -14458,6 +14780,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx,
             shutdown_rx: watch::channel(false).1,
         };
@@ -14554,6 +14877,286 @@ mod tests {
         cache_task.await.unwrap();
     }
 
+    // ── issue #582: ownership reclaim ──────────────────────────────────
+
+    fn membership_of(nodes: &[&str], replication: usize) -> Arc<Membership> {
+        Arc::new(Membership {
+            ring: Arc::new(HashRing::new(nodes.iter().map(|n| n.to_string()).collect())),
+            replication,
+        })
+    }
+
+    #[test]
+    fn ring_history_covers_the_grace_and_keeps_every_ring_in_force_during_it() {
+        let history = RingHistory::default();
+        let t0 = Instant::now();
+        let grace = Duration::from_secs(120);
+        let a = membership_of(&["a"], 1);
+        let b = membership_of(&["a", "b"], 1);
+
+        // Nothing recorded: nothing can be called unowned.
+        assert!(history.checks_within_at(grace, "a", t0 + grace).is_none());
+
+        history.record_at(Arc::clone(&a), t0);
+        history.record_at(Arc::clone(&b), t0 + Duration::from_secs(10));
+
+        // The window reaches back before the first membership: not covered.
+        assert!(
+            history
+                .checks_within_at(grace, "a", t0 + Duration::from_secs(100))
+                .is_none()
+        );
+
+        // Window [t0+5, t0+125]: `a` was in force at its start, `b` after.
+        let (checks, generation) = history
+            .checks_within_at(grace, "a", t0 + Duration::from_secs(125))
+            .unwrap();
+        assert_eq!(generation, 2);
+        assert!(checks.iter().any(|c| Arc::ptr_eq(&c.ring, &a.ring)));
+        assert!(checks.iter().any(|c| Arc::ptr_eq(&c.ring, &b.ring)));
+
+        // Window [t0+15, t0+135]: `b` alone was in force; `a` is pruned.
+        let (checks, _) = history
+            .checks_within_at(grace, "a", t0 + Duration::from_secs(135))
+            .unwrap();
+        assert_eq!(checks.len(), 1);
+        assert!(Arc::ptr_eq(&checks[0].ring, &b.ring));
+        assert_eq!(
+            history.0.lock().unwrap().epochs.len(),
+            1,
+            "memberships older than the one in force at the window's start are dropped"
+        );
+    }
+
+    #[test]
+    fn ring_history_records_a_republished_ring_once_and_a_changed_one_again() {
+        let history = RingHistory::default();
+        let t0 = Instant::now();
+        let a = membership_of(&["a", "b"], 1);
+        let a_again = membership_of(&["b", "a"], 1);
+        let a_r2 = membership_of(&["a", "b"], 2);
+        let b = membership_of(&["a"], 1);
+
+        history.record_if_new_at(Arc::clone(&a), t0);
+        history.record_if_new_at(Arc::clone(&a), t0 + Duration::from_secs(5));
+        history.record_if_new_at(a_again, t0 + Duration::from_secs(10));
+        assert_eq!(
+            history.0.lock().unwrap().epochs.len(),
+            1,
+            "a heartbeat repeat is not an epoch"
+        );
+        assert_eq!(history.0.lock().unwrap().generation, 1);
+
+        history.record_if_new_at(a_r2, t0 + Duration::from_secs(15));
+        history.record_if_new_at(b, t0 + Duration::from_secs(20));
+        history.record_if_new_at(a, t0 + Duration::from_secs(25));
+        assert_eq!(
+            history.0.lock().unwrap().epochs.len(),
+            4,
+            "replication and member changes are"
+        );
+    }
+
+    #[test]
+    fn published_membership_takes_the_change_or_a_repeat_of_the_held_ring_only() {
+        let names = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let held = membership_of(&["a", "b", "c"], 2);
+        let known_ring: KnownRing = Arc::new(Mutex::new(Some(Arc::clone(&held))));
+
+        // The ack changed the ring: what it installed.
+        let after = membership_of(&["a", "b"], 2);
+        let change = RingChange {
+            before: Some(Arc::clone(&held)),
+            after: Arc::clone(&after),
+        };
+        let got = published_membership(Some(&change), &known_ring, &names(&["a", "b"]), 2).unwrap();
+        assert!(Arc::ptr_eq(&got, &after));
+
+        // No change because the roster repeats the held ring (a handoff
+        // installed it first): the held ring, so the history learns it.
+        let got = published_membership(None, &known_ring, &names(&["c", "b", "a"]), 2).unwrap();
+        assert!(Arc::ptr_eq(&got, &held));
+
+        // No change because the roster was withheld (own join pending):
+        // it differs from the held ring and must not enter the history.
+        assert!(
+            published_membership(None, &known_ring, &names(&["a", "b", "c", "d"]), 2).is_none()
+        );
+        assert!(published_membership(None, &known_ring, &names(&["a", "b", "c"]), 3).is_none());
+
+        // No ring yet: nothing to record.
+        let empty: KnownRing = Arc::new(Mutex::new(None));
+        assert!(published_membership(None, &empty, &names(&["a"]), 1).is_none());
+    }
+
+    #[test]
+    fn same_members_ignores_order_and_duplicates_but_not_replication() {
+        let m = membership_of(&["x", "y"], 2);
+        let names = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(same_members(&m, &names(&["y", "x"]), 2));
+        assert!(same_members(&m, &names(&["x", "y", "x"]), 2));
+        assert!(!same_members(&m, &names(&["x", "y"]), 1));
+        assert!(!same_members(&m, &names(&["x"]), 2));
+        assert!(!same_members(&m, &names(&["x", "y", "z"]), 2));
+    }
+
+    /// A promoted node named `me` with no handoff in flight, over a real
+    /// cache actor: the shape `reclaim_pass` runs against in production.
+    fn reclaim_test_context(request_tx: mpsc::Sender<CacheRequest>) -> NodeContext {
+        NodeContext {
+            name: "me".to_string(),
+            token: "tk-me".to_string(),
+            discovery_addr: "d".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        }
+    }
+
+    /// Two keys over `{me, other}` with R=1: one `other` owns, one `me` owns.
+    fn keys_split_by_owner(ring: &HashRing) -> (Key, Key) {
+        let mut theirs = None;
+        let mut mine = None;
+        for i in 0..256 {
+            let k = key(format!("key-{i}").as_bytes());
+            if ring.is_owner_hashed(KeyHash::of(&k), "me", 1) {
+                mine.get_or_insert(k);
+            } else {
+                theirs.get_or_insert(k);
+            }
+            if mine.is_some() && theirs.is_some() {
+                break;
+            }
+        }
+        (theirs.unwrap(), mine.unwrap())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reclaim_pass_removes_a_key_unowned_under_every_ring_of_the_grace_and_keeps_the_rest() {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let uncovered = reclaim_test_context(request_tx.clone());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let now = Instant::now();
+
+        let alone = membership_of(&["me"], 1);
+        let shared = membership_of(&["me", "other"], 1);
+        let (theirs, mine) = keys_split_by_owner(&shared.ring);
+        for k in [&theirs, &mine] {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: k.clone(),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        // History not covering the grace yet: the pass does not run.
+        uncovered
+            .ring_history
+            .record_at(Arc::clone(&shared), now - Duration::from_secs(30));
+        assert_eq!(reclaim_pass(&uncovered, &shutdown_rx).await, None);
+        drop(uncovered);
+
+        // `alone` (me owns everything) was in force until 100 s ago, inside
+        // the grace: `theirs` was live under it and must stay.
+        let recent = reclaim_test_context(request_tx.clone());
+        recent
+            .ring_history
+            .record_at(Arc::clone(&alone), now - Duration::from_secs(300));
+        recent
+            .ring_history
+            .record_at(Arc::clone(&shared), now - Duration::from_secs(100));
+        assert_eq!(reclaim_pass(&recent, &shutdown_rx).await, Some(0));
+        drop(recent);
+        assert_eq!(
+            send_command(
+                &request_tx,
+                Command::Get {
+                    key: theirs.clone()
+                }
+            )
+            .await,
+            Response::Value(Bytes::from_static(b"v"))
+        );
+
+        // `shared` alone has been in force for the whole grace: `theirs` goes,
+        // `mine` stays.
+        let settled = reclaim_test_context(request_tx.clone());
+        settled
+            .ring_history
+            .record_at(Arc::clone(&alone), now - Duration::from_secs(300));
+        settled
+            .ring_history
+            .record_at(Arc::clone(&shared), now - Duration::from_secs(200));
+        assert_eq!(reclaim_pass(&settled, &shutdown_rx).await, Some(1));
+        assert_eq!(
+            send_command(
+                &request_tx,
+                Command::Get {
+                    key: theirs.clone()
+                }
+            )
+            .await,
+            Response::NotFound
+        );
+        assert_eq!(
+            send_command(&request_tx, Command::Get { key: mine.clone() }).await,
+            Response::Value(Bytes::from_static(b"v"))
+        );
+
+        // A handoff write just landed: the cache pauses the pass.
+        send_command(
+            &request_tx,
+            Command::HandoffSet {
+                key: theirs.clone(),
+                value: Bytes::from_static(b"h"),
+                ttl: None,
+                if_absent: false,
+                token: "tk-me".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(reclaim_pass(&settled, &shutdown_rx).await, Some(0));
+        assert_eq!(
+            send_command(
+                &request_tx,
+                Command::Get {
+                    key: theirs.clone()
+                }
+            )
+            .await,
+            Response::Value(Bytes::from_static(b"h"))
+        );
+
+        drop(request_tx);
+        drop(settled);
+        cache_task.await.unwrap();
+    }
+
+    #[test]
+    fn reclaim_checks_refuse_while_a_handoff_this_node_ran_is_unconfirmed() {
+        // The slot is completed but discovery has not confirmed it: the
+        // forwarding window is open and the join is still settling.
+        let (node_context, _after_ring, _pre) = completed_unconfirmed_context(&[]);
+        node_context.ring_history.record_at(
+            membership_of(&["ready-node"], 1),
+            Instant::now() - Duration::from_secs(300),
+        );
+        assert!(reclaim_checks(&node_context).is_none());
+    }
+
     // ── issue #93: abandon reverts known_ring ──────────────────────────
 
     /// A `NodeContext` (named "ready-node") whose `known_ring` currently
@@ -14620,6 +15223,7 @@ mod tests {
             request_tx,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -14894,6 +15498,7 @@ mod tests {
             request_tx,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -15313,6 +15918,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         }
@@ -15726,6 +16332,7 @@ mod tests {
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
                     active_rereplication: Arc::new(Mutex::new(None)),
+                    ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
                     shutdown_rx: watch::channel(false).1,
                 }),
@@ -15870,6 +16477,7 @@ mod tests {
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
                     active_rereplication: Arc::new(Mutex::new(None)),
+                    ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
                     shutdown_rx: watch::channel(false).1,
                 }),
@@ -16002,6 +16610,7 @@ mod tests {
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
                     active_rereplication: Arc::new(Mutex::new(None)),
+                    ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
                     shutdown_rx: watch::channel(false).1,
                 }),
@@ -16127,6 +16736,7 @@ mod tests {
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
                     active_rereplication: Arc::new(Mutex::new(None)),
+                    ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
                     shutdown_rx: watch::channel(false).1,
                 }),
@@ -16309,6 +16919,7 @@ mod tests {
             request_tx,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         };
@@ -16428,6 +17039,7 @@ mod tests {
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
                     active_rereplication: Arc::new(Mutex::new(None)),
+                    ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
                     shutdown_rx: watch::channel(false).1,
                 }),
@@ -16586,6 +17198,7 @@ mod tests {
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
                     active_rereplication: Arc::new(Mutex::new(None)),
+                    ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
                     shutdown_rx: watch::channel(false).1,
                 }),
@@ -16773,6 +17386,7 @@ mod tests {
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
                     active_rereplication: Arc::new(Mutex::new(None)),
+                    ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
                     shutdown_rx: watch::channel(false).1,
                 }),
@@ -16910,6 +17524,7 @@ mod tests {
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
                     active_rereplication: Arc::new(Mutex::new(None)),
+                    ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
                     shutdown_rx: watch::channel(false).1,
                 }),
@@ -17654,6 +18269,7 @@ mod tests {
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
         }
@@ -17908,6 +18524,7 @@ mod tests {
                 request_tx: mpsc::channel(1).0,
                 leaving: Arc::new(Mutex::new(None)),
                 active_rereplication: Arc::new(Mutex::new(None)),
+                ring_history: RingHistory::default(),
                 rereplication_tx: mpsc::channel(1).0,
                 shutdown_rx: watch::channel(false).1,
             };
@@ -18460,6 +19077,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx,
             shutdown_rx: shutdown_rx.clone(),
         };
@@ -19115,6 +19733,7 @@ mod tests {
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
             active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
             rereplication_tx,
             shutdown_rx: watch::channel(false).1,
         };

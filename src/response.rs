@@ -139,6 +139,14 @@ pub enum Response {
     /// Internal-only (staged node join), in answer to `Command::Sweep` — how many
     /// entries the sweep actually removed.
     Swept(usize),
+    /// Internal-only (issue #582), in answer to `Command::ReclaimUnowned`:
+    /// how many entries the pass removed, or `paused` when the cache saw a
+    /// handoff write too recently for any reclaim to be safe (see
+    /// `Cache::reclaim_unowned`).
+    Reclaimed {
+        removed: usize,
+        paused: bool,
+    },
     /// Internal-only (issue #124), in answer to `Command::Stats` — the
     /// metrics endpoint's snapshot. Boxed: the snapshot is by far the
     /// largest variant and would otherwise inflate every `Response`.
@@ -249,6 +257,7 @@ impl Response {
             | Self::Marked
             | Self::Unmarked
             | Self::Swept(_)
+            | Self::Reclaimed { .. }
             | Self::Stats(_) => {
                 unreachable!(
                     "internal-only response (staged node join): never sent to a wire client, only \
