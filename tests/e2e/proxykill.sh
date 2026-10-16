@@ -24,7 +24,7 @@ wait_members 2 $D 60 || { T "FAIL: eviction"; fail=1; }
 T "evicted after $(( $(date +%s)-t0 ))s; restarting $P-c"; docker start $P-c >/dev/null
 wait_members 3 $D 60 || { T "FAIL: rejoin"; fail=1; }; T "rejoined after $(( $(date +%s)-t0 ))s"
 docker wait $P-load >/dev/null
-docker logs $P-load > "$L/load.log" 2>&1; load=$(tail -1 "$L/load.log"); echo "=== load: $load"
+docker logs $P-load > "$L/load.log" 2>&1; load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1); echo "=== load: $load"
 check=$(docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
 echo "=== check: $check"
 for c in $(docker ps -aq --filter name=$P-); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); echo "$n $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $c)" >> "$L/ipmap.txt"; docker logs -t $c > "$L/$n.log" 2>&1; done
