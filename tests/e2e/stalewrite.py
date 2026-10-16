@@ -31,6 +31,7 @@ ap.add_argument("--workers", type=int, default=4); ap.add_argument("--prefix", d
 ap.add_argument("--size", type=int, default=200); ap.add_argument("--duration", type=float, default=0)
 ap.add_argument("--settle", type=float, default=15); ap.add_argument("--report-every", type=float, default=30)
 ap.add_argument("--max-examples", type=int, default=50)
+ap.add_argument("--recheck-after", type=float, default=0, help="seconds after the first check to read every key back once more (0 = no second check)")
 a = ap.parse_args()
 addrs = [(x.rsplit(":", 1)[0], int(x.rsplit(":", 1)[1])) for x in a.addr.split(",")]
 pad = "x" * a.size
@@ -111,9 +112,14 @@ async def main():
     await asyncio.sleep(a.settle)
     out = await check(c)
     stats = c.stats()
-    await c.close()
     print(json.dumps(dict(t=int(time.time() - t0), phase="checked", n=a.n, writes=res["writes"], write_err=res["write_err"],
                           errors=res["errors"], replica_write_failures=stats.replica_write_failures,
                           **out)), flush=True)
+    if a.recheck_after > 0:
+        # Tells a lasting divergence from a forward that was still in flight at the first check.
+        await asyncio.sleep(a.recheck_after)
+        out = await check(c)
+        print(json.dumps(dict(t=int(time.time() - t0), phase="rechecked", n=a.n, **out)), flush=True)
+    await c.close()
 
 asyncio.run(main())
