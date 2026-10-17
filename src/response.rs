@@ -142,10 +142,14 @@ pub enum Response {
     /// Internal-only (issue #582), in answer to `Command::ReclaimUnowned`:
     /// how many entries the pass removed, or `paused` when the cache saw a
     /// handoff write too recently for any reclaim to be safe (see
-    /// `Cache::reclaim_unowned`).
+    /// `Cache::reclaim_unowned`). `handoff_writes` (issue #594) is how
+    /// many handoff writes the cache has ever taken, as of the start of
+    /// the call — what `run_reclaim` compares between passes to know
+    /// whether a snapshot is worth taking.
     Reclaimed {
         removed: usize,
         paused: bool,
+        handoff_writes: u64,
     },
     /// Internal-only (issue #124), in answer to `Command::Stats` — the
     /// metrics endpoint's snapshot. Boxed: the snapshot is by far the
