@@ -3005,7 +3005,13 @@ fn unconfirmed_completed_joiner(node_context: &NodeContext) -> Option<(String, A
 /// `abandon_migration` for a `G` verdict (issue #571): takes the slot only
 /// if it is still the very instance the heartbeat asked about
 /// (`identity`, see `unconfirmed_completed_joiner`) and still a completed
-/// handoff — never a transfer that a same-name retry started meanwhile.
+/// handoff — never a transfer that a same-name retry started meanwhile,
+/// and never the remnant an `X` left behind (issue #595): a remnant
+/// carries the `forward_revoked` of the slot it was cut from (so the
+/// forwards already queued against that slot stay revoked), which is the
+/// very identity the heartbeat went out with, but it is not a handoff —
+/// taking it would schedule a re-replication over a ring nobody left,
+/// superseding whichever real one is in flight.
 /// Returns its dead copies to restore and the post-join ring it was
 /// built on, for the re-replication the caller schedules.
 fn abandon_departed_slot(
@@ -3013,7 +3019,9 @@ fn abandon_departed_slot(
     identity: &Arc<AtomicBool>,
 ) -> Option<(Vec<Key>, Arc<HashRing>)> {
     match take_abandoned_slot(node_context, |active| {
-        Arc::ptr_eq(&active.forward_revoked, identity) && active.completed_at.is_some()
+        Arc::ptr_eq(&active.forward_revoked, identity)
+            && active.completed_at.is_some()
+            && !active.remnant
     }) {
         TakenSlot::Completed(taken) => {
             revert_known_ring_after_abandon(node_context, &taken);
@@ -20142,6 +20150,43 @@ mod tests {
             node_context.known_ring.lock().unwrap().as_ref().unwrap(),
             &pre_completion_ring
         ));
+    }
+
+    #[test]
+    fn a_gone_verdict_leaves_the_remnant_an_x_left_for_the_lingering_joiner() {
+        // Issue #595: the heartbeat names joiner-0; before its ack comes
+        // back, discovery's `X` for the same abandon lands and leaves a
+        // remnant carrying joiner-prev's window — and the slot's
+        // `forward_revoked`, the identity the heartbeat went out with.
+        // The `G` must not take the remnant: there is nothing to restore
+        // and no ring anybody left, and the re-replication the caller
+        // would schedule from the answer supersedes a real one.
+        let (node_context, own_revoked, lingering_revoked) = context_with_a_lingering_joiner();
+        let (asked_name, asked_identity) = unconfirmed_completed_joiner(&node_context).unwrap();
+        assert_eq!(asked_name, "joiner-0");
+        assert!(Arc::ptr_eq(&asked_identity, &own_revoked));
+
+        assert!(matches!(
+            abandon_migration(&node_context, "joiner-0"),
+            AbandonOutcome::Completed(_)
+        ));
+        {
+            let slot = node_context.active_migration.lock().unwrap();
+            let remnant = slot.as_ref().expect("the remnant carries joiner-prev");
+            assert!(remnant.remnant);
+            assert!(Arc::ptr_eq(&remnant.forward_revoked, &asked_identity));
+        }
+
+        assert!(
+            abandon_departed_slot(&node_context, &asked_identity).is_none(),
+            "a remnant is not the handoff the heartbeat asked about"
+        );
+        let slot = node_context.active_migration.lock().unwrap();
+        let remnant = slot.as_ref().expect("the remnant stays");
+        assert!(remnant.remnant);
+        assert_eq!(remnant.lingering.len(), 1);
+        assert_eq!(remnant.lingering[0].joining_name, "joiner-prev");
+        assert!(!lingering_revoked.load(Ordering::SeqCst));
     }
 
     /// A slot whose own joiner is `joiner-0` (completed, unconfirmed,
