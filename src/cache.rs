@@ -236,16 +236,21 @@ pub struct Cache {
     /// call.
     pending_removal: VecDeque<Key>,
     /// Issue #582: when the last `U` handoff write (`handoff_set` /
-    /// `handoff_set_if_absent`) landed. `reclaim_unowned` refuses to run
-    /// while one is recent: a handoff is the one way a copy this node will
-    /// own under a ring it has not adopted yet can arrive, and the
-    /// ownership rings the pass is given cannot see that ring.
+    /// `handoff_set_if_absent`) that arrived *ahead of its ring* landed.
+    /// `reclaim_unowned` refuses to run while one is recent: a handoff is
+    /// the one way a copy this node will own under a ring it has not
+    /// adopted yet can arrive, and the ownership rings the pass is given
+    /// cannot see that ring. Issue #601: a handoff write for a key this
+    /// node already owns under its adopted ring is not such a copy — it is
+    /// covered exactly as a client write under that ring is — and leaves
+    /// this alone (the caller says which, see `handoff_set`).
     last_handoff_at: Option<Instant>,
-    /// Issue #594: how many handoff writes (`handoff_set` /
-    /// `handoff_set_if_absent`) have landed since this cache was created.
-    /// Reported by `reclaim_unowned` so the reclaim pass can tell that
-    /// nothing a handoff could have brought in has arrived since the pass
-    /// it last completed — and skip taking a key snapshot at all.
+    /// Issue #594: how many handoff writes that arrived ahead of their
+    /// ring (`handoff_set` / `handoff_set_if_absent` with `ahead_of_ring`)
+    /// have landed since this cache was created. Reported by
+    /// `reclaim_unowned` so the reclaim pass can tell that nothing a
+    /// handoff could have brought in has arrived since the pass it last
+    /// completed — and skip taking a key snapshot at all.
     handoff_writes: u64,
     /// Test-only: how many namespace lookups went by name (hash + compare
     /// of the whole name) — what a multi-key frame must do once, not per
@@ -518,16 +523,34 @@ impl Cache {
     /// frames from the source node and stays indistinguishable from a
     /// client write here — the `sets_total` HELP text documents that
     /// remainder instead.)
-    pub fn handoff_set(&mut self, key: Key, value: Bytes, ttl: Option<Duration>) {
+    ///
+    /// `ahead_of_ring` (issue #601) is the caller's word that this node
+    /// does *not* own `key` under the membership it has adopted — the
+    /// write arrived ahead of the ring that will make it an owner (a
+    /// leaver's handoff before the post-leave roster, a re-replication
+    /// before the roster that made this node a target). Only such a
+    /// write pauses `reclaim_unowned` and counts toward its
+    /// `handoff_writes`: a key this node already owns is kept by the pass
+    /// for the same reason a client write of it is, so it moves nothing.
+    pub fn handoff_set(
+        &mut self,
+        key: Key,
+        value: Bytes,
+        ttl: Option<Duration>,
+        ahead_of_ring: bool,
+    ) {
         // Same TTL-overflow stance as `set_with_ttl`: too far out to
         // represent is "never expires", not a panic.
         let now = Instant::now();
         let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
-        self.note_handoff(now);
+        self.note_handoff(now, ahead_of_ring);
         self.insert(key, value, expires_at);
     }
 
-    fn note_handoff(&mut self, now: Instant) {
+    fn note_handoff(&mut self, now: Instant, ahead_of_ring: bool) {
+        if !ahead_of_ring {
+            return;
+        }
         self.last_handoff_at = Some(now);
         self.handoff_writes = self.handoff_writes.wrapping_add(1);
     }
@@ -535,15 +558,17 @@ impl Cache {
     /// The `if_absent` companion to [`Self::handoff_set`] (issue #266's
     /// put-if-absent re-replication), mirroring `cas_set_at` with
     /// `CasCondition::Absent` minus the `cas_sets` bump — no client sent
-    /// a `k` frame for this write.
+    /// a `k` frame for this write. `ahead_of_ring` as for
+    /// [`Self::handoff_set`].
     pub fn handoff_set_if_absent(
         &mut self,
         key: &Key,
         value: Bytes,
         ttl: Option<Duration>,
+        ahead_of_ring: bool,
     ) -> CasResult {
         let now = Instant::now();
-        self.note_handoff(now);
+        self.note_handoff(now, ahead_of_ring);
         if !self.condition_holds_at(key, CasCondition::Absent, now) {
             return CasResult::Mismatch;
         }
@@ -557,11 +582,13 @@ impl Cache {
     /// membership discovery published during a grace period, so a copy
     /// that was live under any ring of that period is kept. Returns
     /// `(removed, paused)`; `paused` is `true` and nothing is touched when
-    /// a handoff write landed within `handoff_quiet_for`: such a write can
-    /// carry a key this node is about to own under a ring it has not
-    /// adopted yet (a leaver's handoff reaches the entrant before the
-    /// roster without the leaver does), which no ownership check the
-    /// caller holds can see. Ownership is evaluated per key at removal, so
+    /// a handoff write that arrived ahead of its ring landed within
+    /// `handoff_quiet_for`: such a write carries a key this node is about
+    /// to own under a ring it has not adopted yet (a leaver's handoff
+    /// reaches the entrant before the roster without the leaver does),
+    /// which no ownership check the caller holds can see. A handoff write
+    /// for a key this node already owned when it landed does not pause
+    /// (issue #601; `handoff_set`'s `ahead_of_ring`). Ownership is evaluated per key at removal, so
     /// a stale key list is harmless; marks and expiry are not consulted,
     /// the plain sweep handles those.
     ///
@@ -3040,10 +3067,10 @@ mod tests {
             report(0, false, 0)
         );
 
-        cache.handoff_set(key(b"a"), Bytes::from_static(b"1"), None);
-        cache.handoff_set_if_absent(&key(b"b"), Bytes::from_static(b"2"), None);
+        cache.handoff_set(key(b"a"), Bytes::from_static(b"1"), None, true);
+        cache.handoff_set_if_absent(&key(b"b"), Bytes::from_static(b"2"), None, true);
         // A refused put-if-absent still counts: it was a handoff write.
-        cache.handoff_set_if_absent(&key(b"b"), Bytes::from_static(b"3"), None);
+        cache.handoff_set_if_absent(&key(b"b"), Bytes::from_static(b"3"), None, true);
         assert_eq!(
             cache.reclaim_unowned_at(&[], &none, quiet, t0),
             report(0, true, 3),
@@ -3065,7 +3092,7 @@ mod tests {
         let mut cache = Cache::new(UNBOUNDED);
         cache.set(key(b"theirs"), Bytes::from_static(b"2"));
         let t0 = Instant::now();
-        cache.handoff_set(key(b"handed"), Bytes::from_static(b"h"), None);
+        cache.handoff_set(key(b"handed"), Bytes::from_static(b"h"), None, true);
         let keys = [key(b"theirs"), key(b"handed")];
         let none = |_: &Key| false;
 
@@ -3092,10 +3119,44 @@ mod tests {
         assert_eq!(cache.get(&key(b"handed")), None);
 
         // The put-if-absent form (re-replication) pauses the same way.
-        cache.handoff_set_if_absent(&key(b"again"), Bytes::from_static(b"a"), None);
+        cache.handoff_set_if_absent(&key(b"again"), Bytes::from_static(b"a"), None, true);
         assert_eq!(
             cache.reclaim_unowned(&[key(b"again")], &none, Duration::from_secs(60)),
             report(0, true, 2)
+        );
+    }
+
+    #[test]
+    fn a_handoff_write_for_a_key_already_owned_neither_pauses_nor_counts() {
+        // Issue #601: the caller vouches that this node already owns the
+        // key under its adopted ring (`ahead_of_ring: false`) — the pass
+        // keeps it for the same reason it keeps a client write, so the
+        // write neither pauses the pass nor moves the count the pass's
+        // mark watches. Both setters, stored or refused.
+        let mut cache = Cache::new(UNBOUNDED);
+        let none = |_: &Key| false;
+        let quiet = Duration::from_secs(60);
+        let t0 = Instant::now();
+
+        cache.handoff_set(key(b"mine"), Bytes::from_static(b"1"), None, false);
+        cache.handoff_set_if_absent(&key(b"also-mine"), Bytes::from_static(b"2"), None, false);
+        cache.handoff_set_if_absent(&key(b"also-mine"), Bytes::from_static(b"3"), None, false);
+        assert_eq!(
+            cache.reclaim_unowned_at(&[], &none, quiet, t0),
+            report(0, false, 0),
+            "an owned key's handoff write is a client write to the pass"
+        );
+        assert_eq!(cache.get(&key(b"mine")), Some(Bytes::from_static(b"1")));
+        assert_eq!(
+            cache.get(&key(b"also-mine")),
+            Some(Bytes::from_static(b"2"))
+        );
+
+        // One write ahead of its ring still pauses as before.
+        cache.handoff_set(key(b"theirs"), Bytes::from_static(b"t"), None, true);
+        assert_eq!(
+            cache.reclaim_unowned_at(&[], &none, quiet, t0),
+            report(0, true, 1)
         );
     }
 

@@ -2382,6 +2382,7 @@ async fn handle_connection(
                     ttl,
                     if_absent,
                     token,
+                    ahead_of_ring: _,
                 },
                 tag,
             )) => {
@@ -2423,6 +2424,11 @@ async fn handle_connection(
                 // Issue #266: also how a survivor re-replicates a key to
                 // the owner an eviction promoted, in which case
                 // `if_absent` is set and a key already present here wins.
+                // Issue #601: only a key this node does not own yet under
+                // the membership it has adopted arrived ahead of its ring
+                // — the case the reclaim pass's handoff pause exists for.
+                // One it already owns is, to that pass, a client write.
+                let ahead_of_ring = !owns_under_known_ring(&node_context, &key);
                 let response = execute_command(
                     &request_tx,
                     Command::HandoffSet {
@@ -2431,6 +2437,7 @@ async fn handle_connection(
                         ttl,
                         if_absent,
                         token,
+                        ahead_of_ring,
                     },
                 )
                 .await?;
@@ -8263,6 +8270,27 @@ fn wrong_node(node_context: &NodeContext, key: &Key) -> bool {
     wrong_node_hashed(node_context, KeyHash::of(key))
 }
 
+/// Issue #601: whether this node owns `key` under the membership it has
+/// adopted (`known_ring`, anywhere in the key's top-R) — what the `U` arm
+/// tells the cache so a handoff write for a key already owned is not
+/// taken for one that arrived ahead of its ring (`Cache::handoff_set`'s
+/// `ahead_of_ring`). Nothing adopted yet, or not an owner: the key is
+/// ahead of its ring. Unlike `wrong_node` this ignores `promoted` and the
+/// unconfirmed-join exception — it asks which ring covers the key, not
+/// whether to serve it.
+fn owns_under_known_ring(node_context: &NodeContext, key: &Key) -> bool {
+    node_context
+        .known_ring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|membership| {
+            membership
+                .ring
+                .is_owner(key, &node_context.name, membership.replication)
+        })
+}
+
 /// `wrong_node` for a key whose hash is already known — what the
 /// multi-key arms use so a frame's (potentially huge) shared namespace is
 /// hashed once, not once per key.
@@ -11859,6 +11887,95 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_handoff_write_pauses_the_reclaim_pass_only_for_a_key_this_node_does_not_own_yet() {
+        // Issue #601: the `U` arm tells the cache whether the key arrived
+        // ahead of its ring. One this node already owns under its adopted
+        // membership is a client write to the reclaim pass — no pause, no
+        // count. One it does not own yet (a leaver's handoff before the
+        // post-leave roster publishes) pauses the pass as before.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let membership = membership_of(&["ready-node", "other-node"], 1);
+        let candidates = || (0..2000).map(|i| key(format!("key-{i}").as_bytes()));
+        let owned = candidates()
+            .find(|candidate| membership.ring.is_owner(candidate, "ready-node", 1))
+            .unwrap();
+        let theirs = candidates()
+            .find(|candidate| !membership.ring.is_owner(candidate, "ready-node", 1))
+            .unwrap();
+        let mut node_context = node_context_over(Arc::new(Mutex::new(None)));
+        node_context.request_tx = request_tx.clone();
+        *node_context.known_ring.lock().unwrap() = Some(membership);
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+            },
+            shutdown_rx,
+        ));
+        let probe = || Command::ReclaimUnowned {
+            keys: Vec::new(),
+            checks: Vec::new(),
+            handoff_quiet_for: RECLAIM_GRACE,
+        };
+        // `U <ns-len> <key-len> <value-len> <token-len>\n<token><ns><key><value>`
+        let frame = |target: &Key| {
+            let mut frame = format!("U 0 {} 1 13\ntk-ready-node", target.name.len()).into_bytes();
+            frame.extend_from_slice(&target.name);
+            frame.push(b'v');
+            frame
+        };
+        let mut ack = [0u8; 2];
+
+        client.write_all(&frame(&owned)).await.unwrap();
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"S\n");
+        assert_eq!(
+            send_command(&request_tx, probe()).await,
+            Response::Reclaimed {
+                removed: 0,
+                paused: false,
+                handoff_writes: 0,
+            },
+            "a key this node owns under its adopted ring neither pauses nor counts"
+        );
+        assert_eq!(
+            send_command(&request_tx, Command::Get { key: owned.clone() }).await,
+            Response::Value(Bytes::from_static(b"v")),
+            "the write itself lands either way"
+        );
+
+        client.write_all(&frame(&theirs)).await.unwrap();
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"S\n");
+        assert_eq!(
+            send_command(&request_tx, probe()).await,
+            Response::Reclaimed {
+                removed: 0,
+                paused: true,
+                handoff_writes: 1,
+            },
+            "a key received ahead of its ring pauses the pass as before"
+        );
+
+        client.shutdown().await.unwrap();
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn handoff_delete_with_the_wrong_token_is_rejected_and_deletes_nothing() {
         // Issue #295: same proof as `handoff_set_with_the_wrong_token_is_
         // rejected_and_stores_nothing`, for `u`.
@@ -15246,6 +15363,7 @@ mod tests {
                 ttl: None,
                 if_absent: false,
                 token: "tk-me".to_string(),
+                ahead_of_ring: true,
             },
         )
         .await;
@@ -15354,6 +15472,7 @@ mod tests {
                 ttl: None,
                 if_absent: false,
                 token: "tk-me".to_string(),
+                ahead_of_ring: true,
             },
         )
         .await;

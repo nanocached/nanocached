@@ -252,12 +252,21 @@ pub enum Command {
     /// doesn't actually own. It leads the body (before `namespace`/`key`/
     /// `value`, same as `X`'s `<token><joining_name>`) so the connection
     /// handler can verify it before acting.
+    ///
+    /// `ahead_of_ring` (issue #601) is not on the wire: the parser leaves
+    /// it `false`, and the connection handler sets it after the token
+    /// check to whether this node does *not* own `key` under the
+    /// membership it has adopted — the write arrived ahead of the ring
+    /// that will make it an owner. Only such a write pauses the ownership
+    /// reclaim pass (`Cache::handoff_set`); one for a key this node
+    /// already owns is, to the pass, a client write.
     HandoffSet {
         key: Key,
         value: Bytes,
         ttl: Option<Duration>,
         if_absent: bool,
         token: String,
+        ahead_of_ring: bool,
     },
     /// `u <ns-len> <key-len> <token-len> [tag]\n<token><ns><key>` (issue
     /// #124, cluster-internal like `U`): a decommissioning node
@@ -431,6 +440,7 @@ impl Command {
                 // doc comment) — nothing left for the cache actor to do
                 // with it.
                 token: _,
+                ahead_of_ring,
             } => {
                 if if_absent {
                     // Issue #266: re-replication after an eviction — must
@@ -442,11 +452,11 @@ impl Command {
                     // handoff variants leave the client-visible
                     // `sets`/`cas_sets` counters alone — no client asked
                     // for this write.
-                    match cache.handoff_set_if_absent(&key, value, ttl) {
+                    match cache.handoff_set_if_absent(&key, value, ttl, ahead_of_ring) {
                         CasResult::Stored | CasResult::Mismatch => {}
                     }
                 } else {
-                    cache.handoff_set(key, value, ttl);
+                    cache.handoff_set(key, value, ttl, ahead_of_ring);
                 }
                 Response::Stored
             }
@@ -1202,6 +1212,9 @@ fn parse_with_mode(
                     ttl,
                     if_absent,
                     token,
+                    // Decided by the connection handler, not the wire —
+                    // see the variant's doc comment (issue #601).
+                    ahead_of_ring: false,
                 },
                 tag,
             ))
@@ -2108,7 +2121,7 @@ mod tests {
         // Issue #594: a zero-key call is the pass's probe — it touches
         // nothing and reports the handoff-write count.
         cache.set(name.clone(), Bytes::from_static(b"Bob"));
-        cache.handoff_set(key(b"handed"), Bytes::from_static(b"h"), None);
+        cache.handoff_set(key(b"handed"), Bytes::from_static(b"h"), None, true);
         assert_eq!(
             Command::ReclaimUnowned {
                 keys: Vec::new(),
@@ -2955,6 +2968,7 @@ mod tests {
                 ttl: Some(Duration::from_secs(30)),
                 if_absent: false,
                 token: "tok-h".to_string(),
+                ahead_of_ring: false,
             })
         );
         assert!(input.is_empty());
@@ -2995,6 +3009,7 @@ mod tests {
                 ttl: None,
                 if_absent: true,
                 token: "tok-h".to_string(),
+                ahead_of_ring: false,
             })
         );
 
@@ -3007,6 +3022,7 @@ mod tests {
                 ttl: Some(Duration::from_secs(30)),
                 if_absent: true,
                 token: "tok-h".to_string(),
+                ahead_of_ring: false,
             })
         );
 
@@ -3032,6 +3048,7 @@ mod tests {
                 ttl: None,
                 if_absent: true,
                 token: "tok-h".to_string(),
+                ahead_of_ring: false,
             }
             .execute(&mut cache),
             Response::Stored
@@ -3046,6 +3063,7 @@ mod tests {
                 ttl: None,
                 if_absent: true,
                 token: "tok-h".to_string(),
+                ahead_of_ring: false,
             }
             .execute(&mut cache),
             Response::Stored
@@ -3069,6 +3087,7 @@ mod tests {
             ttl: None,
             if_absent: false,
             token: "tok-h".to_string(),
+            ahead_of_ring: false,
         }
         .execute(&mut cache);
         Command::HandoffSet {
@@ -3077,6 +3096,7 @@ mod tests {
             ttl: Some(Duration::from_secs(60)),
             if_absent: true,
             token: "tok-h".to_string(),
+            ahead_of_ring: false,
         }
         .execute(&mut cache);
 

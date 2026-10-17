@@ -138,8 +138,10 @@ are open):</p>
   change (and once more when the 120&nbsp;s grace moves past the previous
   membership) a node drops the keys it has owned under <em>no</em> membership
   discovery published to it during the last 120&nbsp;s, provided no handoff
-  write reached it in that time and it is not itself leaving, mid-handoff or
-  still forwarding for a join (issue #582). The pass is checked every
+  write for a key it did not yet own under its adopted membership reached it
+  in that time (a handoff write for a key it already owns is, to the pass, a
+  client write &mdash; issue #601) and it is not itself leaving, mid-handoff
+  or still forwarding for a join (issue #582). The pass is checked every
   30&nbsp;s but skipped while nothing it judges against has moved (issue
   #594). Until then the node keeps more entries than its share of
   the keys, and if an eviction makes it an owner again inside that window the
