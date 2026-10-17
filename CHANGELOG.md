@@ -30,6 +30,19 @@ framework adapters at one version, whether or not a component changed.
   what the pass exists to find. `docs/architecture.html`'s "Known limits"
   now lists the reclaim pass among the walkers and the snapshot's
   transient size (#594).
+- `nanocached-node`: a `G` verdict from discovery (#571, "the joiner you
+  asked about has left") no longer takes the remnant an `X` for the same
+  join left behind (#573). The remnant keeps the abandoned slot's
+  `forward_revoked` flag so the forwards already queued against that slot
+  stay revoked, and that flag is also the identity the heartbeat carried
+  — so when the `X` landed before the heartbeat's ack, the `G` matched the
+  remnant, "abandoned" it (nothing to restore, the remnant is rebuilt with
+  its lingering windows intact) and scheduled a re-replication over a ring
+  nobody left, which superseded whichever real re-replication was in
+  flight and left its unsent keys for the next ring change. Needs another
+  join inside the previous joiner's forwarding grace and the `X` beating
+  the ack; found by review, reproduced in a unit test, not in Docker
+  (#595).
 
 ### Security
 
