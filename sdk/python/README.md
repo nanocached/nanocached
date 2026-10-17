@@ -80,7 +80,7 @@ A proxy looks like a single node that owns every key, so once connected this
 client is in its ordinary single-connection mode: no ring, no client-side
 replication, and no hedged reads — there are no replicas to hedge to, so
 `connect()` rejects a `read_hedge_after` set together with `via_proxy`
-(issue #488: an option that can never take effect is a misconfiguration,
+(an option that can never take effect is a misconfiguration,
 not something to ignore). Namespaces,
 clear/clear_all, tags, keep-alive and compression all work unchanged.
 Pointing `via_proxy` at an address that turns out to be a cache node (not a
@@ -243,7 +243,7 @@ reads and read repair do not apply to batches. When a batch
 ends in `PartialWrongNodeError`/`PartialConnectionLostError`,
 `get_many`'s `partial_values` are decoded as strictly as a successful
 read's; a stored value that isn't valid UTF-8 is left out of them rather
-than returned with replacement characters (issue #488) — use
+than returned with replacement characters — use
 `get_many_bytes` for the exact bytes.
 
 ## Compare-and-set
@@ -312,7 +312,7 @@ raises `ConnectionLostError` (a `ConnectionError` subclass) instead of
 silently retrying — see incr/decr's own caveat above, which applies here
 identically.
 
-**What "never sent" means (issue #484).** A non-idempotent request is
+**What "never sent" means.** A non-idempotent request is
 replayed after a redial only when this SDK can prove no complete frame
 reached the server. Every nanocached SDK applies the same rule — the
 connection was already closed before the frame was written, or the
@@ -488,7 +488,7 @@ client = await NanocachedClient.connect(
 ```
 
 `ca` is only meaningful when `tls=True`; a `ca` set with `tls=False` is
-rejected by `connect()` (issue #488) — it is almost always a forgotten
+rejected by `connect()` — it is almost always a forgotten
 `tls=True`. An unreadable or unparseable CA file is a connect-time error
 too.
 
@@ -520,7 +520,7 @@ fresh keyspace, or only after every client touching an existing one has
 upgraded and enabled it together. Incompressible data (already-compressed
 media, random bytes) is passed through unchanged rather than bloated.
 
-**Incompatible with `incr`/`decr` (issue #321).** A `compress=True` client
+**Incompatible with `incr`/`decr`.** A `compress=True` client
 raises `CompressionIncompatibleError` from both immediately rather than
 produce a value the protocol can't safely round-trip — see "Counters
 (incr/decr)" above.
@@ -537,7 +537,7 @@ produce a value the protocol can't safely round-trip — see "Counters
   every connection is torn down. It also waits for an in-flight
   node-list refresh or redial to finish before returning — a guarantee
   the other SDKs' `close()` does not make — a deliberate Python-only
-  guarantee (issue #488), kept because asyncio makes it cheap here and
+  guarantee, kept because asyncio makes it cheap here and
   it would slow `close()` down elsewhere. It is idempotent, but calling it again
   on an already-closed client prints a warning to stderr — usually a sign the client's
   lifecycle was mismanaged. Likewise, calling `connect()` again for the
@@ -551,7 +551,7 @@ produce a value the protocol can't safely round-trip — see "Counters
 - Caller mistakes (a negative `ttl_seconds`, an empty address list)
   raise host-language builtins (`ValueError`), not `NanocachedError` —
   the SDK's error family covers failures the server or network produced,
-  a convention shared across the SDKs (issue #47). Authentication
+  a convention shared across the SDKs. Authentication
   failure is `AuthenticationError`, a `NanocachedError` subclass.
 
 ## License
