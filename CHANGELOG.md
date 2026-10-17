@@ -12,6 +12,25 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-node`: the ownership reclaim pass (#582) no longer takes a
+  snapshot of every key every 30 s. Each pass started with a full key walk
+  on the cache task (about 25 ms per million keys, during which every
+  request waits) that held 64 bytes per key outside `--max-memory` (61 MiB
+  at 1M keys, 183 MiB at 3M — roughly the default limit's worth of small
+  entries) and then re-checked ownership of every key on the same task
+  (about 200 ms per million), in steady state with nothing to remove. The
+  pass now remembers what its last complete run judged against — the
+  published-membership history, how many of those memberships the grace
+  window still covers, and the cache's count of handoff writes — and skips
+  the snapshot while none of the three has moved, which outside a
+  membership change is always. An abandon that reverts a handoff's ring
+  also re-arms it, since the keys admitted under that unpublished ring are
+  what the pass exists to find. `docs/architecture.html`'s "Known limits"
+  now lists the reclaim pass among the walkers and the snapshot's
+  transient size (#594).
+
 ### Security
 
 - Updated `rustls` to 0.23.46 in the node, proxy and discovery binaries

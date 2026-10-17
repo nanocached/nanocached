@@ -241,6 +241,12 @@ pub struct Cache {
     /// own under a ring it has not adopted yet can arrive, and the
     /// ownership rings the pass is given cannot see that ring.
     last_handoff_at: Option<Instant>,
+    /// Issue #594: how many handoff writes (`handoff_set` /
+    /// `handoff_set_if_absent`) have landed since this cache was created.
+    /// Reported by `reclaim_unowned` so the reclaim pass can tell that
+    /// nothing a handoff could have brought in has arrived since the pass
+    /// it last completed — and skip taking a key snapshot at all.
+    handoff_writes: u64,
     /// Test-only: how many namespace lookups went by name (hash + compare
     /// of the whole name) — what a multi-key frame must do once, not per
     /// key.
@@ -293,6 +299,16 @@ pub enum CasCondition {
 }
 
 /// `Cache::cas_set`'s outcome.
+/// What one `reclaim_unowned` call did — see that method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReclaimReport {
+    pub removed: usize,
+    pub paused: bool,
+    /// Issue #594: handoff writes landed since the cache was created, as
+    /// of the start of the call.
+    pub handoff_writes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CasResult {
     /// The condition held; the new value is now stored.
@@ -391,6 +407,7 @@ impl Cache {
             cas_deletes: 0,
             pending_removal: VecDeque::new(),
             last_handoff_at: None,
+            handoff_writes: 0,
             #[cfg(test)]
             name_lookups: std::cell::Cell::new(0),
         }
@@ -506,8 +523,13 @@ impl Cache {
         // represent is "never expires", not a panic.
         let now = Instant::now();
         let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
-        self.last_handoff_at = Some(now);
+        self.note_handoff(now);
         self.insert(key, value, expires_at);
+    }
+
+    fn note_handoff(&mut self, now: Instant) {
+        self.last_handoff_at = Some(now);
+        self.handoff_writes = self.handoff_writes.wrapping_add(1);
     }
 
     /// The `if_absent` companion to [`Self::handoff_set`] (issue #266's
@@ -521,7 +543,7 @@ impl Cache {
         ttl: Option<Duration>,
     ) -> CasResult {
         let now = Instant::now();
-        self.last_handoff_at = Some(now);
+        self.note_handoff(now);
         if !self.condition_holds_at(key, CasCondition::Absent, now) {
             return CasResult::Mismatch;
         }
@@ -542,12 +564,18 @@ impl Cache {
     /// caller holds can see. Ownership is evaluated per key at removal, so
     /// a stale key list is harmless; marks and expiry are not consulted,
     /// the plain sweep handles those.
+    ///
+    /// Issue #594: the returned `ReclaimReport::handoff_writes` is the
+    /// count of handoff writes ever landed, read *before* anything is
+    /// removed. With no `keys` the call is a pure probe of that count and
+    /// of `paused` — what the pass asks before deciding whether to take a
+    /// key snapshot at all.
     pub fn reclaim_unowned(
         &mut self,
         keys: &[Key],
         owned: &dyn Fn(&Key) -> bool,
         handoff_quiet_for: Duration,
-    ) -> (usize, bool) {
+    ) -> ReclaimReport {
         self.reclaim_unowned_at(keys, owned, handoff_quiet_for, Instant::now())
     }
 
@@ -557,12 +585,17 @@ impl Cache {
         owned: &dyn Fn(&Key) -> bool,
         handoff_quiet_for: Duration,
         now: Instant,
-    ) -> (usize, bool) {
+    ) -> ReclaimReport {
+        let handoff_writes = self.handoff_writes;
         if self
             .last_handoff_at
             .is_some_and(|at| now.saturating_duration_since(at) < handoff_quiet_for)
         {
-            return (0, true);
+            return ReclaimReport {
+                removed: 0,
+                paused: true,
+                handoff_writes,
+            };
         }
         let mut removed = 0;
         for key in keys {
@@ -570,7 +603,11 @@ impl Cache {
                 removed += 1;
             }
         }
-        (removed, false)
+        ReclaimReport {
+            removed,
+            paused: false,
+            handoff_writes,
+        }
     }
 
     fn cas_set_at(
@@ -2963,15 +3000,61 @@ mod tests {
         let keys = [key(b"mine"), key(b"theirs"), key(b"absent")];
         assert_eq!(
             cache.reclaim_unowned(&keys, &owned, Duration::from_secs(60)),
-            (1, false)
+            report(1, false, 0)
         );
         assert_eq!(cache.get(&key(b"mine")), Some(Bytes::from_static(b"1")));
         assert_eq!(cache.get(&key(b"theirs")), None);
         assert_eq!(
             cache.reclaim_unowned(&keys, &owned, Duration::from_secs(60)),
-            (0, false),
+            report(0, false, 0),
             "idempotent"
         );
+    }
+
+    fn report(removed: usize, paused: bool, handoff_writes: u64) -> ReclaimReport {
+        ReclaimReport {
+            removed,
+            paused,
+            handoff_writes,
+        }
+    }
+
+    #[test]
+    fn reclaim_unowned_reports_the_handoff_writes_landed_so_far_and_probes_with_no_keys() {
+        // Issue #594: both handoff setters count, a plain set does not,
+        // and the count is read before the call removes anything — so a
+        // zero-key call is a probe of the count (and of the pause).
+        let mut cache = Cache::new(UNBOUNDED);
+        let none = |_: &Key| false;
+        let t0 = Instant::now();
+        let late = t0 + Duration::from_secs(120);
+        let quiet = Duration::from_secs(60);
+
+        assert_eq!(
+            cache.reclaim_unowned_at(&[], &none, quiet, t0),
+            report(0, false, 0)
+        );
+        cache.set(key(b"plain"), Bytes::from_static(b"p"));
+        assert_eq!(
+            cache.reclaim_unowned_at(&[], &none, quiet, t0),
+            report(0, false, 0)
+        );
+
+        cache.handoff_set(key(b"a"), Bytes::from_static(b"1"), None);
+        cache.handoff_set_if_absent(&key(b"b"), Bytes::from_static(b"2"), None);
+        // A refused put-if-absent still counts: it was a handoff write.
+        cache.handoff_set_if_absent(&key(b"b"), Bytes::from_static(b"3"), None);
+        assert_eq!(
+            cache.reclaim_unowned_at(&[], &none, quiet, t0),
+            report(0, true, 3),
+            "paused while a handoff is recent, count still reported"
+        );
+        assert_eq!(
+            cache.reclaim_unowned_at(&[key(b"a"), key(b"b")], &none, quiet, late),
+            report(2, false, 3),
+            "the count is as of the start of the call"
+        );
+        assert_eq!(cache.get(&key(b"plain")), Some(Bytes::from_static(b"p")));
     }
 
     #[test]
@@ -2993,7 +3076,7 @@ mod tests {
                 Duration::from_secs(60),
                 t0 + Duration::from_secs(30)
             ),
-            (0, true)
+            report(0, true, 1)
         );
         assert_eq!(cache.get(&key(b"theirs")), Some(Bytes::from_static(b"2")));
 
@@ -3004,7 +3087,7 @@ mod tests {
                 Duration::from_secs(60),
                 t0 + Duration::from_secs(61)
             ),
-            (2, false)
+            report(2, false, 1)
         );
         assert_eq!(cache.get(&key(b"handed")), None);
 
@@ -3012,7 +3095,7 @@ mod tests {
         cache.handoff_set_if_absent(&key(b"again"), Bytes::from_static(b"a"), None);
         assert_eq!(
             cache.reclaim_unowned(&[key(b"again")], &none, Duration::from_secs(60)),
-            (0, true)
+            report(0, true, 2)
         );
     }
 

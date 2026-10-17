@@ -1909,6 +1909,7 @@ async fn handle_connection(
                     generation,
                     &joined,
                     &node_context.known_ring,
+                    &node_context.ring_history,
                 ) {
                     MigrationOutcome::New { guard, restore } => {
                         // Issue #62: before the key snapshot below, so
@@ -3129,6 +3130,7 @@ fn revert_known_ring_after_abandon(node_context: &NodeContext, taken: &ActiveMig
         .is_some_and(|current| Arc::ptr_eq(&current.ring, &taken.after_ring))
     {
         *guard = taken.pre_completion_ring.clone();
+        node_context.ring_history.touch();
     }
 }
 
@@ -4207,6 +4209,28 @@ impl RingHistory {
         inner.generation += 1;
     }
 
+    /// Issue #594: bumps the generation without recording anything — for
+    /// an abandon that reverts `known_ring` to the pre-join ring. The
+    /// published rings did not change, but the keys this node admitted
+    /// while `known_ring` held the handoff's unpublished post-join ring
+    /// did: the next reclaim pass must look again rather than trust the
+    /// last one (`ReclaimMark`).
+    fn touch(&self) {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.generation += 1;
+    }
+
+    #[cfg(test)]
+    fn generation(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+    }
+
     /// One `OwnerCheck` per membership in force at some point during the
     /// last `grace`, plus the generation they were read at — or `None`
     /// when the history does not reach back that far (a fresh node, or a
@@ -4679,6 +4703,7 @@ impl MigrationGuard {
         generation: Option<u64>,
         joined: &[(String, String)],
         known_ring: &KnownRing,
+        ring_history: &RingHistory,
     ) -> MigrationOutcome {
         let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -4865,6 +4890,7 @@ impl MigrationGuard {
                 .is_some_and(|current| Arc::ptr_eq(&current.ring, &after_ring))
             {
                 *known_ring_guard = pre_completion_ring;
+                ring_history.touch();
             }
         }
 
@@ -6957,12 +6983,21 @@ async fn wait_for_migration_slot_to_clear(node_context: &NodeContext, joining_na
 /// overlapped the join (issue #582): the ring a handoff predicts is not
 /// the ring discovery ends up publishing, and only the published ones
 /// count here.
+///
+/// Issue #594: a pass is not free — its key snapshot (`Cache::keys`)
+/// stalls the cache task for about 25 ms per million keys and holds
+/// 64 bytes per key outside `--max-memory` (183 MiB at 3M), and the
+/// ownership checks cost the task several hundred milliseconds more —
+/// so it runs only when something could have changed its answer
+/// (`ReclaimMark`). In steady state that is never: a few passes per
+/// membership change, not one every interval.
 async fn run_reclaim(node_context: NodeContext, mut shutdown_rx: watch::Receiver<bool>) {
+    let mut settled: Option<ReclaimMark> = None;
     loop {
         if wait_or_shutdown(RECLAIM_INTERVAL, &mut shutdown_rx).await {
             return;
         }
-        if let Some(removed) = reclaim_pass(&node_context, &shutdown_rx).await
+        if let Some(removed) = reclaim_pass(&node_context, &shutdown_rx, &mut settled).await
             && removed > 0
         {
             println!(
@@ -6974,25 +7009,84 @@ async fn run_reclaim(node_context: NodeContext, mut shutdown_rx: watch::Receiver
     }
 }
 
+/// Issue #594: what the last *fully completed* reclaim pass judged
+/// against. A key this node holds can only become unowned-under-every-ring
+/// through one of three events, each of which moves one of these fields:
+///
+/// - discovery publishes a membership, or a handoff's ring is reverted on
+///   an abandon (`RingHistory::generation`, bumped by `record` and
+///   `touch`);
+/// - an old membership ages out of the grace window, so a key it alone
+///   gave this node is no longer covered (`epochs`, the number of rings in
+///   the window — only ever appended with a generation bump, only ever
+///   dropped from the front as the window moves, so `(generation,
+///   epochs)` identifies the exact set of rings a pass sees);
+/// - a handoff write lands, which can carry a key under a ring this node
+///   has not seen published (`handoff_writes`, the cache's count as of
+///   *before* the pass took its snapshot, so a key that arrived during the
+///   pass and is missing from the snapshot makes the next pass run).
+///
+/// A plain client write cannot: `wrong_node` admits a key only if this
+/// node owns it under `known_ring`, which is a published ring, a
+/// handoff's own post-join ring that discovery is about to publish (a new
+/// generation either way), or — through `serving_locally_for_unconfirmed_join`
+/// — the pre-join published ring. While all three stand still, the keys a
+/// completed pass left are exactly the keys the next would leave.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ReclaimMark {
+    generation: u64,
+    epochs: usize,
+    handoff_writes: u64,
+}
+
 /// One pass of `run_reclaim`: `None` when it could not run (see
-/// `reclaim_checks`), else how many entries it removed. Works from a
-/// snapshot of the keys in `SWEEP_BUDGET` chunks, yielding between them,
-/// and stops early if the membership moves under it (the history's
-/// generation changed) or the cache reports a recent handoff; what is
-/// left waits for the next interval. Ownership is re-evaluated per key at
-/// removal, so the snapshot being stale is harmless.
+/// `reclaim_checks`), else how many entries it removed — `Some(0)` without
+/// touching the keys when nothing has moved since the pass `settled`
+/// records (issue #594). Works from a snapshot of the keys in
+/// `SWEEP_BUDGET` chunks, yielding between them, and stops early if the
+/// membership moves under it (the history's generation changed) or the
+/// cache reports a recent handoff; what is left waits for the next
+/// interval, and only a pass that ran every chunk updates `settled`.
+/// Ownership is re-evaluated per key at removal, so the snapshot being
+/// stale is harmless.
 async fn reclaim_pass(
     node_context: &NodeContext,
     shutdown_rx: &watch::Receiver<bool>,
+    settled: &mut Option<ReclaimMark>,
 ) -> Option<usize> {
     let (checks, generation) = reclaim_checks(node_context)?;
+    let probe = Command::ReclaimUnowned {
+        keys: Vec::new(),
+        checks: Vec::new(),
+        handoff_quiet_for: RECLAIM_GRACE,
+    };
+    let handoff_writes = match execute_command(&node_context.request_tx, probe).await {
+        Ok(Response::Reclaimed {
+            paused: false,
+            handoff_writes,
+            ..
+        }) => handoff_writes,
+        _ => return Some(0),
+    };
+    let mark = ReclaimMark {
+        generation,
+        epochs: checks.len(),
+        handoff_writes,
+    };
+    if *settled == Some(mark) {
+        return Some(0);
+    }
+
     let keys = list_keys(&node_context.request_tx).await?;
     let mut removed = 0;
+    let mut completed = true;
     for chunk in keys.chunks(SWEEP_BUDGET) {
         if *shutdown_rx.borrow() {
+            completed = false;
             break;
         }
         if reclaim_checks(node_context).map(|(_, generation)| generation) != Some(generation) {
+            completed = false;
             break;
         }
         match execute_command(
@@ -7008,10 +7102,17 @@ async fn reclaim_pass(
             Ok(Response::Reclaimed {
                 removed: count,
                 paused: false,
+                ..
             }) => removed += count,
-            _ => break,
+            _ => {
+                completed = false;
+                break;
+            }
         }
         tokio::task::yield_now().await;
+    }
+    if completed {
+        *settled = Some(mark);
     }
     Some(removed)
 }
@@ -11445,6 +11546,7 @@ mod tests {
             None,
             &joined,
             &node_context.known_ring,
+            &node_context.ring_history,
         )
         .unwrap_new();
 
@@ -14510,6 +14612,7 @@ mod tests {
             None,
             &joined,
             &node_context.known_ring,
+            &node_context.ring_history,
         )
         .unwrap_new();
 
@@ -14809,6 +14912,7 @@ mod tests {
             None,
             &joined,
             &node_context.known_ring,
+            &node_context.ring_history,
         )
         .unwrap_new();
 
@@ -15066,7 +15170,10 @@ mod tests {
         uncovered
             .ring_history
             .record_at(Arc::clone(&shared), now - Duration::from_secs(30));
-        assert_eq!(reclaim_pass(&uncovered, &shutdown_rx).await, None);
+        assert_eq!(
+            reclaim_pass(&uncovered, &shutdown_rx, &mut None).await,
+            None
+        );
         drop(uncovered);
 
         // `alone` (me owns everything) was in force until 100 s ago, inside
@@ -15078,7 +15185,10 @@ mod tests {
         recent
             .ring_history
             .record_at(Arc::clone(&shared), now - Duration::from_secs(100));
-        assert_eq!(reclaim_pass(&recent, &shutdown_rx).await, Some(0));
+        assert_eq!(
+            reclaim_pass(&recent, &shutdown_rx, &mut None).await,
+            Some(0)
+        );
         drop(recent);
         assert_eq!(
             send_command(
@@ -15100,7 +15210,10 @@ mod tests {
         settled
             .ring_history
             .record_at(Arc::clone(&shared), now - Duration::from_secs(200));
-        assert_eq!(reclaim_pass(&settled, &shutdown_rx).await, Some(1));
+        assert_eq!(
+            reclaim_pass(&settled, &shutdown_rx, &mut None).await,
+            Some(1)
+        );
         assert_eq!(
             send_command(
                 &request_tx,
@@ -15128,7 +15241,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(reclaim_pass(&settled, &shutdown_rx).await, Some(0));
+        assert_eq!(
+            reclaim_pass(&settled, &shutdown_rx, &mut None).await,
+            Some(0)
+        );
         assert_eq!(
             send_command(
                 &request_tx,
@@ -15143,6 +15259,156 @@ mod tests {
         drop(request_tx);
         drop(settled);
         cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reclaim_pass_skips_the_snapshot_while_nothing_moved_and_runs_again_when_it_did() {
+        // Issue #594: a completed pass settles; the next one must not take
+        // a key snapshot (observable: a copy injected straight into the
+        // cache that the pass would remove survives), until the rings it
+        // judges against move (here through `touch`, the abandon path) or
+        // a handoff write lands.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let node_context = reclaim_test_context(request_tx.clone());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let now = Instant::now();
+
+        let alone = membership_of(&["me"], 1);
+        let shared = membership_of(&["me", "other"], 1);
+        let (theirs, mine) = keys_split_by_owner(&shared.ring);
+        let set = |k: &Key| Command::Set {
+            key: k.clone(),
+            value: Bytes::from_static(b"v"),
+            ttl: None,
+        };
+        let get = |k: &Key| Command::Get { key: k.clone() };
+        send_command(&request_tx, set(&theirs)).await;
+        send_command(&request_tx, set(&mine)).await;
+        node_context
+            .ring_history
+            .record_at(Arc::clone(&alone), now - Duration::from_secs(300));
+        node_context
+            .ring_history
+            .record_at(Arc::clone(&shared), now - Duration::from_secs(200));
+
+        let mut settled = None;
+        assert_eq!(
+            reclaim_pass(&node_context, &shutdown_rx, &mut settled).await,
+            Some(1)
+        );
+        let mark = settled.expect("a pass that ran every chunk settles");
+        assert_eq!(mark.epochs, 1, "only `shared` is inside the grace");
+        assert_eq!(mark.handoff_writes, 0);
+        assert_eq!(
+            send_command(&request_tx, get(&theirs)).await,
+            Response::NotFound
+        );
+
+        // Nothing moved: the injected unowned copy is not even looked at.
+        send_command(&request_tx, set(&theirs)).await;
+        assert_eq!(
+            reclaim_pass(&node_context, &shutdown_rx, &mut settled).await,
+            Some(0)
+        );
+        assert_eq!(settled, Some(mark));
+        assert_eq!(
+            send_command(&request_tx, get(&theirs)).await,
+            Response::Value(Bytes::from_static(b"v"))
+        );
+
+        // An abandon reverted `known_ring` (`RingHistory::touch`): the next
+        // pass runs again and finds the copy.
+        node_context.ring_history.touch();
+        assert_eq!(
+            reclaim_pass(&node_context, &shutdown_rx, &mut settled).await,
+            Some(1)
+        );
+        assert_ne!(settled, Some(mark));
+        assert_eq!(settled.map(|m| m.generation), Some(mark.generation + 1));
+        assert_eq!(
+            send_command(&request_tx, get(&theirs)).await,
+            Response::NotFound
+        );
+        assert_eq!(
+            send_command(&request_tx, get(&mine)).await,
+            Response::Value(Bytes::from_static(b"v"))
+        );
+
+        // A handoff write pauses the pass and leaves the mark alone, so the
+        // pass is not settled against a count it never judged.
+        let mark = settled.unwrap();
+        send_command(
+            &request_tx,
+            Command::HandoffSet {
+                key: theirs.clone(),
+                value: Bytes::from_static(b"h"),
+                ttl: None,
+                if_absent: false,
+                token: "tk-me".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(
+            reclaim_pass(&node_context, &shutdown_rx, &mut settled).await,
+            Some(0)
+        );
+        assert_eq!(settled, Some(mark));
+        assert_eq!(
+            send_command(&request_tx, get(&theirs)).await,
+            Response::Value(Bytes::from_static(b"h"))
+        );
+
+        drop(request_tx);
+        drop(node_context);
+        cache_task.await.unwrap();
+    }
+
+    #[test]
+    fn abandoning_a_completed_join_touches_the_reclaim_history() {
+        // Issue #594: both abandon paths that revert `known_ring` bump the
+        // history's generation, so a settled reclaim pass runs again — the
+        // keys admitted under the unpublished post-join ring are now
+        // unowned under every published one.
+        let (node_context, _after_ring, _pre) = completed_unconfirmed_context(&["key-3"]);
+        assert_eq!(node_context.ring_history.generation(), 0);
+        assert!(matches!(
+            abandon_migration(&node_context, "joiner-0"),
+            AbandonOutcome::Completed(_)
+        ));
+        assert_eq!(node_context.ring_history.generation(), 1);
+
+        // An `M` whose roster shows the previous joiner never made it.
+        let (node_context, _after_ring, _pre) = completed_unconfirmed_context(&["key-3"]);
+        let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
+        let outcome = MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            "joiner-1".to_string(),
+            "127.0.0.1:10".to_string(),
+            "tok-joiner-1".to_string(),
+            Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "other-node".to_string(),
+                "joiner-1".to_string(),
+            ])),
+            2,
+            None,
+            &joined,
+            &node_context.known_ring,
+            &node_context.ring_history,
+        );
+        assert!(matches!(outcome, MigrationOutcome::New { .. }));
+        assert_eq!(node_context.ring_history.generation(), 1);
+
+        // No revert (a newer membership already replaced the handoff's
+        // ring): nothing to re-judge, the generation stays.
+        let (node_context, _after_ring, _pre) = completed_unconfirmed_context(&["key-3"]);
+        *node_context.known_ring.lock().unwrap() = Some(membership_of(&["ready-node"], 1));
+        assert!(matches!(
+            abandon_migration(&node_context, "joiner-0"),
+            AbandonOutcome::Completed(_)
+        ));
+        assert_eq!(node_context.ring_history.generation(), 0);
     }
 
     #[test]
@@ -15378,6 +15644,7 @@ mod tests {
             None,
             &joined,
             &node_context.known_ring,
+            &node_context.ring_history,
         );
 
         let _guard = match outcome {
@@ -15580,6 +15847,7 @@ mod tests {
             None,
             &[],
             &known_ring,
+            &RingHistory::default(),
         );
 
         assert!(
@@ -15633,6 +15901,7 @@ mod tests {
             None,
             &[],
             &known_ring,
+            &RingHistory::default(),
         );
 
         assert!(
@@ -15692,6 +15961,7 @@ mod tests {
             Some(7),
             &[],
             &known_ring,
+            &RingHistory::default(),
         );
 
         assert!(
@@ -15758,6 +16028,7 @@ mod tests {
             Some(2),
             &[],
             &known_ring,
+            &RingHistory::default(),
         );
 
         assert!(
@@ -15843,6 +16114,7 @@ mod tests {
             Some(2),
             &joined,
             &known_ring,
+            &RingHistory::default(),
         );
 
         let _guard = match outcome {
@@ -15972,6 +16244,7 @@ mod tests {
             Some(1),
             &joined,
             &known_ring,
+            &RingHistory::default(),
         ) {
             MigrationOutcome::New { guard, .. } => guard,
             _ => panic!("a completed handoff must not block the next join"),
@@ -16064,6 +16337,7 @@ mod tests {
                 Some(2),
                 &joined,
                 &known_ring,
+                &RingHistory::default(),
             );
             assert!(matches!(outcome, MigrationOutcome::New { .. }));
             assert!(
@@ -16229,6 +16503,7 @@ mod tests {
             Some(5),
             &[],
             &known_ring,
+            &RingHistory::default(),
         );
 
         assert!(
@@ -16849,6 +17124,7 @@ mod tests {
             None,
             joined,
             known_ring,
+            &RingHistory::default(),
         )
     }
 
@@ -17815,6 +18091,7 @@ mod tests {
                 Some(2),
                 &joined,
                 &known_ring,
+                &RingHistory::default(),
             );
 
             assert!(matches!(outcome, MigrationOutcome::New { .. }));
@@ -17864,6 +18141,7 @@ mod tests {
             None,
             &joined,
             &known_ring,
+            &RingHistory::default(),
         );
 
         assert!(matches!(outcome, MigrationOutcome::New { .. }));
@@ -20052,6 +20330,7 @@ mod tests {
             None,
             &[],
             &node_context.known_ring,
+            &node_context.ring_history,
         );
         let guard = outcome.unwrap_new();
         {

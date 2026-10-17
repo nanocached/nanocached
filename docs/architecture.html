@@ -134,11 +134,14 @@ are open):</p>
   <li>A client write that reaches a node a join has displaced releases that
   copy's dead-copy mark, so the mark sweep never reclaims it (the release is
   deliberate: a mark that outlives its value once deleted fresh writes). Such a
-  copy is removed instead by the ownership reclaim pass: every 30&nbsp;s a node
-  drops the keys it has owned under <em>no</em> membership discovery published
-  to it during the last 120&nbsp;s, provided no handoff write reached it in
-  that time and it is not itself leaving, mid-handoff or still forwarding for
-  a join (issue #582). Until then the node keeps more entries than its share of
+  copy is removed instead by the ownership reclaim pass: after a membership
+  change (and once more when the 120&nbsp;s grace moves past the previous
+  membership) a node drops the keys it has owned under <em>no</em> membership
+  discovery published to it during the last 120&nbsp;s, provided no handoff
+  write reached it in that time and it is not itself leaving, mid-handoff or
+  still forwarding for a join (issue #582). The pass is checked every
+  30&nbsp;s but skipped while nothing it judges against has moved (issue
+  #594). Until then the node keeps more entries than its share of
   the keys, and if an eviction makes it an owner again inside that window the
   copy is live again &mdash; by design, since a membership that flips back
   within the grace is exactly what the grace waits for &mdash; so an old value
@@ -289,16 +292,22 @@ that needs the read to strictly precede the write awaits the
 
 <h2>Known limits</h2>
 <p><strong>A ring change stalls a node for a few tens of milliseconds
-per million keys.</strong> Re-replication, a staged handoff, and a
-decommission each begin by taking a snapshot of every live key the node
-holds, and that walk runs on the node&rsquo;s single cache task, so
-requests that arrive during it wait. Measured in release builds at about
-25&nbsp;ms per million live keys (5&nbsp;ms at 200k, 52&nbsp;ms at 2M);
-at the default <code>--max-memory</code> of 256&nbsp;MiB a node holds on
-the order of 2&ndash;3M small entries, so one membership change costs a
-single pause of a few tens of milliseconds &mdash; the same order as the
-expiry sweep&rsquo;s own periodic refill, and only on membership
-changes, never on the request path. Bounding it would need an ordered
+per million keys.</strong> Re-replication, a staged handoff, a
+decommission, and the ownership reclaim pass each begin by taking a
+snapshot of every live key the node holds, and that walk runs on the
+node&rsquo;s single cache task, so requests that arrive during it wait.
+Measured in release builds at about 25&nbsp;ms per million live keys
+(5&nbsp;ms at 200k, 52&nbsp;ms at 2M); at the default
+<code>--max-memory</code> of 256&nbsp;MiB a node holds on the order of
+2&ndash;3M small entries, so one membership change costs a few pauses of
+a few tens of milliseconds each (one per walker that runs, and the
+reclaim pass runs about twice per change: once after it, once when the
+grace window moves past the old membership) &mdash; the same order as
+the expiry sweep&rsquo;s own periodic refill, and only on membership
+changes, never on the request path or on a timer. The snapshot itself
+is a transient allocation of 64 bytes per key that
+<code>--max-memory</code> does not account for (about 180&nbsp;MiB at
+3M keys), so leave that much headroom above the limit. Bounding it would need an ordered
 per-namespace key index that every write maintains; that standing cost
 on the hot path was judged not worth removing a rare, bounded pause.
 Size the node count so a single node&rsquo;s keyspace stays in the low

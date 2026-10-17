@@ -290,6 +290,8 @@ pub enum Command {
     /// node holds but owns under none of `checks` — every membership
     /// discovery published during the reclaim grace — unless a handoff
     /// write landed within `handoff_quiet_for` (`Cache::reclaim_unowned`).
+    /// With no `keys` it removes nothing and only reports (issue #594): the
+    /// pause, and how many handoff writes have landed so far.
     ReclaimUnowned {
         keys: Vec<Key>,
         checks: Vec<OwnerCheck>,
@@ -521,8 +523,12 @@ impl Command {
                 handoff_quiet_for,
             } => {
                 let owned = |key: &Key| checks.iter().any(|check| check.owns(key));
-                let (removed, paused) = cache.reclaim_unowned(&keys, &owned, handoff_quiet_for);
-                Response::Reclaimed { removed, paused }
+                let report = cache.reclaim_unowned(&keys, &owned, handoff_quiet_for);
+                Response::Reclaimed {
+                    removed: report.removed,
+                    paused: report.paused,
+                    handoff_writes: report.handoff_writes,
+                }
             }
         }
     }
@@ -2084,7 +2090,8 @@ mod tests {
             reclaim(owner).execute(&mut cache),
             Response::Reclaimed {
                 removed: 0,
-                paused: false
+                paused: false,
+                handoff_writes: 0,
             }
         );
         assert_eq!(cache.get(&name), Some(Bytes::from_static(b"Alice")));
@@ -2092,10 +2099,30 @@ mod tests {
             reclaim(other).execute(&mut cache),
             Response::Reclaimed {
                 removed: 1,
-                paused: false
+                paused: false,
+                handoff_writes: 0,
             }
         );
         assert_eq!(cache.get(&name), None);
+
+        // Issue #594: a zero-key call is the pass's probe — it touches
+        // nothing and reports the handoff-write count.
+        cache.set(name.clone(), Bytes::from_static(b"Bob"));
+        cache.handoff_set(key(b"handed"), Bytes::from_static(b"h"), None);
+        assert_eq!(
+            Command::ReclaimUnowned {
+                keys: Vec::new(),
+                checks: Vec::new(),
+                handoff_quiet_for: Duration::ZERO,
+            }
+            .execute(&mut cache),
+            Response::Reclaimed {
+                removed: 0,
+                paused: false,
+                handoff_writes: 1,
+            }
+        );
+        assert_eq!(cache.get(&name), Some(Bytes::from_static(b"Bob")));
     }
 
     #[test]
