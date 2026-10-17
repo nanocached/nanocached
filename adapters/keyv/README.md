@@ -8,10 +8,10 @@ adapters. If you're still on `cache-manager` v5, see the sibling
 [`nanocached-cache-manager`](../cache-manager) instead.
 
 - **One store ⇄ one namespace.** Every `NanocachedKeyvStore` is scoped to
-  exactly one nanocached namespace (issue #105), named by its own
+  exactly one nanocached namespace, named by its own
   `namespace` config (default `"keyv"`) — two stores on different
   namespaces never collide, even against the same cluster, and `clear()`
-  is that namespace's `CLEAR` (issue #106).
+  is that namespace's `CLEAR`.
 - **`get`/`set`/`delete`/`clear`** map to the SDK's namespaced
   get/set/delete, with all of its routing, replication, hedged reads and
   retries.
@@ -190,18 +190,16 @@ Node.js 20+, `keyv` ^5 (the relative-millisecond-`ttl` adapter contract
 this targets — `keyv@6`'s absolute-`expires` contract is a different shape
 and, as of writing, still only at a release candidate, not what published
 `cache-manager`/`@nestjs/cache-manager` depend on), nanocached server ≥ the
-release that ships namespaces and `CLEAR` (issues #105/#106).
+release that ships namespaces and `CLEAR`.
 
 ## Policy note
 
 Framework adapters are ecosystem-specific and live **outside** the
-six-language SDK parity policy ([#25]): parity applies to the SDK core
+six-language SDK parity policy: parity applies to the SDK core
 only. This module exists for Keyv/`cache-manager` v6+/NestJS 11; other
 ecosystems get their own idiomatic adapters (Spring `CacheManager`,
 `IDistributedCache`, Django cache backend, [JCache](../jcache),
 [`cache-manager` v5](../cache-manager)) rather than mirrors of this one.
-
-[#25]: https://github.com/nanocached/nanocached/issues/25
 
 ## Building
 

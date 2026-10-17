@@ -16,12 +16,12 @@ and friends run against a nanocached cluster.
   compare-and-set. Two racing callers can both observe "absent" and both
   write; the later write wins. Same trade-off the Spring adapter's
   `putIfAbsent` documents.
-- **`get_many`/`set_many`** use the wire's batched multi-get/multi-set
-  (issues #150/#152): one round trip per involved node instead of one per
+- **`get_many`/`set_many`** use the wire's batched multi-get/multi-set:
+  one round trip per involved node instead of one per
   key. **`delete_many`** remains a concurrent client-side fan-out — the
   wire has no multi-key delete.
-- **`incr`/`decr`** use the wire's own atomic counter (`INCR`, issue
-  #129): atomic on the node that owns the key, unlike `add()`/`touch()`
+- **`incr`/`decr`** use the wire's own atomic counter (`INCR`): atomic on the
+  node that owns the key, unlike `add()`/`touch()`
   above. Matches `BaseCache`'s own contract — raises `ValueError` if the
   key doesn't exist — and is exactly as volatile as `set()`: LRU
   eviction or this alias's `TIMEOUT` reclaim a counter the same as any
@@ -130,7 +130,7 @@ connection survive the request cycle.
 
 ### Preforking servers (Gunicorn `preload_app`, uWSGI)
 
-The bridge is fork-aware (issue #393): the backend records which process
+The bridge is fork-aware: the backend records which process
 started its loop thread and rebuilds the loop, thread and client on the
 first cache operation in a `fork()` child. Without that, a warm-up cache
 touch in a preloading master (e.g. from `AppConfig.ready()`) would leave
@@ -182,10 +182,10 @@ def my_view(request):
 ## Consistency notes
 
 `add()` and `touch()` are get-then-set (see above), not atomic.
-`get_many`/`set_many` batch by owning node (issues #150/#152) and
+`get_many`/`set_many` batch by owning node and
 `delete_many` fans out per key — in every case a failure partway through
 leaves whichever keys were already processed changed rather than rolling
-back. `incr`/`decr` (issue #129) are atomic on the node that owns the
+back. `incr`/`decr` are atomic on the node that owns the
 key, since the wire has a real `INCR`.
 
 ## Counter storage
@@ -245,18 +245,16 @@ Mitigate with all of:
 ## Requirements
 
 Python 3.11+, Django 4.2+, `nanocached` (Python SDK) 0.3+, a nanocached
-server ≥ the release that ships namespaces and CLEAR (issues #105/#106).
+server ≥ the release that ships namespaces and CLEAR.
 
 ## Policy note
 
 Framework adapters are ecosystem-specific and live **outside** the
-six-language SDK parity policy ([#25]): parity applies to the SDK core
+six-language SDK parity policy: parity applies to the SDK core
 only. This module exists for Django; other ecosystems get their own
 idiomatic adapters (Spring Cache, `IDistributedCache`, cache-manager
 store, [JCache](../jcache), [Keyv](../keyv)) rather than mirrors of this
 one.
-
-[#25]: https://github.com/nanocached/nanocached/issues/25
 
 ## Testing
 
