@@ -13,7 +13,7 @@ path = "src/main.rs"
 bytes = "1"
 lru = "0.18"
 rustc-hash = "2"
-rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2.0"
 sha2 = "0.10"
 tokio = {

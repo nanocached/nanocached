@@ -12,6 +12,17 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Security
+
+- Updated `rustls` to 0.23.46 in the node, proxy and discovery binaries
+  (RUSTSEC-2026-0346: `Debug` impls for client session values exposed TLS
+  secrets; RUSTSEC-2026-0347: buffered application data was sent to the
+  outer server after an ECH rejection; RUSTSEC-2026-0348: Brotli
+  certificate decompression could allocate up to 1 GiB before
+  authentication; RUSTSEC-2026-0349: an unauthenticated ServerHello could
+  downgrade later connections to classical key exchange). The crate's
+  lower bound is raised to 0.23.46 as well (#593).
+
 ## [0.4.5] - 2026-10-15
 
 ### Fixed
