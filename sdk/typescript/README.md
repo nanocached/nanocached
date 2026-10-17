@@ -619,7 +619,10 @@ never replayed.
   forgotten?`) when called again for a single address whose previous
   connection is still open; the check is skipped for multi-address
   configs, where concurrent clients sharing an address list are
-  legitimate (issue #12)
+  legitimate (issue #12). The check is per address within the process,
+  not per client instance, so several clients to one single address trip
+  it even when each is closed in turn; share one client, or use a
+  multi-address config, if that is your shape
 - `client.nodeUrls` — addresses currently connected to (introspection)
 - `client.stats()` — a snapshot `ClientStats` of counters for failures and
   events this client swallows or retries by design instead of raising

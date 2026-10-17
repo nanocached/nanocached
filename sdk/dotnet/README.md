@@ -538,7 +538,10 @@ means the caller lost track of the client's lifecycle. Likewise,
 single configured address while a previous connection to it is still
 open — a sign `close()` was forgotten. Neither warning fires for
 multi-address configs, since legitimate concurrent clients would make
-that a false positive.
+that a false positive. The connect check is per address within the
+process, not per client instance, so several clients to one single
+address trip it even when each is closed in turn; share one client, or
+use a multi-address config, if that is your shape.
 
 ## Errors
 

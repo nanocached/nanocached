@@ -590,7 +590,10 @@ plain integer on the wire.
 - `connect()` warns to stderr (`was close() forgotten?`) when called again
   for a single address whose previous connection is still open; the check
   is skipped for multi-address configs, where concurrent clients sharing
-  an address list are legitimate (issue #12).
+  an address list are legitimate (issue #12). The check is per address
+  within the process, not per client instance, so several clients to one
+  single address trip it even when each is closed in turn; share one
+  client, or use a multi-address config, if that is your shape.
 - It shares no code with the server (the repository's independence
   rule); the hash pipeline is pinned to cross-language test vectors that
   the server, TypeScript, Python, and Java implementations also assert.
