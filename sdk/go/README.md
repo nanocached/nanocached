@@ -159,7 +159,7 @@ A proxy answers the identify handshake exactly like a single node that
 owns every key, so from there the client runs in its ordinary
 single-connection mode: no ring, no per-node connections, and — since a
 single connection has no replicas to hedge to — **`Connect` rejects a
-configured `ReadHedgeAfter` together with `ViaProxy`** (issue #488: an
+configured `ReadHedgeAfter` together with `ViaProxy`** (an
 option that can never take effect is a misconfiguration, not something
 to ignore). Every other option —
 `Compress`, `FireAndForgetReplicas`, `ReadRepair`, namespaces,
@@ -260,7 +260,7 @@ replaying could let a replica drift from the primary (e.g. after a
 dropped earlier replica write), while forwarding the literal result keeps
 every replica byte-identical to it.
 
-**`Incr`/`Decr` are at-least-once, not exactly-once** (issue #225).
+**`Incr`/`Decr` are at-least-once, not exactly-once**.
 Unlike `Get`/`Set`/`Delete`, INCR is not idempotent, so it is never
 silently resent once the request may have already reached the primary: a
 connection failure at that point is returned as `ErrConnectionLost`
@@ -272,7 +272,7 @@ it) — so a caller that sees `ErrConnectionLost` from `Incr`/`Decr` cannot
 tell whether the increment took effect, and must decide for itself
 whether to retry (risking a double-apply) or treat the result as unknown.
 
-**What "never sent" means (issue #484).** A non-idempotent request is
+**What "never sent" means.** A non-idempotent request is
 replayed after a redial only when this SDK can prove no complete frame
 reached the server: the connection was already closed before the frame
 was written, or the write call itself failed while the connection was
@@ -285,7 +285,7 @@ replayed. Every SDK applies this same rule; the Node and asyncio SDKs,
 whose runtimes buffer writes in user space and flush them in the
 background, can only ever prove the first case.
 
-**Incompatible with `Compress`** (issue #321): a client constructed with
+**Incompatible with `Compress`**: a client constructed with
 `Compress: true` returns `ErrCompressIncompatible` from `Incr`/`Decr`
 immediately, before any I/O, rather than produce a value the protocol
 can't safely round-trip — see "Value compression" below.
@@ -389,7 +389,7 @@ by replaying `k`/`x` on a replica, which could otherwise evaluate the
 same condition against its own possibly-different copy and reach a
 different outcome.
 
-**These four calls are at-least-once, not exactly-once** (issue #225),
+**These four calls are at-least-once, not exactly-once**,
 the same caveat `Incr`/`Decr` carry. `k`/`x` are not idempotent —
 replaying a `k`/`x` that already succeeded would re-evaluate the
 condition against the value/absence it itself just wrote and report a
@@ -483,7 +483,7 @@ client, err := nanocached.Connect(nanocached.Config{
 })
 ```
 
-A set `CA` with `TLS` `false` fails `Connect` (issue #488) — a CA is
+A set `CA` with `TLS` `false` fails `Connect` — a CA is
 only ever read over TLS, so that combination is almost always a
 forgotten `TLS: true`. An unreadable or unparseable CA file when `TLS`
 is `true` fails `Connect` too.
@@ -530,7 +530,7 @@ an existing one has upgraded and enabled it together. Incompressible
 data (already-compressed media, random bytes) is passed through
 unchanged rather than bloated.
 
-**Incompatible with `Incr`/`Decr`** (issue #321): the protocol has no way
+**Incompatible with `Incr`/`Decr`**: the protocol has no way
 to tell a compressed value from a plain counter, so `Compress: true`
 makes `Incr`/`Decr` return `ErrCompressIncompatible` rather than corrupt
 a counter or a compressed value — see "Incr and Decr" above.
@@ -549,13 +549,13 @@ a counter or a compressed value — see "Incr and Decr" above.
   mistakes (an invalid TTL, an empty address list)
   surface as ordinary errors outside the sentinel set — they indicate a
   bug in the calling code, not a nanocached failure; this convention is
-  shared across the SDKs (issue #47).
+  shared across the SDKs.
 - `Close()` is idempotent; calling it a second time warns to stderr
   instead of erroring. `Connect()` also warns to stderr if it's called
   for a single address that a previous, still-open connection from this
   process already points at — a common sign that `Close()` was
   forgotten. That check is skipped for multi-address configs, where
-  concurrent clients sharing an address list are legitimate (issue #12).
+  concurrent clients sharing an address list are legitimate.
   It is per address within the process, not per client instance, so
   several clients to one single address trip it even when each is closed
   in turn; share one client, or use a multi-address config, if that is
