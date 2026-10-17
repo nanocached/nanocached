@@ -930,8 +930,27 @@ final class Connection {
     /** This connection's only reader, for its whole lifetime — nothing
      * else may read from {@code in}. Consumes responses off the wire and
      * dispatches each to the oldest pending request (FIFO —
-     * Request pipelining). */
+     * Request pipelining).
+     *
+     * <p>Issue #600: a {@code RuntimeException} out of the loop — none is
+     * known to be thrown, the parser reports every malformed field as a
+     * {@link NanocachedException} — used to end this thread through the
+     * JVM's default uncaught-exception handler with the connection never
+     * poisoned: the socket stayed open and every pending request waited
+     * for the watchdog (30&nbsp;s). It now poisons like an I/O failure,
+     * with the exception kept as the cause. An {@code Error} is left to
+     * the JVM: it is not a condition this SDK can recover from. The Python
+     * SDK's read loop guards the same hole (issue #8). */
     private void readLoop() {
+        try {
+            dispatchResponses();
+        } catch (RuntimeException error) {
+            poison(new NanocachedException.ConnectionFailed(
+                    "nanocached: connection failed: " + error, error));
+        }
+    }
+
+    private void dispatchResponses() {
         while (true) {
             Response response;
             try {

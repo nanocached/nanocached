@@ -11,6 +11,18 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- A `RuntimeException` thrown on a connection's reader thread now poisons
+  the connection at once, with the exception as the cause of the
+  `ConnectionFailed` every pending request gets. Before, only `IOException`
+  and `NanocachedException` were caught there: any other exception ended
+  the reader thread through the JVM's default uncaught-exception handler
+  with the socket still open, and every pending request waited for the
+  request watchdog (30 s) to time it out. No such exception is known to be
+  thrown by the response parser; this closes the hole the Python SDK's
+  read loop already guards (#600).
+
 ## [0.4.5] - 2026-10-15
 
 ### Fixed
