@@ -51,7 +51,7 @@ off just that one, leaving the other autoconfigured.
 
 **Inert without `nanocached.addresses`.** The autoconfiguration is gated on
 that property (a `Binder`-based condition that accepts both the YAML-list
-and comma-string forms, issue #388), so adding the dependency alone
+and comma-string forms), so adding the dependency alone
 changes nothing — same principle as Boot's own autoconfigurations backing
 off until configured. It also runs `@AutoConfigureBefore` Boot's own
 `CacheAutoConfiguration`, so it wins over Boot's default manager (e.g. the
@@ -109,15 +109,13 @@ beyond the two beans; it does not change adapter behavior.
 ## Requirements
 
 Java 17+, Spring Boot 3.x, nanocached server ≥ the release that ships
-namespaces and CLEAR (issues #105/#106).
+namespaces and CLEAR.
 
 ## Policy note
 
 Framework adapters are ecosystem-specific and live **outside** the
-six-language SDK parity policy ([#25]): parity applies to the SDK core
+six-language SDK parity policy: parity applies to the SDK core
 only.
-
-[#25]: https://github.com/nanocached/nanocached/issues/25
 
 ## Building
 

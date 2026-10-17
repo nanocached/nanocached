@@ -8,15 +8,15 @@ multi-key ops, and `wrap()` (its read-through idiom) all run against a
 nanocached cluster.
 
 - **One store ⇄ one namespace.** Every `NanocachedStore` is scoped to
-  exactly one nanocached namespace (issue #105), named by its `namespace`
+  exactly one nanocached namespace, named by its `namespace`
   config (default `"cache-manager"`) — two stores on different namespaces
   never collide, even against the same cluster, and `reset()` is that
-  namespace's `CLEAR` (issue #106): an O(1) sub-map drop on every node,
+  namespace's `CLEAR`: an O(1) sub-map drop on every node,
   never the whole-cluster flush.
 - **`get`/`set`/`del`/`mget`/`mset`/`mdel`** map to the SDK's namespaced
   operations, with all of its routing, replication, hedged reads and
-  retries. `mget`/`mset` use the SDK's batched `getMany`/`setMany`
-  (issue #152): one wire round trip per involved node. `mdel` remains a
+  retries. `mget`/`mset` use the SDK's batched `getMany`/`setMany`:
+  one wire round trip per involved node. `mdel` remains a
   `Promise.all` loop — the wire has no multi-key delete.
 - **Values are JSON-serialized** (`JSON.stringify`/`JSON.parse`), the
   convention `cache-manager`'s own stores use (its Redis store does the
@@ -24,7 +24,7 @@ nanocached cluster.
 - **`keys()` is unsupported** — the wire has no key-enumeration operation,
   so it always throws a documented `NotSupportedError` rather than
   returning a misleading empty answer. **`ttl()` degrades gracefully
-  instead** ([#274](https://github.com/nanocached/nanocached/issues/274)):
+  instead**:
   the wire has no TTL-readback operation either, but `ttl()` is a
   *required* `Store` member that `cache-manager`'s own `wrap()` calls
   unconditionally whenever `refreshThreshold` is configured — throwing
@@ -116,7 +116,7 @@ client directly, for anything this store doesn't itself surface —
   matching the Redis store's own convention, since `undefined` already
   means exactly that. **`null`** is a real, distinct value and round-trips
   normally (`JSON.stringify(null)` is `"null"`, not `undefined`).
-- **`reset()`** clears this store's namespace only (`CLEAR`, issue #106)
+- **`reset()`** clears this store's namespace only (`CLEAR`)
   — never `NanocachedClient.clearAll()`'s whole-cluster flush. Two stores
   on different namespaces are fully isolated from each other's `reset()`.
 - **`keys()`** always throws `NotSupportedError`: a nanocached node only
@@ -138,8 +138,8 @@ client directly, for anything this store doesn't itself surface —
   `wrap()` without `refreshThreshold` at all. If your application relies
   on refresh-ahead actually firing before expiry, this store cannot
   provide that; use `wrap()` for its cache-aside behavior only.
-- **`mget`/`mset`** ride the wire's batched multi-get/multi-set (issue
-  #152) — one round trip per involved node; **`mdel`** is a concurrent
+- **`mget`/`mset`** ride the wire's batched multi-get/multi-set — one round
+  trip per involved node; **`mdel`** is a concurrent
   `Promise.all` loop over `del`. `mget` preserves key order in its result
   (including `undefined` holes for misses); `mset` applies one `ttl` to
   every entry, same as `cache-manager`'s own multi-store fallback for a
@@ -150,18 +150,16 @@ client directly, for anything this store doesn't itself surface —
 Node.js 20+, `cache-manager` ^5 (the `get`/`set`/`del`/`reset`/`mget`/`mset`
 shape this targets — its `Keyv`-based v6+/NestJS 11 successor is
 [`nanocached-keyv`](../keyv), a separate package), nanocached server ≥ the
-release that ships namespaces and `CLEAR` (issues #105/#106).
+release that ships namespaces and `CLEAR`.
 
 ## Policy note
 
 Framework adapters are ecosystem-specific and live **outside** the
-six-language SDK parity policy ([#25]): parity applies to the SDK core
+six-language SDK parity policy: parity applies to the SDK core
 only. This module exists for `cache-manager` v5; other ecosystems get
 their own idiomatic adapters (Spring `CacheManager`, `IDistributedCache`,
 Django cache backend, [JCache](../jcache), [Keyv](../keyv) for
 `cache-manager` v6+/NestJS 11) rather than mirrors of this one.
-
-[#25]: https://github.com/nanocached/nanocached/issues/25
 
 ## Building
 

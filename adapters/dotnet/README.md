@@ -150,18 +150,16 @@ namespace directly through `client.Namespace(...)`.
 ## Policy note
 
 Framework adapters are ecosystem-specific and live **outside** the
-six-language SDK parity policy ([#25]): parity applies to the SDK core
+six-language SDK parity policy: parity applies to the SDK core
 only. This module exists for `IDistributedCache`; other ecosystems get
 their own idiomatic adapters (Spring `CacheManager`, Django cache backend,
 cache-manager store, [JCache](../jcache), [Keyv](../keyv)) rather than
 mirrors of this one.
 
-[#25]: https://github.com/nanocached/nanocached/issues/25
-
 ## Requirements
 
-.NET 8+, nanocached server ≥ the release that ships namespaces (issue
-#105) — namespaced frames need a server that understands them.
+.NET 8+, nanocached server ≥ the release that ships namespaces — namespaced
+frames need a server that understands them.
 
 ## Building
 

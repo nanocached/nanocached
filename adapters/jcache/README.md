@@ -16,7 +16,7 @@ over.
   on first use", JSR-107 requires explicit `CacheManager.createCache(...)`
   — `getCache` on an uncreated name answers `null`, per spec.
 - **`putIfAbsent`/`replace(k,old,new)`/`remove(k,old)`** map directly to
-  the SDK's compare-and-set primitives (issue #141) — genuinely atomic,
+  the SDK's compare-and-set primitives — genuinely atomic,
   not a racy get-then-write.
 - **`getAndPut`/`getAndReplace`/`getAndRemove`** are bounded
   compare-and-set retry loops built on `getWithToken` + the CAS
@@ -126,7 +126,7 @@ users.removeAll();                                    // maps to CLEAR
 
 ## Atomicity
 
-`putIfAbsent` maps straight onto the SDK's `putIfAbsent` (issue #141) — a
+`putIfAbsent` maps straight onto the SDK's `putIfAbsent` — a
 single conditional wire round trip, genuinely atomic.
 
 `getAndPut`, `getAndReplace`, `getAndRemove`, `replace(k,old,new)`, and
@@ -136,8 +136,8 @@ current value and the digest it was read with (`getWithToken`), compare
 (for the two CAS-condition ops, against the caller's `oldValue` via
 `equals()` — not a digest of `oldValue`'s own re-serialized form, which
 would fail for a value that's `equals()`-equal but not canonically
-serialized, e.g. a `HashMap` built in a different insertion order;
-issue #186), attempt the conditioned write with the digest that read
+serialized, e.g. a `HashMap` built in a different insertion order), attempt
+the conditioned write with the digest that read
 observed, and retry on a concurrent change, up to 10 attempts.
 
 Under pathological sustained contention on one key, `getAndPut` and
@@ -198,20 +198,17 @@ module.
 ## Requirements
 
 Java 17+, `javax.cache:cache-api:1.1.1`, nanocached server ≥ the release
-that ships namespaces/CLEAR (issues #105/#106) and compare-and-set
-(issue #141).
+that ships namespaces/CLEAR and compare-and-set.
 
 ## Policy note
 
 Framework adapters are ecosystem-specific and live **outside** the
-six-language SDK parity policy ([#25]): parity applies to the SDK core
+six-language SDK parity policy: parity applies to the SDK core
 only. This module exists for JSR-107; other ecosystems get their own
 idiomatic adapters (Spring `CacheManager`, `IDistributedCache`, Django
 cache backend, [cache-manager](../cache-manager) v5,
 [Keyv](../keyv) for cache-manager v6+/NestJS 11) rather than mirrors of
 this one.
-
-[#25]: https://github.com/nanocached/nanocached/issues/25
 
 ## Building
 
