@@ -169,8 +169,8 @@ existed, err := client.Delete("greeting")</code></pre>
   of production constants (request timeout, keep-alive interval, the
   in-flight budgets for fire-and-forget replica writes and hedge legs,
   the batch-decompression cap) as mutable, documented-but-hidden values
-  so its own test suite can shrink them. That is a deliberate convention
-  (issue #488), not an API: they are not part of any SDK's public
+  so its own test suite can shrink them. That is a deliberate convention,
+  not an API: they are not part of any SDK's public
   surface, changing one affects every client in the process, and a test
   that lowers one is expected to restore it. Applications configure
   what they need through the connect options instead.</li>
