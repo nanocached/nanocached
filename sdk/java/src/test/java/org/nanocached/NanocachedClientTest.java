@@ -5565,4 +5565,52 @@ class NanocachedClientTest {
             Connection.requestTimeoutMillis = original;
         }
     }
+
+    // ── Reader thread: a RuntimeException poisons, not just IOException (issue #600) ──
+
+    @Test
+    void aRuntimeExceptionOnTheReaderThreadPoisonsTheConnectionAtOnce() throws Exception {
+        // readLoop caught IOException and NanocachedException only; any
+        // other RuntimeException out of the read path killed the reader
+        // thread without poison(), so every pending request waited for
+        // the watchdog (30 s) and the socket stayed open. Python's read
+        // loop guards the same hole explicitly (issue #8). No networking:
+        // a Socket whose input stream throws the moment it is read.
+        java.io.InputStream throwing = new java.io.InputStream() {
+            @Override
+            public int read() {
+                throw new IllegalStateException("simulated reader-thread failure");
+            }
+        };
+        java.net.Socket socket = new java.net.Socket() {
+            @Override
+            public java.io.InputStream getInputStream() {
+                return throwing;
+            }
+
+            @Override
+            public java.io.OutputStream getOutputStream() {
+                return java.io.OutputStream.nullOutputStream();
+            }
+        };
+        java.util.concurrent.CountDownLatch closed = new java.util.concurrent.CountDownLatch(1);
+        // Quiet the JVM's default handler for the reader thread's death on
+        // the unfixed code, which is not what this test is about.
+        Thread.UncaughtExceptionHandler original = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((thread, error) -> {});
+        try {
+            Connection connection = new Connection(socket, false, closed::countDown);
+            assertTrue(closed.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                    "the reader thread's RuntimeException did not poison the connection");
+            assertTrue(socket.isClosed(), "poison() closes the socket");
+            NanocachedException.ConnectionFailed error = assertThrows(
+                    NanocachedException.ConnectionFailed.class,
+                    () -> connection.get(new byte[0], "k".getBytes(StandardCharsets.UTF_8)));
+            // A poisoned connection refuses at once (notSent=true: the frame
+            // never touched the wire) — no 30 s watchdog wait.
+            assertTrue(error.getMessage().contains("closed"), error.getMessage());
+        } finally {
+            Thread.setDefaultUncaughtExceptionHandler(original);
+        }
+    }
 }
