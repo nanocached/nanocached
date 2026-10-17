@@ -6245,5 +6245,53 @@ class IdentifyFailureRetiresTheSocketTests(unittest.IsolatedAsyncioTestCase):
             await server.wait_closed()
 
 
+class EstablishedConnectionResetRetiresTheSocketTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_reset_mid_session_leaves_no_unretrieved_close_waiter(self):
+        # The established-connection twin of
+        # IdentifyFailureRetiresTheSocketTests: a node that resets an open
+        # connection (killed, or its listener torn down under a scale-in)
+        # puts the ConnectionResetError on the protocol's close waiter as
+        # well as raising it from the read loop. _poison() only closes
+        # the writer, and the client replaces a poisoned connection on
+        # the next redial without ever calling wait_closed() on it — so
+        # nothing retrieved the waiter's exception, and whenever cyclic GC
+        # finalized the waiter before the protocol asyncio logged "Future
+        # exception was never retrieved" at ERROR. The read loop, which
+        # always runs on this path, has to retrieve it.
+        import socket
+        import struct
+
+        from nanocached._connection import Connection
+
+        async def reset_after_the_first_request(reader, writer):
+            with contextlib.suppress(Exception):
+                await reader.readuntil(b"\n")
+            sock = writer.get_extra_info("socket")
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            writer.close()
+
+        server = await asyncio.start_server(reset_after_the_first_request, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            connection = Connection(reader, writer, on_close=lambda: None, tagged=False)
+            with self.assertRaises(ConnectionError):
+                await connection.get(b"k")
+            # Nothing calls wait_closed() here on purpose: a replaced
+            # connection is simply dropped. Give the read loop its turns.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            waiter = writer._protocol._get_close_waiter(writer)
+            self.assertTrue(waiter.done())
+            # Read the flag before .exception(), which itself retrieves.
+            retrieved = not waiter._log_traceback
+            self.assertIsInstance(waiter.exception(), ConnectionResetError)
+            self.assertTrue(retrieved, "connection_lost error left unretrieved on the close waiter")
+            await connection.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+
 if __name__ == "__main__":
     unittest.main()

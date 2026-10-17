@@ -257,6 +257,26 @@ def _encode_multi_set(
     return header + body
 
 
+async def _retire(writer: asyncio.StreamWriter) -> None:
+    """Waits for a writer whose transport is already closing (connection
+    reset or closed by the peer) to finish, so the connection_lost error
+    — an RST on the `A` ack from a node that is exiting mid-handshake
+    (issue #588), or a reset of an established connection (issue #599) —
+    is retrieved from the protocol's close waiter. Without this the error
+    sits un-retrieved on that future and asyncio logs "Future exception
+    was never retrieved" (at ERROR, through the asyncio logger) whenever
+    cyclic GC happens to finalize the future before the protocol. The
+    caller's own error is what propagates: a close-time error is dropped
+    here. Since connection_lost has run or is scheduled by the time the
+    transport reports closing, the wait is at most one loop turn. Only
+    called for such a transport — see _identify's _connect_and_identify
+    and Connection._poison."""
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
 class _MultiWrongNode:
     """Sentinel marking one key's per-key ``W`` inside a multi_get/
     multi_set roster (issues #128/#150/#151) — distinct from a clean
@@ -340,6 +360,12 @@ class Connection:
         # _read_loop checks the response against before handing it out.
         self._pending: deque[_PendingSlot] = deque()
         self._closed = False
+        # Issue #599: set by _poison() when the transport was already
+        # closing before it closed the writer — the peer reset or closed
+        # the connection, which is what leaves an error on the protocol's
+        # close waiter. The read loop (and wait_closed()) then wait for
+        # the close so that error is retrieved; see _retire.
+        self._peer_closed = False
         self._last_used = time.monotonic()
         self._on_close = on_close
         # The progress-based request deadline (issue #42): armed when the
@@ -383,6 +409,13 @@ class Connection:
             await self._read_task
         except asyncio.CancelledError:
             pass
+        # Issue #599: a connection close() poisoned after the peer had
+        # already reset it, whose read task was cancelled above before it
+        # ever ran, still has the error on its close waiter — the read
+        # loop's own retrieval never happened. Idempotent on a waiter the
+        # read loop already drained.
+        if self._peer_closed:
+            await _retire(self._writer)
 
     async def get(self, key: bytes, namespace: bytes = b"") -> bytes | None:
         marker, value = await self._request(lambda tag: _encode_get(key, tag, namespace))
@@ -581,6 +614,12 @@ class Connection:
         self._clear_deadline()
         pending = list(self._pending)
         self._pending.clear()
+        # Issue #599: observed before close() below flips it — only a
+        # transport the peer already took down carries an error on its
+        # close waiter, and only that one is waited for (a healthy TLS
+        # connection closed from here would otherwise wait on the
+        # shutdown handshake).
+        self._peer_closed = self._writer.transport.is_closing()
         self._writer.close()
         for slot in pending:
             if not slot.future.cancelled():
@@ -758,6 +797,20 @@ class Connection:
         return future
 
     async def _read_loop(self) -> None:
+        """Runs _dispatch_responses to its end and then, if the peer
+        took the connection down (issue #599: _poison() saw the transport
+        already closing), waits for the close so the connection_lost
+        error is retrieved from the protocol's close waiter. This is the
+        one place that always runs on that path: the owning client
+        replaces a poisoned connection on its next redial without
+        calling wait_closed() on it."""
+        try:
+            await self._dispatch_responses()
+        finally:
+            if self._peer_closed:
+                await _retire(self._writer)
+
+    async def _dispatch_responses(self) -> None:
         while True:
             try:
                 marker, value, tag = await self._read_one_response()

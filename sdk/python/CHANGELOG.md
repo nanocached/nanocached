@@ -11,6 +11,20 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ### Fixed
 
+- A connection the node resets mid-session (a node killed, or its listener
+  torn down under a scale-in) now waits for its socket to finish closing
+  once the read loop has failed it, which retrieves the
+  `ConnectionResetError` asyncio had recorded on the protocol's close
+  waiter. Before, `_poison()` only closed the writer and the client
+  replaced the connection on its next redial without ever waiting on it,
+  so the error sat unretrieved and asyncio logged `Future exception was
+  never retrieved` (an ERROR through the `asyncio` logger) whenever the
+  garbage collector happened to finalize the waiter before the protocol
+  — the established-connection twin of the dial-time case fixed in 0.4.5
+  (#588). Only a connection the peer already took down is waited for; a
+  `close()` of a healthy connection never waits on a TLS shutdown
+  handshake. No socket was leaked; the error the caller sees is
+  unchanged (#599).
 - A dial that fails during the `A` handshake — typically a node exiting
   mid-handshake and resetting the connection — now waits for its socket
   to finish closing, which retrieves the connection error asyncio had

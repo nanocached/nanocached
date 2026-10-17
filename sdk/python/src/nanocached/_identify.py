@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TypeVar
 
-from ._connection import _parse_strict_uint
+from ._connection import _parse_strict_uint, _retire
 from ._errors import AuthenticationError, DiscoveryBusyError, NanocachedError
 
 # Sent as the `A` secret when the caller didn't configure one: a server
@@ -204,23 +204,6 @@ async def _connect_and_identify_with_deadline(
             f"nanocached: connecting to {host}:{port} timed out after {CONNECT_DEADLINE}s"
         ) from error
 
-
-async def _retire(writer: asyncio.StreamWriter) -> None:
-    """Waits for a writer whose transport is already closing (connection
-    reset or closed by the peer) to finish, so the connection_lost error
-    — typically an RST on the `A` ack from a node that is exiting
-    mid-handshake — is retrieved from the protocol's close waiter. Without
-    this the error sits un-retrieved on that future and asyncio logs
-    "Future exception was never retrieved" (at ERROR, through the asyncio
-    logger) whenever cyclic GC happens to finalize the future before the
-    protocol. The caller's own error is what propagates: a close-time error
-    is dropped here. Since connection_lost has run or is scheduled by the
-    time the transport reports closing, the wait is at most one loop turn.
-    Only called for such a transport — see _connect_and_identify."""
-    try:
-        await writer.wait_closed()
-    except Exception:
-        pass
 
 
 async def _connect_and_identify(
