@@ -16,5 +16,5 @@ load(){
   local l=$1; shift
   docker run --rm --name load-$l --network $NET -v $E:/w e2e-client python load.py --label $l "$@" > $E/logs/$l.json 2> $E/logs/$l.progress; }
 summ(){ python3 -c "
-import json,sys;d=json.load(open('$E/logs/$1.json'));print({k:d[k] for k in ('ops','ops_s','get','set','delete','miss','corrupt','stale','future_version','connects','err_total','errors')}); [print('  ',s) for s in d['samples'][:5]]"; }
+import json,sys;d=json.loads([l for l in open('$E/logs/$1.json') if l.startswith('{\"label\"')][-1]);print({k:d[k] for k in ('ops','ops_s','get','set','miss','corrupt','err_total','errors','sdk_stats') if k in d})"; }
 warns(){ for c in "$@"; do echo "== $c"; docker logs $c 2>&1 | grep -v "accepted connection" | grep -i "warn\|error\|panic" | sed 's/[0-9.]*:[0-9]*:/X:/' | sort | uniq -c | sort -rn | head -8; done; }
