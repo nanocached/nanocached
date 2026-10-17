@@ -275,8 +275,7 @@ default; <code>describe-tasks</code> shows
 <p>The stuck task is not the node holding on to a stale answer. Against
 a local DNS server that answered NXDOMAIN and then published the record,
 both the Alpine image and a glibc build re-query the name on every
-5&nbsp;s retry and join on the first retry after the record appears
-(issue #174). What keeps a Fargate task stuck for minutes is most likely
+5&nbsp;s retry and join on the first retry after the record appears. What keeps a Fargate task stuck for minutes is most likely
 a negative-cache entry in the VPC resolver its ENI talks to — the other
 zone's task used a different resolver, and the replacement task started
 after the entry had expired. Such a task recovers by itself once the
@@ -341,9 +340,7 @@ withdrawn. Under a normal scale-in discovery is up and logs <code>node
 left the cluster</code> instead.)</p>
 <p>The same drain with a bug in it is instructive: this guide's first
 run hit a bug in which an authenticated node could not fetch the roster
-on the way out (<a
-href="https://github.com/nanocached/nanocached/issues/171">#171</a>,
-fixed in the images pinned above). The leavers exited 0 on time, ECS
+on the way out (fixed in the images pinned above). The leavers exited 0 on time, ECS
 was satisfied, and 2,736 of the 20,000 keys were gone. Watch the
 leaver's log, not just the exit code.</p>
 
