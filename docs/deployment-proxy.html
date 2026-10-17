@@ -223,8 +223,7 @@ a frame already written can't be retried — the proxy's own backend
 connections are exactly as exposed to that 60&nbsp;s timeout as an
 SDK's, just with no traffic of their own to keep them busy while no
 client is attached. Re-run on the 0.4.2 image, the release that shipped
-the fix (issue <a
-href="https://github.com/nanocached/nanocached/issues/514">#514</a>):
+the fix:
 a key set, then 100&nbsp;s — well past the node's 60&nbsp;s idle
 timeout — with the proxy otherwise untouched, then a fresh connection
 sending <code>INCR +1</code>. The log group carried nothing but the

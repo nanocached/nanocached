@@ -263,7 +263,7 @@ independent <code>g</code> frames. Replies:</p>
 order as the request's keys: a decimal byte length (a hit — that many
 bytes of the trailing body belong to this key, in order), <code>-</code>
 (a miss), or <code>W</code> (this node doesn't own this particular key).
-Issue #125's <code>R</code> and the fatal <code>E</code> still apply to
+The <code>R</code> status and the fatal <code>E</code> still apply to
 the whole frame, but <code>W</code> never does — a <code>&lt;key-length&gt;</code>
 being wrong for one key out of a thousand doesn't invalidate the other
 999.</p>
@@ -394,7 +394,7 @@ window is the same one the pre-tags protocol always had.</p>
     node's own view of membership it does not own this key, so the
     client's routing table is stale. SDKs respond by refreshing the node
     list and retrying once.</td></tr>
-    <tr><td><code>R\n</code></td><td>Retryable error (issue #125): this
+    <tr><td><code>R\n</code></td><td>Retryable error: this
     one request failed transiently — an upstream briefly unreachable
     behind <code>nanocached-proxy</code>, typically — and should be
     retried shortly <em>on the same connection</em>; nothing is torn
@@ -405,7 +405,7 @@ window is the same one the pre-tags protocol always had.</p>
     <code>R &lt;tag&gt;\n</code>. Today the proxy is the only emitter —
     nodes and discovery accept the capability token but have no
     transient per-request failure to report.</td></tr>
-    <tr><td><code>T\n</code></td><td>Not numeric (issue #129, <code>i</code>
+    <tr><td><code>T\n</code></td><td>Not numeric (<code>i</code>
     only): the key exists but its stored value isn't a decimal-ASCII
     <code>i64</code>, or applying <code>&lt;delta&gt;</code> would
     overflow one.</td></tr>

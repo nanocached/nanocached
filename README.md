@@ -296,8 +296,8 @@ request response tags; a server that supports them echoes the capability
 in its reply (`OnT\n`/`OdT\n`) and the connection runs in tagged mode —
 see "Response tags" below.
 
-A further optional `R` field (`A <secret-length> [T] R\n<secret>`,
-issue #125) declares that the client understands the retryable-error
+A further optional `R` field (`A <secret-length> [T] R\n<secret>`) declares
+that the client understands the retryable-error
 status: a server may then answer a *transiently* failed request with
 `R\n` (`R <tag>\n` in tagged mode) instead of the fatal
 `E`-and-close — the client retries that one request, bounded, on the
