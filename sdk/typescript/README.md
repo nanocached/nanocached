@@ -127,7 +127,7 @@ const client = await NanocachedClient.connect({
 ```
 
 `ca` is only meaningful when `tls: true`; a `ca` set with `tls` unset or
-`false` is rejected by `connect()` (issue #488) — it is almost always a
+`false` is rejected by `connect()` — it is almost always a
 forgotten `tls: true`. An unreadable or unparseable CA file is a
 connect-time error too.
 
@@ -159,7 +159,7 @@ after every client touching an existing one has upgraded and enabled it
 together. Incompressible data (already-compressed media, random bytes) is
 passed through unchanged rather than bloated.
 
-**Incompatible with `incr`/`decr`** (issue #321): a `compress`-enabled
+**Incompatible with `incr`/`decr`**: a `compress`-enabled
 client rejects `incr`/`decr` outright with `CompressionIncompatibleError`
 — see [`incr`/`decr`](#incr--decr) above.
 
@@ -319,7 +319,7 @@ A proxy looks exactly like a single node that owns every key, so once
 connected the client is in the same single-connection mode a direct node
 address puts it in: no ring view, no per-node connections, and **no hedged
 reads** — `connect()` rejects a `readHedgeAfterMs` set together with
-`viaProxy` (issue #488), since a proxy connection has no replicas to hedge
+`viaProxy`, since a proxy connection has no replicas to hedge
 to and an option that can never take effect is a misconfiguration. Namespaces, `clear`/`clearAll`,
 tags, keep-alive, and compression all work unchanged over that one
 connection.
@@ -393,7 +393,7 @@ wire operation for decrement, the server only ever sees `i`. Both default
 isn't an integer `incr` can operate on (or where applying `delta` would
 overflow) rejects with `NotNumericError`.
 
-**Incompatible with value compression** (issue #321): a client constructed
+**Incompatible with value compression**: a client constructed
 with `compress: true` rejects `incr`/`decr` immediately, before any I/O,
 with `CompressionIncompatibleError`. The wire protocol has no marker byte
 on incr/decr's ASCII result, so a compress-enabled client can neither incr
@@ -550,7 +550,7 @@ call throws `ConnectionLostError` instead of being replayed — replaying
 it would evaluate the condition against the already-changed value and
 could misreport a real success as `false`.
 
-**What "never sent" means (issue #484).** A non-idempotent request is
+**What "never sent" means.** A non-idempotent request is
 replayed after a redial only when this SDK can prove no complete frame
 reached the server. Every nanocached SDK applies the same rule — the
 connection was already closed before the frame was written, or the
@@ -619,7 +619,7 @@ never replayed.
   forgotten?`) when called again for a single address whose previous
   connection is still open; the check is skipped for multi-address
   configs, where concurrent clients sharing an address list are
-  legitimate (issue #12). The check is per address within the process,
+  legitimate. The check is per address within the process,
   not per client instance, so several clients to one single address trip
   it even when each is closed in turn; share one client, or use a
   multi-address config, if that is your shape
@@ -645,7 +645,7 @@ everything else. Node system errors from the socket itself
 so do caller mistakes caught by argument validation (e.g. an invalid
 `ttlSeconds` throws a builtin `RangeError`): those indicate a bug in the
 calling code, not a nanocached failure, a convention shared across the
-SDKs (issue #47).
+SDKs.
 
 ## License
 

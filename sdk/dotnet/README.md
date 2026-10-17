@@ -77,7 +77,7 @@ owns every key (full `Get`/`Set`/`Delete`, never routing-stale), so once
 connected the client is in its ordinary single-connection mode: **no
 ring, no per-node connections, and no hedged reads** — there is nobody
 else to hedge to, so `ConnectAsync` rejects a `ReadHedgeAfter` set
-together with `ViaProxy` (issue #488: an option that can never take
+together with `ViaProxy` (an option that can never take
 effect is a misconfiguration, not something to ignore). Namespaces, `ClearAsync`/`ClearAllAsync`, response
 tags, keep-alive, and compression all work unchanged over the one
 connection.
@@ -413,8 +413,8 @@ restart, a network blip) redials and retries once transparently — for
 are idempotent, so replaying one after a redial is always safe.
 
 **`IncrAsync`/`DecrAsync`, `PutIfAbsentAsync`/`ReplaceIfPresentAsync`/
-`ReplaceAsync`, and `DeleteIfMatchesAsync` are NOT idempotent** (issue
-#225): replaying a fully-sent Incr would double-apply it, and replaying a
+`ReplaceAsync`, and `DeleteIfMatchesAsync` are NOT idempotent**: replaying a
+fully-sent Incr would double-apply it, and replaying a
 fully-sent CAS/conditional-delete could report an already-succeeded
 operation as a mismatch. For these, the redial-and-retry only ever
 resends the request when the connection is known to have died *before*
@@ -424,7 +424,7 @@ reply was lost, the primary may already have applied the operation, and
 these methods throw `ConnectionLostException` instead of guessing —
 read the key back to find out which happened.
 
-**What "never sent" means (issue #484).** A non-idempotent request is
+**What "never sent" means.** A non-idempotent request is
 replayed after a redial only when this SDK can prove no complete frame
 reached the server: the connection was already closed before the frame
 was written, or the write call itself failed while the connection was
@@ -479,8 +479,8 @@ other SDKs — not a literal zero-length secret.
 
 For a private CA, point `Ca` at a PEM file of trusted root certificate(s)
 — it replaces the default trust store and is only consulted when `Tls`
-is true (a set `Ca` with `Tls` false is rejected by `ConnectAsync` —
-issue #488; an unreadable or unparseable CA file when `Tls` is true is a
+is true (a set `Ca` with `Tls` false is rejected by `ConnectAsync`; an
+unreadable or unparseable CA file when `Tls` is true is a
 connect-time error too):
 
 ```csharp
@@ -553,7 +553,7 @@ isn't an integer, and `CompressionIncompatibleException` for
 catch clause covers "an expected nanocached failure". Caller mistakes
 (an invalid TTL, an empty address list) throw `ArgumentException`
 instead: they indicate a bug in the calling code, not a nanocached
-failure, a convention shared across the SDKs (issue #47).
+failure, a convention shared across the SDKs.
 
 ### Retryable errors and `transient_retries`
 

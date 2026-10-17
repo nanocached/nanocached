@@ -152,7 +152,7 @@ a connection failure: if the connection dies after the primary already
 applied the delta but before its reply arrived, the SDK throws
 `NanocachedException.ConnectionFailed` rather than risk applying the
 delta twice. See [Reconnect and keep-alive](#reconnect-and-keep-alive)
-for the full rule (issue #225).
+for the full rule.
 
 In a cluster, only the primary owner runs the increment; the replicas
 receive the primary's literal resulting value (and TTL) as an ordinary
@@ -283,8 +283,7 @@ the `true` it actually was. So none of `putIfAbsent`/`replaceIfPresent`/
 `replace`/`deleteIfMatches` is retried after a connection failure that
 happens once the request may have reached the server — they throw
 `NanocachedException.ConnectionFailed` instead. See
-[Reconnect and keep-alive](#reconnect-and-keep-alive) for the full rule
-(issue #225).
+[Reconnect and keep-alive](#reconnect-and-keep-alive) for the full rule.
 
 ## Fire-and-forget replica writes
 
@@ -375,9 +374,9 @@ INCR, or report an already-succeeded CAS/delete-if-matches as a
 mismatch); it throws `NanocachedException.ConnectionFailed` instead,
 leaving the caller unable to tell "definitely not applied" from
 "applied, but the ack was lost" — at-least-once, not exactly-once,
-and not something this SDK smooths over (issue #225).
+and not something this SDK smooths over.
 
-**What "never sent" means (issue #484).** A non-idempotent request is
+**What "never sent" means.** A non-idempotent request is
 replayed after a redial only when this SDK can prove no complete frame
 reached the server: the connection was already closed before the frame
 was written, or the write call itself failed while the connection was
@@ -441,7 +440,7 @@ one connection and no ring view:
   that.
 - **`readHedgeAfter` is rejected.** Hedging needs a second owner to send
   the same read to; a single connection has none, so `connect()` refuses
-  a `readHedgeAfter` set together with `viaProxy` (issue #488) rather than
+  a `readHedgeAfter` set together with `viaProxy` rather than
   carrying an option that can never take effect.
 
 On a lost connection, the client first retries the same proxy (it may
@@ -462,7 +461,7 @@ NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
 
 `tls` is a plain boolean, default `false`. `ca` names a PEM file of
 trusted root certificate(s) — it's meaningful only when `tls` is `true`
-(set without it, `connect()` rejects the options — issue #488), and an
+(set without it, `connect()` rejects the options), and an
 unreadable or unparseable CA file is a connect-time error. `ca` accepts a `java.nio.file.Path`, or a `String`
 path / `java.io.File` via convenience overloads.
 
@@ -507,7 +506,7 @@ this client's lifecycle. Likewise, calling `connect()` again for the
 same single address while a previous connection to it is still open
 warns to stderr — `was close() forgotten?`. That check is skipped for
 multi-address configs, where concurrent clients sharing an address list
-are legitimate (issue #12). It is per address within the process, not per
+are legitimate. It is per address within the process, not per
 client instance, so several clients to one single address trip it even
 when each is closed in turn; share one client, or use a multi-address
 config, if that is your shape.
@@ -519,7 +518,7 @@ including `AuthenticationFailed` for a rejected secret — so one catch
 clause covers "an expected nanocached failure". Caller mistakes (an
 invalid TTL, an empty address list) throw `IllegalArgumentException`
 instead: they indicate a bug in the calling code, not a nanocached
-failure, a convention shared across the SDKs (issue #47).
+failure, a convention shared across the SDKs.
 
 A `nanocached-proxy` may answer an individual request with a transient
 failure (its upstream node was briefly unreachable and survived its own

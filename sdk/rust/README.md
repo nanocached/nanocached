@@ -76,7 +76,7 @@ let client = NanocachedClient::connect(
 A proxy looks, on the wire, exactly like a single node that owns every
 key, so from here on the client runs in its existing single-connection
 mode: no ring view, no per-node connections, and **`connect()` rejects a
-`read_hedge_after` set together with `via_proxy`** (issue #488) — there
+`read_hedge_after` set together with `via_proxy`** — there
 are no replicas on this one connection to hedge a read to, and an option
 that can never take effect is a misconfiguration. Namespaces, `clear`/`clear_all`, compression, and
 keep-alive all work unchanged. If the proxy connection is lost, the same
@@ -147,7 +147,7 @@ retried, since nothing could have been applied yet. On
 `Err(Error::ConnectionLost)`, whether the counter actually changed is
 unknown — check with a subsequent `get` if that matters.
 
-**What "never sent" means (issue #484).** A non-idempotent request is
+**What "never sent" means.** A non-idempotent request is
 replayed after a redial only when this SDK can prove no complete frame
 reached the server: the connection was already closed before the frame
 was written, or the write call itself failed while the connection was
@@ -484,7 +484,7 @@ request that finds a dead connection pays its own full dial attempt) —
 the Go SDK's equivalent is a negative `Config.ReconnectCooldown`.
 
 The per-request timeout (30 s by default; `Options::request_timeout`)
-is progress-based, as in the Go SDK (issue #488): when a request's
+is progress-based, as in the Go SDK: when a request's
 timer fires it is only given up if the connection received no response
 at all within the last window — a server that is still answering, just
 slowly, never has a queued request timed out on it; a server that has
@@ -526,7 +526,8 @@ nanocached = { version = "0.2", default-features = false } # plaintext only, sma
 
 `tls` is a plain bool; `ca` names a PEM file of trusted root
 certificate(s) and is only meaningful when `tls(true)` (set without it,
-`connect()` rejects the options — issue #488). Without `ca`, `tls(true)` verifies against the platform's
+`connect()` rejects the options). Without `ca`, `tls(true)` verifies against
+the platform's
 trust store; with it, `ca`'s certificate(s) replace that store entirely.
 An unreadable or unparseable CA file is a `connect()`-time error, as is
 `tls(true)` when the crate was built with `default-features = false`.
@@ -590,7 +591,7 @@ plain integer on the wire.
 - `connect()` warns to stderr (`was close() forgotten?`) when called again
   for a single address whose previous connection is still open; the check
   is skipped for multi-address configs, where concurrent clients sharing
-  an address list are legitimate (issue #12). The check is per address
+  an address list are legitimate. The check is per address
   within the process, not per client instance, so several clients to one
   single address trip it even when each is closed in turn; share one
   client, or use a multi-address config, if that is your shape.
@@ -599,7 +600,7 @@ plain integer on the wire.
   the server, TypeScript, Python, and Java implementations also assert.
 - Every failure is a variant of the one `Error` enum. Caller mistakes
   are `Error::InvalidArgument` — this SDK's `Result`-based idiom for
-  what the other SDKs raise as host-language builtins (issue #47);
+  what the other SDKs raise as host-language builtins;
   authentication failure surfaces as `Error::Protocol`. `Error::Retryable`
   is the one variant that's never a sign of a real problem with the
   connection — see "Transient retries and `Error::Retryable`" above.
