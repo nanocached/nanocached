@@ -128,8 +128,11 @@ as it is.</p>
 <p>Two more ways copies come to disagree or go missing were measured in
 chaos runs that join, decommission and kill nodes back to back (issues
 <a href="https://github.com/nanocached/nanocached/issues/563">#563</a> and
-<a href="https://github.com/nanocached/nanocached/issues/565">#565</a>; both
-are open):</p>
+<a href="https://github.com/nanocached/nanocached/issues/565">#565</a>). The
+first is now bounded by the ownership reclaim pass described below (#563,
+closed by <a href="https://github.com/nanocached/nanocached/pull/585">PR
+#585</a>); the second was closed on 2026-10-13 with its cause unconfirmed and
+no code change, to be reopened as a new issue if a cause is found:</p>
 <ul>
   <li>A client write that reaches a node a join has displaced releases that
   copy's dead-copy mark, so the mark sweep never reclaims it (the release is
@@ -184,7 +187,14 @@ are orchestrated by discovery in stages:</p>
   <li>The joining node registers; discovery tells the existing nodes to
   migrate the keys the newcomer now owns.</li>
   <li>While migration runs, existing nodes keep serving those keys and
-  forward concurrent writes to the joiner, so no update is lost.</li>
+  forward concurrent writes to the joiner, so no update is dropped. The
+  forward is unconditional and may lag, so during the forwarding window
+  a key rewritten or invalidated within a few seconds of a previous
+  write via an old owner can keep the previous value until the next
+  write or TTL expiry; frequently updated keys (counters via
+  <code>INCR</code>, last-seen timestamps) are the realistic exposure
+  (issue <a href="https://github.com/nanocached/nanocached/issues/589">#589</a>,
+  accepted).</li>
   <li>When every node reports completion, discovery promotes the joiner
   into the served node list; clients pick it up on their next
   refresh. Until it is promoted, the joiner answers <code>W</code> to
@@ -314,6 +324,96 @@ per-namespace key index that every write maintains; that standing cost
 on the hot path was judged not worth removing a rare, bounded pause.
 Size the node count so a single node&rsquo;s keyspace stays in the low
 millions if even that pause matters to you.</p>
+
+<h2 id="accepted-behaviour">Accepted behaviour</h2>
+<p>Each item below is a behaviour that was designed in or measured, judged,
+and left as it is. The sections above describe most of them in context;
+this list is the record of the decisions, one line per item with the issue
+that made it, so the next one has a place to go. Items without an issue of
+their own were recorded in the inventory, issue <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>. Configuration
+facts (request size, connection caps, idle timeout) are in the per-page
+limits sections, not here.</p>
+<p><strong>Consistency and membership changes</strong></p>
+<ul>
+  <li>During a join&rsquo;s forwarding window, a key rewritten or
+  invalidated within seconds of a write via an old owner may keep the
+  previous value until the next write or TTL expiry (lagging unconditional
+  forward, relay coalescing). Bounded by TTL; needs a join, a double write
+  with changed content and a lagging forward to coincide. Revisit if a
+  versioned write path is adopted. &mdash; <a href="https://github.com/nanocached/nanocached/issues/589">#589</a>, accepted 2026-10-17.</li>
+  <li>Re-replication handoff carries no version: when two survivors hold
+  different copies, the first to reach the fresh node is kept, newer or
+  not. &mdash; <a href="https://github.com/nanocached/nanocached/issues/563">#563</a> design note.</li>
+  <li>No anti-entropy sweep: diverged copies converge on the next write or
+  TTL turnover; a read-only key stays as it is. &mdash; design, <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>.</li>
+  <li>Two membership changes inside one drain window (two scale-ins at
+  once, an eviction while a third drains) leave keys transiently below R;
+  scale in one node at a time. &mdash; design, <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>.</li>
+  <li>A displaced copy loses its dead-copy mark on rewrite and is removed
+  by the ownership reclaim pass after the 120&nbsp;s grace; an eviction
+  that flips membership back inside the grace makes it live again. &mdash;
+  <a href="https://github.com/nanocached/nanocached/issues/563">#563</a>, <a href="https://github.com/nanocached/nanocached/issues/582">#582</a>, fixed to this shape by <a href="https://github.com/nanocached/nanocached/pull/585">#585</a>.</li>
+  <li>A replica leg refused with <code>W</code> by a live node is
+  swallowed by the SDK; the key sits on one copy until its next write, and
+  if that node dies first the newest value is lost. 1.5&ndash;17&nbsp;% of
+  writes in chaos runs, spread unexplained. &mdash; <a href="https://github.com/nanocached/nanocached/issues/565">#565</a>, closed
+  2026-10-13 with the cause unconfirmed; reopen as a new issue if a cause
+  is found.</li>
+  <li>The proxy re-enqueues a retried request (stale-view <code>W</code>,
+  replica fallback) outside the client&rsquo;s send order; a pipelined
+  <code>G</code> then <code>S</code> on one connection can read its own
+  <code>S</code>. &mdash; design, <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>.</li>
+  <li>A ring change pauses a node about 25&nbsp;ms per million live keys
+  (snapshot walk on the single cache task), with a transient allocation of
+  64 bytes per key; see Known limits above. &mdash; measured,
+  <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>.</li>
+  <li>Hedged and fallback reads: a miss means the primary answered miss; a
+  non-hedged read falls to the next owner only on connection failure; read
+  repair is off by default. &mdash; <a href="https://github.com/nanocached/nanocached/issues/64">#64</a>.</li>
+</ul>
+<p><strong>Data model and operations</strong></p>
+<ul>
+  <li><code>INCR</code> and compare-and-set are as volatile as a plain
+  set: eviction and TTL reclaim counters, CAS is not a distributed lock
+  (eviction breaks mutual exclusion), and replicas receive the
+  <em>result</em> as a set. &mdash; <a href="https://github.com/nanocached/nanocached/issues/129">#129</a>, <a href="https://github.com/nanocached/nanocached/issues/141">#141</a>.</li>
+  <li>The memory bound is approximate: key and value bytes plus a small
+  per-entry overhead. &mdash; design, <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>.</li>
+  <li>Replica-leg writes, read-repair writes and node-list refreshes fail
+  silently; the per-client counters (<code>stats()</code>) are the only
+  signal. &mdash; design, <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>.</li>
+  <li>A standalone node has nobody to hand entries to: a restart is a cold
+  cache. &mdash; design, <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>.</li>
+  <li>Asymmetric port mapping (<code>-p 9999:8356</code>) is unsupported:
+  it is NAT, which the cluster design excludes. &mdash; design,
+  <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>.</li>
+  <li>Any registered node can fetch every member&rsquo;s token
+  (<code>T</code> frame), which handoffs to peers met after registration
+  need; registering a node is the trust step. &mdash; design,
+  <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>.</li>
+  <li>The operations endpoint (<code>/healthz</code>, <code>/readyz</code>,
+  <code>/metrics</code>) is unauthenticated; bind it internally. &mdash;
+  design, <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>.</li>
+  <li>Cluster-internal frames are not frozen; a mixed-version cluster is a
+  transient rolling-upgrade state only, discovery first. &mdash; policy,
+  see <a href="compatibility.html">Compatibility</a>.</li>
+</ul>
+<p><strong>SDKs and adapters</strong></p>
+<ul>
+  <li>The <code>connect()</code> forgotten-close warning is kept per
+  address within a process, not per client instance, so several clients
+  to one single address trip it even when each is closed in turn. Tracking
+  per instance would never fire (a new instance has no previous
+  connection), so the choice is this warning or none; kept. &mdash;
+  <a href="https://github.com/nanocached/nanocached/issues/592">#592</a>.</li>
+  <li>Keyv adapter: <code>has</code>, the <code>getMany</code> family and
+  <code>iterator</code> are deliberately omitted; JCache: honest subset
+  (<code>iterator</code>, management and several configurations throw
+  <code>UnsupportedOperationException</code>). &mdash; <a href="https://github.com/nanocached/nanocached/issues/120">#120</a>,
+  <a href="https://github.com/nanocached/nanocached/issues/118">#118</a>.</li>
+  <li>SDK production constants are mutable, documented-but-hidden test
+  knobs, not an API. &mdash; convention, <a href="https://github.com/nanocached/nanocached/issues/488">#488</a>.</li>
+</ul>
 
 <h2>Design decisions</h2>
 <p>The main choices, in summary:</p>

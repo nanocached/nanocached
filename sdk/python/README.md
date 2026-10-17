@@ -544,7 +544,10 @@ produce a value the protocol can't safely round-trip — see "Counters
   same single address while a previous connection to it is still open
   prints a warning ("was close() forgotten?"); this check is skipped for
   multi-address configs, where concurrent clients sharing an address list
-  are legitimate.
+  are legitimate. The check is per address within the process, not per
+  client instance, so several clients to one single address trip it even
+  when each is closed in turn; share one client, or use a multi-address
+  config, if that is your shape.
 - Caller mistakes (a negative `ttl_seconds`, an empty address list)
   raise host-language builtins (`ValueError`), not `NanocachedError` —
   the SDK's error family covers failures the server or network produced,

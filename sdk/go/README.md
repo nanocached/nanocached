@@ -556,6 +556,10 @@ a counter or a compressed value — see "Incr and Decr" above.
   process already points at — a common sign that `Close()` was
   forgotten. That check is skipped for multi-address configs, where
   concurrent clients sharing an address list are legitimate (issue #12).
+  It is per address within the process, not per client instance, so
+  several clients to one single address trip it even when each is closed
+  in turn; share one client, or use a multi-address config, if that is
+  your shape.
 
 ## License
 

@@ -507,7 +507,10 @@ this client's lifecycle. Likewise, calling `connect()` again for the
 same single address while a previous connection to it is still open
 warns to stderr — `was close() forgotten?`. That check is skipped for
 multi-address configs, where concurrent clients sharing an address list
-are legitimate (issue #12).
+are legitimate (issue #12). It is per address within the process, not per
+client instance, so several clients to one single address trip it even
+when each is closed in turn; share one client, or use a multi-address
+config, if that is your shape.
 
 ## Errors
 
