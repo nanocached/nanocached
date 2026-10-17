@@ -43,6 +43,19 @@ framework adapters at one version, whether or not a component changed.
   join inside the previous joiner's forwarding grace and the `X` beating
   the ack; found by review, reproduced in a unit test, not in Docker
   (#595).
+- `nanocached-node`: a handoff write (`U`/`u`) for a key this node already
+  owns under the membership it has adopted no longer pauses the ownership
+  reclaim pass (#582) for 120 s. The pause exists for a key received ahead
+  of its ring — a leaver's handoff before the post-leave roster publishes,
+  a re-replication before the roster that made this node a target — which
+  no ownership check the pass holds can see; it fired for every handoff
+  write, so each re-replication `u` a survivor received after an eviction
+  or leave, and a leaver's forwards for keys the receiver already held as
+  a replica, postponed its reclaim of leftovers from an earlier join by the
+  drain or the churn plus 120 s. The connection handler now tells the cache
+  whether the key was owned when the write landed; only a key that was not
+  pauses the pass (and counts toward the #594 mark). Delay, not loss, from
+  reading the code (#601).
 
 ### Security
 
