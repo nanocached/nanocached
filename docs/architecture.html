@@ -129,10 +129,11 @@ as it is.</p>
 chaos runs that join, decommission and kill nodes back to back (issues
 <a href="https://github.com/nanocached/nanocached/issues/563">#563</a> and
 <a href="https://github.com/nanocached/nanocached/issues/565">#565</a>). The
-first is now bounded by the ownership reclaim pass described below (#563,
-closed by <a href="https://github.com/nanocached/nanocached/pull/585">PR
-#585</a>); the second was closed on 2026-10-13 with its cause unconfirmed and
-no code change, to be reopened as a new issue if a cause is found:</p>
+first is now bounded by the ownership reclaim pass described below (the
+fix that closed #563 and
+<a href="https://github.com/nanocached/nanocached/issues/582">#582</a>); the
+second was closed on 2026-10-13 with its cause unconfirmed and no code
+change, to be reopened as a new issue if a cause is found:</p>
 <ul>
   <li>A client write that reaches a node a join has displaced releases that
   copy's dead-copy mark, so the mark sweep never reclaims it (the release is
@@ -352,7 +353,9 @@ limits sections, not here.</p>
   <li>A displaced copy loses its dead-copy mark on rewrite and is removed
   by the ownership reclaim pass after the 120&nbsp;s grace; an eviction
   that flips membership back inside the grace makes it live again. &mdash;
-  <a href="https://github.com/nanocached/nanocached/issues/563">#563</a>, <a href="https://github.com/nanocached/nanocached/issues/582">#582</a>, fixed to this shape by <a href="https://github.com/nanocached/nanocached/pull/585">#585</a>.</li>
+  <a href="https://github.com/nanocached/nanocached/issues/563">#563</a>,
+  <a href="https://github.com/nanocached/nanocached/issues/582">#582</a>
+  (the fix that closed them gave it this shape).</li>
   <li>A replica leg refused with <code>W</code> by a live node is
   swallowed by the SDK; the key sits on one copy until its next write, and
   if that node dies first the newest value is lost. 1.5&ndash;17&nbsp;% of
