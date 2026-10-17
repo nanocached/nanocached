@@ -9,6 +9,12 @@ tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-10-17
+
+No changes. Version aligned with the rest of the project: every release
+ships the server, the six SDKs and the seven framework adapters at one
+version, whether or not a component changed.
+
 ## [0.4.5] - 2026-10-15
 
 ### Fixed
@@ -350,6 +356,7 @@ changes ship without a deprecation cycle and are listed below.
 0.1.2 is the first release published by CI.
 
 [Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.5...HEAD
+[0.4.6]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.5...sdk/typescript/v0.4.6
 [0.4.5]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.4...sdk/typescript/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.2...sdk/typescript/v0.4.4
 [0.4.2]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.1...sdk/typescript/v0.4.2
