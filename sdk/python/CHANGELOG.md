@@ -9,6 +9,8 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-10-17
+
 ### Fixed
 
 - A connection the node resets mid-session (a node killed, or its listener
@@ -378,6 +380,7 @@ without a deprecation cycle and are listed below.
   release history for earlier changes).
 
 [Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.5...HEAD
+[0.4.6]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.5...sdk/python/v0.4.6
 [0.4.5]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.4...sdk/python/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.2...sdk/python/v0.4.4
 [0.4.2]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.1...sdk/python/v0.4.2

@@ -10,6 +10,12 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-10-17
+
+No changes. Version aligned with the rest of the project: every release
+ships the server, the six SDKs and the seven framework adapters at one
+version, whether or not a component changed.
+
 ## [0.4.5] - 2026-10-15
 
 ### Fixed
@@ -400,6 +406,7 @@ changes ship without a deprecation cycle and are listed below.
   earlier changes).
 
 [Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.5...HEAD
+[0.4.6]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.5...sdk/dotnet/v0.4.6
 [0.4.5]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.4...sdk/dotnet/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.2...sdk/dotnet/v0.4.4
 [0.4.2]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.1...sdk/dotnet/v0.4.2

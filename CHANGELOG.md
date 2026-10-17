@@ -12,6 +12,8 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-10-17
+
 ### Fixed
 
 - `nanocached-node`: the ownership reclaim pass (#582) no longer takes a
@@ -625,6 +627,7 @@ without a deprecation cycle and are listed here.
   (separate Dockerfile targets).
 
 [Unreleased]: https://github.com/nanocached/nanocached/compare/server/v0.4.5...HEAD
+[0.4.6]: https://github.com/nanocached/nanocached/compare/server/v0.4.5...server/v0.4.6
 [0.4.5]: https://github.com/nanocached/nanocached/compare/server/v0.4.4...server/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/server/v0.4.3...server/v0.4.4
 [0.4.3]: https://github.com/nanocached/nanocached/compare/server/v0.4.2...server/v0.4.3
