@@ -1180,15 +1180,25 @@ public sealed class NanocachedClient : IDisposable
     /// same "a miss is not an error" contract <see cref="GetBytesAsync(byte[])"/>
     /// itself has. <paramref name="keys"/> must be non-empty.
     ///
-    /// <para>A batch never fails as a whole: if some keys are still
-    /// wrong-node after one bounded refresh-and-retry, throws
+    /// <para>A batch never fails as a whole, and it survives an
+    /// unreachable owner the way a single <see cref="GetBytesAsync(byte[])"/>
+    /// does: a key whose owner cannot be reached at the connection level
+    /// (a dead node, a certificate this client cannot verify) is read
+    /// from its next owner in rank order (see <see cref="MultiGetPassAsync"/>),
+    /// so with replication the batch still resolves. If some keys are
+    /// still wrong-node after one bounded refresh-and-retry, throws
     /// <see cref="PartialWrongNodeException{T}"/> whose
     /// <c>PartialValues</c> holds every key that DID resolve, rather than
     /// discarding a mostly-successful batch over a handful of stale
-    /// placements. In single-node/proxy mode a <c>W</c> propagates
-    /// immediately, exactly as <see cref="GetBytesAsync(byte[])"/>'s own
-    /// single-mode behavior does — there is no ring to refresh
-    /// against.</para>
+    /// placements. If some keys' every owner was unreachable, throws
+    /// <see cref="PartialConnectionLostException{T}"/> (its
+    /// <c>PartialValues</c> the keys that did resolve, its
+    /// <c>InnerException</c> the last connection error), or the bare
+    /// connection error when nothing resolved — a connection loss is
+    /// never reported as a wrong-node answer. In single-node/proxy mode a
+    /// <c>W</c> propagates immediately, exactly as
+    /// <see cref="GetBytesAsync(byte[])"/>'s own single-mode behavior does
+    /// — there is no ring to refresh against.</para>
     ///
     /// <para>Larger batches are transparently split into more than one
     /// <c>m</c> sub-frame per owner (batch chunking, see
@@ -1260,11 +1270,41 @@ public sealed class NanocachedClient : IDisposable
             return values;
         }
 
-        List<int>? retry = await MultiGetPassAsync(namespaceBytes, keys, keyBytes, values, null, budget).ConfigureAwait(false);
-        if (retry.Count == 0) return values;
-        await MaybeRefreshAsync(force: true).ConfigureAwait(false);
-        retry = await MultiGetPassAsync(namespaceBytes, keys, keyBytes, values, retry, budget).ConfigureAwait(false);
-        if (retry.Count > 0) throw new PartialWrongNodeException<Dictionary<string, byte[]>>(values);
+        (List<int> stillWrongNode, List<int> stillUnreachable, Exception? lastError) =
+            await MultiGetPassAsync(namespaceBytes, keys, keyBytes, values, null, budget).ConfigureAwait(false);
+        if (stillWrongNode.Count > 0 || stillUnreachable.Count > 0)
+        {
+            // One bounded refresh-and-retry, as before, over everything
+            // still unresolved: a `W` is stale routing the refresh fixes;
+            // a key whose every owner was stillUnreachable gets one more walk
+            // of its (possibly re-ranked) owners, which is what the old
+            // same-primary retry amounted to for it.
+            await MaybeRefreshAsync(force: true).ConfigureAwait(false);
+            stillWrongNode.AddRange(stillUnreachable);
+            (stillWrongNode, stillUnreachable, Exception? secondError) =
+                await MultiGetPassAsync(namespaceBytes, keys, keyBytes, values, stillWrongNode, budget).ConfigureAwait(false);
+            lastError = secondError ?? lastError;
+        }
+        if (stillWrongNode.Count > 0) throw new PartialWrongNodeException<Dictionary<string, byte[]>>(values);
+        if (stillUnreachable.Count > 0)
+        {
+            // Nothing answered `W` for these keys: every owner of each was
+            // stillUnreachable, on both passes. That is a connection loss,
+            // reported the way the single-node branch reports a mid-batch
+            // one — with whatever did resolve attached — or as the bare
+            // connection error when nothing resolved, exactly as ReadAsync
+            // throws for a single key. A ChunkedBatchInterruptedException
+            // is internal: its entries were already applied in the pass,
+            // so only the connection error it wraps goes to the caller.
+            Exception cause = lastError is ChunkedBatchInterruptedException interrupted
+                ? interrupted.InnerException!
+                : lastError ?? new ConnectionLostException("nanocached: no owner is reachable for these keys");
+            if (values.Count > 0)
+            {
+                throw new PartialConnectionLostException<Dictionary<string, byte[]>>(values, cause);
+            }
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cause).Throw();
+        }
         return values;
     }
 
@@ -1402,65 +1442,113 @@ public sealed class NanocachedClient : IDisposable
     }
 
     /// <summary>One pass of <see cref="GetManyBytesAsync(byte[], IReadOnlyList{string})"/>'s
-    /// cluster routing: group the given indices (every key, when
-    /// <paramref name="retryIndices"/> is <c>null</c> — the initial pass —
-    /// or just the keys a previous pass left unresolved) by their current
-    /// primary owner (matching plain <c>Get</c>'s own primary-first
-    /// stance), dispatch one (possibly chunked) <c>m</c> exchange per
-    /// owner concurrently, splice hits into <paramref name="values"/>,
-    /// and return the indices still unresolved: a per-key <c>W</c>, or a
-    /// whole owner group whose call failed outright. Called once for the
-    /// initial pass and once more, if needed, after a single forced
-    /// refresh.</summary>
-    private async Task<List<int>> MultiGetPassAsync(
+    /// cluster routing, with the same owner fallback a single
+    /// <c>Get</c> has (<see cref="ReadAsync{T}"/>). The given indices
+    /// (every key, when <paramref name="retryIndices"/> is <c>null</c> —
+    /// the initial pass — or just the keys a previous pass left
+    /// unresolved) are grouped by their current owner and one (possibly
+    /// chunked) <c>m</c> exchange is dispatched per owner concurrently;
+    /// hits are spliced into <paramref name="values"/>. A key whose owner
+    /// answered a per-key <c>W</c> is done for this pass: that is stale
+    /// routing, and the caller's refresh is the answer, exactly as
+    /// <see cref="ReadAsync{T}"/> rethrows a <see cref="WrongNodeException"/>
+    /// rather than trying the next owner. A key whose owner group failed
+    /// at the connection level — a dead or unreachable node, a
+    /// certificate this client cannot verify, a possibly idle-closed
+    /// connection; indistinguishable, the stance <see cref="ReadAsync{T}"/>
+    /// takes — is sent to its <em>next</em> owner in rank order, the same
+    /// walk <see cref="ReadAsync{T}"/> does for one key, until an owner
+    /// answers or the key has run out of owners. On a chunked group only
+    /// the keys from the failing chunk onward move on (issue #411 / #485;
+    /// the hits earlier chunks returned are kept).
+    ///
+    /// <para>Returns the indices that ended the pass on a <c>W</c>, the
+    /// indices whose every owner was unreachable, and the last
+    /// connection-level error seen (<c>null</c> when there was none).
+    /// Keys with no owners at all (an empty ring view) count as <c>W</c>:
+    /// a refresh may populate it. Called once for the initial pass and
+    /// once more, if needed, after a single forced refresh.</para></summary>
+    private async Task<(List<int> WrongNode, List<int> Unreachable, Exception? LastError)> MultiGetPassAsync(
         byte[] namespaceBytes, IReadOnlyList<string> keys, byte[][] keyBytes,
         Dictionary<string, byte[]> values, List<int>? retryIndices, long[] budget)
     {
-        List<int> indices = retryIndices ?? Enumerable.Range(0, keys.Count).ToList();
+        List<int> pending = retryIndices is null ? Enumerable.Range(0, keys.Count).ToList() : new List<int>(retryIndices);
+        var rank = new Dictionary<int, int>(pending.Count);
+        foreach (int idx in pending) rank[idx] = 0;
+        var wrongNode = new List<int>();
+        var unreachable = new List<int>();
+        Exception? lastError = null;
 
-        var groups = new Dictionary<string, List<int>>();
-        var retry = new List<int>();
-        foreach (int idx in indices)
+        while (pending.Count > 0)
         {
-            IReadOnlyList<string> owners = OwnerNames(namespaceBytes, keyBytes[idx]);
-            if (owners.Count == 0)
+            var groups = new Dictionary<string, List<int>>();
+            foreach (int idx in pending)
             {
-                retry.Add(idx);
-                continue;
+                IReadOnlyList<string> owners = OwnerNames(namespaceBytes, keyBytes[idx]);
+                if (owners.Count == 0)
+                {
+                    wrongNode.Add(idx);
+                }
+                else if (rank[idx] >= owners.Count)
+                {
+                    unreachable.Add(idx);
+                }
+                else
+                {
+                    string owner = owners[rank[idx]];
+                    if (!groups.TryGetValue(owner, out List<int>? group))
+                    {
+                        group = new List<int>();
+                        groups[owner] = group;
+                    }
+                    group.Add(idx);
+                }
             }
-            if (!groups.TryGetValue(owners[0], out List<int>? group))
-            {
-                group = new List<int>();
-                groups[owners[0]] = group;
-            }
-            group.Add(idx);
-        }
+            pending = new List<int>();
 
-        var legs = new List<Task<List<int>>>(groups.Count);
-        foreach ((string owner, List<int> groupIndices) in groups)
-        {
-            legs.Add(RunMultiGetLegAsync(namespaceBytes, owner, groupIndices, keys, keyBytes, values, budget));
+            var legs = new List<Task<MultiGetLegResult>>(groups.Count);
+            foreach ((string owner, List<int> groupIndices) in groups)
+            {
+                legs.Add(RunMultiGetLegAsync(namespaceBytes, owner, groupIndices, keys, keyBytes, values, budget));
+            }
+            foreach (Task<MultiGetLegResult> leg in legs)
+            {
+                MultiGetLegResult result = await leg.ConfigureAwait(false);
+                wrongNode.AddRange(result.WrongNode);
+                if (result.Error is null) continue;
+                lastError = result.Error;
+                foreach (int idx in result.Unresolved)
+                {
+                    rank[idx]++;
+                    pending.Add(idx);
+                }
+            }
         }
-        foreach (Task<List<int>> leg in legs)
-        {
-            retry.AddRange(await leg.ConfigureAwait(false));
-        }
-        return retry;
+        return (wrongNode, unreachable, lastError);
     }
 
-    /// <summary>One owner group's <c>m</c> exchange: a connection-level
-    /// failure retries whatever the group's chunk(s) never resolved
-    /// (indistinguishable from a possibly-idle-closed connection, same
-    /// stance <see cref="ApplyReconnectingAsync{T}"/>'s own callers take
-    /// elsewhere) — the whole group when its first chunk failed, only the
-    /// tail from the failing chunk onward when an earlier chunk had already
+    /// <summary>What one owner group's <c>m</c> exchange left behind
+    /// (<see cref="RunMultiGetLegAsync"/>): the indices that answered
+    /// <c>W</c>, the indices the group never resolved because of a
+    /// connection-level failure (the whole group when its first chunk
+    /// failed, the tail from the failing chunk onward otherwise), and
+    /// that failure (<c>null</c> when the group completed).</summary>
+    private readonly record struct MultiGetLegResult(List<int> WrongNode, List<int> Unresolved, Exception? Error);
+
+    /// <summary>One owner group's <c>m</c> exchange: hits are spliced into
+    /// <paramref name="values"/> (a client-side <c>Compress</c> mismatch
+    /// propagates, aborting the batch immediately — never fed into the
+    /// retry pass, since it isn't a routing outcome); a per-key <c>W</c>
+    /// is reported as such; a connection-level failure (indistinguishable
+    /// from a possibly-idle-closed connection, same stance
+    /// <see cref="ApplyReconnectingAsync{T}"/>'s own callers take
+    /// elsewhere) reports whatever the group's chunk(s) never resolved so
+    /// <see cref="MultiGetPassAsync"/> can send those keys to their next
+    /// owner — the whole group when its first chunk failed, only the tail
+    /// from the failing chunk onward when an earlier chunk had already
     /// succeeded (issue #411 / #485; those hits are kept, as the multi-set
-    /// leg and the Rust/TypeScript SDKs already do); a per-key <c>W</c>
-    /// retries just that key; a hit is
-    /// spliced into <paramref name="values"/> (a client-side <c>Compress</c>
-    /// mismatch propagates, aborting the batch immediately — never fed
-    /// into the retry pass, since it isn't a routing outcome).</summary>
-    private async Task<List<int>> RunMultiGetLegAsync(
+    /// leg and the other SDKs do).</summary>
+    private async Task<MultiGetLegResult> RunMultiGetLegAsync(
         byte[] namespaceBytes, string owner, List<int> groupIndices,
         IReadOnlyList<string> keys, byte[][] keyBytes, Dictionary<string, byte[]> values,
         long[] budget)
@@ -1475,9 +1563,10 @@ public sealed class NanocachedClient : IDisposable
         // issue #485: how many leading entries are real results. Equal to
         // the group size on success; on a ChunkedBatchInterruptedException
         // it is the count of entries the chunks before the failing one
-        // already fetched, and everything from there on goes back to the
-        // retry pass untouched.
+        // already fetched, and everything from there on moves to the next
+        // owner untouched.
         int resolved;
+        Exception? error = null;
         try
         {
             entries = await MultiGetChunkedAsync(owner, namespaceBytes, groupKeys).ConfigureAwait(false);
@@ -1487,30 +1576,26 @@ public sealed class NanocachedClient : IDisposable
         {
             // issue #411 / #485: a chunk after the first failed at the
             // connection level (surviving the built-in redial) — keep the
-            // earlier chunks' hits and retry only the unresolved tail,
-            // rather than resending keys that already resolved.
+            // earlier chunks' hits; only the unresolved tail moves on.
             entries = partial.CompletedEntries;
             resolved = entries.Count;
+            error = partial;
         }
-        catch (NanocachedException)
+        catch (NanocachedException first)
         {
             // The first chunk itself failed: nothing resolved, the whole
-            // group goes back to the retry pass, exactly as before.
-            return new List<int>(groupIndices);
+            // group moves on to its next owner.
+            return new MultiGetLegResult(new List<int>(), new List<int>(groupIndices), first);
         }
 
-        var retry = new List<int>();
-        for (int i = resolved; i < groupIndices.Count; i++)
-        {
-            retry.Add(groupIndices[i]);
-        }
+        var wrongNode = new List<int>();
         for (int i = 0; i < resolved; i++)
         {
             int idx = groupIndices[i];
             Connection.MultiEntry entry = entries[i];
             if (entry.WrongNode)
             {
-                retry.Add(idx);
+                wrongNode.Add(idx);
             }
             else if (entry.Ok)
             {
@@ -1522,7 +1607,7 @@ public sealed class NanocachedClient : IDisposable
                 }
             }
         }
-        return retry;
+        return new MultiGetLegResult(wrongNode, groupIndices.GetRange(resolved, groupIndices.Count - resolved), error);
     }
 
     /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>

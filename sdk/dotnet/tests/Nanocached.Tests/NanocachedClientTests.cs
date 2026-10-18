@@ -1435,16 +1435,16 @@ public class NanocachedClientTests
     {
         // Issue #485: in cluster mode RunMultiGetLegAsync used to discard
         // the chunks an owner had already answered when a later chunk
-        // failed at the connection level, and resend the whole group on
-        // the retry pass — which, against a node that keeps failing,
-        // meant the already-fetched hits never reached the caller. The
-        // leg must keep the resolved prefix and retry only the tail (as
-        // the multi-set leg and the Rust/TypeScript SDKs do). Two ~600 KB
-        // keys with the same primary force exactly two `m` sub-frames on
-        // that node; from its 2nd `m` request onward the node fails
-        // (stickily, so the built-in redial and the retry pass fail too),
-        // and the surviving evidence is key0's value inside the
-        // PartialWrongNodeException the batch ends with.
+        // failed at the connection level, and resend the whole group —
+        // which, against a node that keeps failing, meant the
+        // already-fetched hits never reached the caller. The leg must keep
+        // the resolved prefix and move only the tail on. Two ~600 KB keys
+        // with the same primary force exactly two `m` sub-frames on that
+        // node; from its 2nd `m` request onward the node fails (stickily,
+        // so the built-in redial and the retry pass fail too). With R=1
+        // the tail has no other owner, so the batch ends with a
+        // connection-loss error — not a wrong-node one, nothing answered
+        // `W` — carrying key0's value.
         using Cluster cluster = StartCluster(replication: 1);
         using NanocachedClient client =
             await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
@@ -1471,8 +1471,8 @@ public class NanocachedClientTests
         MockNode primary = cluster.Nodes[Names[0]];
         primary.FailMultiGetFromRequestOnward(2);
 
-        PartialWrongNodeException<Dictionary<string, byte[]>> error =
-            await Assert.ThrowsAsync<PartialWrongNodeException<Dictionary<string, byte[]>>>(
+        PartialConnectionLostException<Dictionary<string, byte[]>> error =
+            await Assert.ThrowsAsync<PartialConnectionLostException<Dictionary<string, byte[]>>>(
                 () => client.GetManyBytesAsync(new[] { key0, key1 }));
 
         // chunk 1 (key0) answered; every later `m` — chunk 2, its redial,
@@ -1480,6 +1480,7 @@ public class NanocachedClientTests
         Assert.True(primary.MultiGetRequestCount >= 3, $"got {primary.MultiGetRequestCount} `m` requests");
         Assert.Equal(Encoding.UTF8.GetBytes("v0"), error.PartialValues[key0]);
         Assert.False(error.PartialValues.ContainsKey(key1));
+        Assert.NotNull(error.InnerException);
     }
 
     [Fact]
@@ -1663,6 +1664,61 @@ public class NanocachedClientTests
         await Task.Delay(50);
 
         Assert.Equal("still here", await client.GetAsync("survives"));
+    }
+
+    [Fact]
+    public async Task GetManyReadsFromTheNextOwnerWhenAPrimaryIsUnreachable()
+    {
+        // A primary that cannot be reached at the connection level (here a
+        // closed port; in the field a dead node, or a certificate this
+        // client cannot verify) must not fail the keys it owns: with R=2
+        // the replica holds them, and a single GetAsync would already have
+        // fallen over to it. Discovery is left as it is — the client's
+        // ring still names the dead node as primary.
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        var values = new Dictionary<string, string>();
+        for (int i = 0; i < 24; i++) values[$"key-{i}"] = $"value-{i}";
+        await client.SetManyAsync(values);
+        string dead = Names[0];
+        Assert.Contains(values.Keys, key => OwnersOf(key)[0] == dead);
+        cluster.Nodes[dead].Dispose();
+        await Task.Delay(50); // let the FIN land
+
+        Dictionary<string, string> got = await client.GetManyAsync(values.Keys.ToList());
+        Assert.Equal(values, got);
+    }
+
+    [Fact]
+    public async Task GetManyReportsAnUnreachableOwnerAsAConnectionLossNotWrongNode()
+    {
+        // R=1: the only owner of some keys is gone. Nothing answered `W`,
+        // so the error must not be the wrong-node one; the keys the live
+        // node owns are still returned, attached to the exception.
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        var values = new Dictionary<string, string>();
+        for (int i = 0; i < 24; i++) values[$"key-{i}"] = $"value-{i}";
+        await client.SetManyAsync(values);
+        string dead = Names[0];
+        string live = Names[1];
+        Dictionary<string, string> liveValues = values
+            .Where(pair => new HashRing(Names).Owners(Bytes(pair.Key), 1)[0] == live)
+            .ToDictionary(pair => pair.Key, pair => pair.Value);
+        Assert.True(liveValues.Count > 0 && liveValues.Count < values.Count, "both nodes must own some keys");
+        cluster.Nodes[dead].Dispose();
+        await Task.Delay(50); // let the FIN land
+
+        PartialConnectionLostException<Dictionary<string, string>> error =
+            await Assert.ThrowsAsync<PartialConnectionLostException<Dictionary<string, string>>>(
+                () => client.GetManyAsync(values.Keys.ToList()));
+        Assert.IsNotAssignableFrom<WrongNodeException>(error);
+        Assert.Equal(liveValues, error.PartialValues);
+        Assert.NotNull(error.InnerException);
     }
 
     [Fact]

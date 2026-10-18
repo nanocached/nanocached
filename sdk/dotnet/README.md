@@ -211,10 +211,14 @@ always `string` — unlike single-key `GetAsync`/`SetAsync`,
 `byte[]` can't safely key a `Dictionary` (reference, not content,
 identity).
 
-**A batch never fails as a whole.** Each key's outcome is independent:
-if some keys are still routed to the wrong node after one bounded
-refresh-and-retry (the same policy `GetAsync`/`SetAsync` apply per key,
-not per call), `GetManyAsync`/`GetManyBytesAsync` throw
+**A batch never fails as a whole.** Each key's outcome is independent,
+and a batched read survives an unreachable owner the way a single
+`GetAsync` does: a key whose owner cannot be reached at the connection
+level (a dead node, a certificate this client cannot verify) is read
+from its next owner in rank order, so with replication the batch still
+resolves. If some keys are still routed to the wrong node after one
+bounded refresh-and-retry (the same policy `GetAsync`/`SetAsync` apply
+per key, not per call), `GetManyAsync`/`GetManyBytesAsync` throw
 `PartialWrongNodeException<T>` — a `WrongNodeException` subclass whose
 `PartialValues` property holds every key that DID resolve, so existing
 `catch (WrongNodeException)` handling keeps working unchanged while a
@@ -231,9 +235,14 @@ catch (PartialWrongNodeException<Dictionary<string, string>> partial)
 }
 ```
 
+If some keys' every owner was unreachable, `GetManyAsync`/
+`GetManyBytesAsync` throw `PartialConnectionLostException<T>`
+(`PartialValues` the keys that did resolve, `InnerException` the last
+connection error), or the bare connection error when nothing resolved —
+a connection loss is never reported as a wrong-node answer.
 `SetManyAsync`/`SetManyBytesAsync` have nothing to return on success, so
-they just throw a plain `WrongNodeException` on the same condition —
-every other key in the batch was still stored. In single-node/proxy
+they just throw a plain `WrongNodeException` on the wrong-node condition
+— every other key in the batch was still stored. In single-node/proxy
 mode a `W` propagates immediately, exactly like `GetAsync`/`SetAsync`'s
 own single-mode behavior — there is no ring to refresh against.
 

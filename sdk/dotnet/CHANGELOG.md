@@ -10,6 +10,20 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- `GetManyAsync`/`GetManyBytesAsync` in cluster mode now read a key from
+  its next owner when its primary cannot be reached at the connection
+  level, the same walk a single `GetAsync` already did (#623, the .NET
+  part of #616). Before, the batch sent every key to its primary only,
+  retried the same primary once after a refresh, and then threw
+  `PartialWrongNodeException<T>` for keys that nothing had answered `W`
+  for — seen in the field as a client that could not verify one node's
+  rotated TLS certificate failing a bulk read although the other owner
+  held every key. Keys whose every owner is unreachable now throw
+  `PartialConnectionLostException<T>` (or the bare connection error when
+  nothing resolved) instead of a wrong-node error.
+
 ## [0.4.6] - 2026-10-17
 
 No changes. Version aligned with the rest of the project: every release
