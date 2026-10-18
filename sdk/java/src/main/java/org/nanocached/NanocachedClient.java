@@ -1831,14 +1831,24 @@ public final class NanocachedClient implements AutoCloseable {
      * miss is not an error" contract {@link #getBytes(byte[])} itself
      * has. {@code keys} must be non-empty.
      *
-     * <p>A batch never fails as a whole: if some keys are still
-     * wrong-node after one bounded refresh-and-retry, throws {@link
+     * <p>A batch never fails as a whole, and it survives an unreachable
+     * owner the way a single {@link #getBytes(byte[])} does: a key whose
+     * owner cannot be reached at the connection level (a dead node, a
+     * certificate this client cannot verify) is read from its next owner
+     * in rank order (see {@link #multiGetPass}), so with replication the
+     * batch still resolves. If some keys are still wrong-node after one
+     * bounded refresh-and-retry, throws {@link
      * NanocachedException.PartialWrongNode} whose {@code partialValues}
      * holds every key that DID resolve, rather than discarding a
-     * mostly-successful batch over a handful of stale placements. In
-     * single-node/proxy mode a {@code W} propagates immediately, exactly
-     * as {@link #getBytes(byte[])}'s own single-mode behavior does —
-     * there is no ring to refresh against.
+     * mostly-successful batch over a handful of stale placements. If some
+     * keys' every owner was unreachable, throws {@link
+     * NanocachedException.PartialConnectionFailed} (its {@code
+     * partialValues} the keys that did resolve, its cause the last
+     * connection failure), or the bare connection failure when nothing
+     * resolved — a connection loss is never reported as a wrong-node
+     * answer. In single-node/proxy mode a {@code W} propagates
+     * immediately, exactly as {@link #getBytes(byte[])}'s own single-mode
+     * behavior does — there is no ring to refresh against.
      *
      * <p>Larger batches are transparently split into more than one
      * {@code m} sub-frame per owner (batch chunking, see {@link
@@ -1941,11 +1951,46 @@ public final class NanocachedClient implements AutoCloseable {
             return values;
         }
 
-        List<Integer> retry = multiGetPass(namespace, keys, values, null, budget);
-        if (retry.isEmpty()) return values;
-        maybeRefresh(true);
-        retry = multiGetPass(namespace, keys, values, retry, budget);
-        if (!retry.isEmpty()) throw new NanocachedException.PartialWrongNodeRaw(values, retry);
+        MultiGetPassOutcome outcome = multiGetPass(namespace, keys, values, null, budget);
+        NanocachedException lastError = outcome.lastError;
+        if (!outcome.wrongNode.isEmpty() || !outcome.unreachable.isEmpty()) {
+            // One bounded refresh-and-retry, as before, over everything
+            // still unresolved: a `W` is stale routing the refresh fixes;
+            // a key whose every owner was unreachable gets one more walk
+            // of its (possibly re-ranked) owners, which is what the old
+            // same-primary retry amounted to for it.
+            maybeRefresh(true);
+            List<Integer> pending = new ArrayList<>(outcome.wrongNode);
+            pending.addAll(outcome.unreachable);
+            outcome = multiGetPass(namespace, keys, values, pending, budget);
+            if (outcome.lastError != null) lastError = outcome.lastError;
+        }
+        if (!outcome.wrongNode.isEmpty()) {
+            List<Integer> unresolved = new ArrayList<>(outcome.wrongNode);
+            unresolved.addAll(outcome.unreachable);
+            throw new NanocachedException.PartialWrongNodeRaw(values, unresolved);
+        }
+        if (!outcome.unreachable.isEmpty()) {
+            // Nothing answered `W` for these keys: every owner of each was
+            // unreachable, on both passes. That is a connection loss,
+            // reported the way the single-mode branch reports a mid-batch
+            // one — with whatever did resolve attached — or as the bare
+            // connection failure when nothing resolved, exactly as read()
+            // throws for a single key.
+            if (lastError == null) {
+                lastError = new NanocachedException("nanocached: no owner is reachable for these keys");
+            }
+            boolean anyResolved = false;
+            for (byte[] value : values) {
+                if (value != null) {
+                    anyResolved = true;
+                    break;
+                }
+            }
+            if (!anyResolved) throw lastError;
+            throw new NanocachedException.PartialConnectionFailedRaw(
+                    lastError.getMessage(), lastError, values, outcome.unreachable);
+        }
         return values;
     }
 
@@ -2127,120 +2172,183 @@ public final class NanocachedClient implements AutoCloseable {
         return Integer.toString(length).length();
     }
 
-    /** One pass of {@link #getManyBytes(byte[], byte[][])}'s cluster routing:
-     * group the given indices (every key, when {@code retryIndices} is
-     * {@code null} — the initial pass — or just the keys a previous pass
-     * left unresolved) by their current primary owner (matching plain
-     * {@code get}'s own primary-first stance), dispatch one (possibly
-     * chunked) {@code m} exchange per owner concurrently, splice hits
-     * into {@code values}, and return the indices still unresolved: a
-     * per-key {@code W}, or a whole owner group whose call failed
-     * outright. Called once for the initial pass and once more, if
-     * needed, after a single forced refresh. */
-    private List<Integer> multiGetPass(
+    /** What one {@link #multiGetPass} left unresolved: the indices whose
+     * owner answered a per-key {@code W}, the indices whose every owner
+     * was unreachable, and the last connection-level failure seen ({@code
+     * null} when there was none). */
+    private static final class MultiGetPassOutcome {
+        final List<Integer> wrongNode;
+        final List<Integer> unreachable;
+        final NanocachedException lastError;
+
+        MultiGetPassOutcome(List<Integer> wrongNode, List<Integer> unreachable, NanocachedException lastError) {
+            this.wrongNode = wrongNode;
+            this.unreachable = unreachable;
+            this.lastError = lastError;
+        }
+    }
+
+    /** One pass of {@link #getManyBytes(byte[], byte[][])}'s cluster
+     * routing, with the same owner fallback a single {@code get} has
+     * ({@link #read}). The given indices (every key, when {@code
+     * retryIndices} is {@code null} — the initial pass — or just the keys
+     * a previous pass left unresolved) are grouped by their current owner
+     * and one (possibly chunked) {@code m} exchange is dispatched per
+     * owner concurrently; hits are spliced into {@code values}. A key
+     * whose owner answered a per-key {@code W} is done for this pass:
+     * that is stale routing, and the caller's refresh is the answer,
+     * exactly as {@link #read} rethrows a {@code WrongNode} rather than
+     * trying the next owner. A key whose owner group failed at the
+     * connection level — a dead or unreachable node, a certificate this
+     * client cannot verify, a possibly idle-closed connection;
+     * indistinguishable, the stance {@link #read} takes — is sent to its
+     * <em>next</em> owner in rank order, the same walk {@link #read} does
+     * for one key, until an owner answers or the key has run out of
+     * owners. On a chunked group only the keys from the failing chunk
+     * onward move on (issue #411; the hits earlier chunks returned are
+     * kept). Keys with no owners at all (an empty ring view) count as
+     * {@code W}: a refresh may populate it. Called once for the initial
+     * pass and once more, if needed, after a single forced refresh. */
+    private MultiGetPassOutcome multiGetPass(
             byte[] namespace, byte[][] keyBytes, byte[][] values, List<Integer> retryIndices,
             long[] budget) {
-        List<Integer> indices = retryIndices;
-        if (indices == null) {
-            indices = new ArrayList<>(keyBytes.length);
-            for (int i = 0; i < keyBytes.length; i++) indices.add(i);
+        List<Integer> pending;
+        if (retryIndices == null) {
+            pending = new ArrayList<>(keyBytes.length);
+            for (int i = 0; i < keyBytes.length; i++) pending.add(i);
+        } else {
+            pending = new ArrayList<>(retryIndices);
         }
+        Map<Integer, Integer> rank = new java.util.HashMap<>();
+        for (int idx : pending) rank.put(idx, 0);
 
-        Map<String, List<Integer>> groups = new LinkedHashMap<>();
-        // Thread-safe: runMultiGetLeg mutates this directly from whichever
+        // Thread-safe: runMultiGetLeg mutates these directly from whichever
         // replicaWriters thread runs its leg, one leg per owner running
-        // concurrently — mirrors multiSetPass's own retry list.
-        List<Integer> retry = Collections.synchronizedList(new ArrayList<>());
-        for (int idx : indices) {
-            List<String> owners = ownerNames(namespace, keyBytes[idx]);
-            if (owners.isEmpty()) {
-                retry.add(idx);
-                continue;
-            }
-            groups.computeIfAbsent(owners.get(0), name -> new ArrayList<>()).add(idx);
-        }
+        // concurrently — mirrors multiSetPass's own retry list. `rank` is
+        // only touched here, after every leg has been drained.
+        List<Integer> wrongNode = Collections.synchronizedList(new ArrayList<>());
+        List<Integer> moved = Collections.synchronizedList(new ArrayList<>());
+        java.util.concurrent.atomic.AtomicReference<NanocachedException> lastError =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        List<Integer> unreachable = new ArrayList<>();
 
-        List<CompletableFuture<Void>> legs = new ArrayList<>(groups.size());
-        for (Map.Entry<String, List<Integer>> group : groups.entrySet()) {
-            String owner = group.getKey();
-            List<Integer> groupIndices = group.getValue();
-            Runnable leg = () -> runMultiGetLeg(namespace, owner, groupIndices, keyBytes, values, retry, budget);
-            // issue #277: routed through submitReplicaWrite (rather than a
-            // raw CompletableFuture.supplyAsync onto replicaWriters, as
-            // this used to be) so a leg racing close() past
-            // replicaWriters.shutdown() runs inline instead of leaking a
-            // raw RejectedExecutionException out of this public API —
-            // same fallback every other replicaWriters call site already
-            // relies on.
-            legs.add(submitReplicaWrite(leg));
+        while (!pending.isEmpty()) {
+            Map<String, List<Integer>> groups = new LinkedHashMap<>();
+            for (int idx : pending) {
+                List<String> owners = ownerNames(namespace, keyBytes[idx]);
+                int r = rank.get(idx);
+                if (owners.isEmpty()) {
+                    wrongNode.add(idx);
+                } else if (r >= owners.size()) {
+                    unreachable.add(idx);
+                } else {
+                    groups.computeIfAbsent(owners.get(r), name -> new ArrayList<>()).add(idx);
+                }
+            }
+            pending = new ArrayList<>();
+            moved.clear();
+
+            List<CompletableFuture<Void>> legs = new ArrayList<>(groups.size());
+            for (Map.Entry<String, List<Integer>> group : groups.entrySet()) {
+                String owner = group.getKey();
+                List<Integer> groupIndices = group.getValue();
+                Runnable leg = () -> runMultiGetLeg(
+                        namespace, owner, groupIndices, keyBytes, values, wrongNode, moved, lastError, budget);
+                // issue #277: routed through submitReplicaWrite (rather
+                // than a raw CompletableFuture.supplyAsync onto
+                // replicaWriters, as this used to be) so a leg racing
+                // close() past replicaWriters.shutdown() runs inline
+                // instead of leaking a raw RejectedExecutionException out
+                // of this public API — same fallback every other
+                // replicaWriters call site already relies on.
+                legs.add(submitReplicaWrite(leg));
+            }
+            // Always drain every leg, even after one has already failed: a
+            // leg that fails fast (e.g. a decompression error escaping
+            // runMultiGetLeg) must not leave later legs un-joined, hiding
+            // a second, independent bug — the same stance write()'s
+            // replica legs and multiSetPass's owner legs already take; see
+            // drainLegsKeepingFirstBug's own doc comment for issue #233.
+            RuntimeException legBug = drainLegsKeepingFirstBug(legs);
+            if (legBug != null) throw legBug;
+
+            for (int idx : new ArrayList<>(moved)) {
+                rank.put(idx, rank.get(idx) + 1);
+                pending.add(idx);
+            }
         }
-        // Always drain every leg, even after one has already failed: a leg
-        // that fails fast (e.g. a decompression error escaping
-        // runMultiGetLeg) must not leave later legs un-joined, hiding a
-        // second, independent bug — the same stance write()'s replica legs
-        // and multiSetPass's owner legs already take; see
-        // drainLegsKeepingFirstBug's own doc comment for issue #233.
-        RuntimeException legBug = drainLegsKeepingFirstBug(legs);
-        if (legBug != null) throw legBug;
-        return retry;
+        return new MultiGetPassOutcome(new ArrayList<>(wrongNode), unreachable, lastError.get());
     }
 
     /** One owner group's {@code m} exchange, run on {@link
      * #replicaWriters} by {@link #multiGetPass} (via {@link
-     * #submitReplicaWrite}): a connection-level failure retries the whole
-     * group (indistinguishable from a possibly-idle-closed connection,
-     * same stance {@link #applyReconnecting}'s own callers take
-     * elsewhere); a per-key {@code W} retries just that key; a hit is
-     * spliced into {@code values} (decompression failures propagate,
-     * aborting the batch immediately — never fed into the retry pass,
-     * since they're a client-side {@code compress} mismatch, not a
-     * routing outcome). {@code retry} must already be a thread-safe list
-     * — this runs concurrently with every other owner's leg, mirroring
-     * {@link #runMultiSetLeg}.
+     * #submitReplicaWrite}): a hit is spliced into {@code values}
+     * (decompression failures propagate, aborting the batch immediately —
+     * never fed into the retry pass, since they're a client-side {@code
+     * compress} mismatch, not a routing outcome); a per-key {@code W} is
+     * added to {@code wrongNode}; a connection-level failure
+     * (indistinguishable from a possibly-idle-closed connection, same
+     * stance {@link #applyReconnecting}'s own callers take elsewhere)
+     * adds whatever the group's chunk(s) never resolved to {@code moved}
+     * so {@link #multiGetPass} can send those keys to their next owner —
+     * the whole group when its first chunk failed, only the tail from the
+     * failing chunk onward when an earlier chunk had already succeeded
+     * (issue #411: a {@link ChunkedConnectionFailure}'s already-resolved
+     * entries are kept, not re-fetched) — and records the failure in
+     * {@code lastError}. {@code wrongNode} and {@code moved} must already
+     * be thread-safe lists — this runs concurrently with every other
+     * owner's leg, mirroring {@link #runMultiSetLeg}.
      *
-     * <p>Issue #411: a {@link ChunkedConnectionFailure} (a chunk after the
-     * first failing within this leg's own {@link #multiGetChunked} call)
-     * is folded into the same whole-group retry as any other
-     * connection-level failure here — the next {@link #multiGetPass} pass
-     * simply re-fetches the group, so nothing already resolved is lost,
-     * just retried once more; unlike the single-mode path there is no
-     * further pass to fall back to after that, so there's no partial
-     * exception to build here.
-     *
-     * <p>Unlike the {@code multiGetChunked} call above, {@link
-     * #decompressForBatch}'s {@link NanocachedException.DecompressionFailed}
-     * is deliberately left uncaught here rather than folded into the same
-     * retry-and-return guard — it needs to escape this leg, not be
-     * swallowed — but that means it can reach {@link
-     * #drainLegsKeepingFirstBug} on a leg other than the first to fail,
-     * since every owner's leg runs concurrently and any of them can trip
-     * the shared {@code budget} check at the same time (issue #413);
-     * {@code drainLegsKeepingFirstBug} knows to classify that one
-     * specially rather than as a background write bug. */
+     * <p>{@link #decompressForBatch}'s {@link
+     * NanocachedException.DecompressionFailed} is deliberately left
+     * uncaught here rather than folded into the connection-failure guard
+     * — it needs to escape this leg, not be swallowed — but that means it
+     * can reach {@link #drainLegsKeepingFirstBug} on a leg other than the
+     * first to fail, since every owner's leg runs concurrently and any of
+     * them can trip the shared {@code budget} check at the same time
+     * (issue #413); {@code drainLegsKeepingFirstBug} knows to classify
+     * that one specially rather than as a background write bug. */
     private void runMultiGetLeg(
             byte[] namespace, String owner, List<Integer> groupIndices,
-            byte[][] keyBytes, byte[][] values, List<Integer> retry, long[] budget) {
+            byte[][] keyBytes, byte[][] values, List<Integer> wrongNode, List<Integer> moved,
+            java.util.concurrent.atomic.AtomicReference<NanocachedException> lastError, long[] budget) {
         byte[][] groupKeys = new byte[groupIndices.size()][];
         for (int i = 0; i < groupIndices.size(); i++) {
             groupKeys[i] = keyBytes[groupIndices.get(i)];
         }
 
         List<Connection.MultiEntry> entries;
+        // How many leading entries are real results: the group size on
+        // success; on a ChunkedConnectionFailure the count of entries the
+        // chunks before the failing one already fetched (its entries from
+        // the failing chunk onward are null); 0 when the first chunk
+        // itself failed.
+        int resolved;
         try {
             entries = multiGetChunked(() -> memberConnection(owner), namespace, groupKeys);
-        } catch (ChunkedConnectionFailure | NanocachedException connectionFailure) {
-            retry.addAll(groupIndices);
-            return;
+            resolved = entries.size();
+        } catch (ChunkedConnectionFailure partial) {
+            entries = partial.partialEntries;
+            resolved = 0;
+            while (resolved < entries.size() && entries.get(resolved) != null) resolved++;
+            lastError.set(partial.cause);
+        } catch (NanocachedException connectionFailure) {
+            entries = Collections.emptyList();
+            resolved = 0;
+            lastError.set(connectionFailure);
         }
 
-        for (int i = 0; i < groupIndices.size(); i++) {
+        for (int i = 0; i < resolved; i++) {
             int idx = groupIndices.get(i);
             Connection.MultiEntry entry = entries.get(i);
             if (entry.wrongNode()) {
-                retry.add(idx);
+                wrongNode.add(idx);
             } else if (entry.ok()) {
                 values[idx] = decompressForBatch(entry.value(), budget);
             }
+        }
+        if (resolved < groupIndices.size()) {
+            moved.addAll(groupIndices.subList(resolved, groupIndices.size()));
         }
     }
 
