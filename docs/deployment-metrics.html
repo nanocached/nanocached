@@ -35,15 +35,17 @@ operations port. Which collector picks them up depends on the
 monitoring stack you already run, so this page is separate from the
 shape guides: it says what there is to collect and how the two kinds
 of metric behave once collected, then applies that to the single-node
-EC2 shape with the CloudWatch Agent, built, checked and torn down as
-shown. The ECS and EKS shapes are added here as each is verified.</p>
+EC2 shape with the CloudWatch Agent and to the clustered ECS shape with
+the AWS Distro for OpenTelemetry collector as a sidecar, each built,
+checked and torn down as shown. The EKS shape is added here once it is
+verified.</p>
 
 <h2 id="what">What there is to collect</h2>
 <p><code>GET /metrics</code> on <code>--metrics-port</code> answers in
 Prometheus text format (the endpoint, with its two probe paths, is
 described under <a href="deployment-operations.html#ops">what every
 deployment needs</a>). A node exports fourteen series plus two per
-namespace; the ones to scale on are listed under
+namespace, a discovery server six; the ones to scale on are listed under
 <a href="deployment-operations.html#metrics">metrics to scale on</a>,
 and <code>curl -s http://127.0.0.1:9356/metrics | grep -v '^#'</code>
 prints the full set with its current values. Three things about them
@@ -57,8 +59,9 @@ it restarts. A Prometheus server stores counters as they are and
 <code>rate()</code> does the rest. A CloudWatch-style backend stores
 statistics per period, and the collector decides what number it hands
 over for a counter &mdash; the cumulative value, or the increase since
-the previous scrape. The CloudWatch Agent below hands over the
-increase, so <code>Sum</code> over a period is the number of
+the previous scrape. The CloudWatch Agent and the OpenTelemetry
+collector below both hand over the increase, so <code>Sum</code> over
+a period is the number of
 operations in that period, and after a restart the counter simply
 starts again from zero (the period&rsquo;s <code>Sum</code> is the
 operations since the restart, never a negative number); a
@@ -73,7 +76,7 @@ building a dashboard on it.</p>
 where a budget is set) carry a <code>namespace</code> label; nothing
 else does. The default namespace is the empty string, and a collector
 that turns labels into dimensions leaves out a series whose dimension
-value is empty &mdash; the CloudWatch Agent&rsquo;s output below does
+value is empty &mdash; the output of both collectors below does
 &mdash; so the default namespace is
 read from the node-wide <code>nanocached_node_entries</code> and
 <code>…_memory_used_bytes</code> instead, and the labelled series
@@ -83,14 +86,14 @@ per metric, which is what a per-metric price is charged on.</p>
 endpoint is unauthenticated and never TLS, which is why the shape
 guides bind it inside the VPC. The least exposure is a collector on
 the same instance or in the same task scraping
-<code>127.0.0.1</code>, which is what the EC2 shape below does; a
+<code>127.0.0.1</code>, which is what both shapes below do; a
 central scraper is the alternative, reaching the port through the
 security-group rule the shape guides already carry (the operations
 port from inside the VPC, nothing wider).</p>
 <p>The collectors this page covers are the ones whose output is a
 service you can read back from the command line: the CloudWatch Agent
-(EC2, below), the AWS Distro for OpenTelemetry collector (ECS, EKS)
-and a Prometheus server (EKS). Amazon Managed Service for Prometheus
+(EC2, below), the AWS Distro for OpenTelemetry collector (ECS, below;
+EKS) and a Prometheus server (EKS). Amazon Managed Service for Prometheus
 and Amazon Managed Grafana take the same scrape output through remote
 write; neither was available to the account these runs used, so they
 are not described here.</p>
@@ -282,6 +285,262 @@ aws iam detach-role-policy --role-name $NAME-ec2 \
 <p>The metric namespace cannot be deleted: <code>nanocached</code> stays
 listed in the console with its last values until CloudWatch ages them
 out, at no charge once nothing is written to it.</p>
+
+<h2 id="ecs">Cluster on ECS with the OpenTelemetry collector</h2>
+<p>Start from the <a href="deployment-ecs.html">ECS guide</a>: same
+network, security groups, Cloud Map name, cluster and services. Each
+task &mdash; the discovery task and every node task &mdash; gets a
+second container, the AWS Distro for OpenTelemetry collector, which
+scrapes <code>localhost</code> inside the task&rsquo;s network
+namespace every 15&nbsp;s and writes each scrape to CloudWatch Logs in
+the embedded metric format, exactly as the agent does on EC2. One
+configuration serves both kinds of task: the job name and the port are
+environment variables the sidecar sets, and the configuration refers
+to them.</p>
+
+<h3>IAM</h3>
+<p>Two changes to the ECS guide&rsquo;s roles. The tasks now need a
+role of their own, because the collector calls CloudWatch &mdash; the
+first shape on this site where they do &mdash; and
+<code>CloudWatchAgentServerPolicy</code> is the one managed policy that
+covers the log and metric writes:</p>
+<pre><code>aws iam create-role --role-name $NAME-ecs-task --tags Key=Project,Value=$NAME \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+    "Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name $NAME-ecs-task \
+  --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy</code></pre>
+<p>And the execution role&rsquo;s inline policy must cover the
+collector&rsquo;s configuration parameter as well as the auth secret,
+since both are injected through <code>secrets</code>:</p>
+<pre><code>aws iam put-role-policy --role-name $NAME-ecs-execution --policy-name read-parameters \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",
+    \"Action\":\"ssm:GetParameters\",
+    \"Resource\":[\"arn:aws:ssm:$AWS_REGION:${ACCOUNT}:parameter/$NAME/auth-secret\",
+                 \"arn:aws:ssm:$AWS_REGION:${ACCOUNT}:parameter/$NAME/otel-config\"]}]}"</code></pre>
+
+<h3>The collector&rsquo;s configuration</h3>
+<p>Save this as <code>otel-config.yaml</code> and put it in Parameter
+Store as a plain <code>String</code> (it is well under the 4&nbsp;KB a
+standard parameter holds):</p>
+<pre><code>receivers:
+  prometheus:
+    config:
+      global:
+        scrape_interval: 15s
+      scrape_configs:
+        - job_name: ${env:NANOCACHED_JOB}
+          static_configs:
+            - targets: ['localhost:${env:NANOCACHED_METRICS_PORT}']
+processors:
+  resourcedetection:
+    detectors: [ecs]
+    timeout: 5s
+  resource:
+    attributes:
+      - key: TaskId
+        from_attribute: aws.ecs.task.id
+        action: insert
+  batch:
+    timeout: 5s
+exporters:
+  awsemf:
+    namespace: nanocached
+    log_group_name: nanocached-metrics
+    log_stream_name: ${env:NANOCACHED_JOB}/{TaskId}
+    dimension_rollup_option: NoDimensionRollup
+    resource_to_telemetry_conversion:
+      enabled: true
+    metric_descriptors:
+      - metric_name: nanocached_node_memory_used_bytes
+        unit: Bytes
+        overwrite: true
+      - metric_name: nanocached_node_memory_max_bytes
+        unit: Bytes
+        overwrite: true
+      - metric_name: nanocached_node_namespace_used_bytes
+        unit: Bytes
+        overwrite: true
+      - metric_name: nanocached_node_namespace_budget_bytes
+        unit: Bytes
+        overwrite: true
+    metric_declarations:
+      - dimensions: [[TaskId, namespace]]
+        metric_name_selectors: ["^nanocached_node_namespace_"]
+      - dimensions: [[TaskId]]
+        metric_name_selectors:
+          - "^nanocached_node_(memory_used_bytes|memory_max_bytes|entries|connections|connections_max)$"
+          - "^nanocached_node_(hits|misses|sets|deletes|evictions|expirations|incrs|cas_sets|cas_deletes)_total$"
+          - "^nanocached_discovery_"
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [resourcedetection, resource, batch]
+      exporters: [awsemf]</code></pre>
+<pre><code>aws ssm put-parameter --name /$NAME/otel-config --type String \
+  --value file://otel-config.yaml --tags Key=Project,Value=$NAME</code></pre>
+<p>What each part is for:</p>
+<ul>
+  <li><strong>The per-task dimension.</strong> With a
+  <code>localhost</code> target, the <code>instance</code> label is the
+  same on every task, so it cannot tell tasks apart.
+  <code>resourcedetection</code> asks the task metadata endpoint for
+  the task&rsquo;s identity, the <code>resource</code> processor copies
+  the task ID into an attribute called <code>TaskId</code>, and
+  <code>resource_to_telemetry_conversion</code> makes that attribute
+  available to the declarations as a dimension. The zone, task family
+  and revision come along as well and are in every log event, should
+  you want them as dimensions instead.</li>
+  <li><strong><code>metric_declarations</code></strong> is the
+  allow-list, as on EC2: <code>TaskId</code> alone for the node and
+  discovery series, <code>TaskId</code> and <code>namespace</code> for
+  the per-namespace ones. <code>NoDimensionRollup</code> stops the
+  exporter from also publishing each metric without dimensions.</li>
+  <li><strong><code>metric_descriptors</code></strong> attaches a unit
+  to the byte gauges; without it every metric arrived with no unit (the
+  receiver does not infer one from a <code>_bytes</code> suffix).</li>
+  <li><strong><code>${env:…}</code></strong> is expanded by the
+  collector when it reads the configuration, including inside the
+  embedded Prometheus block, and <code>{TaskId}</code> in
+  <code>log_stream_name</code> is filled in by the exporter &mdash; so
+  one parameter gives each task its own job name, port and log
+  stream.</li>
+  <li>The configuration is read once, when the task starts (it arrives
+  as an environment variable). A change to the parameter reaches a
+  task only when the task is replaced &mdash; a new deployment
+  (<code>aws ecs update-service --force-new-deployment</code>), or, as
+  in this run, one task stopped and replaced by the service: the unit
+  descriptors were added to the parameter just before the stop, and the
+  replacement task published units while the untouched task did
+  not.</li>
+</ul>
+
+<h3>Task definitions</h3>
+<p>The sidecar is the same container in both task definitions, with
+two environment variables and the log prefix changed. For
+<code>td-node.json</code>, add it after the node container; for
+<code>td-discovery.json</code>, with <code>nanocached-discovery</code>,
+<code>9357</code> and a <code>discovery-otel</code> prefix:</p>
+<pre><code>{
+  "name": "otel-collector",
+  "image": "public.ecr.aws/aws-observability/aws-otel-collector@sha256:7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e",
+  "essential": false,
+  "environment": [{"name": "NANOCACHED_JOB", "value": "nanocached-node"},
+                  {"name": "NANOCACHED_METRICS_PORT", "value": "9356"}],
+  "secrets": [{"name": "AOT_CONFIG_CONTENT",
+               "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/nanocached/otel-config"}],
+  "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": "/ecs/nanocached",
+                       "awslogs-region": "us-east-1", "awslogs-stream-prefix": "node-otel"}}
+}</code></pre>
+<ul>
+  <li><code>essential: false</code>: a collector that exits must not
+  take the cache container down with it. The reverse is handled by
+  ECS &mdash; when the essential container stops, the task stops.</li>
+  <li>No <code>dependsOn</code>: the collector starts beside the node
+  and scrapes from the moment it is ready. In this run the node was
+  listening one second before the collector&rsquo;s first scrape, and
+  neither sidecar logged a failed scrape; a slower node start would
+  show as a short run of failed scrapes in the sidecar&rsquo;s log,
+  nothing worse.</li>
+  <li>The image is pinned by digest, as the nanocached images are;
+  this is the 0.50.0 release of the collector. <code>docker buildx
+  imagetools inspect</code> against a newer tag prints the digest to
+  move to.</li>
+  <li>The node task is registered with <code>--memory 2048</code>
+  instead of the guide&rsquo;s 1024 (the next size Fargate offers at
+  512&nbsp;CPU units), so the collector is not carved out of the
+  512&nbsp;MiB cache&rsquo;s headroom; and both task definitions take
+  <code>--task-role-arn</code> for the new role:</li>
+</ul>
+<pre><code>TASK_ARN=arn:aws:iam::${ACCOUNT}:role/${NAME}-ecs-task
+aws ecs register-task-definition --family $NAME-node --network-mode awsvpc \
+  --requires-compatibilities FARGATE --cpu 512 --memory 2048 \
+  --execution-role-arn $EXEC_ARN --task-role-arn $TASK_ARN \
+  --tags key=Project,value=$NAME --container-definitions file://td-node.json</code></pre>
+<p>Services are created exactly as in the ECS guide. In this run
+discovery&rsquo;s Cloud Map record was discoverable 92&nbsp;s after its
+<code>create-service</code>, and the node service was steady 2&nbsp;min
+6&nbsp;s after that first <code>create-service</code>; both node tasks
+joined on their first attempt.</p>
+
+<h3>Verifying</h3>
+<p>Each sidecar has its own log stream under <code>/ecs/$NAME</code>
+(prefix <code>node-otel</code> or <code>discovery-otel</code>); the
+line to look for is <q>Everything is ready. Begin running and
+processing data</q>, and a configuration the collector cannot parse
+ends the stream with the error before that line. The metrics then
+carry the task ID:</p>
+<pre><code>aws cloudwatch list-metrics --namespace nanocached \
+  --query 'Metrics[?Dimensions[?Name==`TaskId`]].[MetricName,Dimensions[].Value|join(`,`,@)]' --output text
+TASK=$(aws ecs list-tasks --cluster $NAME --service-name node --query 'taskArns[0]' --output text | sed 's#.*/##')
+aws cloudwatch get-metric-statistics --namespace nanocached \
+  --metric-name nanocached_node_entries --dimensions Name=TaskId,Value=$TASK \
+  --start-time $(date -u -v-10M +%Y-%m-%dT%H:%M:%SZ) --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --period 60 --statistics Maximum SampleCount \
+  --query 'sort_by(Datapoints,&amp;Timestamp)[].[Timestamp,Maximum,SampleCount]' --output text
+  # GNU date: $(date -u -d '-10 min' +%Y-%m-%dT%H:%M:%SZ)</code></pre>
+<p>In this run the cluster was given a known load from the
+application tier through discovery (2,000 keys written in batches of
+200, the same 2,000 read back in batches, 500 reads of keys that did
+not exist, 100 keys written in a namespace called <code>orders</code>)
+and every number was checked against each task&rsquo;s
+<code>/metrics</code>, read over 9356 from the application
+instance:</p>
+<ul>
+  <li>The discovery task&rsquo;s six series were listed under its task
+  ID about two minutes after its collector started, with the first
+  datapoints in the collector&rsquo;s start minute; the node
+  tasks&rsquo; fourteen, plus two for <code>orders</code>, likewise
+  carried their start minute and were readable at the first query made
+  two and a half minutes later (not polled finer than that).</li>
+  <li>Gauges matched per task: <code>nanocached_node_entries</code>
+  <code>Maximum</code> 2,100 on both tasks (under a replication factor
+  of 2, both hold every key), <code>…_memory_used_bytes</code> 426,442,
+  <code>…_namespace_entries</code> for <code>orders</code> 100, four
+  samples a minute.</li>
+  <li>Counters arrived as increases, and the split between tasks was
+  the ownership split: <code>…_sets_total</code> <code>Sum</code> 2,100
+  on each task in the write minute and 0 after;
+  <code>…_hits_total</code> 1,014 and 986; <code>…_misses_total</code>
+  265 and 235 &mdash; each the task&rsquo;s own cumulative value, since
+  the whole load fell inside one minute. As on EC2, the first sample
+  of each counter is the baseline and is not published.</li>
+  <li><code>nanocached_discovery_members</code> read 2 under the
+  discovery task&rsquo;s ID.</li>
+</ul>
+<p>What a task replacement looks like is the ECS-specific question,
+and the run answered it with <code>aws ecs stop-task</code> on one
+node task. ECS had a replacement running and healthy 73&nbsp;s after
+the stop (the new node joined 49&nbsp;s after it), and the surviving
+node handed it every key under the replication factor, so the new
+task&rsquo;s <code>entries</code> read 2,100 from its first sample.
+Three things follow for a dashboard:</p>
+<ul>
+  <li>The stopped task&rsquo;s ID simply stops updating &mdash; one
+  sample in its last minute &mdash; and the new ID appears in the next
+  minute. A widget pinned to one task ID goes dark; graph the dimension
+  with a <code>SEARCH</code> expression or an aggregate across
+  <code>TaskId</code> instead.</li>
+  <li>The 2,100 writes that filled the new node were the migration
+  transfer, which the node counts in <code>…_sets_total</code>; but they
+  happened before the collector&rsquo;s first sample, so as increases
+  they are invisible (<code>Sum</code> 0 in the new task&rsquo;s first
+  minutes). A burst that completes before the first scrape is never
+  seen by a delta-reporting collector.</li>
+  <li><code>nanocached_discovery_members</code> dipped to 1 and back to
+  2 inside the stop minute (<code>Minimum</code> 1,
+  <code>Maximum</code> 2), which is the one place the event is visible
+  as a value rather than as a dimension changing.</li>
+</ul>
+
+<h3>Teardown</h3>
+<p>The ECS guide&rsquo;s teardown, plus the task role, the
+configuration parameter and the metrics log group:</p>
+<pre><code>aws iam detach-role-policy --role-name $NAME-ecs-task \
+  --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+aws iam delete-role --role-name $NAME-ecs-task
+aws ssm delete-parameter --name /$NAME/otel-config
+aws logs delete-log-group --log-group-name nanocached-metrics</code></pre>
 
 </main>
 
