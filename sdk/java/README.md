@@ -190,8 +190,12 @@ byte[][] values = client.getManyBytes(keys); // values[1] == null → miss
 client.setManyBytes(keys, new byte[][] {v1, v2}, 60);
 ```
 
-**A batch never fails as a whole.** Each key's outcome is independent:
-if some keys are still routed to the wrong node after one bounded
+**A batch never fails as a whole.** Each key's outcome is independent,
+and a batched read survives an unreachable owner the way a single `get`
+does: a key whose owner cannot be reached at the connection level (a
+dead node, a certificate this client cannot verify) is read from its
+next owner in rank order, so with replication the batch still resolves.
+If some keys are still routed to the wrong node after one bounded
 refresh-and-retry (the same policy `get`/`set` apply per key, not per
 call), `getMany`/`getManyBytes` throw
 `NanocachedException.PartialWrongNode` — a `WrongNode` subclass whose
@@ -212,12 +216,18 @@ try {
 }
 ```
 
-`setMany`/`setManyBytes` have nothing to return on success, so they
-just throw a plain `NanocachedException.WrongNode` on the same
-condition — every other key in the batch was still stored. In
-single-node/proxy mode a `W` propagates immediately, exactly like
-`get`/`set`'s own single-mode behavior — there is no ring to refresh
-against.
+If some keys' every owner was unreachable, `getMany`/`getManyBytes`
+throw `NanocachedException.PartialConnectionFailed` (`partialValues`
+the keys that did resolve, the cause the last connection failure; the
+decoded counterpart is `PartialConnectionFailedStrings`, the positional
+one `PartialConnectionFailedRaw` with `unresolvedIndices`), or the bare
+connection failure when nothing resolved — a connection loss is never
+reported as a wrong-node answer. `setMany`/`setManyBytes` have nothing
+to return on success, so they just throw a plain
+`NanocachedException.WrongNode` on the wrong-node condition — every
+other key in the batch was still stored. In single-node/proxy mode a
+`W` propagates immediately, exactly like `get`/`set`'s own single-mode
+behavior — there is no ring to refresh against.
 
 Within one `setMany`/`setManyBytes` batch, the same node can be one
 key's primary and another key's replica at once; it receives exactly

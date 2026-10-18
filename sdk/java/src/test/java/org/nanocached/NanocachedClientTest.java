@@ -2129,6 +2129,68 @@ class NanocachedClientTest {
     }
 
     @Test
+    void getManyReadsFromTheNextOwnerWhenAPrimaryIsUnreachable() throws Exception {
+        // A primary that cannot be reached at the connection level (here a
+        // closed port; in the field a dead node, or a certificate this
+        // client cannot verify) must not fail the keys it owns: with R=2
+        // the replica holds them, and a single get would already have
+        // fallen over to it. Discovery is left as it is — the client's
+        // ring still names the dead node as primary.
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < 24; i++) values.put("key-" + i, "value-" + i);
+                client.setMany(values);
+                String dead = NAMES.get(0);
+                HashRing ring = new HashRing(NAMES);
+                assertTrue(values.keySet().stream().anyMatch(
+                        key -> ring.owners(key.getBytes(StandardCharsets.UTF_8), 2).get(0).equals(dead)),
+                        "the key set must give the dead node some primaries");
+                cluster.nodes().get(dead).close();
+                Thread.sleep(50); // let the FIN land
+
+                assertEquals(values, client.getMany(new ArrayList<>(values.keySet())));
+            }
+        }
+    }
+
+    @Test
+    void getManyReportsAnUnreachableOwnerAsAConnectionFailureNotWrongNode() throws Exception {
+        // R=1: the only owner of some keys is gone. Nothing answered `W`,
+        // so the failure must not be the wrong-node one; the keys the live
+        // node owns are still returned, attached to the exception.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < 24; i++) values.put("key-" + i, "value-" + i);
+                client.setMany(values);
+                String dead = NAMES.get(0);
+                String live = NAMES.get(1);
+                HashRing ring = new HashRing(NAMES);
+                Map<String, String> liveValues = new java.util.LinkedHashMap<>();
+                for (Map.Entry<String, String> entry : values.entrySet()) {
+                    if (ring.owners(entry.getKey().getBytes(StandardCharsets.UTF_8), 1).get(0).equals(live)) {
+                        liveValues.put(entry.getKey(), entry.getValue());
+                    }
+                }
+                assertTrue(!liveValues.isEmpty() && liveValues.size() < values.size(),
+                        "both nodes must own some keys");
+                cluster.nodes().get(dead).close();
+                Thread.sleep(50); // let the FIN land
+
+                NanocachedException failure = assertThrows(
+                        NanocachedException.PartialConnectionFailedStrings.class,
+                        () -> client.getMany(new ArrayList<>(values.keySet())));
+                assertFalse(failure instanceof NanocachedException.WrongNode);
+                assertEquals(liveValues,
+                        ((NanocachedException.PartialConnectionFailedStrings) failure).partialValues);
+                assertTrue(failure.getCause() instanceof NanocachedException.ConnectionFailed,
+                        "cause = " + failure.getCause());
+            }
+        }
+    }
+
+    @Test
     void aDeadReplicaDoesNotFailWrites() throws Exception {
         try (Cluster cluster = startCluster(2)) {
             try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
