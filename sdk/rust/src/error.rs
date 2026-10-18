@@ -103,19 +103,22 @@ pub enum Error {
     /// [`Self::PartialWrongNode`]'s own map has been decoded the same
     /// way a successful `get_many` decodes `get_many_bytes`' own result.
     PartialWrongNodeText(HashMap<String, String>),
-    /// issue #411 — `get_many`/`get_many_bytes`, single-node/proxy mode
-    /// only: a chunked batch (issue #222) split into more than one `m`
-    /// sub-frame, and a connection failure on chunk N>1 — after the
-    /// SDK's own transparent reconnect-and-retry for that chunk
-    /// (`apply_reconnecting`) also failed — aborted the batch. Carries
-    /// every key that DID resolve from the chunk(s) that landed before
-    /// the failure, plus the underlying connection error, rather than
-    /// discarding those results and surfacing a bare connection error
-    /// that would wrongly imply nothing was read at all. Mirrors
-    /// [`Self::PartialWrongNode`]'s shape. Never raised when the very
-    /// first chunk fails — there is no partial data yet, so the plain
-    /// underlying error propagates instead, exactly as before this
-    /// issue.
+    /// `get_many`/`get_many_bytes` when a connection loss left part of
+    /// the batch unresolved while another part did resolve. In
+    /// single-node/proxy mode (issue #411): a chunked batch (issue #222)
+    /// split into more than one `m` sub-frame, and a connection failure
+    /// on chunk N>1 — after the SDK's own transparent reconnect-and-retry
+    /// for that chunk (`apply_reconnecting`) also failed — aborted the
+    /// batch; carries every key that DID resolve from the chunk(s) that
+    /// landed before the failure. In cluster mode: some keys' every owner
+    /// was unreachable at the connection level (the batch reads a key
+    /// from its next owner when one cannot be reached, the way a single
+    /// `get` does) while other keys resolved; carries those. Either way
+    /// the boxed error is the underlying connection error, so a bare
+    /// connection error never wrongly implies nothing was read at all.
+    /// Mirrors [`Self::PartialWrongNode`]'s shape. Never raised when
+    /// nothing resolved — there is no partial data then, so the plain
+    /// underlying error propagates instead.
     PartialConnectionLost(HashMap<String, Vec<u8>>, Box<Error>),
     /// As [`Self::PartialConnectionLost`], but returned by `get_many` —
     /// the UTF-8-decoded counterpart (see [`Self::PartialWrongNodeText`]).

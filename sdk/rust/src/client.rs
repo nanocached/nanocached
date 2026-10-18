@@ -1065,6 +1065,28 @@ pub struct NanocachedClient {
     keepalive: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
 
+/// What one `multi_get_pass` left unresolved: the indices whose owner
+/// answered a per-key `W`, the indices whose every owner was
+/// unreachable, and the last connection-level error seen (`None` when
+/// there was none).
+#[derive(Default)]
+struct MultiGetOutcome {
+    wrong_node: Vec<usize>,
+    unreachable: Vec<usize>,
+    last_error: Option<Error>,
+}
+
+/// One owner group's result inside `multi_get_pass` — see
+/// `run_multi_get_leg`.
+struct MultiGetLeg {
+    wrong_node: Vec<usize>,
+    hits: Vec<(String, Vec<u8>)>,
+    /// The indices the group never resolved because of a connection-level
+    /// failure; empty when `error` is `None`.
+    moved: Vec<usize>,
+    error: Option<Error>,
+}
+
 impl NanocachedClient {
     pub async fn connect(options: Options) -> Result<Self> {
         if options.addresses.is_empty() {
@@ -1888,12 +1910,21 @@ impl NanocachedClient {
     /// miss is not an error" contract [`Self::get_bytes`] itself has.
     /// `keys` must be non-empty.
     ///
-    /// A batch never fails as a whole: if some keys are still wrong-node
-    /// after one bounded refresh-and-retry, returns
-    /// `Err(Error::PartialWrongNode)` whose map holds every key that DID
-    /// resolve, rather than discarding a mostly-successful batch over a
-    /// handful of stale placements. In single-node/proxy mode a `W`
-    /// propagates immediately, exactly as [`Self::get_bytes`]'s own
+    /// A batch never fails as a whole, and it survives an unreachable
+    /// owner the way a single [`Self::get_bytes`] does: a key whose owner
+    /// cannot be reached at the connection level (a dead node, a
+    /// certificate this client cannot verify) is read from its next owner
+    /// in rank order (see `multi_get_pass`), so with replication the
+    /// batch still resolves. If some keys are still wrong-node after one
+    /// bounded refresh-and-retry, returns `Err(Error::PartialWrongNode)`
+    /// whose map holds every key that DID resolve, rather than discarding
+    /// a mostly-successful batch over a handful of stale placements. If
+    /// some keys' every owner was unreachable, returns
+    /// `Err(Error::PartialConnectionLost)` (its map the keys that did
+    /// resolve, its boxed error the last connection failure), or the bare
+    /// connection error when nothing resolved — a connection loss is
+    /// never reported as a wrong-node answer. In single-node/proxy mode a
+    /// `W` propagates immediately, exactly as [`Self::get_bytes`]'s own
     /// single-mode behavior does — there is no ring to refresh against.
     ///
     /// Larger batches are transparently split into more than one `m`
@@ -1968,7 +1999,7 @@ impl NanocachedClient {
         }
 
         let indices: Vec<usize> = (0..key_strings.len()).collect();
-        let retry = self
+        let mut outcome = self
             .multi_get_pass(
                 namespace,
                 &key_strings,
@@ -1978,22 +2009,49 @@ impl NanocachedClient {
                 &budget,
             )
             .await?;
-        if retry.is_empty() {
-            return Ok(values);
+        let mut last_error = outcome.last_error.take();
+        if !outcome.wrong_node.is_empty() || !outcome.unreachable.is_empty() {
+            // One bounded refresh-and-retry, as before, over everything
+            // still unresolved: a `W` is stale routing the refresh fixes;
+            // a key whose every owner was unreachable gets one more walk
+            // of its (possibly re-ranked) owners, which is what the old
+            // same-primary retry amounted to for it.
+            self.maybe_refresh(true).await;
+            let mut pending = outcome.wrong_node;
+            pending.extend(outcome.unreachable);
+            outcome = self
+                .multi_get_pass(
+                    namespace,
+                    &key_strings,
+                    &key_bytes,
+                    &mut values,
+                    pending,
+                    &budget,
+                )
+                .await?;
+            if let Some(error) = outcome.last_error.take() {
+                last_error = Some(error);
+            }
         }
-        self.maybe_refresh(true).await;
-        let retry = self
-            .multi_get_pass(
-                namespace,
-                &key_strings,
-                &key_bytes,
-                &mut values,
-                retry,
-                &budget,
-            )
-            .await?;
-        if !retry.is_empty() {
+        if !outcome.wrong_node.is_empty() {
             return Err(Error::PartialWrongNode(values));
+        }
+        if !outcome.unreachable.is_empty() {
+            // Nothing answered `W` for these keys: every owner of each was
+            // unreachable, on both passes. That is a connection loss,
+            // reported the way the single-mode branch reports a mid-batch
+            // one — with whatever did resolve attached — or as the bare
+            // connection error when nothing resolved, exactly as read()
+            // returns for a single key.
+            let error = last_error.unwrap_or_else(|| {
+                Error::ConnectionLost(
+                    "nanocached: no owner is reachable for these keys".to_string(),
+                )
+            });
+            if values.is_empty() {
+                return Err(error);
+            }
+            return Err(Error::PartialConnectionLost(values, Box::new(error)));
         }
         Ok(values)
     }
@@ -2122,15 +2180,28 @@ impl NanocachedClient {
         Ok(entries)
     }
 
-    /// One pass of [`Self::get_many_bytes_in`]'s cluster routing: group
-    /// the given `indices` (every key, on the initial pass, or just the
-    /// keys a previous pass left unresolved) by their current primary
-    /// owner (matching plain `get`'s own primary-first stance), dispatch
-    /// one (possibly chunked) `m` exchange per owner concurrently,
-    /// splice hits into `values`, and return the indices still
-    /// unresolved: a per-key `W`, or a whole owner group whose call
-    /// failed outright. Called once for the initial pass and once more,
-    /// if needed, after a single forced refresh.
+    /// One pass of [`Self::get_many_bytes_in`]'s cluster routing, with
+    /// the same owner fallback a single `get` has ([`Self::read`]). The
+    /// given `indices` (every key, on the initial pass, or just the keys
+    /// a previous pass left unresolved) are grouped by their current
+    /// owner and one (possibly chunked) `m` exchange is dispatched per
+    /// owner concurrently; hits are spliced into `values`. A key whose
+    /// owner answered a per-key `W` is done for this pass: that is stale
+    /// routing, and the caller's refresh is the answer, exactly as
+    /// `read()` returns `Error::WrongNode` rather than trying the next
+    /// owner. A key whose owner group failed at the connection level — a
+    /// dead or unreachable node, a certificate this client cannot verify,
+    /// a possibly idle-closed connection; indistinguishable, the stance
+    /// `read()` takes — is sent to its *next* owner in rank order, the
+    /// same walk `read()` does for one key, until an owner answers or the
+    /// key has run out of owners. On a chunked group only the keys from
+    /// the failing chunk onward move on (issue #411; the hits earlier
+    /// chunks returned are kept). Keys with no owners at all (an empty
+    /// ring view) count as `W`: a refresh may populate it. Called once
+    /// for the initial pass and once more, if needed, after a single
+    /// forced refresh. The `Err` return is a client-side decompression
+    /// failure only — never a routing outcome, so it aborts the batch
+    /// immediately rather than feeding into the retry pass.
     async fn multi_get_pass(
         &self,
         namespace: &[u8],
@@ -2139,56 +2210,73 @@ impl NanocachedClient {
         values: &mut HashMap<String, Vec<u8>>,
         indices: Vec<usize>,
         budget: &AtomicU64,
-    ) -> Result<Vec<usize>> {
-        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut retry = Vec::new();
-        {
-            let state = self.inner.state.lock().await;
-            for idx in indices {
-                let owners = Self::owner_names(&state, namespace, &key_bytes[idx]);
-                match owners.into_iter().next() {
-                    Some(primary) => groups.entry(primary).or_default().push(idx),
-                    None => retry.push(idx),
+    ) -> Result<MultiGetOutcome> {
+        let mut rank: HashMap<usize, usize> = indices.iter().map(|&idx| (idx, 0)).collect();
+        let mut pending = indices;
+        let mut outcome = MultiGetOutcome::default();
+
+        while !pending.is_empty() {
+            let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+            {
+                let state = self.inner.state.lock().await;
+                for idx in pending.drain(..) {
+                    let owners = Self::owner_names(&state, namespace, &key_bytes[idx]);
+                    if owners.is_empty() {
+                        outcome.wrong_node.push(idx);
+                    } else if let Some(owner) = owners.get(rank[&idx]) {
+                        groups.entry(owner.clone()).or_default().push(idx);
+                    } else {
+                        outcome.unreachable.push(idx);
+                    }
+                }
+            }
+
+            let legs =
+                futures_util::future::join_all(groups.iter().map(|(owner, group_indices)| {
+                    self.run_multi_get_leg(
+                        namespace,
+                        owner,
+                        group_indices,
+                        key_strings,
+                        key_bytes,
+                        budget,
+                    )
+                }))
+                .await;
+
+            for leg in legs {
+                let leg = leg?;
+                outcome.wrong_node.extend(leg.wrong_node);
+                for (key, value) in leg.hits {
+                    values.insert(key, value);
+                }
+                if let Some(error) = leg.error {
+                    outcome.last_error = Some(error);
+                    for idx in leg.moved {
+                        *rank.get_mut(&idx).expect("every pending index has a rank") += 1;
+                        pending.push(idx);
+                    }
                 }
             }
         }
-
-        let outcomes =
-            futures_util::future::join_all(groups.iter().map(|(owner, group_indices)| {
-                self.run_multi_get_leg(
-                    namespace,
-                    owner,
-                    group_indices,
-                    key_strings,
-                    key_bytes,
-                    budget,
-                )
-            }))
-            .await;
-
-        for outcome in outcomes {
-            let outcome = outcome?;
-            retry.extend(outcome.0);
-            for (key, value) in outcome.1 {
-                values.insert(key, value);
-            }
-        }
-        Ok(retry)
+        Ok(outcome)
     }
 
     /// One owner group's `m` exchange, run concurrently with every other
-    /// group by [`Self::multi_get_pass`]: a connection-level failure
-    /// retries whatever chunk(s) of the group didn't get a response —
-    /// same stance [`Self::apply_reconnecting`]'s own callers take
-    /// elsewhere, just scoped to the unresolved tail rather than the
-    /// whole group since issue #411's `multi_get_chunked` now reports
-    /// which chunk(s) landed before the failure; a per-key `W` retries
-    /// just that key; a hit is returned for the caller to splice into
-    /// `values` once every group has finished (a client-side `compress`
-    /// mismatch propagates, aborting the batch immediately — never fed
-    /// into the retry pass, since it isn't a routing outcome). Returns
-    /// `(retry indices, decoded hits)` rather than mutating shared state
-    /// directly, since every group runs concurrently with the others.
+    /// group by [`Self::multi_get_pass`]: a hit is returned for the caller
+    /// to splice into `values` once every group has finished (a
+    /// client-side `compress` mismatch propagates, aborting the batch
+    /// immediately — never fed into the retry pass, since it isn't a
+    /// routing outcome); a per-key `W` is reported in `wrong_node`; a
+    /// connection-level failure (same stance [`Self::apply_reconnecting`]'s
+    /// own callers take elsewhere) reports whatever chunk(s) of the group
+    /// didn't get a response in `moved`, so the pass can send those keys
+    /// to their next owner — the whole group when its first chunk failed,
+    /// only the unresolved tail otherwise, since issue #411's
+    /// `multi_get_chunked` reports which chunk(s) landed before the
+    /// failure — together with that failure. Returns a value rather than
+    /// mutating shared state directly, since every group runs
+    /// concurrently with the others.
     async fn run_multi_get_leg(
         &self,
         namespace: &[u8],
@@ -2197,27 +2285,33 @@ impl NanocachedClient {
         key_strings: &[&str],
         key_bytes: &[Vec<u8>],
         budget: &AtomicU64,
-    ) -> Result<(Vec<usize>, Vec<(String, Vec<u8>)>)> {
+    ) -> Result<MultiGetLeg> {
         let group_keys: Vec<Vec<u8>> = group_indices
             .iter()
             .map(|&i| key_bytes[i].clone())
             .collect();
-        let (entries, tail_failed) = match self
+        let (entries, error) = match self
             .multi_get_chunked(Some(owner), namespace, &group_keys)
             .await
         {
-            Ok(entries) => (entries, false),
-            Err((partial_entries, _connection_failure)) => (partial_entries, true),
+            Ok(entries) => (entries, None),
+            Err((partial_entries, connection_failure)) => {
+                (partial_entries, Some(connection_failure))
+            }
         };
         let resolved = entries.len();
 
-        let mut retry = Vec::new();
-        let mut hits = Vec::new();
+        let mut leg = MultiGetLeg {
+            wrong_node: Vec::new(),
+            hits: Vec::new(),
+            moved: Vec::new(),
+            error,
+        };
         for (&idx, entry) in group_indices.iter().zip(entries) {
             match entry {
-                MultiEntry::WrongNode => retry.push(idx),
+                MultiEntry::WrongNode => leg.wrong_node.push(idx),
                 MultiEntry::Hit(value) => {
-                    hits.push((
+                    leg.hits.push((
                         key_strings[idx].to_string(),
                         Self::decompress_for_batch(
                             self.inner.compress,
@@ -2230,10 +2324,10 @@ impl NanocachedClient {
                 MultiEntry::Miss | MultiEntry::Stored => {}
             }
         }
-        if tail_failed {
-            retry.extend_from_slice(&group_indices[resolved..]);
+        if leg.error.is_some() {
+            leg.moved.extend_from_slice(&group_indices[resolved..]);
         }
-        Ok((retry, hits))
+        Ok(leg)
     }
 
     pub async fn set_many(&self, values: &HashMap<String, String>, ttl_seconds: u64) -> Result<()> {

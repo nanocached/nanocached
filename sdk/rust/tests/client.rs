@@ -3665,6 +3665,98 @@ async fn a_not_numeric_incr_never_touches_the_replica() {
 }
 
 #[tokio::test]
+async fn get_many_reads_from_the_next_owner_when_a_primary_is_unreachable() {
+    // A primary that cannot be reached at the connection level (here a
+    // closed port; in the field a dead node, or a certificate this client
+    // cannot verify) must not fail the keys it owns: with R=2 the replica
+    // holds them, and a single get would already have fallen over to it.
+    // Discovery is left as it is — the client's ring still names the dead
+    // node as primary.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    let values: HashMap<String, String> = (0..24)
+        .map(|i| (format!("key-{i}"), format!("value-{i}")))
+        .collect();
+    client.set_many(&values, 0).await.unwrap();
+    let dead = NAMES[0];
+    assert!(
+        values.keys().any(|key| owners_of(key)[0] == dead),
+        "the key set must give the dead node some primaries"
+    );
+    nodes
+        .iter()
+        .find(|(name, _)| name == dead)
+        .unwrap()
+        .1
+        .stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let keys: Vec<String> = values.keys().cloned().collect();
+    assert_eq!(client.get_many(&keys).await.unwrap(), values);
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn get_many_reports_an_unreachable_owner_as_a_connection_loss_not_wrong_node() {
+    // R=1: the only owner of some keys is gone. Nothing answered `W`, so
+    // the error must not be the wrong-node one; the keys the live node
+    // owns are still returned, attached to the error.
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    let values: HashMap<String, String> = (0..24)
+        .map(|i| (format!("key-{i}"), format!("value-{i}")))
+        .collect();
+    client.set_many(&values, 0).await.unwrap();
+    let (dead, live) = (NAMES[0], NAMES[1]);
+    let ring = HashRing::new(NAMES.iter().map(|name| name.to_string()).collect());
+    let live_values: HashMap<String, String> = values
+        .iter()
+        .filter(|(key, _)| ring.owners(b"", key.as_bytes(), 1)[0] == live)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert!(
+        !live_values.is_empty() && live_values.len() < values.len(),
+        "both nodes must own some keys"
+    );
+    nodes
+        .iter()
+        .find(|(name, _)| name == dead)
+        .unwrap()
+        .1
+        .stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let keys: Vec<String> = values.keys().cloned().collect();
+    match client.get_many(&keys).await {
+        Err(Error::PartialConnectionLostText(partial, cause)) => {
+            assert_eq!(partial, live_values);
+            assert!(
+                matches!(*cause, Error::ConnectionLost(_)),
+                "cause = {cause:?}"
+            );
+        }
+        other => panic!("expected PartialConnectionLostText, got {other:?}"),
+    }
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
 async fn reads_fail_over_when_the_primary_dies() {
     let (nodes, discovery) = start_cluster(2).await;
     let client = NanocachedClient::connect(options(discovery.port))
