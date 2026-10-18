@@ -181,8 +181,12 @@ same as `get`/`set`. Batch keys are always `String`-shaped (`&[impl
 AsRef<str>]` for reads, `&HashMap<String, _>` for writes) — unlike
 single-key `get`/`set`, which accept any `impl AsRef<[u8]>`.
 
-**A batch never fails as a whole.** Each key's outcome is independent:
-if some keys are still routed to the wrong node after one bounded
+**A batch never fails as a whole.** Each key's outcome is independent,
+and a batched read survives an unreachable owner the way a single `get`
+does: a key whose owner cannot be reached at the connection level (a
+dead node, a certificate this client cannot verify) is read from its
+next owner in rank order, so with replication the batch still resolves.
+If some keys are still routed to the wrong node after one bounded
 refresh-and-retry (the same policy `get`/`set` apply per key, not per
 call), `get_many`/`get_many_bytes` return
 `Err(Error::PartialWrongNode(map))`/`Err(Error::PartialWrongNodeText(map))`
@@ -197,11 +201,17 @@ match client.get_many(&keys).await {
 }
 ```
 
-`set_many`/`set_many_bytes` have nothing to attach on a persisting
-wrong-node, so they just return a plain `Err(Error::WrongNode)` — every
-other key in the batch was still stored. In single-node/proxy mode a `W`
-propagates immediately, exactly like `get`/`set`'s own single-mode
-behavior — there is no ring to refresh against.
+If some keys' every owner was unreachable, `get_many`/`get_many_bytes`
+return `Err(Error::PartialConnectionLost(map, cause))`/
+`Err(Error::PartialConnectionLostText(map, cause))` — the `map` the
+keys that did resolve, `cause` the last connection error — or the bare
+connection error when nothing resolved; a connection loss is never
+reported as a wrong-node answer. `set_many`/`set_many_bytes` have
+nothing to attach on a persisting wrong-node, so they just return a
+plain `Err(Error::WrongNode)` — every other key in the batch was still
+stored. In single-node/proxy mode a `W` propagates immediately, exactly
+like `get`/`set`'s own single-mode behavior — there is no ring to
+refresh against.
 
 Within one `set_many`/`set_many_bytes` batch, the same node can be one
 key's primary and another key's replica at once; it receives exactly
