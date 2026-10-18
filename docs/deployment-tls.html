@@ -734,8 +734,9 @@ including the wait for the Cloud Map record before the node service.</p>
 <p><strong>Verifying.</strong> Each task&rsquo;s init stream has one
 line, <code>tls-init: minted a certificate for 10.1.1.20</code>, and
 its exit code in <code>describe-tasks</code> is 0. The count that
-matters is the half-configuration warning across the whole log group,
-which must be zero:</p>
+matters is <code>WARN TLS</code> lines across the whole log group:
+zero right after a start, and later only handshake failures from your
+own checks, naming their address:</p>
 <pre><code>aws logs filter-log-events --log-group-name /ecs/$NAME --log-stream-name-prefix node-tls-init \
   --query 'events[].message' --output text
 aws logs filter-log-events --log-group-name /ecs/$NAME --filter-pattern '"WARN TLS"' \
@@ -909,10 +910,11 @@ main container, which is the Kubernetes equivalent of the ECS
 <code>dependsOn</code>; the probes stay plain HTTP on the ops port.</p>
 <p><strong>Verifying.</strong> Both rollouts were complete 31&nbsp;s
 after the apply, the node pods one per zone. Each pod&rsquo;s init
-log has one line, and the half-configuration warning must be absent
-from every container log &mdash; count it over the full logs, since a
-label selector shows only each pod&rsquo;s last ten lines by
-default:</p>
+log has one line, and <code>WARN TLS</code> lines must be absent from
+every container log right after a start, with only your own
+checks&rsquo; handshake failures appearing later &mdash; count them
+over the full logs, since a label selector shows only each
+pod&rsquo;s last ten lines by default:</p>
 <pre><code>kubectl -n nanocached logs deploy/node -c tls-init          # tls-init: minted a certificate for 192.168.21.3
 kubectl -n nanocached logs -l 'app in (nanocached-discovery,nanocached-node)' --all-containers --tail=-1 \
   | grep -c "WARN TLS"                                           # 0</code></pre>
@@ -1025,7 +1027,7 @@ involved, so the proxy&rsquo;s own port was checked directly:</p>
   printf 'A 9\nchange-me' | nc $ip 8358 | od -c | head -1    # 025 003 003 ... : a TLS alert, then closed
 done</code></pre>
 <p><strong>Scaling and redeploying</strong> were run under a long-lived
-client: one connection in proxy mode doing a read every 10&nbsp;ms
+client: one connection in proxy mode doing roughly eighty reads a second
 for 150&nbsp;s and counting failures. Scaling the service from two
 tasks to one was stable in 18&nbsp;s; the stopped task logged its
 drain, <code>nanocached_discovery_proxies</code> read 1, the survivor
@@ -1046,7 +1048,8 @@ about it. From the application&rsquo;s side the proxy is fine:
 <code>/healthz</code> answers 200. But it announces itself to
 discovery in plaintext, discovery&rsquo;s log gains a <code>WARN TLS
 handshake with 10.1.1.52 failed: received corrupt message</code> line
-every couple of seconds (41 in the 80&nbsp;s the task ran), the proxy
+every couple of seconds (41 by the time the task was stopped, about a
+minute and a half after it was launched), the proxy
 never obtains a roster, so <code>/readyz</code> stays 503 and ECS marks
 the task <code>UNHEALTHY</code>, and its own log says only
 <code>roster refresh failed: connection closed mid-frame</code> and
