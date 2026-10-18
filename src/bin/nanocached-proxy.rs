@@ -1061,6 +1061,20 @@ struct RefresherConfig {
     drain: watch::Receiver<bool>,
 }
 
+/// Appended to a backend failure when this proxy dials in plaintext and the
+/// peer closed the connection before answering the first frame: that is what
+/// a TLS-only discovery server or node does to a plaintext request, and the
+/// proxy has no other way to tell. The start-up warning covers a proxy that
+/// was launched half-configured; this covers one whose cluster moved to TLS
+/// under it, and names the flag either way.
+fn plaintext_hint(tls_connector: &Option<TlsConnector>, error: &io::Error) -> &'static str {
+    if tls_connector.is_none() && error.kind() == io::ErrorKind::UnexpectedEof {
+        " (sent in plaintext; a peer that requires TLS closes the connection like this — is --tls-ca missing?)"
+    } else {
+        ""
+    }
+}
+
 async fn run_refresher(
     config: RefresherConfig,
     ring_tx: watch::Sender<Option<Arc<RingView>>>,
@@ -1108,7 +1122,10 @@ async fn run_refresher(
                 }
             }
             Err(error) => {
-                eprintln!("WARN roster refresh failed: {error}");
+                eprintln!(
+                    "WARN roster refresh failed: {error}{}",
+                    plaintext_hint(&tls_connector, &error)
+                );
                 waiters.retain(|waiter| !waiter.is_closed());
             }
         }
@@ -4893,6 +4910,25 @@ fn main() -> ExitCode {
         None => None,
     };
 
+    // Client-side and backend-side TLS are configured independently (the
+    // proxy is dialled by applications *and* dials discovery and every
+    // node, carrying the shared secret both ways). Half-configuring it is
+    // easy to do and otherwise silent: a proxy with no `--tls-ca` against
+    // a TLS-only cluster looks fine to its clients and never obtains a
+    // roster. Same check as the node and discovery binaries.
+    match (&tls_acceptor, &tls_connector) {
+        (Some(_), None) => eprintln!(
+            "nanocached-proxy: WARN TLS is enabled for client connections only (no --tls-ca): \
+             connections to discovery and to every node — and the shared secret they carry — \
+             go out in plaintext"
+        ),
+        (None, Some(_)) => eprintln!(
+            "nanocached-proxy: WARN TLS is enabled for backend connections only \
+             (no --tls-cert/--tls-key): client traffic — and the shared secret — arrives in plaintext"
+        ),
+        _ => {}
+    }
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -5630,6 +5666,16 @@ mod tests {
             vec!["10.0.0.1:8357".to_string(), "10.0.0.2:8357".to_string()]
         );
         assert_eq!(parsed.max_connections, 9);
+    }
+
+    #[test]
+    fn plaintext_hint_names_the_flag_only_for_an_eof_on_a_plaintext_dial() {
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed mid-frame");
+        let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+        assert!(plaintext_hint(&None, &eof).contains("--tls-ca"));
+        assert_eq!(plaintext_hint(&None, &refused), "");
+        let (_acceptor, connector) = self_signed_tls();
+        assert_eq!(plaintext_hint(&Some(connector), &eof), "");
     }
 
     #[test]
