@@ -35,8 +35,8 @@ segments of a deployment are encrypted. This page says what each one
 covers, why a node&rsquo;s certificate must name its IP address, how to
 mint and distribute self-signed certificates on AWS, and how to rotate
 them &mdash; then applies all of it to the single-node and the clustered
-EC2 shapes and to the ECS shape, each built, checked and torn down
-exactly as shown.</p>
+EC2 shapes and to the ECS and EKS shapes, each built, checked and torn
+down exactly as shown.</p>
 
 <h2 id="segments">What each flag encrypts</h2>
 <p>Every process accepts connections, and most of them also dial out.
@@ -96,7 +96,9 @@ configuration, so a discovery certificate names whatever that is
 A proxy behind a load balancer, reached by the balancer&rsquo;s name,
 likewise names that name. The ECS shape below is the one where
 discovery is reached by a DNS name, and its certificate carries that
-name beside the task&rsquo;s IP.</p>
+name beside the task&rsquo;s IP; on EKS the name is a Service, and the
+single label <code>disc</code> that nodes dial is in the SAN as
+itself.</p>
 <p>The IP has to be known when the certificate is minted. On EC2 that
 is a matter of choosing it: <code>run-instances</code> takes
 <code>--private-ip-address</code>, and the shape below fixes the
@@ -210,6 +212,15 @@ operator&rsquo;s machine. It is the price of minting at start, and the
 init limits it: the key exists as an environment variable of a
 container that deletes its copy from the shared volume and exits
 before the node starts.</p>
+<p>On Kubernetes the same three files are two Secrets &mdash; the trust
+bundle in one, the signing pair in the other &mdash; mounted read-only
+into the init container, and only the trust Secret is mounted by the
+applications. A Secret is readable by anything that can mount Secrets
+in its namespace, so the signing Secret stays in the cluster&rsquo;s
+namespace and applications in another namespace get a copy of the
+trust Secret alone:</p>
+<pre><code>kubectl -n nanocached create secret generic nanocached-tls-ca      --from-file=ca.pem=ca.pem
+kubectl -n nanocached create secret generic nanocached-tls-signing --from-file=signing-cert.pem=ca.pem --from-file=signing-key.pem=ca-key.pem</code></pre>
 
 <h2 id="rotation">Rotation</h2>
 <p>Certificate and key are read once, at start, so a rotation is a
@@ -254,7 +265,14 @@ forced deployment of discovery and node; signing pair := the new CA
 and another forced deployment; trust := the new CA alone whenever the
 next deployment happens. Each forced deployment of the node service
 is a rolling replacement in which every old task drains and every new
-one joins, so the data survives it. Run on the ECS shape below.</p>
+one joins, so the data survives it. Run on the ECS shape below. On
+Kubernetes the deployment is <code>kubectl rollout restart</code>, and
+a changed Secret is applied with <code>kubectl create secret
+--dry-run=client -o yaml | kubectl apply -f -</code>; a pod that mounts
+the trust Secret sees the new file within about a minute, but an
+application reads its <code>ca</code> file when it constructs a client,
+so count on the restart, not on the propagation. Run on the EKS shape
+below.</p>
 
 <h2 id="ec2-single">Single node on EC2, with TLS</h2>
 <p>This is the <a href="deployment-ec2-single.html">single-node
@@ -761,6 +779,188 @@ with every node, which is step two doing what step one guarded
 against.</p>
 <p><strong>Teardown</strong> is the ECS guide&rsquo;s plus
 <code>delete-parameter</code> for the three TLS parameters.</p>
+
+<h2 id="eks">Cluster on EKS, with TLS</h2>
+<p>This is the <a href="deployment-eks.html">EKS shape</a> &mdash; a
+discovery Deployment behind the <code>disc</code> Service, a node
+Deployment spread across two zones &mdash; with every segment
+encrypted, by the same device as on ECS: a pod&rsquo;s address is
+assigned when it is scheduled, so an init container mints the
+pod&rsquo;s leaf at start. Three things change from ECS. The pod IP
+comes from the downward API rather than a metadata endpoint; the CA
+material comes from two Secrets mounted as files rather than from
+parameters injected as variables; and the shared volume is an
+<code>emptyDir</code> backed by memory, so the leaf and key never
+touch a worker&rsquo;s disk. Discovery&rsquo;s leaf names the
+Service in every form a dialler might use: <code>disc</code>, which
+the nodes dial, through <code>disc.nanocached.svc.cluster.local</code>
+for an application in another namespace. The cluster itself is the
+EKS guide&rsquo;s <code>eksctl</code> configuration unchanged; the
+workload below was applied to it, checked from a pod in the
+namespace, grown, rotated and torn down.</p>
+<p><strong>The Secrets</strong>, from the files minted under
+<a href="#self-signed">Self-signed certificates</a>, as in
+<a href="#distribution">Distribution</a>; the auth Secret is the EKS
+guide&rsquo;s.</p>
+<p><strong>The init script</strong> is the ECS one with the address
+and the files coming from the pod:</p>
+<pre><code>set -eu
+apk add --no-cache openssl &gt;/dev/null
+[ -n "${POD_IP:-}" ] || { echo "tls-init: POD_IP is not set" &gt;&amp;2; exit 1; }
+cd /tls
+cp /tls-ca/ca.pem ca.pem
+openssl req -new -newkey rsa:2048 -nodes -keyout key.pem -out leaf.csr -subj "/CN=nanocached-$POD_IP" 2&gt;/dev/null
+printf 'subjectAltName=IP:%s%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' "$POD_IP" "${TLS_EXTRA_SAN:-}" &gt; leaf.ext
+openssl x509 -req -in leaf.csr -CA /tls-signing/signing-cert.pem -CAkey /tls-signing/signing-key.pem -days 365 -extfile leaf.ext -out cert.pem 2&gt;/dev/null
+rm -f leaf.csr leaf.ext
+chown 10001:10001 ca.pem cert.pem key.pem; chmod 644 ca.pem cert.pem; chmod 600 key.pem
+echo "tls-init: minted a certificate for $POD_IP"</code></pre>
+<p><strong>The manifests.</strong> The node Deployment in full; the
+discovery Deployment has the same init container, volumes and mounts,
+its <code>TLS_EXTRA_SAN</code> set to
+<code>,DNS:disc,DNS:disc.nanocached,DNS:disc.nanocached.svc,DNS:disc.nanocached.svc.cluster.local</code>,
+and the three flags on the discovery container. The Service and the
+rest are the EKS guide&rsquo;s:</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node
+  namespace: nanocached
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: nanocached-node}
+  template:
+    metadata:
+      labels: {app: nanocached-node}
+    spec:
+      terminationGracePeriodSeconds: 45
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: nanocached-node}
+      initContainers:
+        - name: tls-init
+          image: public.ecr.aws/docker/library/alpine:3.21
+          command: ["sh", "-c"]
+          args:
+            - |
+                set -eu
+                apk add --no-cache openssl &gt;/dev/null
+                [ -n "${POD_IP:-}" ] || { echo "tls-init: POD_IP is not set" &gt;&amp;2; exit 1; }
+                cd /tls
+                cp /tls-ca/ca.pem ca.pem
+                openssl req -new -newkey rsa:2048 -nodes -keyout key.pem -out leaf.csr -subj "/CN=nanocached-$POD_IP" 2&gt;/dev/null
+                printf 'subjectAltName=IP:%s%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' "$POD_IP" "${TLS_EXTRA_SAN:-}" &gt; leaf.ext
+                openssl x509 -req -in leaf.csr -CA /tls-signing/signing-cert.pem -CAkey /tls-signing/signing-key.pem -days 365 -extfile leaf.ext -out cert.pem 2&gt;/dev/null
+                rm -f leaf.csr leaf.ext
+                chown 10001:10001 ca.pem cert.pem key.pem; chmod 644 ca.pem cert.pem; chmod 600 key.pem
+                echo "tls-init: minted a certificate for $POD_IP"
+          env:
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: TLS_EXTRA_SAN
+              value: ""
+          volumeMounts:
+            - {name: tls, mountPath: /tls}
+            - {name: tls-ca, mountPath: /tls-ca, readOnly: true}
+            - {name: tls-signing, mountPath: /tls-signing, readOnly: true}
+      containers:
+        - name: node
+          image: ghcr.io/nanocached/nanocached-node@sha256:2104f8263c6f909d734fb6302a74bbedd5d583c14fb73713268ef4627fad5337
+          args: ["--host", "0.0.0.0", "--port", "8356", "--discovery", "disc:8357",
+                 "--drain-timeout", "20", "--metrics-port", "9356", "--max-memory", "536870912",
+                 "--tls-cert", "/tls/cert.pem", "--tls-key", "/tls/key.pem", "--tls-ca", "/tls/ca.pem"]
+          envFrom:
+            - secretRef: {name: nanocached-auth}
+          ports:
+            - {containerPort: 8356, name: data}
+            - {containerPort: 9356, name: ops}
+          volumeMounts:
+            - {name: tls, mountPath: /tls, readOnly: true}
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+            failureThreshold: 36
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {memory: 1Gi}
+      volumes:
+        - name: tls
+          emptyDir: {medium: Memory}
+        - name: tls-ca
+          secret: {secretName: nanocached-tls-ca}
+        - name: tls-signing
+          secret: {secretName: nanocached-tls-signing}</code></pre>
+<p>The init container&rsquo;s failure keeps the pod from starting its
+main container, which is the Kubernetes equivalent of the ECS
+<code>dependsOn</code>; the probes stay plain HTTP on the ops port.</p>
+<p><strong>Verifying.</strong> Both rollouts were complete 31&nbsp;s
+after the apply, the node pods one per zone. Each pod&rsquo;s init
+log has one line, and the half-configuration warning must be absent
+from every container log &mdash; count it over the full logs, since a
+label selector shows only each pod&rsquo;s last ten lines by
+default:</p>
+<pre><code>kubectl -n nanocached logs deploy/node -c tls-init          # tls-init: minted a certificate for 192.168.21.3
+kubectl -n nanocached logs -l 'app in (nanocached-discovery,nanocached-node)' --all-containers --tail=-1 \
+  | grep -c "WARN TLS"                                           # 0</code></pre>
+<p>Discovery&rsquo;s log shows the two registrations and promotions;
+each node&rsquo;s shows <code>joined the cluster via discovery at
+disc:8357</code> after the <code>Connection refused</code> retries the
+EKS guide describes, which are the Service having no endpoint until
+discovery is ready, not TLS. From a pod in the namespace with the
+trust Secret mounted (<code>python:3.11-alpine</code>, the SDK
+installed at start), the SDK is configured with the Service name and
+the mounted file:</p>
+<pre><code>client = await NanocachedClient.connect(
+    [("disc", 8357)],
+    auth_secret="change-me",
+    tls=True,
+    ca="/tls-ca/ca.pem",
+)</code></pre>
+<pre><code>echo | openssl s_client -connect disc:8357 -CAfile /tls-ca/ca.pem 2&gt;/dev/null \
+  | openssl x509 -noout -ext subjectAltName
+# IP Address:192.168.24.73, DNS:disc, DNS:disc.nanocached, DNS:disc.nanocached.svc, DNS:disc.nanocached.svc.cluster.local</code></pre>
+<p>With the Python SDK at 0.4.6: 2,000 keys written with
+<code>set_many</code> and read back complete, and again after every
+step below; an unrelated certificate as <code>ca</code>,
+<code>tls=True</code> without <code>ca</code>, and a plaintext
+connection fail as on the other shapes, and the four
+<code>WARN TLS handshake</code> lines they leave in discovery&rsquo;s
+log name the check pod&rsquo;s address; no other such line appeared
+on any pod during the run.</p>
+<p><strong>Growing</strong> is <code>kubectl scale deploy/node
+--replicas=3</code>: the new pod minted its leaf, the rollout reported
+complete 6&nbsp;s after the scale, a member handed it 1,308 keys, the
+member count read 3 and the 2,000 keys read back.</p>
+<p><strong>Rotation.</strong> Leaf rotation is <code>kubectl rollout
+restart</code> of a Deployment. The CA rotation run: step one, the
+trust Secret re-applied with both CAs, <code>rollout restart
+deploy/discovery</code> (complete in 21&nbsp;s; the three nodes
+logged <code>re-registered with discovery</code>), then <code>rollout
+restart deploy/node</code> (52&nbsp;s for three pods, each new pod
+joining before an old one drained). The check pod, which had kept a
+copy of the old CA alone, read all 2,000 keys between the two
+restarts and after them; re-created, it mounted the two-certificate
+file and read them again. Step two, the signing Secret re-applied
+with the new CA, <code>rollout restart deploy/node</code>
+(52&nbsp;s) and <code>deploy/discovery</code> (21&nbsp;s): afterwards
+<code>openssl s_client</code> against each node pod&rsquo;s address
+and against <code>disc</code> showed <code>issuer=CN=nanocached CA
+2</code>, the member count was 3, the 2,000 keys read back, and no
+pod had restarted. During each node rollout the surge pod waited a
+few seconds for capacity (<code>FailedScheduling &hellip; Insufficient
+memory</code> in the events, then scheduled once a leaver had gone);
+two <code>t3.medium</code> workers hold four 1&nbsp;GiB node pods,
+and a rollout of three needs the fourth slot.</p>
+<p><strong>Teardown</strong> is the EKS guide&rsquo;s: the namespace
+takes the Secrets with it, and <code>eksctl delete cluster</code>
+the rest.</p>
 
 </main>
 
