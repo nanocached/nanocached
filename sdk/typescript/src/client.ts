@@ -1543,15 +1543,23 @@ export class NanocachedClient {
    * miss is not an error" contract `getBytes` itself has. `keys` must
    * be non-empty.
    *
-   * A batch never fails as a whole: if some keys are still wrong-node
-   * after one bounded refresh-and-retry (the same policy `getBytes`
-   * itself applies, generalized to a per-key roster instead of an
-   * all-or-nothing retry — see `multiGetPass`), this throws
+   * A batch never fails as a whole, and it survives an unreachable owner
+   * the way a single `getBytes` does: a key whose owner cannot be
+   * reached at the connection level (a dead node, a certificate this
+   * client cannot verify) is read from its next owner in rank order (see
+   * `multiGetPass`), so with replication the batch still resolves. If
+   * some keys are still wrong-node after one bounded refresh-and-retry
+   * (the same policy `getBytes` itself applies, generalized to a per-key
+   * roster instead of an all-or-nothing retry), this throws
    * `PartialWrongNodeError` whose `.partialValues` holds every key that
    * DID resolve, rather than discarding a mostly-successful batch over
-   * a handful of stale placements. In single-node/proxy mode a `W`
-   * propagates the same way, immediately — there is no ring to refresh
-   * against.
+   * a handful of stale placements. If some keys' every owner was
+   * unreachable, this throws `PartialConnectionLostError` (its
+   * `.partialValues` the keys that did resolve, its message naming the
+   * last connection error), or the bare connection error when nothing
+   * resolved — a connection loss is never reported as a wrong-node
+   * answer. In single-node/proxy mode a `W` propagates immediately as a
+   * plain `PartialWrongNodeError` — there is no ring to refresh against.
    *
    * Larger batches are transparently split into more than one `m`
    * sub-frame per owner (batch chunking, see MAX_BATCH_KEYS and, for
@@ -1625,12 +1633,39 @@ export class NanocachedClient {
       return values;
     }
 
-    let retryIndices = await this.multiGetPass(namespace, keys, keyBytes, values, undefined, budget);
-    if (retryIndices.length === 0) return values;
-
-    await this.maybeRefreshNodeList({ force: true });
-    retryIndices = await this.multiGetPass(namespace, keys, keyBytes, values, retryIndices, budget);
-    if (retryIndices.length > 0) throw new PartialWrongNodeError(values);
+    let { wrongNode, unreachable, lastError } = await this.multiGetPass(namespace, keys, keyBytes, values, undefined, budget);
+    if (wrongNode.length > 0 || unreachable.length > 0) {
+      // One bounded refresh-and-retry, as before, over everything still
+      // unresolved: a `W` is stale routing the refresh fixes; a key whose
+      // every owner was unreachable gets one more walk of its (possibly
+      // re-ranked) owners, which is what the old same-primary retry
+      // amounted to for it.
+      await this.maybeRefreshNodeList({ force: true });
+      const second = await this.multiGetPass(namespace, keys, keyBytes, values, [...wrongNode, ...unreachable], budget);
+      wrongNode = second.wrongNode;
+      unreachable = second.unreachable;
+      lastError = second.lastError ?? lastError;
+    }
+    if (wrongNode.length > 0) throw new PartialWrongNodeError(values);
+    if (unreachable.length > 0) {
+      // Nothing answered `W` for these keys: every owner of each was
+      // unreachable, on both passes. That is a connection loss, reported
+      // the way the single-node branch reports a mid-batch one — with
+      // whatever did resolve attached — or as a bare connection error
+      // when nothing resolved, exactly as readFromOwners throws for a
+      // single key. `lastError` may be multiGetChunked's own
+      // PartialConnectionLostError<MultiEntry[]> (a chunked group that
+      // died after an earlier chunk landed); its entries were already
+      // applied in the pass, so it is never handed to the caller as is —
+      // its partialValues are not a key→value map.
+      const message =
+        `nanocached: getMany/getManyBytes could not reach any owner of ${unreachable.length} of ${keys.length} keys: ` +
+        (lastError instanceof Error ? lastError.message : String(lastError));
+      const requestWasSent = lastError instanceof ConnectionLostError ? lastError.requestWasSent : true;
+      if (values.size > 0) throw new PartialConnectionLostError(values, message, { requestWasSent });
+      if (lastError instanceof PartialConnectionLostError) throw new ConnectionLostError(message, { requestWasSent });
+      throw lastError ?? new ConnectionLostError(message);
+    }
     return values;
   }
 
@@ -1662,20 +1697,32 @@ export class NanocachedClient {
     return value;
   }
 
-  /** One pass of getManyBytes' cluster routing: group the given indices
-   * (every key, when retryIndices is undefined — the initial pass — or
-   * just what a previous pass left unresolved) by their current
-   * primary owner (matching readFromOwners' own primary-first stance),
-   * dispatch one (possibly chunked) `m` exchange per owner
-   * concurrently, splice hits into values, and return the indices
-   * still unresolved: a per-key `W`, or a whole owner group whose call
-   * failed outright — indistinguishable from a possibly-idle-closed
-   * connection, the same stance memberConnection's own callers take
-   * elsewhere. Called once for the initial pass and once more, if
-   * needed, after a single forced refresh — see
-   * getManyBytesInNamespace. This deliberately does not reuse
-   * withWrongNodeRetry (whole-operation, exception-driven); it's the
-   * same two-pass-with-forced-refresh idiom fanoutClear/
+  /** One pass of getManyBytes' cluster routing, with the same owner
+   * fallback a single get has. The given indices (every key, when
+   * retryIndices is undefined — the initial pass — or just what a
+   * previous pass left unresolved) are grouped by their current owner
+   * and one (possibly chunked) `m` exchange is dispatched per owner
+   * concurrently; hits are spliced into `values`. A key whose owner
+   * answered a per-key `W` is done for this pass: that is stale
+   * routing, and the caller's refresh is the answer, exactly as
+   * readFromOwners rethrows WrongNodeError rather than trying the next
+   * owner. A key whose owner group failed at the connection level — a
+   * dead or unreachable node, a certificate this client cannot verify,
+   * a possibly idle-closed connection; indistinguishable, the stance
+   * readFromOwners takes — is sent to its *next* owner in rank order,
+   * the same walk readFromOwners does for one key, until an owner
+   * answers or the key has run out of owners. On a chunked group only
+   * the keys from the failing chunk onward move on (issue #411; the
+   * hits earlier chunks returned are kept).
+   *
+   * Returns the indices that ended the pass on a `W`, the indices whose
+   * every owner was unreachable, and the last connection-level error
+   * seen (undefined when there was none). Keys with no owners at all (an
+   * empty ring view) count as `W`: a refresh may populate it. Called
+   * once for the initial pass and once more, if needed, after a single
+   * forced refresh — see getManyBytesInNamespace. This deliberately does
+   * not reuse withWrongNodeRetry (whole-operation, exception-driven);
+   * it's the same two-pass-with-forced-refresh idiom fanoutClear/
    * clearFanoutAttempt already use, just keyed per-key instead of
    * per-node. */
   private async multiGetPass(
@@ -1685,70 +1732,80 @@ export class NanocachedClient {
     values: Map<string, Buffer>,
     retryIndices: readonly number[] | undefined,
     budget: { decompressed: number },
-  ): Promise<number[]> {
-    const indices = retryIndices ?? keyBytes.map((_, index) => index);
+  ): Promise<{ wrongNode: number[]; unreachable: number[]; lastError: unknown }> {
+    let pending = retryIndices ? [...retryIndices] : keyBytes.map((_, index) => index);
+    const rank = new Map<number, number>(pending.map((index) => [index, 0]));
+    const wrongNode: number[] = [];
+    const unreachable: number[] = [];
+    let lastError: unknown = undefined;
 
-    const groups = new Map<string, number[]>();
-    const retry: number[] = [];
-    for (const index of indices) {
-      const owners = this.ownerNames(keyBytes[index], namespace);
-      if (owners.length === 0) {
-        retry.push(index);
-        continue;
-      }
-      const primary = owners[0];
-      const group = groups.get(primary);
-      if (group) group.push(index);
-      else groups.set(primary, [index]);
-    }
-
-    await Promise.all(
-      [...groups.entries()].map(async ([owner, groupIndices]) => {
-        const groupKeyBytes = groupIndices.map((index) => keyBytes[index]);
-        let entries: MultiEntry[];
-        try {
-          entries = await this.multiGetChunked(() => this.memberConnection(owner), namespace, groupKeyBytes);
-        } catch (error) {
-          // issue #411: this owner's group already got chunked into more
-          // than one `m` sub-frame, and an earlier one succeeded before
-          // the connection died on a later one — apply what it already
-          // fetched instead of retrying keys that are already resolved;
-          // only the indices the failing chunk never reached go back into
-          // `retry`.
-          if (error instanceof PartialConnectionLostError) {
-            const partial = error.partialValues as MultiEntry[];
-            for (let i = 0; i < partial.length; i++) {
-              const entry = partial[i];
-              if (entry.kind === "hit") values.set(keys[groupIndices[i]], this.decompressForBatch(entry.value, budget));
-              else if (entry.kind === "wrongNode") retry.push(groupIndices[i]);
-            }
-            retry.push(...groupIndices.slice(partial.length));
-            return;
-          }
-          // issue #390: this was the file's one undiscriminating swallow
-          // site — a genuine programming error thrown here was folded
-          // into the per-key retry list and finally misreported as
-          // PartialWrongNodeError (stale routing). Only the listed
-          // connection-level failures may stand in for "retry this
-          // group", the same isSwallowable stance multiSetPass and every
-          // other swallow site already take.
-          if (!isSwallowable(error)) throw error;
-          retry.push(...groupIndices);
-          return;
+    const runGroup = async (
+      owner: string,
+      groupIndices: number[],
+    ): Promise<{ groupIndices: number[]; entries: MultiEntry[]; error: unknown; resolved: number }> => {
+      const groupKeyBytes = groupIndices.map((index) => keyBytes[index]);
+      try {
+        const entries = await this.multiGetChunked(() => this.memberConnection(owner), namespace, groupKeyBytes);
+        return { groupIndices, entries, error: undefined, resolved: groupIndices.length };
+      } catch (error) {
+        // issue #411: this owner's group already got chunked into more
+        // than one `m` sub-frame, and an earlier one succeeded before the
+        // connection died on a later one — keep what it already fetched
+        // instead of re-reading keys that are already resolved; only the
+        // indices the failing chunk never reached move on to their next
+        // owner.
+        if (error instanceof PartialConnectionLostError) {
+          const partial = error.partialValues as MultiEntry[];
+          return { groupIndices, entries: partial, error, resolved: partial.length };
         }
-        for (let i = 0; i < groupIndices.length; i++) {
+        // issue #390: this was the file's one undiscriminating swallow
+        // site — a genuine programming error thrown here was folded into
+        // the per-key retry list and finally misreported as
+        // PartialWrongNodeError (stale routing). Only the listed
+        // connection-level failures may stand in for "move this group to
+        // its next owner", the same isSwallowable stance multiSetPass and
+        // every other swallow site already take.
+        if (!isSwallowable(error)) throw error;
+        return { groupIndices, entries: [], error, resolved: 0 };
+      }
+    };
+
+    while (pending.length > 0) {
+      const groups = new Map<string, number[]>();
+      for (const index of pending) {
+        const owners = this.ownerNames(keyBytes[index], namespace);
+        const owner = owners[rank.get(index)!];
+        if (owners.length === 0) wrongNode.push(index);
+        else if (owner === undefined) unreachable.push(index);
+        else {
+          const group = groups.get(owner);
+          if (group) group.push(index);
+          else groups.set(owner, [index]);
+        }
+      }
+      pending = [];
+      const results = await Promise.all([...groups.entries()].map(([owner, groupIndices]) => runGroup(owner, groupIndices)));
+      for (const { groupIndices, entries, error, resolved } of results) {
+        for (let i = 0; i < resolved; i++) {
           const index = groupIndices[i];
           const entry = entries[i];
-          if (entry.kind === "wrongNode") retry.push(index);
+          if (entry.kind === "wrongNode") wrongNode.push(index);
           // Same decompression getBytesInNamespace applies to a single get
           // (issue #294) — a cluster-mode batch read must not hand back
           // marker-prefixed DEFLATE bytes when compress is enabled.
           else if (entry.kind === "hit") values.set(keys[index], this.decompressForBatch(entry.value, budget));
         }
-      }),
-    );
+        if (error !== undefined) {
+          lastError = error;
+          for (const index of groupIndices.slice(resolved)) {
+            rank.set(index, rank.get(index)! + 1);
+            pending.push(index);
+          }
+        }
+      }
+    }
 
-    return retry;
+    return { wrongNode, unreachable, lastError };
   }
 
   /** Issues one or more `m` sub-frames against whatever `connectionFor`

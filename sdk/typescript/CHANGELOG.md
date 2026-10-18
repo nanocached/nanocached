@@ -9,6 +9,19 @@ tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- `getMany`/`getManyBytes` in cluster mode now read a key from its next
+  owner when its primary cannot be reached at the connection level, the
+  same walk a single `get` already did (#623, the TypeScript part of
+  #616). Before, the batch sent every key to its primary only, retried the
+  same primary once after a refresh, and then threw `PartialWrongNodeError`
+  for keys that nothing had answered `W` for — seen in the field as a
+  client that could not verify one node's rotated TLS certificate failing a
+  bulk read although the other owner held every key. Keys whose every
+  owner is unreachable now throw `PartialConnectionLostError` (or the bare
+  connection error when nothing resolved) instead of a wrong-node error.
+
 ## [0.4.6] - 2026-10-17
 
 No changes. Version aligned with the rest of the project: every release

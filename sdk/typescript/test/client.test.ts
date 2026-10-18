@@ -3316,6 +3316,86 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
     }
   });
 
+  it("reads a key from its next owner when its primary is unreachable", async () => {
+    // A primary that cannot be reached at the connection level (here a
+    // closed port; in the field a dead node, or a certificate this client
+    // cannot verify) must not fail the keys it owns: with R=2 the replica
+    // holds them, and a single get would already have fallen over to it.
+    // Discovery is left as it is — the client's ring still names the dead
+    // node as primary.
+    const cluster = await startReplicatedCluster(2);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    let deadClosed = false;
+    try {
+      const values: Record<string, string> = {};
+      const keys: string[] = [];
+      for (let i = 0; i < 24; i++) {
+        const key = `key-${i}`;
+        keys.push(key);
+        values[key] = `value-${i}`;
+      }
+      await client.setMany(values);
+      const dead = cluster.nodes[0];
+      const ring = new HashRing(names);
+      assert.ok(
+        keys.some((key) => ring.owners(Buffer.from(key), 2)[0] === dead.name),
+        "the key set must give the dead node some primaries",
+      );
+      await dead.mock.close();
+      deadClosed = true;
+      await waitFor(() => (client as any).target.members.get(dead.name).connection.isClosed(), "the client to see the FIN");
+
+      const got = await client.getMany(keys);
+      assert.deepEqual(Object.fromEntries(got), values);
+    } finally {
+      await client.close();
+      await Promise.all([cluster.discovery.close(), cluster.nodes[1].mock.close(), deadClosed ? Promise.resolve() : cluster.nodes[0].mock.close()]);
+    }
+  });
+
+  it("reports an unreachable owner as a connection loss, not as wrong-node", async () => {
+    // R=1: the only owner of some keys is gone. Nothing answered `W`, so
+    // the error must not be the wrong-node one; the keys the live node
+    // owns are still returned, attached to the error.
+    const cluster = await startReplicatedCluster(1);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    let deadClosed = false;
+    try {
+      const values: Record<string, string> = {};
+      const keys: string[] = [];
+      for (let i = 0; i < 24; i++) {
+        const key = `key-${i}`;
+        keys.push(key);
+        values[key] = `value-${i}`;
+      }
+      await client.setMany(values);
+      const [dead, live] = cluster.nodes;
+      const ring = new HashRing(names);
+      const liveValues = Object.fromEntries(
+        Object.entries(values).filter(([key]) => ring.owners(Buffer.from(key), 1)[0] === live.name),
+      );
+      const liveCount = Object.keys(liveValues).length;
+      assert.ok(liveCount > 0 && liveCount < keys.length, "both nodes must own some keys");
+      await dead.mock.close();
+      deadClosed = true;
+      await waitFor(() => (client as any).target.members.get(dead.name).connection.isClosed(), "the client to see the FIN");
+
+      try {
+        await client.getMany(keys);
+        assert.fail("expected getMany to reject");
+      } catch (error) {
+        assert.ok(error instanceof PartialConnectionLostError, `expected PartialConnectionLostError, got ${String(error)}`);
+        assert.ok(!(error instanceof WrongNodeError));
+        const partial = (error as PartialConnectionLostError<Map<string, string>>).partialValues;
+        assert.deepEqual(Object.fromEntries(partial), liveValues);
+        assert.match((error as Error).message, /could not reach any owner of \d+ of 24 keys/);
+      }
+    } finally {
+      await client.close();
+      await Promise.all([cluster.discovery.close(), cluster.nodes[1].mock.close(), deadClosed ? Promise.resolve() : cluster.nodes[0].mock.close()]);
+    }
+  });
+
   it("degrades to a partial map wrapped in PartialWrongNodeError when a per-key W persists", async () => {
     const cluster = await startReplicatedCluster(1);
     const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
