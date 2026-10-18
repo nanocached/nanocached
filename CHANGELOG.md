@@ -12,6 +12,16 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-proxy`: warns at start-up when TLS is configured in one
+  direction only (`--tls-cert`/`--tls-key` without `--tls-ca`, or the
+  reverse), as the node and discovery binaries already did; a proxy with no
+  `--tls-ca` against a TLS-only cluster looked fine to its clients and never
+  obtained a roster, and its own log never said why. A roster-refresh
+  failure that looks like a plaintext request to a TLS-only peer (the
+  connection closed before the first reply) now says so and names the flag.
+
 ## [0.4.6] - 2026-10-17
 
 ### Fixed
