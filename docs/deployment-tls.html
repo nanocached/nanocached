@@ -34,9 +34,9 @@
 segments of a deployment are encrypted. This page says what each one
 covers, why a node&rsquo;s certificate must name its IP address, how to
 mint and distribute self-signed certificates on AWS, and how to rotate
-them &mdash; then applies all of it to the single-node and the clustered
-EC2 shapes and to the ECS and EKS shapes, each built, checked and torn
-down exactly as shown.</p>
+them &mdash; then applies all of it to the four AWS shapes, single-node
+EC2, clustered EC2, ECS and EKS, each built, checked and torn down
+exactly as shown.</p>
 
 <h2 id="segments">What each flag encrypts</h2>
 <p>Every process accepts connections, and most of them also dial out.
@@ -932,8 +932,8 @@ step below; an unrelated certificate as <code>ca</code>,
 <code>tls=True</code> without <code>ca</code>, and a plaintext
 connection fail as on the other shapes, and the four
 <code>WARN TLS handshake</code> lines they leave in discovery&rsquo;s
-log name the check pod&rsquo;s address; no other such line appeared
-on any pod during the run.</p>
+log name the check pod&rsquo;s address; none appeared on any pod alive
+at the end of the run, nor in the counts taken before each restart.</p>
 <p><strong>Growing</strong> is <code>kubectl scale deploy/node
 --replicas=3</code>: the new pod minted its leaf, the rollout reported
 complete 6&nbsp;s after the scale, a member handed it 1,308 keys, the
@@ -943,8 +943,8 @@ restart</code> of a Deployment. The CA rotation run: step one, the
 trust Secret re-applied with both CAs, <code>rollout restart
 deploy/discovery</code> (complete in 21&nbsp;s; the three nodes
 logged <code>re-registered with discovery</code>), then <code>rollout
-restart deploy/node</code> (52&nbsp;s for three pods, each new pod
-joining before an old one drained). The check pod, which had kept a
+restart deploy/node</code> (52&nbsp;s for three pods, one at a time).
+The check pod, which had kept a
 copy of the old CA alone, read all 2,000 keys between the two
 restarts and after them; re-created, it mounted the two-certificate
 file and read them again. Step two, the signing Secret re-applied
