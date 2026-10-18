@@ -282,9 +282,9 @@ the files the fetch produced:</p>
 # active / healthz=200 / readyz=200
 # -rw-r--r--. 1 10001 10001 1201 cert.pem
 # -rw-------. 1 10001 10001 1705 key.pem</code></pre>
-<p>The unit was active about a minute after launch, as without TLS;
-the fetch adds two API calls to the start-up path and nothing
-noticeable.</p>
+<p>The unit was active by the time Systems Manager could reach the
+instance, as without TLS; the fetch adds two API calls to the start-up
+path and nothing noticeable.</p>
 <p><strong>From the application server</strong>, the SDK needs the
 trust file and <code>tls</code>; the file comes from the trust
 parameter, which the instance role can read:</p>
