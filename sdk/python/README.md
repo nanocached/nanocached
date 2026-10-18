@@ -219,14 +219,22 @@ batch containing both `"a"` and `b"a"` is rejected up front with
 namespace-scoped: `client.namespace(ns).get_many(...)`/`.set_many(...)`,
 same as `get`/`set`.
 
-**A batch never fails as a whole.** Each key's outcome is independent:
-if some keys are still routed to the wrong node after one bounded
+**A batch never fails as a whole.** Each key's outcome is independent,
+and a batched read survives an unreachable owner the way a single `get`
+does: a key whose owner cannot be reached at the connection level (a
+dead node, a certificate this client cannot verify) is read from its
+next owner in rank order, so with replication the batch still resolves.
+If some keys are still routed to the wrong node after one bounded
 refresh-and-retry (the same policy `get`/`set` apply per key, not per
 call), `get_many`/`get_many_bytes` raise `PartialWrongNodeError` — a
 `WrongNodeError` subclass — whose `.partial_values` holds every key
-that DID resolve, rather than discarding a mostly-successful batch;
-`set_many` raises a plain `WrongNodeError` while every other key in the
-batch was still stored. In single-node/proxy mode a `W` propagates
+that DID resolve, rather than discarding a mostly-successful batch. If
+some keys' every owner was unreachable, they raise
+`PartialConnectionLostError` (`.partial_values` the keys that did
+resolve, `__cause__` the last connection error), or the bare connection
+error when nothing resolved — a connection loss is never reported as a
+wrong-node answer. `set_many` raises a plain `WrongNodeError` while
+every other key in the batch was still stored. In single-node/proxy mode a `W` propagates
 immediately, exactly like `get`/`set`'s own single-mode behavior — there
 is no ring to refresh against.
 
