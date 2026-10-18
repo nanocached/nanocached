@@ -209,10 +209,10 @@ pub struct Cache {
     /// Issue #124: operation counters, snapshotted by `stats()` for the
     /// metrics endpoint. Plain fields, not atomics — the cache actor is
     /// single-threaded. Issue #394: `U` handoff writes bypass these (see
-    /// `handoff_set`); `sets` still includes staged-join migration and
-    /// any other internal write delivered as an ordinary `S` frame,
-    /// which this node cannot tell apart from a client's — the exported
-    /// HELP text says so.
+    /// `handoff_set`), and since the staged-join migration moved to `U`
+    /// as well (issue #266) every cluster-management transfer does, so
+    /// `sets` counts client writes only — the exported HELP text says
+    /// so.
     hits: u64,
     misses: u64,
     sets: u64,
@@ -519,10 +519,9 @@ impl Cache {
     /// whatever internal transfer was in flight, contradicting the
     /// metrics HELP text and tripping rate-based alerting during routine
     /// scaling. These variants insert without touching any operation
-    /// counter. (Staged-join migration transfer arrives as ordinary `S`
-    /// frames from the source node and stays indistinguishable from a
-    /// client write here — the `sets_total` HELP text documents that
-    /// remainder instead.)
+    /// counter. (The staged-join migration also arrives this way since
+    /// issue #266, so no internal transfer is left in the client
+    /// counters.)
     ///
     /// `ahead_of_ring` (issue #601) is the caller's word that this node
     /// does *not* own `key` under the membership it has adopted — the

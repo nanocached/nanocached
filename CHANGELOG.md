@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: the `# HELP` line of `nanocached_node_sets_total`
+  said a staged join's migration transfer and a decommissioning node's
+  drain-out were counted there. Both travel as `U` handoff frames since
+  the join bulk transfer moved to them (#266), and handoff writes bypass
+  the client counters (#394), so the counter has counted client writes
+  only; the description now says so. Found while verifying the metrics
+  guide (#169): a joiner's `entries` rose to the migrated count while its
+  `sets_total` stayed at 0.
 - `nanocached-proxy`: warns at start-up when TLS is configured in one
   direction only (`--tls-cert`/`--tls-key` without `--tls-ca`, or the
   reverse), as the node and discovery binaries already did; a proxy with no

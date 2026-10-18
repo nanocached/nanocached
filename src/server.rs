@@ -1530,12 +1530,11 @@ fn render_node_metrics(
     metric(
         "nanocached_node_sets_total",
         "counter",
-        "Stored writes. Includes cluster-management writes delivered as \
-         ordinary S frames — a staged join's migration transfer and a \
-         decommissioning node's drain-out — which this node cannot tell \
-         apart from client writes (issue #394): expect a one-time burst \
-         proportional to the moved dataset during scaling events. \
-         Re-replication handoffs (U) are not counted here.",
+        "Stored client writes (S, s and o frames). Cluster-management \
+         transfers travel as handoff frames (U/u) and are not counted \
+         here — a staged join's migration, a decommissioning node's \
+         drain-out and re-replication alike — so a joiner's entries \
+         rise while this counter stays flat.",
         format!("nanocached_node_sets_total {}\n", stats.sets),
     );
     metric(
