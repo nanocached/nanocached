@@ -164,7 +164,10 @@ self-signed certs are marked as their own CA and get refused):</p>
   -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=serverAuth"</code></pre>
 <p>Being self-signed, the same <code>cert.pem</code> doubles as the
-<code>--tls-ca</code> trust anchor for anything connecting to it.</p>
+<code>--tls-ca</code> trust anchor for anything connecting to it. For
+what each flag encrypts in a cluster, certificate names, distribution
+and rotation on AWS, see <a href="deployment-tls.html">TLS</a> under
+Deployment.</p>
 
 <h2>Connect a client</h2>
 <p>Use any of the six SDKs — each detects whether it reached a node or a
