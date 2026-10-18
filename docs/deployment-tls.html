@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TLS — nanocached</title>
+<meta name="description" content="TLS for a nanocached deployment: which segments each flag encrypts, why node certificates carry IP addresses, a self-signed recipe, distribution through Parameter Store, rotation, and the single-node EC2 shape verified end to end.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <nav>
+    <a class="brand" href="index.html"><img src="favicon.svg" alt=""><span><b>nano</b>cached</span></a>
+    <div class="links">
+      <a href="getting-started.html">Getting started</a>
+      <a href="protocol.html">Protocol</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="sdks.html">SDKs</a>
+      <a href="deployment.html" aria-current="page">Deployment</a>
+      <a href="capacity-planner.html">Capacity planner</a>
+      <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+
+<h1>TLS</h1>
+<p class="lede">Three flags, the same on every binary, decide which
+segments of a deployment are encrypted. This page says what each one
+covers, why a node&rsquo;s certificate must name its IP address, how to
+mint and distribute self-signed certificates on AWS, and how to rotate
+them &mdash; then applies all of it to the single-node EC2 shape, which
+was built, checked and torn down exactly as shown.</p>
+
+<h2 id="segments">What each flag encrypts</h2>
+<p>Every process accepts connections, and most of them also dial out.
+<code>--tls-cert</code>/<code>--tls-key</code> (a PEM chain and its
+key) turn on TLS for everything the process <em>accepts</em>, with no
+plaintext fallback: a plaintext client gets a TLS alert and the
+connection is closed. <code>--tls-ca</code> (a PEM file of one or more
+CA certificates) turns on TLS for everything the process <em>dials</em>,
+trusting only those certificates &mdash; not the system trust store,
+since a private cluster&rsquo;s certificates are not publicly issued.
+The two are independent, and a process with only one of them set warns
+at start-up that the other direction is plaintext. The SDKs take the
+same two pieces as options: <code>tls</code> and, for anything that is
+not publicly issued, <code>ca</code>. There are no client certificates:
+a peer is authenticated by the shared secret, and TLS adds
+confidentiality and the server&rsquo;s identity on top.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Segment</th><th>Server side</th><th>Dialling side</th><th>Verified against</th></tr></thead>
+  <tbody>
+    <tr><td>Application &rarr; node (data)</td><td>node <code>--tls-cert/--tls-key</code></td><td>SDK <code>tls</code> + <code>ca</code></td><td>the node&rsquo;s IP address, as configured (single node) or as discovery handed it out (cluster)</td></tr>
+    <tr><td>Application &rarr; discovery (node list)</td><td>discovery <code>--tls-cert/--tls-key</code></td><td>SDK <code>tls</code> + <code>ca</code></td><td>the address in the SDK&rsquo;s configuration: a hostname or an IP</td></tr>
+    <tr><td>Node &rarr; discovery (registration, heartbeats)</td><td>discovery <code>--tls-cert/--tls-key</code></td><td>node <code>--tls-ca</code></td><td>the node&rsquo;s <code>--discovery</code> address</td></tr>
+    <tr><td>Discovery &rarr; node (join and eviction orders)</td><td>node <code>--tls-cert/--tls-key</code></td><td>discovery <code>--tls-ca</code></td><td>the IP the node registered from</td></tr>
+    <tr><td>Node &rarr; node (handoffs)</td><td>node <code>--tls-cert/--tls-key</code></td><td>node <code>--tls-ca</code></td><td>the peer&rsquo;s IP, from the roster</td></tr>
+    <tr><td>Application &rarr; proxy</td><td>proxy <code>--tls-cert/--tls-key</code></td><td>SDK <code>tls</code> + <code>ca</code></td><td>the proxy&rsquo;s address: the IP it registered from, or a load balancer&rsquo;s name</td></tr>
+    <tr><td>Proxy &rarr; node, proxy &rarr; discovery</td><td>as above</td><td>proxy <code>--tls-ca</code></td><td>as above</td></tr>
+  </tbody>
+</table>
+</div>
+<p>By shape: a <strong>single node</strong> has one segment, so the node
+gets <code>--tls-cert/--tls-key</code> and nothing else. A
+<strong>cluster</strong> has all of the first five, so discovery and
+every node get all three flags. A <strong>proxy tier</strong> adds the
+last two, and the proxy gets all three as well. The operations endpoint
+(<code>--metrics-port</code>) is plain HTTP in every case; it was
+checked over HTTP on the TLS node below, and the
+<a href="deployment-operations.html#ops">usual advice</a> of keeping it
+inside the VPC is the whole of its protection.</p>
+
+<h2 id="names">Names in certificates</h2>
+<p>Nodes are addressed by IP. Discovery records the source IP of a
+node&rsquo;s registration connection, hands that address to the SDKs
+in the node list and to the other nodes in rosters, and dials it
+itself for join and eviction orders. Every one of those connections
+verifies the node&rsquo;s certificate against that IP, so a
+node&rsquo;s certificate must carry its IP address in
+<code>subjectAltName</code>. A certificate with only a DNS name fails
+with <code>certificate not valid for name "10.0.0.10"</code> on
+discovery and an <code>IP address mismatch</code> on the SDKs. The
+same holds for a proxy that applications reach through the proxy list
+discovery serves: that list is registration IPs too.</p>
+<p>Discovery itself is different: nodes dial the address given as
+<code>--discovery</code> and applications dial the address in their
+configuration, so a discovery certificate names whatever that is
+&mdash; a DNS name if you front discovery with one, an IP otherwise.
+A proxy behind a load balancer, reached by the balancer&rsquo;s name,
+likewise names that name.</p>
+<p>The IP has to be known when the certificate is minted. On EC2 that
+is a matter of choosing it: <code>run-instances</code> takes
+<code>--private-ip-address</code>, and the shape below fixes the
+node&rsquo;s address that way. Where an address is only assigned when
+the process starts, the certificate has to be minted then, from a CA
+whose certificate the applications already trust.</p>
+
+<h2 id="self-signed">Self-signed certificates</h2>
+<p>A self-signed certificate is a leaf that is its own trust anchor:
+the same file is the node&rsquo;s <code>--tls-cert</code> and every
+dialler&rsquo;s <code>ca</code>. It needs three extensions that
+OpenSSL&rsquo;s defaults do not give it &mdash; <code>CA:FALSE</code>
+(a self-signed certificate is otherwise marked as a CA, which rustls
+refuses to accept as a server&rsquo;s leaf), a
+<code>subjectAltName</code> with the IP, and <code>serverAuth</code>
+&mdash; and the <code>-subj</code> is then only a label:</p>
+<pre><code>NODE_PRIVATE_IP=10.0.0.10
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout node-key.pem -out node-cert.pem \
+  -subj "/CN=nanocached-node" \
+  -addext "subjectAltName=IP:$NODE_PRIVATE_IP" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth"</code></pre>
+<p>The result is about 1.2&nbsp;KB of certificate and 1.7&nbsp;KB of
+key, which matters for the distribution step. Because the system trust
+store is never consulted (not by the servers, and not by an SDK once
+<code>ca</code> is set), a self-signed deployment always carries the
+certificate to the application tier explicitly; an SDK configured with
+<code>tls</code> alone verifies against the platform store and
+rejects the node with <code>CERTIFICATE_VERIFY_FAILED</code>, which
+is the right outcome for a certificate nobody vouched for.</p>
+<p>A private CA (your own, or a managed one such as AWS Private CA)
+changes the shape in one way: the trust anchor becomes the CA
+certificate, so a node&rsquo;s leaf can be reissued &mdash; or minted
+at start-up with whatever IP the node got &mdash; without the
+application tier having to learn a new file. The flags are the same;
+<code>--tls-ca</code> and <code>ca</code> take the CA certificate
+instead of the leaf. That variant was not run for this page.</p>
+
+<h2 id="distribution">Distribution</h2>
+<p>Two files per process, with different sensitivity: the certificate
+is public, the key is a secret. Systems Manager Parameter Store holds
+both as parameters under one prefix &mdash; the certificate as a
+<code>String</code>, the key as a <code>SecureString</code> encrypted
+with the account&rsquo;s default key &mdash; and the standard
+tier&rsquo;s 4&nbsp;KB limit per parameter fits the sizes above with
+room to spare. A third parameter carries the certificates the
+<em>application tier</em> should trust, which is the same file today
+and becomes a bundle during rotation:</p>
+<pre><code>aws ssm put-parameter --name /nanocached/tls/node-cert --type String       --value file://node-cert.pem
+aws ssm put-parameter --name /nanocached/tls/node-key  --type SecureString --value file://node-key.pem
+aws ssm put-parameter --name /nanocached/tls/trust     --type String       --value file://node-cert.pem</code></pre>
+<p>An instance whose role carries
+<code>AmazonSSMManagedInstanceCore</code> &mdash; the policy the
+deployment shapes already attach for Session Manager &mdash; can read
+all three, decryption included; no further IAM statement was needed in
+the run below. The node fetches its two before every start, so a
+replacement instance and a restart after rotation take the same path.
+Applications fetch the trust parameter the same way, and nothing on
+the application side ever needs the key. Secrets Manager would hold
+the key in the same manner, read with
+<code>get-secret-value</code> in place of
+<code>get-parameter --with-decryption</code>; that path was not run
+for this page.</p>
+
+<h2 id="rotation">Rotation</h2>
+<p>Certificate and key are read once, at start, so a rotation is a
+restart: replace the files (here, overwrite the parameters and let the
+fetch step pick them up) and restart the process. With a self-signed
+leaf the trust anchor rotates with it, which forces an order on the
+steps: the application tier has to trust old <em>and</em> new before
+the node switches, or every connection fails the moment it does.</p>
+<ol>
+  <li>Mint the new pair with the same IP. Publish old + new,
+  concatenated, as the trust parameter, and let the applications pick
+  it up (an application reads its <code>ca</code> file when it
+  constructs a client; the check program below was simply run again).</li>
+  <li>Overwrite the node&rsquo;s certificate and key parameters with
+  the new pair and restart the node. From restart to
+  <code>/readyz</code> answering again took 1.7&nbsp;s, including the
+  parameter fetch; a standalone node comes back empty either way.</li>
+  <li>Once no application still trusts only the old certificate,
+  publish the new certificate alone as the trust parameter.</li>
+</ol>
+<p>Checked on the EC2 shape below: with the node still on the old
+certificate, both the bundle and the old file alone connect; after the
+restart, the bundle connects and the old file alone fails with
+<code>CERTIFICATE_VERIFY_FAILED</code>. With a private CA, step 1
+disappears for leaf rotation and reappears, in the same form, when the
+CA itself is rotated.</p>
+
+<h2 id="ec2-single">Single node on EC2, with TLS</h2>
+<p>This is the <a href="deployment-ec2-single.html">single-node
+shape</a> with one segment encrypted: application to node. Everything
+not shown here &mdash; the VPC, the two security groups, the instance
+role with <code>AmazonSSMManagedInstanceCore</code>, the application
+server&rsquo;s subnet &mdash; is as in that guide; the differences
+are the ones below, and the whole thing was built from an empty
+account, checked, rotated and torn down in one sitting.</p>
+<p><strong>Before the instance exists</strong>, pick its address, mint
+the certificate for it and store the three parameters. The address is
+the first usable one in the node subnet
+(<code>10.0.0.0/24</code>&rsquo;s <code>.1</code>&ndash;<code>.3</code>
+are reserved by AWS; <code>.10</code> is chosen for legibility):</p>
+<pre><code>NODE_PRIVATE_IP=10.0.0.10
+# the openssl command from "Self-signed certificates", then:
+aws ssm put-parameter --name /nanocached/tls/node-cert --type String       --value file://node-cert.pem
+aws ssm put-parameter --name /nanocached/tls/node-key  --type SecureString --value file://node-key.pem
+aws ssm put-parameter --name /nanocached/tls/trust     --type String       --value file://node-cert.pem</code></pre>
+<p><strong>The user-data</strong> gains a fetch script that
+<code>systemd</code> runs before every start, and the unit gains a
+read-only volume and the two flags. The container runs as uid 10001,
+so the script hands the files to that user; the key is
+<code>0600</code>, the certificate <code>0644</code>, and both are
+written to a temporary name and renamed so a restart never sees a
+half-written key. The region comes from the instance metadata service
+rather than any CLI default:</p>
+<pre><code>#!/bin/bash
+set -euo pipefail
+dnf install -y docker
+systemctl enable --now docker
+install -d -m 700 /etc/nanocached
+cat &gt; /etc/nanocached/env &lt;&lt;'ENV'
+NANOCACHED_AUTH_SECRET=change-me
+ENV
+chmod 600 /etc/nanocached/env
+cat &gt; /usr/local/bin/nanocached-fetch-tls &lt;&lt;'FETCH'
+#!/bin/bash
+# Pull this node's certificate and private key from Parameter Store into a
+# directory the container's user (uid 10001) can read. Runs before every start.
+set -euo pipefail
+TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+install -d -m 750 -o 10001 -g 10001 /etc/nanocached/tls
+aws ssm get-parameter --region "$REGION" --name /nanocached/tls/node-cert \
+  --query Parameter.Value --output text &gt; /etc/nanocached/tls/cert.pem.new
+aws ssm get-parameter --region "$REGION" --name /nanocached/tls/node-key --with-decryption \
+  --query Parameter.Value --output text &gt; /etc/nanocached/tls/key.pem.new
+chown 10001:10001 /etc/nanocached/tls/cert.pem.new /etc/nanocached/tls/key.pem.new
+chmod 644 /etc/nanocached/tls/cert.pem.new
+chmod 600 /etc/nanocached/tls/key.pem.new
+mv /etc/nanocached/tls/cert.pem.new /etc/nanocached/tls/cert.pem
+mv /etc/nanocached/tls/key.pem.new /etc/nanocached/tls/key.pem
+FETCH
+chmod 755 /usr/local/bin/nanocached-fetch-tls
+cat &gt; /etc/systemd/system/nanocached-node.service &lt;&lt;'UNIT'
+[Unit]
+Description=nanocached node
+After=docker.service
+Requires=docker.service
+[Service]
+ExecStartPre=-/usr/bin/docker rm -f nanocached-node
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:2104f8263c6f909d734fb6302a74bbedd5d583c14fb73713268ef4627fad5337
+ExecStartPre=/usr/local/bin/nanocached-fetch-tls
+ExecStart=/usr/bin/docker run --rm --name nanocached-node \
+  --network host \
+  --env-file /etc/nanocached/env \
+  --volume /etc/nanocached/tls:/etc/nanocached/tls:ro \
+  ghcr.io/nanocached/nanocached-node@sha256:2104f8263c6f909d734fb6302a74bbedd5d583c14fb73713268ef4627fad5337 \
+  --host 0.0.0.0 --port 8356 --metrics-port 9356 \
+  --tls-cert /etc/nanocached/tls/cert.pem --tls-key /etc/nanocached/tls/key.pem \
+  --max-memory 1073741824
+ExecStop=/usr/bin/docker stop -t 30 nanocached-node
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now nanocached-node</code></pre>
+<p><strong>The launch</strong> adds the fixed address; the rest of the
+command is unchanged:</p>
+<pre><code>NODE_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.small \
+  --subnet-id $NODE_SUBNET_ID --private-ip-address $NODE_PRIVATE_IP --security-group-ids $NODE_SG \
+  --iam-instance-profile Name=$NAME-ec2 --user-data file://node-user-data.sh \
+  --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-node}]" \
+  --query 'Instances[0].InstanceId' --output text)</code></pre>
+<p><strong>On the node</strong>, the same three checks as before plus
+the files the fetch produced:</p>
+<pre><code>aws ssm send-command --instance-ids $NODE_ID --document-name AWS-RunShellScript \
+  --parameters 'commands=["systemctl is-active nanocached-node",
+    "curl -s -o /dev/null -w healthz=%{http_code}\\\\n http://127.0.0.1:9356/healthz",
+    "curl -s -o /dev/null -w readyz=%{http_code}\\\\n http://127.0.0.1:9356/readyz",
+    "ls -ln /etc/nanocached/tls"]'
+# active / healthz=200 / readyz=200
+# -rw-r--r--. 1 10001 10001 1201 cert.pem
+# -rw-------. 1 10001 10001 1705 key.pem</code></pre>
+<p>The unit was active about a minute after launch, as without TLS;
+the fetch adds two API calls to the start-up path and nothing
+noticeable.</p>
+<p><strong>From the application server</strong>, the SDK needs the
+trust file and <code>tls</code>; the file comes from the trust
+parameter, which the instance role can read:</p>
+<pre><code>aws ssm get-parameter --region us-east-1 --name /nanocached/tls/trust \
+  --query Parameter.Value --output text &gt; /etc/nanocached-trust.pem</code></pre>
+<pre><code>client = await NanocachedClient.connect(
+    [("10.0.0.10", 8356)],
+    auth_secret="change-me",
+    tls=True,
+    ca="/etc/nanocached-trust.pem",
+)</code></pre>
+<p>Run that way with the Python SDK at 0.4.6, a cache check (set, get,
+delete) succeeds. The three ways of getting it wrong each fail where
+they should: an unrelated self-signed certificate as <code>ca</code>
+and <code>tls=True</code> with no <code>ca</code> (the platform trust
+store) both fail the handshake with
+<code>CERTIFICATE_VERIFY_FAILED</code>, and a plaintext connection is
+answered with a TLS alert and closed &mdash; the SDK reports
+<code>unexpected response to A</code>, and <code>nc</code> shows the
+alert&rsquo;s first bytes (<code>025 003 003</code>). One detail of
+the application host: Amazon Linux 2023&rsquo;s default
+<code>python3</code> is 3.9, below the SDK&rsquo;s 3.11 floor, so
+<code>pip</code> finds no version; <code>dnf install python3.11
+python3.11-pip</code> and <code>python3.11 -m pip install
+nanocached</code> is what worked. The operations endpoint answered
+<code>/metrics</code> over plain HTTP from the application server, and
+from outside the app group both ports were refused, as before.</p>
+<p><strong>Rotation</strong> followed the three steps above: a second
+pair minted for the same address, the trust parameter overwritten with
+both certificates and re-fetched on the application server (both the
+bundle and the old file alone still connected), then the node&rsquo;s
+two parameters overwritten and <code>systemctl restart
+nanocached-node</code>: <code>/readyz</code> was back in 1.7&nbsp;s,
+<code>openssl x509 -in /etc/nanocached/tls/cert.pem -noout
+-serial</code> on the node showed the new serial, the bundle connected
+and the old file alone failed verification.</p>
+<p><strong>Teardown</strong> is the single-node guide&rsquo;s sequence
+plus the parameters, one call each:</p>
+<pre><code>for p in node-cert node-key trust; do aws ssm delete-parameter --name /nanocached/tls/$p; done</code></pre>
+
+</main>
+
+<footer class="site-footer">
+  <div>
+    <span>nanocached</span>
+    <a href="https://github.com/nanocached/nanocached/blob/main/LICENSE">MIT License</a>
+    <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    <a href="https://github.com/nanocached/nanocached/issues">Issues</a>
+  </div>
+</footer>
+
+</body>
+</html>
