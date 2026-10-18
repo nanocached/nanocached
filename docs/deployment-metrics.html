@@ -35,10 +35,10 @@ operations port. Which collector picks them up depends on the
 monitoring stack you already run, so this page is separate from the
 shape guides: it says what there is to collect and how the two kinds
 of metric behave once collected, then applies that to the single-node
-EC2 shape with the CloudWatch Agent and to the clustered ECS shape with
-the AWS Distro for OpenTelemetry collector as a sidecar, each built,
-checked and torn down as shown. The EKS shape is added here once it is
-verified.</p>
+EC2 shape with the CloudWatch Agent, to the clustered ECS shape with
+the AWS Distro for OpenTelemetry collector as a sidecar, and to the
+clustered EKS shape with a Prometheus server in the cluster, each
+built, checked and torn down as shown.</p>
 
 <h2 id="what">What there is to collect</h2>
 <p><code>GET /metrics</code> on <code>--metrics-port</code> answers in
@@ -55,8 +55,15 @@ decide how a collector should be configured.</p>
 <code>connections</code> series are gauges: the value at the moment of
 the scrape. Everything ending in <code>_total</code> is a counter: a
 running total since the process started, which drops back to zero when
-it restarts. A Prometheus server stores counters as they are and
-<code>rate()</code> does the rest. A CloudWatch-style backend stores
+it restarts. A Prometheus server stores counters as they are &mdash;
+on EKS below, an instant query returned each pod&rsquo;s exact
+cumulative value &mdash; and <code>rate()</code> or
+<code>increase()</code> does the rest, extrapolating across the window
+you give it (an <code>increase()</code> over five minutes answered
+2,369 and 2,248 on two pods that had each taken exactly 2,100 writes
+inside the window, which is the function working as designed, not a
+lost or doubled write). A
+CloudWatch-style backend stores
 statistics per period, and the collector decides what number it hands
 over for a counter &mdash; the cumulative value, or the increase since
 the previous scrape. The CloudWatch Agent and the OpenTelemetry
@@ -74,26 +81,31 @@ building a dashboard on it.</p>
 (<code>nanocached_node_namespace_entries</code>,
 <code>…_namespace_used_bytes</code>, and <code>…_namespace_budget_bytes</code>
 where a budget is set) carry a <code>namespace</code> label; nothing
-else does. The default namespace is the empty string, and a collector
-that turns labels into dimensions leaves out a series whose dimension
-value is empty &mdash; the output of both collectors below does
-&mdash; so the default namespace is
-read from the node-wide <code>nanocached_node_entries</code> and
-<code>…_memory_used_bytes</code> instead, and the labelled series
-cover the named namespaces. Each named namespace is one more series
-per metric, which is what a per-metric price is charged on.</p>
+else does. The default namespace is the empty string. Prometheus
+treats an empty label value as no label at all, so there the default
+namespace is the series <em>without</em> a <code>namespace</code>
+label, next to <code>{namespace="orders"}</code>; a collector that
+turns labels into dimensions leaves out a series whose dimension value
+is empty &mdash; the output of both AWS collectors below does &mdash;
+so on CloudWatch the default namespace is read from the node-wide
+<code>nanocached_node_entries</code> and <code>…_memory_used_bytes</code>
+instead, and the labelled series cover the named namespaces. Each
+named namespace is one more series per metric, which is what a
+per-metric price is charged on.</p>
 <p><strong>Plain HTTP, no authentication.</strong> The operations
 endpoint is unauthenticated and never TLS, which is why the shape
 guides bind it inside the VPC. The least exposure is a collector on
 the same instance or in the same task scraping
-<code>127.0.0.1</code>, which is what both shapes below do; a
-central scraper is the alternative, reaching the port through the
-security-group rule the shape guides already carry (the operations
-port from inside the VPC, nothing wider).</p>
+<code>127.0.0.1</code>, which is what the EC2 and ECS shapes below
+do; a central scraper is the alternative, reaching the port through
+the security-group rule the shape guides already carry (the
+operations port from inside the VPC, nothing wider) &mdash; on EKS the
+Prometheus pod is that scraper, inside the pod network the EKS guide
+describes as reachable from pods and from nothing outside.</p>
 <p>The collectors this page covers are the ones whose output is a
 service you can read back from the command line: the CloudWatch Agent
-(EC2, below), the AWS Distro for OpenTelemetry collector (ECS, below;
-EKS) and a Prometheus server (EKS). Amazon Managed Service for Prometheus
+(EC2, below), the AWS Distro for OpenTelemetry collector (ECS, below)
+and a Prometheus server (EKS, below). Amazon Managed Service for Prometheus
 and Amazon Managed Grafana take the same scrape output through remote
 write; neither was available to the account these runs used, so they
 are not described here.</p>
@@ -526,12 +538,14 @@ Three things follow for a dashboard:</p>
   minute. A widget pinned to one task ID goes dark; graph the dimension
   with a <code>SEARCH</code> expression or an aggregate across
   <code>TaskId</code> instead.</li>
-  <li>The 2,100 writes that filled the new node were the migration
-  transfer, which the <code>…_sets_total</code> series&rsquo; own
-  description says it counts; they happened before the collector&rsquo;s
-  first sample, and the new task&rsquo;s <code>Sum</code> read 0 in its
-  first minutes. A burst that completes before the first scrape is
-  never seen by a delta-reporting collector.</li>
+  <li>The new task&rsquo;s <code>…_sets_total</code> read
+  <code>Sum</code> 0 in its first minutes although 2,100 entries had
+  just arrived: a join&rsquo;s migration transfer is delivered as
+  handoff frames, which that series does not count (on EKS below, where
+  the counter is read raw, the new pod&rsquo;s value was exactly 0; the
+  series&rsquo; own description line is out of date on this point).
+  Expect <code>entries</code> to jump on a joiner while
+  <code>…_sets_total</code> stays flat.</li>
   <li><code>nanocached_discovery_members</code> dipped to 1 and back to
   2 inside the stop minute (<code>Minimum</code> 1,
   <code>Maximum</code> 2), which is the one place the event is visible
@@ -546,6 +560,240 @@ configuration parameter and the metrics log group:</p>
 aws iam delete-role --role-name $NAME-ecs-task
 aws ssm delete-parameter --name /$NAME/otel-config
 aws logs delete-log-group --log-group-name nanocached-metrics</code></pre>
+
+<h2 id="eks">Cluster on EKS with Prometheus</h2>
+<p>Start from the <a href="deployment-eks.html">EKS guide</a>; its
+<code>nanocached.yaml</code> is applied unchanged. The named
+<code>ops</code> port every nanocached container already declares is
+what the scrape configuration looks for, so there is nothing to
+annotate, and nothing here calls an AWS API, so there is no IAM to
+add &mdash; the Kubernetes API is the service discovery. A Prometheus
+server runs in a <code>monitoring</code> namespace, discovers the
+nanocached pods and scrapes them every 15&nbsp;s. If you already run
+Prometheus (or a Prometheus-compatible agent) in the cluster, the
+scrape job is the only part to take.</p>
+
+<h3>The manifest</h3>
+<p><code>prometheus.yaml</code>:</p>
+<pre><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus-pods
+  namespace: nanocached
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-pods
+  namespace: nanocached
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: prometheus-pods}
+subjects:
+  - {kind: ServiceAccount, name: prometheus, namespace: monitoring}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: nanocached
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces: {names: [nanocached]}
+        relabel_configs:
+          # Only the nanocached pods, and only their operations port, which
+          # every nanocached manifest names "ops".
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: nanocached-(node|discovery)
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            regex: ops
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: prometheus}
+  template:
+    metadata:
+      labels: {app: prometheus}
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+          args: ["--config.file=/etc/prometheus/prometheus.yml",
+                 "--storage.tsdb.path=/prometheus",
+                 "--storage.tsdb.retention.time=7d"]
+          ports:
+            - {containerPort: 9090, name: http}
+          readinessProbe:
+            httpGet: {path: /-/ready, port: http}
+          volumeMounts:
+            - {name: config, mountPath: /etc/prometheus, readOnly: true}
+            - {name: data, mountPath: /prometheus}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 512Mi}
+      volumes:
+        - name: config
+          configMap: {name: prometheus}
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  selector: {app: prometheus}
+  ports:
+    - {name: http, port: 9090, targetPort: http}</code></pre>
+<pre><code>kubectl apply -f prometheus.yaml
+kubectl -n monitoring rollout status deploy/prometheus</code></pre>
+<p>What each part is for:</p>
+<ul>
+  <li><strong>Discovery and the two <code>keep</code> rules.</strong>
+  <code>role: pod</code> lists every container port of every pod in the
+  <code>nanocached</code> namespace as a candidate target; the first
+  rule keeps the pods labelled <code>app: nanocached-node</code> or
+  <code>nanocached-discovery</code>, the second keeps only the port
+  named <code>ops</code>, so the data ports are never scraped. The
+  three <code>target_label</code> rules are what the series carry
+  afterwards: <code>app</code> to tell nodes from discovery,
+  <code>pod</code> as the per-instance identity, <code>node</code> for
+  the worker it runs on.</li>
+  <li><strong>RBAC</strong> is a <code>Role</code> in the
+  <code>nanocached</code> namespace, not a <code>ClusterRole</code>: the
+  job only lists pods there. Scraping a second namespace means a
+  second <code>RoleBinding</code> and a second entry under
+  <code>namespaces</code>.</li>
+  <li><strong>Storage</strong> is an <code>emptyDir</code>: the data
+  lives as long as the pod. That is enough to check a deployment and
+  wrong for production, where the volume is a PersistentVolumeClaim
+  (not exercised here). Retention is seven days of whatever the
+  volume holds.</li>
+  <li><strong>The image</strong> is pinned by digest, as the nanocached
+  images are; this is the 3.15.0 release. The ConfigMap mounted at
+  <code>/etc/prometheus</code> replaces the image&rsquo;s own
+  directory, which this release started from without complaint.</li>
+  <li>Nothing exposes the server: it is a ClusterIP Service,
+  <code>prometheus.monitoring:9090</code> inside the cluster, and
+  <code>kubectl -n monitoring port-forward svc/prometheus 9090</code>
+  for a browser.</li>
+</ul>
+
+<h3>Verifying</h3>
+<p>The targets page says whether discovery found the pods and whether
+the scrapes succeed; from any pod in the cluster (the API is the
+same thing the UI shows):</p>
+<pre><code>kubectl -n nanocached run curl --rm -it --image=curlimages/curl --restart=Never -- \
+  -s http://prometheus.monitoring:9090/api/v1/targets
+# three activeTargets, "health": "up", labels app/pod/node, lastScrape a few seconds ago
+kubectl -n nanocached run curl --rm -it --image=curlimages/curl --restart=Never -- \
+  -sG http://prometheus.monitoring:9090/api/v1/query --data-urlencode 'query=sum by (app) (nanocached_node_entries)'</code></pre>
+<p>(Pass PromQL through <code>--data-urlencode</code>; its braces and
+quotes need URL-encoding.) In this run all three targets
+were up and had been scraped within 25&nbsp;s of the manifest being
+applied, each scrape taking 1&ndash;4&nbsp;ms, and
+<code>count_over_time(up{job="nanocached"}[1m])</code> read 4 per
+target. The cluster was then given the same known load as on ECS
+(2,000 keys written through <code>disc</code>, the same 2,000 read
+back, 500 reads of missing keys, 100 keys in a namespace called
+<code>orders</code>) from a pod in the namespace, and the
+server&rsquo;s answers were checked against each pod&rsquo;s
+<code>/metrics</code>:</p>
+<ul>
+  <li>Instant queries returned the endpoint&rsquo;s values exactly,
+  counters included: <code>nanocached_node_sets_total</code> 2,100 on
+  both pods, <code>…_hits_total</code> 1,004 and 996,
+  <code>…_misses_total</code> 253 and 247, <code>…_entries</code>
+  2,100, <code>…_memory_used_bytes</code> 426,442. This is the raw
+  cumulative value; the window functions are how it becomes a rate
+  (<code>rate(nanocached_node_hits_total[2m])</code> read about 9.7 and
+  9.1 per second a minute after the burst) or a count over a period
+  (the extrapolated <code>increase()</code> described in the common
+  section).</li>
+  <li><code>nanocached_node_namespace_entries</code> came back as two
+  series per pod: one without a <code>namespace</code> label (2,000,
+  the default namespace) and <code>{namespace="orders"}</code> (100).</li>
+  <li><code>nanocached_discovery_members</code> read 2 under
+  <code>app="nanocached-discovery"</code>, and
+  <code>sum by (app) (nanocached_node_entries)</code> 4,200 &mdash; the
+  aggregate that keeps meaning when pods come and go.</li>
+</ul>
+<p>What a pod replacement looks like, from <code>kubectl delete
+pod</code> on one node pod:</p>
+<ul>
+  <li>The replacement pod was created within a second, ready
+  7&nbsp;s later, and its target was <code>up</code> at the next
+  query 5&nbsp;s after that &mdash; faster than one scrape interval, so
+  no <code>up == 0</code> sample was recorded for it in this run (a
+  pod that takes longer to become ready would show one per scrape until
+  it does).</li>
+  <li>The deleted pod&rsquo;s <code>up</code> stayed 1 in instant
+  queries until about 33&nbsp;s after the delete and then the series
+  was gone; no <code>up == 0</code> sample was ever recorded for it
+  (whether it answered scrapes while draining or left service
+  discovery before a scrape could fail is not distinguishable from
+  that). Prometheus marks a vanished target&rsquo;s series stale, so a
+  graph
+  of <code>nanocached_node_entries</code> by <code>pod</code> ends the
+  old line and starts a new one, with no manual cleanup;
+  <code>last_over_time(…[5m])</code> still finds the old pod&rsquo;s
+  last value for anyone who needs it.</li>
+  <li><code>sum by (app) (nanocached_node_entries)</code> read 4,200
+  before and after (not sampled during): the surviving pod stayed at
+  2,100 (under a replication factor of 2 with two pods it already held
+  every key) and the joiner read 2,100 from its first samples. The
+  joiner&rsquo;s <code>…_sets_total</code> started at 0 (see the ECS
+  section on why), and
+  <code>min_over_time(nanocached_discovery_members[3m])</code> never
+  read below 2 at a scrape instant across the event.</li>
+</ul>
+
+<h3>Teardown</h3>
+<p>The EKS guide&rsquo;s teardown deletes the <code>nanocached</code>
+namespace and then the cluster; delete the <code>monitoring</code>
+namespace in the same command, and the cluster delete takes the rest
+(there is no IAM or log group of this shape&rsquo;s own to remove):</p>
+<pre><code>kubectl delete namespace monitoring nanocached
+eksctl delete cluster --name $NAME --region us-east-1 --wait</code></pre>
+<p>In this run <code>eksctl create cluster</code> took 14&nbsp;min
+24&nbsp;s and the delete, namespaces included, 13&nbsp;min
+50&nbsp;s, with every stack gone and no VPC, role or instance left
+behind.</p>
 
 </main>
 
