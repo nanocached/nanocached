@@ -10,6 +10,20 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- `GetMany`/`GetManyBytes` in cluster mode now read a key from its next
+  owner when its primary cannot be reached at the connection level, the
+  same walk a single `Get` already did (#623, the Go part of #616).
+  Before, the batch sent every key to its primary only, retried the same
+  primary once after a refresh, and then returned `ErrWrongNode` for keys
+  that nothing had answered `W` for — seen in the field as a client that
+  could not verify one node's rotated TLS certificate failing a bulk read
+  although the other owner held every key. Keys whose every owner is
+  unreachable now come back with the last connection error
+  (`ErrConnectionLost`) alongside the keys that did resolve, instead of
+  `ErrWrongNode`.
+
 ## [0.4.6] - 2026-10-17
 
 No changes. Version aligned with the rest of the project: every release

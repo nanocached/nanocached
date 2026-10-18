@@ -1217,13 +1217,20 @@ func (c *Client) GetMany(keys []string) (map[string]string, error) {
 // "a miss is not an error" contract GetBytes itself has. keys must be
 // non-empty.
 //
-// A batch never fails as a whole: if some keys are still wrong-node
-// after one bounded refresh-and-retry (the same policy GetBytes' own
-// withClusterRetry applies, generalized to a per-key roster instead of
-// an all-or-nothing retry — see multiGetPass), the returned map holds
+// A batch never fails as a whole, and it survives an unreachable owner
+// the way a single GetBytes does: a key whose owner cannot be reached at
+// the connection level (a dead node, a certificate this client cannot
+// verify) is read from its next owner in rank order (see multiGetPass),
+// so with replication the batch still resolves. If some keys are still
+// wrong-node after one bounded refresh-and-retry (the same policy
+// GetBytes' own withClusterRetry applies, generalized to a per-key
+// roster instead of an all-or-nothing retry), the returned map holds
 // every key that DID resolve, paired with ErrWrongNode, rather than
 // discarding a mostly-successful batch over a handful of stale
-// placements. In single-node/proxy mode a `W` propagates immediately,
+// placements. If some keys' every owner was unreachable, the map holds
+// the keys that did resolve, paired with the last connection error
+// (ErrConnectionLost) — a connection loss is never reported as
+// ErrWrongNode. In single-node/proxy mode a `W` propagates immediately,
 // exactly as GetBytes' own single-mode behavior does — there is no ring
 // to refresh against.
 //
@@ -1263,7 +1270,7 @@ func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, 
 	var decompressed int64
 
 	if single {
-		entries, chunkErr := c.multiGetChunked("", namespace, keyBytes)
+		entries, _, chunkErr := c.multiGetChunked("", namespace, keyBytes)
 		for i, entry := range entries {
 			if !entry.ok {
 				continue
@@ -1294,20 +1301,40 @@ func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, 
 		return values, nil
 	}
 
-	retry, err := c.multiGetPass(namespace, keys, keyBytes, values, nil, &decompressed)
+	outcome, err := c.multiGetPass(namespace, keys, keyBytes, values, nil, &decompressed)
 	if err != nil {
 		return values, err
 	}
-	if len(retry) == 0 {
-		return values, nil
+	lastError := outcome.lastError
+	if len(outcome.wrongNode) > 0 || len(outcome.unreachable) > 0 {
+		// One bounded refresh-and-retry, as before, over everything still
+		// unresolved: a `W` is stale routing the refresh fixes; a key
+		// whose every owner was unreachable gets one more walk of its
+		// (possibly re-ranked) owners, which is what the old same-primary
+		// retry amounted to for it.
+		c.maybeRefresh(true)
+		pending := append(outcome.wrongNode, outcome.unreachable...)
+		outcome, err = c.multiGetPass(namespace, keys, keyBytes, values, pending, &decompressed)
+		if err != nil {
+			return values, err
+		}
+		if outcome.lastError != nil {
+			lastError = outcome.lastError
+		}
 	}
-	c.maybeRefresh(true)
-	retry, err = c.multiGetPass(namespace, keys, keyBytes, values, retry, &decompressed)
-	if err != nil {
-		return values, err
-	}
-	if len(retry) > 0 {
+	if len(outcome.wrongNode) > 0 {
 		return values, ErrWrongNode
+	}
+	if len(outcome.unreachable) > 0 {
+		// Nothing answered `W` for these keys: every owner of each was
+		// unreachable, on both passes. That is a connection loss, reported
+		// the way the single-node branch reports a mid-batch one — the
+		// keys that did resolve in the map, the last connection error
+		// alongside — exactly as read() returns for a single key.
+		if lastError == nil {
+			lastError = connectionLost("no owner is reachable for these keys", nil)
+		}
+		return values, lastError
 	}
 	return values, nil
 }
@@ -1364,11 +1391,13 @@ func multiSetEntryCost(key, value []byte) int {
 // namespace+key fits under maxRequestBytes on its own. Always returns
 // len(keys) entries: a chunk that fails outright (a connection-level
 // failure, not a per-key `W`) leaves its keys' entries at the zero
-// value (a clean miss) and that chunk's error is returned alongside —
-// the caller treats that gap as "still needs a retry", exactly like a
-// per-key WrongNode.
-func (c *Client) multiGetChunked(slot string, namespace []byte, keys [][]byte) ([]multiEntry, error) {
-	entries := make([]multiEntry, len(keys))
+// value (a clean miss) and that chunk's error is returned alongside,
+// with resolved — the index its chunk started at — telling the caller
+// how many leading entries are real answers (len(keys) on success);
+// everything from resolved onward still needs another owner or a retry,
+// exactly like a per-key WrongNode.
+func (c *Client) multiGetChunked(slot string, namespace []byte, keys [][]byte) (entries []multiEntry, resolved int, err error) {
+	entries = make([]multiEntry, len(keys))
 	budget := maxRequestBytes - len(namespace) - multiFrameHeaderSlack
 	for start := 0; start < len(keys); {
 		end := start
@@ -1388,84 +1417,118 @@ func (c *Client) multiGetChunked(slot string, namespace []byte, keys [][]byte) (
 			return opErr
 		})
 		if err != nil {
-			return entries, err
+			return entries, start, err
 		}
 		copy(entries[start:end], chunkEntries)
 		start = end
 	}
-	return entries, nil
+	return entries, len(keys), nil
 }
 
-// multiGetPass runs one pass of GetManyBytes' cluster routing: group
-// the given indices (every key, when retryIndices is nil — the initial
-// pass — or just the keys a previous pass left unresolved) by their
-// current primary owner (matching plain Get's own primary-first
-// stance), dispatch one (possibly chunked) `m` exchange per owner
-// concurrently, splice hits into values, and return the indices still
-// unresolved: a per-key `W`, or a whole owner group whose call failed
-// outright (indistinguishable from a possibly-idle-closed connection,
-// same stance applyReconnecting's own callers take elsewhere). Called
-// once for the initial pass and once more, if needed, after a single
-// force refresh — see getManyNS. The returned error is a client-side
-// decompression failure only (Config.Compress mismatch) — never a
-// routing outcome, so it aborts the batch immediately rather than
-// feeding into the retry pass.
+// multiGetOutcome is what one multiGetPass leaves unresolved: the
+// indices whose owner answered a per-key `W`, the indices whose every
+// owner was unreachable, and the last connection-level error seen (nil
+// when there was none).
+type multiGetOutcome struct {
+	wrongNode   []int
+	unreachable []int
+	lastError   error
+}
+
+// multiGetPass runs one pass of GetManyBytes' cluster routing, with the
+// same owner fallback a single Get has (read). The given indices (every
+// key, when retryIndices is nil — the initial pass — or just the keys a
+// previous pass left unresolved) are grouped by their current owner and
+// one (possibly chunked) `m` exchange is dispatched per owner
+// concurrently; hits are spliced into values. A key whose owner answered
+// a per-key `W` is done for this pass: that is stale routing, and the
+// caller's refresh is the answer, exactly as read() returns ErrWrongNode
+// rather than trying the next owner. A key whose owner group failed at
+// the connection level — a dead or unreachable node, a certificate this
+// client cannot verify, a possibly idle-closed connection;
+// indistinguishable, the stance read() takes — is sent to its *next*
+// owner in rank order, the same walk read() does for one key, until an
+// owner answers or the key has run out of owners. On a chunked group
+// only the keys from the failing chunk onward move on (the hits earlier
+// chunks returned are kept). Keys with no owners at all (an empty ring
+// view) count as `W`: a refresh may populate it. Called once for the
+// initial pass and once more, if needed, after a single force refresh —
+// see getManyNS. The returned error is a client-side decompression
+// failure only (Config.Compress mismatch) — never a routing outcome, so
+// it aborts the batch immediately rather than feeding into the retry
+// pass.
 func (c *Client) multiGetPass(
 	namespace []byte, keys []string, keyBytes [][]byte,
 	values map[string][]byte, retryIndices []int, decompressed *int64,
-) ([]int, error) {
-	indices := retryIndices
-	if indices == nil {
-		indices = make([]int, len(keys))
+) (multiGetOutcome, error) {
+	pending := retryIndices
+	if pending == nil {
+		pending = make([]int, len(keys))
 		for i := range keys {
-			indices[i] = i
+			pending[i] = i
 		}
 	}
-
-	groups := make(map[string][]int)
-	var retry []int
-	for _, idx := range indices {
-		owners := c.ownerNames(namespace, keyBytes[idx])
-		if len(owners) == 0 {
-			retry = append(retry, idx)
-			continue
-		}
-		groups[owners[0]] = append(groups[owners[0]], idx)
-	}
-
-	var mu sync.Mutex
+	rank := make(map[int]int, len(pending))
+	var outcome multiGetOutcome
 	var spliceErr error
-	var wg sync.WaitGroup
-	wg.Add(len(groups))
-	for owner, groupIndices := range groups {
-		go func(owner string, groupIndices []int) {
-			defer wg.Done()
-			groupKeys := make([][]byte, len(groupIndices))
-			for i, idx := range groupIndices {
-				groupKeys[i] = keyBytes[idx]
-			}
-			entries, err := c.multiGetChunked(owner, namespace, groupKeys)
 
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				retry = append(retry, groupIndices...)
-				return
+	type legResult struct {
+		groupIndices []int
+		entries      []multiEntry
+		err          error
+		resolved     int
+	}
+
+	for len(pending) > 0 {
+		groups := make(map[string][]int)
+		for _, idx := range pending {
+			owners := c.ownerNames(namespace, keyBytes[idx])
+			switch {
+			case len(owners) == 0:
+				outcome.wrongNode = append(outcome.wrongNode, idx)
+			case rank[idx] >= len(owners):
+				outcome.unreachable = append(outcome.unreachable, idx)
+			default:
+				owner := owners[rank[idx]]
+				groups[owner] = append(groups[owner], idx)
 			}
-			for i, idx := range groupIndices {
-				entry := entries[i]
+		}
+		pending = nil
+
+		results := make([]legResult, 0, len(groups))
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		wg.Add(len(groups))
+		for owner, groupIndices := range groups {
+			go func(owner string, groupIndices []int) {
+				defer wg.Done()
+				groupKeys := make([][]byte, len(groupIndices))
+				for i, idx := range groupIndices {
+					groupKeys[i] = keyBytes[idx]
+				}
+				entries, resolved, err := c.multiGetChunked(owner, namespace, groupKeys)
+				mu.Lock()
+				results = append(results, legResult{groupIndices, entries, err, resolved})
+				mu.Unlock()
+			}(owner, groupIndices)
+		}
+		wg.Wait()
+
+		// Splicing runs on this goroutine, serialized across every owner
+		// group: once the cumulative decompression budget is crossed, the
+		// remaining entries (in this and other groups) skip decompressing
+		// rather than each allocating another value first. The budget
+		// only applies when compression is enabled — with it off,
+		// maybeDecompress is a no-op and *decompressed never advances, so
+		// this check never trips.
+		for _, result := range results {
+			for i := 0; i < result.resolved; i++ {
+				idx := result.groupIndices[i]
+				entry := result.entries[i]
 				switch {
 				case entry.wrongNode:
-					retry = append(retry, idx)
+					outcome.wrongNode = append(outcome.wrongNode, idx)
 				case entry.ok:
-					// Decompression here runs under `mu`, so it is
-					// serialized across every owner goroutine: once the
-					// cumulative budget is crossed, the remaining entries
-					// (in this and other groups) skip decompressing rather
-					// than each allocating another value first. The budget
-					// only applies when compression is enabled — with it
-					// off, maybeDecompress is a no-op and *decompressed
-					// never advances, so this check never trips.
 					if *decompressed > maxMultiGetDecompressedBytes {
 						continue
 					}
@@ -1494,10 +1557,16 @@ func (c *Client) multiGetPass(
 					values[keys[idx]] = value
 				}
 			}
-		}(owner, groupIndices)
+			if result.err != nil {
+				outcome.lastError = result.err
+				for _, idx := range result.groupIndices[result.resolved:] {
+					rank[idx]++
+					pending = append(pending, idx)
+				}
+			}
+		}
 	}
-	wg.Wait()
-	return retry, spliceErr
+	return outcome, spliceErr
 }
 
 // maybeDecompress is GetBytes' own decompression step (see getBytesNS),
