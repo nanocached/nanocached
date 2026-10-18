@@ -22,6 +22,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -4174,6 +4175,98 @@ func TestClusterGetManyDegradesToAPartialMapWithErrWrongNodeWhenWrongNodePersist
 	}
 	if _, present := values[wrongKey]; present {
 		t.Fatalf("GetMany = %v, want wrongKey absent (never resolved)", values)
+	}
+}
+
+func TestClusterGetManyReadsFromTheNextOwnerWhenAPrimaryIsUnreachable(t *testing.T) {
+	// A primary that cannot be reached at the connection level (here a
+	// closed port; in the field a dead node, or a certificate this client
+	// cannot verify) must not fail the keys it owns: with R=2 the replica
+	// holds them, and a single Get would already have fallen over to it.
+	// Discovery is left as it is — the client's ring still names the dead
+	// node as primary.
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	want := make(map[string]string, 24)
+	keys := make([]string, 0, 24)
+	for i := 0; i < 24; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		keys = append(keys, key)
+		want[key] = fmt.Sprintf("value-%d", i)
+	}
+	if _, err := client.SetMany(want, 0); err != nil {
+		t.Fatal(err)
+	}
+	dead := testNames[0]
+	deadOwnsSome := false
+	for _, key := range keys {
+		if ownersOf(key)[0] == dead {
+			deadOwnsSome = true
+		}
+	}
+	if !deadOwnsSome {
+		t.Fatal("the key set must give the dead node some primaries")
+	}
+	nodes[dead].close()
+	time.Sleep(50 * time.Millisecond) // let the FIN land
+
+	got, err := client.GetMany(keys)
+	if err != nil {
+		t.Fatalf("GetMany with the primary of some keys closed = %v, %v, want success", got, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetMany = %v, want %v", got, want)
+	}
+}
+
+func TestClusterGetManyReportsAnUnreachableOwnerAsAConnectionLossNotWrongNode(t *testing.T) {
+	// R=1: the only owner of some keys is gone. Nothing answered `W`, so
+	// the error must not be ErrWrongNode; the keys the live node owns
+	// are still returned alongside.
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	all := make(map[string]string, 24)
+	keys := make([]string, 0, 24)
+	for i := 0; i < 24; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		keys = append(keys, key)
+		all[key] = fmt.Sprintf("value-%d", i)
+	}
+	if _, err := client.SetMany(all, 0); err != nil {
+		t.Fatal(err)
+	}
+	dead, live := testNames[0], testNames[1]
+	liveValues := map[string]string{}
+	for key, value := range all {
+		if NewHashRing(testNames).Owners([]byte(key), 1)[0] == live {
+			liveValues[key] = value
+		}
+	}
+	if len(liveValues) == 0 || len(liveValues) == len(all) {
+		t.Fatalf("both nodes must own some keys; live owns %d of %d", len(liveValues), len(all))
+	}
+	nodes[dead].close()
+	time.Sleep(50 * time.Millisecond) // let the FIN land
+
+	got, err := client.GetMany(keys)
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("GetMany err = %v, want ErrConnectionLost", err)
+	}
+	if errors.Is(err, ErrWrongNode) {
+		t.Fatalf("GetMany err = %v, must not be ErrWrongNode — nothing answered W", err)
+	}
+	if !reflect.DeepEqual(got, liveValues) {
+		t.Fatalf("GetMany = %v, want exactly the live node's keys %v", got, liveValues)
 	}
 }
 

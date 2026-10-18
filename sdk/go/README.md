@@ -308,14 +308,21 @@ is not an error" shape `Get`/`GetBytes` use. Both are also
 namespace-scoped: `client.Namespace(ns).GetMany(...)`/`.SetMany(...)`,
 same as `Get`/`Set`.
 
-**A batch never fails as a whole.** Each key's outcome is independent:
-if some keys are still routed to the wrong node after one bounded
+**A batch never fails as a whole.** Each key's outcome is independent,
+and a batched read survives an unreachable owner the way a single `Get`
+does: a key whose owner cannot be reached at the connection level (a
+dead node, a certificate this client cannot verify) is read from its
+next owner in rank order, so with replication the batch still resolves.
+If some keys are still routed to the wrong node after one bounded
 refresh-and-retry (the same policy `Get`/`Set` apply per key, not
 per call), `GetManyBytes` returns the partial map together with
 `ErrWrongNode` rather than discarding a mostly-successful batch, and
 `SetManyBytes` returns the map of every key actually confirmed stored
 together with `ErrWrongNode` — every other key in the batch was still
-stored. This also covers a connection failure partway through a
+stored. If some keys' every owner was unreachable, `GetManyBytes`
+returns the keys that did resolve together with the last connection
+error (`ErrConnectionLost`) — a connection loss is never reported as
+`ErrWrongNode`. This also covers a connection failure partway through a
 chunked batch (see below): the returned map always reflects exactly
 what was actually persisted in that call, so a non-nil error never
 means "assume nothing was written". In single-node/proxy mode a `W`
