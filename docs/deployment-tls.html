@@ -564,8 +564,8 @@ Step one: the trust parameter overwritten with both CA certificates
 (2.3&nbsp;KB, still inside the 4&nbsp;KB tier), then one restart per
 process, discovery first &mdash; <code>systemctl restart
 nanocached-discovery</code> took 19&nbsp;s to <code>/readyz</code>,
-the three nodes re-registered on their own (<code>re-registered with
-discovery</code> in each journal) and the member count stayed 3
+the seed&rsquo;s node journal showed <code>re-registered with
+discovery</code> and the member count stayed 3
 &mdash; then each node in turn, 23&nbsp;s each, <code>ca.pem</code>
 holding two certificates on every host afterwards; the application
 tier, still trusting only the old CA at this point, kept reading all
@@ -574,8 +574,7 @@ one host: a leaf for <code>10.0.0.13</code> issued by the new CA, its
 two parameters overwritten, the node restarted; it rejoined,
 <code>openssl x509 -noout -issuer</code> on its certificate named the
 new CA, and the application tier with the bundle read all 2,000 keys.
-An application still trusting only the old CA could no longer read
-the keys that host owns. Step three &mdash; the new CA alone as the
+Step three &mdash; the new CA alone as the
 trust parameter and one more round of restarts &mdash; is step one
 again with a smaller file, and was left for the next routine
 restart.</p>
