@@ -52,7 +52,10 @@ three paths on it (plain HTTP, on <code>--host</code>):</p>
 <p>The endpoint is unauthenticated by design (probes and scrapers don't
 do protocol handshakes) — bind it to an internal interface and don't
 expose it outside the task network. Omitting the flag disables the
-endpoint entirely.</p>
+endpoint entirely. Collecting what it serves &mdash; which agent, with
+which configuration, and what the numbers look like once stored &mdash;
+is the subject of <a href="deployment-metrics.html">metrics
+collection</a>.</p>
 
 <h2 id="metrics">Metrics to scale on</h2>
 <p><strong>Nodes</strong> scale on the memory watermark. Sum
