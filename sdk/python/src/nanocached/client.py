@@ -1277,14 +1277,23 @@ class NanocachedClient:
         non-empty. A miss is simply absent from the returned dict, the
         same "a miss is not an error" contract get() itself has.
 
-        A batch never fails as a whole: if some keys are still
-        wrong-node after one bounded refresh-and-retry (the same policy
-        get()'s own _with_wrong_node_retry applies, generalized to a
-        per-key roster instead of an all-or-nothing retry — see
-        _multi_get_pass()), this raises PartialWrongNodeError — a
-        WrongNodeError subclass — whose ``partial_values`` holds every
-        key that DID resolve, rather than discarding a
-        mostly-successful batch over a handful of stale placements. In
+        A batch never fails as a whole, and it survives an unreachable
+        owner the way a single get() does: a key whose owner cannot be
+        reached at the connection level (a dead node, a certificate this
+        client cannot verify) is read from its next owner in rank order
+        (see _multi_get_pass()), so with replication the batch still
+        resolves. If some keys are still wrong-node after one bounded
+        refresh-and-retry (the same policy get()'s own
+        _with_wrong_node_retry applies, generalized to a per-key roster
+        instead of an all-or-nothing retry), this raises
+        PartialWrongNodeError — a WrongNodeError subclass — whose
+        ``partial_values`` holds every key that DID resolve, rather than
+        discarding a mostly-successful batch over a handful of stale
+        placements. If some keys' every owner was unreachable, this
+        raises PartialConnectionLostError (its ``partial_values`` the
+        keys that did resolve, its ``__cause__`` the last connection
+        error), or the bare connection error when nothing resolved — a
+        connection loss is never reported as a wrong-node answer. In
         single-node/proxy mode a ``W`` propagates immediately as a plain
         WrongNodeError, exactly as get()'s own single-mode behavior
         does — there is no ring to refresh against.
@@ -1354,13 +1363,37 @@ class NanocachedClient:
             return values
 
         values = {}
-        retry = await self._multi_get_pass(namespace, originals, key_bytes_list, values, None, budget)
-        if not retry:
-            return values
-        await self._maybe_refresh(force=True)
-        retry = await self._multi_get_pass(namespace, originals, key_bytes_list, values, retry, budget)
-        if retry:
+        wrong_node, unreachable, last_error = await self._multi_get_pass(
+            namespace, originals, key_bytes_list, values, None, budget
+        )
+        if wrong_node or unreachable:
+            # One bounded refresh-and-retry, as before, over everything
+            # still unresolved: a `W` is stale routing the refresh fixes;
+            # a key whose every owner was unreachable gets one more walk
+            # of its (possibly re-ranked) owners, which is what the old
+            # same-primary retry amounted to for it.
+            await self._maybe_refresh(force=True)
+            wrong_node, unreachable, error = await self._multi_get_pass(
+                namespace, originals, key_bytes_list, values, wrong_node + unreachable, budget
+            )
+            last_error = error or last_error
+        if wrong_node:
             raise PartialWrongNodeError(values)
+        if unreachable:
+            # Nothing answered `W` for these keys: every owner of each
+            # was unreachable, on both passes. That is a connection
+            # loss, reported the way the single-node path reports a
+            # mid-batch one — with whatever did resolve attached — or
+            # as the bare connection error when nothing resolved,
+            # exactly as _read() raises for a single key.
+            assert last_error is not None
+            if values:
+                raise PartialConnectionLostError(
+                    values,
+                    f"nanocached: get_many/get_many_bytes could not reach any owner of "
+                    f"{len(unreachable)} of {len(key_bytes_list)} keys: {last_error}",
+                ) from last_error
+            raise last_error
         return values
 
     async def _get_many(self, namespace: bytes, keys: Sequence[str | bytes]) -> dict[str | bytes, str]:
@@ -1439,60 +1472,70 @@ class NanocachedClient:
         values: dict[str | bytes, bytes],
         retry_indices: list[int] | None,
         budget: list[int],
-    ) -> list[int]:
-        """Runs one pass of get_many_bytes' cluster routing: group the
-        given indices (every key, when retry_indices is None — the
-        initial pass — or just the keys a previous pass left unresolved)
-        by their current primary owner (matching plain get()'s own
-        primary-first stance), dispatch one (possibly chunked) ``m``
-        exchange per owner concurrently, splice hits into ``values``,
-        and return the indices still unresolved: a per-key ``W``, or the
-        keys an owner group's connection-level failure never resolved
-        (indistinguishable from a possibly-idle-closed connection, same
-        stance _read() itself takes) — the whole group when its first
-        chunk failed, only the tail from the failing chunk onward when
-        an earlier chunk had already succeeded (issue #411 / #485; the
-        hits it returned are kept). Called once for the initial pass and
-        once more, if needed, after a single forced refresh — see
-        _get_many_bytes()."""
-        indices = retry_indices if retry_indices is not None else list(range(len(originals)))
+    ) -> tuple[list[int], list[int], BaseException | None]:
+        """Runs one pass of get_many_bytes' cluster routing, with the
+        same owner fallback a single get() has. The given indices (every
+        key on the initial pass, or just the keys a previous pass left
+        unresolved) are grouped by their primary owner and one (possibly
+        chunked) ``m`` exchange is dispatched per owner concurrently.
+        Hits are spliced into ``values``. A key whose owner answered a
+        per-key ``W`` is done for this pass: that is stale routing, and
+        the caller's refresh is the answer, exactly as _read() raises
+        WrongNodeError rather than trying the next owner. A key whose
+        owner group failed at the connection level — a dead or
+        unreachable node, a certificate the client cannot verify, a
+        possibly idle-closed connection; indistinguishable, the stance
+        _read() takes — is sent to its *next* owner in rank order, the
+        same walk _read() does for one key, until an owner answers or
+        the key has run out of owners. On a chunked group only the keys
+        from the failing chunk onward move on (issue #411 / #485; the
+        hits earlier chunks returned are kept).
 
-        groups: dict[str, list[int]] = {}
-        retry: list[int] = []
-        for idx in indices:
-            owners = self._owner_names(namespace, key_bytes_list[idx])
-            if not owners:
-                retry.append(idx)
-                continue
-            groups.setdefault(owners[0], []).append(idx)
+        Returns the indices that ended the pass on a ``W``, the indices
+        whose every owner was unreachable, and the last connection-level
+        error seen (None when there was none). Keys with no owners at
+        all (an empty ring view) count as ``W``: a refresh may populate
+        it."""
+        pending = list(retry_indices) if retry_indices is not None else list(range(len(originals)))
+        rank: dict[int, int] = {idx: 0 for idx in pending}
+        wrong_node: list[int] = []
+        unreachable: list[int] = []
+        last_error: BaseException | None = None
 
-        async def run_group(owner: str, group_indices: list[int]) -> tuple[list[int], dict[str | bytes, bytes]]:
+        async def run_group(
+            owner: str, group_indices: list[int]
+        ) -> tuple[list[int], list[bytes | None | object], BaseException | None, int]:
             group_keys = [key_bytes_list[idx] for idx in group_indices]
             entries, error, failed_at = await self._multi_get_chunked(
                 lambda: self._member_connection(owner), namespace, group_keys
             )
-            # Issue #411 / #485: a connection-level failure on chunk N>1
-            # leaves entries[:failed_at] as real, already-fetched results
-            # — keep them, and send only the unresolved tail
-            # (entries[failed_at:], still at their None placeholder) back
-            # for the retry pass, the same way the TypeScript and Rust
-            # SDKs do. A first-chunk failure (failed_at == 0) retries the
-            # whole group, exactly as before.
-            resolved = len(group_indices) if error is None else failed_at
-            local_retry: list[int] = list(group_indices[resolved:])
-            local_values: dict[str | bytes, bytes] = {}
-            for idx, entry in zip(group_indices[:resolved], entries[:resolved]):
-                if entry is WRONG_NODE:
-                    local_retry.append(idx)
-                elif entry is not None:
-                    local_values[originals[idx]] = self._decompress_for_batch(entry, budget)
-            return local_retry, local_values
+            return group_indices, entries, error, failed_at
 
-        results = await asyncio.gather(*(run_group(owner, idxs) for owner, idxs in groups.items()))
-        for local_retry, local_values in results:
-            retry.extend(local_retry)
-            values.update(local_values)
-        return retry
+        while pending:
+            groups: dict[str, list[int]] = {}
+            for idx in pending:
+                owners = self._owner_names(namespace, key_bytes_list[idx])
+                if not owners:
+                    wrong_node.append(idx)
+                elif rank[idx] >= len(owners):
+                    unreachable.append(idx)
+                else:
+                    groups.setdefault(owners[rank[idx]], []).append(idx)
+            pending = []
+            results = await asyncio.gather(*(run_group(owner, idxs) for owner, idxs in groups.items()))
+            for group_indices, entries, error, failed_at in results:
+                resolved = len(group_indices) if error is None else failed_at
+                for idx, entry in zip(group_indices[:resolved], entries[:resolved]):
+                    if entry is WRONG_NODE:
+                        wrong_node.append(idx)
+                    elif entry is not None:
+                        values[originals[idx]] = self._decompress_for_batch(entry, budget)
+                if error is not None:
+                    last_error = error
+                    for idx in group_indices[resolved:]:
+                        rank[idx] += 1
+                        pending.append(idx)
+        return wrong_node, unreachable, last_error
 
     async def set_many(
         self, values: Mapping[str | bytes, str | bytes], *, ttl_seconds: int = 0

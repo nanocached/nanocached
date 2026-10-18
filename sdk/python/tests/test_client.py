@@ -5935,15 +5935,18 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_many_retries_only_the_unresolved_tail_when_a_later_chunk_fails_in_cluster_mode(self):
         # Issue #485: in cluster mode a connection-level failure on chunk
         # N>1 of one owner's group used to throw away the chunks that
-        # had already succeeded and resend the whole group on the retry
-        # pass. The TypeScript and Rust SDKs keep the resolved prefix and
-        # retry only the tail; this SDK must do the same.
+        # had already succeeded and resend the whole group. The resolved
+        # prefix is kept and only the tail moves on — and, since a
+        # connection-level failure sends a key to its next owner (the
+        # same walk a single get() does), the tail is read from the
+        # replica, in one frame carrying only the tail's keys; the
+        # primary is not asked again.
         from nanocached.client import _MAX_BATCH_KEYS
 
         nodes, discovery = await self.start_cluster()
         try:
-            primary_name = NAMES[0]
-            primary = nodes[primary_name]
+            primary_name, replica_name = NAMES[0], NAMES[1]
+            primary, replica = nodes[primary_name], nodes[replica_name]
             keys: list[str] = []
             i = 0
             while len(keys) < _MAX_BATCH_KEYS + 50:
@@ -5958,19 +5961,23 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
                 await client.set_many(values)
                 primary.multi_get_count = 0
                 primary.multi_get_frame_sizes.clear()
+                replica.multi_get_count = 0
+                replica.multi_get_frame_sizes.clear()
                 # Chunk 1 (the first _MAX_BATCH_KEYS keys) answers; chunk 2
                 # (the remaining 50) dies at the connection level, once.
                 primary.fail_multi_get_after(1)
 
                 self.assertEqual(await client.get_many(keys), values)
 
-                # chunk 1 + the failed chunk 2 + the retry pass resending
-                # ONLY chunk 2's keys — not the whole group again (which
-                # would be two more `m` frames, four in total).
-                self.assertEqual(primary.multi_get_count, 3)
+                # The primary saw chunk 1 and the failed chunk 2, nothing
+                # more; the replica saw exactly one frame, carrying only
+                # chunk 2's keys — not the whole group again.
+                self.assertEqual(primary.multi_get_count, 2)
+                self.assertEqual(replica.multi_get_count, 1)
                 sizes = primary.multi_get_frame_sizes
-                self.assertLess(sizes[2], sizes[0], f"retry frame should carry only the tail: {sizes}")
-                self.assertEqual(sizes[2], sizes[1], f"retry frame should equal the failed chunk: {sizes}")
+                tail = replica.multi_get_frame_sizes[0]
+                self.assertLess(tail, sizes[0], f"the moved frame should carry only the tail: {sizes} / {tail}")
+                self.assertEqual(tail, sizes[1], f"the moved frame should equal the failed chunk: {sizes} / {tail}")
             finally:
                 await client.close()
         finally:
@@ -6064,6 +6071,76 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             for node in nodes.values():
                 await node.close()
+
+    async def test_get_many_reads_from_the_next_owner_when_a_primary_is_unreachable(self):
+        # A primary that cannot be reached at the connection level (here
+        # a closed port; in the field a dead node, or a certificate this
+        # client cannot verify) must not fail the keys it owns: with
+        # R=2 the replica holds them, and a single get() would already
+        # have fallen over to it. Discovery is left as it is — the
+        # client's ring still names the dead node as primary.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                keys = [f"k{i}" for i in range(24)]
+                await client.set_many({key: f"v{key}" for key in keys})
+                dead = NAMES[0]
+                owned_by_dead = [key for key in keys if self.owners_of(key)[0] == dead]
+                self.assertTrue(owned_by_dead, "the key set must give the dead node some primaries")
+                await nodes[dead].close()
+                await wait_for(
+                    lambda: client._members[dead].connection.closed,
+                    "the client to see the FIN",
+                )
+                self.assertEqual(await client.get_many(keys), {key: f"v{key}" for key in keys})
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                try:
+                    await node.close()
+                except Exception:
+                    pass
+
+    async def test_get_many_reports_an_unreachable_owner_as_a_connection_loss_not_wrong_node(self):
+        # R=1: the only owner of some keys is gone. Nothing answered
+        # `W`, so the error must not be the wrong-node one; the keys the
+        # live node owns are still returned, attached to the error.
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=1
+        ).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                keys = [f"k{i}" for i in range(24)]
+                await client.set_many({key: f"v{key}" for key in keys})
+                dead, live = NAMES[0], NAMES[1]
+                live_keys = [key for key in keys if HashRing(NAMES).owners(key.encode(), 1)[0] == live]
+                self.assertTrue(live_keys and len(live_keys) < len(keys))
+                await nodes[dead].close()
+                await wait_for(
+                    lambda: client._members[dead].connection.closed,
+                    "the client to see the FIN",
+                )
+                with self.assertRaises(PartialConnectionLostError) as ctx:
+                    await client.get_many(keys)
+                self.assertNotIsInstance(ctx.exception, WrongNodeError)
+                self.assertEqual(ctx.exception.partial_values, {key: f"v{key}" for key in live_keys})
+                self.assertIsNotNone(ctx.exception.__cause__)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                try:
+                    await node.close()
+                except Exception:
+                    pass
 
     async def test_a_persisting_per_key_wrong_node_raises_partial_wrong_node_error(self):
         nodes, discovery = await self.start_cluster()
