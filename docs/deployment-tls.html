@@ -707,7 +707,7 @@ mint keeps the node from starting instead of starting it without
 certificates. Services are created exactly as in the ECS guide,
 including the wait for the Cloud Map record before the node service.</p>
 <p><strong>Verifying.</strong> Each task&rsquo;s init stream has one
-line, <code>tls-init: minted a certificate for 10.1.1.195</code>, and
+line, <code>tls-init: minted a certificate for 10.1.1.20</code>, and
 its exit code in <code>describe-tasks</code> is 0. The count that
 matters is the half-configuration warning across the whole log group,
 which must be zero:</p>
@@ -746,10 +746,10 @@ the trust parameter overwritten with both CAs, then
 <code>update-service --force-new-deployment</code> on discovery
 (stable after 160&nbsp;s; the three nodes logged
 <code>re-registered with discovery</code> against the new task) and
-on node (176&nbsp;s; three new tasks minted leaves and joined, three
-old ones drained). The application tier, still trusting only the old
-CA, read all 2,000 keys during and after both, then re-fetched the
-bundle. Step two, the signing pair overwritten with the new CA and
+on node (176&nbsp;s; three new tasks minted leaves and joined, and the
+member count was back at 3). The application tier, still trusting only
+the old CA, read all 2,000 keys between the two deployments and after
+them, then re-fetched the bundle. Step two, the signing pair overwritten with the new CA and
 another forced deployment of node (193&nbsp;s; the leavers handed
 off 984, 791 and 778 entries) and of discovery (129&nbsp;s):
 afterwards <code>openssl s_client</code> against each node task and
