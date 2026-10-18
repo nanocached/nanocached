@@ -34,8 +34,8 @@
 segments of a deployment are encrypted. This page says what each one
 covers, why a node&rsquo;s certificate must name its IP address, how to
 mint and distribute self-signed certificates on AWS, and how to rotate
-them &mdash; then applies all of it to the single-node EC2 shape, which
-was built, checked and torn down exactly as shown.</p>
+them &mdash; then applies all of it to the single-node and the clustered
+EC2 shapes, each built, checked and torn down exactly as shown.</p>
 
 <h2 id="segments">What each flag encrypts</h2>
 <p>Every process accepts connections, and most of them also dial out.
@@ -126,13 +126,32 @@ certificate to the application tier explicitly; an SDK configured with
 <code>tls</code> alone verifies against the platform store and
 rejects the node with <code>CERTIFICATE_VERIFY_FAILED</code>, which
 is the right outcome for a certificate nobody vouched for.</p>
-<p>A private CA (your own, or a managed one such as AWS Private CA)
-changes the shape in one way: the trust anchor becomes the CA
-certificate, so a node&rsquo;s leaf can be reissued &mdash; or minted
-at start-up with whatever IP the node got &mdash; without the
-application tier having to learn a new file. The flags are the same;
+<p>A cluster needs one certificate per host, each with its own IP, and
+a trust anchor that does not change every time a host does. That is a
+private CA: a self-signed CA certificate whose key stays with the
+operator, and a leaf per host signed by it. The flags are the same;
 <code>--tls-ca</code> and <code>ca</code> take the CA certificate
-instead of the leaf. That variant was not run for this page.</p>
+instead of the leaf, and a leaf can be reissued without the application
+tier learning a new file. Minting the CA and one leaf:</p>
+<pre><code># once: the CA. Its key never leaves the operator's machine.
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout ca-key.pem -out ca.pem \
+  -subj "/CN=nanocached CA" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+# per host: a leaf for its address.
+IP=10.0.0.11
+openssl req -new -newkey rsa:2048 -nodes -keyout host-$IP-key.pem -out host-$IP.csr \
+  -subj "/CN=nanocached-$IP"
+printf 'subjectAltName=IP:%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' \
+  $IP &gt; host-$IP.ext
+openssl x509 -req -in host-$IP.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -days 365 \
+  -extfile host-$IP.ext -out host-$IP-cert.pem</code></pre>
+<p>A host serves its leaf alone (no chain: the dialler trusts the CA
+directly), and a leaf from this CA and a self-signed leaf from the
+section above do not trust each other, so a deployment picks one model.
+A managed CA (AWS Private CA) fits the same slot &mdash; it signs the
+leaves, its certificate is the trust anchor &mdash; and was not run for
+this page.</p>
 
 <h2 id="distribution">Distribution</h2>
 <p>Two files per process, with different sensitivity: the certificate
@@ -147,6 +166,13 @@ and becomes a bundle during rotation:</p>
 <pre><code>aws ssm put-parameter --name /nanocached/tls/node-cert --type String       --value file://node-cert.pem
 aws ssm put-parameter --name /nanocached/tls/node-key  --type SecureString --value file://node-key.pem
 aws ssm put-parameter --name /nanocached/tls/trust     --type String       --value file://node-cert.pem</code></pre>
+<p>With a private CA the layout gains a level: the CA certificate is
+the trust parameter, and each host&rsquo;s pair sits under its
+address, which the host reads from the instance metadata service to
+pick its own:</p>
+<pre><code>aws ssm put-parameter --name /nanocached/tls/ca                  --type String       --value file://ca.pem
+aws ssm put-parameter --name /nanocached/tls/hosts/10.0.0.11/cert --type String       --value file://host-10.0.0.11-cert.pem
+aws ssm put-parameter --name /nanocached/tls/hosts/10.0.0.11/key  --type SecureString --value file://host-10.0.0.11-key.pem</code></pre>
 <p>An instance whose role carries
 <code>AmazonSSMManagedInstanceCore</code> &mdash; the policy the
 deployment shapes already attach for Session Manager &mdash; can read
@@ -158,7 +184,10 @@ the application side ever needs the key. Secrets Manager would hold
 the key in the same manner, read with
 <code>get-secret-value</code> in place of
 <code>get-parameter --with-decryption</code>; that path was not run
-for this page.</p>
+for this page. Where the fetched files land matters once an instance is
+imaged: the cluster shape below writes them to <code>/run</code>, a
+tmpfs that is never in a snapshot, and the same choice is right for a
+single node that will ever be imaged.</p>
 
 <h2 id="rotation">Rotation</h2>
 <p>Certificate and key are read once, at start, so a rotation is a
@@ -179,12 +208,21 @@ the node switches, or every connection fails the moment it does.</p>
   <li>Once no application still trusts only the old certificate,
   publish the new certificate alone as the trust parameter.</li>
 </ol>
-<p>Checked on the EC2 shape below: with the node still on the old
-certificate, both the bundle and the old file alone connect; after the
-restart, the bundle connects and the old file alone fails with
-<code>CERTIFICATE_VERIFY_FAILED</code>. With a private CA, step 1
-disappears for leaf rotation and reappears, in the same form, when the
-CA itself is rotated.</p>
+<p>Checked on the single-node shape below: with the node still on the
+old certificate, both the bundle and the old file alone connect; after
+the restart, the bundle connects and the old file alone fails with
+<code>CERTIFICATE_VERIFY_FAILED</code>.</p>
+<p>With a private CA there are two rotations. A <strong>leaf</strong>
+rotates alone: overwrite that host&rsquo;s two parameters and restart
+its processes; nothing else changes, because every dialler trusts the
+CA, not the leaf. The <strong>CA</strong> rotates in the three steps
+above, applied to every process at once: publish old + new as the
+trust parameter and restart every process (each reads
+<code>--tls-ca</code> at start), re-fetch on the applications, then
+reissue each host&rsquo;s leaf under the new CA and restart it, host
+by host; publishing the new CA alone, and the restart that picks it
+up, can wait for the next routine restart. Both were run on the
+cluster shape below.</p>
 
 <h2 id="ec2-single">Single node on EC2, with TLS</h2>
 <p>This is the <a href="deployment-ec2-single.html">single-node
@@ -324,6 +362,226 @@ and the old file alone failed verification.</p>
 <p><strong>Teardown</strong> is the single-node guide&rsquo;s sequence
 plus the parameters, one call each:</p>
 <pre><code>for p in node-cert node-key trust; do aws ssm delete-parameter --name /nanocached/tls/$p; done</code></pre>
+
+<h2 id="ec2-cluster">Cluster on EC2, with TLS</h2>
+<p>This is the <a href="deployment-ec2-cluster.html">clustered
+shape</a> &mdash; a seed running discovery and a node at
+<code>10.0.0.11</code>, nodes at other fixed addresses, growth from an
+image &mdash; with every segment encrypted: application to node and to
+discovery, node to discovery, discovery to node, node to node. Every
+process gets all three flags, each host gets a leaf from the private
+CA, and the application tier trusts the CA certificate. The network,
+security groups and role are the cluster guide&rsquo;s; what follows
+is the difference, built and checked from an empty account with a
+seed, two nodes (one added from the image) and an application server,
+then torn down.</p>
+<p><strong>Before the instances exist</strong>: the CA, a leaf per
+address you are about to launch, and the parameters. The seed&rsquo;s
+one leaf (<code>IP:10.0.0.11</code>) serves both its discovery and
+its node; one mint per host, not per process.</p>
+<pre><code># the CA and the leaves, from "Self-signed certificates", for 10.0.0.11 and 10.0.0.12; then:
+aws ssm put-parameter --name /nanocached/tls/ca --type String --value file://ca.pem
+for IP in 10.0.0.11 10.0.0.12; do
+  aws ssm put-parameter --name /nanocached/tls/hosts/$IP/cert --type String       --value file://host-$IP-cert.pem
+  aws ssm put-parameter --name /nanocached/tls/hosts/$IP/key  --type SecureString --value file://host-$IP-key.pem
+done</code></pre>
+<p><strong>The user-data</strong> differs from the cluster
+guide&rsquo;s in three places. The fetch is its own
+<code>oneshot</code> unit, because on the seed two services would
+otherwise run it at once into the same files; both services
+<code>Requires=</code> and <code>After=</code> it, so a plain
+<code>systemctl restart</code> of either re-fetches first. The files
+go to <code>/run/nanocached/tls</code>, a tmpfs, so that the image
+taken from a node below never contains a private key. And the host
+picks its own parameters by its address from the instance metadata
+service, which is what lets a node from the image start with no
+user-data at all. The seed&rsquo;s user-data in full:</p>
+<pre><code>#!/bin/bash
+set -euo pipefail
+dnf install -y docker
+systemctl enable --now docker
+install -d -m 700 /etc/nanocached
+cat &gt; /etc/nanocached/env &lt;&lt;'ENV'
+NANOCACHED_AUTH_SECRET=change-me
+ENV
+chmod 600 /etc/nanocached/env
+cat &gt; /usr/local/bin/nanocached-fetch-tls &lt;&lt;'FETCH'
+#!/bin/bash
+# Pull this host's certificate and key, and the cluster CA, from Parameter
+# Store into /run (tmpfs: never on the disk, never in an image). The host's
+# own address picks its parameters. Runs before every start of either service.
+set -euo pipefail
+TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+md() { curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/$1"; }
+REGION=$(md placement/region); IP=$(md local-ipv4)
+install -d -m 750 -o 10001 -g 10001 /run/nanocached/tls
+cd /run/nanocached/tls
+aws ssm get-parameter --region "$REGION" --name /nanocached/tls/ca --query Parameter.Value --output text &gt; ca.pem.new
+aws ssm get-parameter --region "$REGION" --name /nanocached/tls/hosts/$IP/cert --query Parameter.Value --output text &gt; cert.pem.new
+aws ssm get-parameter --region "$REGION" --name /nanocached/tls/hosts/$IP/key --with-decryption --query Parameter.Value --output text &gt; key.pem.new
+chown 10001:10001 ca.pem.new cert.pem.new key.pem.new
+chmod 644 ca.pem.new cert.pem.new; chmod 600 key.pem.new
+mv ca.pem.new ca.pem; mv cert.pem.new cert.pem; mv key.pem.new key.pem
+FETCH
+chmod 755 /usr/local/bin/nanocached-fetch-tls
+cat &gt; /etc/systemd/system/nanocached-tls.service &lt;&lt;'UNIT'
+[Unit]
+Description=nanocached TLS material from Parameter Store
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nanocached-fetch-tls
+UNIT
+cat &gt; /etc/systemd/system/nanocached-discovery.service &lt;&lt;'UNIT'
+[Unit]
+Description=nanocached discovery
+After=docker.service nanocached-tls.service
+Requires=docker.service nanocached-tls.service
+[Service]
+ExecStartPre=-/usr/bin/docker rm -f nanocached-discovery
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-discovery@sha256:1a4dcdd2208f741114485da89783920f7f300161e56610d85c855f2991995835
+ExecStart=/usr/bin/docker run --rm --name nanocached-discovery \
+  --network host \
+  --env-file /etc/nanocached/env \
+  --volume /run/nanocached/tls:/etc/nanocached/tls:ro \
+  ghcr.io/nanocached/nanocached-discovery@sha256:1a4dcdd2208f741114485da89783920f7f300161e56610d85c855f2991995835 \
+  --host 0.0.0.0 --port 8357 --metrics-port 9357 \
+  --replication-factor 2 \
+  --tls-cert /etc/nanocached/tls/cert.pem --tls-key /etc/nanocached/tls/key.pem --tls-ca /etc/nanocached/tls/ca.pem
+ExecStop=/usr/bin/docker stop -t 30 nanocached-discovery
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+UNIT
+cat &gt; /etc/systemd/system/nanocached-node.service &lt;&lt;'UNIT'
+[Unit]
+Description=nanocached node
+After=docker.service nanocached-tls.service nanocached-discovery.service
+Requires=docker.service nanocached-tls.service
+[Service]
+ExecStartPre=-/usr/bin/docker rm -f nanocached-node
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:2104f8263c6f909d734fb6302a74bbedd5d583c14fb73713268ef4627fad5337
+ExecStart=/usr/bin/docker run --rm --name nanocached-node \
+  --network host \
+  --env-file /etc/nanocached/env \
+  --volume /run/nanocached/tls:/etc/nanocached/tls:ro \
+  ghcr.io/nanocached/nanocached-node@sha256:2104f8263c6f909d734fb6302a74bbedd5d583c14fb73713268ef4627fad5337 \
+  --host 0.0.0.0 --port 8356 --metrics-port 9356 \
+  --discovery 10.0.0.11:8357 --drain-timeout 20 \
+  --tls-cert /etc/nanocached/tls/cert.pem --tls-key /etc/nanocached/tls/key.pem --tls-ca /etc/nanocached/tls/ca.pem \
+  --max-memory 1073741824
+ExecStop=/usr/bin/docker stop -t 30 nanocached-node
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now nanocached-discovery nanocached-node</code></pre>
+<p>A node&rsquo;s user-data is the same file without the discovery
+unit and with <code>systemctl enable --now nanocached-node</code> at
+the end. Both launch as in the cluster guide, the node now also with
+a fixed address (<code>--private-ip-address 10.0.0.12</code>).</p>
+<p><strong>Verifying</strong> adds one line to the cluster
+guide&rsquo;s checks on the seed &mdash; the count of half-configured
+TLS warnings in both journals, which must be zero, since a process
+with only one direction of TLS configured says so at start-up and
+then runs:</p>
+<pre><code>aws ssm send-command --instance-ids $SEED_ID --document-name AWS-RunShellScript \
+  --parameters 'commands=["systemctl is-active nanocached-discovery nanocached-node",
+    "curl -s http://127.0.0.1:9357/metrics | grep ^nanocached_discovery_members",
+    "ls -ln /run/nanocached/tls",
+    "journalctl -u nanocached-discovery -u nanocached-node -o cat | grep -c \"WARN TLS\""]'
+# active / active / nanocached_discovery_members 2 / ca.pem cert.pem key.pem owned by 10001 / 0</code></pre>
+<p>From the application server, the SDK&rsquo;s configuration is
+discovery&rsquo;s address, the secret, <code>tls</code> and the CA
+certificate, fetched from the trust parameter as on the single node:</p>
+<pre><code>client = await NanocachedClient.connect(
+    [("10.0.0.11", 8357)],
+    auth_secret="change-me",
+    tls=True,
+    ca="/etc/nanocached-trust.pem",   # the /nanocached/tls/ca parameter
+)</code></pre>
+<p>Run that way with the Python SDK at 0.4.6: 2,000 keys written with
+<code>set_many</code> and read back complete with
+<code>get_many</code>, every one of them again after each step below.
+An unrelated certificate as <code>ca</code>, <code>tls=True</code>
+without <code>ca</code>, and a plaintext connection fail as on the
+single node (the first two with
+<code>CERTIFICATE_VERIFY_FAILED</code>, the third with a TLS alert),
+and each of those attempts is one <code>WARN TLS handshake</code>
+line in discovery&rsquo;s journal naming the application
+server&rsquo;s address &mdash; the only lines of that kind the run
+produced. Discovery&rsquo;s own journal shows the two registrations
+and promotions; the node&rsquo;s shows <code>joined the cluster via
+discovery at 10.0.0.11:8357</code>.</p>
+<p><strong>Growing the cluster</strong> keeps the cluster
+guide&rsquo;s image (taken from a node with <code>--no-reboot</code>;
+94&nbsp;s to available here) and changes what a launch from it needs:
+an address chosen in advance, a leaf for it, its two parameters, and
+<code>--private-ip-address</code> on <code>run-instances</code>. No
+user-data: the fetch script in the image finds the parameters by the
+address.</p>
+<pre><code>IP=10.0.0.13
+# mint host-$IP-cert.pem / host-$IP-key.pem from the CA, then:
+aws ssm put-parameter --name /nanocached/tls/hosts/$IP/cert --type String       --value file://host-$IP-cert.pem
+aws ssm put-parameter --name /nanocached/tls/hosts/$IP/key  --type SecureString --value file://host-$IP-key.pem
+NODE2_ID=$(aws ec2 run-instances --image-id $IMAGE_ID --instance-type t3.small \
+  --subnet-id $NODE_SUBNET_ID --security-group-ids $NODE_SG --private-ip-address $IP \
+  --iam-instance-profile Name=$NAME-ec2 \
+  --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-node}]" \
+  --query 'Instances[0].InstanceId' --output text)</code></pre>
+<p>The order matters, and this run tried it the wrong way round on
+purpose: launched before its parameters existed, the new instance
+failed its fetch (<code>ParameterNotFound</code>), and because the
+node unit <code>Requires=</code> the fetch, the node unit failed to
+start and stayed down &mdash; <code>Restart=always</code> retries a
+service that exited, not one whose dependency failed, so nothing
+loops and nothing recovers by itself. Putting the parameters and
+<code>systemctl start nanocached-node</code> over Run Command was the
+fix: <code>/readyz</code> answered 3&nbsp;s later, discovery
+registered and promoted the node, the seed&rsquo;s node handed it
+1,336 of the 2,000 keys over TLS (its journal&rsquo;s
+<code>migration completed</code> line, the new node&rsquo;s
+<code>accepted connection from 10.0.0.11</code>), the member count
+read 3, and every key still read back.</p>
+<p><strong>Rotating a leaf</strong> is a restart of that host:
+overwrite its two parameters with a new pair from the same CA and
+<code>systemctl restart nanocached-node</code>. The restart is the
+planned leave from the cluster guide and then a join: the node handed
+its 1,336 entries off within the drain budget, <code>systemctl
+restart</code> returned after 22&nbsp;s, <code>/readyz</code>
+answered a second later, discovery logged the leave and a fresh
+registration, <code>openssl x509 -in /run/nanocached/tls/cert.pem
+-noout -serial</code> showed the new serial, and the 2,000 keys read
+back complete. On the seed, the two units read the same files, so a
+leaf rotation there restarts both.</p>
+<p><strong>Rotating the CA</strong> is the three-step order from
+<a href="#rotation">Rotation</a>, and this run did the first two.
+Step one: the trust parameter overwritten with both CA certificates
+(2.3&nbsp;KB, still inside the 4&nbsp;KB tier), then one restart per
+process, discovery first &mdash; <code>systemctl restart
+nanocached-discovery</code> took 19&nbsp;s to <code>/readyz</code>,
+the seed&rsquo;s node journal showed <code>re-registered with
+discovery</code> and the member count stayed 3
+&mdash; then each node in turn, 23&nbsp;s each, <code>ca.pem</code>
+holding two certificates on every host afterwards; the application
+tier, still trusting only the old CA at this point, kept reading all
+2,000 keys throughout, and then re-fetched the bundle. Step two, for
+one host: a leaf for <code>10.0.0.13</code> issued by the new CA, its
+two parameters overwritten, the node restarted; it rejoined,
+<code>openssl x509 -noout -issuer</code> on its certificate named the
+new CA, and the application tier with the bundle read all 2,000 keys.
+Step three &mdash; the new CA alone as the
+trust parameter and one more round of restarts &mdash; is step one
+again with a smaller file, and was left for the next routine
+restart.</p>
+<p><strong>Teardown</strong> is the cluster guide&rsquo;s (instances,
+image and snapshot, role, groups, network) plus one
+<code>delete-parameter</code> per parameter: the CA and two per
+host.</p>
 
 </main>
 
