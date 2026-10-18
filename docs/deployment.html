@@ -48,9 +48,9 @@ then pick the shape that matches how you run things.</p>
   and EKS shapes and the proxy tier run with TLS end to end.</li>
   <li><a href="deployment-metrics.html">Metrics collection</a> &mdash;
   what <code>/metrics</code> exports, how gauges and counters behave
-  once collected, the single-node EC2 shape scraped by the CloudWatch
-  Agent and the ECS cluster with the OpenTelemetry collector as a
-  sidecar.</li>
+  once collected, and the three cluster shapes&rsquo; collectors: the
+  CloudWatch Agent on a single EC2 node, the OpenTelemetry collector
+  as an ECS sidecar, and a Prometheus server on EKS.</li>
 </ul>
 
 <h2>Shapes</h2>
