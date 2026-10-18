@@ -1270,7 +1270,7 @@ func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, 
 	var decompressed int64
 
 	if single {
-		entries, chunkErr, _ := c.multiGetChunked("", namespace, keyBytes)
+		entries, _, chunkErr := c.multiGetChunked("", namespace, keyBytes)
 		for i, entry := range entries {
 			if !entry.ok {
 				continue
@@ -1396,7 +1396,7 @@ func multiSetEntryCost(key, value []byte) int {
 // how many leading entries are real answers (len(keys) on success);
 // everything from resolved onward still needs another owner or a retry,
 // exactly like a per-key WrongNode.
-func (c *Client) multiGetChunked(slot string, namespace []byte, keys [][]byte) (entries []multiEntry, err error, resolved int) {
+func (c *Client) multiGetChunked(slot string, namespace []byte, keys [][]byte) (entries []multiEntry, resolved int, err error) {
 	entries = make([]multiEntry, len(keys))
 	budget := maxRequestBytes - len(namespace) - multiFrameHeaderSlack
 	for start := 0; start < len(keys); {
@@ -1417,12 +1417,12 @@ func (c *Client) multiGetChunked(slot string, namespace []byte, keys [][]byte) (
 			return opErr
 		})
 		if err != nil {
-			return entries, err, start
+			return entries, start, err
 		}
 		copy(entries[start:end], chunkEntries)
 		start = end
 	}
-	return entries, nil, len(keys)
+	return entries, len(keys), nil
 }
 
 // multiGetOutcome is what one multiGetPass leaves unresolved: the
@@ -1506,7 +1506,7 @@ func (c *Client) multiGetPass(
 				for i, idx := range groupIndices {
 					groupKeys[i] = keyBytes[idx]
 				}
-				entries, err, resolved := c.multiGetChunked(owner, namespace, groupKeys)
+				entries, resolved, err := c.multiGetChunked(owner, namespace, groupKeys)
 				mu.Lock()
 				results = append(results, legResult{groupIndices, entries, err, resolved})
 				mu.Unlock()
