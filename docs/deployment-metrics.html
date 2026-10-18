@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metrics collection — nanocached</title>
+<meta name="description" content="Collecting nanocached's /metrics on AWS: what the endpoint exports, how gauges and counters arrive in a time-series backend, and the single-node EC2 shape with the CloudWatch Agent verified end to end.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <nav>
+    <a class="brand" href="index.html"><img src="favicon.svg" alt=""><span><b>nano</b>cached</span></a>
+    <div class="links">
+      <a href="getting-started.html">Getting started</a>
+      <a href="protocol.html">Protocol</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="sdks.html">SDKs</a>
+      <a href="deployment.html" aria-current="page">Deployment</a>
+      <a href="capacity-planner.html">Capacity planner</a>
+      <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+
+<h1>Metrics collection</h1>
+<p class="lede">Every binary serves Prometheus-format metrics on its
+operations port. Which collector picks them up depends on the
+monitoring stack you already run, so this page is separate from the
+shape guides: it says what there is to collect and how the two kinds
+of metric behave once collected, then applies that to the single-node
+EC2 shape with the CloudWatch Agent, built, checked and torn down as
+shown. The ECS and EKS shapes are added here as each is verified.</p>
+
+<h2 id="what">What there is to collect</h2>
+<p><code>GET /metrics</code> on <code>--metrics-port</code> answers in
+Prometheus text format (the endpoint, with its two probe paths, is
+described under <a href="deployment-operations.html#ops">what every
+deployment needs</a>). A node exports fourteen series plus two per
+namespace; the ones to scale on are listed under
+<a href="deployment-operations.html#metrics">metrics to scale on</a>,
+and <code>curl -s http://127.0.0.1:9356/metrics | grep -v '^#'</code>
+prints the full set with its current values. Three things about them
+decide how a collector should be configured.</p>
+<p><strong>Gauges and counters.</strong> The
+<code>_bytes</code>, <code>_entries</code> and
+<code>connections</code> series are gauges: the value at the moment of
+the scrape. Everything ending in <code>_total</code> is a counter: a
+running total since the process started, which drops back to zero when
+it restarts. A Prometheus server stores counters as they are and
+<code>rate()</code> does the rest. A CloudWatch-style backend stores
+statistics per period, and the collector decides what number it hands
+over for a counter &mdash; the cumulative value, or the increase since
+the previous scrape. The CloudWatch Agent below hands over the
+increase, so <code>Sum</code> over a period is the number of
+operations in that period, and after a restart the counter simply
+starts again from zero (the period&rsquo;s <code>Sum</code> is the
+operations since the restart, never a negative number); a
+gauge&rsquo;s <code>Sum</code> is meaningless there
+(four scrapes a minute of a 250-entry cache sum to 1,000), so gauges
+are read with <code>Maximum</code> or <code>Average</code>. Whichever
+backend you use, check which of the two it stores for a counter before
+building a dashboard on it.</p>
+<p><strong>Labels.</strong> The per-namespace series
+(<code>nanocached_node_namespace_entries</code>,
+<code>…_namespace_used_bytes</code>, and <code>…_namespace_budget_bytes</code>
+where a budget is set) carry a <code>namespace</code> label; nothing
+else does. The default namespace is the empty string, and a collector
+that turns labels into dimensions leaves out a series whose dimension
+value is empty &mdash; the CloudWatch Agent&rsquo;s output below does
+&mdash; so the default namespace is
+read from the node-wide <code>nanocached_node_entries</code> and
+<code>…_memory_used_bytes</code> instead, and the labelled series
+cover the named namespaces. Each named namespace is one more series
+per metric, which is what a per-metric price is charged on.</p>
+<p><strong>Plain HTTP, no authentication.</strong> The operations
+endpoint is unauthenticated and never TLS, which is why the shape
+guides bind it inside the VPC. The least exposure is a collector on
+the same instance or in the same task scraping
+<code>127.0.0.1</code>, which is what the EC2 shape below does; a
+central scraper is the alternative, reaching the port through the
+security-group rule the shape guides already carry (the operations
+port from inside the VPC, nothing wider).</p>
+<p>The collectors this page covers are the ones whose output is a
+service you can read back from the command line: the CloudWatch Agent
+(EC2, below), the AWS Distro for OpenTelemetry collector (ECS, EKS)
+and a Prometheus server (EKS). Amazon Managed Service for Prometheus
+and Amazon Managed Grafana take the same scrape output through remote
+write; neither was available to the account these runs used, so they
+are not described here.</p>
+
+<h2 id="ec2">Single node on EC2 with the CloudWatch Agent</h2>
+<p>Start from the <a href="deployment-ec2-single.html">single-node EC2
+guide</a>: same network, same security groups, same instance (the run
+behind this section built the node subnet and the node group only,
+and drove the load from the node itself; the application tier adds
+nothing to the metrics path). The
+agent runs on the node, scrapes <code>127.0.0.1:9356</code> every
+15&nbsp;s and publishes each scrape to CloudWatch Logs in the embedded
+metric format, from which CloudWatch extracts the metrics. Nothing
+inbound changes &mdash; the operations port is read over loopback.</p>
+
+<h3>IAM</h3>
+<p>One more managed policy on the instance role from that guide.
+<code>CloudWatchAgentServerPolicy</code> grants the log and metric
+writes the agent needs and nothing the node needs.</p>
+<pre><code>aws iam attach-role-policy --role-name $NAME-ec2 \
+  --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy</code></pre>
+
+<h3>The agent</h3>
+<p>Amazon Linux 2023 carries the agent in its own repository, so it is
+one more package on the <code>dnf install</code> line of
+<code>node-user-data.sh</code> (<code>dnf install -y docker
+amazon-cloudwatch-agent</code>), and the rest is appended after the
+<code>systemctl enable --now nanocached-node</code> line. Two files:
+a Prometheus scrape configuration with one static target, and the
+agent configuration that points at it and says which series to turn
+into metrics, under which dimensions.</p>
+<pre><code>cat &gt; /opt/aws/amazon-cloudwatch-agent/etc/prometheus.yaml &lt;&lt;'PROM'
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: nanocached-node
+    static_configs:
+      - targets: ['127.0.0.1:9356']
+PROM
+cat &gt; /opt/aws/amazon-cloudwatch-agent/etc/nanocached.json &lt;&lt;'JSON'
+{
+  "logs": {
+    "metrics_collected": {
+      "prometheus": {
+        "log_group_name": "nanocached-metrics",
+        "prometheus_config_path": "/opt/aws/amazon-cloudwatch-agent/etc/prometheus.yaml",
+        "emf_processor": {
+          "metric_declaration_dedup": true,
+          "metric_namespace": "nanocached",
+          "metric_unit": {
+            "nanocached_node_memory_used_bytes": "Bytes",
+            "nanocached_node_memory_max_bytes": "Bytes",
+            "nanocached_node_namespace_used_bytes": "Bytes",
+            "nanocached_node_namespace_budget_bytes": "Bytes"
+          },
+          "metric_declaration": [
+            {
+              "source_labels": ["job"],
+              "label_matcher": "^nanocached-node$",
+              "dimensions": [["host", "namespace"]],
+              "metric_selectors": ["^nanocached_node_namespace_"]
+            },
+            {
+              "source_labels": ["job"],
+              "label_matcher": "^nanocached-node$",
+              "dimensions": [["host"]],
+              "metric_selectors": [
+                "^nanocached_node_(memory_used_bytes|memory_max_bytes|entries|connections|connections_max)$",
+                "^nanocached_node_(hits|misses|sets|deletes|evictions|expirations|incrs|cas_sets|cas_deletes)_total$"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "force_flush_interval": 5
+  }
+}
+JSON
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/nanocached.json</code></pre>
+<p>What each part is for:</p>
+<ul>
+  <li><strong><code>metric_declaration</code></strong> is an allow-list:
+  a scraped series that matches no declaration is written to the log
+  group but never becomes a metric. The two entries give the
+  per-namespace series a <code>namespace</code> dimension beside
+  <code>host</code> and everything else <code>host</code> alone; the
+  second entry names its series explicitly rather than matching
+  <code>^nanocached_node_</code>, which would also match the namespace
+  series (what a series matched by two declarations becomes was not
+  tried here). The
+  <code>host</code> label is added by the agent and is the
+  instance&rsquo;s private DNS name
+  (<code>ip-10-0-0-65.ec2.internal</code> in this run); the
+  <code>instance</code> and <code>job</code> labels are also there to
+  use as dimensions if you prefer them.</li>
+  <li><strong><code>metric_namespace</code></strong> and
+  <strong><code>log_group_name</code></strong> are set explicitly so the
+  metrics land in a namespace of their own rather than the
+  agent&rsquo;s default and the log group has a name you will recognise
+  at teardown. The agent creates the log group and one stream in it
+  named after the job.</li>
+  <li><strong><code>metric_unit</code></strong> attaches a unit to the
+  byte gauges, so the console shows them scaled. Counters and counts
+  are left without one.</li>
+  <li><strong><code>fetch-config … -s</code></strong> validates the
+  JSON, writes the agent&rsquo;s own configuration, starts it and
+  enables it, so it is back after a reboot without further
+  arrangement.</li>
+</ul>
+<p>From launch to a running agent took about 80&nbsp;s (cloud-init
+reported <q>Up 79.77 seconds</q>; the agent&rsquo;s own start time was
+one second earlier), about ten seconds more than the plain node in the
+EC2 guide. The package that installed was
+<code>amazon-cloudwatch-agent-1.300071.0</code>.</p>
+
+<h3>Verifying</h3>
+<p>On the node, three things say the agent is scraping:</p>
+<pre><code>aws ssm send-command --instance-ids $NODE_ID --document-name AWS-RunShellScript \
+  --parameters 'commands=["/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status",
+    "systemctl is-enabled amazon-cloudwatch-agent",
+    "tail -1 /opt/aws/amazon-cloudwatch-agent/logs/configuration-validation.log"]'
+# "status": "running", "configstatus": "configured" / enabled /
+# The given config: /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.toml is valid</code></pre>
+<p>A scrape that fails shows up only in
+<code>/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log</code>;
+the <code>up</code> series is not forwarded, so the file is the place
+to look when a metric stays flat.</p>
+<p>From anywhere with the CLI, the first datapoints carry the minute
+the agent started in (how soon after that they became readable was not
+timed in this run; the first query, six minutes later, found all of
+them). The host dimension is the value the agent attached:</p>
+<pre><code>aws cloudwatch list-metrics --namespace nanocached \
+  --query 'Metrics[].[MetricName,Dimensions[].Value|join(`,`,@)]' --output text
+HOST=ip-10-0-0-65.ec2.internal
+aws cloudwatch get-metric-statistics --namespace nanocached \
+  --metric-name nanocached_node_entries --dimensions Name=host,Value=$HOST \
+  --start-time $(date -u -v-10M +%Y-%m-%dT%H:%M:%SZ) --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  # GNU date: $(date -u -d '-10 min' +%Y-%m-%dT%H:%M:%SZ)
+  --period 60 --statistics Maximum SampleCount \
+  --query 'sort_by(Datapoints,&amp;Timestamp)[].[Timestamp,Maximum,SampleCount]' --output text</code></pre>
+<p>In this run the node was given a known load first (200 keys
+written in one batch, 300 reads of which 100 missed, 50 keys written
+in a namespace called <code>orders</code>, after an earlier batch of
+the same 200 keys), so every number CloudWatch returned could be
+checked against <code>/metrics</code>:</p>
+<ul>
+  <li><code>list-metrics</code> showed fourteen metrics under
+  <code>host</code> and two under <code>host,namespace</code> with
+  <code>namespace=orders</code>; the default namespace&rsquo;s two
+  series were, as said above, not published.</li>
+  <li>Gauges matched the endpoint: <code>nanocached_node_entries</code>
+  <code>Maximum</code> 250, <code>…_memory_used_bytes</code> 48,592,
+  <code>…_memory_max_bytes</code> 1,073,741,824,
+  <code>…_namespace_entries</code> for <code>orders</code> 50, four
+  samples in every minute.</li>
+  <li>Counters arrived as increases: <code>nanocached_node_sets_total</code>
+  <code>Sum</code> 450 in the minute the writes happened and 0 in every
+  minute after, against a cumulative 450 on the endpoint;
+  <code>…_hits_total</code> 200 and <code>…_misses_total</code> 100 the
+  same way. The first sample of each counter is dropped (three samples
+  in that minute, not four) because an increase needs a predecessor.</li>
+  <li>A <code>systemctl restart nanocached-node</code> on the node
+  (<code>/readyz</code> was 200 again within the same second), followed
+  by 30 more writes: <code>entries</code> fell to 0 and rose to 30,
+  <code>sets_total</code> summed to 30 for that minute &mdash; not
+  negative, and not the 450 the counter had stood at before &mdash; and
+  the sample count stayed at four a minute throughout. The agent
+  carries on scraping across a restart of the node, and the restart is
+  visible as the gauges dropping, not as a gap.</li>
+</ul>
+<p>Each scrape also lands in the log group as a few events, split by
+metric type and dimension set (one document for the gauges under
+<code>host</code>, one for the counters, one per named namespace),
+each carrying its values, the labels and the metric declarations,
+four times a minute per node &mdash; which is where the retention cost
+sits. Set a
+retention period on <code>nanocached-metrics</code> once the metrics
+are confirmed; the metrics themselves are kept by CloudWatch on its
+own schedule and do not depend on the log events staying.</p>
+
+<h3>Teardown</h3>
+<p>The EC2 guide&rsquo;s teardown, plus the log group and the extra
+policy before the role is deleted:</p>
+<pre><code>aws logs delete-log-group --log-group-name nanocached-metrics
+aws iam detach-role-policy --role-name $NAME-ec2 \
+  --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy</code></pre>
+<p>The metric namespace cannot be deleted: <code>nanocached</code> stays
+listed in the console with its last values until CloudWatch ages them
+out, at no charge once nothing is written to it.</p>
+
+</main>
+
+<footer class="site-footer">
+  <div>
+    <span>nanocached</span>
+    <a href="https://github.com/nanocached/nanocached/blob/main/LICENSE">MIT License</a>
+    <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    <a href="https://github.com/nanocached/nanocached/issues">Issues</a>
+  </div>
+</footer>
+
+</body>
+</html>

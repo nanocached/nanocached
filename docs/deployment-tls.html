@@ -78,7 +78,9 @@ last two, and the proxy gets all three as well. The operations endpoint
 (<code>--metrics-port</code>) is plain HTTP in every case; it was
 checked over HTTP on the TLS node below, and the
 <a href="deployment-operations.html#ops">usual advice</a> of keeping it
-inside the VPC is the whole of its protection.</p>
+inside the VPC is the whole of its protection (and a collector on the
+same host, as in <a href="deployment-metrics.html">metrics
+collection</a>, never leaves it).</p>
 
 <h2 id="names">Names in certificates</h2>
 <p>Nodes are addressed by IP. Discovery records the source IP of a
