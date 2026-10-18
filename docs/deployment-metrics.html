@@ -59,8 +59,10 @@ statistics per period, and the collector decides what number it hands
 over for a counter &mdash; the cumulative value, or the increase since
 the previous scrape. The CloudWatch Agent below hands over the
 increase, so <code>Sum</code> over a period is the number of
-operations in that period and a restart costs nothing but one dropped
-sample; a gauge&rsquo;s <code>Sum</code> is meaningless there
+operations in that period, and after a restart the counter simply
+starts again from zero (the period&rsquo;s <code>Sum</code> is the
+operations since the restart, never a negative number); a
+gauge&rsquo;s <code>Sum</code> is meaningless there
 (four scrapes a minute of a 250-entry cache sum to 1,000), so gauges
 are read with <code>Maximum</code> or <code>Average</code>. Whichever
 backend you use, check which of the two it stores for a counter before
@@ -69,9 +71,10 @@ building a dashboard on it.</p>
 (<code>nanocached_node_namespace_entries</code>,
 <code>…_namespace_used_bytes</code>, and <code>…_namespace_budget_bytes</code>
 where a budget is set) carry a <code>namespace</code> label; nothing
-else does. The default namespace is the empty string, and a backend
-that turns labels into dimensions drops a series whose dimension value
-is empty &mdash; CloudWatch does &mdash; so the default namespace is
+else does. The default namespace is the empty string, and a collector
+that turns labels into dimensions leaves out a series whose dimension
+value is empty &mdash; the CloudWatch Agent&rsquo;s output below does
+&mdash; so the default namespace is
 read from the node-wide <code>nanocached_node_entries</code> and
 <code>…_memory_used_bytes</code> instead, and the labelled series
 cover the named namespaces. Each named namespace is one more series
@@ -94,7 +97,10 @@ are not described here.</p>
 
 <h2 id="ec2">Single node on EC2 with the CloudWatch Agent</h2>
 <p>Start from the <a href="deployment-ec2-single.html">single-node EC2
-guide</a>: same network, same security groups, same instance. The
+guide</a>: same network, same security groups, same instance (the run
+behind this section built the node subnet and the node group only,
+and drove the load from the node itself; the application tier adds
+nothing to the metrics path). The
 agent runs on the node, scrapes <code>127.0.0.1:9356</code> every
 15&nbsp;s and publishes each scrape to CloudWatch Logs in the embedded
 metric format, from which CloudWatch extracts the metrics. Nothing
@@ -174,8 +180,9 @@ JSON
   per-namespace series a <code>namespace</code> dimension beside
   <code>host</code> and everything else <code>host</code> alone; the
   second entry names its series explicitly rather than matching
-  <code>^nanocached_node_</code>, which would also catch the namespace
-  series and publish them a second time without their label. The
+  <code>^nanocached_node_</code>, which would also match the namespace
+  series (what a series matched by two declarations becomes was not
+  tried here). The
   <code>host</code> label is added by the agent and is the
   instance&rsquo;s private DNS name
   (<code>ip-10-0-0-65.ec2.internal</code> in this run); the
@@ -195,9 +202,10 @@ JSON
   enables it, so it is back after a reboot without further
   arrangement.</li>
 </ul>
-<p>From launch to a running agent took the same 80&nbsp;s as the plain
-node (cloud-init reported <q>Up 79.77 seconds</q>; the agent&rsquo;s
-own start time was one second earlier). The package that installed was
+<p>From launch to a running agent took about 80&nbsp;s (cloud-init
+reported <q>Up 79.77 seconds</q>; the agent&rsquo;s own start time was
+one second earlier), about ten seconds more than the plain node in the
+EC2 guide. The package that installed was
 <code>amazon-cloudwatch-agent-1.300071.0</code>.</p>
 
 <h3>Verifying</h3>
@@ -212,15 +220,17 @@ own start time was one second earlier). The package that installed was
 <code>/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log</code>;
 the <code>up</code> series is not forwarded, so the file is the place
 to look when a metric stays flat.</p>
-<p>From anywhere with the CLI, the metrics are readable in the same
-minute the agent starts. The host dimension is the value the agent
-attached:</p>
+<p>From anywhere with the CLI, the first datapoints carry the minute
+the agent started in (how soon after that they became readable was not
+timed in this run; the first query, six minutes later, found all of
+them). The host dimension is the value the agent attached:</p>
 <pre><code>aws cloudwatch list-metrics --namespace nanocached \
   --query 'Metrics[].[MetricName,Dimensions[].Value|join(`,`,@)]' --output text
 HOST=ip-10-0-0-65.ec2.internal
 aws cloudwatch get-metric-statistics --namespace nanocached \
   --metric-name nanocached_node_entries --dimensions Name=host,Value=$HOST \
   --start-time $(date -u -v-10M +%Y-%m-%dT%H:%M:%SZ) --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  # GNU date: $(date -u -d '-10 min' +%Y-%m-%dT%H:%M:%SZ)
   --period 60 --statistics Maximum SampleCount \
   --query 'sort_by(Datapoints,&amp;Timestamp)[].[Timestamp,Maximum,SampleCount]' --output text</code></pre>
 <p>In this run the node was given a known load first (200 keys
@@ -253,9 +263,12 @@ checked against <code>/metrics</code>:</p>
   carries on scraping across a restart of the node, and the restart is
   visible as the gauges dropping, not as a gap.</li>
 </ul>
-<p>Each scrape is also one event in the log group, which is where the
-retention cost sits: a document with the fourteen values, the labels
-and the metric declarations, four times a minute per node. Set a
+<p>Each scrape also lands in the log group as a few events, split by
+metric type and dimension set (one document for the gauges under
+<code>host</code>, one for the counters, one per named namespace),
+each carrying its values, the labels and the metric declarations,
+four times a minute per node &mdash; which is where the retention cost
+sits. Set a
 retention period on <code>nanocached-metrics</code> once the metrics
 are confirmed; the metrics themselves are kept by CloudWatch on its
 own schedule and do not depend on the log events staying.</p>
