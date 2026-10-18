@@ -35,8 +35,8 @@ segments of a deployment are encrypted. This page says what each one
 covers, why a node&rsquo;s certificate must name its IP address, how to
 mint and distribute self-signed certificates on AWS, and how to rotate
 them &mdash; then applies all of it to the four AWS shapes, single-node
-EC2, clustered EC2, ECS and EKS, each built, checked and torn down
-exactly as shown.</p>
+EC2, clustered EC2, ECS and EKS, and to the proxy tier on ECS, each
+built, checked and torn down exactly as shown.</p>
 
 <h2 id="segments">What each flag encrypts</h2>
 <p>Every process accepts connections, and most of them also dial out.
@@ -47,8 +47,11 @@ connection is closed. <code>--tls-ca</code> (a PEM file of one or more
 CA certificates) turns on TLS for everything the process <em>dials</em>,
 trusting only those certificates &mdash; not the system trust store,
 since a private cluster&rsquo;s certificates are not publicly issued.
-The two are independent, and a process with only one of them set warns
-at start-up that the other direction is plaintext. The SDKs take the
+The two are independent. A node or a discovery server with only one
+of them set warns at start-up that the other direction is plaintext;
+the proxy does not, so a proxy&rsquo;s flags have to be checked by
+reading its task definition or unit, and what a half-configured proxy
+looks like from outside is described in the proxy section below. The SDKs take the
 same two pieces as options: <code>tls</code> and, for anything that is
 not publicly issued, <code>ca</code>. There are no client certificates:
 a peer is authenticated by the shared secret, and TLS adds
@@ -535,10 +538,14 @@ unit and with <code>systemctl enable --now nanocached-node</code> at
 the end. Both launch as in the cluster guide, the node now also with
 a fixed address (<code>--private-ip-address 10.0.0.12</code>).</p>
 <p><strong>Verifying</strong> adds one line to the cluster
-guide&rsquo;s checks on the seed &mdash; the count of half-configured
-TLS warnings in both journals, which must be zero, since a process
-with only one direction of TLS configured says so at start-up and
-then runs:</p>
+guide&rsquo;s checks on the seed &mdash; a count of <code>WARN
+TLS</code> lines in both journals. The pattern matches two kinds of
+line: the start-up warning a node or discovery prints when only one
+direction of TLS is configured, and a <code>WARN TLS handshake</code>
+line any process prints per connection whose handshake failed. Right
+after a start the count must be zero; later, the only lines should be
+handshake failures from your own negative checks, naming their
+address:</p>
 <pre><code>aws ssm send-command --instance-ids $SEED_ID --document-name AWS-RunShellScript \
   --parameters 'commands=["systemctl is-active nanocached-discovery nanocached-node",
     "curl -s http://127.0.0.1:9357/metrics | grep ^nanocached_discovery_members",
@@ -961,6 +968,180 @@ and a rollout of three needs the fourth slot.</p>
 <p><strong>Teardown</strong> is the EKS guide&rsquo;s: the namespace
 takes the Secrets with it, and <code>eksctl delete cluster</code>
 the rest.</p>
+
+<h2 id="proxy">The proxy tier, with TLS</h2>
+<p>This is the <a href="deployment-proxy.html">proxy tier</a> as that
+guide runs it &mdash; a third ECS service beside discovery and node;
+on EKS a third Deployment, described and not run &mdash; with both of
+the proxy&rsquo;s sides encrypted. The proxy terminates TLS from the
+applications (<code>--tls-cert/--tls-key</code>) and dials discovery
+and every node over TLS (<code>--tls-ca</code>), and it is addressed
+the way nodes are: it registers the IP it dialled discovery from, the
+SDKs in proxy mode receive that IP in the proxy list and verify the
+proxy&rsquo;s certificate against it. So a proxy task gets the same
+init container as a node task, minting a leaf for its own address with
+no extra names, and the same three flags. The cluster below is the
+<a href="#ecs">ECS shape above</a> with the proxy guide&rsquo;s two
+security-group rules added, built from an empty account, checked from
+an application server in proxy mode, scaled, redeployed and torn
+down.</p>
+<p><strong>The task definition</strong> is the node&rsquo;s from the
+ECS section with the proxy guide&rsquo;s container in place of the
+node&rsquo;s: image, ports 8358 and 9358, <code>startPeriod: 30</code>,
+no <code>--max-memory</code>, and the three flags appended to its
+command. The init container, its secrets, the volume and the
+<code>dependsOn</code> are identical, with <code>TLS_EXTRA_SAN</code>
+empty. The service is created exactly as in the proxy guide.</p>
+<p><strong>Verifying.</strong> The service was stable 66&nbsp;s after
+<code>create-service</code>, one task per zone, each with a
+<code>minted a certificate for</code> line and exit code 0 on its
+init; discovery&rsquo;s <code>nanocached_discovery_proxies</code>
+read 2. From the application server, the SDK is configured as in the
+proxy guide plus the trust file:</p>
+<pre><code>client = await NanocachedClient.connect(
+    [("disc.nanocached.local", 8357)],
+    auth_secret="change-me",
+    via_proxy=True,
+    tls=True,
+    ca="/etc/nanocached-trust.pem",
+)</code></pre>
+<p>Run that way with the Python SDK at 0.4.6: 2,000 keys written
+through a proxy with <code>set_many</code> and read back complete,
+and <code>incr</code> through a proxy answered 6 for a counter set to
+5. The nodes accept only TLS, so a write that succeeds through the
+proxy is the proof that the proxy&rsquo;s side towards the nodes is
+encrypted; the proxy&rsquo;s own metrics showed
+<code>nanocached_proxy_backend_connections 2</code> on the proxy the
+client had picked, and each node&rsquo;s
+<code>nanocached_node_connections</code> read 1, that proxy. The
+SDK&rsquo;s negative cases (an unrelated <code>ca</code>, no
+<code>ca</code>, plaintext) fail at discovery before any proxy is
+involved, so the proxy&rsquo;s own port was checked directly:</p>
+<pre><code>for ip in $PROXY_IPS; do
+  echo | openssl s_client -connect $ip:8358 -CAfile trust.pem 2&gt;/dev/null \
+    | openssl x509 -noout -issuer -ext subjectAltName       # issuer=CN=nanocached CA / IP Address:10.1.0.206
+  echo | openssl s_client -connect $ip:8358 -CAfile unrelated.pem 2&gt;/dev/null \
+    | grep 'Verify return code'                               # 21 (unable to verify the first certificate)
+  printf 'A 9\nchange-me' | nc $ip 8358 | od -c | head -1    # 025 003 003 ... : a TLS alert, then closed
+done</code></pre>
+<p><strong>Scaling and redeploying</strong> were run under a long-lived
+client: one connection in proxy mode doing a read every 10&nbsp;ms
+for 150&nbsp;s and counting failures. Scaling the service from two
+tasks to one was stable in 18&nbsp;s; the stopped task logged its
+drain, <code>nanocached_discovery_proxies</code> read 1, the survivor
+held the client&rsquo;s connection, and the client finished its 150 s
+with 11,782 reads and no failure (which of the two tasks it had been
+on at the start was not recorded). Back to two tasks took 34&nbsp;s.
+Then a forced deployment of the service, which is how a proxy&rsquo;s
+leaf is rotated: stable after 113&nbsp;s, two new tasks with two new
+leaves, and a client that had been connected to a task that no longer
+existed finished its 150&nbsp;s with 11,969 reads and no failure,
+having reconnected to a proxy presenting a certificate it had never
+seen, verified by the same CA. The 2,000 keys read back afterwards.</p>
+<p><strong>What a half-configured proxy looks like</strong> was run on
+purpose, as a one-off task from a copy of the definition with
+<code>--tls-ca</code> removed, since the proxy prints no warning
+about it. From the application&rsquo;s side the proxy is fine:
+<code>openssl s_client</code> verifies its certificate, and
+<code>/healthz</code> answers 200. But it announces itself to
+discovery in plaintext, discovery&rsquo;s log gains a <code>WARN TLS
+handshake with 10.1.1.52 failed: received corrupt message</code> line
+every couple of seconds (41 in the 80&nbsp;s the task ran), the proxy
+never obtains a roster, so <code>/readyz</code> stays 503 and ECS marks
+the task <code>UNHEALTHY</code>, and its own log says only
+<code>roster refresh failed: connection closed mid-frame</code> and
+<code>proxy announce &hellip; failed</code>, never the word TLS. A
+service would keep replacing such a task; the health check catches
+it, and discovery&rsquo;s log names it. The node logs carried no TLS
+failure at any point in the run (the only lines mentioning TLS were
+<code>closed without TLS close_notify</code> at <code>INFO</code>, a
+peer going away without the closing handshake); every <code>WARN TLS
+handshake</code> line in the log group named either the application
+server or that one-off task.</p>
+<p><strong>On EKS</strong>, the proxy guide&rsquo;s Deployment with
+the EKS section&rsquo;s init container, Secrets, volume and flags
+&mdash; the node Deployment above with the proxy&rsquo;s container,
+ports and resources. Not run on a cluster, like the proxy
+guide&rsquo;s own EKS section; the pieces it is made of were:</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy
+  namespace: nanocached
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: nanocached-proxy}
+  template:
+    metadata:
+      labels: {app: nanocached-proxy}
+    spec:
+      terminationGracePeriodSeconds: 45
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: nanocached-proxy}
+      initContainers:
+        - name: tls-init
+          image: public.ecr.aws/docker/library/alpine:3.21
+          command: ["sh", "-c"]
+          args:
+            - |
+                set -eu
+                apk add --no-cache openssl &gt;/dev/null
+                [ -n "${POD_IP:-}" ] || { echo "tls-init: POD_IP is not set" &gt;&amp;2; exit 1; }
+                cd /tls
+                cp /tls-ca/ca.pem ca.pem
+                openssl req -new -newkey rsa:2048 -nodes -keyout key.pem -out leaf.csr -subj "/CN=nanocached-$POD_IP" 2&gt;/dev/null
+                printf 'subjectAltName=IP:%s%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' "$POD_IP" "${TLS_EXTRA_SAN:-}" &gt; leaf.ext
+                openssl x509 -req -in leaf.csr -CA /tls-signing/signing-cert.pem -CAkey /tls-signing/signing-key.pem -days 365 -extfile leaf.ext -out cert.pem 2&gt;/dev/null
+                rm -f leaf.csr leaf.ext
+                chown 10001:10001 ca.pem cert.pem key.pem; chmod 644 ca.pem cert.pem; chmod 600 key.pem
+                echo "tls-init: minted a certificate for $POD_IP"
+          env:
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: TLS_EXTRA_SAN
+              value: ""
+          volumeMounts:
+            - {name: tls, mountPath: /tls}
+            - {name: tls-ca, mountPath: /tls-ca, readOnly: true}
+            - {name: tls-signing, mountPath: /tls-signing, readOnly: true}
+      containers:
+        - name: proxy
+          image: ghcr.io/nanocached/nanocached-proxy@sha256:2104f8263c6f909d734fb6302a74bbedd5d583c14fb73713268ef4627fad5337
+          args: ["--host", "0.0.0.0", "--port", "8358", "--discovery", "disc:8357",
+                 "--drain-timeout", "20", "--metrics-port", "9358",
+                 "--tls-cert", "/tls/cert.pem", "--tls-key", "/tls/key.pem", "--tls-ca", "/tls/ca.pem"]
+          envFrom:
+            - secretRef: {name: nanocached-auth}
+          ports:
+            - {containerPort: 8358, name: data}
+            - {containerPort: 9358, name: ops}
+          volumeMounts:
+            - {name: tls, mountPath: /tls, readOnly: true}
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {memory: 512Mi}
+      volumes:
+        - name: tls
+          emptyDir: {medium: Memory}
+        - name: tls-ca
+          secret: {secretName: nanocached-tls-ca}
+        - name: tls-signing
+          secret: {secretName: nanocached-tls-signing}</code></pre>
+<p><strong>Teardown</strong> is the proxy guide&rsquo;s order
+(proxy first, so its drain runs while the nodes are there) plus the
+parameters, as in the ECS section.</p>
 
 </main>
 
