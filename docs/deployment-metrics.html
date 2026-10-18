@@ -60,8 +60,9 @@ on EKS below, an instant query returned each pod&rsquo;s exact
 cumulative value &mdash; and <code>rate()</code> or
 <code>increase()</code> does the rest, extrapolating across the window
 you give it (an <code>increase()</code> over five minutes answered
-2,369 for 2,100 writes that fell inside the window, which is the
-function working as designed, not a lost or doubled write). A
+2,369 and 2,248 on two pods that had each taken exactly 2,100 writes
+inside the window, which is the function working as designed, not a
+lost or doubled write). A
 CloudWatch-style backend stores
 statistics per period, and the collector decides what number it hands
 over for a counter &mdash; the cumulative value, or the increase since
@@ -99,8 +100,8 @@ the same instance or in the same task scraping
 do; a central scraper is the alternative, reaching the port through
 the security-group rule the shape guides already carry (the
 operations port from inside the VPC, nothing wider) &mdash; on EKS the
-Prometheus pod is that scraper, and the cluster&rsquo;s own security
-groups already keep the port to pods.</p>
+Prometheus pod is that scraper, inside the pod network the EKS guide
+describes as reachable from pods and from nothing outside.</p>
 <p>The collectors this page covers are the ones whose output is a
 service you can read back from the command line: the CloudWatch Agent
 (EC2, below), the AWS Distro for OpenTelemetry collector (ECS, below)
@@ -692,8 +693,7 @@ kubectl -n monitoring rollout status deploy/prometheus</code></pre>
   three <code>target_label</code> rules are what the series carry
   afterwards: <code>app</code> to tell nodes from discovery,
   <code>pod</code> as the per-instance identity, <code>node</code> for
-  the worker it runs on (the zone can be added the same way from the
-  node&rsquo;s labels if you want it).</li>
+  the worker it runs on.</li>
   <li><strong>RBAC</strong> is a <code>Role</code> in the
   <code>nanocached</code> namespace, not a <code>ClusterRole</code>: the
   job only lists pods there. Scraping a second namespace means a
@@ -723,10 +723,10 @@ same thing the UI shows):</p>
 # three activeTargets, "health": "up", labels app/pod/node, lastScrape a few seconds ago
 kubectl -n nanocached run curl --rm -it --image=curlimages/curl --restart=Never -- \
   -sG http://prometheus.monitoring:9090/api/v1/query --data-urlencode 'query=sum by (app) (nanocached_node_entries)'</code></pre>
-<p>(Pass PromQL through <code>--data-urlencode</code>; a query pasted
-into the URL breaks on its first brace.) In this run all three targets
-were up with their first scrape done 22&ndash;25&nbsp;s after the
-manifest was applied, each scrape taking 1&ndash;4&nbsp;ms, and
+<p>(Pass PromQL through <code>--data-urlencode</code>; its braces and
+quotes need URL-encoding.) In this run all three targets
+were up and had been scraped within 25&nbsp;s of the manifest being
+applied, each scrape taking 1&ndash;4&nbsp;ms, and
 <code>count_over_time(up{job="nanocached"}[1m])</code> read 4 per
 target. The cluster was then given the same known load as on ECS
 (2,000 keys written through <code>disc</code>, the same 2,000 read
@@ -762,22 +762,25 @@ pod</code> on one node pod:</p>
   no <code>up == 0</code> sample was recorded for it in this run (a
   pod that takes longer to become ready would show one per scrape until
   it does).</li>
-  <li>The deleted pod kept answering scrapes while it drained
-  (<code>up</code> 1 for about 30&nbsp;s after the delete), then its
-  series left instant queries within the next scrape interval &mdash;
-  Prometheus marks a vanished target&rsquo;s series stale, so a graph
+  <li>The deleted pod&rsquo;s <code>up</code> stayed 1 in instant
+  queries until about 33&nbsp;s after the delete and then the series
+  was gone; no <code>up == 0</code> sample was ever recorded for it
+  (whether it answered scrapes while draining or left service
+  discovery before a scrape could fail is not distinguishable from
+  that). Prometheus marks a vanished target&rsquo;s series stale, so a
+  graph
   of <code>nanocached_node_entries</code> by <code>pod</code> ends the
   old line and starts a new one, with no manual cleanup;
   <code>last_over_time(…[5m])</code> still finds the old pod&rsquo;s
   last value for anyone who needs it.</li>
   <li><code>sum by (app) (nanocached_node_entries)</code> read 4,200
-  before, during and after: the leaver handed its entries to the
-  survivor and the joiner received its share, which is the handoff the
-  EKS guide describes. The joiner&rsquo;s <code>…_sets_total</code>
-  started at 0 (see the ECS section on why), and
-  <code>min_over_time(nanocached_discovery_members[3m])</code> stayed
-  at 2 across the event &mdash; at the scrape instants the leave and
-  the join overlapped.</li>
+  before and after (not sampled during): the surviving pod stayed at
+  2,100 (under a replication factor of 2 with two pods it already held
+  every key) and the joiner read 2,100 from its first samples. The
+  joiner&rsquo;s <code>…_sets_total</code> started at 0 (see the ECS
+  section on why), and
+  <code>min_over_time(nanocached_discovery_members[3m])</code> never
+  read below 2 at a scrape instant across the event.</li>
 </ul>
 
 <h3>Teardown</h3>
