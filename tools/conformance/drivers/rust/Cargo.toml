@@ -1,0 +1,22 @@
+[package]
+name = "conformance"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "conformance"
+path = "src/main.rs"
+
+[[bin]]
+name = "scenario"
+path = "src/bin/scenario.rs"
+
+[dependencies]
+nanocached = { path = "../../../../sdk/rust" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+sha2 = "0.10"
+base64 = "0.22"
+futures = "0.3"
+
+[workspace]
