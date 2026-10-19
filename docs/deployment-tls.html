@@ -47,11 +47,10 @@ connection is closed. <code>--tls-ca</code> (a PEM file of one or more
 CA certificates) turns on TLS for everything the process <em>dials</em>,
 trusting only those certificates &mdash; not the system trust store,
 since a private cluster&rsquo;s certificates are not publicly issued.
-The two are independent. A node or a discovery server with only one
-of them set warns at start-up that the other direction is plaintext;
-the proxy does not, so a proxy&rsquo;s flags have to be checked by
-reading its task definition or unit, and what a half-configured proxy
-looks like from outside is described in the proxy section below. The SDKs take the
+The two are independent. A process with only one of them set warns at
+start-up that the other direction is plaintext, and what a
+half-configured proxy looks like from outside is described in the
+proxy section below. The SDKs take the
 same two pieces as options: <code>tls</code> and, for anything that is
 not publicly issued, <code>ca</code>. There are no client certificates:
 a peer is authenticated by the shared secret, and TLS adds
@@ -1044,8 +1043,7 @@ having reconnected to a proxy presenting a certificate it had never
 seen, verified by the same CA. The 2,000 keys read back afterwards.</p>
 <p><strong>What a half-configured proxy looks like</strong> was run on
 purpose, as a one-off task from a copy of the definition with
-<code>--tls-ca</code> removed, since the proxy prints no warning
-about it. From the application&rsquo;s side the proxy is fine:
+<code>--tls-ca</code> removed. From the application&rsquo;s side the proxy is fine:
 <code>openssl s_client</code> verifies its certificate, and
 <code>/healthz</code> answers 200. But it announces itself to
 discovery in plaintext, discovery&rsquo;s log gains a <code>WARN TLS

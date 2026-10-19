@@ -11,6 +11,8 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-10-19
+
 ### Fixed
 
 - `getMany`/`getManyBytes` in cluster mode now read a key from its next
@@ -412,6 +414,7 @@ without a deprecation cycle and are listed below.
   release history for earlier changes).
 
 [Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.5...HEAD
+[0.4.7]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.6...sdk/java/v0.4.7
 [0.4.6]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.5...sdk/java/v0.4.6
 [0.4.5]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.4...sdk/java/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.2...sdk/java/v0.4.4

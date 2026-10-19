@@ -10,6 +10,8 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-10-19
+
 ### Fixed
 
 - A request that fails inside the connection's read loop (a desynced or
@@ -426,6 +428,7 @@ changes ship without a deprecation cycle and are listed below.
   earlier changes).
 
 [Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.5...HEAD
+[0.4.7]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.6...sdk/dotnet/v0.4.7
 [0.4.6]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.5...sdk/dotnet/v0.4.6
 [0.4.5]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.4...sdk/dotnet/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.2...sdk/dotnet/v0.4.4
