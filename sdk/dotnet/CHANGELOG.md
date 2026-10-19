@@ -12,6 +12,12 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- A request that fails inside the connection's read loop (a desynced or
+  over-large reply, a reset mid-response) now sees the connection marked
+  closed before its own failure is delivered. The failure used to be
+  delivered first, so the client's redial step could run before `Close()`
+  and reuse the dying connection, whose drain then rejected the retry with
+  a generic "connection closed" instead of the read's own reason (#633).
 - `GetManyAsync`/`GetManyBytesAsync` in cluster mode now read a key from
   its next owner when its primary cannot be reached at the connection
   level, the same walk a single `GetAsync` already did (#623, the .NET

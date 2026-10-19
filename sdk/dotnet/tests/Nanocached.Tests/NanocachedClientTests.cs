@@ -1232,6 +1232,47 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task AReadFailureMarksTheConnectionClosedBeforeItsWaiterSeesTheFailure()
+    {
+        // The read loop fails the oldest waiter with the read's own reason
+        // and then closes the connection. The waiter's continuation runs on
+        // another thread, and the client's redial step reads IsClosed first
+        // — so IsClosed must already be true by the time the waiter can
+        // observe the failure, or the retry reuses the dying connection and
+        // is rejected by Close()'s drain with the generic "connection
+        // closed" instead (this is what the flaky message in
+        // MultiGetResponseExceedingTheCumulativeByteBoundPoisonsTheConnection
+        // was). Checked here on a bare Connection, many times, since the
+        // window is a thread hand-off.
+        long defaultBound = Connection.MaxMultiGetResponseBytes;
+        Connection.MaxMultiGetResponseBytes = 3;
+        try
+        {
+            using var node = new MockNode();
+            using (NanocachedClient seed = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port)))
+            {
+                await seed.SetAsync("a", "xy");
+                await seed.SetAsync("b", "zw");
+            }
+            byte[][] keys = { Encoding.UTF8.GetBytes("a"), Encoding.UTF8.GetBytes("b") };
+            for (int i = 0; i < 50; i++)
+            {
+                using var raw = new System.Net.Sockets.TcpClient();
+                await raw.ConnectAsync("127.0.0.1", node.Port);
+                var connection = new Connection(raw.GetStream());
+                ConnectionLostException error = await Assert.ThrowsAsync<ConnectionLostException>(
+                    () => connection.MultiGetAsync(Array.Empty<byte>(), keys));
+                Assert.True(connection.IsClosed, $"iteration {i}: the waiter saw the failure before the connection was marked closed");
+                Assert.Contains("exceeds", error.Message);
+            }
+        }
+        finally
+        {
+            Connection.MaxMultiGetResponseBytes = defaultBound;
+        }
+    }
+
+    [Fact]
     public async Task MultiGetResponseJustUnderTheCumulativeByteBoundStillSucceeds()
     {
         // Companion to MultiGetResponseExceedingTheCumulativeByteBoundPoisonsTheConnection:
