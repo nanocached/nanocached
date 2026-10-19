@@ -936,14 +936,25 @@ internal sealed class Connection
                 // retry layer only redials on ConnectionLostException — a
                 // raw EndOfStreamException (server FIN landing while a
                 // request was in flight) used to escape both.
-                if (_pending.TryDequeue(out var failed))
+                //
+                // Order matters: the connection is marked closed *before*
+                // the failed waiter is completed. The waiter's continuation
+                // runs on another thread (RunContinuationsAsynchronously),
+                // and NanocachedClient's redial check reads IsClosed as
+                // its first step — completing the waiter first let that
+                // check win the race, reuse this dying connection for the
+                // retry, and have Close()'s drain reject the retry with the
+                // generic "connection closed" instead of this read's own
+                // reason (issue #633).
+                bool dequeued = _pending.TryDequeue(out var failed);
+                Exception cause = _closeReason ?? error;
+                Close();
+                if (dequeued)
                 {
-                    Exception cause = _closeReason ?? error;
                     failed.Tcs.TrySetException(cause is ConnectionLostException
                         ? cause
                         : new ConnectionLostException($"nanocached: connection failed: {cause.Message}", cause));
                 }
-                Close();
                 return;
             }
 
