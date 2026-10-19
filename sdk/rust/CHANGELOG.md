@@ -6,6 +6,8 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-10-19
+
 ### Fixed
 
 - `get_many`/`get_many_bytes` in cluster mode now read a key from its

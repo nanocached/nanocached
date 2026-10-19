@@ -10,6 +10,8 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-10-19
+
 ### Fixed
 
 - `GetMany`/`GetManyBytes` in cluster mode now read a key from its next
@@ -353,6 +355,7 @@ SDK line, with no code change relative to 0.1.0.
 
 Pipeline-validation release of the first Go SDK.
 
+[0.4.7]: https://github.com/nanocached/nanocached/compare/sdk/go/v0.4.6...sdk/go/v0.4.7
 [0.4.6]: https://github.com/nanocached/nanocached/compare/sdk/go/v0.4.5...sdk/go/v0.4.6
 [0.4.5]: https://github.com/nanocached/nanocached/compare/sdk/go/v0.4.4...sdk/go/v0.4.5
 [0.4.4]: https://github.com/nanocached/nanocached/compare/sdk/go/v0.4.2...sdk/go/v0.4.4
