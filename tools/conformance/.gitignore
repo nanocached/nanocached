@@ -1,0 +1,13 @@
+# per-run output and build products of the drivers
+/results/
+/drivers/go/conf-go
+/drivers/java/classes/
+/drivers/dotnet/bin/
+/drivers/dotnet/obj/
+/drivers/rust/conformance
+/drivers/rust/target/
+__pycache__/
+/drivers/go/conf-go-scenario
+/drivers/dotnet-scenario/bin/
+/drivers/dotnet-scenario/obj/
+/drivers/rust/scenario
