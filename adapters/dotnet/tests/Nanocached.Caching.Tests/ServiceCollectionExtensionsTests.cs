@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
@@ -210,6 +212,54 @@ public sealed class ServiceCollectionExtensionsTests
         Assert.Equal(value, await cache.GetStringAsync("small"));
         int stored = node.EntryFor(NanocachedCacheOptions.DefaultNamespace, "small"u8.ToArray())!.Value.Length;
         Assert.True(stored >= value.Length, $"value under the threshold should be stored uncompressed ({stored})");
+    }
+
+    [Theory]
+    [InlineData("10.0.0.1:8357", "10.0.0.1", 8357)]
+    [InlineData("node.internal:8357", "node.internal", 8357)]
+    [InlineData("[::1]:8357", "::1", 8357)]
+    [InlineData("[fe80::1%eth0]:8357", "fe80::1%eth0", 8357)]
+    public void Addresses_parse_to_host_and_port_with_IPv6_brackets_stripped(string address, string host, int port)
+    {
+        Assert.Equal((host, port), ServiceCollectionExtensions.ParseAddress(address));
+    }
+
+    [Theory]
+    [InlineData("no-port")]
+    [InlineData("host:")]
+    [InlineData(":8357")]
+    [InlineData("host:abc")]
+    [InlineData("[::1]")]
+    public void Malformed_addresses_are_rejected(string address)
+    {
+        Assert.Throws<ArgumentException>(() => ServiceCollectionExtensions.ParseAddress(address));
+    }
+
+    [Fact]
+    public async Task A_bracketed_IPv6_loopback_address_connects()
+    {
+        if (!Socket.OSSupportsIPv6) return; // nothing to connect to on this host
+        MockNode node;
+        try
+        {
+            node = new MockNode(listenOn: IPAddress.IPv6Loopback);
+        }
+        catch (SocketException)
+        {
+            return; // no ::1 on this host (a container with IPv6 off)
+        }
+        using (node)
+        {
+            var services = new ServiceCollection();
+            services.AddNanocachedDistributedCache(options =>
+            {
+                options.Addresses.Add($"[::1]:{node.Port}");
+            });
+            await using ServiceProvider provider = services.BuildServiceProvider();
+            IDistributedCache cache = provider.GetRequiredService<IDistributedCache>();
+            await cache.SetStringAsync("k", "v");
+            Assert.Equal("v", await cache.GetStringAsync("k"));
+        }
     }
 
     [Fact]

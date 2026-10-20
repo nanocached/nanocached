@@ -38,10 +38,10 @@ internal sealed class MockNode : IDisposable
     // presenting this certificate before the wire protocol starts.
     private readonly X509Certificate2? _serverCertificate;
 
-    internal MockNode(X509Certificate2? serverCertificate = null)
+    internal MockNode(X509Certificate2? serverCertificate = null, IPAddress? listenOn = null)
     {
         _serverCertificate = serverCertificate;
-        _listener = new TcpListener(IPAddress.Loopback, 0);
+        _listener = new TcpListener(listenOn ?? IPAddress.Loopback, 0);
         _listener.Start();
         _acceptLoop = Task.Run(AcceptLoopAsync);
     }

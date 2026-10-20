@@ -41,6 +41,25 @@ public sealed class NanocachedDistributedCacheTests
     }
 
     [Fact]
+    public async Task A_key_with_a_lone_surrogate_is_rejected_instead_of_colliding_with_another_key()
+    {
+        using var node = new MockNode();
+        await using ServiceProvider provider = BuildProvider(node);
+        IDistributedCache cache = provider.GetRequiredService<IDistributedCache>();
+
+        // Encoding.UTF8 would turn both into "x\uFFFD": the first key's
+        // value would be served for the second.
+        await cache.SetStringAsync("x\uFFFD", "replacement-char");
+        await Assert.ThrowsAsync<ArgumentException>(() => cache.GetStringAsync("x\uD800"));
+        await Assert.ThrowsAsync<ArgumentException>(() => cache.SetStringAsync("x\uD800", "lone"));
+        await Assert.ThrowsAsync<ArgumentException>(() => cache.RefreshAsync("x\uD801"));
+        await Assert.ThrowsAsync<ArgumentException>(() => cache.RemoveAsync("x\uDC00"));
+        Assert.Throws<ArgumentException>(() => cache.Get("x\uD800"));
+        Assert.Equal("replacement-char", await cache.GetStringAsync("x\uFFFD")); // a well-formed key is untouched
+        Assert.Equal(1, node.SetCount);
+    }
+
+    [Fact]
     public async Task Missing_key_returns_null()
     {
         using var node = new MockNode();
