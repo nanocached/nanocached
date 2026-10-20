@@ -102,6 +102,14 @@ unreachable.</p>
   promoted owner(s) as a put-if-absent handoff (<code>U</code>'s
   trailing <code>A</code> token — see <a href="protocol.html">Protocol</a>),
   so a re-replication racing a newer client write on the receiver can never regress it.
+  While the pass runs, and for 60&nbsp;s after it, each sender also
+  mirrors the client writes it accepts to that promoted owner, as it
+  would to a decommission&rsquo;s entrant: a client keeps its node list
+  for up to 30&nbsp;s after the eviction, and until it refreshes its
+  writes reach only the surviving old owners (the leg to the evicted
+  node fails and is swallowed), so without the mirror the promoted owner
+  kept the copy the pass handed it, missing the write, delete or
+  increment acknowledged meanwhile.
   This runs independently of, and is ordered against, a join in
   progress: a join's sweep of its own dead-copy marks waits for any
   in-flight re-replication to finish first (so it can't reclaim a
@@ -363,6 +371,14 @@ here.</p>
   and removing it would need versioned writes in the server and every
   SDK. Revisit if a versioned write path is adopted for other
   reasons.</li>
+  <li>During a re-replication&rsquo;s forwarding window (the pass and
+  60&nbsp;s after it), a second eviction replaces the window with its
+  own snapshot, so a client still routing by the first eviction&rsquo;s
+  node list can miss the first promoted owner for the rest of its
+  refresh interval; and with R&nbsp;&ge;&nbsp;3 two senders&rsquo;
+  unconditional forwards of one key can interleave at the promoted
+  owner, which is the lagging-forward item above. Accepted: both are the
+  same exposure the join and decommission windows carry.</li>
   <li>Re-replication handoff carries no version: when two survivors hold
   different copies, the first to reach the fresh node is kept, newer or
   not. A version would have to ride on every entry and every SDK write

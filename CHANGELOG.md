@@ -28,6 +28,14 @@ framework adapters at one version, whether or not a component changed.
   client's delete could land after the relayed delete and bring the key
   back on the joiner — seen with two joins a few seconds apart, where
   several old owners send the same key (#690).
+- `nanocached-node` mirrors the client writes it accepts during a
+  re-replication, and for 60 s after it, to the owner the eviction
+  promoted — as unconditional `U`/`u` handoffs, the way a decommission
+  already mirrors them to its entrant. A client keeps its node list for
+  up to 30 s after an eviction (every SDK), so its writes reached the
+  surviving old owners only, and the promoted owner kept the copy the
+  pass had handed it: an acknowledged write, delete or increment was
+  missing on that one owner until the key was written again (#689).
 - `nanocached-node`'s sweep no longer reclaims a marked copy of a key
   the node owns again. A join marks the keys it moves as dead copies for
   the sweep; when that joiner is evicted the keys come back to the node,

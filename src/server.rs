@@ -757,6 +757,10 @@ struct NodeContext {
     /// it, the `M` handler rejects new joins while it is set, and
     /// `/readyz` reports not-ready.
     leaving: Arc<Mutex<Option<LeaveState>>>,
+    /// A re-replication's forwarding window — the writes this node must
+    /// mirror to the owners an eviction newly promoted, during the pass
+    /// and for a grace after it (see `RereplicationForward`).
+    rereplication_forward: Arc<Mutex<Option<RereplicationForward>>>,
     /// Issue #266: a `run_rereplication` in flight, if any — set by
     /// `spawn_or_supersede_rereplication` when `adopt_membership` reports
     /// a ring change that dropped a member (an eviction, or a leave this
@@ -875,6 +879,70 @@ impl LeaveState {
     }
 }
 
+/// The forwarding window of a re-replication: after a ring change dropped
+/// a member, the survivors that re-replicate a key (`rereplication_targets`)
+/// also mirror the concurrent client writes of it to the owner the change
+/// newly promoted, for as long as the pass runs and for `grace` after it.
+/// Without it, a client still routing with the pre-eviction node list
+/// writes only to the surviving old owners (its leg to the evicted one
+/// fails and is swallowed), and the new owner keeps the copy the pass
+/// handed it — the acknowledged write, delete or increment is missing on
+/// that one owner until the key is written again. Every SDK refreshes its
+/// node list after 30 s of staleness; the grace is twice that. Mirrors
+/// `LeaveState` (the decommission's window): same one-shot ring snapshot,
+/// same shared connection per target, same unconditional `U`/`u` frames.
+struct RereplicationForward {
+    /// The ring before the change — who owned each key, so this node can
+    /// tell which keys it is an eligible sender for.
+    before_ring: Arc<HashRing>,
+    /// The ring after it — who owns each key now.
+    after_ring: Arc<HashRing>,
+    replication: usize,
+    /// name → address and name → membership token for every member of
+    /// `after_ring`, from the roster fetched for the pass.
+    addresses: HashMap<String, String>,
+    tokens: HashMap<String, String>,
+    /// One shared forwarding connection per target address, so the
+    /// forward queue keeps a target's writes in order.
+    connections: Mutex<HashMap<String, Arc<AsyncMutex<Option<ClientStream>>>>>,
+    /// Stamped when the pass returns; the window closes `grace` later.
+    completed_at: Option<Instant>,
+    grace: Duration,
+}
+
+impl RereplicationForward {
+    fn forwarding_open(&self) -> bool {
+        self.completed_at
+            .is_none_or(|completed_at| completed_at.elapsed() < self.grace)
+    }
+
+    /// The forward target for member `name` — `None` for a name the
+    /// roster carried no address or token for (skipped, like the pass
+    /// itself skips such a target).
+    fn forward_target(&self, name: &str) -> Option<ForwardTarget> {
+        let addr = self.addresses.get(name)?.clone();
+        let token = self.tokens.get(name)?.clone();
+        let connection = {
+            let mut connections = self
+                .connections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(
+                connections
+                    .entry(addr.clone())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(None))),
+            )
+        };
+        Some(ForwardTarget {
+            addr,
+            connection,
+            token,
+            revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
+        })
+    }
+}
+
 /// Configuration for registering this node with discovery servers (see
 /// `src/bin/nanocached-discovery.rs`). When set, `run` asks to join once
 /// (staged node join) using a random per-process name (node identity decoupled from address) and, once
@@ -971,6 +1039,7 @@ pub(crate) async fn run(
         active_rereplication: Arc::new(Mutex::new(None)),
         ring_history: RingHistory::default(),
         rereplication_tx: rereplication_tx.clone(),
+        rereplication_forward: Arc::new(Mutex::new(None)),
         shutdown_rx: shutdown_rx.clone(),
     });
     // After `node_context`: the sweep judges a marked copy by the ring this
@@ -2605,8 +2674,13 @@ async fn handle_connection(
                             }
 
                             // Decommission drain — see `leave_target_for`.
-                            if let Some(target) = leave_target_for_hashed(node_context, key_hash) {
-                                ForwardBatch::add(&mut leave_batches, target, key.name, value);
+                            for target in handoff_targets_for_hashed(node_context, key_hash) {
+                                ForwardBatch::add(
+                                    &mut leave_batches,
+                                    target,
+                                    key.name.clone(),
+                                    value.clone(),
+                                );
                             }
                         }
 
@@ -2698,21 +2772,21 @@ async fn handle_connection(
                 // `U`, not a plain `S`: until the post-leave roster
                 // publishes, the entrant doesn't own the key yet and
                 // answers `S` with `W`.
-                if let Some(node_context) = &config.node_context
-                    && let Some(target) = leave_target_for(node_context, &key)
-                {
-                    spawn_forward(
-                        &config,
-                        node_context.clone(),
-                        target,
-                        OwnedForwardedWrite::HandoffSet {
-                            key: key.clone(),
-                            value: value.clone(),
-                            ttl,
-                            if_absent: false,
-                        },
-                    )
-                    .await;
+                if let Some(node_context) = &config.node_context {
+                    for target in handoff_targets_for(node_context, &key) {
+                        spawn_forward(
+                            &config,
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::HandoffSet {
+                                key: key.clone(),
+                                value: value.clone(),
+                                ttl,
+                                if_absent: false,
+                            },
+                        )
+                        .await;
+                    }
                 }
 
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
@@ -2847,21 +2921,21 @@ async fn handle_connection(
                 // (the value is this node's own), a write that landed after
                 // the drain snapshot does; `StoredUnchanged` tells them
                 // apart (`Cache::handoff_set`).
-                if matches!(response, Response::Stored)
-                    && let Some(target) = leave_target_for(&node_context, &key)
-                {
-                    spawn_forward(
-                        &config,
-                        node_context.clone(),
-                        target,
-                        OwnedForwardedWrite::HandoffSet {
-                            key: key.clone(),
-                            value: value.clone(),
-                            ttl,
-                            if_absent,
-                        },
-                    )
-                    .await;
+                if matches!(response, Response::Stored) {
+                    for target in handoff_targets_for(&node_context, &key) {
+                        spawn_forward(
+                            &config,
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::HandoffSet {
+                                key: key.clone(),
+                                value: value.clone(),
+                                ttl,
+                                if_absent,
+                            },
+                        )
+                        .await;
+                    }
                 }
 
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
@@ -2925,16 +2999,16 @@ async fn handle_connection(
                 // As for `U`: a delete that found nothing here (`N`) is an
                 // echo or a repeat, and nothing of it is left to leave with
                 // this node.
-                if matches!(response, Response::Deleted)
-                    && let Some(target) = leave_target_for(&node_context, &key)
-                {
-                    spawn_forward(
-                        &config,
-                        node_context.clone(),
-                        target,
-                        OwnedForwardedWrite::HandoffDelete { key: key.clone() },
-                    )
-                    .await;
+                if matches!(response, Response::Deleted) {
+                    for target in handoff_targets_for(&node_context, &key) {
+                        spawn_forward(
+                            &config,
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::HandoffDelete { key: key.clone() },
+                        )
+                        .await;
+                    }
                 }
 
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
@@ -2966,16 +3040,16 @@ async fn handle_connection(
 
                 // Issue #124: see the `S` arm's decommission mirror —
                 // a `u`, not a plain `D`, for the same wrong-node reason.
-                if let Some(node_context) = &config.node_context
-                    && let Some(target) = leave_target_for(node_context, &key)
-                {
-                    spawn_forward(
-                        &config,
-                        node_context.clone(),
-                        target,
-                        OwnedForwardedWrite::HandoffDelete { key: key.clone() },
-                    )
-                    .await;
+                if let Some(node_context) = &config.node_context {
+                    for target in handoff_targets_for(node_context, &key) {
+                        spawn_forward(
+                            &config,
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::HandoffDelete { key: key.clone() },
+                        )
+                        .await;
+                    }
                 }
 
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
@@ -3026,21 +3100,21 @@ async fn handle_connection(
                         }
                     }
 
-                    if let Some(node_context) = &config.node_context
-                        && let Some(target) = leave_target_for(node_context, &key)
-                    {
-                        spawn_forward(
-                            &config,
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::HandoffSet {
-                                key: key.clone(),
-                                value: value.clone(),
-                                ttl,
-                                if_absent: false,
-                            },
-                        )
-                        .await;
+                    if let Some(node_context) = &config.node_context {
+                        for target in handoff_targets_for(node_context, &key) {
+                            spawn_forward(
+                                &config,
+                                node_context.clone(),
+                                target,
+                                OwnedForwardedWrite::HandoffSet {
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                    ttl,
+                                    if_absent: false,
+                                },
+                            )
+                            .await;
+                        }
                     }
                 }
 
@@ -3101,21 +3175,21 @@ async fn handle_connection(
                         }
                     }
 
-                    if let Some(node_context) = &config.node_context
-                        && let Some(target) = leave_target_for(node_context, &key)
-                    {
-                        spawn_forward(
-                            &config,
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::HandoffSet {
-                                key,
-                                value,
-                                ttl,
-                                if_absent: false,
-                            },
-                        )
-                        .await;
+                    if let Some(node_context) = &config.node_context {
+                        for target in handoff_targets_for(node_context, &key) {
+                            spawn_forward(
+                                &config,
+                                node_context.clone(),
+                                target,
+                                OwnedForwardedWrite::HandoffSet {
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                    ttl,
+                                    if_absent: false,
+                                },
+                            )
+                            .await;
+                        }
                     }
                 }
 
@@ -3161,16 +3235,16 @@ async fn handle_connection(
                         }
                     }
 
-                    if let Some(node_context) = &config.node_context
-                        && let Some(target) = leave_target_for(node_context, &key)
-                    {
-                        spawn_forward(
-                            &config,
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::HandoffDelete { key: key.clone() },
-                        )
-                        .await;
+                    if let Some(node_context) = &config.node_context {
+                        for target in handoff_targets_for(node_context, &key) {
+                            spawn_forward(
+                                &config,
+                                node_context.clone(),
+                                target,
+                                OwnedForwardedWrite::HandoffDelete { key: key.clone() },
+                            )
+                            .await;
+                        }
                     }
                 }
 
@@ -7031,6 +7105,22 @@ async fn run_superseding_rereplication(
         }
     }
 
+    // The forwarding window opens with the pass — a later ring change's
+    // pass replaces it with its own, newer, snapshot.
+    *node_context
+        .rereplication_forward
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RereplicationForward {
+        before_ring: Arc::clone(&before_ring),
+        after_ring: Arc::clone(&after_ring),
+        replication,
+        addresses: addresses.clone(),
+        tokens: tokens.clone(),
+        connections: Mutex::new(HashMap::new()),
+        completed_at: None,
+        grace: FORWARDING_GRACE_BASE,
+    });
+
     run_rereplication(
         &node_context,
         &before_ring,
@@ -7044,6 +7134,19 @@ async fn run_superseding_rereplication(
     .await;
 
     state.done.store(true, Ordering::SeqCst);
+    {
+        // Stamp this pass's own window only: a later pass may already
+        // have put its own in the slot.
+        let mut window = node_context
+            .rereplication_forward
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(window) = window.as_mut()
+            && Arc::ptr_eq(&window.after_ring, &after_ring)
+        {
+            window.completed_at = Some(Instant::now());
+        }
+    }
     let mut slot = node_context
         .active_rereplication
         .lock()
@@ -9267,18 +9370,14 @@ fn lingering_clear_targets(node_context: &NodeContext) -> Vec<ForwardTarget> {
         .collect()
 }
 
-/// Issue #124: if a decommission is in flight and this node owned
-/// `key`, returns the forward target for the node that newly enters the
+/// Issue #124: if a decommission is in flight and this node owned the
+/// key, returns the forward target for the node that newly enters the
 /// key's top-R once this node is gone — a concurrent client write must
 /// reach it, or the copy handed over by the drain-out transfer goes
 /// stale the moment discovery publishes the post-leave roster (the
-/// exact mirror of `migration_target_for`'s join-side reasoning).
-fn leave_target_for(node_context: &NodeContext, key: &Key) -> Option<ForwardTarget> {
-    leave_target_for_hashed(node_context, KeyHash::of(key))
-}
-
-/// `leave_target_for` for a key whose hash is already known — see
-/// `wrong_node_hashed`.
+/// exact mirror of `migration_target_for`'s join-side reasoning). Takes
+/// the key's hash — see `wrong_node_hashed`; reached through
+/// `handoff_targets_for`.
 fn leave_target_for_hashed(node_context: &NodeContext, key_hash: KeyHash) -> Option<ForwardTarget> {
     let leaving = node_context
         .leaving
@@ -9313,6 +9412,58 @@ fn leave_clear_targets(node_context: &NodeContext) -> Vec<ForwardTarget> {
         .into_iter()
         .filter_map(|name| leave.forward_target(name))
         .collect()
+}
+
+/// Where a client write of `key` must also go for an eviction's
+/// re-replication in flight (or inside its grace): the owners the ring
+/// change newly promoted that this node is an eligible sender for — see
+/// `RereplicationForward`. An expired window is cleared here, lazily, as
+/// `migration_targets_for` clears an expired handoff slot.
+fn rereplication_targets_for_hashed(
+    node_context: &NodeContext,
+    key_hash: KeyHash,
+) -> Vec<ForwardTarget> {
+    let mut slot = node_context
+        .rereplication_forward
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|window| !window.forwarding_open())
+    {
+        *slot = None;
+    }
+    let Some(window) = slot.as_ref() else {
+        return Vec::new();
+    };
+    rereplication_targets(
+        &window.before_ring,
+        &window.after_ring,
+        key_hash,
+        window.replication,
+        &node_context.name,
+    )
+    .iter()
+    .filter_map(|name| window.forward_target(name))
+    .collect()
+}
+
+/// Every window a client write of `key` must be mirrored through as a
+/// handoff frame (an unconditional `U`, a `u`): the decommission's
+/// entrant (`leave_target_for`) and the re-replication's newly promoted
+/// owners (`rereplication_targets_for_hashed`). Empty when neither is in
+/// flight — the common case.
+fn handoff_targets_for(node_context: &NodeContext, key: &Key) -> Vec<ForwardTarget> {
+    handoff_targets_for_hashed(node_context, KeyHash::of(key))
+}
+
+/// `handoff_targets_for` for a key whose hash is already known.
+fn handoff_targets_for_hashed(node_context: &NodeContext, key_hash: KeyHash) -> Vec<ForwardTarget> {
+    let mut targets: Vec<ForwardTarget> = leave_target_for_hashed(node_context, key_hash)
+        .into_iter()
+        .collect();
+    targets.extend(rereplication_targets_for_hashed(node_context, key_hash));
+    targets
 }
 
 /// Forwards a client's `D` for `key` to `target`, mirroring
@@ -9621,6 +9772,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -9981,6 +10133,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -10074,6 +10227,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -10159,6 +10313,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         });
         let target = Arc::new(ForwardTarget {
@@ -10240,6 +10395,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -10315,6 +10471,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
         let connection = Arc::new(AsyncMutex::new(None));
@@ -10414,6 +10571,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
         let connection = Arc::new(AsyncMutex::new(None));
@@ -10543,6 +10701,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
         let connection = Arc::new(AsyncMutex::new(None));
@@ -10696,6 +10855,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -10847,6 +11007,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -13097,6 +13258,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
         let scope = ClearScope::Namespace(Bytes::from_static(b"users"));
@@ -13366,6 +13528,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -13474,6 +13637,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -13545,6 +13709,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -13634,6 +13799,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -13817,6 +13983,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -14703,6 +14870,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -14836,6 +15004,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -14959,6 +15128,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -15067,6 +15237,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -15150,6 +15321,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -15221,6 +15393,197 @@ mod tests {
         );
     }
 
+    /// A `RereplicationForward` for tests: `dead` was evicted, `me` is the
+    /// surviving old owner of every key and `peer` the owner the change
+    /// promoted (R = 2 over two names), reachable at `peer_addr`.
+    fn rereplication_window(
+        peer_addr: &str,
+        completed_at: Option<Instant>,
+    ) -> RereplicationForward {
+        let mut addresses = HashMap::new();
+        addresses.insert("me".to_string(), "127.0.0.1:1".to_string());
+        addresses.insert("peer".to_string(), peer_addr.to_string());
+        let mut tokens = HashMap::new();
+        tokens.insert("me".to_string(), "tk-me".to_string());
+        tokens.insert("peer".to_string(), "tok-peer".to_string());
+        RereplicationForward {
+            before_ring: Arc::new(HashRing::new(vec!["dead".to_string(), "me".to_string()])),
+            after_ring: Arc::new(HashRing::new(vec!["me".to_string(), "peer".to_string()])),
+            replication: 2,
+            addresses,
+            tokens,
+            connections: Mutex::new(HashMap::new()),
+            completed_at,
+            grace: FORWARDING_GRACE_BASE,
+        }
+    }
+
+    #[test]
+    fn rereplication_targets_for_follow_the_window_and_clear_it_once_the_grace_has_passed() {
+        let node_context = NodeContext {
+            name: "me".to_string(),
+            token: "tk-me".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+        let k = key(b"any");
+
+        // No window: nothing to mirror.
+        assert!(handoff_targets_for(&node_context, &k).is_empty());
+
+        // The pass is running: the promoted owner, as a handoff target.
+        *node_context.rereplication_forward.lock().unwrap() =
+            Some(rereplication_window("127.0.0.1:2", None));
+        let targets = handoff_targets_for(&node_context, &k);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].addr, "127.0.0.1:2");
+        assert_eq!(targets[0].token, "tok-peer");
+        assert!(
+            !targets[0].as_handoff,
+            "a `U`/`u` frame, not a join's relay"
+        );
+        // Each target shares one connection, so forwards stay in order.
+        assert!(Arc::ptr_eq(
+            &targets[0].connection,
+            &handoff_targets_for(&node_context, &k)[0].connection
+        ));
+
+        // Done a moment ago: still open, the clients have not refreshed.
+        *node_context.rereplication_forward.lock().unwrap() =
+            Some(rereplication_window("127.0.0.1:2", Some(Instant::now())));
+        assert_eq!(handoff_targets_for(&node_context, &k).len(), 1);
+
+        // The grace has passed: closed, and the slot is cleared.
+        *node_context.rereplication_forward.lock().unwrap() = Some(rereplication_window(
+            "127.0.0.1:2",
+            Some(Instant::now() - FORWARDING_GRACE_BASE - Duration::from_secs(1)),
+        ));
+        assert!(handoff_targets_for(&node_context, &k).is_empty());
+        assert!(node_context.rereplication_forward.lock().unwrap().is_none());
+
+        // A node that was not an old owner of the key is no sender for it.
+        let other = NodeContext {
+            name: "peer".to_string(),
+            rereplication_forward: Arc::new(Mutex::new(Some(rereplication_window(
+                "127.0.0.1:2",
+                None,
+            )))),
+            ..node_context
+        };
+        assert!(handoff_targets_for(&other, &k).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_survivor_mirrors_client_writes_to_the_owner_an_eviction_promoted() {
+        // After `dead` was evicted, `me` re-replicates its keys to `peer`
+        // (put-if-absent, read as it goes). A client still routing by the
+        // old node list writes to `me` only — its leg to `dead` fails and
+        // is swallowed — so without this mirror `peer` kept whatever the
+        // pass handed it: the write, delete or increment acknowledged here
+        // was missing on that owner until the key was written again.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let node_context = NodeContext {
+            name: "me".to_string(),
+            token: "tk-me".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            rereplication_forward: Arc::new(Mutex::new(Some(rereplication_window(
+                &peer_addr, None,
+            )))),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        // A set, then a delete of the same key.
+        client.write_all(b"S 3 2\nkeyv1D 3\nkey").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"S\nD\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+
+        for _ in 0..500 {
+            if frames.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        peer_task.abort();
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(
+            frames.len(),
+            2,
+            "the write and the delete must reach the promoted owner: {frames:?}"
+        );
+        // An unconditional `U` (no trailing `A`): the client's write is
+        // newer than anything the pass carries.
+        assert_eq!(frames[0], b"U 0 3 2 8\ntok-peerkeyv1");
+        assert_eq!(frames[1], b"u 0 3 8\ntok-peerkey");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn decommission_forwards_handoff_frames_it_receives_to_the_entrant() {
         // A draining node can be handed a key by `U`/`u` rather than `S`/`D`:
@@ -15284,6 +15647,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -15416,6 +15780,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
             latest_published: Arc::new(Mutex::new(None)),
             roster_refresh: Arc::default(),
@@ -15583,6 +15948,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -15737,6 +16103,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -16072,6 +16439,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -16241,6 +16609,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -16335,6 +16704,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx,
         };
 
@@ -16432,6 +16802,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx,
         };
 
@@ -16531,6 +16902,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx,
         };
 
@@ -16674,6 +17046,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx,
         };
 
@@ -16938,6 +17311,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -17143,6 +17517,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -17444,6 +17819,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -17682,6 +18058,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         }
     }
@@ -18056,6 +18433,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
         (node_context, after_ring, pre_completion_ring)
@@ -18449,6 +18827,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
 
@@ -18876,6 +19255,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         }
     }
@@ -19295,6 +19675,7 @@ mod tests {
                     active_rereplication: Arc::new(Mutex::new(None)),
                     ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
+                    rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
@@ -19443,6 +19824,7 @@ mod tests {
                     active_rereplication: Arc::new(Mutex::new(None)),
                     ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
+                    rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
@@ -19579,6 +19961,7 @@ mod tests {
                     active_rereplication: Arc::new(Mutex::new(None)),
                     ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
+                    rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
@@ -19708,6 +20091,7 @@ mod tests {
                     active_rereplication: Arc::new(Mutex::new(None)),
                     ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
+                    rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
@@ -19895,6 +20279,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
         let mut stale = completed_forwarding_slot(&["dead"]);
@@ -20017,6 +20402,7 @@ mod tests {
                     active_rereplication: Arc::new(Mutex::new(None)),
                     ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
+                    rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
@@ -20193,6 +20579,7 @@ mod tests {
                     active_rereplication: Arc::new(Mutex::new(None)),
                     ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
+                    rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
@@ -20391,6 +20778,7 @@ mod tests {
                     active_rereplication: Arc::new(Mutex::new(None)),
                     ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
+                    rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
@@ -20532,6 +20920,7 @@ mod tests {
                     active_rereplication: Arc::new(Mutex::new(None)),
                     ring_history: RingHistory::default(),
                     rereplication_tx: mpsc::channel(1).0,
+                    rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
@@ -21290,6 +21679,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         }
     }
@@ -21547,6 +21937,7 @@ mod tests {
                 active_rereplication: Arc::new(Mutex::new(None)),
                 ring_history: RingHistory::default(),
                 rereplication_tx: mpsc::channel(1).0,
+                rereplication_forward: Arc::new(Mutex::new(None)),
                 shutdown_rx: watch::channel(false).1,
             };
 
@@ -22102,6 +22493,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: shutdown_rx.clone(),
         };
 
@@ -22760,6 +23152,7 @@ mod tests {
             active_rereplication: Arc::new(Mutex::new(None)),
             ring_history: RingHistory::default(),
             rereplication_tx,
+            rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         };
         let revoked = Arc::clone(
