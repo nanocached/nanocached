@@ -15585,6 +15585,79 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_relayed_delete_keeps_the_key_out_when_the_handoff_copy_lands_after_it() {
+        // The receiving side of the race a joiner (or an eviction's newly
+        // promoted owner) sees: an old owner relays a client's delete as
+        // `u` while another sender's transfer, which read the key before
+        // that delete, delivers it put-if-absent (`U … A`) a moment
+        // later. On one node, over the wire, in that order: the delete
+        // answers `N` (nothing held yet), the put-if-absent is a success
+        // for its sender (`S`) but stores nothing, and a read finds the
+        // key absent.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let node_context = NodeContext {
+            name: "entrant".to_string(),
+            token: "tk-entrant".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        // The relayed delete, the late put-if-absent copy, then a read;
+        // each handoff frame carries this node's token (issue #295).
+        let request = b"u 0 3 10\ntk-entrantkeyU 0 3 2 10 A\ntk-entrantkeyv0G 3\nkey";
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"N\nS\nN\n";
+        let mut response = vec![0u8; expected.len()];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut response))
+            .await
+            .expect("three replies within 5 s")
+            .unwrap();
+        assert_eq!(
+            response, expected,
+            "the delete finds nothing, the put-if-absent is acked without storing, the read misses"
+        );
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn decommission_forwards_handoff_frames_it_receives_to_the_entrant() {
         // A draining node can be handed a key by `U`/`u` rather than `S`/`D`:
         // by a lingering joiner's old owner (`ForwardTarget::as_handoff`),
