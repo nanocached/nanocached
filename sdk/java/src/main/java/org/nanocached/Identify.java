@@ -323,7 +323,19 @@ final class Identify {
      * accident of the auth outcome, it's present whether accepted or
      * rejected. */
     private static AuthIdentity readIdentity(InputStream in) throws IOException {
-        byte[] ack = readExactly(in, 3);
+        // A node at its connection limit answers a bare {@code B\n} — two
+        // bytes, then it closes — instead of the three-byte identity.
+        // Read two first so that reply is seen as what it is; a
+        // three-byte read would end short, be taken for a legacy server's
+        // door-slam, retried with the lesser {@code A} forms and reported
+        // as a closed connection. Not an IOException, so the caller's
+        // legacy-signal classification never sees it.
+        byte[] head = readExactly(in, 2);
+        if (head[0] == 'B' && head[1] == '\n') {
+            throw new NanocachedException.ConnectionFailed(
+                    "nanocached: the server is at its connection limit (busy)", null);
+        }
+        byte[] ack = new byte[] {head[0], head[1], readExactly(in, 1)[0]};
         boolean accepted = ack[0] == 'O';
         if (!accepted && ack[0] != 'E') {
             throw new NanocachedException("nanocached: unexpected response to A");

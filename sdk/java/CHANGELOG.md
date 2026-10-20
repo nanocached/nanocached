@@ -13,6 +13,13 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A node at its connection limit, which answers `B` and closes, is
+  reported as busy (`NanocachedException.ConnectionFailed`, naming the
+  limit) after one dial. The two-byte reply used to end the three-byte
+  identity read short, which was taken for a legacy server's door-slam,
+  so the dial was retried with the two lesser `A` forms and came out as
+  a closed connection.
+
 - The error for a namespace, key or value over the request limit names
   the limit ("the server accepts requests of up to 1 MiB") instead of a
   server source constant and file (#734).
