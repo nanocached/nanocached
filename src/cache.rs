@@ -847,10 +847,19 @@ impl Cache {
         if self.handoff_tombstones.len() >= MAX_HANDOFF_TOMBSTONES {
             self.forget_oldest_tombstone();
         }
+        // The key is sliced out of the connection's receive buffer; kept
+        // as is, a tombstone would pin that whole (pipelined) chunk for
+        // its two-minute life — the same reason `insert_into` and
+        // `ensure_namespace` copy theirs. One copy, shared by both
+        // containers.
+        let key = Key::new(
+            Bytes::copy_from_slice(&key.namespace),
+            Bytes::copy_from_slice(&key.name),
+        );
         if self.handoff_tombstones.insert(key.clone(), now).is_none() {
-            self.used_bytes += tombstone_bytes(key);
+            self.used_bytes += tombstone_bytes(&key);
         }
-        self.tombstone_order.push_back((now, key.clone()));
+        self.tombstone_order.push_back((now, key));
         // Re-deletes leave stale items behind the live ones; compact once
         // they are the majority so the order queue stays bounded too.
         if self.tombstone_order.len() > 2 * MAX_HANDOFF_TOMBSTONES {
@@ -1642,6 +1651,9 @@ impl Cache {
         include_marked: bool,
         owned: Option<&dyn Fn(&Key) -> bool>,
     ) -> usize {
+        // Expired tombstones give their charge back on the sweep, not only
+        // when the next handoff delete happens to arrive.
+        self.prune_tombstones(now);
         if self.pending_removal.is_empty() {
             self.pending_removal
                 .extend(self.slots.values().flat_map(|sub_map| {
@@ -3534,6 +3546,43 @@ mod tests {
             cache.used_bytes,
             with_entry - tombstone_bytes(&k) + tombstone_bytes(&key(b"next"))
         );
+    }
+
+    #[test]
+    fn a_tombstone_copies_its_key_out_of_the_receive_buffer_and_the_sweep_prunes_it() {
+        let mut cache = Cache::new(UNBOUNDED);
+        // A key sliced from a larger buffer, as the parser hands it over.
+        let frame = Bytes::from(vec![b'x'; 4096]);
+        let k = Key::new(frame.slice(0..4), frame.slice(10..18));
+        let deleted_at = Instant::now();
+        cache.handoff_delete_at(&k, deleted_at);
+        let stored = cache
+            .handoff_tombstones
+            .keys()
+            .next()
+            .expect("one tombstone");
+        assert_eq!(stored, &k, "the same key");
+        assert!(
+            stored.namespace.as_ptr() != k.namespace.as_ptr()
+                && stored.name.as_ptr() != k.name.as_ptr(),
+            "the tombstone must not share the frame's allocation"
+        );
+        let charged = cache.used_bytes;
+        assert_eq!(charged, tombstone_bytes(&k));
+        // Not yet expired: a sweep leaves it.
+        cache.sweep_at(
+            deleted_at + HANDOFF_TOMBSTONE_TTL - Duration::from_secs(1),
+            true,
+            None,
+        );
+        assert_eq!(cache.handoff_tombstones.len(), 1);
+        assert_eq!(cache.used_bytes, charged);
+        // Expired: the sweep prunes it and gives the charge back, with no
+        // handoff delete needed to trigger that.
+        cache.sweep_at(deleted_at + HANDOFF_TOMBSTONE_TTL, true, None);
+        assert!(cache.handoff_tombstones.is_empty());
+        assert!(cache.tombstone_order.is_empty());
+        assert_eq!(cache.used_bytes, 0);
     }
 
     #[test]
