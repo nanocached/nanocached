@@ -96,9 +96,16 @@ which is why they are three services with three desired counts:</p>
 <table>
   <tr><th>role</th><th>count is set by</th><th>rule of thumb</th></tr>
   <tr><td>discovery</td><td>nothing — it is the coordinator, joins are
-  staged one at a time through it, a second copy would not help. Its
-  loss stops new client bootstraps until the scheduler replaces it;
-  nodes and proxies keep working on their last roster.</td><td>1</td></tr>
+  staged one at a time through it, and a larger desired count on the
+  one service would not help: a second task behind the same name is
+  not a replica. Its loss stops new client bootstraps until the
+  scheduler replaces it; nodes and proxies keep working on their last
+  roster. If that gap matters, run a second discovery <em>service</em>
+  with its own name and list both, in the same order, in every
+  <code>--discovery</code> and every client's address list: a client
+  given both can bootstrap and read and write while the first is down
+  (joins still wait for the first-listed one).</td><td>1 per
+  service</td></tr>
   <tr><td>node</td><td>data: dataset × R ÷ the task's
   <code>--max-memory</code>, even across zones</td><td>≥ 2, even</td></tr>
   <tr><td>proxy</td><td>client connections and throughput: concurrent
