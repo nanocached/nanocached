@@ -9,6 +9,22 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Fixed
+
+- `LOCATION = "[::1]:8357"` connects: the brackets around an IPv6
+  literal are stripped before the address reaches the SDK, which used to
+  try to resolve `[::1]` as a host name and fail on the first cache call
+  (#729).
+- An `int` outside the signed 64-bit range (for example `10**4300`) is
+  pickled like any other value instead of raising `ValueError` from the
+  decimal fast path; `incr`/`decr` on such a key raise `NotNumericError`
+  as for any non-counter value (#679).
+- README: `add()` has been atomic (put-if-absent) since the wire gained
+  compare-and-set; only `touch()` is get-then-set. The Python SDK
+  requirement now matches `pyproject.toml`, the minimum server version
+  is named, and new sections describe an unreachable node and the
+  request size limit (#672, #736).
+
 ## [0.4.7] - 2026-10-19
 
 No changes. Version aligned with the rest of the project: every release

@@ -121,6 +121,15 @@ _ADDRESS_SPLIT_RE = re.compile(r"[;,]")
 # still decodes correctly: its pickled ints just keep unpickling.
 _DECIMAL_INT_RE = re.compile(rb"^-?(0|[1-9]\d*)$")
 
+# The wire counter is a signed 64-bit integer. A Python ``int`` outside
+# that range cannot be incremented anyway, and ``str()`` on a very large
+# one trips CPython's int-to-decimal conversion limit (4300 digits by
+# default) with a ``ValueError`` before anything is sent — so only ints
+# the counter could actually hold take the decimal fast path; the rest
+# are pickled like any other value, which has no size limit of its own.
+_MIN_I64 = -(2**63)
+_MAX_I64 = 2**63 - 1
+
 
 def _is_counter_value(value: object) -> bool:
     # Exactly ``int`` — not a subclass (issue #392): ``IntEnum``/
@@ -131,7 +140,7 @@ def _is_counter_value(value: object) -> bool:
     # type; ``incr()``/``decr()`` keep requiring plain-int counters,
     # matching django.core.cache's own semantics. ``bool`` is excluded
     # for free — it's an ``int`` subclass too.
-    return type(value) is int
+    return type(value) is int and _MIN_I64 <= value <= _MAX_I64
 
 
 def _encode_value(value: object) -> bytes:
@@ -249,6 +258,11 @@ def _split_host_port(address: str) -> tuple[str, int]:
         raise ImproperlyConfigured(
             f"nanocached_django: invalid LOCATION address {address!r}, expected \"host:port\""
         )
+    # An IPv6 literal is written in brackets to keep its colons apart from
+    # the port ("[::1]:8357"); the SDK wants the bare address, and would
+    # otherwise try to resolve "[::1]" as a host name.
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
     return host, int(port)
 
 

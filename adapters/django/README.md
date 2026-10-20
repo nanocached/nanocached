@@ -12,17 +12,17 @@ and friends run against a nanocached cluster.
   drop on every node, no key scan, and never the whole store).
 - **`get`/`set`/`delete`/`has_key`/`touch`** map onto the SDK's namespaced
   get/set/delete, with all of its routing, replication, and retries.
-- **`add`** and **`touch`** are get-then-set, not atomic — the wire has no
-  compare-and-set. Two racing callers can both observe "absent" and both
-  write; the later write wins. Same trade-off the Spring adapter's
-  `putIfAbsent` documents.
+- **`add`** is atomic: it is the wire's put-if-absent, evaluated by the
+  key's primary owner alone, so of several racing `add()` calls exactly
+  one returns `True`. **`touch`** is get-then-set, not atomic — a write
+  that lands between its read and its re-set is overwritten with the
+  pre-touch value.
 - **`get_many`/`set_many`** use the wire's batched multi-get/multi-set:
   one round trip per involved node instead of one per
   key. **`delete_many`** remains a concurrent client-side fan-out — the
   wire has no multi-key delete.
 - **`incr`/`decr`** use the wire's own atomic counter (`INCR`): atomic on the
-  node that owns the key, unlike `add()`/`touch()`
-  above. Matches `BaseCache`'s own contract — raises `ValueError` if the
+  node that owns the key, unlike `touch()` above. Matches `BaseCache`'s own contract — raises `ValueError` if the
   key doesn't exist — and is exactly as volatile as `set()`: LRU
   eviction or this alias's `TIMEOUT` reclaim a counter the same as any
   other entry, so it suits rate limiting and approximate counts, never a
@@ -181,7 +181,7 @@ def my_view(request):
 
 ## Consistency notes
 
-`add()` and `touch()` are get-then-set (see above), not atomic.
+`touch()` is get-then-set (see above), not atomic; `add()` is.
 `get_many`/`set_many` batch by owning node and
 `delete_many` fans out per key — in every case a failure partway through
 leaves whichever keys were already processed changed rather than rolling
@@ -192,10 +192,13 @@ key, since the wire has a real `INCR`.
 
 To make `incr`/`decr` possible, this backend changed what a plain `int`
 value looks like on the wire: instead of the usual pickle round trip, an
-`int` (excluding `bool`) is stored as `INCR`'s own decimal-ASCII grammar
-— the same bytes the wire's atomic counter reads and writes directly.
-Everything else — `str`, `dict`, model instances, `None`, `bool`, ... —
-is still pickled exactly as before. `get()` tells the two apart by the
+`int` (excluding `bool`) within the signed 64-bit range the wire counter
+holds is stored as `INCR`'s own decimal-ASCII grammar — the same bytes
+the wire's atomic counter reads and writes directly. Everything else —
+`str`, `dict`, model instances, `None`, `bool`, an `int` outside that
+range (which `incr` could not increment anyway), ... — is still pickled
+exactly as before, and a pickled value has no size limit of its own
+beyond the request size limit below. `get()` tells the two apart by the
 bytes themselves: a pickle stream always begins with the `0x80` PROTO
 opcode (Python's pickle protocol 2+, which `HIGHEST_PROTOCOL` always is),
 a byte that can never start an ASCII decimal integer, so there is no
@@ -242,10 +245,35 @@ Mitigate with all of:
   aren't fully trusted, isolate this cache's namespace to trusted writers
   only rather than relying on the pickle stream itself for safety.
 
+## When the node is unreachable
+
+Every operation fails fast rather than hanging: the SDK bounds each
+connect and each request by its timeouts. A node that is down makes
+every cache method raise — the SDK's `ConnectionLostError` for a
+connection that was lost, or the operating system's own error
+(`ConnectionRefusedError`, `socket.gaierror`, ...) when no connection
+could be opened at all. This backend does not catch it, and neither do
+`cache.get()` in a view, `@cache_page` or `CacheMiddleware`: the request
+fails. Django's cache-backed session store is the exception: its `load()`
+catches any exception and starts an empty session, so an outage there
+looks like every user being logged out.
+
+## Value size limit
+
+A namespace, key and value together must fit in one request: 1 MiB
+minus a 256-byte header, 1,048,320 bytes. A `set`/`add`/`set_many` entry
+over that size raises the SDK's `ValueError` before anything is sent,
+and nothing is written. The value is measured after pickling (or as the
+decimal digits of an `int`), and after compression when
+`OPTIONS.COMPRESS` is on.
+
 ## Requirements
 
-Python 3.11+, Django 4.2+, `nanocached` (Python SDK) 0.3+, a nanocached
-server ≥ the release that ships namespaces and CLEAR.
+Python 3.11+, Django 4.2+, `nanocached` (Python SDK) 0.4.7+ (what
+`pyproject.toml` pins), a nanocached server 0.4.0 or later — the release
+that added namespaces, `CLEAR`, the put-if-absent `add()` uses, the
+`INCR` behind `incr`/`decr`, and the batched multi-get/multi-set behind
+`get_many`/`set_many`.
 
 ## Policy note
 
