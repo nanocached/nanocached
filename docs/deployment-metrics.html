@@ -81,7 +81,13 @@ building a dashboard on it.</p>
 (<code>nanocached_node_namespace_entries</code>,
 <code>…_namespace_used_bytes</code>, and <code>…_namespace_budget_bytes</code>
 where a budget is set) carry a <code>namespace</code> label; nothing
-else does. The default namespace is the empty string. Prometheus
+else does. They cover the 256 largest namespaces by bytes;
+<code>nanocached_node_namespaces</code> counts every live namespace and
+<code>…_namespaces_unlisted</code> the ones beyond those 256, whose
+entries and bytes are still in the node-wide gauges. A name longer than
+256 bytes appears cut to 128 bytes with its length and a hash of the
+whole name appended, so a scrape stays a few hundred bytes per listed
+namespace whatever a client names its namespaces. The default namespace is the empty string. Prometheus
 treats an empty label value as no label at all, so there the default
 namespace is the series <em>without</em> a <code>namespace</code>
 label, next to <code>{namespace="orders"}</code>; a collector that
