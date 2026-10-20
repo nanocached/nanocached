@@ -209,9 +209,19 @@ connection error when nothing resolved; a connection loss is never
 reported as a wrong-node answer. `set_many`/`set_many_bytes` have
 nothing to attach on a persisting wrong-node, so they just return a
 plain `Err(Error::WrongNode)` — every other key in the batch was still
-stored. In single-node/proxy mode a `W` propagates immediately, exactly
-like `get`/`set`'s own single-mode behavior — there is no ring to
-refresh against.
+stored; a key whose primary could not be reached at all (no `W` was
+ever received) returns `Err(Error::PartialConnectionLostKeys(stored,
+cause))` instead, `stored` the keys whose primary did acknowledge. In
+single-node/proxy mode a `W` propagates immediately, exactly like
+`get`/`set`'s own single-mode behavior — there is no ring to refresh
+against.
+
+A key that appears more than once in a `get_many`/`get_many_bytes` list
+is fetched once (the result is a map anyway). Without this a long list
+of one repeated key would cost one `m` frame per 400 copies and hold
+every frame's reply until the call returned. When a
+`set_many`/`set_many_bytes` retry pass runs after a refresh, a key is
+re-sent only to the owners that have not acknowledged it yet.
 
 Within one `set_many`/`set_many_bytes` batch, the same node can be one
 key's primary and another key's replica at once; it receives exactly
@@ -467,7 +477,11 @@ its connections warm automatically, pinging any connection that real
 traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
 restart, a network blip) redials and retries once transparently (all
-operations are idempotent). There is nothing to configure.
+operations are idempotent). There is nothing to configure. A request
+that timed out (no reply within the request deadline) is never redialed
+and resent: the node was reachable and simply did not answer, so a
+second attempt would most likely wait out another deadline — a `set`
+whose replica has stopped reading costs one deadline, not two.
 
 Every dial (connect, redial, refresh) is bounded by a 5-second
 connect deadline covering the TCP connect and handshake, so a node
@@ -517,6 +531,12 @@ response arrives on the connection, not per request. Under deep
 pipelining against a slow-but-healthy server the two SDKs can therefore
 time out differently for the same workload; that's intentional, not a
 bug, in both SDKs.
+
+`close()` also releases a caller whose request is still being written
+to a peer that has stopped reading (its receive window is full): that
+caller, and every one queued behind it for the connection, fails with
+the connection-closed error at once rather than at the request
+deadline.
 
 ## Authentication and TLS
 

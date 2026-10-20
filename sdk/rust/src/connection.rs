@@ -695,7 +695,7 @@ impl Connection {
                         continue;
                     }
                     self.close();
-                    return Err(Error::ConnectionLost(format!(
+                    return Err(Error::ConnectionLostTimedOut(format!(
                         "nanocached: request timed out after {timeout:?} with no response from the server"
                     )));
                 }
@@ -810,7 +810,29 @@ impl Connection {
                 shutdown: &self.shutdown,
                 completed: false,
             };
-            let write_result = write_half.write_all(&frame).await;
+            // A writer blocked here because the peer stopped reading (its
+            // receive window is full) must still be released by `close()`:
+            // the read task's drain cannot take `write_state` while this
+            // write holds it, so without this the writer — and every
+            // request queued behind it for the lock — outlived `close()`
+            // until the request deadline. The shutdown signal is the same
+            // one `close()` flips, so a close that already happened is
+            // seen at once (`borrow_and_update`), not waited for.
+            let mut shutdown_rx = self.shutdown.subscribe();
+            let write_result = if *shutdown_rx.borrow_and_update() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "connection closed",
+                ))
+            } else {
+                tokio::select! {
+                    result = write_half.write_all(&frame) => result,
+                    _ = shutdown_rx.changed() => Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "connection closed while the request was being written",
+                    )),
+                }
+            };
             guard.completed = true;
 
             if let Err(error) = write_result {

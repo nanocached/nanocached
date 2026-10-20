@@ -736,6 +736,43 @@ struct MultiSetOwnerBatch {
     values: Vec<Arc<[u8]>>,
 }
 
+/// What one `set_many_bytes` call learns across its two `multi_set_pass`
+/// passes. `acknowledged` records, per position, every owner (by name)
+/// that answered `S` for it, so the retry pass sends a position only to
+/// the owners that have not acknowledged it yet — a key whose primary
+/// leg failed used to be re-sent to every owner after the refresh,
+/// including a replica that had already stored it, which was duplicate
+/// traffic and a chance to re-apply an older value over a newer
+/// concurrent write. `primary_unreachable` holds the positions whose
+/// primary leg's latest outcome was a connection failure rather than a
+/// `W`; `primary_acknowledged` the positions whose primary stored them;
+/// `last_cause` the most recent leg-level connection failure. Legs run
+/// concurrently, so everything sits behind one mutex (never held across
+/// an await).
+#[derive(Default)]
+struct MultiSetTracker {
+    inner: std::sync::Mutex<MultiSetTrackerInner>,
+}
+
+#[derive(Default)]
+struct MultiSetTrackerInner {
+    acknowledged: HashMap<usize, std::collections::HashSet<String>>,
+    primary_unreachable: std::collections::HashSet<usize>,
+    primary_acknowledged: std::collections::HashSet<usize>,
+    last_cause: Option<Error>,
+}
+
+impl MultiSetTracker {
+    fn is_acknowledged(&self, idx: usize, owner: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .acknowledged
+            .get(&idx)
+            .is_some_and(|owners| owners.contains(owner))
+    }
+}
+
 /// One hedged-read leg's outcome (hedged reads, issue #64): tagged with
 /// `index` — its position in the owners list, 0 being the primary — so
 /// `read_hedged` can tell a provisional replica miss (`index != 0`) apart
@@ -1950,7 +1987,17 @@ impl NanocachedClient {
                 "nanocached: get_many/get_many_bytes requires at least one key".to_string(),
             ));
         }
-        let key_strings: Vec<&str> = keys.iter().map(|key| key.as_ref()).collect();
+        // A key that appears more than once is fetched once (the result
+        // is a map anyway). Without this, a list of many copies of one key
+        // sent one `m` frame per 400 copies and retained every frame's
+        // reply until the call returned, so about 60 KB of request could
+        // hold hundreds of MB of replies.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let key_strings: Vec<&str> = keys
+            .iter()
+            .map(|key| key.as_ref())
+            .filter(|key| seen.insert(key))
+            .collect();
         let mut key_bytes: Vec<Vec<u8>> = Vec::with_capacity(key_strings.len());
         for key in &key_strings {
             let bytes = key.as_bytes().to_vec();
@@ -2451,21 +2498,63 @@ impl NanocachedClient {
             }
         }
 
+        let tracker = MultiSetTracker::default();
         let indices: Vec<usize> = (0..key_bytes.len()).collect();
         let retry = self
-            .multi_set_pass(namespace, &key_bytes, &value_bytes, ttl_seconds, indices)
+            .multi_set_pass(
+                namespace,
+                &key_bytes,
+                &value_bytes,
+                ttl_seconds,
+                indices,
+                &tracker,
+            )
             .await;
         if retry.is_empty() {
             return Ok(());
         }
         self.maybe_refresh(true).await;
         let retry = self
-            .multi_set_pass(namespace, &key_bytes, &value_bytes, ttl_seconds, retry)
+            .multi_set_pass(
+                namespace,
+                &key_bytes,
+                &value_bytes,
+                ttl_seconds,
+                retry,
+                &tracker,
+            )
             .await;
-        if !retry.is_empty() {
+        if retry.is_empty() {
+            return Ok(());
+        }
+        // A key is still unresolved after the retry pass. Only a real `W`
+        // from its primary is a wrong-node outcome; a primary that could
+        // not be reached at the connection level on both passes (the
+        // leg's connection closed or timed out, no `W` ever received) is
+        // a connection failure and is reported as one, with the keys
+        // whose primary did acknowledge attached — a caller that reacts
+        // to `WrongNode` by refreshing and retrying must not do that for
+        // a dead node, and one that logs the message must not be told
+        // the node answered.
+        let inner = tracker.inner.lock().unwrap();
+        if retry
+            .iter()
+            .any(|idx| !inner.primary_unreachable.contains(idx))
+        {
             return Err(Error::WrongNode);
         }
-        Ok(())
+        let cause = inner.last_cause.clone().unwrap_or_else(|| {
+            Error::ConnectionLost("nanocached: no owner is reachable for these keys".to_string())
+        });
+        let succeeded: std::collections::HashSet<String> = inner
+            .primary_acknowledged
+            .iter()
+            .map(|&idx| {
+                String::from_utf8(key_bytes[idx].clone())
+                    .expect("key bytes were validated as UTF-8 in this method")
+            })
+            .collect();
+        Err(Error::PartialConnectionLostKeys(succeeded, Box::new(cause)))
     }
 
     /// [`Self::multi_get_chunked`]'s write-side twin: one or more `o`
@@ -2538,6 +2627,7 @@ impl NanocachedClient {
         value_bytes: &[Vec<u8>],
         ttl_seconds: u64,
         indices: Vec<usize>,
+        tracker: &MultiSetTracker,
     ) -> Vec<usize> {
         let mut owners: HashMap<String, MultiSetOwnerBatch> = HashMap::new();
         let mut retry = Vec::new();
@@ -2556,6 +2646,12 @@ impl NanocachedClient {
                 let shared_key: Arc<[u8]> = Arc::from(key_bytes[idx].as_slice());
                 let shared_value: Arc<[u8]> = Arc::from(value_bytes[idx].as_slice());
                 for (rank, name) in names.into_iter().enumerate() {
+                    // An owner that already stored this position on the
+                    // previous pass is not sent it again (see
+                    // MultiSetTracker).
+                    if tracker.is_acknowledged(idx, &name) {
+                        continue;
+                    }
                     let batch = owners.entry(name).or_default();
                     batch.indices.push(idx);
                     batch.is_primary.push(rank == 0);
@@ -2583,10 +2679,19 @@ impl NanocachedClient {
                     } else {
                         let client = self.clone();
                         let owned_namespace: Arc<[u8]> = Arc::from(namespace.to_vec());
+                        // Its outcome is never waited for, so it records
+                        // nothing in the tracker: the retry pass (if any)
+                        // sends this owner its positions again, as before.
                         tokio::spawn(async move {
                             let _permit = permit; // held until this task finishes
                             let _ = client
-                                .run_multi_set_leg(&owned_namespace, &name, &batch, ttl_seconds)
+                                .run_multi_set_leg(
+                                    &owned_namespace,
+                                    &name,
+                                    &batch,
+                                    ttl_seconds,
+                                    None,
+                                )
                                 .await;
                         });
                         continue;
@@ -2598,7 +2703,7 @@ impl NanocachedClient {
             let owned_namespace = namespace.to_vec();
             joined.push(async move {
                 client
-                    .run_multi_set_leg(&owned_namespace, &name, &batch, ttl_seconds)
+                    .run_multi_set_leg(&owned_namespace, &name, &batch, ttl_seconds, Some(tracker))
                     .await
             });
         }
@@ -2622,26 +2727,53 @@ impl NanocachedClient {
     /// precisely that a chunk which already succeeded must go through
     /// this, not through the unresolved-tail's blanket "count everything
     /// as failed" branch.
+    ///
+    /// `entry` is `None` for a position the leg never got an answer for
+    /// (a connection failure), treated exactly like a `W` — unresolved —
+    /// except that the tracker remembers which of the two it was. A
+    /// position with a real `S` answer is recorded as acknowledged by
+    /// `owner` in `tracker` (when there is one — a fire-and-forget leg
+    /// passes `None`) so the retry pass skips it.
     fn apply_multi_set_leg_entry(
         &self,
+        owner: &str,
         idx: usize,
         is_primary: bool,
-        entry: &MultiEntry,
+        entry: Option<&MultiEntry>,
         retry: &mut Vec<usize>,
+        tracker: Option<&MultiSetTracker>,
     ) {
-        let wrong_node = matches!(entry, MultiEntry::WrongNode);
-        if !is_primary {
-            if wrong_node {
-                self.inner
-                    .stats
-                    .replica_write_failures
-                    .fetch_add(1, Ordering::Relaxed);
+        let unresolved = entry.is_none_or(|entry| matches!(entry, MultiEntry::WrongNode));
+        if !unresolved {
+            if let Some(tracker) = tracker {
+                let mut inner = tracker.inner.lock().unwrap();
+                inner
+                    .acknowledged
+                    .entry(idx)
+                    .or_default()
+                    .insert(owner.to_string());
+                if is_primary {
+                    inner.primary_acknowledged.insert(idx);
+                }
             }
             return;
         }
-        if wrong_node {
-            retry.push(idx);
+        if !is_primary {
+            self.inner
+                .stats
+                .replica_write_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return;
         }
+        if let Some(tracker) = tracker {
+            let mut inner = tracker.inner.lock().unwrap();
+            if entry.is_none() {
+                inner.primary_unreachable.insert(idx);
+            } else {
+                inner.primary_unreachable.remove(&idx);
+            }
+        }
+        retry.push(idx);
     }
 
     /// Dispatches one owner's `o` sub-batch (via
@@ -2668,9 +2800,10 @@ impl NanocachedClient {
         name: &str,
         batch: &MultiSetOwnerBatch,
         ttl_seconds: u64,
+        tracker: Option<&MultiSetTracker>,
     ) -> Vec<usize> {
         let mut retry = Vec::new();
-        match self
+        let (entries, failure) = match self
             .multi_set_chunked(
                 Some(name),
                 namespace,
@@ -2680,34 +2813,23 @@ impl NanocachedClient {
             )
             .await
         {
-            Ok(entries) => {
-                for ((&idx, &is_primary), entry) in
-                    batch.indices.iter().zip(&batch.is_primary).zip(&entries)
-                {
-                    self.apply_multi_set_leg_entry(idx, is_primary, entry, &mut retry);
-                }
+            Ok(entries) => (entries, None),
+            Err((partial_entries, connection_failure)) => {
+                (partial_entries, Some(connection_failure))
             }
-            Err((partial_entries, _connection_failure)) => {
-                let resolved = partial_entries.len();
-                for ((&idx, &is_primary), entry) in batch
-                    .indices
-                    .iter()
-                    .zip(&batch.is_primary)
-                    .zip(&partial_entries)
-                {
-                    self.apply_multi_set_leg_entry(idx, is_primary, entry, &mut retry);
-                }
-                for i in resolved..batch.indices.len() {
-                    if batch.is_primary[i] {
-                        retry.push(batch.indices[i]);
-                    } else {
-                        self.inner
-                            .stats
-                            .replica_write_failures
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
+        };
+        if let (Some(tracker), Some(failure)) = (tracker, failure) {
+            tracker.inner.lock().unwrap().last_cause = Some(failure);
+        }
+        for (i, (&idx, &is_primary)) in batch.indices.iter().zip(&batch.is_primary).enumerate() {
+            self.apply_multi_set_leg_entry(
+                name,
+                idx,
+                is_primary,
+                entries.get(i),
+                &mut retry,
+                tracker,
+            );
         }
         retry
     }
@@ -3784,6 +3906,10 @@ impl NanocachedClient {
         F: Fn(Arc<Connection>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        // A `ConnectionLostTimedOut` is deliberately not retried: the peer
+        // accepted the frame and simply never answered within the request
+        // deadline, so a redial-and-resend would most likely stall for
+        // another full deadline — see that variant's doc comment.
         let result = match op(self.slot_connection(slot).await?).await {
             Err(Error::ConnectionLost(_)) | Err(Error::ConnectionLostAfterSend(_)) => {
                 op(self.slot_connection(slot).await?).await
@@ -3830,7 +3956,9 @@ impl NanocachedClient {
     /// doc comment. A no-op for every other error, `Ok` included.
     fn downgrade_sent_error(error: Error) -> Error {
         match error {
-            Error::ConnectionLostAfterSend(message) => Error::ConnectionLost(message),
+            Error::ConnectionLostAfterSend(message) | Error::ConnectionLostTimedOut(message) => {
+                Error::ConnectionLost(message)
+            }
             other => other,
         }
     }
@@ -4024,6 +4152,17 @@ impl NanocachedClient {
             }
         }
 
+        // Forced refreshes are single-flight too: a forced caller that
+        // waited for the gate while another refresh ran reuses that
+        // refresh instead of running its own. Without this, N callers
+        // hitting the same dead node ran N full refreshes one after
+        // another (each a discovery round trip, up to the connect timeout
+        // when discovery is slow), and the last caller waited behind N - 1
+        // results it did not need. A refresh that completed — including
+        // one whose fetch failed, which also advances `last_fetch` — is
+        // what the waiter would have got from its own attempt moments
+        // later.
+        let observed = self.inner.state.lock().await.last_fetch;
         let _gate = self.inner.refresh_gate.lock().await;
         {
             let state = self.inner.state.lock().await;
@@ -4032,6 +4171,9 @@ impl NanocachedClient {
                     < Duration::from_millis(NODE_LIST_STALE_AFTER_MS.load(Ordering::SeqCst))
             {
                 // Someone else refreshed while we were waiting for the gate.
+                return;
+            }
+            if force && state.last_fetch > observed {
                 return;
             }
         }

@@ -6,6 +6,37 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+### Fixed
+
+- `get_many`/`get_many_bytes` fetch a repeated key once. A list of many
+  copies of one key used to be sent as one `m` frame per 400 copies with
+  every frame's reply retained until the call returned, so about 60 KB of
+  request could hold hundreds of MB of replies (#698).
+- `set_many`/`set_many_bytes` in cluster mode retry only the legs that
+  failed: a key whose primary leg failed used to be re-sent to every
+  owner after the refresh, including a replica that had already stored
+  it (#720). And a key whose primary could not be reached at all (no `W`
+  was ever received) now returns `Error::PartialConnectionLostKeys` with
+  the keys whose primary acknowledged, instead of `Error::WrongNode`
+  (#722).
+- The `Display` text of `Error::PartialConnectionLost`,
+  `Error::PartialConnectionLostText` and `Error::PartialConnectionLostKeys`
+  no longer describes a chunked batch interrupted partway, which a cluster
+  batch whose keys had no reachable owner never was (#671).
+- Forced node-list refreshes are single-flight: callers that hit a dead
+  node at the same time used to run one full refresh each, one after
+  another behind the refresh gate; a forced caller now reuses a refresh
+  that finished while it waited (#721).
+- `close()` releases a caller blocked writing a request to a peer that
+  has stopped reading, and every caller queued behind it. They used to
+  stay pending until the request deadline, with the socket open (#723).
+- A request that timed out is no longer redialed and resent once: the
+  peer was reachable and simply did not answer, so the resend waited out
+  a second full deadline — a cluster `set` whose replica had stopped
+  reading took 60 s instead of 30 s (#725). `Error` gains the internal
+  `ConnectionLostTimedOut` variant, folded into `ConnectionLost` before
+  any public method returns it, like `ConnectionLostAfterSend`.
+
 ## [0.4.7] - 2026-10-19
 
 ### Fixed
