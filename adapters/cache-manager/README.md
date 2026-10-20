@@ -11,8 +11,8 @@ nanocached cluster.
   exactly one nanocached namespace, named by its `namespace`
   config (default `"cache-manager"`) — two stores on different namespaces
   never collide, even against the same cluster, and `reset()` is that
-  namespace's `CLEAR`: an O(1) sub-map drop on every node,
-  never the whole-cluster flush.
+  namespace's `CLEAR`: one sub-map removal on every node, with the
+  entries freed off its cache thread, never the whole-cluster flush.
 - **`get`/`set`/`del`/`mget`/`mset`/`mdel`** map to the SDK's namespaced
   operations, with all of its routing, replication and retries (hedged
   reads and read repair apply to single-key `get` only, not to batches).

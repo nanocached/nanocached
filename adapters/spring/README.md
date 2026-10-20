@@ -7,10 +7,9 @@ friends run against a nanocached cluster.
 
 - **Named cache ⇄ namespace.** Each Spring cache is one nanocached
   namespace named after it — same key in two caches never collides, and
-  `Cache.clear()` is the namespace's `CLEAR` on every node (no key scan;
-  the node frees the namespace's entries on its cache thread, which takes
-  time linear in their number and answers nothing else meanwhile — about
-  0.3 µs per small entry).
+  `Cache.clear()` is the namespace's `CLEAR` on every node (no key scan:
+  one sub-map removal, with the entries freed off the node's cache
+  thread, so other requests are not held up behind it).
 - **`get`/`put`/`evict`** map to the SDK's namespaced get/set/delete, with
   all of its routing, replication, hedged reads and retries.
 - **`get(key, valueLoader)`** (read-through) computes on a miss once per

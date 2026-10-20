@@ -138,8 +138,9 @@ copy onto the same few nodes. Namespaced frames need a server that
 understands them; talking `g`/`s`/`d` to a pre-namespace node gets `E\n`
 and a closed connection, so upgrade every node before using namespaces.
 
-`ClearAsync()` drops every entry in a namespace in one call — an O(1)
-sub-map drop on each node, not a scan-and-delete — including on the
+`ClearAsync()` drops every entry in a namespace in one call — one
+sub-map removal on each node, with the entries freed off the node's
+cache thread, not a scan-and-delete — including on the
 empty (default) namespace's own handle. `ClearAllAsync()`, on the client
 itself, drops every namespace, the default one included:
 

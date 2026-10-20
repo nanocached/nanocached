@@ -69,8 +69,8 @@ fn name_charge(name: &[u8]) -> usize {
 }
 
 /// One namespace's sub-map plus its own byte accounting, so `clear`
-/// (issue #106) can drop the whole thing and credit `Cache::used_bytes`
-/// in O(1) without walking the entries.
+/// (issue #106) can remove the whole thing and credit `Cache::used_bytes`
+/// without walking the entries, and hand the map to `free_off_thread`.
 struct Namespace {
     /// The namespace's own allocation (never a slice of a request frame,
     /// issue #406). Shared with the `Cache::namespaces` index key by a
@@ -95,6 +95,43 @@ struct Namespace {
     /// global `HashSet<Key>` so no mark lookup ever hashes the (up to
     /// ~1 MiB) namespace name.
     migrated: HashSet<Bytes, RandomState>,
+}
+
+/// A removed map holding at least this many entries is freed on a thread
+/// of its own (`free_off_thread`) rather than on the cache actor. Below
+/// it, freeing inline is a fraction of a millisecond — less than a thread
+/// costs to start.
+const OFF_THREAD_FREE_MIN_ENTRIES: usize = 4096;
+
+/// Test-only: how many maps `free_off_thread` handed to a thread.
+#[cfg(test)]
+static OFF_THREAD_FREES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Frees what `clear`/`clear_all` removed. Dropping an `LruCache` frees
+/// every entry, so the time is linear in their number — 3,000,000 small
+/// ones took 0.9 s, during which the single cache actor answered nothing
+/// to anyone (issue #702). A map of `OFF_THREAD_FREE_MIN_ENTRIES` or more
+/// entries is therefore moved to a short-lived thread and freed there;
+/// the actor returns at once. `Cache::used_bytes` was credited when the
+/// map was removed, before its memory is actually returned, so for the
+/// moments the free takes the process can sit above its memory limit by
+/// the amount just dropped — a burst of writes landing in exactly that
+/// window is the price of not stalling every reader. A map too small to
+/// be worth a thread, or one the OS will not start a thread for (the
+/// closure, and the map with it, is dropped right here in that case),
+/// is freed inline as before.
+fn free_off_thread<T: Send + 'static>(dropped: T, entries: usize) {
+    if entries < OFF_THREAD_FREE_MIN_ENTRIES {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("nanocached-clear-free".to_string())
+        .spawn(move || drop(dropped));
+    #[cfg(test)]
+    if spawned.is_ok() {
+        OFF_THREAD_FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    drop(spawned);
 }
 
 impl Namespace {
@@ -1376,15 +1413,17 @@ impl Cache {
         }
     }
 
-    /// `CLEAR <ns>` (issue #106): drops the whole namespace in O(1) — its
-    /// sub-map is one allocation to free, its byte share one subtraction —
-    /// rather than scanning and unlinking entries one by one (which would
-    /// stall every other command on the single-threaded cache actor for
-    /// the whole walk, the Redis `KEYS` foot-gun). Returns how many
-    /// entries went. The namespace's `migrated` marks go with it (they
-    /// live in the sub-map) — the values they referred to no longer exist,
-    /// and a mark must never outlive its value (a later write under the
-    /// same key would otherwise inherit it and be swept, see `insert`).
+    /// `CLEAR <ns>` (issue #106): removes the whole namespace in O(1) on
+    /// the cache actor — its sub-map is one map removal, its byte share
+    /// one subtraction — and frees the entries off the actor
+    /// (`free_off_thread`), rather than scanning and unlinking them one
+    /// by one here (which would stall every other command on the
+    /// single-threaded cache actor for the whole walk, the Redis `KEYS`
+    /// foot-gun). Returns how many entries went. The namespace's
+    /// `migrated` marks go with it (they live in the sub-map) — the values
+    /// they referred to no longer exist, and a mark must never outlive its
+    /// value (a later write under the same key would otherwise inherit it
+    /// and be swept, see `insert`).
     pub fn clear(&mut self, namespace: &[u8]) -> usize {
         let Some(id) = self.namespaces.remove(namespace) else {
             return 0;
@@ -1403,16 +1442,18 @@ impl Cache {
         // already reclaimed. The name's own charge is released alongside.
         self.used_bytes -= dropped.used_bytes + name_charge(&dropped.name);
         self.marked -= dropped.migrated.len();
+        free_off_thread(dropped, removed);
 
         removed
     }
 
     /// Whole-store flush (issue #106): every namespace, the default one
-    /// included. Same O(#namespaces) shape as `clear`.
+    /// included. Same shape as `clear`: O(#namespaces) on the actor, the
+    /// entries freed off it.
     pub fn clear_all(&mut self) -> usize {
         let removed = self.entry_count;
         self.namespaces.clear();
-        self.slots.clear();
+        free_off_thread(std::mem::take(&mut self.slots), removed);
         self.tails.clear();
         self.entry_count = 0;
         self.used_bytes = 0;
@@ -2629,6 +2670,47 @@ mod tests {
         // Clearing again, or a namespace that never existed, is a no-op.
         assert_eq!(cache.clear(b"users"), 0);
         assert_eq!(cache.clear(b"nope"), 0);
+    }
+
+    #[test]
+    fn clear_and_clear_all_free_a_large_map_off_the_cache_thread() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut cache = Cache::new(UNBOUNDED);
+        let fill = |cache: &mut Cache, namespace: &[u8], count: usize| {
+            for i in 0..count {
+                cache.set(
+                    namespaced(namespace, format!("k{i}").as_bytes()),
+                    Bytes::from_static(b"v"),
+                );
+            }
+        };
+
+        // A small namespace is freed inline: a thread would cost more
+        // than the free.
+        fill(&mut cache, b"small", OFF_THREAD_FREE_MIN_ENTRIES - 1);
+        let before = OFF_THREAD_FREES.load(Relaxed);
+        assert_eq!(cache.clear(b"small"), OFF_THREAD_FREE_MIN_ENTRIES - 1);
+        assert_eq!(OFF_THREAD_FREES.load(Relaxed), before);
+
+        // At the threshold the map goes to a thread, and the accounting
+        // is settled on the actor before it is freed.
+        fill(&mut cache, b"big", OFF_THREAD_FREE_MIN_ENTRIES);
+        assert_eq!(cache.clear(b"big"), OFF_THREAD_FREE_MIN_ENTRIES);
+        assert_eq!(OFF_THREAD_FREES.load(Relaxed), before + 1);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.used_bytes, 0);
+        assert_eq!(cache.get(&namespaced(b"big", b"k0")), None);
+
+        // `clear_all` counts the store as a whole: two namespaces that
+        // are each below the threshold go to one thread together.
+        fill(&mut cache, b"left", OFF_THREAD_FREE_MIN_ENTRIES / 2);
+        fill(&mut cache, b"right", OFF_THREAD_FREE_MIN_ENTRIES / 2);
+        assert_eq!(cache.clear_all(), OFF_THREAD_FREE_MIN_ENTRIES);
+        assert_eq!(OFF_THREAD_FREES.load(Relaxed), before + 2);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.used_bytes, 0);
+        assert_eq!(cache.namespaces.len(), 0);
+        assert!(cache.slots.is_empty());
     }
 
     #[test]

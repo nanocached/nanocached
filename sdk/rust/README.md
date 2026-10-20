@@ -364,8 +364,9 @@ refreshed once (the same path a `W` reply already triggers) and the
 whole fan-out is retried against the refreshed list; a node still
 failing after that fails the call with an error naming it. Both are
 idempotent, so a caller can simply retry on error. On the wire these are
-the `c`/`F` commands, a single O(1) sub-map drop on each node rather
-than a scan-and-delete, so neither stalls other requests to that node.
+the `c`/`F` commands, a single sub-map removal on each node with the
+entries freed off its cache thread, rather than a scan-and-delete, so
+neither stalls other requests to that node.
 
 ## Fire-and-forget replica writes
 
