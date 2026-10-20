@@ -221,6 +221,41 @@ describe("nanocached-keyv, through Keyv's own API", () => {
   });
 
   describe("clear()", () => {
+    it("wipes every Keyv instance sharing the store, whatever Keyv's own namespace prefix says", async () => {
+      // Documented, not fixable here: the wire has no delete-by-prefix,
+      // so Keyv's README example (users.clear() leaves cache's keys) does
+      // not hold on a shared store. Two stores on two nanocached
+      // namespaces are the isolation this adapter offers.
+      const node = await startMockNode();
+      try {
+        const store = await connectStore(node);
+        try {
+          const users = new Keyv({ store, namespace: "users" });
+          const cache = new Keyv({ store, namespace: "cache" });
+          await users.set("foo", "users");
+          await cache.set("foo", "cache");
+          await users.clear();
+          assert.equal(await users.get("foo"), undefined);
+          assert.equal(await cache.get("foo"), undefined); // gone too
+
+          const other = await connectStore(node, { namespace: "other" });
+          try {
+            const isolated = new Keyv({ store: other, namespace: "cache" });
+            await isolated.set("foo", "isolated");
+            await cache.set("foo", "cache");
+            await users.clear();
+            assert.equal(await isolated.get("foo"), "isolated"); // its own nanocached namespace
+          } finally {
+            await other.disconnect();
+          }
+        } finally {
+          await store.disconnect();
+        }
+      } finally {
+        await node.close();
+      }
+    });
+
     it("sends exactly one clear frame on the wire", async () => {
       const node = await startMockNode();
       try {

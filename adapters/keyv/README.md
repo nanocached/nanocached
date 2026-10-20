@@ -11,7 +11,10 @@ adapters. If you're still on `cache-manager` v5, see the sibling
   exactly one nanocached namespace, named by its own
   `namespace` config (default `"keyv"`) — two stores on different
   namespaces never collide, even against the same cluster, and `clear()`
-  is that namespace's `CLEAR`.
+  is that namespace's `CLEAR`: it wipes the whole nanocached namespace,
+  so every `Keyv` instance sharing one store (or one store `namespace`)
+  loses its keys together, whatever Keyv's own `namespace` prefix says.
+  See "Namespace vs. Keyv's own prefixing".
 - **`get`/`set`/`delete`/`clear`** map to the SDK's namespaced
   get/set/delete, with all of its routing, replication, hedged reads and
   retries.
@@ -143,14 +146,23 @@ This adapter's `namespace` config (→ one dedicated nanocached namespace) and
 Keyv's own `namespace`/`useKeyPrefix` options (an in-band string prefix Keyv
 adds to every key before ever calling this store, independent of any
 storage backend) are **two unrelated concepts that happen to share a
-name** — the classic trap here is conflating them, not any actual
-double-write bug: this store's namespace isolation is already complete on
-its own (one instance = one nanocached namespace = `clear()` is always
-exactly right, no key-prefix bookkeeping needed), so Keyv's own prefixing
-is pure redundancy on top of it. Leaving it on (the default) is harmless —
-just an extra string baked into the wire key bytes, and keys that are less
-legible if you inspect the nanocached server directly — which is why the
-examples above pass `useKeyPrefix: false`.
+name**. This store's isolation is the nanocached namespace: one store
+instance is one namespace, and `clear()` is that namespace's `CLEAR`.
+Keyv's own prefix is a string baked into each wire key; the wire has no
+way to enumerate or delete keys by prefix, so this store cannot honour
+it for `clear()`. Keyv's README shows two instances on one store with
+different `namespace` options, where `users.clear()` leaves
+`cache.get("foo")` intact — **that does not hold here**: with
+`new Keyv({ store, namespace: "users" })` and
+`new Keyv({ store, namespace: "cache" })` on the same store (or on two
+stores with the same `namespace` config), `users.clear()` empties the
+nanocached namespace and `cache.get("foo")` is `undefined` afterwards.
+To isolate `Keyv` instances, give each its own store with its own
+`namespace` config; then their `clear()`s are independent, and Keyv's
+prefix buys nothing. Leaving Keyv's prefixing on costs only an extra
+string in every wire key, and keys that are less legible if you inspect
+the server directly — which is why the examples above pass
+`useKeyPrefix: false`.
 
 ## Honest subset — what's omitted, and why each is the more correct choice
 

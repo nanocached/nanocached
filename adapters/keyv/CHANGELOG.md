@@ -11,6 +11,15 @@ changed. What 1.0.0 will promise is described on the
 
 ### Fixed
 
+- README: `clear()` wipes the whole nanocached namespace, so `Keyv`
+  instances sharing one store (or one store `namespace`) lose their keys
+  together regardless of Keyv's own `namespace` prefix — the opposite of
+  Keyv's README example, which the README used to call "always exactly
+  right". The wire cannot delete by prefix; isolate instances with one
+  store per nanocached namespace (#678).
+
+### Fixed
+
 - The README now describes what happens when the node is unreachable
   (Keyv's default swallows the SDK's `ConnectionLostError`: writes
   resolve `false` and emit `error`, reads resolve `undefined` without
