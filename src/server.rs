@@ -8776,6 +8776,14 @@ impl ForwardQueues {
     /// admitted into an empty queue, so it can never wait forever).
     /// Returns the queue's id if the caller must now start a drainer for
     /// it, `None` if one is already running.
+    ///
+    /// A full queue with no drainer is admitted into as well: the wait
+    /// is for a drainer to make room, and a queue `deactivate` left
+    /// non-empty — its drainer could not be handed to `run` — has none,
+    /// so a push that waited on it waited forever, and with it the
+    /// client connection that made it (a push runs before the ack).
+    /// Admitting it lets this push hand in the drainer that works the
+    /// queue down.
     async fn push(
         &self,
         node_context: &NodeContext,
@@ -8808,8 +8816,10 @@ impl ForwardQueues {
                     .targets
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let used = targets.get(&id).map_or(0, |queue| queue.bytes);
-                if used == 0 || used + wanted <= MAX_FORWARD_QUEUE_BYTES {
+                let (used, draining) = targets
+                    .get(&id)
+                    .map_or((0, false), |queue| (queue.bytes, queue.draining));
+                if used == 0 || !draining || used + wanted <= MAX_FORWARD_QUEUE_BYTES {
                     let queue = targets.entry(id).or_insert_with(|| {
                         TargetQueue::new(
                             node_context.clone(),
@@ -14988,6 +14998,78 @@ mod tests {
             queues.targets.lock().unwrap()[&id].bytes,
             entry_bytes(&forward_set("a", "1")) + b"ns".len()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_push_into_a_full_queue_with_no_drainer_is_admitted_and_starts_one() {
+        // `deactivate` leaves a queue without a drainer when the drainer
+        // could not be handed to `run` (forward_tx full, the waiter cap
+        // reached) or died. Its writes stay. A push into it that did not
+        // fit used to wait for room a drainer would make — and there was
+        // none to make it, so the push, and the client connection behind
+        // it, hung until the node shut down.
+        let queues = Arc::new(ForwardQueues::default());
+        let node_context = test_node_context(
+            "ready-node",
+            "tk-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let target = test_forward_target("127.0.0.1:9");
+
+        let filling = OwnedForwardedWrite::Set {
+            key: Key::unnamespaced(Bytes::from_static(b"big")),
+            value: Bytes::from(vec![
+                0_u8;
+                MAX_FORWARD_QUEUE_BYTES
+                    - FORWARD_ENTRY_OVERHEAD_BYTES
+                    - 3
+            ]),
+            ttl: None,
+        };
+        let id = queues
+            .push(&node_context, target.duplicate(), [filling])
+            .await
+            .expect("the first write starts a drainer");
+        // The drainer could not be started: the queue keeps its write
+        // and has no drainer.
+        queues.deactivate(id);
+        assert_eq!(queues.targets.lock().unwrap()[&id].ops.len(), 1);
+        assert!(!queues.targets.lock().unwrap()[&id].draining);
+
+        // The next write does not fit, but nothing would ever make room:
+        // it is admitted, and this push starts the drainer.
+        let started = tokio::time::timeout(
+            Duration::from_secs(5),
+            queues.push(&node_context, target.duplicate(), [forward_set("a", "1")]),
+        )
+        .await
+        .expect("a push into a queue with no drainer must not wait");
+        assert_eq!(started, Some(id), "this push starts the drainer");
+        assert_eq!(queues.targets.lock().unwrap()[&id].ops.len(), 2);
+        assert!(queues.targets.lock().unwrap()[&id].draining);
+
+        // With a drainer again, a write that does not fit waits as before.
+        let waiting = tokio::spawn({
+            let queues = Arc::clone(&queues);
+            let target = target.duplicate();
+            async move {
+                queues
+                    .push(&node_context, target, [forward_set("b", "2")])
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a push into a full, draining queue waits"
+        );
+        let (_, _, popped) = queues.next(id).expect("the filling write");
+        assert!(matches!(popped, OwnedForwardedWrite::Set { .. }));
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiting push completes once there is room")
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
