@@ -138,10 +138,15 @@ export class ConnectionLostError extends NanocachedError {
    * between "definitely sent" and "ambiguous" isn't tracked separately. */
   readonly requestWasSent: boolean;
 
-  constructor(message: string, options?: { requestWasSent?: boolean }) {
+  /** `cause` is the Node system error (ECONNREFUSED, ENOTFOUND, a TLS
+   * handshake failure, ...) a failed dial wraps — see `connectSocket` —
+   * so a caller that needs the platform's `code` still has it, under
+   * this SDK's own class. */
+  constructor(message: string, options?: { requestWasSent?: boolean; cause?: unknown }) {
     super(message);
     this.name = "ConnectionLostError";
     this.requestWasSent = options?.requestWasSent ?? true;
+    if (options?.cause !== undefined) this.cause = options.cause;
   }
 }
 

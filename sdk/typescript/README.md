@@ -665,12 +665,16 @@ after one refresh — see [Batched get and set](#batched-get-and-set)),
 `DecompressionError`, `DiscoveryBusyError`, and protocol/auth failures —
 extends the exported `NanocachedError` base class, so `error instanceof
 NanocachedError` distinguishes an expected nanocached failure from
-everything else. Node system errors from the socket itself
-(`ECONNREFUSED`, `ECONNRESET`, …) surface as-is, outside the family — and
-so do caller mistakes caught by argument validation (e.g. an invalid
-`ttlSeconds` throws a builtin `RangeError`): those indicate a bug in the
-calling code, not a nanocached failure, a convention shared across the
-SDKs.
+everything else. A dial that fails — `ECONNREFUSED`, `ENOTFOUND`, a reset
+or close during the handshake, a TLS handshake that does not complete,
+the 5 s connect deadline, or a node that answers `B` because it is at
+its connection limit — throws `ConnectionLostError` with
+`requestWasSent` `false` and, where there is one, the Node system error
+as `cause`; so does a socket that dies under an established connection.
+Only caller mistakes caught by argument validation stay outside the
+family (e.g. an invalid `ttlSeconds` throws a builtin `RangeError`):
+those indicate a bug in the calling code, not a nanocached failure, a
+convention shared across the SDKs.
 
 ## License
 

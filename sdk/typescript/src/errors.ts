@@ -4,11 +4,11 @@
  * failure that has no more specific class — so callers can catch "an
  * expected nanocached failure" as one family (`instanceof
  * NanocachedError`), the way the other five SDKs' base
- * type/enum/sentinels already allow. Node system errors from the socket
- * itself (ECONNREFUSED, ECONNRESET, ...) still surface as-is — they are
- * the platform's, not this SDK's — mirroring the Python SDK, whose
- * connection failures are builtin `ConnectionError`/`OSError` outside
- * its own base too. */
+ * type/enum/sentinels already allow. A Node system error from the socket
+ * itself (ECONNREFUSED, ENOTFOUND, ECONNRESET, ...) is wrapped in a
+ * `ConnectionLostError` that carries it as `cause`, for a failed dial
+ * (`socket.ts`) and for a socket that dies under an established
+ * connection (`connection.ts`) alike. */
 export class NanocachedError extends Error {
   constructor(message: string) {
     super(message);

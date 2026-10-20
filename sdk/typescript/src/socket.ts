@@ -43,9 +43,20 @@ export async function connectSocket(options: ConnectSocketOptions): Promise<Sock
         ),
       );
     }, deadline);
+    // A dial that fails — refused, unresolvable, reset, a TLS handshake
+    // that does not complete — is this SDK's own `ConnectionLostError`,
+    // with the Node system error as `cause` and `requestWasSent: false`
+    // (nothing was ever written), the same shape as the deadline above
+    // and the same family the other SDKs raise; `error instanceof
+    // NanocachedError` catches it, and the OS message stays in the text.
     const onError = (error: Error) => {
       clearTimeout(timer);
-      reject(error);
+      reject(
+        new ConnectionLostError(`nanocached: could not connect to ${options.host}:${options.port}: ${error.message}`, {
+          requestWasSent: false,
+          cause: error,
+        }),
+      );
     };
 
     const socket = options.tls

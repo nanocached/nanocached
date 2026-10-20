@@ -1187,9 +1187,63 @@ describe("NanocachedClient reconnect-on-use", () => {
     try {
       await node.close();
       await waitFor(() => singleConnectionClosed(client), "the client to see the FIN");
-      await assert.rejects(client.get("k"), /ECONNREFUSED/);
+      // The redial's failure is this SDK's own error, not the raw
+      // system error — the same family `connect()` throws — with the
+      // system error kept as `cause`.
+      await assert.rejects(client.get("k"), (error: unknown) => {
+        assert.ok(error instanceof ConnectionLostError, `got ${String(error)}`);
+        assert.equal(error.requestWasSent, false);
+        assert.match(error.message, /ECONNREFUSED/);
+        assert.equal((error.cause as NodeJS.ErrnoException).code, "ECONNREFUSED");
+        return true;
+      });
     } finally {
       await client.close();
+    }
+  });
+
+  it("a refused connect is a ConnectionLostError carrying the system error as cause", async () => {
+    const port = await unusedPort();
+    await assert.rejects(NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port }] }), (error: unknown) => {
+      assert.ok(error instanceof ConnectionLostError, `got ${String(error)}`);
+      assert.ok(error instanceof NanocachedError);
+      assert.equal(error.requestWasSent, false);
+      assert.match(error.message, new RegExp(`127\\.0\\.0\\.1:${port}`));
+      assert.equal((error.cause as NodeJS.ErrnoException).code, "ECONNREFUSED");
+      return true;
+    });
+  });
+
+  it("a node at its connection limit is reported busy on the first dial", async () => {
+    // A node over --max-connections answers a bare `B\n` and closes: two
+    // bytes, not the three-byte identity. Seen for what it is on the
+    // first probe — not retried with the lesser `A` forms the way a
+    // close-before-reply door-slam is.
+    let dials = 0;
+    const sockets = new Set<Socket>();
+    const busy = createServer((socket) => {
+      dials++;
+      sockets.add(socket);
+      socket.on("error", () => {});
+      socket.on("close", () => sockets.delete(socket));
+      socket.end("B\n");
+    });
+    await new Promise<void>((resolve, reject) => {
+      busy.once("error", reject);
+      busy.listen(0, "127.0.0.1", () => resolve());
+    });
+    const port = (busy.address() as { port: number }).port;
+    try {
+      await assert.rejects(NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port }] }), (error: unknown) => {
+        assert.ok(error instanceof ConnectionLostError, `got ${String(error)}`);
+        assert.match(error.message, /connection limit/);
+        assert.equal(error.requestWasSent, false);
+        return true;
+      });
+      assert.equal(dials, 1);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => busy.close(() => resolve()));
     }
   });
 
@@ -6051,7 +6105,10 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
     try {
       await assert.rejects(
         NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }], viaProxy: true }),
-        (error: unknown) => error instanceof Error && typeof (error as NodeJS.ErrnoException).code === "string",
+        (error: unknown) =>
+          error instanceof ConnectionLostError &&
+          error.requestWasSent === false &&
+          typeof (error.cause as NodeJS.ErrnoException).code === "string",
       );
     } finally {
       await discovery.close();
