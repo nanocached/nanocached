@@ -13,6 +13,7 @@ from nanocached import (
     AuthenticationError,
     ClientStats,
     CompressionIncompatibleError,
+    ConnectFailedError,
     ConnectionLostError,
     DecompressionError,
     DiscoveryBusyError,
@@ -1372,6 +1373,70 @@ class AddressesTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await first.close()
             await second.close()
+
+
+class DialFailureTests(unittest.IsolatedAsyncioTestCase):
+    """Every way a dial fails is the SDK's own ConnectFailedError, with
+    the OS error as the cause — not whichever builtin the OS raised."""
+
+    async def test_a_refused_connect_is_a_connect_failed_error(self):
+        dead = await unused_port()
+        with self.assertRaises(ConnectFailedError) as raised:
+            await NanocachedClient.connect([("127.0.0.1", dead)])
+        self.assertIsInstance(raised.exception, NanocachedError)
+        self.assertIsInstance(raised.exception, ConnectionError)
+        self.assertNotIsInstance(raised.exception, ConnectionLostError)
+        self.assertIsInstance(raised.exception.__cause__, ConnectionRefusedError)
+        self.assertIn(f"127.0.0.1:{dead}", str(raised.exception))
+
+    async def test_a_redial_of_a_dead_node_is_a_connect_failed_error(self):
+        # The redial path is a different call site from connect(): an
+        # operation on a client whose node has since died dials again,
+        # and that failure used to escape as a raw ConnectionRefusedError.
+        node = await MockNode().start()
+        client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+        try:
+            await client.set("k", "v")
+            await node.close()
+            # Once the client has seen the node's close, the next
+            # operation redials (an operation racing the close instead
+            # fails as a lost connection, which is not the path under
+            # test).
+            for _ in range(200):
+                if client._single.closed:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(client._single.closed)
+            with self.assertRaises(ConnectFailedError) as raised:
+                await client.get("k")
+            self.assertIsInstance(raised.exception.__cause__, ConnectionRefusedError)
+        finally:
+            await client.close()
+
+    async def test_a_node_at_its_connection_limit_is_reported_busy(self):
+        # A node over --max-connections answers a bare `B\n` and closes:
+        # two bytes, not the three-byte identity. Seen for what it is,
+        # on the first probe — not retried with lesser `A` forms as a
+        # door-slam would be.
+        dials = 0
+
+        async def busy(reader, writer):
+            nonlocal dials
+            dials += 1
+            writer.write(b"B\n")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(busy, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            with self.assertRaises(ConnectFailedError) as raised:
+                await NanocachedClient.connect([("127.0.0.1", port)])
+            self.assertIn("connection limit", str(raised.exception))
+            self.assertEqual(dials, 1)
+        finally:
+            server.close()
+            await server.wait_closed()
 
 
 class CloseWarningTests(unittest.IsolatedAsyncioTestCase):
@@ -6484,9 +6549,10 @@ class IdentifyFailureRetiresTheSocketTests(unittest.IsolatedAsyncioTestCase):
         try:
             with (
                 mock.patch("asyncio.open_connection", spying_open_connection),
-                self.assertRaises(ConnectionResetError),
+                self.assertRaises(ConnectFailedError) as raised,
             ):
                 await connect_and_identify("127.0.0.1", port, None, None)
+            self.assertIsInstance(raised.exception.__cause__, ConnectionResetError)
             # Every stage of the handshake fallback (`T R`, `T`, plain) was
             # reset: three sockets, each closed with its connection_lost
             # error already retrieved by the time the dial has failed.

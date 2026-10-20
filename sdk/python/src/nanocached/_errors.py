@@ -92,6 +92,24 @@ class CompressionIncompatibleError(NanocachedError):
         )
 
 
+class ConnectFailedError(NanocachedError, ConnectionError):
+    """A dial failed before any request was sent: the port refused the
+    connection, the host did not resolve, the peer reset or closed the
+    connection during the ``A`` handshake, the TLS handshake failed, the
+    server answered ``B`` because it is at its connection limit, or the
+    connect deadline passed. The OS-level error, when there was one, is
+    ``__cause__``. Raised by ``connect()`` when no address could be
+    reached, and by any operation whose redial of a dead node fails.
+
+    Deliberately not a ``ConnectionLostError``: that one means a request
+    may already have reached the server. Nothing was sent here, so a
+    caller may always retry — and the non-idempotent operations' own
+    retry wrapper does (see ``ConnectionLostError``)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
 class ConnectionLostError(NanocachedError, ConnectionError):
     """A request's connection failed *after* its frame was already fully
     written to the socket (issue #225) — write()/drain() returned

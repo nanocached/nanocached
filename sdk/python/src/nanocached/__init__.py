@@ -9,6 +9,7 @@ from ._errors import (
     AlreadyClosedError,
     AuthenticationError,
     CompressionIncompatibleError,
+    ConnectFailedError,
     ConnectionLostError,
     DiscoveryBusyError,
     NanocachedError,
@@ -21,13 +22,14 @@ from ._errors import (
 )
 from ._hashring import HashRing
 from ._identify import DiscoveredNode
-from .client import ClientStats, NanocachedClient, Namespace
+from .client import ClientStats, Namespace, NanocachedClient
 
 __all__ = [
     "AlreadyClosedError",
     "AuthenticationError",
     "ClientStats",
     "CompressionIncompatibleError",
+    "ConnectFailedError",
     "ConnectionLostError",
     "DecompressionError",
     "DiscoveredNode",

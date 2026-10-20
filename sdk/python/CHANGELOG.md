@@ -11,6 +11,17 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ### Fixed
 
+- A dial that fails raises `ConnectFailedError` (a `NanocachedError` and
+  a `ConnectionError`, with the OS error as `__cause__`) instead of the
+  raw `ConnectionRefusedError`, `socket.gaierror` or
+  `ConnectionResetError` — or, for the connect deadline, a builtin
+  `ConnectionError` — so `except NanocachedError` catches a refused or
+  unresolvable address the way it does in the Go, Java and Rust SDKs.
+  Applies to `connect()` and to the redial any operation makes after
+  its node died. A node at its connection limit, which answers `B` and
+  closes, is now reported as busy by that same error instead of as
+  "connection closed during the auth handshake".
+
 - `set_many` in cluster mode raises `PartialSetConnectionLostError`
   (with the keys whose primary did store them in `partial_keys`, and the
   connection failure as `__cause__`) when a key's primary could not be

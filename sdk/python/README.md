@@ -447,6 +447,15 @@ subclass — catch that one class when you don't care which:
 
 - `AuthenticationError` — the `auth_secret` handshake failed. Never
   transient; retrying with the same configuration cannot succeed.
+- `ConnectFailedError` — a dial failed before anything was sent: the
+  port refused the connection, the host did not resolve, the server
+  reset or closed the connection during the handshake, the TLS handshake
+  failed, the server answered `B` because it is at its connection limit,
+  or the 5 s connect deadline passed. A `ConnectionError` subclass with
+  the OS error, when there was one, as `__cause__`. Raised by `connect()`
+  when no address could be reached and by any operation whose redial of
+  a dead node fails. Nothing was sent, so retrying is always safe —
+  unlike `ConnectionLostError` below.
 - `WrongNodeError` — normally handled internally (a stale routing table
   is refreshed and the call retried once); it only escapes in
   single-node mode, where there is no discovery to refresh from.
