@@ -198,7 +198,8 @@ and clustered production use identical code. See
   </tbody>
 </table>
 </div>
-<p>The memory bound is approximate (sum of stored key and value bytes);
+<p>The memory bound is approximate (stored key and value bytes, plus
+100 bytes per entry and 256 bytes per non-default namespace);
 least-recently-used entries are evicted first. Use the
 <a href="capacity-planner.html">capacity planner</a> to size nodes, R,
 and TTL against a target hit rate.</p>
