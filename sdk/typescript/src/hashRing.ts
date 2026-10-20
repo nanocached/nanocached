@@ -106,32 +106,44 @@ function mulHi32(a: number, b: number): number {
   return (a1 * b1 + (mid1 >>> 16) + (mid2 >>> 16)) >>> 0;
 }
 
+/** Feeds one byte into the FNV-1a state held in `partsHi`/`partsLo`. */
+function feedPart(byte: number): void {
+  const lo = (partsLo ^ byte) >>> 0;
+  // Multiply by the FNV prime 0x100000001b3 = 2^40 + 0x1b3 (mod 2^64):
+  // `h << 40` only reaches the high word, as `lo << 8`.
+  const product = lo * 0x1b3; // < 2^41, exact in a double
+  const carry = Math.floor(product / 4294967296);
+  partsHi = (Math.imul(partsHi, 0x1b3) + carry + (lo << 8)) >>> 0;
+  partsLo = product >>> 0;
+}
+
+/** The FNV-1a state after the namespace part of `keyHash` —
+ * `be32(len(ns)) || ns` for a named namespace, the offset basis for the
+ * default one — into `partsHi`/`partsLo`; a key's own bytes continue from
+ * it. FNV-1a is a streaming hash, so hashing the namespace once and
+ * continuing per key equals `keyHash` while costing the namespace's
+ * bytes once per namespace rather than once per key: `getMany`/`setMany`
+ * under a 900 KB namespace used to re-hash it for every key of the
+ * batch, on the event loop — 8.8 s for 400 keys. */
+function namespaceParts(namespace: Uint8Array): void {
+  partsHi = 0xcbf29ce4;
+  partsLo = 0x84222325;
+  if (namespace.length > 0) {
+    const length = namespace.length;
+    feedPart(length >>> 24);
+    feedPart((length >>> 16) & 0xff);
+    feedPart((length >>> 8) & 0xff);
+    feedPart(length & 0xff);
+    for (let i = 0; i < namespace.length; i++) feedPart(namespace[i]);
+  }
+}
+
 /** `keyHash(key, namespace)` into `partsHi`/`partsLo` — FNV-1a fed the
  * `be32(len(ns))`, namespace and key bytes one after the other, which is
  * the same stream `keyHash` concatenates (see its doc comment). */
 function keyHashParts(key: Uint8Array, namespace: Uint8Array): void {
-  let hi = 0xcbf29ce4;
-  let lo = 0x84222325;
-  const feed = (byte: number): void => {
-    lo = (lo ^ byte) >>> 0;
-    // Multiply by the FNV prime 0x100000001b3 = 2^40 + 0x1b3 (mod 2^64):
-    // `h << 40` only reaches the high word, as `lo << 8`.
-    const product = lo * 0x1b3; // < 2^41, exact in a double
-    const carry = Math.floor(product / 4294967296);
-    hi = (Math.imul(hi, 0x1b3) + carry + (lo << 8)) >>> 0;
-    lo = product >>> 0;
-  };
-  if (namespace.length > 0) {
-    const length = namespace.length;
-    feed(length >>> 24);
-    feed((length >>> 16) & 0xff);
-    feed((length >>> 8) & 0xff);
-    feed(length & 0xff);
-    for (let i = 0; i < namespace.length; i++) feed(namespace[i]);
-  }
-  for (let i = 0; i < key.length; i++) feed(key[i]);
-  partsHi = hi;
-  partsLo = lo;
+  namespaceParts(namespace);
+  for (let i = 0; i < key.length; i++) feedPart(key[i]);
 }
 
 /** `fmix64` of the value `hi:lo` (each taken mod 2^32), into
@@ -177,6 +189,9 @@ const MAX_BOUNDED_SELECTION = 32;
  * this class doesn't react to nodes joining or leaving after construction.
  */
 export class HashRing {
+  /** The last namespace `owners` hashed (a copy, compared by content) and
+   * the FNV-1a state after it — see `namespaceParts`. */
+  private namespaceState: { namespace: Buffer; hi: number; lo: number } | null = null;
   private readonly nodes: readonly string[];
   // Each node's `fnv1a(name)` as two u32 halves: `owners` scores every
   // node for every lookup, and BigInt arithmetic there cost more than
@@ -221,7 +236,17 @@ export class HashRing {
   owners(key: Uint8Array, replicas: number, namespace: Uint8Array = EMPTY_NAMESPACE): string[] {
     const count = this.nodes.length;
     if (count === 0 || replicas === 0) return [];
-    keyHashParts(key, namespace);
+    // The namespace's share of the hash, paid once per namespace change
+    // (the keys of one batch share theirs) — see `namespaceParts`.
+    const cached = this.namespaceState;
+    if (cached !== null && cached.namespace.length === namespace.length && cached.namespace.equals(namespace)) {
+      partsHi = cached.hi;
+      partsLo = cached.lo;
+    } else {
+      namespaceParts(namespace);
+      this.namespaceState = { namespace: Buffer.from(namespace), hi: partsHi, lo: partsLo };
+    }
+    for (let i = 0; i < key.length; i++) feedPart(key[i]);
     const keyHi = partsHi;
     const keyLo = partsLo;
 

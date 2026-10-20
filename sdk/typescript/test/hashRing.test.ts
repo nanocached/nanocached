@@ -213,6 +213,30 @@ describe("HashRing", () => {
   });
 });
 
+describe("HashRing hashes a namespace once per batch", () => {
+  it("routes 400 keys under a 900 KB namespace in the time of the keys' own bytes", () => {
+    // The namespace's share of the hash is computed once per namespace
+    // change, not once per key: 400 keys under a 900 KB namespace used
+    // to cost 8.8 s on the event loop.
+    const ring = new HashRing(["node-a", "node-b", "node-c"]);
+    const namespace = Buffer.alloc(900_000, 0x6e);
+    const keys = Array.from({ length: 400 }, (_, i) => Buffer.from(`key-${i}`));
+    const started = process.hrtime.bigint();
+    const owners = keys.map((key) => ring.owners(key, 2, namespace));
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(owners.every((o) => o.length === 2));
+    assert.ok(elapsedMs < 3000, `400 keys under a 900 KB namespace took ${elapsedMs.toFixed(0)} ms`);
+    // The cached state places keys exactly as a fresh ring does, and a
+    // different namespace of the same length is not mistaken for it.
+    const fresh = new HashRing(["node-a", "node-b", "node-c"]);
+    assert.deepEqual(ring.owners(keys[7], 3, namespace), fresh.owners(keys[7], 3, namespace));
+    const other = Buffer.alloc(900_000, 0x6d);
+    assert.deepEqual(ring.owners(keys[7], 3, other), fresh.owners(keys[7], 3, other));
+    assert.deepEqual(ring.owners(keys[7], 3, Buffer.from("users")), fresh.owners(keys[7], 3, Buffer.from("users")));
+    assert.deepEqual(ring.owners(keys[7], 3), fresh.owners(keys[7], 3));
+  });
+});
+
 describe("HashRing.owners bounded top-R selection (audit finding)", () => {
   // The pre-fix implementation, verbatim apart from reading the node
   // hashes from a parameter: score every node with the BigInt primitives,
