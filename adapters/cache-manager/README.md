@@ -168,10 +168,10 @@ on `error` is the only place the outage is reported.
 
 ## Value size limit
 
-A namespace, key and value together must fit in one request of
-`MAX_REQUEST_BYTES` (1 MiB minus a 256-byte header, exported by the
-SDK): a `set` or `mset` entry over that size rejects with a `RangeError`
-before anything is sent, and the key or value is not written. Values
+A namespace, key and value together must fit in one request: 1 MiB
+minus a 256-byte header, 1,048,320 bytes. A `set` or `mset` entry over
+that size rejects with a `RangeError` before anything is sent, and the
+entry is not written. Values
 are measured after JSON serialization, and after compression when
 `compress` is on.
 
