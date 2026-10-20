@@ -287,7 +287,15 @@ existed, err := client.Delete("greeting")</code></pre>
   degrading replication or a stuck refresh is detectable.</li>
   <li><b>Concurrency</b> — every client is safe for concurrent use;
   requests are pipelined per connection, so concurrent callers each pay
-  only their own network latency, not everyone else's ahead of them.</li>
+  only their own network latency, not everyone else's ahead of them.
+  Concurrent writes to the <em>same key</em> are not ordered across its
+  owners, though: each owner keeps whichever write reached it last, so
+  two callers racing a <code>set</code>, or a <code>set</code> against a
+  <code>delete</code>, can leave the replicas disagreeing until the next
+  write or TTL expiry, with nothing in <code>stats()</code> — see the
+  <a href="architecture.html#accepted-behaviour">accepted behaviour</a>
+  list; a proxy serialises one key's writes, counters and
+  compare-and-set are unaffected.</li>
   <li><b>Value compression</b> — off by default; when enabled, values at
   or above a configurable threshold are transparently DEFLATE-compressed
   on write and decompressed on read. Every client touching a given
