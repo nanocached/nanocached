@@ -12,6 +12,16 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Changed
+
+- `nanocached-proxy` answers the fatal `E` (and closes) instead of the
+  retryable `R` when its connection to a node fails after an `i`, `k` or
+  `x` may have reached the node. `R` is defined as "not applied, re-send",
+  and every SDK re-sent on it, so a counter could move twice and a
+  compare-and-set could report failure for a condition it had applied.
+  Idempotent writes and requests that provably never left the proxy keep
+  getting `R` (#656).
+
 ### Added
 
 - `nanocached-proxy` logs a replica leg of `S`/`D` (and of the result
