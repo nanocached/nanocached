@@ -184,13 +184,42 @@ adapter:
   two outcomes the wire's actual limitation (no key enumeration) leaves
   available anyway.
 
+## When the node is unreachable
+
+Every operation fails fast rather than hanging: the SDK bounds each
+connect and each request by its timeouts, and a node that is down makes
+the store's `get`/`set`/`delete`/`clear` reject with the SDK's
+`ConnectionLostError`, or with the operating system's own connect error
+(an `Error` with `code: "ECONNREFUSED"`, for example) when no connection
+could be opened at all. What your code sees is then Keyv's own
+convention, not this adapter's: by default (`throwOnErrors: false`) Keyv
+swallows the rejection. `set`/`delete`/`clear` resolve `false` and emit
+the error on Keyv's `error` event; `get` resolves `undefined` and, in
+`keyv` 5.6, emits nothing at all — so an outage looks like a cold cache
+on reads, and only writes report it, and only to an `error` listener.
+With `new Keyv({ store, throwOnErrors: true })` every rejection
+propagates to the caller instead. `cache-manager` v6+ `createCache()` and NestJS's
+`CacheModule` build on Keyv's default, so their `get`/`wrap` fail open
+in the same way.
+
+## Value size limit
+
+A namespace, key and value together must fit in one request: 1 MiB
+minus a 256-byte header, 1,048,320 bytes. A `set` over that size rejects
+with a `RangeError` before anything is sent, and nothing is written. The value is measured as Keyv hands it
+over — its JSON envelope (`{value, expires}`) included — and after
+compression when `compress` is on. Under Keyv's default error policy
+that `RangeError` is the same `error` event plus `set` resolving `false`
+described above, so an oversize value is silently not cached unless
+`throwOnErrors` is on or an `error` listener is attached.
+
 ## Requirements
 
 Node.js 20+, `keyv` ^5 (the relative-millisecond-`ttl` adapter contract
 this targets — `keyv@6`'s absolute-`expires` contract is a different shape
 and, as of writing, still only at a release candidate, not what published
-`cache-manager`/`@nestjs/cache-manager` depend on), nanocached server ≥ the
-release that ships namespaces and `CLEAR`.
+`cache-manager`/`@nestjs/cache-manager` depend on), nanocached server
+0.4.0 or later — the release that added namespaces and `CLEAR`.
 
 ## Policy note
 

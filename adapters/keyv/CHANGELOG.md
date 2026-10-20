@@ -9,6 +9,15 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Fixed
+
+- The README now describes what happens when the node is unreachable
+  (Keyv's default swallows the SDK's `ConnectionLostError`: writes
+  resolve `false` and emit `error`, reads resolve `undefined` without
+  an event; `throwOnErrors` turns both back into rejections), what a value over the request size limit
+  does (`RangeError`, swallowed the same way), and names the minimum
+  server version, with tests pinning both behaviours (#672, #736).
+
 ## [0.4.7] - 2026-10-19
 
 No changes. Version aligned with the rest of the project: every release
