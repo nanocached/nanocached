@@ -163,7 +163,7 @@ final class Connection {
         timedOutError = new NanocachedException.ConnectionFailed(
                 "nanocached: no response from server within " + requestTimeoutMillis
                         + "ms (request timed out)",
-                null);
+                null, false, true);
         try {
             socket.close();
         } catch (IOException ignored) {
@@ -825,11 +825,12 @@ final class Connection {
                     // (notSent=false) error: it drains every slot still
                     // pending, and the ones ahead of this frame were
                     // fully sent.
-                    boolean notSent = timedOutError == null;
+                    boolean timedOut = timedOutError != null;
+                    boolean notSent = !timedOut;
                     poison(new NanocachedException.ConnectionFailed(
                             "nanocached: connection failed: " + error.getMessage(), error));
                     throw new NanocachedException.ConnectionFailed(
-                            "nanocached: connection failed: " + error.getMessage(), error, notSent);
+                            "nanocached: connection failed: " + error.getMessage(), error, notSent, timedOut);
                 }
             }
 

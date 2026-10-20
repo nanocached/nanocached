@@ -1652,9 +1652,10 @@ class NanocachedClientTest {
                 node.goSilentAfterHandshake();
 
                 long started = System.nanoTime();
-                // The client's retry layer redials once after the first
-                // timeout; the redialed connection times out too, so this
-                // settles after roughly two windows — still bounded.
+                // A request timeout is surfaced as-is: the client's retry
+                // layer does not redial and resend after one (the peer is
+                // reachable and simply not answering), so this settles
+                // after one window.
                 NanocachedException error = assertThrows(NanocachedException.class,
                         () -> client.get("k"));
                 assertTrue(error.getMessage().contains("request timed out"),
@@ -5673,6 +5674,276 @@ class NanocachedClientTest {
             assertTrue(error.getMessage().contains("closed"), error.getMessage());
         } finally {
             Thread.setDefaultUncaughtExceptionHandler(original);
+        }
+    }
+
+    // ── a String with a lone surrogate is rejected, not encoded as '?' ──
+
+    @Test
+    void aStringWithALoneSurrogateIsRejectedInsteadOfCollidingWithAQuestionMark() throws Exception {
+        // String.getBytes(UTF_8) silently turns a lone surrogate into '?',
+        // so "x\uD800" and "x?" used to address the same entry: a read
+        // under one key returned the other key's value.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("x?", "question");
+                assertThrows(IllegalArgumentException.class, () -> client.set("x\uD800", "surrogate"));
+                assertThrows(IllegalArgumentException.class, () -> client.get("x\uD800"));
+                assertThrows(IllegalArgumentException.class, () -> client.set("k", "v\uDC00"));
+                assertThrows(IllegalArgumentException.class, () -> client.namespace("ns\uD800"));
+                assertThrows(IllegalArgumentException.class, () -> client.setMany(Map.of("x\uD800", "v")));
+                assertThrows(IllegalArgumentException.class, () -> client.getMany(List.of("x\uD800")));
+                assertEquals(Optional.of("question"), client.get("x?"));
+                assertEquals(1, node.store.size());
+
+                // A well-formed pair is an ordinary key.
+                client.set("x😀", "emoji");
+                assertEquals(Optional.of("emoji"), client.get("x😀"));
+            }
+        }
+    }
+
+    // ── getMany reads a repeated key once ───────────────────────────
+
+    @Test
+    void getManyReadsARepeatedKeyOnce() throws Exception {
+        // A list of many copies of one key used to be sent as one `m`
+        // frame per 400 copies with every frame's reply retained until
+        // the call returned — hundreds of MB from a 60 KB request.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "value");
+                Map<String, String> values = client.getMany(java.util.Collections.nCopies(2_000, "k"));
+                assertEquals(Map.of("k", "value"), values);
+                assertEquals(1, node.multiGetCount.get());
+                assertEquals(1, node.multiGetFrameBodyBytes.size());
+
+                // The positional form keeps every position, sharing one
+                // result between the copies of a key.
+                byte[] k = "k".getBytes(StandardCharsets.UTF_8);
+                byte[] missing = "missing".getBytes(StandardCharsets.UTF_8);
+                byte[][] positional = client.getManyBytes(new byte[][] {k, missing, k});
+                assertArrayEquals("value".getBytes(StandardCharsets.UTF_8), positional[0]);
+                assertNull(positional[1]);
+                assertSame(positional[0], positional[2]);
+                assertEquals(2, node.multiGetCount.get());
+            }
+        }
+    }
+
+    @Test
+    void getManyMapsAPartialFailureBackOntoEveryPositionOfARepeatedKey() throws Exception {
+        // The de-duplicated batch's unresolved indices and partial values
+        // are expanded back to the caller's positions, so a repeated key
+        // that stayed wrong-node is reported at each of its positions.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String onA = keyOwnedBy(NAMES.get(0));
+                String onB = keyOwnedBy(NAMES.get(1));
+                client.set(onA, "a");
+                client.set(onB, "b");
+                MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                nodeA.answerWrongNodeOnce();
+                nodeA.answerWrongNodeOnce();
+
+                byte[][] keys = {
+                    onA.getBytes(StandardCharsets.UTF_8),
+                    onB.getBytes(StandardCharsets.UTF_8),
+                    onA.getBytes(StandardCharsets.UTF_8),
+                };
+                NanocachedException.PartialWrongNodeRaw partial = assertThrows(
+                        NanocachedException.PartialWrongNodeRaw.class, () -> client.getManyBytes(keys));
+                assertArrayEquals(new int[] {0, 2}, partial.unresolvedIndices);
+                assertEquals(3, partial.partialValues.length);
+                assertNull(partial.partialValues[0]);
+                assertArrayEquals("b".getBytes(StandardCharsets.UTF_8), partial.partialValues[1]);
+                assertNull(partial.partialValues[2]);
+            }
+        }
+    }
+
+    /** A key whose primary under {@link #NAMES} (R=1) is {@code owner}. */
+    private static String keyOwnedBy(String owner) {
+        HashRing ring = new HashRing(NAMES);
+        for (int i = 0; ; i++) {
+            String candidate = "key-" + i;
+            if (ring.route(candidate.getBytes(StandardCharsets.UTF_8)).equals(owner)) return candidate;
+        }
+    }
+
+    // ── setMany retries only the legs that failed ───────────────────
+
+    @Test
+    void batchedSetRetriesOnlyTheLegsThatFailedAndReportsAnUnreachablePrimaryAsAConnectionFailure()
+            throws Exception {
+        // With R=2 every key goes to both nodes. Node B closes on every
+        // `o` frame: the retry pass used to re-send every rank of each
+        // key whose primary (B) leg failed, including node A, which had
+        // already stored it — A received 19 key-sends for 12 keys. And
+        // the exhausted retry used to be reported as WrongNode although B
+        // never answered `W`: it was unreachable.
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                MockNode nodeB = cluster.nodes().get(NAMES.get(1));
+                nodeB.failAllMultiSets();
+
+                Map<String, String> batch = new java.util.LinkedHashMap<>();
+                Set<String> primaryOnA = new java.util.HashSet<>();
+                HashRing ring = new HashRing(NAMES);
+                for (int i = 0; i < 12; i++) {
+                    String key = "key-" + i;
+                    batch.put(key, "v" + i);
+                    if (ring.route(key.getBytes(StandardCharsets.UTF_8)).equals(NAMES.get(0))) primaryOnA.add(key);
+                }
+                assertTrue(!primaryOnA.isEmpty() && primaryOnA.size() < 12, "want keys with each primary");
+
+                NanocachedException.PartialConnectionFailedSet failure = assertThrows(
+                        NanocachedException.PartialConnectionFailedSet.class, () -> client.setMany(batch));
+                assertEquals(primaryOnA, failure.succeededKeys);
+                assertEquals(12, nodeA.multiSetKeyCount.get(), "every key sent to A exactly once");
+                assertEquals(12, nodeA.store.size());
+            }
+        }
+    }
+
+    // ── forced refreshes are single-flight ──────────────────────────
+
+    @Test
+    void concurrentCallersOnADeadNodeShareOneForcedRefresh() throws Exception {
+        // Four callers that find their node dead at the same time used to
+        // run four full refreshes one after another behind refreshLock,
+        // the last caller waiting through all of them.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = keyOwnedBy(NAMES.get(0));
+                client.set(key, "v");
+                cluster.nodes().get(NAMES.get(0)).close();
+                cluster.discovery().laterListDelayMillis = 400;
+                assertEquals(1, cluster.discovery().connectionCount.get());
+
+                ExecutorService callers = Executors.newFixedThreadPool(4);
+                try {
+                    List<Future<Long>> elapsed = new ArrayList<>();
+                    for (int i = 0; i < 4; i++) {
+                        elapsed.add(callers.submit(() -> {
+                            long started = System.nanoTime();
+                            assertThrows(NanocachedException.class, () -> client.get(key));
+                            return (System.nanoTime() - started) / 1_000_000;
+                        }));
+                    }
+                    for (Future<Long> caller : elapsed) {
+                        long millis = caller.get(10, java.util.concurrent.TimeUnit.SECONDS);
+                        assertTrue(millis < 1_000, "a caller waited " + millis + "ms (serialized refreshes?)");
+                    }
+                } finally {
+                    callers.shutdownNow();
+                }
+                assertEquals(2, cluster.discovery().connectionCount.get(), "one shared refresh");
+            }
+        }
+    }
+
+    // ── concurrent decompressions share one budget ──────────────────
+
+    @Test
+    void concurrentDecompressionsAreBoundedByTheClientWideBudget() throws Exception {
+        // N concurrent reads of a compressed value each decompressed in
+        // full at once, N × the per-value cap. With the budget lowered
+        // to one byte, every reservation clamps to the whole budget, so
+        // decompressions run one at a time.
+        long savedBudget = Compression.maxInflightDecompressedBytes;
+        Compression.maxInflightDecompressedBytes = 1;
+        java.util.concurrent.atomic.AtomicInteger inFlight = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger peak = new java.util.concurrent.atomic.AtomicInteger();
+        Compression.inflateTestHook = phase -> {
+            if (phase.equals("start")) {
+                int now = inFlight.incrementAndGet();
+                peak.accumulateAndGet(now, Math::max);
+                try {
+                    Thread.sleep(30);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            } else {
+                inFlight.decrementAndGet();
+            }
+        };
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client =
+                    NanocachedClient.connect(single("127.0.0.1", node.port()).compress(true))) {
+                String value = "0123456789".repeat(200);
+                client.set("k", value);
+                ExecutorService readers = Executors.newFixedThreadPool(8);
+                try {
+                    List<Future<Optional<String>>> reads = new ArrayList<>();
+                    for (int i = 0; i < 8; i++) reads.add(readers.submit(() -> client.get("k")));
+                    for (Future<Optional<String>> read : reads) {
+                        assertEquals(Optional.of(value), read.get(10, java.util.concurrent.TimeUnit.SECONDS));
+                    }
+                } finally {
+                    readers.shutdownNow();
+                }
+                assertEquals(1, peak.get(), "decompressions ran concurrently past the budget");
+            }
+        } finally {
+            Compression.inflateTestHook = null;
+            Compression.maxInflightDecompressedBytes = savedBudget;
+        }
+    }
+
+    // ── the identify exchange has one absolute deadline ─────────────
+
+    @Test
+    void aPeerThatTricklesTheRosterFailsTheDialAtTheDeadline() throws Exception {
+        // The identify read timeout used to be per read (SO_TIMEOUT), so
+        // a discovery server that sent one byte every few seconds held
+        // connect() — and every refresh behind refreshLock — for as long
+        // as the roster was long.
+        int originalTimeout = Identify.connectTimeoutMillis;
+        Identify.connectTimeoutMillis = 500;
+        try (Cluster cluster = startCluster(1)) {
+            cluster.discovery().listByteDelayMillis = 100; // the roster is >100 bytes: >10 s untreated
+            long started = System.nanoTime();
+            NanocachedException.ConnectionFailed error = assertThrows(
+                    NanocachedException.ConnectionFailed.class,
+                    () -> connect("127.0.0.1", cluster.discovery().port()));
+            long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+            assertTrue(elapsedMillis < 2_000, "connect took " + elapsedMillis + "ms");
+            assertTrue(error.getMessage().contains("identify exchange"), "unexpected failure: " + error.getMessage());
+        } finally {
+            Identify.connectTimeoutMillis = originalTimeout;
+        }
+    }
+
+    // ── a stalled replica costs one request timeout, not two ────────
+
+    @Test
+    void aStalledReplicaBoundsAClusterSetByOneRequestTimeout() throws Exception {
+        // A replica that acknowledged the handshake and then stopped
+        // reading timed out the replica leg, which was then redialed and
+        // re-sent for a second full timeout — set() returned after twice
+        // the request deadline although the primary had answered at once.
+        long defaultTimeout = Connection.requestTimeoutMillis;
+        Connection.requestTimeoutMillis = 300;
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = keyOwnedBy(NAMES.get(0));
+                client.set(key, "warm");
+                MockNode replica = cluster.nodes().get(NAMES.get(1));
+                int connectionsBefore = replica.connectionCount.get();
+                replica.goSilentAfterHandshake();
+
+                long started = System.nanoTime();
+                client.set(key, "v");
+                long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+                assertTrue(elapsedMillis >= 250 && elapsedMillis < 550,
+                        "set took " + elapsedMillis + "ms, want about one timeout");
+                assertEquals(connectionsBefore, replica.connectionCount.get(), "no redial after a timeout");
+                assertEquals(1, client.stats().replicaWriteFailures());
+            }
+        } finally {
+            Connection.requestTimeoutMillis = defaultTimeout;
         }
     }
 }

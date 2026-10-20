@@ -30,7 +30,10 @@ try (NanocachedClient client = NanocachedClient.connect(options)) {
 ```
 
 Keys and values are `byte[]`, with `String` convenience overloads
-(encoded as UTF-8). `get`/`get(byte[])` decode the value as strict UTF-8
+(encoded as UTF-8; a `String` that is not well-formed UTF-16 — one with
+a lone surrogate — throws `IllegalArgumentException` rather than being
+encoded with `?` in its place, which would make it the same key as the
+one with a literal `?`). `get`/`get(byte[])` decode the value as strict UTF-8
 and return `Optional<String>` (a value that isn't valid UTF-8 throws
 `java.io.UncheckedIOException`); `getBytes`/`getBytes(byte[])` return the
 raw `Optional<byte[]>` without decoding. The client is thread-safe;
@@ -225,9 +228,21 @@ connection failure when nothing resolved — a connection loss is never
 reported as a wrong-node answer. `setMany`/`setManyBytes` have nothing
 to return on success, so they just throw a plain
 `NanocachedException.WrongNode` on the wrong-node condition — every
-other key in the batch was still stored. In single-node/proxy mode a
-`W` propagates immediately, exactly like `get`/`set`'s own single-mode
-behavior — there is no ring to refresh against.
+other key in the batch was still stored; a key whose primary could not
+be reached at all (no `W` was ever received) throws
+`NanocachedException.PartialConnectionFailedSet` instead, with the keys
+whose primary did acknowledge in `succeededKeys`. In single-node/proxy
+mode a `W` propagates immediately, exactly like `get`/`set`'s own
+single-mode behavior — there is no ring to refresh against.
+
+A key that appears more than once in a `getMany`/`getManyBytes` list is
+fetched once (the result is a map anyway); in the positional
+`getManyBytes(byte[][])` every position of a repeated key refers to the
+same `byte[]`. Without this a long list of one repeated key would
+cost one `m` frame per 400 copies and hold every frame's reply until the
+call returned. When a `setMany`/`setManyBytes` retry pass runs after a
+refresh, a key is re-sent only to the owners that have not acknowledged
+it yet.
 
 Within one `setMany`/`setManyBytes` batch, the same node can be one
 key's primary and another key's replica at once; it receives exactly
@@ -374,7 +389,12 @@ traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
 restart, a network blip) redials and retries once transparently — but
 **only when the dead connection had genuinely never sent the request**
-(e.g. it had already gone idle-timed-out before this call began). For
+(e.g. it had already gone idle-timed-out before this call began). A
+request that timed out (no reply within the 30-second request deadline)
+is never redialed and resent, for idempotent requests too: the node was
+reachable and simply did not answer, so a second attempt would most
+likely wait out another deadline — a `set` whose replica has stopped
+reading costs one deadline, not two. For
 `get`/`set`/`delete`/`clear`, which are idempotent, that is the only case
 that matters. `incr`/`decr`/`putIfAbsent`/`replaceIfPresent`/`replace`/
 `deleteIfMatches` are **not** idempotent: if the connection instead dies
@@ -502,6 +522,17 @@ this on for a fresh keyspace, or only after every client touching an
 existing one has upgraded and enabled it together. Incompressible data
 (already-compressed media, random bytes) is passed through unchanged
 rather than bloated.
+
+Decompression is bounded three ways: one value may expand to at most
+64 MiB, one `getMany`/`getManyBytes` response to at most 256 MiB across
+the batch, and one client to at most 256 MiB of DEFLATE output in
+flight at a time across every concurrent read. Each decompression of a
+compressed value reserves the 64 MiB per-value cap from that last
+budget while it runs (its output size is not known in advance), so at
+most four run at once per client and further ones wait; the budget is
+released as soon as the value is returned — what a caller then holds is
+the caller's. Before this bound, N concurrent reads of a 61 KB value
+that inflates to 60 MiB held N × 60 MiB at once.
 
 **Incompatible with `incr`/`decr`.** There is no marker byte for INCR's
 plain-decimal-ASCII result, so a client with `compress(true)` refuses to

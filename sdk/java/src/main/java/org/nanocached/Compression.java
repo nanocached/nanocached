@@ -41,6 +41,62 @@ final class Compression {
     // other five SDKs.
     static volatile long maxMultiGetDecompressedBytes = 256L * 1024 * 1024;
 
+    // Bounds how many bytes of DEFLATE output one client may be producing
+    // at any one time, across every concurrent get/getMany. The two caps
+    // above are per call: N concurrent reads of a value that expands to
+    // the per-value cap each decompressed in full at the same time, so
+    // 32 concurrent reads of one 61 KB value that inflates to 60 MiB
+    // exhausted a 512 MiB heap. Each DEFLATE decompression reserves the
+    // per-value cap from this budget (its output size is not known in
+    // advance) and releases it when it returns, so at most four run at
+    // once by default; the rest wait. What a caller holds after a read
+    // returns is the caller's. Mutable, not final, only so a test can
+    // lower it; read once, when a client is built.
+    static volatile long maxInflightDecompressedBytes = 256L * 1024 * 1024;
+
+    /** {@link #maxInflightDecompressedBytes} as a counting semaphore of
+     * bytes, one per {@link NanocachedClient}. */
+    static final class InflateBudget {
+        private final long limit;
+        private long available;
+
+        InflateBudget(long limit) {
+            this.limit = limit;
+            this.available = limit;
+        }
+
+        /** Reserves {@code n} bytes (clamped to the whole budget, so a
+         * reservation can always be met), waiting until they are free. */
+        long acquire(long n) {
+            n = Math.min(n, limit);
+            synchronized (this) {
+                while (available < n) {
+                    try {
+                        wait();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new NanocachedException(
+                                "nanocached: interrupted while waiting for the decompression budget", interrupted);
+                    }
+                }
+                available -= n;
+            }
+            return n;
+        }
+
+        void release(long n) {
+            synchronized (this) {
+                available += n;
+                notifyAll();
+            }
+        }
+    }
+
+    /** When set, called with {@code "start"} once a DEFLATE decompression
+     * holds its reservation and with {@code "end"} when it releases it —
+     * only so a test can observe how many decompressions run at once. */
+    static volatile java.util.function.Consumer<String> inflateTestHook;
+
     private Compression() {}
 
     /**
@@ -92,6 +148,14 @@ final class Compression {
      * Value compression.
      */
     static byte[] decompressValue(byte[] value) {
+        return decompressValue(value, null);
+    }
+
+    /** As {@link #decompressValue(byte[])}, charging a DEFLATE value's
+     * expansion against {@code budget} ({@link
+     * #maxInflightDecompressedBytes}) for as long as it runs; a {@code
+     * null} budget skips the accounting (tests of the codec itself). */
+    static byte[] decompressValue(byte[] value, InflateBudget budget) {
         if (value.length == 0) {
             throw new NanocachedException.DecompressionFailed(
                     "nanocached: compress is enabled but this value has no marker byte "
@@ -106,6 +170,9 @@ final class Compression {
         }
 
         if (marker == MARKER_DEFLATE) {
+            long reserved = budget == null ? 0 : budget.acquire(MAX_DECOMPRESSED_LENGTH + 1L);
+            java.util.function.Consumer<String> hook = inflateTestHook;
+            if (hook != null) hook.accept("start");
             Inflater inflater = new Inflater(true);
             try {
                 inflater.setInput(body);
@@ -154,6 +221,8 @@ final class Compression {
                         error);
             } finally {
                 inflater.end();
+                if (hook != null) hook.accept("end");
+                if (budget != null) budget.release(reserved);
             }
         }
 

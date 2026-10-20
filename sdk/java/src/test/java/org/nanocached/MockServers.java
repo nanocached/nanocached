@@ -68,6 +68,16 @@ final class MockServers {
         final AtomicInteger multiGetCount = new AtomicInteger();
         /** Counts every `o` (multi-set, issue #151) frame received. */
         final AtomicInteger multiSetCount = new AtomicInteger();
+        /** The total number of key/value pairs carried by every `o` frame
+         * received — lets a test prove a batched set sent each key to a
+         * node exactly once, where a frame count alone cannot. */
+        final AtomicInteger multiSetKeyCount = new AtomicInteger();
+        /** When set, every `o` frame is read in full and then the
+         * connection is closed without a reply — a replica (or primary)
+         * that is down for every attempt, including the client's own
+         * in-leg redial, unlike the one-shot {@link
+         * #closeAfterNextMultiSet}. */
+        private volatile boolean failAllMultiSets = false;
         /** Every `m` frame's body byte count (namespace + every key's
          * bytes, header line excluded) in receipt order (issue #222) —
          * lets a test prove request chunking really did keep each
@@ -381,6 +391,11 @@ final class MockServers {
         /** As {@link #closeAfterNextMultiGet}, for `o` (multi-set). */
         void closeAfterNextMultiSet() {
             closeAfterMultiSet.incrementAndGet();
+        }
+
+        /** See {@link #failAllMultiSets}. */
+        void failAllMultiSets() {
+            failAllMultiSets = true;
         }
 
         private boolean takeCloseAfterMultiSet() {
@@ -967,7 +982,11 @@ final class MockServers {
                                 values[i] = in.readNBytes(valueLens[i]);
                             }
                             multiSetCount.incrementAndGet();
+                            multiSetKeyCount.addAndGet(n);
                             multiSetFrameBodyBytes.add(bodyBytes);
+                            if (failAllMultiSets) {
+                                return; // close without replying, every time
+                            }
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
                             }
@@ -1197,6 +1216,18 @@ final class MockServers {
          * would blow the aggregate response cap) without actually
          * holding that much node data in memory. */
         volatile String rawListResponse;
+        /** Every accepted connection, including the client's bootstrap
+         * one — lets a test count the refreshes a client actually ran. */
+        final AtomicInteger connectionCount = new AtomicInteger();
+        /** When positive, every `L` after the first connection's is
+         * answered only after this many milliseconds — a discovery
+         * server that is slow once the client is up, so a test can tell
+         * N serialized refreshes (N delays) from one shared refresh. */
+        volatile long laterListDelayMillis = 0;
+        /** When positive, every `L` reply is written one byte at a time
+         * with this many milliseconds between bytes — a peer that keeps
+         * the identify exchange alive without ever going silent. */
+        volatile long listByteDelayMillis = 0;
 
         MockDiscovery(List<DiscoveredNode> nodes, int replication) throws IOException {
             this.nodes = nodes;
@@ -1220,6 +1251,7 @@ final class MockServers {
             while (!server.isClosed()) {
                 try {
                     Socket socket = server.accept();
+                    connectionCount.incrementAndGet();
                     Thread worker = new Thread(() -> serve(socket), "mock-discovery-conn");
                     worker.setDaemon(true);
                     worker.start();
@@ -1257,6 +1289,8 @@ final class MockServers {
                             out.flush();
                             return;
                         }
+                        long delay = connectionCount.get() > 1 ? laterListDelayMillis : 0;
+                        if (delay > 0) Thread.sleep(delay);
                         List<DiscoveredNode> snapshot = nodes;
                         StringBuilder frame = new StringBuilder(
                                 "N " + snapshot.size() + " " + replication + "\n");
@@ -1265,8 +1299,18 @@ final class MockServers {
                                     .append(node.address().length()).append('\n')
                                     .append(node.name()).append(node.address()).append('\n');
                         }
-                        out.write(frame.toString().getBytes(StandardCharsets.UTF_8));
-                        out.flush();
+                        byte[] bytes = frame.toString().getBytes(StandardCharsets.UTF_8);
+                        long byteDelay = listByteDelayMillis;
+                        if (byteDelay <= 0) {
+                            out.write(bytes);
+                            out.flush();
+                        } else {
+                            for (byte b : bytes) {
+                                out.write(b);
+                                out.flush();
+                                Thread.sleep(byteDelay);
+                            }
+                        }
                     } else if (parts[0].equals("Q")) {
                         // SDK proxy mode (issue #122): same B-on-startup-grace
                         // shape as L above; the header carries only the
@@ -1292,6 +1336,8 @@ final class MockServers {
                 }
             } catch (IOException | RuntimeException done) {
                 // Connection closed — normal end of a mock session.
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
             }
         }
     }
