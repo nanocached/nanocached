@@ -45,6 +45,12 @@ const MAX_DRAIN_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
 /// can-never-fit range without banning small-but-real budgets.
 const MIN_NAMESPACE_BUDGET_BYTES: usize = 10 * cache::ENTRY_OVERHEAD_BYTES;
 
+/// The most a flag that sizes a `tokio::sync::Semaphore` may ask for:
+/// `Semaphore::new` panics above `Semaphore::MAX_PERMITS`, and a flag
+/// value is not a reason to crash at startup after "listening" was
+/// printed.
+const MAX_SEMAPHORE_PERMITS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
 /// Reads the shared auth secret from the environment rather than a CLI
 /// flag, since CLI arguments are visible to anyone who can list processes
 /// (e.g. `ps`) on the host. An unset or empty value means auth is not
@@ -199,6 +205,12 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                 if max_connections == 0 {
                     return Err("--max-connections must be at least 1".to_string().into());
                 }
+                if max_connections > MAX_SEMAPHORE_PERMITS {
+                    return Err(format!(
+                        "--max-connections must be at most {MAX_SEMAPHORE_PERMITS}"
+                    )
+                    .into());
+                }
                 args.max_connections = max_connections;
             }
             "--max-connections-per-ip" => {
@@ -224,6 +236,13 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                          frame); {raw} would serialise every large request instead of \
                          bounding memory",
                         server::MIN_MAX_IN_FLIGHT_BYTES
+                    )
+                    .into());
+                }
+                if bytes > MAX_SEMAPHORE_PERMITS {
+                    return Err(format!(
+                        "--max-in-flight-bytes must be at most {MAX_SEMAPHORE_PERMITS}; {raw} \
+                         is more than the budget can count"
                     )
                     .into());
                 }
