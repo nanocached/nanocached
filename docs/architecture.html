@@ -334,8 +334,8 @@ node&rsquo;s single cache task, so requests that arrive during it wait.
 Measured in release builds at about 25&nbsp;ms per million live keys
 (5&nbsp;ms at 200k, 52&nbsp;ms at 2M); at the default
 <code>--max-memory</code> of 256&nbsp;MiB a node holds on the order of
-2&ndash;3M small entries, so one membership change costs a few pauses of
-a few tens of milliseconds each (one per walker that runs, and the
+1.3&ndash;1.5M small entries, so one membership change costs a few pauses of
+some tens of milliseconds each (one per walker that runs, and the
 reclaim pass runs about twice per change: once after it, once when the
 grace window moves past the old membership) &mdash; the same order as
 the expiry sweep&rsquo;s own periodic refill, and only on membership
@@ -441,8 +441,11 @@ here.</p>
   lock since eviction breaks mutual exclusion. Replicas receive the
   <em>result</em> as a set, because replaying the operation could drift a
   replica from the primary.</li>
-  <li>The memory bound is approximate: key and value bytes plus a small
-  per-entry overhead; allocator overhead is not metered. Leave headroom.</li>
+  <li>The memory bound is approximate: key and value bytes plus a
+  per-entry and a per-namespace overhead measured on the container image
+  (allocator share included), so resident memory tracks the bound for
+  tiny entries and namespaces; transient allocations (snapshots, in-flight
+  requests, forward queues) are outside it. Leave headroom for those.</li>
   <li>Replica-leg writes, read-repair writes and node-list refreshes fail
   silently, so that a dead replica never fails a write; the per-client
   counters (<code>stats()</code>) are the signal.</li>
