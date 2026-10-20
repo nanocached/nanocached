@@ -15,7 +15,12 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 from ._connection import _parse_strict_uint, _retire
-from ._errors import AuthenticationError, DiscoveryBusyError, NanocachedError
+from ._errors import (
+    AuthenticationError,
+    ConnectFailedError,
+    DiscoveryBusyError,
+    NanocachedError,
+)
 
 # Sent as the `A` secret when the caller didn't configure one: a server
 # with no secret accepts any non-empty secret, and one that requires a
@@ -192,6 +197,13 @@ async def _connect_and_identify_with_deadline(
     request_retryable: bool,
     fetch_discovery: _FetchDiscovery[_DiscoveryResult],
 ) -> NodeTarget | _DiscoveryResult:
+    # Every way a dial can fail before a request is sent — refused,
+    # unresolvable, reset or closed mid-handshake, a failed TLS handshake,
+    # the deadline — surfaces as this SDK's own ConnectFailedError, with
+    # the OSError (when there is one) as __cause__, instead of whichever
+    # builtin the OS happened to raise. The SDK's own errors (an auth
+    # refusal, a busy discovery server, a malformed ack) and the
+    # legacy-server signal pass through untouched.
     try:
         return await asyncio.wait_for(
             _connect_and_identify(
@@ -200,9 +212,13 @@ async def _connect_and_identify_with_deadline(
             CONNECT_DEADLINE,
         )
     except TimeoutError as error:
-        raise ConnectionError(
+        raise ConnectFailedError(
             f"nanocached: connecting to {host}:{port} timed out after {CONNECT_DEADLINE}s"
         ) from error
+    except NanocachedError:
+        raise
+    except OSError as error:
+        raise ConnectFailedError(f"nanocached: could not connect to {host}:{port}: {error}") from error
 
 
 
@@ -249,7 +265,16 @@ async def _connect_and_identify(
         try:
             writer.write(b"A %d%b\n%b" % (len(secret), tag_field, secret))
             await writer.drain()
-            ack = await reader.readexactly(3)
+            # A node at its connection limit answers a bare `B\n` (two
+            # bytes, then it closes) instead of the three-byte identity
+            # — read two first so that reply is seen as what it is, not
+            # as a door-slam that would be retried with a lesser `A`.
+            ack = await reader.readexactly(2)
+            if ack == b"B\n":
+                raise ConnectFailedError(
+                    f"nanocached: {host}:{port} is at its connection limit (busy)"
+                )
+            ack += await reader.readexactly(1)
             if ack[0:1] not in (b"O", b"E") or ack[1:2] not in (b"n", b"d"):
                 raise NanocachedError("nanocached: unexpected response to A")
 
@@ -274,9 +299,9 @@ async def _connect_and_identify(
             if request_tags:
                 raise _LegacyServerSignal() from error
             if isinstance(error, asyncio.IncompleteReadError):
-                # An EOFError, not an OSError — wrap it so it stays inside
-                # client.py's _SWALLOWABLE_ERRORS contract.
-                raise NanocachedError(
+                # An EOFError, not an OSError — wrapped so it is a
+                # ConnectFailedError like every other failed dial.
+                raise ConnectFailedError(
                     "nanocached: connection closed during the auth handshake"
                 ) from error
             raise
