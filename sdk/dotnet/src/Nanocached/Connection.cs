@@ -910,6 +910,12 @@ internal sealed class Connection
     /// nothing else may read from <see cref="_stream"/>. Consumes
     /// responses off the wire and dispatches each to the oldest pending
     /// request (FIFO — request pipelining), until a read fails.</summary>
+    /// <summary>Test hook: invoked by the read loop after it has closed
+    /// the connection on a read failure and immediately before it fails
+    /// the oldest waiter — the point at which <see cref="IsClosed"/> must
+    /// already be true. Null outside tests.</summary>
+    internal static Action<Connection>? BeforeFailingWaiterForTest;
+
     private async Task ReadLoopAsync()
     {
         while (true)
@@ -955,6 +961,13 @@ internal sealed class Connection
                 Close();
                 if (dequeued)
                 {
+                    // Close() must come first: the waiter's continuation
+                    // runs on another thread and the client's redial step
+                    // reads IsClosed before deciding to retry, so a waiter
+                    // released before the close would reuse the dying
+                    // connection. The hook lets a test observe the state at
+                    // exactly this point instead of racing the hand-off.
+                    BeforeFailingWaiterForTest?.Invoke(this);
                     failed.Tcs.TrySetException(cause is ConnectionLostException
                         ? cause
                         : new ConnectionLostException($"nanocached: connection failed: {cause.Message}", cause));

@@ -1233,6 +1233,43 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task TheReadLoopHasClosedTheConnectionAtTheMomentItFailsTheWaiter()
+    {
+        // The deterministic form of the loop test below: instead of racing
+        // the thread hand-off many times, observe IsClosed on the read
+        // loop's own thread, right before it releases the waiter. With
+        // Close() moved after TrySetException this sees false every run.
+        long defaultBound = Connection.MaxMultiGetResponseBytes;
+        Connection.MaxMultiGetResponseBytes = 3;
+        Connection? target = null;
+        bool? closedWhenFailing = null;
+        Connection.BeforeFailingWaiterForTest = connection =>
+        {
+            if (ReferenceEquals(connection, target)) closedWhenFailing = connection.IsClosed;
+        };
+        try
+        {
+            using var node = new MockNode();
+            using (NanocachedClient seed = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port)))
+            {
+                await seed.SetAsync("a", "xy");
+                await seed.SetAsync("b", "zw");
+            }
+            byte[][] keys = { Encoding.UTF8.GetBytes("a"), Encoding.UTF8.GetBytes("b") };
+            using var raw = new System.Net.Sockets.TcpClient();
+            await raw.ConnectAsync("127.0.0.1", node.Port);
+            target = new Connection(raw.GetStream());
+            await Assert.ThrowsAsync<ConnectionLostException>(() => target.MultiGetAsync(Array.Empty<byte>(), keys));
+            Assert.True(closedWhenFailing, "the read loop failed the waiter before marking the connection closed");
+        }
+        finally
+        {
+            Connection.BeforeFailingWaiterForTest = null;
+            Connection.MaxMultiGetResponseBytes = defaultBound;
+        }
+    }
+
+    [Fact]
     public async Task AReadFailureMarksTheConnectionClosedBeforeItsWaiterSeesTheFailure()
     {
         // The read loop fails the oldest waiter with the read's own reason
