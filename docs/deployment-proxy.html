@@ -171,7 +171,14 @@ node's definition. The choices that matter:</p>
   href="deployment-operations.html#graceful-scale-in">graceful
   scale-in</a>); ECS must not SIGKILL it first.</li>
   <li><b>0.25 vCPU, 512 MiB.</b> The proxy holds no data; its memory is
-  connection buffers. Watch CPU and
+  connection buffers and the requests in flight. Those are bounded:
+  each client connection may hold 64 MiB of undelivered requests and
+  replies (counted at their worst case, so a batched read is charged
+  the largest reply it could get), and the proxy as a whole holds
+  <code>--max-in-flight-bytes</code> (256 MiB by default) across every
+  connection; a client that pipelines past its share is simply read
+  more slowly until its replies have gone out. Raise the flag together
+  with the task's memory. Watch CPU and
   <code>nanocached_proxy_client_connections</code> before sizing up
   or out.</li>
   <li><b>No service registry.</b> Discovery is the proxy roster; nothing
