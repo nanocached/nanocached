@@ -16,9 +16,12 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
@@ -132,7 +135,17 @@ final class Identify {
     private static Result identifyOnce(
             String host, int port, byte[] authSecret, SSLContext tls, ProbeStage stage, boolean listProxies)
             throws IOException {
-        Socket socket = open(host, port, tls);
+        // One absolute deadline for the whole dial: name resolution, the
+        // TCP connect, the TLS handshake and every read of the identify
+        // exchange share it (see Deadline).
+        Deadline deadline = new Deadline(host, port, connectTimeoutMillis);
+        Socket socket;
+        try {
+            socket = open(host, port, tls, deadline);
+        } catch (IOException error) {
+            deadline.finish();
+            throw deadline.translate(error);
+        }
         try {
             byte[] secret = authSecret != null ? authSecret : NO_SECRET_PLACEHOLDER;
             OutputStream out = socket.getOutputStream();
@@ -147,7 +160,8 @@ final class Identify {
                 out.write(secret);
                 out.flush();
                 identity = readIdentity(socket.getInputStream());
-            } catch (IOException error) {
+            } catch (IOException raw) {
+                IOException error = deadline.translate(raw);
                 // Only an extended attempt is worth stepping back a stage
                 // for — a failure while already running the plain (LEGACY)
                 // form is a real failure. A read timeout is not a
@@ -170,7 +184,10 @@ final class Identify {
             if (identity.kind() == 'n') {
                 // Identify succeeded — hand the socket to Connection with
                 // the exchange deadline cleared, mirroring Go's
-                // SetDeadline(time.Time{}) on success (issue #40).
+                // SetDeadline(time.Time{}) on success (issue #40). If the
+                // watchdog won the race and already closed the socket,
+                // this is a timeout, not a live connection.
+                if (!deadline.finish()) throw deadline.timeout();
                 socket.setSoTimeout(0);
                 return new NodeTarget(socket, identity.tagged());
             }
@@ -189,14 +206,110 @@ final class Identify {
             ClusterTarget cluster = readNodeList(socket.getInputStream());
             socket.close();
             return cluster;
-        } catch (IOException | RuntimeException error) {
+        } catch (IOException error) {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // The original failure is the interesting one.
+            }
+            throw deadline.translate(error);
+        } catch (RuntimeException error) {
             try {
                 socket.close();
             } catch (IOException ignored) {
                 // The original failure is the interesting one.
             }
             throw error;
+        } finally {
+            deadline.finish();
         }
+    }
+
+    /** The absolute deadline of one dial-and-identify attempt. A socket
+     * read timeout ({@code SO_TIMEOUT}) bounds each blocking read, not
+     * the exchange: a peer that sent one byte every few seconds kept
+     * {@code connect()} (and a node-list refresh, which every caller
+     * waits behind) going for minutes, and the TLS handshake and {@link
+     * InputStream#readNBytes} loop over many reads inside one call. So a
+     * watchdog closes the socket when the deadline passes, whatever the
+     * dial is doing at that moment, and the resulting failure is reported
+     * as a timeout rather than as the closed socket it looks like. Only
+     * one of the dialing thread and the watchdog ever "finishes" the
+     * attempt: whichever wins {@link #state} decides whether a node
+     * socket is handed on alive or the attempt is a timeout. */
+    private static final class Deadline {
+        private final String host;
+        private final int port;
+        private final int timeoutMillis;
+        private final long deadlineNanos;
+        private static final int RUNNING = 0;
+        private static final int FINISHED = 1;
+        private static final int FIRED = 2;
+        private final AtomicInteger state = new AtomicInteger(RUNNING);
+        private volatile ScheduledFuture<?> watchdog;
+
+        Deadline(String host, int port, int timeoutMillis) {
+            this.host = host;
+            this.port = port;
+            this.timeoutMillis = timeoutMillis;
+            this.deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        }
+
+        int remainingMillis() {
+            return (int) Math.max(1, TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
+        }
+
+        /** Arms the watchdog on {@code socket}; called once the socket
+         * exists, before anything that can block on the peer. */
+        void watch(Socket socket) {
+            watchdog = WATCHDOG.schedule(() -> {
+                if (!state.compareAndSet(RUNNING, FIRED)) return;
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                    // The dialing thread's own failure is what gets reported.
+                }
+            }, deadlineNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
+        }
+
+        /** Ends the attempt from the dialing thread: {@code true} when it
+         * won against the watchdog (the socket is still open), {@code
+         * false} when the watchdog already fired. Idempotent. */
+        boolean finish() {
+            state.compareAndSet(RUNNING, FINISHED);
+            ScheduledFuture<?> armed = watchdog;
+            if (armed != null) armed.cancel(false);
+            return state.get() != FIRED;
+        }
+
+        /** A failure seen after the watchdog closed the socket is the
+         * timeout, whatever shape the closed socket gave it; translated
+         * before the legacy-server fallback in {@link #identifyOnce} can
+         * mistake it for a server that closed without replying. */
+        IOException translate(IOException error) {
+            return state.get() == FIRED ? timeout() : error;
+        }
+
+        SocketTimeoutException timeout() {
+            return new SocketTimeoutException(
+                    "nanocached: " + host + ":" + port + " did not complete the identify exchange within "
+                            + timeoutMillis + "ms");
+        }
+    }
+
+    // Deadline watchdogs: one daemon thread for every dial in the process;
+    // each task does nothing but close one socket, and a cancelled task
+    // leaves the queue at once.
+    private static final ScheduledThreadPoolExecutor WATCHDOG = newWatchdogPool();
+
+    private static ScheduledThreadPoolExecutor newWatchdogPool() {
+        ScheduledThreadPoolExecutor pool = new ScheduledThreadPoolExecutor(1, runnable -> {
+            Thread thread = new Thread(runnable, "nanocached-dial-watchdog");
+            thread.setDaemon(true);
+            return thread;
+        });
+        pool.setRemoveOnCancelPolicy(true);
+        return pool;
     }
 
     private record AuthIdentity(boolean accepted, char kind, boolean tagged) {}
@@ -312,7 +425,7 @@ final class Identify {
         }
     }
 
-    private static Socket open(String host, int port, SSLContext tls) throws IOException {
+    private static Socket open(String host, int port, SSLContext tls, Deadline deadline) throws IOException {
         // Both paths bound the TCP connect (issue #11): the TLS factory's
         // own connect(host, port) has no timeout, so an unresponsive
         // (packet-dropping) address would hang connect()/refresh forever
@@ -322,23 +435,22 @@ final class Identify {
         // (issue #40): a peer that accepts the connection but never
         // answers must surface as a connect failure, not hang the caller
         // in readExactly forever. identifyOnce clears it only when
-        // handing a node socket to Connection.
+        // handing a node socket to Connection. The deadline's watchdog
+        // bounds the exchange as a whole on top of that (see Deadline).
         Socket plain = new Socket();
         try {
             // DNS counts against the same deadline as the connect itself.
-            int deadlineMs = connectTimeoutMillis;
-            long started = System.nanoTime();
-            InetSocketAddress address = resolve(host, port, deadlineMs);
-            int remainingMs = deadlineMs - (int) TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
-            plain.connect(address, Math.max(1, remainingMs));
+            InetSocketAddress address = resolve(host, port, deadline.remainingMillis());
+            deadline.watch(plain);
+            plain.connect(address, deadline.remainingMillis());
             plain.setTcpNoDelay(true);
-            plain.setSoTimeout(deadlineMs);
+            plain.setSoTimeout(deadline.remainingMillis());
             if (tls == null) {
                 return plain;
             }
             SSLSocket socket =
                     (SSLSocket) tls.getSocketFactory().createSocket(plain, host, port, true);
-            socket.setSoTimeout(deadlineMs);
+            socket.setSoTimeout(deadline.remainingMillis());
             // Without this, the JDK verifies the certificate chain but
             // never checks it was actually issued to `host` — a valid
             // cert for any other name would be accepted, defeating TLS

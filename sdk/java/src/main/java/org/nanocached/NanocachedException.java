@@ -94,18 +94,39 @@ public class NanocachedException extends RuntimeException {
          */
         private final boolean notSent;
 
+        /** {@code true} when the request deadline expired with this
+         * request still unanswered ({@link Connection}'s watchdog — also
+         * set on a write that failed because the watchdog closed the
+         * socket under it, and on every request the watchdog's poison
+         * drained). The peer was reachable and simply did not answer in
+         * time, so the client's own redial-and-retry for idempotent
+         * requests does not apply: a second attempt would most likely
+         * wait out another whole deadline. Always {@code false} on the
+         * public two-argument constructor. */
+        private final boolean timedOut;
+
         public ConnectionFailed(String message, Throwable cause) {
-            this(message, cause, false);
+            this(message, cause, false, false);
         }
 
         ConnectionFailed(String message, Throwable cause, boolean notSent) {
+            this(message, cause, notSent, false);
+        }
+
+        ConnectionFailed(String message, Throwable cause, boolean notSent, boolean timedOut) {
             super(message, cause);
             this.notSent = notSent;
+            this.timedOut = timedOut;
         }
 
         /** See {@link #notSent}. */
         public boolean notSent() {
             return notSent;
+        }
+
+        /** See {@link #timedOut}. */
+        public boolean timedOut() {
+            return timedOut;
         }
     }
 

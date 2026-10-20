@@ -41,6 +41,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
@@ -515,6 +516,10 @@ public final class NanocachedClient implements AutoCloseable {
     private final byte[] authSecret;
     private final SSLContext tls;
     private final boolean compress;
+    /** This client's share of in-flight DEFLATE output — see {@link
+     * Compression#maxInflightDecompressedBytes}. */
+    private final Compression.InflateBudget inflateBudget =
+            new Compression.InflateBudget(Compression.maxInflightDecompressedBytes);
     private final int compressionThreshold;
     private final boolean fireAndForgetReplicas;
     private final boolean readRepair;
@@ -1274,7 +1279,7 @@ public final class NanocachedClient implements AutoCloseable {
      * Namespace}. {@code namespace} is UTF-8 encoded, matching every other
      * key-ish {@code String} overload in this class. */
     public Namespace namespace(String namespace) {
-        return namespace(namespace.getBytes(StandardCharsets.UTF_8));
+        return namespace(utf8(namespace, "namespace"));
     }
 
     /** As {@link #namespace(String)}. An empty {@code namespace} is not
@@ -1328,7 +1333,7 @@ public final class NanocachedClient implements AutoCloseable {
          * Optional.empty()} when the key is missing.
          * @throws UncheckedIOException if the stored value is not valid UTF-8 */
         public Optional<String> get(String key) {
-            return get(key.getBytes(StandardCharsets.UTF_8));
+            return get(utf8(key, "key"));
         }
 
         /** As {@link #get(String)}. */
@@ -1339,7 +1344,7 @@ public final class NanocachedClient implements AutoCloseable {
         /** Returns the raw value, or {@code Optional.empty()} when the key
          * is missing. */
         public Optional<byte[]> getBytes(String key) {
-            return getBytes(key.getBytes(StandardCharsets.UTF_8));
+            return getBytes(utf8(key, "key"));
         }
 
         /** As {@link #getBytes(String)}. Same semantics as {@link
@@ -1351,7 +1356,7 @@ public final class NanocachedClient implements AutoCloseable {
 
         /** As {@link #getWithToken(byte[])}. */
         public Optional<CasEntry> getWithToken(String key) {
-            return getWithToken(key.getBytes(StandardCharsets.UTF_8));
+            return getWithToken(utf8(key, "key"));
         }
 
         /** As {@link NanocachedClient#getWithToken(byte[])}, scoped to
@@ -1383,7 +1388,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         public void set(String key, String value, long ttlSeconds) {
-            set(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), ttlSeconds);
+            set(utf8(key, "key"), utf8(value, "value"), ttlSeconds);
         }
 
         public void set(byte[] key, byte[] value) {
@@ -1397,7 +1402,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         public boolean delete(String key) {
-            return delete(key.getBytes(StandardCharsets.UTF_8));
+            return delete(utf8(key, "key"));
         }
 
         /** Returns whether the key existed before this call, scoped to
@@ -1437,7 +1442,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         public OptionalLong incr(String key, long delta) {
-            return incr(key.getBytes(StandardCharsets.UTF_8), delta);
+            return incr(utf8(key, "key"), delta);
         }
 
         /** As {@link #incr(String, long)} with a delta of 1. */
@@ -1461,7 +1466,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         public OptionalLong decr(String key, long delta) {
-            return decr(key.getBytes(StandardCharsets.UTF_8), delta);
+            return decr(utf8(key, "key"), delta);
         }
 
         /** As {@link #decr(String, long)} with an amount of 1. */
@@ -1494,7 +1499,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         public boolean putIfAbsent(String key, String value, long ttlSeconds) {
-            return putIfAbsent(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8),
+            return putIfAbsent(utf8(key, "key"), utf8(value, "value"),
                     ttlSeconds);
         }
 
@@ -1513,7 +1518,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         public boolean replaceIfPresent(String key, String value, long ttlSeconds) {
-            return replaceIfPresent(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8),
+            return replaceIfPresent(utf8(key, "key"), utf8(value, "value"),
                     ttlSeconds);
         }
 
@@ -1532,7 +1537,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         public boolean replace(String key, String token, String newValue, long ttlSeconds) {
-            return replace(key.getBytes(StandardCharsets.UTF_8), token, newValue.getBytes(StandardCharsets.UTF_8),
+            return replace(utf8(key, "key"), token, utf8(newValue, "value"),
                     ttlSeconds);
         }
 
@@ -1547,7 +1552,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         public boolean deleteIfMatches(String key, String token) {
-            return deleteIfMatches(key.getBytes(StandardCharsets.UTF_8), token);
+            return deleteIfMatches(utf8(key, "key"), token);
         }
 
         /** As {@link NanocachedClient#deleteIfMatches(byte[], String)},
@@ -1608,7 +1613,7 @@ public final class NanocachedClient implements AutoCloseable {
      * when the key is missing.
      * @throws UncheckedIOException if the stored value is not valid UTF-8 */
     public Optional<String> get(String key) {
-        return get(key.getBytes(StandardCharsets.UTF_8));
+        return get(utf8(key, "key"));
     }
 
     /** Returns the value decoded as strict UTF-8, or {@code Optional.empty()}
@@ -1621,7 +1626,7 @@ public final class NanocachedClient implements AutoCloseable {
     /** Returns the raw value, or {@code Optional.empty()} when the key is
      * missing. */
     public Optional<byte[]> getBytes(String key) {
-        return getBytes(key.getBytes(StandardCharsets.UTF_8));
+        return getBytes(utf8(key, "key"));
     }
 
     /** Returns the raw value, or {@code Optional.empty()} when the key is
@@ -1640,7 +1645,7 @@ public final class NanocachedClient implements AutoCloseable {
     Optional<byte[]> getBytes(byte[] namespace, byte[] key) {
         byte[] raw = readRawBytes(namespace, key);
         if (raw == null) return Optional.empty();
-        return Optional.of(compress ? Compression.decompressValue(raw) : raw);
+        return Optional.of(compress ? Compression.decompressValue(raw, inflateBudget) : raw);
     }
 
     /** As {@link #get(String)}, but returning a {@link CasEntry} carrying
@@ -1649,7 +1654,7 @@ public final class NanocachedClient implements AutoCloseable {
      * #putIfAbsent}/{@link #replaceIfPresent}/{@link #replace}/{@link
      * #deleteIfMatches}. */
     public Optional<CasEntry> getWithToken(String key) {
-        return getWithToken(key.getBytes(StandardCharsets.UTF_8));
+        return getWithToken(utf8(key, "key"));
     }
 
     /** As {@link #getWithToken(String)}. <b>Correctness note</b>: the
@@ -1668,7 +1673,7 @@ public final class NanocachedClient implements AutoCloseable {
     Optional<CasEntry> getWithToken(byte[] namespace, byte[] key) {
         byte[] raw = readRawBytes(namespace, key);
         if (raw == null) return Optional.empty();
-        byte[] value = compress ? Compression.decompressValue(raw) : raw;
+        byte[] value = compress ? Compression.decompressValue(raw, inflateBudget) : raw;
         return Optional.of(new CasEntry(value, contentDigest(raw)));
     }
 
@@ -1865,7 +1870,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
         byte[][] keyBytes = new byte[keys.size()][];
         for (int i = 0; i < keys.size(); i++) {
-            keyBytes[i] = keys.get(i).getBytes(StandardCharsets.UTF_8);
+            keyBytes[i] = utf8(keys.get(i), "key");
         }
         try {
             return spliceMany(keys, getManyBytes(namespace, keyBytes));
@@ -1910,11 +1915,74 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /** The namespaced, positional core every {@code getMany} variant
-     * is built on — see {@link #getManyBytes(byte[][])}. */
+     * is built on — see {@link #getManyBytes(byte[][])}.
+     *
+     * <p>A key that appears more than once is fetched once: the
+     * distinct keys go to the owners, and every position of a repeated
+     * key gets the same result (the same {@code byte[]} instance — a
+     * caller that mutates one slot's array in place sees it in the
+     * other). Without this, a list of many copies of one key sent one
+     * {@code m} frame per 400 copies and retained every frame's reply
+     * until the call returned, so about 60 KB of request could hold
+     * hundreds of MB of replies (a 1 MB value repeated 20,000 times). */
     byte[][] getManyBytes(byte[] namespace, byte[][] keys) {
         if (keys.length == 0) {
             throw new IllegalArgumentException("nanocached: getMany/getManyBytes requires at least one key");
         }
+        Map<java.nio.ByteBuffer, Integer> firstPosition = new LinkedHashMap<>(keys.length);
+        int[] distinctOf = new int[keys.length];
+        for (int i = 0; i < keys.length; i++) {
+            Integer position = firstPosition.putIfAbsent(java.nio.ByteBuffer.wrap(keys[i]), firstPosition.size());
+            distinctOf[i] = position == null ? firstPosition.size() - 1 : position;
+        }
+        if (firstPosition.size() == keys.length) {
+            return getManyDistinct(namespace, keys);
+        }
+
+        byte[][] distinct = new byte[firstPosition.size()][];
+        for (int i = 0; i < keys.length; i++) {
+            distinct[distinctOf[i]] = keys[i];
+        }
+        try {
+            return expandPositions(getManyDistinct(namespace, distinct), distinctOf);
+        } catch (NanocachedException.PartialWrongNodeRaw partial) {
+            throw new NanocachedException.PartialWrongNodeRaw(
+                    expandPositions(partial.partialValues, distinctOf),
+                    expandIndices(partial.unresolvedIndices, distinctOf));
+        } catch (NanocachedException.PartialConnectionFailedRaw partial) {
+            throw new NanocachedException.PartialConnectionFailedRaw(
+                    partial.getMessage(), partial.getCause(),
+                    expandPositions(partial.partialValues, distinctOf),
+                    expandIndices(partial.unresolvedIndices, distinctOf));
+        }
+    }
+
+    /** Maps a result over the distinct keys back onto the caller's
+     * positions: {@code result[i] = distinctValues[distinctOf[i]]}. */
+    private static byte[][] expandPositions(byte[][] distinctValues, int[] distinctOf) {
+        byte[][] values = new byte[distinctOf.length][];
+        for (int i = 0; i < distinctOf.length; i++) {
+            values[i] = distinctValues[distinctOf[i]];
+        }
+        return values;
+    }
+
+    /** As {@link #expandPositions}, for a partial-failure exception's
+     * {@code unresolvedIndices}: every caller position of an unresolved
+     * distinct key is unresolved. */
+    private static List<Integer> expandIndices(int[] distinctUnresolved, int[] distinctOf) {
+        boolean[] unresolved = new boolean[distinctOf.length];
+        for (int d : distinctUnresolved) unresolved[d] = true;
+        List<Integer> positions = new ArrayList<>();
+        for (int i = 0; i < distinctOf.length; i++) {
+            if (unresolved[distinctOf[i]]) positions.add(i);
+        }
+        return positions;
+    }
+
+    /** {@link #getManyBytes(byte[], byte[][])} over keys already known
+     * to be distinct. */
+    private byte[][] getManyDistinct(byte[] namespace, byte[][] keys) {
         for (byte[] key : keys) {
             validateKey(namespace, key);
         }
@@ -2023,7 +2091,7 @@ public final class NanocachedClient implements AutoCloseable {
      * #getManyBytes(byte[], byte[][])}'s per-entry splicing can share it: a
      * no-op when {@code compress} is off. */
     private byte[] maybeDecompress(byte[] value) {
-        return compress ? Compression.decompressValue(value) : value;
+        return compress ? Compression.decompressValue(value, inflateBudget) : value;
     }
 
     /** Decompresses one hit value for a {@code getMany} batch and charges
@@ -2357,7 +2425,7 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     public void set(String key, String value, long ttlSeconds) {
-        set(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), ttlSeconds);
+        set(utf8(key, "key"), utf8(value, "value"), ttlSeconds);
     }
 
     public void set(byte[] key, byte[] value) {
@@ -2410,7 +2478,7 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     public boolean delete(String key) {
-        return delete(key.getBytes(StandardCharsets.UTF_8));
+        return delete(utf8(key, "key"));
     }
 
     /** Returns whether the key existed before this call. */
@@ -2439,7 +2507,7 @@ public final class NanocachedClient implements AutoCloseable {
     private void setManyString(byte[] namespace, Map<String, String> values, long ttlSeconds) {
         Map<String, byte[]> raw = new LinkedHashMap<>(values.size());
         for (Map.Entry<String, String> entry : values.entrySet()) {
-            raw.put(entry.getKey(), entry.getValue().getBytes(StandardCharsets.UTF_8));
+            raw.put(entry.getKey(), utf8(entry.getValue(), "value"));
         }
         setManyBytes(namespace, raw, ttlSeconds);
     }
@@ -2487,7 +2555,7 @@ public final class NanocachedClient implements AutoCloseable {
         List<String> keyList = new ArrayList<>(values.size());
         int i = 0;
         for (Map.Entry<String, byte[]> entry : values.entrySet()) {
-            keyBytes[i] = entry.getKey().getBytes(StandardCharsets.UTF_8);
+            keyBytes[i] = utf8(entry.getKey(), "key");
             valueBytes[i] = entry.getValue();
             keyList.add(entry.getKey());
             i++;
@@ -2570,11 +2638,62 @@ public final class NanocachedClient implements AutoCloseable {
             return;
         }
 
-        List<Integer> retry = multiSetPass(namespace, keys, valueBytes, wireTtlSeconds, null);
+        MultiSetTracker tracker = new MultiSetTracker();
+        List<Integer> retry = multiSetPass(namespace, keys, valueBytes, wireTtlSeconds, null, tracker);
         if (retry.isEmpty()) return;
         maybeRefresh(true);
-        retry = multiSetPass(namespace, keys, valueBytes, wireTtlSeconds, retry);
-        if (!retry.isEmpty()) throw new NanocachedException.WrongNode();
+        retry = multiSetPass(namespace, keys, valueBytes, wireTtlSeconds, retry, tracker);
+        if (retry.isEmpty()) return;
+        // A key is still unresolved after the retry pass. Only a real `W`
+        // from its primary is a wrong-node outcome; a primary that could
+        // not be reached at the connection level on both passes (the
+        // leg's connection closed or timed out, no `W` ever received) is
+        // a connection failure and is reported as one, with the
+        // positions whose primary did acknowledge attached — a caller
+        // that reacts to WrongNode by refreshing and retrying must not
+        // do that for a dead node, and one that logs the message must
+        // not be told the node answered.
+        for (int idx : retry) {
+            if (!tracker.primaryUnreachable.contains(idx)) throw new NanocachedException.WrongNode();
+        }
+        NanocachedException cause = tracker.lastCause.get();
+        if (cause == null) {
+            cause = new NanocachedException.ConnectionFailed(
+                    "nanocached: no owner is reachable for these keys", null);
+        }
+        List<Integer> succeeded = new ArrayList<>(tracker.primaryAcknowledged);
+        Collections.sort(succeeded);
+        throw new NanocachedException.PartialConnectionFailedSetRaw(cause.getMessage(), cause, succeeded);
+    }
+
+    /** What one {@link #setManyBytes(byte[], byte[][], byte[][], long)}
+     * call learns across its two {@link #multiSetPass} passes. {@code
+     * acknowledged} records, per position, every owner (by name) that
+     * answered {@code S} for it, so the retry pass sends a position
+     * only to the owners that have not acknowledged it yet — a key
+     * whose primary leg failed used to be re-sent to every owner after
+     * the refresh, including a replica that had already stored it,
+     * which was duplicate traffic and a chance to re-apply an older
+     * value over a newer concurrent write. {@code primaryUnreachable}
+     * holds the positions whose primary leg's latest outcome was a
+     * connection failure rather than a {@code W}; {@code
+     * primaryAcknowledged} the positions whose primary stored them;
+     * {@code lastCause} the most recent leg-level connection failure.
+     * Legs run concurrently, so every member is thread-safe. */
+    private static final class MultiSetTracker {
+        final Map<Integer, Set<String>> acknowledged = new ConcurrentHashMap<>();
+        final Set<Integer> primaryUnreachable = ConcurrentHashMap.newKeySet();
+        final Set<Integer> primaryAcknowledged = ConcurrentHashMap.newKeySet();
+        final AtomicReference<NanocachedException> lastCause = new AtomicReference<>();
+
+        boolean isAcknowledged(int idx, String owner) {
+            Set<String> owners = acknowledged.get(idx);
+            return owners != null && owners.contains(owner);
+        }
+
+        void acknowledge(int idx, String owner) {
+            acknowledged.computeIfAbsent(idx, ignored -> ConcurrentHashMap.newKeySet()).add(owner);
+        }
     }
 
     /** Builds {@link NanocachedException.PartialConnectionFailedSetRaw}
@@ -2694,7 +2813,7 @@ public final class NanocachedClient implements AutoCloseable {
      * see {@link #runMultiSetLeg}. */
     private List<Integer> multiSetPass(
             byte[] namespace, byte[][] keyBytes, byte[][] valueBytes,
-            Long ttlSeconds, List<Integer> retryIndices) {
+            Long ttlSeconds, List<Integer> retryIndices, MultiSetTracker tracker) {
         List<Integer> indices = retryIndices;
         if (indices == null) {
             indices = new ArrayList<>(keyBytes.length);
@@ -2710,6 +2829,9 @@ public final class NanocachedClient implements AutoCloseable {
                 continue;
             }
             for (int rank = 0; rank < names.size(); rank++) {
+                // An owner that already stored this position on the
+                // previous pass is not sent it again (see MultiSetTracker).
+                if (tracker.isAcknowledged(idx, names.get(rank))) continue;
                 OwnerBatch batch = owners.computeIfAbsent(names.get(rank), name -> new OwnerBatch());
                 batch.indices.add(idx);
                 batch.isPrimary.add(rank == 0);
@@ -2739,8 +2861,11 @@ public final class NanocachedClient implements AutoCloseable {
                 // instead of the shared, still-mutable one. Only the entries
                 // this leg actually touches are copied, not the whole batch.
                 byte[][] backgroundValues = compress ? valueBytes : copyValuesForBackground(valueBytes, batch.indices);
-                Runnable backgroundLeg =
-                        () -> runMultiSetLeg(namespace, name, batch, keyBytes, backgroundValues, ttlSeconds, retry);
+                // Its outcome is never waited for, so it records nothing
+                // in the tracker: the retry pass (if any) sends this
+                // owner its positions again, as before.
+                Runnable backgroundLeg = () -> runMultiSetLeg(
+                        namespace, name, batch, keyBytes, backgroundValues, ttlSeconds, retry, null);
                 try {
                     CompletableFuture.runAsync(backgroundLeg, backgroundLegs)
                             .whenComplete((ignoredResult, error) -> {
@@ -2754,7 +2879,8 @@ public final class NanocachedClient implements AutoCloseable {
                 continue;
             }
 
-            Runnable leg = () -> runMultiSetLeg(namespace, name, batch, keyBytes, valueBytes, ttlSeconds, retry);
+            Runnable leg =
+                    () -> runMultiSetLeg(namespace, name, batch, keyBytes, valueBytes, ttlSeconds, retry, tracker);
             legs.add(submitReplicaWrite(leg));
         }
 
@@ -2857,7 +2983,7 @@ public final class NanocachedClient implements AutoCloseable {
 
     private void runMultiSetLeg(
             byte[] namespace, String name, OwnerBatch batch, byte[][] keyBytes, byte[][] valueBytes,
-            Long ttlSeconds, List<Integer> retry) {
+            Long ttlSeconds, List<Integer> retry, MultiSetTracker tracker) {
         byte[][] groupKeys = new byte[batch.indices.size()][];
         byte[][] groupValues = new byte[batch.indices.size()][];
         for (int i = 0; i < batch.indices.size(); i++) {
@@ -2870,14 +2996,16 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             entries = multiSetChunked(() -> memberConnection(name), namespace, groupKeys, groupValues, ttlSeconds);
         } catch (ChunkedConnectionFailure partial) {
-            applyLegOutcome(batch, partial.partialEntries, retry);
+            if (tracker != null) tracker.lastCause.set(partial.cause);
+            applyLegOutcome(name, batch, partial.partialEntries, retry, tracker);
             return;
         } catch (NanocachedException connectionFailure) {
-            applyLegOutcome(batch, Collections.nCopies(batch.indices.size(), null), retry);
+            if (tracker != null) tracker.lastCause.set(connectionFailure);
+            applyLegOutcome(name, batch, Collections.nCopies(batch.indices.size(), null), retry, tracker);
             return;
         }
 
-        applyLegOutcome(batch, entries, retry);
+        applyLegOutcome(name, batch, entries, retry, tracker);
     }
 
     /** Shared by {@link #runMultiSetLeg}'s three outcomes (a clean
@@ -2889,14 +3017,34 @@ public final class NanocachedClient implements AutoCloseable {
      * retry}; a replica-held one is counted into {@link
      * #replicaWriteFailures} instead — see {@link #runMultiSetLeg}'s own
      * doc comment. A position with a real {@code entry.ok()} answer is
-     * left alone either way: it already succeeded. */
-    private void applyLegOutcome(OwnerBatch batch, List<Connection.MultiEntry> entries, List<Integer> retry) {
+     * recorded as acknowledged by this owner in {@code tracker} (when
+     * there is one — a fire-and-forget leg passes {@code null}) so the
+     * retry pass skips it, and is otherwise left alone: it already
+     * succeeded. */
+    private void applyLegOutcome(
+            String owner, OwnerBatch batch, List<Connection.MultiEntry> entries, List<Integer> retry,
+            MultiSetTracker tracker) {
         for (int i = 0; i < batch.indices.size(); i++) {
             Connection.MultiEntry entry = entries.get(i);
+            int idx = batch.indices.get(i);
+            boolean primary = batch.isPrimary.get(i);
             boolean unresolved = entry == null || entry.wrongNode();
-            if (!unresolved) continue;
-            if (batch.isPrimary.get(i)) {
-                retry.add(batch.indices.get(i));
+            if (!unresolved) {
+                if (tracker != null) {
+                    tracker.acknowledge(idx, owner);
+                    if (primary) tracker.primaryAcknowledged.add(idx);
+                }
+                continue;
+            }
+            if (primary) {
+                if (tracker != null) {
+                    if (entry == null) {
+                        tracker.primaryUnreachable.add(idx);
+                    } else {
+                        tracker.primaryUnreachable.remove(idx);
+                    }
+                }
+                retry.add(idx);
             } else {
                 replicaWriteFailures.incrementAndGet();
             }
@@ -2926,7 +3074,7 @@ public final class NanocachedClient implements AutoCloseable {
     // already dead from an idle timeout), which is always safe.
 
     public OptionalLong incr(String key, long delta) {
-        return incr(key.getBytes(StandardCharsets.UTF_8), delta);
+        return incr(utf8(key, "key"), delta);
     }
 
     /** As {@link #incr(String, long)} with a delta of 1. */
@@ -2949,7 +3097,7 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     public OptionalLong decr(String key, long delta) {
-        return decr(key.getBytes(StandardCharsets.UTF_8), delta);
+        return decr(utf8(key, "key"), delta);
     }
 
     /** As {@link #decr(String, long)} with an amount of 1. */
@@ -3038,7 +3186,7 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     public boolean putIfAbsent(String key, String value, long ttlSeconds) {
-        return putIfAbsent(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), ttlSeconds);
+        return putIfAbsent(utf8(key, "key"), utf8(value, "value"), ttlSeconds);
     }
 
     public boolean putIfAbsent(byte[] key, byte[] value) {
@@ -3071,7 +3219,7 @@ public final class NanocachedClient implements AutoCloseable {
 
     public boolean replaceIfPresent(String key, String value, long ttlSeconds) {
         return replaceIfPresent(
-                key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), ttlSeconds);
+                utf8(key, "key"), utf8(value, "value"), ttlSeconds);
     }
 
     public boolean replaceIfPresent(byte[] key, byte[] value) {
@@ -3100,7 +3248,7 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     public boolean replace(String key, String token, String newValue, long ttlSeconds) {
-        return replace(key.getBytes(StandardCharsets.UTF_8), token, newValue.getBytes(StandardCharsets.UTF_8),
+        return replace(utf8(key, "key"), token, utf8(newValue, "value"),
                 ttlSeconds);
     }
 
@@ -3166,7 +3314,7 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     public boolean deleteIfMatches(String key, String token) {
-        return deleteIfMatches(key.getBytes(StandardCharsets.UTF_8), token);
+        return deleteIfMatches(utf8(key, "key"), token);
     }
 
     /** Removes {@code key} only if its current stored value's {@link
@@ -3236,6 +3384,27 @@ public final class NanocachedClient implements AutoCloseable {
      * byte[], long)}'s ttlSeconds check. The namespace itself has no
      * length limit beyond this shared one (namespaces spec): there is no
      * separate namespace-only cap. */
+    /** The UTF-8 encoding every {@code String} key, namespace and value
+     * overload in this class uses. {@code String.getBytes(UTF_8)} silently
+     * replaces a lone surrogate (half of a UTF-16 pair with no partner)
+     * with {@code '?'}, so {@code "x\uD800"} and {@code "x?"} would address
+     * the same cache entry and a read under one key would return the
+     * other's value. Strings that are not well-formed UTF-16 are rejected
+     * instead, the way every other caller mistake in this class is. */
+    static byte[] utf8(String text, String what) {
+        for (int i = 0, n = text.length(); i < n; i++) {
+            char c = text.charAt(i);
+            if (!Character.isSurrogate(c)) continue;
+            if (Character.isHighSurrogate(c) && i + 1 < n && Character.isLowSurrogate(text.charAt(i + 1))) {
+                i++;
+                continue;
+            }
+            throw new IllegalArgumentException("nanocached: " + what + " is not well-formed UTF-16 (a lone surrogate "
+                    + "at index " + i + " cannot be encoded as UTF-8)");
+        }
+        return text.getBytes(StandardCharsets.UTF_8);
+    }
+
     private static void validateKey(byte[] namespace, byte[] key) {
         if (key.length == 0) {
             throw new IllegalArgumentException("nanocached: key must not be empty");
@@ -3541,6 +3710,14 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             return op.apply(source.get());
         } catch (NanocachedException.ConnectionFailed retryable) {
+            // A request timeout is not the idle-FIN case this retry exists
+            // for: the peer accepted the frame and simply never answered
+            // within the request deadline, so a redial-and-resend would
+            // most likely stall for another full deadline (a replica that
+            // stopped reading made a cluster set take twice the request
+            // timeout) and would re-send a write the peer may still
+            // apply. The timeout is surfaced as-is instead.
+            if (retryable.timedOut()) throw retryable;
             return op.apply(source.get());
         }
     }
@@ -4698,8 +4875,20 @@ public final class NanocachedClient implements AutoCloseable {
         if (ring == null) return;
         if (!force && System.nanoTime() - lastFetchNanos < NODE_LIST_STALE_AFTER.toNanos()) return;
 
+        // Forced refreshes are single-flight: a forced caller that waited
+        // for refreshLock while another refresh ran reuses that refresh
+        // instead of running its own. Without this, N callers hitting
+        // the same dead node ran N full refreshes one after another (each
+        // a discovery round trip, up to the connect timeout when
+        // discovery is slow), and the last caller waited behind N - 1
+        // results it did not need. A refresh that completed — including
+        // one whose fetch failed, which also advances lastFetchNanos — is
+        // what the waiter would have got from its own attempt moments
+        // later, so its outcome is reused either way.
+        long observed = lastFetchNanos;
         synchronized (refreshLock) {
             if (!force && System.nanoTime() - lastFetchNanos < NODE_LIST_STALE_AFTER.toNanos()) return;
+            if (force && lastFetchNanos - observed > 0) return;
             refreshNodeList();
         }
     }
