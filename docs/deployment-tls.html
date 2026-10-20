@@ -47,8 +47,11 @@ connection is closed. <code>--tls-ca</code> (a PEM file of one or more
 CA certificates) turns on TLS for everything the process <em>dials</em>,
 trusting only those certificates &mdash; not the system trust store,
 since a private cluster&rsquo;s certificates are not publicly issued.
-The two are independent. A process with only one of them set warns at
-start-up that the other direction is plaintext, and what a
+The two are independent. A process that dials anything with only one
+of them set warns at start-up that the other direction is plaintext
+(a proxy or a discovery server always does; a node does when it has a
+<code>--discovery</code> to register with &mdash; a standalone node with
+only a certificate dials nothing and stays quiet), and what a
 half-configured proxy looks like from outside is described in the
 proxy section below. The SDKs take the
 same two pieces as options: <code>tls</code> and, for anything that is
@@ -1051,11 +1054,16 @@ handshake with 10.1.1.52 failed: received corrupt message</code> line
 every couple of seconds (41 by the time the task was stopped, about a
 minute and a half after it was launched), the proxy
 never obtains a roster, so <code>/readyz</code> stays 503 and ECS marks
-the task <code>UNHEALTHY</code>, and its own log says only
-<code>roster refresh failed: connection closed mid-frame</code> and
-<code>proxy announce &hellip; failed</code>, never the word TLS. A
-service would keep replacing such a task; the health check catches
-it, and discovery&rsquo;s log names it. The node logs carried no TLS
+the task <code>UNHEALTHY</code>, and its own log names the cause
+twice: at start-up, <code>WARN TLS is enabled for client connections
+only (no --tls-ca): connections to discovery and to every node
+&mdash; and the shared secret they carry &mdash; go out in
+plaintext</code>, and then on every failed refresh, <code>roster
+refresh failed: connection closed mid-frame (sent in plaintext; a
+peer that requires TLS closes the connection like this &mdash; is
+--tls-ca missing?)</code>. A service would keep replacing such a
+task; the health check catches it, and both the proxy&rsquo;s and
+discovery&rsquo;s logs name it. The node logs carried no TLS
 failure at any point in the run (the only lines mentioning TLS were
 <code>closed without TLS close_notify</code> at <code>INFO</code>, a
 peer going away without the closing handshake); every <code>WARN TLS
