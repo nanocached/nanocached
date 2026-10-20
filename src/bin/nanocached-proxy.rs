@@ -1191,6 +1191,38 @@ fn plaintext_hint(tls_connector: &Option<TlsConnector>, error: &io::Error) -> &'
     }
 }
 
+/// The `WARN` line a failed roster refresh logs: the error, plus the
+/// plaintext hint when the failure looks like a TLS-only peer hanging up
+/// on a plaintext dial. One function so the hint cannot be dropped from
+/// the log line without a test noticing.
+fn roster_refresh_warning(tls_connector: &Option<TlsConnector>, error: &io::Error) -> String {
+    format!(
+        "WARN roster refresh failed: {error}{}",
+        plaintext_hint(tls_connector, error)
+    )
+}
+
+/// The start-up warning for a half-configured TLS setup, or `None` when
+/// both sides or neither side is configured. Client-side and backend-side
+/// TLS are independent (the proxy is dialled by applications *and* dials
+/// discovery and every node, carrying the shared secret both ways), and
+/// a proxy with no `--tls-ca` against a TLS-only cluster looks fine to its
+/// clients and never obtains a roster.
+fn half_tls_warning(client_tls: bool, backend_tls: bool) -> Option<&'static str> {
+    match (client_tls, backend_tls) {
+        (true, false) => Some(
+            "nanocached-proxy: WARN TLS is enabled for client connections only (no --tls-ca): \
+             connections to discovery and to every node — and the shared secret they carry — \
+             go out in plaintext",
+        ),
+        (false, true) => Some(
+            "nanocached-proxy: WARN TLS is enabled for backend connections only \
+             (no --tls-cert/--tls-key): client traffic — and the shared secret — arrives in plaintext",
+        ),
+        _ => None,
+    }
+}
+
 async fn run_refresher(
     config: RefresherConfig,
     ring_tx: watch::Sender<Option<Arc<RingView>>>,
@@ -1238,10 +1270,7 @@ async fn run_refresher(
                 }
             }
             Err(error) => {
-                eprintln!(
-                    "WARN roster refresh failed: {error}{}",
-                    plaintext_hint(&tls_connector, &error)
-                );
+                eprintln!("{}", roster_refresh_warning(&tls_connector, &error));
                 waiters.retain(|waiter| !waiter.is_closed());
             }
         }
@@ -5258,17 +5287,8 @@ fn main() -> ExitCode {
     // easy to do and otherwise silent: a proxy with no `--tls-ca` against
     // a TLS-only cluster looks fine to its clients and never obtains a
     // roster. Same check as the node and discovery binaries.
-    match (&tls_acceptor, &tls_connector) {
-        (Some(_), None) => eprintln!(
-            "nanocached-proxy: WARN TLS is enabled for client connections only (no --tls-ca): \
-             connections to discovery and to every node — and the shared secret they carry — \
-             go out in plaintext"
-        ),
-        (None, Some(_)) => eprintln!(
-            "nanocached-proxy: WARN TLS is enabled for backend connections only \
-             (no --tls-cert/--tls-key): client traffic — and the shared secret — arrives in plaintext"
-        ),
-        _ => {}
+    if let Some(warning) = half_tls_warning(tls_acceptor.is_some(), tls_connector.is_some()) {
+        eprintln!("{warning}");
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -6036,6 +6056,43 @@ mod tests {
         assert_eq!(plaintext_hint(&None, &refused), "");
         let (_acceptor, connector) = self_signed_tls();
         assert_eq!(plaintext_hint(&Some(connector), &eof), "");
+    }
+
+    #[test]
+    fn a_failed_roster_refresh_logs_the_error_and_the_plaintext_hint() {
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed mid-frame");
+        let line = roster_refresh_warning(&None, &eof);
+        assert!(
+            line.starts_with("WARN roster refresh failed: connection closed mid-frame"),
+            "{line}"
+        );
+        assert!(line.ends_with("is --tls-ca missing?)"), "{line}");
+        let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+        assert_eq!(
+            roster_refresh_warning(&None, &refused),
+            "WARN roster refresh failed: refused"
+        );
+    }
+
+    #[test]
+    fn a_half_configured_tls_setup_warns_at_start_up_and_a_consistent_one_does_not() {
+        let client_only = half_tls_warning(true, false).expect("client-only TLS warns");
+        assert!(
+            client_only.contains("client connections only (no --tls-ca)"),
+            "{client_only}"
+        );
+        assert!(client_only.contains("plaintext"), "{client_only}");
+        let backend_only = half_tls_warning(false, true).expect("backend-only TLS warns");
+        assert!(
+            backend_only.contains("backend connections only"),
+            "{backend_only}"
+        );
+        assert!(
+            backend_only.contains("--tls-cert/--tls-key"),
+            "{backend_only}"
+        );
+        assert_eq!(half_tls_warning(true, true), None);
+        assert_eq!(half_tls_warning(false, false), None);
     }
 
     #[test]
