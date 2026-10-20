@@ -429,6 +429,20 @@ deprecation cycle. What 1.0.0 will freeze (the client wire protocol and the
 public API of every SDK) is described on the
 [compatibility page](https://nanocached.org/compatibility.html).
 
+## Accepted behaviour
+
+Some behaviours were measured, understood and deliberately left as they
+are, because removing them would cost more than they are worth (most
+would need a version on every write, in the server and every SDK). They
+are collected in one list, one item each with what happens and why it
+stays: the
+[accepted behaviour list](https://nanocached.org/architecture.html#accepted-behaviour)
+on the architecture page. Read it before relying on a cluster during a
+membership change: for example, a counter incremented concurrently by
+several callers in the minute after a node joins can lose a few
+increments, and concurrent writes to one key from several callers can
+leave its replicas disagreeing until the next write.
+
 ## Capacity planning
 
 Memory, effective capacity, replication (R), TTL, and hit rate trade off
