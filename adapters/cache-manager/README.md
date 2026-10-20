@@ -149,7 +149,12 @@ client directly, for anything this store doesn't itself surface —
 - **`mget`/`mset`** ride the wire's batched multi-get/multi-set — one round
   trip per involved node; **`mdel`** is a concurrent
   `Promise.all` loop over `del`. `mget` preserves key order in its result
-  (including `undefined` holes for misses); `mset` applies one `ttl` to
+  (including `undefined` holes for misses — and a hole for a key the
+  node could not fit: the values in one batch reply total at most
+  16 MiB, and a hit past that budget is answered as a miss, so an `mget`
+  of many large keys can come back with fewer values than exist; `get`
+  such a key on its own rather than taking it for evicted); `mset`
+  applies one `ttl` to
   every entry, same as `cache-manager`'s own multi-store fallback for a
   store lacking a native `mset`.
 
