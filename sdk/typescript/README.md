@@ -486,7 +486,10 @@ connection error when nothing resolved — a connection loss is never
 reported as a wrong-node answer. `setMany`/`setManyBytes` have nothing
 to return on success, so they just throw a plain `WrongNodeError` on
 the wrong-node condition — every other key in the batch was still
-stored. In single-node/proxy mode a `W` propagates immediately, exactly
+stored; a key whose primary could not be reached at all (no `W` was
+ever received) throws `PartialConnectionLostError` instead,
+`.partialValues` the keys whose primary did store them. In
+single-node/proxy mode a `W` propagates immediately, exactly
 like `get`/`set`'s own single-mode behavior — there is no ring to
 refresh against.
 

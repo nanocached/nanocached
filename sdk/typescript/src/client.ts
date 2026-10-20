@@ -66,7 +66,10 @@ export class CompressionIncompatibleError extends NanocachedError {
  * handful of stale placements shouldn't force discarding an otherwise
  * successful batch. setMany/setManyBytes have nothing to return on
  * success, so they just throw a plain WrongNodeError on the same
- * condition — there's no partial payload worth attaching. */
+ * condition — there's no partial payload worth attaching (a primary
+ * that could not be reached at all, as opposed to one that answered
+ * `W`, is a PartialConnectionLostError carrying the keys that were
+ * stored). */
 export class PartialWrongNodeError<T = unknown> extends WrongNodeError {
   constructor(public readonly partialValues: T) {
     super();
@@ -126,6 +129,21 @@ const PROGRAMMING_ERROR_CONSTRUCTORS = [TypeError, RangeError, ReferenceError, S
  * identically to a dead replica or a stuck refresh. */
 function isSwallowable(error: unknown): boolean {
   return !PROGRAMMING_ERROR_CONSTRUCTORS.some((ctor) => error instanceof ctor);
+}
+
+/** What one setMany call learns across its two multiSetPass passes.
+ * `acknowledged` records, per key index, every owner (by name) that
+ * answered `S` for it, so the retry pass sends a key only to the owners
+ * that have not acknowledged it yet. `primaryUnreachable` holds the
+ * indices whose primary leg's latest outcome was a connection failure
+ * rather than a `W`; `primaryAcknowledged` the indices whose primary
+ * stored them; `lastCause` the most recent leg-level connection
+ * failure. */
+interface MultiSetTracker {
+  acknowledged: Map<number, Set<string>>;
+  primaryUnreachable: Set<number>;
+  primaryAcknowledged: Set<number>;
+  lastCause: unknown;
 }
 
 /** Snapshot of counters for failures this client swallows by design
@@ -1893,7 +1911,10 @@ export class NanocachedClient {
    * like `setBytes`' own replica legs (`writeToOwners`). A batch never
    * fails as a whole: if some keys' primaries are still wrong-node
    * after one bounded refresh-and-retry, this throws `WrongNodeError`
-   * — every other key in the batch was still stored. In
+   * — every other key in the batch was still stored; a key whose
+   * primary could not be reached at all on both passes (no `W` was
+   * ever received) throws `PartialConnectionLostError` instead, its
+   * `partialValues` the keys whose primary did store them. In
    * single-node/proxy mode a `W` propagates immediately, exactly as
    * `setBytes`' own single-mode behavior does.
    *
@@ -1964,13 +1985,34 @@ export class NanocachedClient {
     // including the replica that had already stored it — duplicate
     // traffic, and a chance to re-apply an older value over a newer
     // concurrent write. getMany keeps its completed chunks the same way.
-    const acknowledged = new Map<number, Set<string>>();
-    let retryIndices = await this.multiSetPass(namespace, keyBytes, valueBytes, ttlSeconds, undefined, acknowledged);
+    const tracker: MultiSetTracker = {
+      acknowledged: new Map(),
+      primaryUnreachable: new Set(),
+      primaryAcknowledged: new Set(),
+      lastCause: undefined,
+    };
+    let retryIndices = await this.multiSetPass(namespace, keyBytes, valueBytes, ttlSeconds, undefined, tracker);
     if (retryIndices.length === 0) return;
 
     await this.maybeRefreshNodeList({ force: true });
-    retryIndices = await this.multiSetPass(namespace, keyBytes, valueBytes, ttlSeconds, retryIndices, acknowledged);
-    if (retryIndices.length > 0) throw new WrongNodeError();
+    retryIndices = await this.multiSetPass(namespace, keyBytes, valueBytes, ttlSeconds, retryIndices, tracker);
+    if (retryIndices.length === 0) return;
+    // A key is still unresolved after the retry pass. Only a real `W`
+    // from its primary is a wrong-node outcome; a primary that could not
+    // be reached at the connection level on both passes (the leg's
+    // connection closed or timed out, no `W` ever received) is a
+    // connection failure and is reported as one, with the keys whose
+    // primary did acknowledge attached — a caller that reacts to
+    // WrongNodeError by refreshing and retrying must not do that for a
+    // dead node, and one that logs the message must not be told the
+    // node answered.
+    if (retryIndices.some((index) => !tracker.primaryUnreachable.has(index))) throw new WrongNodeError();
+    const cause = tracker.lastCause;
+    const causeMessage = cause instanceof Error ? cause.message : "nanocached: no owner is reachable for these keys";
+    const stored = keys.filter((_, index) => tracker.primaryAcknowledged.has(index));
+    throw new PartialConnectionLostError(stored, `nanocached: setMany could not reach the primary of ${retryIndices.length} of ${keys.length} keys: ${causeMessage}`, {
+      requestWasSent: cause instanceof ConnectionLostError ? cause.requestWasSent : true,
+    });
   }
 
   /** multiGetChunked's write-side twin: one or more `o` sub-frames
@@ -2028,9 +2070,10 @@ export class NanocachedClient {
     valueBytes: readonly Buffer[],
     ttlSeconds: number,
     retryIndices: readonly number[] | undefined,
-    acknowledged: Map<number, Set<string>>,
+    tracker: MultiSetTracker,
   ): Promise<number[]> {
     const indices = retryIndices ?? keyBytes.map((_, index) => index);
+    const { acknowledged } = tracker;
 
     const groups = new Map<string, { indices: number[]; isPrimary: boolean[] }>();
     const retry: number[] = [];
@@ -2062,13 +2105,22 @@ export class NanocachedClient {
     // fire-and-forget branch below and the drain after Promise.all(legs).
     const backgroundLegs: Promise<void>[] = [];
     for (const [name, group] of groups) {
-      const acknowledge = (index: number): void => {
+      const acknowledge = (index: number, primary: boolean): void => {
         let owners = acknowledged.get(index);
         if (!owners) {
           owners = new Set();
           acknowledged.set(index, owners);
         }
         owners.add(name);
+        if (primary) tracker.primaryAcknowledged.add(index);
+      };
+      // A primary position that is unresolved is remembered as either
+      // never answered (the leg's connection failed) or answered `W`,
+      // which decides what setMany throws once the retry is exhausted.
+      const unresolvedPrimary = (index: number, reachable: boolean): void => {
+        if (reachable) tracker.primaryUnreachable.delete(index);
+        else tracker.primaryUnreachable.add(index);
+        retry.push(index);
       };
       const runLeg = async (): Promise<void> => {
         let entries: MultiAckEntry[];
@@ -2088,17 +2140,18 @@ export class NanocachedClient {
           // only what the failing chunk never reached falls through to
           // the whole-leg-failure bookkeeping.
           if (error instanceof PartialConnectionLostError) {
+            tracker.lastCause = error;
             const partial = error.partialValues as MultiAckEntry[];
             for (let i = 0; i < group.indices.length; i++) {
               if (i < partial.length) {
-                if (partial[i].kind === "stored") acknowledge(group.indices[i]);
+                if (partial[i].kind === "stored") acknowledge(group.indices[i], group.isPrimary[i]);
                 if (!group.isPrimary[i]) {
                   if (partial[i].kind === "wrongNode") this.replicaWriteFailures++;
                   continue;
                 }
-                if (partial[i].kind === "wrongNode") retry.push(group.indices[i]);
+                if (partial[i].kind === "wrongNode") unresolvedPrimary(group.indices[i], true);
               } else if (group.isPrimary[i]) {
-                retry.push(group.indices[i]);
+                unresolvedPrimary(group.indices[i], false);
               } else {
                 this.replicaWriteFailures++;
               }
@@ -2109,19 +2162,20 @@ export class NanocachedClient {
           // closure — an actual programming bug (isSwallowable) still
           // propagates instead of vanishing into a retry/stat.
           if (!isSwallowable(error)) throw error;
+          tracker.lastCause = error;
           for (let i = 0; i < group.indices.length; i++) {
-            if (group.isPrimary[i]) retry.push(group.indices[i]);
+            if (group.isPrimary[i]) unresolvedPrimary(group.indices[i], false);
             else this.replicaWriteFailures++;
           }
           return;
         }
         for (let i = 0; i < group.indices.length; i++) {
-          if (entries[i].kind === "stored") acknowledge(group.indices[i]);
+          if (entries[i].kind === "stored") acknowledge(group.indices[i], group.isPrimary[i]);
           if (!group.isPrimary[i]) {
             if (entries[i].kind === "wrongNode") this.replicaWriteFailures++;
             continue;
           }
-          if (entries[i].kind === "wrongNode") retry.push(group.indices[i]);
+          if (entries[i].kind === "wrongNode") unresolvedPrimary(group.indices[i], true);
         }
       };
 
