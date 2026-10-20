@@ -208,7 +208,11 @@ Dictionary<string, string> values = await client.GetManyAsync(new[] { "a", "b", 
 ```
 
 A missing key is simply absent from the returned `Dictionary`, the same
-"a miss is not an error" shape `GetAsync`/`GetBytesAsync` use. Both are
+"a miss is not an error" shape `GetAsync`/`GetBytesAsync` use — and so
+is a key the node could not fit: the values in one batch reply total at
+most 16 MiB, and a hit past that budget is answered as a miss, so a
+batch of many large keys can come back with fewer keys than exist (read
+such a key again on its own rather than taking it for evicted). Both are
 also namespace-scoped: `client.Namespace(ns).GetManyAsync(...)`/
 `.SetManyAsync(...)`, same as `GetAsync`/`SetAsync`. Batch keys are
 always `string` — unlike single-key `GetAsync`/`SetAsync`,
@@ -596,7 +600,7 @@ catch clause covers "an expected nanocached failure". Caller mistakes
 instead: they indicate a bug in the calling code, not a nanocached
 failure, a convention shared across the SDKs.
 
-### Retryable errors and `transient_retries`
+### Retryable errors and `TransientRetries`
 
 `nanocached-proxy` may answer a request `R` instead of its usual reply
 when the request specifically failed transiently (e.g. its upstream node

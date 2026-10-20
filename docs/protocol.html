@@ -72,8 +72,10 @@ echoes the capability as <code>OnT</code>/<code>OdT</code>.</div>
 <h2 id="s">S — set</h2>
 <pre><code>S &lt;key-length&gt; &lt;value-length&gt;\n&lt;key&gt;&lt;value&gt;
 S &lt;key-length&gt; &lt;value-length&gt; &lt;ttl-seconds&gt;\n&lt;key&gt;&lt;value&gt;</code></pre>
-<p>Responds <code>S\n</code>. Without a TTL the entry lives until
-evicted (LRU under the memory bound) or deleted; with one it also
+<p>Responds <code>S\n</code>. <code>&lt;ttl-seconds&gt;</code> is an
+unsigned 64-bit decimal (up to <code>18446744073709551615</code>; a
+larger number is a malformed request). Without a TTL the entry lives
+until evicted (LRU under the memory bound) or deleted; with one it also
 expires <code>&lt;ttl-seconds&gt;</code> after the write — a literal
 <code>0</code> is a TTL that has already elapsed, so the entry expires
 immediately (the next access sees a miss).</p>

@@ -175,7 +175,11 @@ let values = client.get_many(&["a", "b", "missing"]).await?;
 ```
 
 A missing key is simply absent from the returned `HashMap`, the same "a
-miss is not an error" shape `get`/`get_bytes` use. Both are also
+miss is not an error" shape `get`/`get_bytes` use — and so is a key the
+node could not fit: the values in one batch reply total at most 16 MiB,
+and a hit past that budget is answered as a miss, so a batch of many
+large keys can come back with fewer keys than exist (read such a key
+again on its own rather than taking it for evicted). Both are also
 namespace-scoped: `client.namespace(ns).get_many(...)`/`.set_many(...)`,
 same as `get`/`set`. Batch keys are always `String`-shaped (`&[impl
 AsRef<str>]` for reads, `&HashMap<String, _>` for writes) — unlike
