@@ -167,6 +167,11 @@ protocol doesn't report server-side LRU evictions to the client.
 
 ## Consistency notes
 
+`getAll` is one batched read per owning node. The values in one batch
+reply total at most 16 MiB, and a hit past that budget is answered as a
+miss, so `getAll` over many large keys can omit a key that exists —
+`get` it on its own rather than taking it for evicted.
+
 `getExpiryForAccess()` (used by `AccessedExpiryPolicy`/
 `TouchedExpiryPolicy`) turns every `get()` into a read followed by an
 unconditional TTL-refresh write — a concurrent writer landing between the
