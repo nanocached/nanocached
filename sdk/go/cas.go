@@ -109,7 +109,7 @@ func (c *Client) getBytesWithTokenNS(namespace []byte, key string) (value []byte
 	if !c.compress {
 		return raw, token, true, nil
 	}
-	value, err = decompressValue(raw)
+	value, err = decompressValue(raw, c.inflate)
 	return value, token, true, err
 }
 

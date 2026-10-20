@@ -441,6 +441,9 @@ type Client struct {
 
 	compress             bool
 	compressionThreshold int
+	// inflate is this client's share of concurrent decompression output —
+	// see maxInflightDecompressedBytes.
+	inflate *inflateBudget
 
 	fireAndForgetReplicas bool
 	// backgroundReplicaSem bounds in-flight background replica writes;
@@ -598,6 +601,7 @@ func Connect(config Config) (*Client, error) {
 		lastFetch:             time.Now(),
 		stopKeepalive:         make(chan struct{}),
 		compress:              config.Compress,
+		inflate:               newInflateBudget(maxInflightDecompressedBytes),
 		compressionThreshold:  compressionThreshold,
 		fireAndForgetReplicas: config.FireAndForgetReplicas,
 		backgroundReplicaSem:  make(chan struct{}, maxInFlightBackgroundReplicaWrites),
@@ -1012,7 +1016,7 @@ func (c *Client) getBytesNS(namespace []byte, key string) (value []byte, ok bool
 	if err != nil || !ok || !c.compress {
 		return raw, ok, err
 	}
-	value, err = decompressValue(raw)
+	value, err = decompressValue(raw, c.inflate)
 	return value, ok, err
 }
 
@@ -1248,6 +1252,11 @@ func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, 
 	if len(keys) == 0 {
 		return nil, invalidArgument("nanocached: GetMany/GetManyBytes requires at least one key")
 	}
+	// A repeated key is read once: a batched read is a set query (the
+	// result is a map), and sending every copy would retain one reply
+	// per copy — 20,000 copies of one key naming a large value is 50
+	// frames and hundreds of MB of replies for 60 KB of request.
+	keys = dedupeKeys(keys)
 	keyBytes := make([][]byte, len(keys))
 	for i, key := range keys {
 		if err := validateKey(namespace, key); err != nil {
@@ -1576,7 +1585,7 @@ func (c *Client) maybeDecompress(value []byte) ([]byte, error) {
 	if !c.compress {
 		return value, nil
 	}
-	return decompressValue(value)
+	return decompressValue(value, c.inflate)
 }
 
 // multiAnyWrongNode reports whether any entry carries a per-key `W` —
@@ -1702,16 +1711,62 @@ func (c *Client) setManyNS(namespace []byte, values map[string][]byte, ttlSecond
 		return stored, nil
 	}
 
-	retry := c.multiSetPass(namespace, keys, keyBytes, valueBytes, wireTTL, nil, stored)
+	// Which owners acknowledged which key, shared across both passes so
+	// the retry sends only the legs that failed: a key whose primary leg
+	// failed used to be re-sent to every owner after the refresh,
+	// including the replica that had already stored it — duplicate
+	// traffic, and a chance to re-apply an older value over a newer
+	// concurrent write. (A detached fire-and-forget replica leg is not
+	// tracked: its outcome may not be known when the retry runs.)
+	acknowledged := &ackTracker{owners: map[int]map[string]bool{}}
+	retry := c.multiSetPass(namespace, keys, keyBytes, valueBytes, wireTTL, nil, stored, acknowledged)
 	if len(retry) == 0 {
 		return stored, nil
 	}
 	c.maybeRefresh(true)
-	retry = c.multiSetPass(namespace, keys, keyBytes, valueBytes, wireTTL, retry, stored)
+	retry = c.multiSetPass(namespace, keys, keyBytes, valueBytes, wireTTL, retry, stored, acknowledged)
 	if len(retry) > 0 {
 		return stored, ErrWrongNode
 	}
 	return stored, nil
+}
+
+// ackTracker records, per key index, the owner names whose `o` leg
+// acknowledged the key — see setManyNS.
+type ackTracker struct {
+	mu     sync.Mutex
+	owners map[int]map[string]bool
+}
+
+func (a *ackTracker) add(idx int, name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	owners := a.owners[idx]
+	if owners == nil {
+		owners = map[string]bool{}
+		a.owners[idx] = owners
+	}
+	owners[name] = true
+}
+
+func (a *ackTracker) has(idx int, name string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.owners[idx][name]
+}
+
+// dedupeKeys returns keys with repeats removed, first occurrence kept.
+func dedupeKeys(keys []string) []string {
+	seen := make(map[string]struct{}, len(keys))
+	distinct := keys[:0:0]
+	for _, key := range keys {
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		distinct = append(distinct, key)
+	}
+	return distinct
 }
 
 // multiSetChunked is multiGetChunked's write-side twin: one or more `o`
@@ -1772,7 +1827,7 @@ func (c *Client) multiSetChunked(slot string, namespace []byte, keys, values [][
 // no primary key.
 func (c *Client) multiSetPass(
 	namespace []byte, keys []string, keyBytes, valueBytes [][]byte, ttlSeconds int64,
-	retryIndices []int, stored map[string]bool,
+	retryIndices []int, stored map[string]bool, acknowledged *ackTracker,
 ) []int {
 	indices := retryIndices
 	if indices == nil {
@@ -1795,6 +1850,11 @@ func (c *Client) multiSetPass(
 			continue
 		}
 		for rank, name := range names {
+			// An owner that already acknowledged this key in an earlier
+			// pass is not sent it again.
+			if acknowledged.has(idx, name) {
+				continue
+			}
 			batch := owners[name]
 			if batch == nil {
 				batch = &ownerBatch{}
@@ -1830,7 +1890,7 @@ func (c *Client) multiSetPass(
 						defer c.backgroundReplicaWG.Done()
 						defer func() { <-c.backgroundReplicaSem }()
 						c.runMultiSetLeg(namespace, name, batch.indices, batch.isPrimary,
-							keys, keyBytes, valueBytes, ttlSeconds, &mu, nil, nil)
+							keys, keyBytes, valueBytes, ttlSeconds, &mu, nil, nil, nil)
 					}(name, batch)
 					continue
 				}
@@ -1844,7 +1904,7 @@ func (c *Client) multiSetPass(
 		go func(name string, batch *ownerBatch) {
 			defer wg.Done()
 			c.runMultiSetLeg(namespace, name, batch.indices, batch.isPrimary,
-				keys, keyBytes, valueBytes, ttlSeconds, &mu, &retry, stored)
+				keys, keyBytes, valueBytes, ttlSeconds, &mu, &retry, stored, acknowledged)
 		}(name, batch)
 	}
 	wg.Wait()
@@ -1874,7 +1934,7 @@ func (c *Client) multiSetPass(
 func (c *Client) runMultiSetLeg(
 	namespace []byte, name string, indices []int, isPrimary []bool,
 	keys []string, keyBytes, valueBytes [][]byte, ttlSeconds int64,
-	mu *sync.Mutex, retry *[]int, stored map[string]bool,
+	mu *sync.Mutex, retry *[]int, stored map[string]bool, acknowledged *ackTracker,
 ) {
 	groupKeys := make([][]byte, len(indices))
 	groupValues := make([][]byte, len(indices))
@@ -1888,6 +1948,9 @@ func (c *Client) runMultiSetLeg(
 	defer mu.Unlock()
 	for i, idx := range indices {
 		if entries[i].ok {
+			if acknowledged != nil {
+				acknowledged.add(idx, name)
+			}
 			if isPrimary[i] && stored != nil {
 				stored[keys[idx]] = true
 			}
@@ -3041,6 +3104,9 @@ func (c *Client) openNodeConnection(address string) (*connection, error) {
 func (c *Client) maybeRefresh(force bool) {
 	c.mu.Lock()
 	skip := c.ring == nil || (!force && time.Since(c.lastFetch) < nodeListStaleAfter)
+	// What the caller saw when it decided to refresh: a forced refresh
+	// that completes while this caller waits for the gate serves it too.
+	observed := c.lastFetch
 	c.mu.Unlock()
 	if skip {
 		return
@@ -3049,7 +3115,12 @@ func (c *Client) maybeRefresh(force bool) {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
 	c.mu.Lock()
-	skip = !force && time.Since(c.lastFetch) < nodeListStaleAfter
+	// Single-flight: N callers that hit a dead node at the same time
+	// used to run N refreshes one after another behind the gate, each a
+	// full fetch against discovery (5 s each when discovery is slow), and
+	// the last caller waited for all of them. A forced caller now reuses
+	// a refresh that finished after it observed its failure.
+	skip = (!force && time.Since(c.lastFetch) < nodeListStaleAfter) || (force && c.lastFetch.After(observed))
 	c.mu.Unlock()
 	if skip {
 		return

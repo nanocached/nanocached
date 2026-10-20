@@ -509,6 +509,15 @@ negative `ttlSeconds` is rejected before any network call.
 
 ## Value compression
 
+Decompression is bounded three ways: one value may expand to at most
+64 MiB, one `GetMany` response to 256 MiB in total, and across every
+concurrent read of this client at most 256 MiB may be being decompressed
+at any one time (each decompression reserves the per-value cap from that
+budget while it runs and releases it when the read returns, so at most
+four run at once; further reads wait their turn rather than multiplying
+the per-value cap by their number). What a caller holds after a read has
+returned is the caller's.
+
 Off by default. When enabled, values at or above `CompressionThreshold`
 bytes are transparently DEFLATE-compressed on `Set`/`SetBytes` and
 decompressed on `Get`/`GetBytes` (value compression):

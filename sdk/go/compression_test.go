@@ -31,7 +31,7 @@ func TestRoundTripsAValueAtOrAboveTheThreshold(t *testing.T) {
 	if len(stored) >= len(value) {
 		t.Fatalf("compressed length %d >= original length %d", len(stored), len(value))
 	}
-	got, err := decompressValue(stored)
+	got, err := decompressValue(stored, nil)
 	if err != nil || !bytes.Equal(got, value) {
 		t.Fatalf("decompressValue = %v, %v", got, err)
 	}
@@ -46,7 +46,7 @@ func TestLeavesAValueBelowTheThresholdUncompressed(t *testing.T) {
 	if !bytes.Equal(stored[1:], value) {
 		t.Fatalf("body = %v, want %v", stored[1:], value)
 	}
-	got, err := decompressValue(stored)
+	got, err := decompressValue(stored, nil)
 	if err != nil || !bytes.Equal(got, value) {
 		t.Fatalf("decompressValue = %v, %v", got, err)
 	}
@@ -64,7 +64,7 @@ func TestIncompressibleDataPassesThroughUnbloated(t *testing.T) {
 	if !bytes.Equal(stored[1:], value) {
 		t.Fatalf("body = %v, want %v", stored[1:], value)
 	}
-	got, err := decompressValue(stored)
+	got, err := decompressValue(stored, nil)
 	if err != nil || !bytes.Equal(got, value) {
 		t.Fatalf("decompressValue = %v, %v", got, err)
 	}
@@ -72,7 +72,7 @@ func TestIncompressibleDataPassesThroughUnbloated(t *testing.T) {
 
 func TestRoundTripsAnEmptyValue(t *testing.T) {
 	stored := compressValue(nil, 256)
-	got, err := decompressValue(stored)
+	got, err := decompressValue(stored, nil)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("decompressValue = %v, %v", got, err)
 	}
@@ -84,30 +84,30 @@ func TestDecompressesThePinnedCrossLanguageVector(t *testing.T) {
 		t.Fatal(err)
 	}
 	compressed := append([]byte{compressionMarkerDeflate}, body...)
-	got, err := decompressValue(compressed)
+	got, err := decompressValue(compressed, nil)
 	if err != nil || string(got) != crossLanguagePlaintext {
 		t.Fatalf("decompressValue = %q, %v", got, err)
 	}
 }
 
 func TestUnrecognizedMarkerByteErrors(t *testing.T) {
-	if _, err := decompressValue([]byte{0x02, 1, 2, 3}); !errors.Is(err, ErrDecompression) {
+	if _, err := decompressValue([]byte{0x02, 1, 2, 3}, nil); !errors.Is(err, ErrDecompression) {
 		t.Fatalf("err = %v, want ErrDecompression", err)
 	}
 }
 
 func TestEmptyValueWithCompressEnabledErrors(t *testing.T) {
-	if _, err := decompressValue(nil); !errors.Is(err, ErrDecompression) {
+	if _, err := decompressValue(nil, nil); !errors.Is(err, ErrDecompression) {
 		t.Fatalf("err = %v, want ErrDecompression", err)
 	}
 }
 
 func TestCorruptDeflateMarkedValueErrors(t *testing.T) {
-	if _, err := decompressValue([]byte{compressionMarkerDeflate, 0xFF, 0xFF, 0xFF, 0xFF}); !errors.Is(err, ErrDecompression) {
+	if _, err := decompressValue([]byte{compressionMarkerDeflate, 0xFF, 0xFF, 0xFF, 0xFF}, nil); !errors.Is(err, ErrDecompression) {
 		t.Fatalf("err = %v, want ErrDecompression", err)
 	}
 	// Sanity check on the message itself, not just the sentinel.
-	if _, err := decompressValue([]byte{compressionMarkerDeflate, 0xFF, 0xFF, 0xFF, 0xFF}); !strings.Contains(err.Error(), "failed to decompress") {
+	if _, err := decompressValue([]byte{compressionMarkerDeflate, 0xFF, 0xFF, 0xFF, 0xFF}, nil); !strings.Contains(err.Error(), "failed to decompress") {
 		t.Fatalf("err = %v, want a message mentioning the failure", err)
 	}
 }
