@@ -3608,7 +3608,19 @@ fn respond_incremented(value: &[u8], ttl: Option<u64>, tag: Option<u32>) -> Vec<
 /// Errors that end the client connection: encoded as `E` (+tag), the
 /// writer closes after sending. See the module docs' failure-surface
 /// note for why upstream failure is fatal to the connection.
-struct Fatal;
+/// Why a request could not be answered. `Transient` is softened to `R`
+/// for a client that declared the retryable-error capability: the
+/// request was provably not applied (not sent, a node answered `E`, no
+/// roster), so re-sending it is safe. `OutcomeUnknown` never is: the
+/// connection to the node failed after an `i`, `k` or `x` may have
+/// reached it, and a re-send could apply a non-idempotent command twice
+/// — the client gets the fatal `E` and must read the key to learn what
+/// happened. Idempotent writes (`S`, `D`, `o`) never need this: they
+/// are re-fanned here instead.
+enum Fatal {
+    Transient,
+    OutcomeUnknown,
+}
 
 type DriverResult = Result<Vec<u8>, Fatal>;
 
@@ -3642,7 +3654,7 @@ fn soften(
     context: &ProxyContext,
 ) -> DriverResult {
     match result {
-        Err(Fatal) if retry_capable => {
+        Err(Fatal::Transient) if retry_capable => {
             context
                 .upstream_failures_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4013,7 +4025,7 @@ async fn finish_get(
         Ok(NodeReply::WrongNode) => {
             force_refresh(context).await;
             let Some(ring) = current_ring(context) else {
-                return Err(Fatal);
+                return Err(Fatal::Transient);
             };
             return retry_get_on(context, namespace, key, ring.owners(namespace, key), tag).await;
         }
@@ -4056,7 +4068,7 @@ async fn retry_get_on(
             Ok(_) | Err(_) => continue,
         }
     }
-    Err(Fatal)
+    Err(Fatal::Transient)
 }
 
 /// Issue #150: awaits every owner group's `M` sub-reply and splices the
@@ -4540,7 +4552,7 @@ async fn finish_write(
         // common case). Re-fan once via `call`, whose transparent
         // redial recovers it; a second failure is real.
         Err(_) => refan_write(context, namespace, key, write_ref, tag, retry_capable).await,
-        Ok(_) => Err(Fatal),
+        Ok(_) => Err(Fatal::Transient),
     }
 }
 
@@ -4556,7 +4568,7 @@ async fn refan_write(
     retry_capable: bool,
 ) -> DriverResult {
     let Some(ring) = current_ring(context) else {
-        return Err(Fatal);
+        return Err(Fatal::Transient);
     };
     let owners = ring.owners(namespace, key);
     let (frame, expect) = write_frame(namespace, key, write);
@@ -4568,7 +4580,7 @@ async fn refan_write(
         Ok(NodeReply::Stored) => Ok(respond("S", tag)),
         Ok(NodeReply::Deleted) => Ok(respond("D", tag)),
         Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
-        _ => Err(Fatal),
+        _ => Err(Fatal::Transient),
     }
 }
 
@@ -4623,8 +4635,8 @@ async fn finish_incr(
         Err(error) if request_not_sent(&error) => {
             refan_incr(context, address, delta, tag, retry_capable).await
         }
-        Err(_) => Err(Fatal),
-        Ok(_) => Err(Fatal),
+        Err(_) => Err(Fatal::OutcomeUnknown),
+        Ok(_) => Err(Fatal::Transient),
     }
 }
 
@@ -4675,7 +4687,7 @@ async fn refan_incr(
 ) -> DriverResult {
     let (namespace, key) = address;
     let Some(ring) = current_ring(context) else {
-        return Err(Fatal);
+        return Err(Fatal::Transient);
     };
     let owners = ring.owners(namespace, key);
     let Some((primary, replicas)) = owners.split_first() else {
@@ -4698,7 +4710,11 @@ async fn refan_incr(
         }
         Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
         Ok(NodeReply::NotNumeric) => Ok(respond("T", tag)),
-        _ => Err(Fatal),
+        // `call_non_idempotent` already re-sent a frame that provably never
+        // left this proxy; any other failure may have applied the command.
+        Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
+        Err(_) => Err(Fatal::OutcomeUnknown),
+        Ok(_) => Err(Fatal::Transient),
     }
 }
 
@@ -4751,8 +4767,8 @@ async fn finish_cas_set(
         Err(error) if request_not_sent(&error) => {
             refan_cas_set(context, address, write, tag, retry_capable).await
         }
-        Err(_) => Err(Fatal),
-        Ok(_) => Err(Fatal),
+        Err(_) => Err(Fatal::OutcomeUnknown),
+        Ok(_) => Err(Fatal::Transient),
     }
 }
 
@@ -4779,7 +4795,7 @@ async fn refan_cas_set(
     let (namespace, key) = address;
     let (condition, value, ttl) = write;
     let Some(ring) = current_ring(context) else {
-        return Err(Fatal);
+        return Err(Fatal::Transient);
     };
     let owners = ring.owners(namespace, key);
     let Some((primary, replicas)) = owners.split_first() else {
@@ -4801,7 +4817,11 @@ async fn refan_cas_set(
             Ok(respond("S", tag))
         }
         Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
-        _ => Err(Fatal),
+        // `call_non_idempotent` already re-sent a frame that provably never
+        // left this proxy; any other failure may have applied the command.
+        Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
+        Err(_) => Err(Fatal::OutcomeUnknown),
+        Ok(_) => Err(Fatal::Transient),
     }
 }
 
@@ -4839,8 +4859,8 @@ async fn finish_cas_delete(
         Err(error) if request_not_sent(&error) => {
             refan_cas_delete(context, address, expected_digest, tag, retry_capable).await
         }
-        Err(_) => Err(Fatal),
-        Ok(_) => Err(Fatal),
+        Err(_) => Err(Fatal::OutcomeUnknown),
+        Ok(_) => Err(Fatal::Transient),
     }
 }
 
@@ -4858,7 +4878,7 @@ async fn refan_cas_delete(
 ) -> DriverResult {
     let (namespace, key) = address;
     let Some(ring) = current_ring(context) else {
-        return Err(Fatal);
+        return Err(Fatal::Transient);
     };
     let owners = ring.owners(namespace, key);
     let Some((primary, replicas)) = owners.split_first() else {
@@ -4880,7 +4900,11 @@ async fn refan_cas_delete(
             Ok(respond("D", tag))
         }
         Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
-        _ => Err(Fatal),
+        // `call_non_idempotent` already re-sent a frame that provably never
+        // left this proxy; any other failure may have applied the command.
+        Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
+        Err(_) => Err(Fatal::OutcomeUnknown),
+        Ok(_) => Err(Fatal::Transient),
     }
 }
 
@@ -4922,7 +4946,7 @@ async fn finish_clear(
 
     force_refresh(context).await;
     let Some(ring) = current_ring(context) else {
-        return Err(Fatal);
+        return Err(Fatal::Transient);
     };
     let frame = match &namespace {
         Some(namespace) => frame_clear(namespace),
@@ -4939,7 +4963,7 @@ async fn finish_clear(
     if all_ok {
         Ok(respond("C", tag))
     } else {
-        Err(Fatal)
+        Err(Fatal::Transient)
     }
 }
 
@@ -5110,7 +5134,7 @@ async fn handle_client(
                     drop(response);
                     drop(charge);
                 }
-                Ok(Err(Fatal)) | Err(_) => {
+                Ok(Err(_)) | Err(_) => {
                     writer_context
                         .upstream_failures_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5176,7 +5200,7 @@ async fn handle_client(
                         // stance on any protocol error) rather than let it
                         // re-negotiate tagging on a live connection.
                         let (response_tx, response_rx) = oneshot::channel();
-                        let _ = response_tx.send(Err(Fatal));
+                        let _ = response_tx.send(Err(Fatal::Transient));
                         let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
                         break 'connection Ok(());
                     }
@@ -5211,7 +5235,7 @@ async fn handle_client(
                 Ok(ParseOutcome::Ready(request, tag)) => {
                     if !authenticated {
                         let (response_tx, response_rx) = oneshot::channel();
-                        let _ = response_tx.send(Err(Fatal));
+                        let _ = response_tx.send(Err(Fatal::Transient));
                         let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
                         break 'connection Ok(());
                     }
@@ -5262,7 +5286,7 @@ async fn handle_client(
                 }
                 Err(_) => {
                     let (response_tx, response_rx) = oneshot::channel();
-                    let _ = response_tx.send(Err(Fatal));
+                    let _ = response_tx.send(Err(Fatal::Transient));
                     let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
                     break 'connection Ok(());
                 }
@@ -9770,12 +9794,16 @@ mod tests {
         node.close_after_incr_apply_once
             .store(true, Ordering::SeqCst);
         stream.write_all(b"i 0 7 5 2\ncounter").await.unwrap();
-        // A tagged, retry-capable client gets the per-request `R` — a
-        // successful `I` here (or a bare connection close) would mean
-        // the fix regressed: either the double-apply happened silently,
-        // or the caller lost the ability to tell "may have been
-        // applied" from "definitely wasn't".
-        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 2");
+        // Not `R`, even for a retry-capable client: `R` means "not
+        // applied, re-send", and every SDK would re-send and move the
+        // counter twice. The fatal `E` and a close are what the client
+        // gets — "may have been applied", which it resolves by reading
+        // the key. A successful `I` here would mean a replayed frame.
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+        assert!(
+            read_line(&mut stream, &mut buf).await.is_err(),
+            "the connection is closed after the fatal E"
+        );
 
         assert_eq!(
             node.incrs(),
@@ -9788,8 +9816,9 @@ mod tests {
             "the delta must be applied exactly once"
         );
 
-        // The connection survived (retry-capable): a fresh INCR still
-        // works and continues from the single applied delta.
+        // A fresh connection's INCR continues from the single applied
+        // delta.
+        let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
         stream.write_all(b"i 0 7 5 3\ncounter").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 2 3");
         read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
@@ -9818,12 +9847,13 @@ mod tests {
         first.write_all(b"i 0 7 5 2\ncounter").await.unwrap();
         second.write_all(b"i 0 7 5 3\ncounter").await.unwrap();
 
-        // Both callers get the per-request "may have been applied" `R`.
-        assert_eq!(read_line(&mut first, &mut first_buf).await.unwrap(), "R 2");
-        assert_eq!(
-            read_line(&mut second, &mut second_buf).await.unwrap(),
-            "R 3"
-        );
+        // Both callers get the fatal `E` and a close: "may have been
+        // applied" is never softened to `R`, which would make each
+        // re-send its `i` and move the counter again.
+        assert_eq!(read_line(&mut first, &mut first_buf).await.unwrap(), "E");
+        assert!(read_line(&mut first, &mut first_buf).await.is_err());
+        assert_eq!(read_line(&mut second, &mut second_buf).await.unwrap(), "E");
+        assert!(read_line(&mut second, &mut second_buf).await.is_err());
 
         assert_eq!(
             node.incrs(),
@@ -9838,6 +9868,7 @@ mod tests {
 
         // The pool redials on the next request: a fresh INCR works and
         // continues from the two applied deltas.
+        let (mut second, mut second_buf) = connect_and_auth_tagged(&proxy).await;
         second.write_all(b"i 0 7 5 4\ncounter").await.unwrap();
         assert_eq!(
             read_line(&mut second, &mut second_buf).await.unwrap(),
@@ -10028,12 +10059,11 @@ mod tests {
             .write_all(format!("k 0 4 3 {alice_digest} 2\nnameBob").as_bytes())
             .await
             .unwrap();
-        // A tagged, retry-capable client gets the per-request `R` — a
-        // successful `S` here (or a bare connection close) would mean
-        // the fix regressed: either the double-apply happened silently,
-        // or the caller lost the ability to tell "may have been
-        // applied" from "definitely wasn't".
-        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 2");
+        // The fatal `E` and a close, never `R`: `R` means "not applied,
+        // re-send", and a re-sent `k` could apply twice. A successful `S`
+        // here would mean a replayed frame.
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+        assert!(read_line(&mut stream, &mut buf).await.is_err());
 
         assert_eq!(
             node.cas_sets(),
@@ -10046,8 +10076,8 @@ mod tests {
             "the CAS must be applied exactly once"
         );
 
-        // The connection survived (retry-capable): a fresh CAS still
-        // works and observes the single applied write.
+        // A fresh connection's CAS observes the single applied write.
+        let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
         let bob_digest = mock_content_digest(b"Bob");
         stream
             .write_all(format!("k 0 4 5 {bob_digest} 3\nnameCarol").as_bytes())
@@ -10087,7 +10117,8 @@ mod tests {
             .write_all(format!("x 0 4 {alice_digest} 2\nname").as_bytes())
             .await
             .unwrap();
-        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 2");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+        assert!(read_line(&mut stream, &mut buf).await.is_err());
 
         assert_eq!(
             node.cas_deletes(),
@@ -10100,8 +10131,9 @@ mod tests {
             "the delete must be applied exactly once"
         );
 
-        // The connection survived (retry-capable): a fresh write/delete
-        // cycle still works.
+        // A fresh connection's write/delete cycle works and sees the
+        // single applied delete.
+        let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
         stream.write_all(b"S 4 3 3\nnameBob").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 3");
         let bob_digest = mock_content_digest(b"Bob");
@@ -10453,7 +10485,7 @@ mod tests {
 
         match result {
             Ok(reply) => assert_eq!(reply, respond_value(b"value", None)),
-            Err(Fatal) => panic!("expected the replica's value, got a fatal error"),
+            Err(_) => panic!("expected the replica's value, got a fatal error"),
         }
         assert!(
             elapsed < UPSTREAM_IO_TIMEOUT + UPSTREAM_IO_TIMEOUT / 2,
