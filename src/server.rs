@@ -1540,7 +1540,9 @@ fn render_node_metrics(
     metric(
         "nanocached_node_deletes_total",
         "counter",
-        "Deletes that removed a live entry.",
+        "Client deletes (D and d frames) that removed a live entry. A \
+         delete relayed from another owner during a join is not counted \
+         here, like the handoff frames left out of sets_total.",
         format!("nanocached_node_deletes_total {}\n", stats.deletes),
     );
     metric(
@@ -9918,6 +9920,36 @@ mod tests {
             },
         )
         .await;
+        // A client delete of a live entry counts; one of a missing key and
+        // a handoff delete (a forward relayed from another owner) do not.
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: key(b"gone"),
+                value: Bytes::from_static(b"v"),
+                ttl: None,
+            },
+        )
+        .await;
+        send_command(&request_tx, Command::Delete { key: key(b"gone") }).await;
+        send_command(&request_tx, Command::Delete { key: key(b"gone") }).await;
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: key(b"relayed"),
+                value: Bytes::from_static(b"v"),
+                ttl: None,
+            },
+        )
+        .await;
+        send_command(
+            &request_tx,
+            Command::HandoffDelete {
+                key: key(b"relayed"),
+                token: String::new(),
+            },
+        )
+        .await;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -9941,7 +9973,8 @@ mod tests {
         );
         assert!(body.contains("nanocached_node_hits_total 1\n"), "{body}");
         assert!(body.contains("nanocached_node_misses_total 1\n"), "{body}");
-        assert!(body.contains("nanocached_node_sets_total 3\n"), "{body}");
+        assert!(body.contains("nanocached_node_sets_total 5\n"), "{body}");
+        assert!(body.contains("nanocached_node_deletes_total 1\n"), "{body}");
         assert!(body.contains("nanocached_node_incrs_total 1\n"), "{body}");
         assert!(
             body.contains("nanocached_node_cas_sets_total 1\n"),

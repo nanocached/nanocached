@@ -706,7 +706,20 @@ impl Cache {
         }
     }
 
+    /// A client's `D`/`d`: counts toward `deletes` when it removed a live
+    /// entry. The `handoff_delete` twin (a forward relayed to a joiner)
+    /// does not, for the same reason `handoff_set` leaves `sets` alone.
     pub fn delete(&mut self, key: &Key) -> bool {
+        let removed = self.delete_at(key, Instant::now());
+        if removed {
+            self.deletes += 1;
+        }
+        removed
+    }
+
+    /// A delete relayed by another owner (`X`): the same removal, not
+    /// counted as a client delete.
+    pub fn handoff_delete(&mut self, key: &Key) -> bool {
         self.delete_at(key, Instant::now())
     }
 
@@ -1580,6 +1593,20 @@ mod tests {
         let mut cache = Cache::new(UNBOUNDED);
 
         assert_eq!(cache.get(&key(b"missing")), None);
+    }
+
+    #[test]
+    fn deletes_counts_client_deletes_of_live_entries_only() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"a"), Bytes::from_static(b"1"));
+        cache.set(key(b"b"), Bytes::from_static(b"2"));
+
+        assert!(cache.delete(&key(b"a")));
+        assert!(!cache.delete(&key(b"a")));
+        assert!(!cache.delete(&key(b"missing")));
+        assert!(cache.handoff_delete(&key(b"b")));
+
+        assert_eq!(cache.stats().deletes, 1);
     }
 
     #[test]
