@@ -2815,7 +2815,7 @@ async fn handle_connection(
             }
             Ok((Command::Incr { key, delta }, tag)) => {
                 if let Some(node_context) = &config.node_context
-                    && wrong_node(node_context, &key)
+                    && not_the_primary(node_context, &key)
                 {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
@@ -2887,7 +2887,7 @@ async fn handle_connection(
                 tag,
             )) => {
                 if let Some(node_context) = &config.node_context
-                    && wrong_node(node_context, &key)
+                    && not_the_primary(node_context, &key)
                 {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
@@ -2958,7 +2958,7 @@ async fn handle_connection(
                 tag,
             )) => {
                 if let Some(node_context) = &config.node_context
-                    && wrong_node(node_context, &key)
+                    && not_the_primary(node_context, &key)
                 {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
@@ -8566,6 +8566,42 @@ fn wrong_node(node_context: &NodeContext, key: &Key) -> bool {
     wrong_node_hashed(node_context, KeyHash::of(key))
 }
 
+/// `wrong_node` for the non-idempotent commands (`i`, `k`, `x`): true
+/// unless this node is the key's *primary* under the adopted ring, not
+/// merely one of its owners. A plain write is accepted by every owner
+/// because the client fans it out to all of them; an increment or a
+/// compare-and-set runs once, on the primary, and the result is then
+/// written to the other owners as a plain `S`. Accepting it on a replica
+/// too let a client with a stale ring (after a join, the old primary is
+/// still an owner at rank 2) and a client with the fresh ring both run
+/// the same `put_if_absent`, both win the same CAS, or both get the same
+/// counter value, for as long as the stale client kept its ring. A `W`
+/// here sends the stale client to refresh and retry on the primary.
+///
+/// The unconfirmed-join exception stays as it is: until discovery lists
+/// the joiner, clients cannot route to it, so the displaced node keeps
+/// serving exactly what `wrong_node` lets it serve.
+fn not_the_primary(node_context: &NodeContext, key: &Key) -> bool {
+    let key_hash = KeyHash::of(key);
+    if wrong_node_hashed(node_context, key_hash) {
+        return true;
+    }
+    if serving_locally_for_unconfirmed_join(node_context, key_hash) {
+        return false;
+    }
+    let primary = node_context
+        .known_ring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_none_or(|membership| {
+            membership
+                .ring
+                .is_owner_hashed(key_hash, &node_context.name, 1)
+        });
+    !primary
+}
+
 /// Issue #601: whether this node owns `key` under the membership it has
 /// adopted (`known_ring`, anywhere in the key's top-R) — what the `U` arm
 /// tells the cache so a handoff write for a key already owned is not
@@ -11178,6 +11214,83 @@ mod tests {
         let mut response = vec![0_u8; expected.len()];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, expected);
+
+        shutdown_tx.send_replace(true);
+        connection_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_answers_w_to_incr_and_cas_on_an_owner_that_is_not_the_primary() {
+        let ring = HashRing::new(vec!["a".to_string(), "b".to_string()]);
+        let theirs = (0..1000)
+            .map(|i| format!("key-{i}"))
+            .find(|name| ring.route(&key(name.as_bytes())) == "a")
+            .expect("some key routes to a");
+        let node_context = test_node_context(
+            "b",
+            "tok-b",
+            Arc::new(Mutex::new(Some(membership_of(&["a", "b"], 2)))),
+            Arc::new(Mutex::new(None)),
+        );
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        let n = theirs.len();
+        client
+            .write_all(format!("i 0 {n} 5\n{theirs}").as_bytes())
+            .await
+            .unwrap();
+        client
+            .write_all(format!("k 0 {n} 1 A\n{theirs}v").as_bytes())
+            .await
+            .unwrap();
+        client
+            .write_all(format!("x 0 {n} 0123456789abcdef0123456789abcdef\n{theirs}").as_bytes())
+            .await
+            .unwrap();
+        // A plain write to the same key is accepted (b is an owner).
+        client
+            .write_all(format!("s 0 {n} 1\n{theirs}v").as_bytes())
+            .await
+            .unwrap();
+
+        // Bounded: an `i` that is dispatched instead of refused has no one to
+        // answer it here, and the read would wait forever instead of failing.
+        let mut response = vec![0_u8; 6];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut response))
+            .await
+            .expect("three W replies within 5 s")
+            .unwrap();
+        assert_eq!(&response, b"W\nW\nW\n");
+
+        let request = request_rx.recv().await.unwrap();
+        assert!(
+            matches!(request.command, Command::Set { .. }),
+            "{:?}",
+            request.command
+        );
+        request.response_tx.send(Response::Stored).unwrap();
+        let mut stored = vec![0_u8; 2];
+        client.read_exact(&mut stored).await.unwrap();
+        assert_eq!(&stored, b"S\n");
 
         shutdown_tx.send_replace(true);
         connection_task.await.unwrap().unwrap();
@@ -16426,6 +16539,58 @@ mod tests {
         node_context.promoted.store(true, Ordering::SeqCst);
         assert!(!wrong_node(&node_context, &key(b"key-0")));
         assert!(!wrong_node(&node_context, &key(b"key-3")));
+    }
+
+    #[test]
+    fn counters_and_cas_are_the_primarys_alone_an_owner_at_rank_two_answers_w() {
+        let node_context = test_node_context(
+            "b",
+            "tok-b",
+            Arc::new(Mutex::new(Some(membership_of(&["a", "b"], 2)))),
+            Arc::new(Mutex::new(None)),
+        );
+        let ring = HashRing::new(vec!["a".to_string(), "b".to_string()]);
+        let primary_of = |name: &str| {
+            (0..1000)
+                .map(|i| key(format!("key-{i}").as_bytes()))
+                .find(|k| ring.route(k) == name)
+                .expect("some key routes there")
+        };
+        let mine = primary_of("b");
+        let theirs = primary_of("a");
+
+        // Both keys have b among their two owners, so a plain write is
+        // accepted for either ...
+        assert!(!wrong_node(&node_context, &mine));
+        assert!(!wrong_node(&node_context, &theirs));
+        // ... but an increment or a CAS only for the key b is primary for.
+        assert!(!not_the_primary(&node_context, &mine));
+        assert!(not_the_primary(&node_context, &theirs));
+
+        // No adopted ring (standalone, or nothing adopted yet): everything
+        // is this node's, as for a plain write.
+        *node_context.known_ring.lock().unwrap() = None;
+        assert!(!not_the_primary(&node_context, &theirs));
+
+        // Not promoted yet: nothing is, as for a plain write.
+        node_context.promoted.store(false, Ordering::SeqCst);
+        assert!(not_the_primary(&node_context, &mine));
+    }
+
+    #[test]
+    fn counters_and_cas_keep_serving_during_the_unconfirmed_join_window() {
+        // Until discovery lists the joiner, clients cannot route to it:
+        // the displaced node keeps serving `i`/`k`/`x` for the keys the
+        // joiner took, exactly as it keeps serving plain writes.
+        let (node_context, after_ring, _pre_completion_ring) = completed_unconfirmed_context(&[]);
+        let taken = (0..1000)
+            .map(|i| key(format!("key-{i}").as_bytes()))
+            .find(|k| {
+                !after_ring.is_owner(k, "ready-node", 2) && after_ring.is_owner(k, "joiner-0", 2)
+            })
+            .expect("some key moved to the joiner");
+        assert!(!wrong_node(&node_context, &taken));
+        assert!(!not_the_primary(&node_context, &taken));
     }
 
     #[test]
