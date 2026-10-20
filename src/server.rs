@@ -10565,6 +10565,16 @@ mod tests {
         assert!(body.contains("nanocached_node_hits_total 1\n"), "{body}");
         assert!(body.contains("nanocached_node_misses_total 1\n"), "{body}");
         assert!(body.contains("nanocached_node_sets_total 5\n"), "{body}");
+        // The HELP text carries a statement operators act on — a joiner's
+        // entries rise while this counter stays flat — so its wording is
+        // pinned here, not only the sample.
+        assert!(
+            body.contains(
+                "# HELP nanocached_node_sets_total Stored client writes (S, s and o frames). \
+                 Cluster-management transfers travel as handoff frames (U/u) and are not counted here"
+            ),
+            "{body}"
+        );
         assert!(body.contains("nanocached_node_deletes_total 1\n"), "{body}");
         assert!(body.contains("nanocached_node_incrs_total 1\n"), "{body}");
         assert!(
