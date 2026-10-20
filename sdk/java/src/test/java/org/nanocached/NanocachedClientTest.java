@@ -3960,6 +3960,16 @@ class NanocachedClientTest {
                         dials.incrementAndGet();
                         accepted.getOutputStream().write("B\n".getBytes(StandardCharsets.US_ASCII));
                         accepted.getOutputStream().flush();
+                        // Wait (bounded) for the client to hang up before closing: a close
+                        // with the client's identify frame still unread is a reset on Linux,
+                        // and a reset discards the B it is queued behind.
+                        accepted.setSoTimeout(2000);
+                        byte[] sink = new byte[256];
+                        try {
+                            while (accepted.getInputStream().read(sink) >= 0) {
+                            }
+                        } catch (java.net.SocketTimeoutException ignored) {
+                        }
                     } catch (java.io.IOException closed) {
                         return;
                     }
