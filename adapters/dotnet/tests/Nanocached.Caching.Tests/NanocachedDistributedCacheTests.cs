@@ -60,6 +60,24 @@ public sealed class NanocachedDistributedCacheTests
     }
 
     [Fact]
+    public async Task An_absolute_only_expiry_misses_at_the_exact_millisecond_not_at_the_rounded_wire_ttl()
+    {
+        // 1.2 s becomes a 2 s wire TTL; the envelope keeps the exact
+        // deadline, so a Get between the two must miss, as
+        // MemoryDistributedCache does.
+        using var node = new MockNode();
+        await using ServiceProvider provider = BuildProvider(node);
+        IDistributedCache cache = provider.GetRequiredService<IDistributedCache>();
+
+        await cache.SetStringAsync("k", "v",
+            new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = TimeSpan.FromMilliseconds(1200) });
+        Assert.Equal("v", await cache.GetStringAsync("k"));
+        await Task.Delay(1400);
+        Assert.Null(await cache.GetStringAsync("k"));
+        Assert.Null(node.EntryFor(NanocachedCacheOptions.DefaultNamespace, System.Text.Encoding.UTF8.GetBytes("k")));
+    }
+
+    [Fact]
     public async Task Missing_key_returns_null()
     {
         using var node = new MockNode();

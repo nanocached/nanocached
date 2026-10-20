@@ -134,7 +134,9 @@ regardless of access, so the extra round trip would buy nothing.
 
 Whole-second TTLs only reach the wire: a positive sub-second remainder
 always rounds **up** to 1 second, never down to 0 (which would mean "no
-expiry"). `AbsoluteExpiration`/`AbsoluteExpirationRelativeToNow` and
+expiry"). The envelope keeps the exact absolute deadline, and `Get`
+misses from that millisecond on — the node may still hold the bytes for
+the rest of the rounded second, but they are not served. `AbsoluteExpiration`/`AbsoluteExpirationRelativeToNow` and
 `SlidingExpiration` may be combined — the tighter of the two always wins,
 exactly like a real sliding-plus-absolute cache entry. A past (or
 exactly-now) absolute expiration throws `ArgumentOutOfRangeException`,
