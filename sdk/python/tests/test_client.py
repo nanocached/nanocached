@@ -6138,8 +6138,17 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
 
             client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
             try:
-                with self.assertRaises(WrongNodeError):
+                # The bad owner never answered `W` — it was unreachable —
+                # so this is a connection failure, not a wrong-node
+                # answer, carrying the keys whose primary did store them.
+                with self.assertRaises(PartialSetConnectionLostError) as raised:
                     await client.set_many(values)
+                self.assertEqual(
+                    raised.exception.partial_keys,
+                    {k for k in keys if self.owners_of(k)[0] == good_name},
+                )
+                self.assertIn("could not reach the primary of 6 of 12 keys", str(raised.exception))
+                self.assertIsInstance(raised.exception.__cause__, ConnectionError)
                 # The good owner saw one frame carrying all 12 keys and
                 # nothing more; the bad one saw the first pass and the
                 # retry of its six primary keys.
