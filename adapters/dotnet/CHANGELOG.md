@@ -9,6 +9,20 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Fixed
+
+- A key that is not well-formed UTF-16 (a lone surrogate) throws
+  `ArgumentException` from every member instead of being encoded as
+  U+FFFD, under which `"x\uD800"` and `"x\uD801"` shared one entry and
+  `Get` under one returned the other's value (#679).
+- `Addresses` accepts an IPv6 literal in brackets (`"[::1]:8357"`): the
+  brackets are stripped before the address reaches the SDK (#729).
+- README: the namespace is not interchangeable with direct SDK access
+  (every value is wrapped in the adapter's envelope, so a direct write
+  makes `Get` throw and a direct read sees envelope bytes), plus new
+  sections on an unreachable node and the request size limit, and the
+  minimum server version is named (#672, #736).
+
 ## [0.4.7] - 2026-10-19
 
 No changes. Version aligned with the rest of the project: every release

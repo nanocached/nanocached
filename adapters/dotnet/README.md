@@ -13,11 +13,15 @@ run against a nanocached cluster.
   Spring adapter, which maps `Cache.clear()` onto the namespace `CLEAR`).
 - **Get/Set/Refresh/Remove** map onto the SDK's namespaced
   get/set/delete, with all of its routing, replication, hedged reads and
-  retries.
+  retries. Keys must be well-formed UTF-16: a lone surrogate throws
+  `ArgumentException` rather than silently sharing an entry with another
+  key.
 - **Sliding expiration**, which the wire protocol has no server-side
   concept of, is emulated client-side: see "Sliding expiration" below.
-- Values are opaque `byte[]` — the SPI's own type — with no serializer
-  involved.
+- Values are the SPI's own `byte[]`, with no serializer involved — but
+  every value is stored inside a small envelope (13 bytes ahead of the
+  payload, see "Sliding expiration"), so the namespace is this adapter's
+  own, not shared with direct SDK readers and writers: see "Namespaces".
 
 ## Install
 
@@ -144,8 +148,34 @@ Two `IDistributedCache` instances bound to different namespaces are fully
 isolated, even over identical keys — the same guarantee
 `NanocachedNamespace` gives the SDK directly. `NanocachedDistributedCache.Namespace`
 exposes which one an instance is bound to, since the SPI itself has no
-notion of it — useful for an application that also reads/writes the same
-namespace directly through `client.Namespace(...)`.
+notion of it.
+
+Give direct SDK access its own namespace rather than sharing this one.
+Every value the adapter writes is wrapped in its envelope, so the two
+do not interoperate: a value written directly through
+`client.Namespace(...)` makes the adapter's `Get`/`Refresh` of that key
+throw `InvalidOperationException` ("not a recognized cache envelope"),
+and a direct read of a key the adapter wrote returns the envelope bytes,
+not the payload.
+
+## When the node is unreachable
+
+Every operation fails fast rather than hanging: the SDK bounds each
+connect and each request by its timeouts. A node that is down makes
+every member throw — the SDK's `ConnectionLostException` for a
+connection that was lost, or the operating system's `SocketException`
+when no connection could be opened at all. The synchronous members
+rethrow what their async counterparts fail with. Nothing in this adapter
+or in `IDistributedCache` fails open: ASP.NET Core session state and
+response caching surface the exception from the request that hit it.
+
+## Value size limit
+
+A namespace, key and value together must fit in one request: 1 MiB
+minus a 256-byte header, 1,048,320 bytes, with the envelope's 13 bytes
+counted as part of the value. A `Set` over that size throws the SDK's
+`ArgumentOutOfRangeException` before anything is sent, and nothing is
+written. The value is measured after compression when `Compress` is on.
 
 ## Policy note
 
@@ -158,8 +188,8 @@ mirrors of this one.
 
 ## Requirements
 
-.NET 8+, nanocached server ≥ the release that ships namespaces — namespaced
-frames need a server that understands them.
+.NET 8+, nanocached server 0.4.0 or later — the release that added
+namespaces and the compare-and-set that sliding renewals use.
 
 ## Building
 

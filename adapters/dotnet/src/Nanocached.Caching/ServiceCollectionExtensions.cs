@@ -87,7 +87,12 @@ public static class ServiceCollectionExtensions
         return clientOptions;
     }
 
-    private static (string Host, int Port) ParseAddress(string address)
+    /// <summary>One <c>"host:port"</c> entry of
+    /// <see cref="NanocachedCacheOptions.Addresses"/>. An IPv6 literal is
+    /// written in brackets to keep its colons apart from the port
+    /// (<c>"[::1]:8357"</c>); the brackets are stripped here because the
+    /// SDK takes the bare address.</summary>
+    internal static (string Host, int Port) ParseAddress(string address)
     {
         int colon = address.LastIndexOf(':');
         if (colon <= 0 || colon == address.Length - 1 || !int.TryParse(address.AsSpan(colon + 1), out int port))
@@ -97,7 +102,12 @@ public static class ServiceCollectionExtensions
                 + "expected \"host:port\"",
                 nameof(address));
         }
-        return (address[..colon], port);
+        string host = address[..colon];
+        if (host.Length >= 2 && host[0] == '[' && host[^1] == ']')
+        {
+            host = host[1..^1];
+        }
+        return (host, port);
     }
 
     /// <summary>The <see cref="IDistributedCache"/> instance actually

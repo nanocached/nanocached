@@ -57,10 +57,35 @@ public class NanocachedDistributedCache : IDistributedCache
 
     /// <summary>The nanocached namespace this cache instance is bound to
     /// (issue #108's shared spec: one adapter instance, one namespace).
-    /// The SPI itself has no notion of this — exposed for an application
-    /// that also talks to the same namespace directly through
-    /// <see cref="NanocachedClient.Namespace(string)"/>.</summary>
+    /// The SPI itself has no notion of this, so it is exposed here. Note
+    /// that every value this class stores is wrapped in its own envelope
+    /// (see the class doc), so the namespace is not interchangeable with
+    /// direct <see cref="NanocachedClient.Namespace(string)"/> access: a
+    /// value written directly makes <see cref="Get"/> throw
+    /// <see cref="InvalidOperationException"/>, and a direct read sees
+    /// envelope bytes rather than the payload.</summary>
     public string Namespace { get; }
+
+    // Strict, like the SDK's own string overloads: Encoding.UTF8 silently
+    // replaces a lone surrogate (half of a UTF-16 pair with no partner)
+    // with U+FFFD, so "x\uD800" and "x\uD801" would address the same
+    // entry and Get under one key would return the other's value. The
+    // adapter hands the SDK bytes, so the SDK's own check never runs.
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+    private static byte[] KeyBytes(string key)
+    {
+        try
+        {
+            return StrictUtf8.GetBytes(key);
+        }
+        catch (EncoderFallbackException error)
+        {
+            throw new ArgumentException(
+                $"nanocached.caching: key is not well-formed UTF-16 (a lone surrogate at index {error.Index} "
+                + "cannot be encoded as UTF-8)", nameof(key), error);
+        }
+    }
 
     /// <summary>Binds to <paramref name="namespace"/> on
     /// <paramref name="client"/> — borrowed: this class never closes it,
@@ -89,7 +114,7 @@ public class NanocachedDistributedCache : IDistributedCache
         ArgumentNullException.ThrowIfNull(key);
         token.ThrowIfCancellationRequested();
 
-        byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+        byte[] keyBytes = KeyBytes(key);
         (byte[] Value, string Token)? read = await _namespace.GetBytesWithTokenAsync(keyBytes).ConfigureAwait(false);
         if (read is not { } hit) return null;
 
@@ -139,7 +164,7 @@ public class NanocachedDistributedCache : IDistributedCache
         DateTimeOffset now = DateTimeOffset.UtcNow;
         Envelope envelope = Envelope.FromOptions(options, value, now);
         long wireTtl = envelope.WireTtlSeconds(now);
-        await _namespace.SetAsync(Encoding.UTF8.GetBytes(key), envelope.ToBytes(), wireTtl).ConfigureAwait(false);
+        await _namespace.SetAsync(KeyBytes(key), envelope.ToBytes(), wireTtl).ConfigureAwait(false);
     }
 
     public void Refresh(string key) => RefreshAsync(key).GetAwaiter().GetResult();
@@ -149,7 +174,7 @@ public class NanocachedDistributedCache : IDistributedCache
         ArgumentNullException.ThrowIfNull(key);
         token.ThrowIfCancellationRequested();
 
-        byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+        byte[] keyBytes = KeyBytes(key);
         (byte[] Value, string Token)? read = await _namespace.GetBytesWithTokenAsync(keyBytes).ConfigureAwait(false);
         // A missing key is a no-op, per IDistributedCache's contract —
         // not a miss error.
@@ -185,7 +210,7 @@ public class NanocachedDistributedCache : IDistributedCache
     {
         ArgumentNullException.ThrowIfNull(key);
         token.ThrowIfCancellationRequested();
-        await _namespace.DeleteAsync(Encoding.UTF8.GetBytes(key)).ConfigureAwait(false);
+        await _namespace.DeleteAsync(KeyBytes(key)).ConfigureAwait(false);
     }
 
     /// <summary>
