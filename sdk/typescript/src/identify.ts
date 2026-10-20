@@ -218,19 +218,25 @@ interface AuthIdentity {
  * accident of the auth outcome, it's present whether accepted or
  * rejected. */
 function tryParseIdentity(buf: Buffer): AuthIdentity | null {
+  if (buf.length >= 1 && buf[0] === 0x42 /* 'B' */) {
+    // The node is at its connection limit: it answers a bare `B\n` —
+    // two bytes, not the three-byte identity — and closes right after
+    // (see nanocached-node's reject_over_limit). Checked before the
+    // length guard below, or the short reply would be taken for a
+    // pre-tags server's door-slam and retried with the lesser `A`
+    // forms. Connection-classified, `requestWasSent: false`, so the
+    // client's retry/cooldown layer treats it like any other failed
+    // dial instead of surfacing a generic protocol error.
+    throw new ConnectionLostError("nanocached: the server is at its connection limit (busy)", {
+      requestWasSent: false,
+    });
+  }
   if (buf.length < 3) return null;
 
   const status = buf[0];
   const type = buf[1];
 
   const accepted = status === 0x4f /* 'O' */;
-  if (status === 0x42 /* 'B' */) {
-    // The node is at its connection limit and closes right after this
-    // (see nanocached-node's reject_over_limit). Connection-classified
-    // so the client's retry/cooldown layer treats it like any other
-    // failed dial instead of surfacing a generic protocol error.
-    throw new ConnectionLostError("nanocached: the server is at its connection limit (busy)");
-  }
   if (!accepted && status !== 0x45 /* 'E' */) {
     throw new NanocachedError("nanocached: unexpected response to A");
   }

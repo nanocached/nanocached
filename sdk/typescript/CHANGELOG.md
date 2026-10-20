@@ -11,6 +11,15 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A dial that fails — `ECONNREFUSED`, `ENOTFOUND`, a reset during the
+  handshake — throws `ConnectionLostError` (`requestWasSent` `false`,
+  the Node system error as `cause`) instead of the raw system error, so
+  `error instanceof NanocachedError` catches it, from `connect()` and
+  from the redial every operation makes after its node died (`incr`
+  already wrapped its own). A node at its connection limit, which
+  answers `B` and closes, is reported as busy instead of as a connection
+  closed before the expected response.
+
 - `setMany` stores an entry whose key is `"__proto__"` instead of
   silently dropping it: the string-to-bytes conversion collected the
   batch on a plain object, where assigning that key sets the prototype.
