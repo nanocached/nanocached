@@ -54,8 +54,12 @@ keys mirror the Spring Boot starter's:
 ```java
 Properties properties = new Properties();
 properties.setProperty("nanocached.addresses", "10.0.0.1:8357,10.0.0.2:8357");
-// optional: nanocached.secret, nanocached.tls, nanocached.ca,
-// nanocached.compress, nanocached.compression-threshold
+// optional, all as plain strings:
+//   nanocached.secret, nanocached.tls (true/false), nanocached.ca,
+//   nanocached.compress (true/false), nanocached.compression-threshold (bytes),
+//   nanocached.fire-and-forget-replicas (true/false), nanocached.read-repair (true/false),
+//   nanocached.reconnect-cooldown-millis (0 disables the cooldown),
+//   nanocached.read-hedge-after-millis
 
 CachingProvider provider = Caching.getCachingProvider(); // ServiceLoader-discovered
 CacheManager manager = provider.getCacheManager(URI.create("nanocached:my-app"), null, properties);
@@ -65,6 +69,13 @@ config.setTypes(String.class, User.class);
 config.setExpiryPolicyFactory(CreatedExpiryPolicy.factoryOf(new Duration(TimeUnit.MINUTES, 10)));
 Cache<String, User> users = manager.createCache("users", config);
 ```
+
+A property that cannot be parsed, or that the client rejects, fails
+`getCacheManager` with a `CacheException` naming the property; booleans
+accept only `true` and `false`. Durations are whole milliseconds, where
+the Boot starter takes ISO-8601 durations. A positive expiry on a cache
+rounds up to whole seconds (the wire's unit): 1.2 s becomes 2 s, so an
+entry never expires earlier than its policy asks.
 
 The URI is only an identity key for `CacheManager` caching (per the
 JSR-107 spec's own identity contract) — it is never parsed as a
@@ -137,18 +148,14 @@ current value and the digest it was read with (`getWithToken`), compare
 `equals()` — not a digest of `oldValue`'s own re-serialized form, which
 would fail for a value that's `equals()`-equal but not canonically
 serialized, e.g. a `HashMap` built in a different insertion order), attempt
-the conditioned write with the digest that read
-observed, and retry on a concurrent change, up to 10 attempts.
-
-Under pathological sustained contention on one key, `getAndPut` and
-`getAndReplace` give up CAS and fall back to a single unconditional
-write so the call still makes progress — the "previous value" they
-return in that case may be stale by the time the overwrite lands.
-`replace(k,old,new)` and `remove(k,old)` do not: their whole contract
-*is* the comparison, so an unconditional fallback would silently
-violate it — exhausting the retry budget there just means the call
-reports failure (JSR-107 doesn't require these to eventually succeed
-under contention).
+the conditioned write with the digest that read observed, and retry on a
+concurrent change, pausing a little longer each time. A loop that is
+still losing the race after 5 seconds fails with a `CacheException`
+rather than guessing: there is no fallback to an unconditional write or
+delete, so a previous value is returned to exactly one caller and
+`getAndRemove` never hands out a value it did not remove. (A fixed
+budget of ten attempts used to end in such a fallback, and four writers
+on one key were enough to exhaust it.)
 
 ## Statistics
 
@@ -159,6 +166,11 @@ platform MBean server. Timings and evictions are not tracked — the wire
 protocol doesn't report server-side LRU evictions to the client.
 
 ## Consistency notes
+
+`getAll` is one batched read per owning node. The values in one batch
+reply total at most 16 MiB, and a hit past that budget is answered as a
+miss, so `getAll` over many large keys can omit a key that exists —
+`get` it on its own rather than taking it for evicted.
 
 `getExpiryForAccess()` (used by `AccessedExpiryPolicy`/
 `TouchedExpiryPolicy`) turns every `get()` into a read followed by an
@@ -195,10 +207,27 @@ non-Java-serialization format is needed here too) — for now, a JVM-wide
 serial filter is the only mitigation available without forking this
 module.
 
+## When the node is unreachable
+
+Every operation fails fast with a `CacheException` whose cause is the
+SDK's `NanocachedException.ConnectionFailed`; nothing hangs. The same
+`CacheException` wrapping applies to every backend failure, as the
+`javax.cache.Cache` contract asks: a value that cannot be read back
+(a class missing from the manager's class loader, a serial-filter
+rejection) and a value the server will not accept.
+
+## Value size limit
+
+A serialized value must fit the server's request limit of 1 MiB (key
+and value together, after serialization and optional compression); a
+larger one is rejected before anything is sent, as a `CacheException`
+whose cause is the SDK's `IllegalArgumentException`.
+
 ## Requirements
 
-Java 17+, `javax.cache:cache-api:1.1.1`, nanocached server ≥ the release
-that ships namespaces/CLEAR and compare-and-set.
+Java 17+, `javax.cache:cache-api:1.1.1`, nanocached server 0.4.0 or
+later (the first release with namespaces, `CLEAR`, compare-and-set and
+the bulk frames `getAll`/`putAll` use).
 
 ## Policy note
 

@@ -95,49 +95,105 @@ public final class NanocachedCachingProvider implements CachingProvider {
 
         NanocachedClient.Options options = new NanocachedClient.Options().addresses(parseAddresses(addresses));
 
+        // Every property is parsed and applied under its own name: a
+        // value the SDK or the parser rejects is a CacheException that
+        // says which property, not a raw NumberFormatException or
+        // IllegalArgumentException escaping getCacheManager.
         String secret = properties.getProperty("nanocached.secret");
         if (secret != null) {
-            options.authSecret(secret);
+            apply("nanocached.secret", () -> options.authSecret(secret));
         }
-        String tls = properties.getProperty("nanocached.tls");
+        Boolean tls = booleanProperty(properties, "nanocached.tls");
         if (tls != null) {
-            options.tls(Boolean.parseBoolean(tls));
+            apply("nanocached.tls", () -> options.tls(tls));
         }
         String ca = properties.getProperty("nanocached.ca");
         if (ca != null) {
-            options.ca(ca);
+            apply("nanocached.ca", () -> options.ca(ca));
         }
-        String compress = properties.getProperty("nanocached.compress");
+        Boolean compress = booleanProperty(properties, "nanocached.compress");
         if (compress != null) {
-            options.compress(Boolean.parseBoolean(compress));
+            apply("nanocached.compress", () -> options.compress(compress));
         }
-        String compressionThreshold = properties.getProperty("nanocached.compression-threshold");
+        Long compressionThreshold = longProperty(properties, "nanocached.compression-threshold");
         if (compressionThreshold != null) {
-            options.compressionThreshold(Integer.parseInt(compressionThreshold));
+            apply("nanocached.compression-threshold",
+                    () -> options.compressionThreshold(Math.toIntExact(compressionThreshold)));
         }
-        String fireAndForgetReplicas = properties.getProperty("nanocached.fire-and-forget-replicas");
+        Boolean fireAndForgetReplicas = booleanProperty(properties, "nanocached.fire-and-forget-replicas");
         if (fireAndForgetReplicas != null) {
-            options.fireAndForgetReplicas(Boolean.parseBoolean(fireAndForgetReplicas));
+            apply("nanocached.fire-and-forget-replicas", () -> options.fireAndForgetReplicas(fireAndForgetReplicas));
         }
-        String readRepair = properties.getProperty("nanocached.read-repair");
+        Boolean readRepair = booleanProperty(properties, "nanocached.read-repair");
         if (readRepair != null) {
-            options.readRepair(Boolean.parseBoolean(readRepair));
+            apply("nanocached.read-repair", () -> options.readRepair(readRepair));
         }
         // Durations are given in whole milliseconds here — a plain
         // Properties value has no ISO-8601 binder like Boot's does.
-        String reconnectCooldownMillis = properties.getProperty("nanocached.reconnect-cooldown-millis");
+        Long reconnectCooldownMillis = longProperty(properties, "nanocached.reconnect-cooldown-millis");
         if (reconnectCooldownMillis != null) {
-            options.reconnectCooldown(Duration.ofMillis(Long.parseLong(reconnectCooldownMillis)));
+            // Zero means "no cooldown", as the Spring Boot starter reads
+            // it; the SDK's own Duration.ZERO means "use the default", so
+            // zero must route through disableReconnectCooldown() to take
+            // effect.
+            apply("nanocached.reconnect-cooldown-millis", () -> {
+                if (reconnectCooldownMillis == 0) {
+                    options.disableReconnectCooldown();
+                } else {
+                    options.reconnectCooldown(Duration.ofMillis(reconnectCooldownMillis));
+                }
+            });
         }
-        String readHedgeAfterMillis = properties.getProperty("nanocached.read-hedge-after-millis");
+        Long readHedgeAfterMillis = longProperty(properties, "nanocached.read-hedge-after-millis");
         if (readHedgeAfterMillis != null) {
-            options.readHedgeAfter(Duration.ofMillis(Long.parseLong(readHedgeAfterMillis)));
+            apply("nanocached.read-hedge-after-millis",
+                    () -> options.readHedgeAfter(Duration.ofMillis(readHedgeAfterMillis)));
         }
 
         try {
             return NanocachedClient.connect(options);
         } catch (RuntimeException e) {
             throw new CacheException("nanocached-jcache: failed to connect to nanocached", e);
+        }
+    }
+
+    /** Only {@code true} and {@code false} are accepted: {@code
+     * Boolean.parseBoolean} reads anything else as {@code false}, so
+     * {@code nanocached.tls=yes} silently connected in plaintext. */
+    private static Boolean booleanProperty(Properties properties, String name) {
+        String value = properties.getProperty(name);
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        if (trimmed.equalsIgnoreCase("true")) {
+            return Boolean.TRUE;
+        }
+        if (trimmed.equalsIgnoreCase("false")) {
+            return Boolean.FALSE;
+        }
+        throw new CacheException(
+                "nanocached-jcache: \"" + name + "\" must be true or false, got \"" + value + "\"");
+    }
+
+    private static Long longProperty(Properties properties, String name) {
+        String value = properties.getProperty(name);
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            throw new CacheException(
+                    "nanocached-jcache: \"" + name + "\" must be a whole number, got \"" + value + "\"", e);
+        }
+    }
+
+    private static void apply(String name, Runnable setter) {
+        try {
+            setter.run();
+        } catch (IllegalArgumentException | ArithmeticException e) {
+            throw new CacheException("nanocached-jcache: \"" + name + "\": " + e.getMessage(), e);
         }
     }
 

@@ -491,7 +491,9 @@ class NanocachedCacheTest {
         node.forceWrongNodeCountsForGet.put(
                 java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")), new AtomicInteger(100));
 
-        assertThrows(NanocachedException.WrongNode.class, () -> cache.getAll(Set.of("a")));
+        javax.cache.CacheException error =
+                assertThrows(javax.cache.CacheException.class, () -> cache.getAll(Set.of("a")));
+        assertTrue(error.getCause() instanceof NanocachedException.WrongNode, "cause: " + error.getCause());
     }
 
     @Test
@@ -524,7 +526,9 @@ class NanocachedCacheTest {
         node.forceWrongNodeCountsForSet.put(
                 java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")), new AtomicInteger(100));
 
-        assertThrows(NanocachedException.WrongNode.class, () -> cache.putAll(Map.of("a", "1")));
+        javax.cache.CacheException error =
+                assertThrows(javax.cache.CacheException.class, () -> cache.putAll(Map.of("a", "1")));
+        assertTrue(error.getCause() instanceof NanocachedException.WrongNode, "cause: " + error.getCause());
     }
 
     // ── getAll/putAll partial-connection-loss recovery (issue #439) ───
@@ -578,7 +582,9 @@ class NanocachedCacheTest {
         // attempts (its own internal original + reconnect-retry) all drop.
         node.armMultiGetDrop(1, 4);
 
-        assertThrows(NanocachedException.ConnectionFailed.class, () -> cache.getAll(seed.keySet()));
+        javax.cache.CacheException error =
+                assertThrows(javax.cache.CacheException.class, () -> cache.getAll(seed.keySet()));
+        assertTrue(error.getCause() instanceof NanocachedException.ConnectionFailed, "cause: " + error.getCause());
     }
 
     @Test
@@ -618,7 +624,9 @@ class NanocachedCacheTest {
         node.multiSetCount.set(0);
         node.armMultiSetDrop(1, 4);
 
-        assertThrows(NanocachedException.ConnectionFailed.class, () -> cache.putAll(seed));
+        javax.cache.CacheException error =
+                assertThrows(javax.cache.CacheException.class, () -> cache.putAll(seed));
+        assertTrue(error.getCause() instanceof NanocachedException.ConnectionFailed, "cause: " + error.getCause());
     }
 
     /** creation → 60 s, update → 30 s: two distinct TTLs within one putAll. */
@@ -844,12 +852,12 @@ class NanocachedCacheTest {
     }
 
     @Test
-    void getAndPutFallbackOverwriteOnDurationZeroDeletesAndFiresRemoved() throws Exception {
-        // Issue #331: fallbackOverwrite's delete branch (reached once the CAS
-        // retry budget is exhausted and the TTL resolves to Duration.ZERO)
-        // deleted the entry but never recorded the removal in statistics nor
-        // fired Removed — unlike getAndReplace's equivalent inline fallback
-        // branch, which it mirrors.
+    void getAndPutOnDurationZeroKeepsRetryingTheConditionedDeleteAndFiresRemoved() throws Exception {
+        // The update expiry resolves to Duration.ZERO, so getAndPut's
+        // write is a conditioned delete. Sustained CAS mismatches used to
+        // exhaust a fixed budget and fall through to an unconditional
+        // delete; now the loop keeps retrying until the mock stops
+        // rejecting, and the removal is recorded and fired exactly once.
         MutableConfiguration<String, String> config = new MutableConfiguration<>();
         config.setTypes(String.class, String.class);
         config.setExpiryPolicyFactory(ModifiedExpiryPolicy.factoryOf(Duration.ZERO));
@@ -868,8 +876,6 @@ class NanocachedCacheTest {
         zeroCache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
                 FactoryBuilder.factoryOf(listener), null, true, true));
 
-        // Sustained CAS mismatch on every k/x request exhausts getAndPut's
-        // retry budget, forcing it to fall through to fallbackOverwrite.
         node.forceCasMismatchCount.set(50);
 
         assertEquals("old", zeroCache.getAndPut("a", "1"));
@@ -877,6 +883,8 @@ class NanocachedCacheTest {
         assertNull(zeroCache.get("a"));
         assertEquals(List.of("REMOVED:a:old=old"), events);
         assertEquals(1, statisticsMBean("zero-fallback").getCacheRemovals());
+        assertEquals(0, node.deleteCount.get(), "no unconditional delete");
+        assertTrue(node.casDeleteCount.get() > 50, "the conditioned delete was retried past the old budget");
     }
 
     @Test
@@ -1040,5 +1048,157 @@ class NanocachedCacheTest {
                 events.add("REMOVED:" + event.getKey() + ":old=" + oldValue);
             }
         }
+    }
+
+    // ── compare-and-set loops never fall back to an unconditional write ──
+
+    @Test
+    void getAndPutKeepsRetryingUnderSustainedContentionInsteadOfOverwriting() {
+        // Thirty forced mismatches in a row: a fixed budget of ten used to
+        // end in an unconditional set whose "previous value" could already
+        // be stale and was handed to more than one caller.
+        cache.put("a", "old");
+        node.forceCasMismatchCount.set(30);
+        assertEquals("old", cache.getAndPut("a", "new"));
+        assertEquals("new", cache.get("a"));
+        assertEquals(1, node.setCount.get(), "only the seeding put sent an unconditional set");
+        assertTrue(node.casSetCount.get() > 30, "the compare-and-set was retried past the old budget");
+    }
+
+    @Test
+    void getAndRemoveNeverFallsBackToAnUnconditionalDelete() {
+        cache.put("a", "old");
+        node.forceCasMismatchCount.set(30);
+        assertEquals("old", cache.getAndRemove("a"));
+        assertNull(cache.get("a"));
+        assertEquals(0, node.deleteCount.get(), "no unconditional delete");
+        assertTrue(node.casDeleteCount.get() > 30);
+    }
+
+    @Test
+    void aCompareAndSetLoopThatKeepsLosingFailsLoudlyAtTheDeadline() throws Exception {
+        // The deadline is reached through reflection so this test still
+        // compiles against an adapter without it and then fails (rather
+        // than being silently skipped by a compilation error).
+        java.lang.reflect.Field deadline = NanocachedCache.class.getDeclaredField("casRetryDeadlineMillis");
+        deadline.setAccessible(true);
+        long saved = deadline.getLong(null);
+        deadline.setLong(null, 200);
+        try {
+            cache.put("a", "old");
+            node.forceCasMismatchCount.set(1_000_000);
+            javax.cache.CacheException error =
+                    assertThrows(javax.cache.CacheException.class, () -> cache.getAndPut("a", "new"));
+            assertTrue(error.getMessage().contains("gave up"), error.getMessage());
+            assertEquals(1, node.setCount.get(), "no unconditional overwrite after giving up");
+            assertEquals("old", cache.get("a"), "the stored value is untouched");
+        } finally {
+            deadline.setLong(null, saved);
+            node.forceCasMismatchCount.set(0);
+        }
+    }
+
+    @Test
+    void concurrentGetAndPutReturnsEveryPreviousValueExactlyOnce() throws Exception {
+        // Eight threads, each a hundred getAndPut with unique values on one
+        // key: every value written must come back as a previous value
+        // exactly once (plus the initial null), which only holds when
+        // every getAndPut is atomic.
+        int threads = 8, perThread = 100;
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        try {
+            List<java.util.concurrent.Future<List<String>>> results = new java.util.ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                int thread = t;
+                results.add(pool.submit(() -> {
+                    List<String> previous = new java.util.ArrayList<>();
+                    for (int i = 0; i < perThread; i++) {
+                        previous.add(cache.getAndPut("hot", "t" + thread + "-" + i));
+                    }
+                    return previous;
+                }));
+            }
+            List<String> all = new java.util.ArrayList<>();
+            for (java.util.concurrent.Future<List<String>> result : results) all.addAll(result.get());
+            long nulls = all.stream().filter(java.util.Objects::isNull).count();
+            assertEquals(1, nulls, "exactly one caller saw the empty cache");
+            Set<String> distinct = new java.util.HashSet<>(all);
+            assertEquals(all.size(), distinct.size(), "a previous value was returned to more than one caller");
+            assertEquals(threads * perThread, all.size());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    // ── backend failures are CacheExceptions ────────────────────────
+
+    @Test
+    void backendFailuresAreReportedAsCacheExceptions() throws Exception {
+        cache.put("a", "1");
+        node.close();
+        Map<String, Runnable> operations = new java.util.LinkedHashMap<>();
+        operations.put("get", () -> cache.get("a"));
+        operations.put("put", () -> cache.put("a", "2"));
+        operations.put("containsKey", () -> cache.containsKey("a"));
+        operations.put("getAll", () -> cache.getAll(Set.of("a", "b")));
+        operations.put("putAll", () -> cache.putAll(Map.of("a", "2", "b", "3")));
+        operations.put("remove", () -> cache.remove("a"));
+        operations.put("clear", () -> cache.clear());
+        operations.put("putIfAbsent", () -> cache.putIfAbsent("c", "3"));
+        operations.put("getAndPut", () -> cache.getAndPut("a", "4"));
+        for (Map.Entry<String, Runnable> operation : operations.entrySet()) {
+            javax.cache.CacheException error = assertThrows(javax.cache.CacheException.class,
+                    operation.getValue()::run, operation.getKey() + " must throw CacheException");
+            assertTrue(error.getCause() instanceof NanocachedException,
+                    operation.getKey() + " cause: " + error.getCause());
+        }
+    }
+
+    @Test
+    void anOversizedValueIsACacheException() {
+        javax.cache.CacheException error = assertThrows(
+                javax.cache.CacheException.class, () -> cache.put("big", "x".repeat(1_200_000)));
+        assertTrue(error.getCause() instanceof IllegalArgumentException, "cause: " + error.getCause());
+    }
+
+    // ── the manager's class loader resolves value classes ───────────
+
+    @Test
+    void theManagerClassLoaderIsUsedForValueClasses() throws Exception {
+        // The application's value class lives in a child loader handed to
+        // getCacheManager(uri, classLoader, props), as JSR-107 asks; a
+        // plain ObjectInputStream resolved with the adapter's loader and
+        // failed every hit with ClassNotFoundException.
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("nanocached-jcache-child");
+        java.nio.file.Path source = dir.resolve("app").resolve("JcUser.java");
+        java.nio.file.Files.createDirectories(source.getParent());
+        java.nio.file.Files.writeString(
+                source, "package app; public record JcUser(String name) implements java.io.Serializable {}");
+        assertEquals(0, javax.tools.ToolProvider.getSystemJavaCompiler()
+                .run(null, null, null, "-d", dir.toString(), source.toString()));
+        try (java.net.URLClassLoader child = new java.net.URLClassLoader(
+                new java.net.URL[] {dir.toUri().toURL()}, NanocachedCacheTest.class.getClassLoader())) {
+            Class<?> type = child.loadClass("app.JcUser");
+            Object user = type.getConstructor(String.class).newInstance("alice");
+            Properties properties = new Properties();
+            properties.setProperty("nanocached.addresses", node.address());
+            CacheManager childManager = provider.getCacheManager(URI.create("test:child-loader"), child, properties);
+            MutableConfiguration<String, Object> config = new MutableConfiguration<>();
+            config.setTypes(String.class, Object.class);
+            config.setExpiryPolicyFactory(EternalExpiryPolicy.factoryOf());
+            Cache<String, Object> users = childManager.createCache("child-users", config);
+            users.put("alice", user);
+            assertEquals(user, users.get("alice"));
+        }
+    }
+
+    // ── a String key with a lone surrogate is rejected ──────────────
+
+    @Test
+    void aKeyWithALoneSurrogateIsRejectedInsteadOfCollidingWithAnotherKey() {
+        cache.put("x?", "question");
+        assertThrows(IllegalArgumentException.class, () -> cache.put("x\uD800", "surrogate"));
+        assertThrows(IllegalArgumentException.class, () -> cache.get("x\uD800"));
+        assertEquals("question", cache.get("x?"));
     }
 }

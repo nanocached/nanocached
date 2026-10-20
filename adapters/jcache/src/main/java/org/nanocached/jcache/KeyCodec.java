@@ -43,6 +43,9 @@ final class KeyCodec {
             System.arraycopy(raw, 0, marked, 1, raw.length);
             return marked;
         }
+        if (key instanceof String text) {
+            requireWellFormed(text);
+        }
         if (key instanceof String
                 || key instanceof Number
                 || key instanceof Boolean
@@ -63,5 +66,25 @@ final class KeyCodec {
             throw new IllegalStateException("nanocached-jcache: failed to serialize cache key", e);
         }
         return bytes.toByteArray();
+    }
+
+    /** {@code String.getBytes(UTF_8)} silently replaces a lone surrogate
+     * (half of a UTF-16 pair with no partner) with {@code '?'}, so two
+     * different keys ({@code "x\uD800"} and {@code "x\uD801"}, or either
+     * and {@code "x?"}) would address one cache entry and a lookup under
+     * one would return the other's value. Such a key is rejected
+     * instead. */
+    private static void requireWellFormed(String text) {
+        for (int i = 0, n = text.length(); i < n; i++) {
+            char c = text.charAt(i);
+            if (!Character.isSurrogate(c)) continue;
+            if (Character.isHighSurrogate(c) && i + 1 < n && Character.isLowSurrogate(text.charAt(i + 1))) {
+                i++;
+                continue;
+            }
+            throw new IllegalArgumentException(
+                    "nanocached-jcache: cache key is not well-formed UTF-16 (a lone surrogate at index " + i
+                            + " cannot be encoded as UTF-8)");
+        }
     }
 }
