@@ -2089,6 +2089,23 @@ enum ClearRoute {
 }
 
 fn route_clear(node_context: &NodeContext, scope: &ClearScope) -> ClearRoute {
+    route_clear_to(node_context, scope, false)
+}
+
+/// `route_clear` for a clear that arrived forwarded from another node
+/// (`f`): it goes on only to a joiner discovery has not confirmed yet —
+/// the one node the clear's origin could not have reached itself. A
+/// confirmed joiner is in every roster, so whoever forwarded the clear
+/// here reached it directly, as it reached this node.
+fn route_handoff_clear(node_context: &NodeContext, scope: &ClearScope) -> ClearRoute {
+    route_clear_to(node_context, scope, true)
+}
+
+fn route_clear_to(
+    node_context: &NodeContext,
+    scope: &ClearScope,
+    only_unconfirmed: bool,
+) -> ClearRoute {
     let mut slot = node_context
         .active_migration
         .lock()
@@ -2102,6 +2119,9 @@ fn route_clear(node_context: &NodeContext, scope: &ClearScope) -> ClearRoute {
     let Some(active) = slot.as_mut() else {
         return ClearRoute::None;
     };
+    if only_unconfirmed && active.confirmed {
+        return ClearRoute::None;
+    }
 
     if active.completed_at.is_none() {
         active.pending_clears.push(scope.clone());
@@ -2859,8 +2879,11 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                // If this node is itself mid-join-handoff for the key,
-                // relay it to the joining owner too.
+                // If this node has a join for the key that discovery has
+                // not confirmed yet, relay it to that joiner too — and only
+                // to that one, see `unconfirmed_join_target_for`: whoever
+                // sent this handoff reached every confirmed joiner itself,
+                // and a relay there sent the frame around in circles.
                 //
                 // An ordinary (unconditional) handoff relays as an
                 // unconditional `S`, exactly like a client `Set`.
@@ -2879,24 +2902,24 @@ async fn handle_connection(
                 // unconditional overwrite: if the joiner already holds a
                 // value it keeps it, and if it holds nothing it finally
                 // gets this key instead of missing it permanently.
-                if let Some(node_context) = &config.node_context {
-                    for target in migration_targets_for(node_context, &key) {
-                        let forward = if if_absent {
-                            OwnedForwardedWrite::HandoffSet {
-                                key: key.clone(),
-                                value: value.clone(),
-                                ttl,
-                                if_absent: true,
-                            }
-                        } else {
-                            OwnedForwardedWrite::Set {
-                                key: key.clone(),
-                                value: value.clone(),
-                                ttl,
-                            }
-                        };
-                        spawn_forward(&config, node_context.clone(), target, forward).await;
-                    }
+                if let Some(node_context) = &config.node_context
+                    && let Some(target) = unconfirmed_join_target_for(node_context, &key)
+                {
+                    let forward = if if_absent {
+                        OwnedForwardedWrite::HandoffSet {
+                            key: key.clone(),
+                            value: value.clone(),
+                            ttl,
+                            if_absent: true,
+                        }
+                    } else {
+                        OwnedForwardedWrite::Set {
+                            key: key.clone(),
+                            value: value.clone(),
+                            ttl,
+                        }
+                    };
+                    spawn_forward(&config, node_context.clone(), target, forward).await;
                 }
 
                 // And to the entrant of a decommission this node is
@@ -2979,18 +3002,19 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                // If this node is itself mid-join-handoff for the key,
-                // propagate like any other delete.
-                if let Some(node_context) = &config.node_context {
-                    for target in migration_targets_for(node_context, &key) {
-                        spawn_forward(
-                            &config,
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::Delete { key: key.clone() },
-                        )
-                        .await;
-                    }
+                // If this node has a join still unconfirmed for the key,
+                // propagate there — and only there, see
+                // `unconfirmed_join_target_for`.
+                if let Some(node_context) = &config.node_context
+                    && let Some(target) = unconfirmed_join_target_for(node_context, &key)
+                {
+                    spawn_forward(
+                        &config,
+                        node_context.clone(),
+                        target,
+                        OwnedForwardedWrite::Delete { key: key.clone() },
+                    )
+                    .await;
                 }
 
                 // Decommission mirror, as for `U` above and the `D` arm
@@ -3260,6 +3284,65 @@ async fn handle_connection(
             }
             Ok((Command::ClearAll, tag)) => {
                 handle_clear(&mut stream, &request_tx, &config, ClearScope::All, tag).await?;
+
+                continue;
+            }
+            Ok((
+                Command::HandoffClear {
+                    all,
+                    namespace,
+                    token,
+                },
+                tag,
+            )) => {
+                let Some(node_context) = config.node_context.clone() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "received f but this node isn't configured with a discovery server",
+                    ));
+                };
+                if !constant_time_eq(token.as_bytes(), node_context.token.as_bytes()) {
+                    eprintln!(
+                        "WARN rejected f from {address}: membership token mismatch \
+                         (sender is not a legitimate handoff source for this node)"
+                    );
+                    write_response(
+                        &mut stream,
+                        &encode_response(&Response::MigrationRejected, tag),
+                    )
+                    .await?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "f carried the wrong membership token",
+                    ));
+                }
+                let scope = if all {
+                    ClearScope::All
+                } else {
+                    ClearScope::Namespace(namespace.clone())
+                };
+                let response = execute_command(
+                    &request_tx,
+                    Command::HandoffClear {
+                        all,
+                        namespace,
+                        token,
+                    },
+                )
+                .await?;
+                // A forwarded clear goes on only to a join this node still
+                // has unconfirmed (queued behind its transfer, or on its
+                // forwarding connection) — see `route_handoff_clear`.
+                if let ClearRoute::Forward(target) = route_handoff_clear(&node_context, &scope) {
+                    spawn_forward(
+                        &config,
+                        node_context.clone(),
+                        target,
+                        OwnedForwardedWrite::Clear(scope),
+                    )
+                    .await;
+                }
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 continue;
             }
@@ -5953,7 +6036,7 @@ async fn transfer_with_retries(
         | ForwardedWrite::Delete { .. }
         | ForwardedWrite::HandoffSet { .. }
         | ForwardedWrite::HandoffDelete { .. } => "a key",
-        ForwardedWrite::Clear(_) => "a clear",
+        ForwardedWrite::Clear { .. } => "a clear",
     };
 
     for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
@@ -5991,9 +6074,9 @@ async fn transfer_with_retries(
                     "outbound delete timed out",
                 ))
             }),
-            ForwardedWrite::Clear(scope) => timeout(
+            ForwardedWrite::Clear { scope, token } => timeout(
                 OUTBOUND_IO_TIMEOUT,
-                ForwardedWrite::Clear(scope).send(active_stream),
+                ForwardedWrite::Clear { scope, token }.send(active_stream),
             )
             .await
             .unwrap_or_else(|_| {
@@ -6074,14 +6157,14 @@ async fn drain_pending_clears(
     joining_addr: &str,
     stream: &mut Option<ClientStream>,
 ) -> bool {
-    let pending = {
+    let (pending, joining_token) = {
         let mut slot = node_context
             .active_migration
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match slot.as_mut() {
-            Some(active) => active.pending_clears.take(),
-            None => Vec::new(),
+            Some(active) => (active.pending_clears.take(), active.joining_token.clone()),
+            None => (Vec::new(), String::new()),
         }
     };
 
@@ -6090,7 +6173,10 @@ async fn drain_pending_clears(
             node_context,
             joining_addr,
             stream,
-            ForwardedWrite::Clear(scope),
+            ForwardedWrite::Clear {
+                scope,
+                token: &joining_token,
+            },
         )
         .await
         {
@@ -8064,7 +8150,10 @@ enum ForwardedWrite<'a> {
         /// Issue #295: see `HandoffSet::token` above.
         token: &'a str,
     },
-    Clear(&'a ClearScope),
+    Clear {
+        scope: &'a ClearScope,
+        token: &'a str,
+    },
 }
 
 /// What a `c`/`F` clears (issue #106): one namespace, or everything.
@@ -8075,15 +8164,24 @@ enum ClearScope {
 }
 
 impl ClearScope {
-    /// The `c`/`F` frame that replays this clear on the joining node.
-    fn message(&self) -> Vec<u8> {
+    /// The `f` frame that replays this clear on another node, carrying
+    /// that node's membership `token` — see `Command::HandoffClear`. Not
+    /// a `c`/`F`: the receiver must know this clear was forwarded, so it
+    /// relays it only to a join it still has unconfirmed and never back
+    /// through a decommission's window.
+    fn handoff_message(&self, token: &str) -> Vec<u8> {
         match self {
             ClearScope::Namespace(namespace) => {
-                let mut message = format!("c {}\n", namespace.len()).into_bytes();
+                let mut message = format!("f {} {}\n", namespace.len(), token.len()).into_bytes();
+                message.extend_from_slice(token.as_bytes());
                 message.extend_from_slice(namespace);
                 message
             }
-            ClearScope::All => b"F\n".to_vec(),
+            ClearScope::All => {
+                let mut message = format!("f 0 {} A\n", token.len()).into_bytes();
+                message.extend_from_slice(token.as_bytes());
+                message
+            }
         }
     }
 }
@@ -8097,7 +8195,7 @@ impl ForwardedWrite<'_> {
             ForwardedWrite::Delete { .. } | ForwardedWrite::HandoffDelete { .. } => {
                 "forwarding the delete to the joining node timed out"
             }
-            ForwardedWrite::Clear(_) => "forwarding the clear to the joining node timed out",
+            ForwardedWrite::Clear { .. } => "forwarding the clear to the joining node timed out",
         }
     }
 
@@ -8159,8 +8257,8 @@ impl ForwardedWrite<'_> {
                 }
                 Ok(())
             }
-            ForwardedWrite::Clear(scope) => {
-                stream.write_all(&scope.message()).await?;
+            ForwardedWrite::Clear { scope, token } => {
+                stream.write_all(&scope.handoff_message(token)).await?;
 
                 let mut ack = [0u8; 2];
                 stream.read_exact(&mut ack).await?;
@@ -8328,7 +8426,10 @@ impl OwnedForwardedWrite {
                     node_context,
                     &target.addr,
                     connection,
-                    ForwardedWrite::Clear(scope),
+                    ForwardedWrite::Clear {
+                        scope,
+                        token: &target.token,
+                    },
                     deadline,
                 )
                 .await
@@ -9286,6 +9387,43 @@ fn serving_locally_for_unconfirmed_join(node_context: &NodeContext, key_hash: Ke
 /// the staged-join handoff design).
 fn migration_targets_for(node_context: &NodeContext, key: &Key) -> Vec<ForwardTarget> {
     migration_targets_for_hashed(node_context, KeyHash::of(key))
+}
+
+/// Where a handoff frame this node received (`U`, `u`) goes on: only to
+/// the slot's joiner while discovery has not confirmed its join, and only
+/// for a key that joiner owns. A handoff is sent by a node working from
+/// a roster — a decommissioning node, a survivor re-replicating, an old
+/// owner relaying for its own joiner — and every confirmed joiner is in
+/// that roster, so the sender reached it directly; relaying there again
+/// only sent frames around in circles (a leaver's drain came back to it
+/// through its entrant's relay and overwrote the newer write it held
+/// meanwhile). The unconfirmed joiner is the one node no roster names
+/// yet, and the one this node must cover.
+fn unconfirmed_join_target_for(node_context: &NodeContext, key: &Key) -> Option<ForwardTarget> {
+    let key_hash = KeyHash::of(key);
+    let mut slot = node_context
+        .active_migration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.as_ref().is_some_and(ActiveMigration::expired) {
+        *slot = None;
+    }
+    let active = slot.as_ref()?;
+    if active.confirmed
+        || !active.forwarding_open()
+        || !active
+            .after_ring
+            .is_owner_hashed(key_hash, &active.joining_name, active.replication)
+    {
+        return None;
+    }
+    Some(ForwardTarget {
+        addr: active.joining_addr.clone(),
+        connection: Arc::clone(&active.forward_connection),
+        token: active.joining_token.clone(),
+        revoked: Arc::clone(&active.forward_revoked),
+        as_handoff: true,
+    })
 }
 
 /// `migration_targets_for` for a key whose hash is already known — see
@@ -13208,12 +13346,136 @@ mod tests {
     }
 
     #[test]
-    fn clear_scope_messages_are_the_c_and_f_frames() {
+    fn clear_scope_messages_are_f_handoff_frames_carrying_the_receivers_token() {
         assert_eq!(
-            ClearScope::Namespace(Bytes::from_static(b"users")).message(),
-            b"c 5\nusers".to_vec()
+            ClearScope::Namespace(Bytes::from_static(b"users")).handoff_message("tok-joiner-0"),
+            b"f 5 12\ntok-joiner-0users".to_vec()
         );
-        assert_eq!(ClearScope::All.message(), b"F\n".to_vec());
+        assert_eq!(
+            ClearScope::All.handoff_message("tok-joiner-0"),
+            b"f 0 12 A\ntok-joiner-0".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_forwarded_clear_goes_on_only_to_an_unconfirmed_joiner() {
+        // A clear that arrived as `f` was forwarded by a node working from
+        // a roster, and a confirmed joiner is in that roster, so the
+        // sender reached it itself. Relaying it there again is what sent
+        // one clear back and forth between a leaver and the node still
+        // forwarding to it, wiping every write in between for the whole
+        // window. A joiner discovery has not confirmed yet is the one
+        // node the sender could not know, so that one still gets it.
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
+                joining_name: "joiner-0".to_string(),
+                joining_addr: "127.0.0.1:9".to_string(),
+                joining_token: "tok-joiner-0".to_string(),
+                after_ring,
+                replication: 2,
+                generation: None,
+                completed_at: None,
+                forwarding_grace: Duration::from_secs(60),
+                acked_entries: Some(0),
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: Vec::new(),
+                confirmed: false,
+                pre_completion_ring: None,
+                pending_clears: PendingClears::default(),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
+                lingering: Vec::new(),
+                remnant: false,
+            }))),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        };
+        let scope = ClearScope::Namespace(Bytes::from_static(b"users"));
+        let a_key = key(b"k");
+
+        // Unconfirmed, transfer running: queued, like a client's clear.
+        assert!(matches!(
+            route_handoff_clear(&node_context, &scope),
+            ClearRoute::Queued
+        ));
+        node_context
+            .active_migration
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .pending_clears
+            .take();
+        // Unconfirmed, forwarding window open: forwarded, and so is a
+        // `U`/`u` for a key the joiner owns.
+        node_context
+            .active_migration
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .completed_at = Some(Instant::now());
+        assert!(matches!(
+            route_handoff_clear(&node_context, &scope),
+            ClearRoute::Forward(_)
+        ));
+        let target = unconfirmed_join_target_for(&node_context, &a_key)
+            .expect("a handoff relays to the unconfirmed joiner");
+        assert_eq!(target.addr, "127.0.0.1:9");
+        assert_eq!(target.token, "tok-joiner-0");
+        assert!(target.as_handoff);
+
+        // Confirmed: a client's clear still chains through (the joiner
+        // is a join target of this node), a forwarded one does not, nor
+        // does a `U`/`u`.
+        node_context
+            .active_migration
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .confirmed = true;
+        assert!(matches!(
+            route_clear(&node_context, &scope),
+            ClearRoute::Forward(_)
+        ));
+        assert!(matches!(
+            route_handoff_clear(&node_context, &scope),
+            ClearRoute::None
+        ));
+        assert!(unconfirmed_join_target_for(&node_context, &a_key).is_none());
+        assert_eq!(migration_targets_for(&node_context, &a_key).len(), 1);
+
+        // Unconfirmed again, but the window closed: nothing.
+        {
+            let mut slot = node_context.active_migration.lock().unwrap();
+            let active = slot.as_mut().unwrap();
+            active.confirmed = false;
+            active.forwarding_grace = Duration::ZERO;
+        }
+        assert!(matches!(
+            route_handoff_clear(&node_context, &scope),
+            ClearRoute::None
+        ));
+        assert!(unconfirmed_join_target_for(&node_context, &a_key).is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -13453,8 +13715,8 @@ mod tests {
                     // body now leads with `<token-len>` bytes of token
                     // too (`fields[3]`).
                     b'U' => (fields[0] + fields[1] + fields[2] + fields[3], b"S\n"),
-                    b'c' => (fields[0], b"C\n"),
-                    b'F' => (0, b"C\n"),
+                    // A forwarded clear: `f <ns-len> <token-len> [A]`.
+                    b'f' => (fields[0] + fields[1], b"C\n"),
                     other => panic!("unexpected frame {other}"),
                 };
                 let frame_end = header_end + 1 + body_length;
@@ -13578,7 +13840,11 @@ mod tests {
         .await;
 
         let frames = frames.lock().unwrap().clone();
-        assert_eq!(frames[0], b"c 5\nusers".to_vec(), "the clear goes first");
+        assert_eq!(
+            frames[0],
+            b"f 5 12\ntok-joiner-0users".to_vec(),
+            "the clear goes first, as a handoff carrying the joiner's token"
+        );
         assert_eq!(frames.len(), 1 + expected_keys);
         // Issue #266: `run_migration`'s own bulk transfer sends a `U`
         // (put-if-absent), not a lowercase `s`.
@@ -15388,8 +15654,9 @@ mod tests {
             frames[0]
         );
         assert_eq!(
-            frames[1], b"c 0\n",
-            "the clear follows on the same connection"
+            frames[1],
+            b"f 0 8\ntok-peer".to_vec(),
+            "the clear follows on the same connection, as a handoff"
         );
     }
 
@@ -15962,6 +16229,324 @@ mod tests {
             vec![expected_v1, expected_v2, expected_del],
             "the echo of v1 and the delete of an absent key are not relayed"
         );
+    }
+
+    /// A node with a join slot for `joiner-0` (confirmed or not, window
+    /// open), serving one connection; returns the frames the joiner saw.
+    async fn frames_relayed_to_the_slot_joiner(
+        confirmed: bool,
+        requests: &[(&str, &[u8])],
+    ) -> Vec<Vec<u8>> {
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        // Two members, R=2: the joiner is in every key's top-R.
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
+                joining_name: "joiner-0".to_string(),
+                joining_addr: peer_addr,
+                joining_token: "tok-joiner-0".to_string(),
+                after_ring,
+                replication: 2,
+                generation: None,
+                completed_at: Some(Instant::now()),
+                forwarding_grace: Duration::from_secs(60),
+                acked_entries: Some(0),
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: Vec::new(),
+                confirmed,
+                pre_completion_ring: None,
+                pending_clears: PendingClears::default(),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
+                lingering: Vec::new(),
+                remnant: false,
+            }))),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        for (frame, expected_reply) in requests {
+            client.write_all(frame.as_bytes()).await.unwrap();
+            let mut reply = vec![0_u8; expected_reply.len()];
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+                .await
+                .expect("a reply within 5 s")
+                .unwrap();
+            assert_eq!(&reply, expected_reply, "{frame:?}");
+            // Let whatever relay the frame caused reach the peer.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        client.shutdown().await.unwrap();
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+        peer_task.abort();
+
+        frames.lock().unwrap().clone()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_frames_are_relayed_only_to_a_joiner_discovery_has_not_confirmed() {
+        // A `U`/`u`/`f` arriving here was sent by a node working from a
+        // roster — a leaver draining, a survivor re-replicating, an old
+        // owner relaying for its own joiner. Once discovery confirmed
+        // this node's joiner it is in that roster and the sender reached
+        // it directly; relaying there again sent a leaver's drained `U v1`
+        // back to the leaver through its entrant, where it overwrote the
+        // v2 the leaver had taken meanwhile (and the clear equivalent
+        // ping-ponged until a window closed). A client's own `S`/`D`/`F`
+        // still goes to the confirmed joiner: it is this node's join
+        // target, and the client did not know it.
+        let unconfirmed = frames_relayed_to_the_slot_joiner(
+            false,
+            &[
+                ("U 0 5 2 13\ntk-ready-nodekey-av1", b"S\n"),
+                ("u 0 5 13\ntk-ready-nodekey-a", b"D\n"),
+                ("f 0 13 A\ntk-ready-node", b"C\n"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            unconfirmed,
+            vec![
+                b"U 0 5 2 12\ntok-joiner-0key-av1".to_vec(),
+                b"u 0 5 12\ntok-joiner-0key-a".to_vec(),
+                b"f 0 12 A\ntok-joiner-0".to_vec(),
+            ],
+            "an unconfirmed joiner gets every handoff frame relayed"
+        );
+
+        let confirmed = frames_relayed_to_the_slot_joiner(
+            true,
+            &[
+                ("U 0 5 2 13\ntk-ready-nodekey-av1", b"S\n"),
+                ("u 0 5 13\ntk-ready-nodekey-a", b"D\n"),
+                ("f 0 13 A\ntk-ready-node", b"C\n"),
+                ("S 5 2\nkey-av2", b"S\n"),
+                ("c 5\nusers", b"C\n"),
+                ("F\n", b"C\n"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            confirmed,
+            vec![
+                b"U 0 5 2 12\ntok-joiner-0key-av2".to_vec(),
+                b"f 5 12\ntok-joiner-0users".to_vec(),
+                b"f 0 12 A\ntok-joiner-0".to_vec(),
+            ],
+            "a confirmed joiner gets only the client's own writes and clears, as handoffs"
+        );
+    }
+
+    /// A node of a two-node test cluster: accepts on `listener`, serves
+    /// every connection with `node_context`, runs the forward tasks it
+    /// spawns. The tasks stop when dropped.
+    async fn serve_test_node(
+        listener: TcpListener,
+        node_context: NodeContext,
+        request_tx: mpsc::Sender<CacheRequest>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(64);
+        let relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                tokio::spawn(task);
+            }
+        });
+        let forward_queues = Arc::new(ForwardQueues::default());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let accept = tokio::spawn(async move {
+            let _keep_open = shutdown_tx;
+            loop {
+                let Ok((server, _)) = listener.accept().await else {
+                    return;
+                };
+                let config = ConnectionConfig {
+                    idle_timeout: IDLE_TIMEOUT,
+                    auth_secret: None,
+                    tls_acceptor: None,
+                    node_context: Some(node_context.clone()),
+                    migration_tx: mpsc::channel(1).0,
+                    forward_tx: forward_tx.clone(),
+                    forward_queues: Arc::clone(&forward_queues),
+                    in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+                };
+                tokio::spawn(handle_connection(
+                    ServerStream::Plain(server),
+                    test_client_addr(),
+                    request_tx.clone(),
+                    config,
+                    shutdown_rx.clone(),
+                ));
+            }
+        });
+        vec![relay, accept]
+    }
+
+    fn two_node_context(name: &str, request_tx: mpsc::Sender<CacheRequest>) -> NodeContext {
+        NodeContext {
+            name: name.to_string(),
+            token: format!("tk-{name}"),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_forwarded_clear_does_not_ping_pong_between_a_leaver_and_a_node_forwarding_to_it() {
+        // S handed its keys to joiner L (confirmed, forwarding window
+        // open); L is now decommissioning with S as its survivor. A
+        // client's `F` at S went to L, L mirrored it back to S as a
+        // client clear, S forwarded it to L again, … and every write
+        // either of them took meanwhile was wiped on each pass until a
+        // window closed. A forwarded clear (`f`) is not a client's: L
+        // applies it and does not mirror it, so the client's next write
+        // to S stays.
+        let s_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let l_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s_addr = s_listener.local_addr().unwrap().to_string();
+        let l_addr = l_listener.local_addr().unwrap().to_string();
+
+        let (s_tx, s_rx) = mpsc::channel(64);
+        let (l_tx, l_rx) = mpsc::channel(64);
+        let s_cache = tokio::spawn(run_cache(s_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let l_cache = tokio::spawn(run_cache(l_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let s_ctx = two_node_context("s", s_tx.clone());
+        let l_ctx = two_node_context("l", l_tx.clone());
+        *s_ctx.active_migration.lock().unwrap() = Some(ActiveMigration {
+            joining_name: "l".to_string(),
+            joining_addr: l_addr.clone(),
+            joining_token: "tk-l".to_string(),
+            after_ring: Arc::new(HashRing::new(vec!["s".to_string(), "l".to_string()])),
+            replication: 1,
+            generation: None,
+            completed_at: Some(Instant::now()),
+            forwarding_grace: Duration::from_secs(60),
+            acked_entries: Some(0),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            marked_keys: Vec::new(),
+            confirmed: true,
+            pre_completion_ring: None,
+            pending_clears: PendingClears::default(),
+            forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
+            lingering: Vec::new(),
+            remnant: false,
+        });
+        let mut addresses = HashMap::new();
+        addresses.insert("s".to_string(), s_addr.clone());
+        addresses.insert("l".to_string(), l_addr.clone());
+        let mut tokens = HashMap::new();
+        tokens.insert("s".to_string(), "tk-s".to_string());
+        *l_ctx.leaving.lock().unwrap() = Some(LeaveState {
+            before_ring: Arc::new(HashRing::new(vec!["s".to_string(), "l".to_string()])),
+            after_ring: Arc::new(HashRing::new(vec!["s".to_string()])),
+            replication: 1,
+            addresses,
+            tokens,
+            connections: Mutex::new(HashMap::new()),
+        });
+
+        let s_tasks = serve_test_node(s_listener, s_ctx, s_tx.clone()).await;
+        let l_tasks = serve_test_node(l_listener, l_ctx, l_tx.clone()).await;
+
+        let mut client = TcpStream::connect(&s_addr).await.unwrap();
+        client.write_all(b"F\n").await.unwrap();
+        let mut ack = [0u8; 2];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"C\n");
+
+        client.write_all(b"S 1 1\nkv").await.unwrap();
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"S\n");
+        let mut absent = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.write_all(b"G 1\nk").await.unwrap();
+            let mut first = [0u8; 2];
+            client.read_exact(&mut first).await.unwrap();
+            if &first == b"N\n" {
+                absent += 1;
+            } else {
+                let mut rest = [0u8; 3];
+                client.read_exact(&mut rest).await.unwrap();
+            }
+        }
+        assert_eq!(
+            absent, 0,
+            "the write after the clear was wiped by the clear circling"
+        );
+
+        for task in s_tasks.into_iter().chain(l_tasks) {
+            task.abort();
+        }
+        drop((s_tx, l_tx));
+        s_cache.abort();
+        l_cache.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -17476,11 +18061,9 @@ mod tests {
                             (fields[0] + fields[1] + fields[2] + fields[3], b"S\n")
                         } else if header.starts_with("u ") {
                             (fields[0] + fields[1] + fields[2], b"D\n")
-                        } else if header.starts_with("c ") {
-                            // A forwarded namespace clear: `c <ns-len>`.
-                            (fields[0], b"C\n")
-                        } else if header == "F" {
-                            (0, b"C\n")
+                        } else if header.starts_with("f ") {
+                            // A forwarded clear: `f <ns-len> <token-len> [A]`.
+                            (fields[0] + fields[1], b"C\n")
                         } else {
                             panic!("unexpected frame {header:?}");
                         };

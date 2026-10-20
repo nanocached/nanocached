@@ -14,6 +14,21 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node` no longer sends a clear or a handed-off write around
+  in circles between two nodes. A clear forwarded to another node was
+  byte-identical to a client's, so a node decommissioning while its
+  join source still forwarded to it mirrored the clear back, the source
+  forwarded it on again, and every write either took in between was
+  wiped until a window closed; and a handoff (`U`/`u`) applied here was
+  relayed to every join target, including a confirmed one its sender
+  had already reached, so a leaver's drained value came back to it
+  through its entrant and overwrote the newer value it held. Forwarded
+  clears now travel as their own frame (`f`, carrying the receiver's
+  membership token), and a node relays a frame that arrived as a
+  handoff only to a joiner discovery has not confirmed yet. During a
+  rolling upgrade, a node still on an earlier version answers `f` with
+  an error, so a clear forwarded to it while the versions are mixed is
+  not applied there.
 - `nanocached-node` forwards a clear it receives while decommissioning to
   every surviving node, behind the writes it has already queued for
   them. The clear used to go only to a join's targets, so a write this

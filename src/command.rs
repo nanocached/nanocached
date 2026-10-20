@@ -196,6 +196,22 @@ pub enum Command {
     /// `F [tag]\n` (issue #106): the whole-store flush — every
     /// namespace, the default one included.
     ClearAll,
+    /// `f <namespace-length> <token-length> [A] [tag]\n<token><namespace>`:
+    /// a clear forwarded by another node (a join's old owner replaying a
+    /// client's clear to the joiner, a decommissioning node mirroring it
+    /// to its entrants). Carries the receiving node's membership token
+    /// like `U`/`u`, drops the namespace (or, with the trailing `A`,
+    /// every namespace), and is acknowledged `C`. Distinct from `c`/`F`
+    /// so the receiver can tell a forwarded clear from a client's own: a
+    /// forwarded clear is applied and relayed only to a join still
+    /// unconfirmed, never through a decommission's window, which is
+    /// what let two nodes forward one clear to each other until a
+    /// window closed.
+    HandoffClear {
+        all: bool,
+        namespace: Bytes,
+        token: String,
+    },
     /// Every cache command addresses a `Key` — namespace plus name (issue
     /// #105). The legacy `G`/`S`/`D` frames address the default (empty)
     /// namespace; their lowercase `g`/`s`/`d` counterparts carry an
@@ -525,6 +541,17 @@ impl Command {
 
             Self::Clear { namespace } => Response::Cleared(cache.clear(&namespace)),
             Self::ClearAll => Response::Cleared(cache.clear_all()),
+            Self::HandoffClear {
+                all,
+                namespace,
+                // Verified by the connection handler before this ever
+                // reaches `execute`, as for `HandoffDelete`.
+                token: _,
+            } => Response::Cleared(if all {
+                cache.clear_all()
+            } else {
+                cache.clear(&namespace)
+            }),
 
             Self::ListEntries => Response::Keys(cache.keys()),
 
@@ -1130,6 +1157,57 @@ fn parse_with_mode(
             input.advance(header_end + 1);
 
             Ok((Command::ClearAll, tag))
+        }
+
+        b"f" => {
+            let namespace_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            let max_trailing = 2;
+            let mut trailing: Vec<&[u8]> = Vec::with_capacity(max_trailing);
+            for part in parts.by_ref() {
+                trailing.push(part);
+                if trailing.len() > max_trailing {
+                    return Err(ParseError::InvalidLength);
+                }
+            }
+            let tag = if tagged {
+                Some(parse_tag(trailing.pop().ok_or(ParseError::InvalidLength)?)?)
+            } else {
+                None
+            };
+            let all = trailing.last().copied() == Some(b"A".as_slice());
+            if all {
+                trailing.pop();
+            }
+            if !trailing.is_empty() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let namespace_length = parse_length(namespace_length)?;
+            let token_length = parse_length(token_length)?;
+            if token_length == 0 {
+                return Err(ParseError::EmptyField);
+            }
+            if all && namespace_length != 0 {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let token_start = header_end + 1;
+            let [namespace_start, namespace_end] =
+                field_ends(token_start, [token_length, namespace_length])?;
+            let frame = take_frame(input, namespace_end)?;
+            let token = decode_field(&frame, token_start, token_length)?;
+            let namespace = frame.slice(namespace_start..namespace_end);
+
+            Ok((
+                Command::HandoffClear {
+                    all,
+                    namespace,
+                    token,
+                },
+                tag,
+            ))
         }
 
         b"S" | b"s" => {
@@ -2253,6 +2331,68 @@ mod tests {
             "an unconditional handoff is newer than the delete"
         );
         assert_eq!(cache.get(&k), Some(Bytes::from_static(b"new")));
+    }
+
+    #[test]
+    fn a_handoff_clear_parses_with_its_token_and_scope_and_clears_like_a_client_clear() {
+        let mut input = BytesMut::from(&b"f 5 3\ntokusers"[..]);
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::HandoffClear {
+                all: false,
+                namespace: Bytes::from_static(b"users"),
+                token: "tok".to_string(),
+            })
+        );
+        let mut input = BytesMut::from(&b"f 0 3 A 7\ntok"[..]);
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::HandoffClear {
+                    all: true,
+                    namespace: Bytes::new(),
+                    token: "tok".to_string(),
+                },
+                Some(7)
+            ))
+        );
+        // `A` with a namespace, an empty token, and a stray field are
+        // malformed.
+        for frame in [
+            &b"f 5 3 A\ntokusers"[..],
+            &b"f 5 0\nusers"[..],
+            &b"f 5 3 x y\ntokusers"[..],
+        ] {
+            let mut input = BytesMut::from(frame);
+            assert!(parse(&mut input).is_err(), "{frame:?}");
+        }
+
+        let mut cache = Cache::new(usize::MAX);
+        cache.set(key(b"k"), Bytes::from_static(b"v"));
+        cache.set(
+            Key::new(Bytes::from_static(b"users"), Bytes::from_static(b"u")),
+            Bytes::from_static(b"v"),
+        );
+        assert_eq!(
+            Command::HandoffClear {
+                all: false,
+                namespace: Bytes::from_static(b"users"),
+                token: "tok".to_string(),
+            }
+            .execute(&mut cache),
+            Response::Cleared(1)
+        );
+        assert_eq!(cache.get(&key(b"k")), Some(Bytes::from_static(b"v")));
+        assert_eq!(
+            Command::HandoffClear {
+                all: true,
+                namespace: Bytes::new(),
+                token: "tok".to_string(),
+            }
+            .execute(&mut cache),
+            Response::Cleared(1)
+        );
+        assert_eq!(cache.get(&key(b"k")), None);
     }
 
     #[test]
