@@ -250,6 +250,15 @@ const REQUEST_BUFFER_SHRINK_THRESHOLD: usize = 64 * 1024;
 /// would hold more distinct namespaces than this, it degrades to a single
 /// clear-all instead — see `PendingClears`.
 const MAX_PENDING_CLEAR_NAMESPACES: usize = 1024;
+/// The same degradation once the queued namespaces' *bytes* exceed this.
+/// A queued namespace is a slice of the client's `c` frame, up to the
+/// request-size limit, so the count cap alone bounded the queue at
+/// 1,024 × ~1 MiB: one connection clearing distinct 1 MB namespaces
+/// during a stalled handoff grew the node by a gigabyte, which the
+/// deployment guides' 1 GiB task does not survive. Sixteen request-sized
+/// frames is far more than any real set of namespaces cleared during
+/// one handoff and small against any task size.
+const MAX_PENDING_CLEAR_BYTES: usize = 16 * MAX_REQUEST_SIZE;
 
 fn request_is_too_large(size: usize) -> bool {
     size > MAX_REQUEST_SIZE
@@ -4301,16 +4310,20 @@ impl RingHistory {
 ///   discards every queued namespace and any further namespace push is a
 ///   no-op.
 /// - Duplicate `ClearScope::Namespace` scopes collapse to one.
-/// - Past `MAX_PENDING_CLEAR_NAMESPACES` distinct namespaces, the queue
-///   degrades to a single clear-all. This clears more than the client
-///   asked for on the joining node, but that's a harmless miss there —
-///   never a resurrection or a stale read — so it's a safe way to bound
-///   both memory and the replay's round-trip count regardless of how many
-///   distinct namespaces a client clears during one handoff.
+/// - Past `MAX_PENDING_CLEAR_NAMESPACES` distinct namespaces, or past
+///   `MAX_PENDING_CLEAR_BYTES` of their names, the queue degrades to a
+///   single clear-all. This clears more than the client asked for on the
+///   joining node, but that's a harmless miss there — never a
+///   resurrection or a stale read — so it's a safe way to bound both
+///   memory and the replay's round-trip count regardless of how many, or
+///   how large, the distinct namespaces a client clears during one
+///   handoff are.
 #[derive(Default)]
 struct PendingClears {
     all: bool,
     namespaces: HashSet<Bytes>,
+    /// The queued names' bytes, what `MAX_PENDING_CLEAR_BYTES` bounds.
+    bytes: usize,
 }
 
 impl PendingClears {
@@ -4320,18 +4333,25 @@ impl PendingClears {
             return;
         }
         match scope {
-            ClearScope::All => {
-                self.all = true;
-                self.namespaces.clear();
-            }
+            ClearScope::All => self.collapse_to_all(),
             ClearScope::Namespace(namespace) => {
-                self.namespaces.insert(namespace);
-                if self.namespaces.len() > MAX_PENDING_CLEAR_NAMESPACES {
-                    self.all = true;
-                    self.namespaces.clear();
+                let length = namespace.len();
+                if self.namespaces.insert(namespace) {
+                    self.bytes += length;
+                }
+                if self.namespaces.len() > MAX_PENDING_CLEAR_NAMESPACES
+                    || self.bytes > MAX_PENDING_CLEAR_BYTES
+                {
+                    self.collapse_to_all();
                 }
             }
         }
+    }
+
+    fn collapse_to_all(&mut self) {
+        self.all = true;
+        self.namespaces.clear();
+        self.bytes = 0;
     }
 
     #[cfg(test)]
@@ -4342,6 +4362,7 @@ impl PendingClears {
     /// Takes every queued clear, leaving this empty — the collapsed
     /// counterpart of `std::mem::take` on the old `Vec<ClearScope>`.
     fn take(&mut self) -> Vec<ClearScope> {
+        self.bytes = 0;
         if self.all {
             self.all = false;
             self.namespaces.clear();
@@ -11434,6 +11455,43 @@ mod tests {
         assert!(pending.all);
         assert!(pending.namespaces.is_empty());
         assert_eq!(pending.take(), vec![ClearScope::All]);
+    }
+
+    #[test]
+    fn pending_clears_degrades_to_all_past_the_byte_cap() {
+        // Each queued namespace pins its slice of the client's `c` frame,
+        // so sixteen request-sized names are the most the queue holds:
+        // the seventeenth collapses it to one clear-all, and the pinned
+        // frames are released with it.
+        let mut pending = PendingClears::default();
+        let per_name = MAX_PENDING_CLEAR_BYTES / 16;
+        for index in 0..16u8 {
+            let mut name = vec![b'n'; per_name];
+            name[0] = index;
+            pending.push(ClearScope::Namespace(Bytes::from(name)));
+        }
+        assert!(!pending.all);
+        assert_eq!(pending.namespaces.len(), 16);
+        assert_eq!(pending.bytes, MAX_PENDING_CLEAR_BYTES);
+
+        // A repeat of a queued name costs nothing more.
+        let mut repeat = vec![b'n'; per_name];
+        repeat[0] = 3;
+        pending.push(ClearScope::Namespace(Bytes::from(repeat)));
+        assert_eq!(pending.bytes, MAX_PENDING_CLEAR_BYTES);
+        assert!(!pending.all);
+
+        pending.push(ClearScope::Namespace(Bytes::from_static(b"one more byte")));
+        assert!(pending.all);
+        assert!(pending.namespaces.is_empty());
+        assert_eq!(pending.bytes, 0);
+        assert_eq!(pending.take(), vec![ClearScope::All]);
+
+        // `take` leaves the accounting at zero for the next handoff.
+        pending.push(ClearScope::Namespace(Bytes::from_static(b"orders")));
+        assert_eq!(pending.bytes, 6);
+        pending.take();
+        assert_eq!(pending.bytes, 0);
     }
 
     #[test]
