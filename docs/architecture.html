@@ -189,7 +189,11 @@ are orchestrated by discovery in stages:</p>
   <li>The joining node registers; discovery tells the existing nodes to
   migrate the keys the newcomer now owns.</li>
   <li>While migration runs, existing nodes keep serving those keys and
-  forward concurrent writes to the joiner, so no update is dropped. The
+  forward concurrent writes to the joiner, so no update is dropped. What
+  is queued for one joiner is bounded at 64&nbsp;MiB; once a joiner
+  that has stopped answering has that much waiting, a client write for
+  it is held before its ack until the queue drains, so the backlog
+  waits in the clients, not in the node's memory. The
   forward is unconditional and may lag, so during the forwarding window
   a key rewritten or invalidated within a few seconds of a previous
   write via an old owner can keep the previous value until the next
