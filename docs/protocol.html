@@ -43,7 +43,9 @@ covers.</p>
 <p>Multiple requests per connection and pipelining are both supported. A
 <code>&lt;key-length&gt;</code> of <code>0</code> is rejected for every
 command; there is no dedicated key or value length limit beyond the
-overall request-size limit (1 MiB per request on a node).</p>
+overall request-size limit (1 MiB per request on a node). A request over
+it, like one the server cannot parse, is answered <code>En\n</code> and
+the connection closed.</p>
 
 <h2 id="a">A — authenticate</h2>
 <pre><code>A &lt;secret-length&gt;\n&lt;secret&gt;</code></pre>
@@ -117,7 +119,7 @@ is</p>
 </ul>
 <p>Every SDK and the server pin the same test vectors for both forms.
 Namespaced frames need a server that understands them; a pre-namespace
-node answers <code>E\n</code> and closes the connection, so upgrade
+node answers <code>En\n</code> and closes the connection, so upgrade
 every node before clients start using namespaces.</p>
 
 <h2 id="clear">c / F — clear a namespace, flush everything</h2>
@@ -419,9 +421,10 @@ window is the same one the pre-tags protocol always had.</p>
     <tr><td><code>E\n</code></td><td>Error — <code>En\n</code> from a
     node, <code>Ed\n</code> from a discovery server: a failed
     <code>A</code>, a command sent before authentication (a discovery
-    server closes such a connection with no reply instead), or the
-    request was malformed. Usually followed by the server closing the
-    connection.</td></tr>
+    server closes such a connection with no reply instead), the
+    request was malformed (an unknown command, a bad length or TTL, an
+    empty key), or it was over the request-size limit. Usually followed
+    by the server closing the connection.</td></tr>
   </tbody>
 </table>
 </div>

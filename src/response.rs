@@ -63,6 +63,14 @@ pub enum Response {
     Busy,
     AuthOk,
     Unauthorized,
+    /// A request this node will not run: one `parse` rejected (an
+    /// unknown command, a malformed length or TTL, an empty key) or one
+    /// over the request-size limit. The same `En\n` bytes as
+    /// `Unauthorized` — `docs/protocol.html` lists one `E` status for
+    /// all of them — and always followed by the server closing the
+    /// connection; a separate variant only so the two reasons read
+    /// apart at the call sites.
+    Malformed,
     /// Staged node join: acknowledges an `M` (migrate) request was received and
     /// parsed — not that the handoff it kicks off has finished. That
     /// completion is reported separately, node-to-discovery, via `C`.
@@ -223,6 +231,7 @@ impl Response {
             Self::Busy => b"B\n".to_vec(),
             Self::AuthOk => b"On\n".to_vec(),
             Self::Unauthorized => b"En\n".to_vec(),
+            Self::Malformed => b"En\n".to_vec(),
             Self::MigrationAccepted(entries) => format!("A {entries}\n").into_bytes(),
             Self::MigrationRejected => b"R\n".to_vec(),
             Self::MigrationCancelled => b"A\n".to_vec(),
@@ -385,6 +394,7 @@ mod tests {
     #[test]
     fn encodes_unauthorized_response() {
         assert_eq!(Response::Unauthorized.encode(), b"En\n");
+        assert_eq!(Response::Malformed.encode(), b"En\n");
     }
 
     #[test]

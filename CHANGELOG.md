@@ -34,6 +34,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node` answers `En\n` before closing the connection on a
+  request it cannot parse (an unknown command, a malformed length or TTL,
+  an empty key) or one over the request-size limit. It used to close
+  with no reply, while `docs/protocol.html` promised an `E` and the proxy
+  sent one, so a hand-written client could not tell a rejected request
+  from a dropped connection; for an over-size request the node now also
+  waits briefly for the client to close first, so the reply is not lost
+  to a reset (#654, #733).
 - Text a user sees no longer carries issue numbers or references to
   documentation sections that do not exist: the `/metrics` HELP lines
   for `connections_max`, `incrs_total`, `cas_sets_total`,
