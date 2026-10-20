@@ -11,6 +11,13 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ### Fixed
 
+- `set_many` in cluster mode raises `PartialSetConnectionLostError`
+  (with the keys whose primary did store them in `partial_keys`, and the
+  connection failure as `__cause__`) when a key's primary could not be
+  reached at all on both passes, instead of `WrongNodeError`, which is
+  now reserved for a primary that actually answered `W`. A caller that
+  reacted to `WrongNodeError` by refreshing and retrying did so for a
+  dead node, and the message claimed the node had answered (#722).
 - A write whose bytes the node has not taken (a node that stopped
   reading) no longer outlives the 30 s request deadline, and `close()`
   no longer leaves such callers pending with their socket open: the

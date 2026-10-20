@@ -237,7 +237,10 @@ some keys' every owner was unreachable, they raise
 resolve, `__cause__` the last connection error), or the bare connection
 error when nothing resolved — a connection loss is never reported as a
 wrong-node answer. `set_many` raises a plain `WrongNodeError` while
-every other key in the batch was still stored. In single-node/proxy mode a `W` propagates
+every other key in the batch was still stored; a key whose primary
+could not be reached at all (no `W` was ever received) raises
+`PartialSetConnectionLostError` instead, `.partial_keys` the keys whose
+primary did store them. In single-node/proxy mode a `W` propagates
 immediately, exactly like `get`/`set`'s own single-mode behavior — there
 is no ring to refresh against.
 

@@ -77,6 +77,26 @@ from ._identify import (
 _SWALLOWABLE_ERRORS = (NanocachedError, ConnectionError, OSError)
 
 
+class _MultiSetTracker:
+    """What one set_many call learns across its two _multi_set_pass
+    passes. ``acknowledged`` records, per key index, every owner (by
+    name) that answered `S` for it, so the retry pass sends a key only
+    to the owners that have not acknowledged it yet. ``primary_unreachable``
+    holds the indices whose primary leg's latest outcome was a
+    connection failure rather than a `W`; ``primary_acknowledged`` the
+    indices whose primary stored them; ``last_cause`` the most recent
+    leg-level connection failure. Single-threaded (asyncio), so no
+    locking."""
+
+    __slots__ = ("acknowledged", "primary_unreachable", "primary_acknowledged", "last_cause")
+
+    def __init__(self) -> None:
+        self.acknowledged: dict[int, set[str]] = {}
+        self.primary_unreachable: set[int] = set()
+        self.primary_acknowledged: set[int] = set()
+        self.last_cause: BaseException | None = None
+
+
 @dataclass(frozen=True)
 class ClientStats:
     """Snapshot of counters for failures this client swallows by design
@@ -1576,7 +1596,12 @@ class NanocachedClient:
         confirmed stored. Its ``partial_keys`` holds those keys, and its
         ``__cause__`` is the original connection error. A failure on the
         very first sub-frame has nothing yet to attach, so it still
-        raises that original exception unwrapped."""
+        raises that original exception unwrapped. In cluster mode the
+        same exception reports a key whose primary could not be reached
+        at the connection level on both passes (no `W` was ever
+        received): ``partial_keys`` holds the keys whose primary did
+        store them, and WrongNodeError is reserved for a primary that
+        actually answered `W`."""
         await self._set_many(b"", values, ttl_seconds=ttl_seconds)
 
     async def _set_many(
@@ -1648,18 +1673,38 @@ class NanocachedClient:
         # traffic, and a chance to re-apply an older value over a newer
         # concurrent write. get_many keeps its completed chunks the same
         # way.
-        acknowledged: dict[int, set[str]] = {}
+        tracker = _MultiSetTracker()
         retry = await self._multi_set_pass(
-            namespace, key_bytes_list, value_bytes_list, ttl_seconds, None, acknowledged
+            namespace, key_bytes_list, value_bytes_list, ttl_seconds, None, tracker
         )
         if not retry:
             return
         await self._maybe_refresh(force=True)
         retry = await self._multi_set_pass(
-            namespace, key_bytes_list, value_bytes_list, ttl_seconds, retry, acknowledged
+            namespace, key_bytes_list, value_bytes_list, ttl_seconds, retry, tracker
         )
-        if retry:
+        if not retry:
+            return
+        # A key is still unresolved after the retry pass. Only a real `W`
+        # from its primary is a wrong-node outcome; a primary that could
+        # not be reached at the connection level on both passes (the
+        # leg's connection closed or timed out, no `W` ever received) is
+        # a connection failure and is reported as one, with the keys
+        # whose primary did acknowledge attached — a caller that reacts
+        # to WrongNodeError by refreshing and retrying must not do that
+        # for a dead node, and one that logs the message must not be
+        # told the node answered.
+        if any(idx not in tracker.primary_unreachable for idx in retry):
             raise WrongNodeError()
+        cause = tracker.last_cause
+        if cause is None:
+            cause = ConnectionError("nanocached: no owner is reachable for these keys")
+        stored = {originals[idx] for idx in tracker.primary_acknowledged}
+        raise PartialSetConnectionLostError(
+            stored,
+            f"nanocached: set_many could not reach the primary of {len(retry)} of "
+            f"{len(key_bytes_list)} keys: {cause}",
+        ) from cause
 
     async def _multi_set_chunked(
         self,
@@ -1705,7 +1750,7 @@ class NanocachedClient:
         value_bytes_list: list[bytes],
         ttl_seconds: int,
         retry_indices: list[int] | None,
-        acknowledged: dict[int, set[str]],
+        tracker: "_MultiSetTracker",
     ) -> list[int]:
         """Runs one pass of set_many's cluster routing: for every key
         still needing resolution (every key, when retry_indices is None,
@@ -1723,12 +1768,16 @@ class NanocachedClient:
         fire_and_forget_replicas, exactly like a single-key replica
         write.
 
-        ``acknowledged`` (key index -> owner names that stored it) is
-        read and extended here: an owner that already acknowledged a key
-        in an earlier pass is not sent it again, so a retry carries only
-        the legs that failed. A key every current owner of which has
-        already acknowledged needs nothing more and is not retried."""
+        ``tracker.acknowledged`` (key index -> owner names that stored
+        it) is read and extended here: an owner that already acknowledged
+        a key in an earlier pass is not sent it again, so a retry carries
+        only the legs that failed. A key every current owner of which has
+        already acknowledged needs nothing more and is not retried. The
+        tracker also learns whether an unresolved primary answered `W` or
+        could not be reached at all, which decides what _set_many raises
+        once the retry pass is exhausted."""
         indices = retry_indices if retry_indices is not None else list(range(len(key_bytes_list)))
+        acknowledged = tracker.acknowledged
 
         owners: dict[str, tuple[list[int], list[bool]]] = {}
         retry: list[int] = []
@@ -1761,21 +1810,31 @@ class NanocachedClient:
             # SDKs' leg-runners). `error` itself carries no further
             # per-key information beyond what `entries` already exposes,
             # so it's intentionally not consulted below.
-            entries, _error, _failed_at = await self._multi_set_chunked(
+            entries, error, _failed_at = await self._multi_set_chunked(
                 lambda: self._member_connection(name), namespace, group_keys, group_values, ttl_seconds
             )
+            if error is not None:
+                tracker.last_cause = error
             leg_retry: list[int] = []
             for idx, primary, entry in zip(leg_indices, is_primary, entries):
                 if entry is True:
                     acknowledged.setdefault(idx, set()).add(name)
+                    if primary:
+                        tracker.primary_acknowledged.add(idx)
                     continue
                 # WRONG_NODE (a real per-key answer) or the untouched
                 # False default (this key's sub-chunk was never reached
-                # because an earlier one in this same leg failed) — both
-                # need the same "not actually stored" handling.
+                # because an earlier one in this same leg failed, or the
+                # leg's connection failed outright) — both need the same
+                # "not actually stored" handling; the tracker remembers
+                # which it was for the primary.
                 if not primary:
                     self._replica_write_failures += 1
                 else:
+                    if entry is WRONG_NODE:
+                        tracker.primary_unreachable.discard(idx)
+                    else:
+                        tracker.primary_unreachable.add(idx)
                     leg_retry.append(idx)
             return leg_retry
 
