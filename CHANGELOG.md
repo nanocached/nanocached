@@ -25,7 +25,9 @@ framework adapters at one version, whether or not a component changed.
   through its entrant and overwrote the newer value it held. Forwarded
   clears now travel as their own frame (`f`, carrying the receiver's
   membership token), and a node relays a frame that arrived as a
-  handoff only to a joiner discovery has not confirmed yet. During a
+  handoff only to a joiner discovery has not confirmed yet (a handoff
+  that changed something on a decommissioning node still goes on to
+  its entrant, as before). During a
   rolling upgrade, a node still on an earlier version answers `f` with
   an error, so a clear forwarded to it while the versions are mixed is
   not applied there.
