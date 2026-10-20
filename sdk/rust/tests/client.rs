@@ -6518,6 +6518,14 @@ async fn connect_reports_a_node_at_its_connection_limit_as_busy_on_the_first_dia
             };
             accepted_dials.fetch_add(1, Ordering::SeqCst);
             let _ = socket.write_all(b"B\n").await;
+            // Wait (bounded) for the client to hang up before closing: a close
+            // with the client's identify frame still unread is a reset on
+            // Linux, and a reset discards the B it is queued behind.
+            let mut sink = [0u8; 256];
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                while matches!(socket.read(&mut sink).await, Ok(n) if n > 0) {}
+            })
+            .await;
             drop(socket);
         }
     });
