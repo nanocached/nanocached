@@ -188,7 +188,14 @@ by replaying <code>i</code> itself. Re-running the increment on a
 replica could drift it from the primary (an eviction, or a replica leg
 that missed an earlier write, leaves it starting from a different base),
 so every replica always ends up with the exact bytes the primary
-computed.</p>
+computed. One exposure remains: for about a minute after a node joins,
+an old owner forwards every write it receives to the joiner, the
+replicated result of an increment included, and that unconditional
+forward can land after a later increment and rewind the counter &mdash;
+a counter incremented concurrently by several callers during that
+window can lose a few increments (serial increments are practically
+exact). See <a href="architecture.html#accepted-behaviour">accepted
+behaviour</a>.</p>
 
 <h2 id="cas">k / x — compare-and-set</h2>
 <pre><code>k &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; &lt;cond&gt; [&lt;ttl-seconds&gt;]\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;</code></pre>

@@ -245,7 +245,13 @@ existed, err := client.Delete("greeting")</code></pre>
   counts that must survive. In a cluster only the primary owner runs the
   increment; the SDK writes the <em>result</em> to the remaining owners
   as an ordinary <code>set</code>, never by replaying the increment
-  itself (replaying it could drift a replica from the primary). Incompatible
+  itself (replaying it could drift a replica from the primary). For
+  about a minute after a node joins, a counter incremented concurrently
+  by several callers can lose a few increments (a replicated result
+  forwarded back to the primary lands after a later increment); serial
+  increments are practically exact, and the proxy does not change this
+  &mdash; see <a href="architecture.html#accepted-behaviour">accepted
+  behaviour</a>. Incompatible
   with value compression: the SDKs reject <code>incr</code>/<code>decr</code>
   outright on a client with <code>compress</code> enabled, since the protocol
   has no way to tell a compressed value from a plain integer. See
