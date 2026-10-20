@@ -3946,6 +3946,36 @@ class NanocachedClientTest {
         }
     }
 
+    // A node over --max-connections answers a bare `B\n` and closes: two
+    // bytes, not the three-byte identity. Seen for what it is on the
+    // first probe — not retried with the lesser `A` forms the way a
+    // close-before-reply door-slam is.
+    @Test
+    void connectReportsANodeAtItsConnectionLimitAsBusyOnTheFirstDial() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger dials = new java.util.concurrent.atomic.AtomicInteger();
+        try (java.net.ServerSocket server = new java.net.ServerSocket(0)) {
+            Thread accepting = new Thread(() -> {
+                while (true) {
+                    try (java.net.Socket accepted = server.accept()) {
+                        dials.incrementAndGet();
+                        accepted.getOutputStream().write("B\n".getBytes(StandardCharsets.US_ASCII));
+                        accepted.getOutputStream().flush();
+                    } catch (java.io.IOException closed) {
+                        return;
+                    }
+                }
+            }, "busy-node");
+            accepting.setDaemon(true);
+            accepting.start();
+
+            NanocachedException.ConnectionFailed error = assertThrows(
+                    NanocachedException.ConnectionFailed.class,
+                    () -> connect("127.0.0.1", server.getLocalPort()));
+            assertTrue(error.getMessage().contains("connection limit"), error.getMessage());
+            assertEquals(1, dials.get(), "a busy reply is not a legacy door-slam to retry");
+        }
+    }
+
     // ── INCR エンコード/デコード (issue #129) ────────────────────────
     // Exercised directly against Connection (bypassing NanocachedClient)
     // so the exact wire bytes and every response shape (with/without ttl,
