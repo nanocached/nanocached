@@ -14,10 +14,11 @@ nanocached cluster.
   namespace's `CLEAR`: an O(1) sub-map drop on every node,
   never the whole-cluster flush.
 - **`get`/`set`/`del`/`mget`/`mset`/`mdel`** map to the SDK's namespaced
-  operations, with all of its routing, replication, hedged reads and
-  retries. `mget`/`mset` use the SDK's batched `getMany`/`setMany`:
-  one wire round trip per involved node. `mdel` remains a
-  `Promise.all` loop — the wire has no multi-key delete.
+  operations, with all of its routing, replication and retries (hedged
+  reads and read repair apply to single-key `get` only, not to batches).
+  `mget`/`mset` use the SDK's batched `getMany`/`setMany`: one wire
+  round trip per involved node. `mdel` remains a `Promise.all` loop —
+  the wire has no multi-key delete.
 - **Values are JSON-serialized** (`JSON.stringify`/`JSON.parse`), the
   convention `cache-manager`'s own stores use (its Redis store does the
   same).
@@ -111,11 +112,18 @@ client directly, for anything this store doesn't itself surface —
   `cache.set(key, value, 1)` (1ms) and `cache.set(key, value, 999)`
   (999ms) both land on the wire as a 1-second TTL — nanocached has no
   finer granularity.
-- **`undefined`** is "missing": `get` resolves `undefined` on a miss;
-  storing `undefined` (`cache.store.set(key, undefined)`) is a no-op,
-  matching the Redis store's own convention, since `undefined` already
-  means exactly that. **`null`** is a real, distinct value and round-trips
-  normally (`JSON.stringify(null)` is `"null"`, not `undefined`).
+- **`undefined`** is "missing": `get` resolves `undefined` on a miss, and
+  storing it (`cache.set(key, undefined)`, or an `mset` entry holding it)
+  throws `NoCacheableError` without writing anything — the same rule
+  `cache-manager`'s own memory store and `cache-manager-redis-yet` apply.
+  The config's `isCacheable` predicate replaces that default: `set` and
+  `mset` throw `NoCacheableError` for any value it rejects, and `mset`
+  checks the whole batch before writing any of it. `wrap()` catches the
+  rejection itself and emits it on the cache's `error` event, so a
+  wrapped function that returns `undefined` still returns `undefined`
+  to its caller; nothing is cached and the event fires. **`null`** is a
+  real, distinct value and round-trips normally (`JSON.stringify(null)`
+  is `"null"`, not `undefined`).
 - **`reset()`** clears this store's namespace only (`CLEAR`)
   — never `NanocachedClient.clearAll()`'s whole-cluster flush. Two stores
   on different namespaces are fully isolated from each other's `reset()`.
@@ -141,16 +149,44 @@ client directly, for anything this store doesn't itself surface —
 - **`mget`/`mset`** ride the wire's batched multi-get/multi-set — one round
   trip per involved node; **`mdel`** is a concurrent
   `Promise.all` loop over `del`. `mget` preserves key order in its result
-  (including `undefined` holes for misses); `mset` applies one `ttl` to
+  (including `undefined` holes for misses — and a hole for a key the
+  node could not fit: the values in one batch reply total at most
+  16 MiB, and a hit past that budget is answered as a miss, so an `mget`
+  of many large keys can come back with fewer values than exist; `get`
+  such a key on its own rather than taking it for evicted); `mset`
+  applies one `ttl` to
   every entry, same as `cache-manager`'s own multi-store fallback for a
   store lacking a native `mset`.
+
+## When the node is unreachable
+
+Every operation fails fast rather than hanging: the SDK bounds each
+connect and each request by its timeouts, and a node that is down makes
+`get`/`set`/`del`/`mget`/`mset`/`mdel`/`reset` reject with the SDK's
+`ConnectionLostError` (a connection error from the operating system when
+no connection could be opened at all). Called directly, that rejection
+is the caller's to handle. `wrap()` fails open: `cache-manager` catches
+the store's `get` and `set` rejections, emits them on the cache's
+`error` event, and runs the wrapped function as if the key were a miss —
+so an outage costs the computation, never the request, but a listener
+on `error` is the only place the outage is reported.
+
+## Value size limit
+
+A namespace, key and value together must fit in one request: 1 MiB
+minus a 256-byte header, 1,048,320 bytes. A `set` or `mset` entry over
+that size rejects with a `RangeError` before anything is sent, and the
+entry is not written. Values
+are measured after JSON serialization, and after compression when
+`compress` is on.
 
 ## Requirements
 
 Node.js 20+, `cache-manager` ^5 (the `get`/`set`/`del`/`reset`/`mget`/`mset`
 shape this targets — its `Keyv`-based v6+/NestJS 11 successor is
-[`nanocached-keyv`](../keyv), a separate package), nanocached server ≥ the
-release that ships namespaces and `CLEAR`.
+[`nanocached-keyv`](../keyv), a separate package), nanocached server
+0.4.0 or later — the release that added namespaces, `CLEAR` and the
+batched multi-get/multi-set frames `mget`/`mset` use.
 
 ## Policy note
 
