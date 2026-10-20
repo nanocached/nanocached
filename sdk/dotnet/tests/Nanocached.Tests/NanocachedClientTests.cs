@@ -697,6 +697,12 @@ public class NanocachedClientTests
                 {
                     return;
                 }
+                catch (InvalidOperationException)
+                {
+                    // Stop() ran while this loop was draining the previous
+                    // dial: the next accept finds the listener not listening.
+                    return;
+                }
                 Interlocked.Increment(ref dials);
                 using (accepted)
                 {
