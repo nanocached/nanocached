@@ -1632,7 +1632,11 @@ func (c *Client) SetMany(values map[string]string, ttlSeconds int64) (map[string
 // SetBytes' own replica legs (write/fanReplicas). A batch never fails
 // as a whole: if some keys' primaries are still wrong-node after one
 // bounded refresh-and-retry, SetManyBytes returns ErrWrongNode — every
-// other key in the batch was still stored. In single-node/proxy mode a
+// other key in the batch was still stored; a key whose primary could
+// not be reached at all on both passes (no `W` was ever received)
+// returns ErrConnectionLost (wrapped, naming how many keys) instead,
+// with the returned map still naming every key whose primary did
+// acknowledge. In single-node/proxy mode a
 // `W` propagates immediately, exactly as SetBytes' own single-mode
 // behavior does.
 //
@@ -1718,24 +1722,75 @@ func (c *Client) setManyNS(namespace []byte, values map[string][]byte, ttlSecond
 	// traffic, and a chance to re-apply an older value over a newer
 	// concurrent write. (A detached fire-and-forget replica leg is not
 	// tracked: its outcome may not be known when the retry runs.)
-	acknowledged := &ackTracker{owners: map[int]map[string]bool{}}
+	acknowledged := &ackTracker{owners: map[int]map[string]bool{}, unreachable: map[int]bool{}}
 	retry := c.multiSetPass(namespace, keys, keyBytes, valueBytes, wireTTL, nil, stored, acknowledged)
 	if len(retry) == 0 {
 		return stored, nil
 	}
 	c.maybeRefresh(true)
 	retry = c.multiSetPass(namespace, keys, keyBytes, valueBytes, wireTTL, retry, stored, acknowledged)
-	if len(retry) > 0 {
-		return stored, ErrWrongNode
+	if len(retry) == 0 {
+		return stored, nil
 	}
-	return stored, nil
+	// A key is still unresolved after the retry pass. Only a real `W`
+	// from its primary is a wrong-node outcome; a primary that could not
+	// be reached at the connection level on both passes (the leg's
+	// connection closed or timed out, no `W` ever received) is a
+	// connection failure and is reported as one — a caller that reacts
+	// to ErrWrongNode by refreshing and retrying must not do that for a
+	// dead node, and one that logs the message must not be told the node
+	// answered. stored already names every key whose primary did
+	// acknowledge.
+	for _, idx := range retry {
+		if !acknowledged.isUnreachable(idx) {
+			return stored, ErrWrongNode
+		}
+	}
+	cause := acknowledged.cause()
+	if cause == nil {
+		cause = connectionLost("no owner is reachable for these keys", nil)
+	}
+	return stored, fmt.Errorf("nanocached: SetMany could not reach the primary of %d of %d keys: %w", len(retry), len(keys), cause)
 }
 
 // ackTracker records, per key index, the owner names whose `o` leg
-// acknowledged the key — see setManyNS.
+// acknowledged the key — see setManyNS — plus which primaries' latest
+// outcome was a connection failure rather than a `W` (unreachable) and
+// the most recent leg-level connection failure (lastErr), which decide
+// what setManyNS returns once the retry pass is exhausted.
 type ackTracker struct {
-	mu     sync.Mutex
-	owners map[int]map[string]bool
+	mu          sync.Mutex
+	owners      map[int]map[string]bool
+	unreachable map[int]bool
+	lastErr     error
+}
+
+func (a *ackTracker) markPrimary(idx int, unreachable bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if unreachable {
+		a.unreachable[idx] = true
+	} else {
+		delete(a.unreachable, idx)
+	}
+}
+
+func (a *ackTracker) isUnreachable(idx int) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.unreachable[idx]
+}
+
+func (a *ackTracker) fail(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastErr = err
+}
+
+func (a *ackTracker) cause() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastErr
 }
 
 func (a *ackTracker) add(idx int, name string) {
@@ -1942,7 +1997,10 @@ func (c *Client) runMultiSetLeg(
 		groupKeys[i] = keyBytes[idx]
 		groupValues[i] = valueBytes[idx]
 	}
-	entries, _ := c.multiSetChunked(name, namespace, groupKeys, groupValues, ttlSeconds)
+	entries, err := c.multiSetChunked(name, namespace, groupKeys, groupValues, ttlSeconds)
+	if err != nil && acknowledged != nil {
+		acknowledged.fail(err)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -1959,6 +2017,12 @@ func (c *Client) runMultiSetLeg(
 		if !isPrimary[i] {
 			c.stats.replicaWriteFailures.Add(1)
 			continue
+		}
+		// A primary position with no answer at all (the leg's connection
+		// failed before this chunk was answered) is unreachable; one that
+		// answered `W` is not — see ackTracker.
+		if acknowledged != nil {
+			acknowledged.markPrimary(idx, !entries[i].wrongNode)
 		}
 		if retry != nil {
 			*retry = append(*retry, idx)
@@ -2536,6 +2600,13 @@ func (c *Client) applyReconnecting(slot string, op func(*connection) error) erro
 		if !errors.Is(err, ErrConnectionLost) && !errors.Is(err, ErrProtocol) {
 			return err
 		}
+		// A request timeout is not the idle-FIN case this retry exists
+		// for: the peer accepted the frame and simply never answered
+		// within the request deadline, so a redial-and-resend would most
+		// likely stall for another full deadline — see errRequestTimedOut.
+		if errors.Is(err, errRequestTimedOut) {
+			return err
+		}
 		conn, redialErr := c.slotConnection(slot)
 		if redialErr != nil {
 			return redialErr
@@ -2566,7 +2637,7 @@ func (c *Client) applyNonIdempotent(slot string, op func(*connection) error) err
 		return err
 	}
 	if err := op(conn); err != nil {
-		if !errors.Is(err, errRequestNotSent) {
+		if !errors.Is(err, errRequestNotSent) || errors.Is(err, errRequestTimedOut) {
 			return err
 		}
 		conn, redialErr := c.slotConnection(slot)

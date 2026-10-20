@@ -1,6 +1,9 @@
 package nanocached
 
-import "errors"
+import (
+	"errors"
+	"net"
+)
 
 // Sentinel errors, matched with errors.Is.
 var (
@@ -121,6 +124,31 @@ var errRequestNotSent = errors.New("nanocached: request was not sent")
 // every errors.Is/As target err already carries, only adding the marker.
 func notSent(err error) error {
 	return errors.Join(err, errRequestNotSent)
+}
+
+// errRequestTimedOut marks an ErrConnectionLost failure caused by the
+// request deadline (requestTimeout) expiring — the connection's read
+// deadline passed with a request still unanswered, or a write blocked
+// past it because the peer stopped reading. The peer was reachable and
+// simply did not answer in time, so the client's own redial-and-retry
+// does not apply: a second attempt would most likely wait out another
+// whole deadline (a replica that stopped reading made a cluster Set take
+// twice the request timeout) and would re-send a write the peer may
+// still apply. Only applyReconnecting/applyNonIdempotent inspect this
+// marker; a caller matching ErrConnectionLost sees no change.
+var errRequestTimedOut = errors.New("nanocached: request timed out")
+
+// timedOut marks err with errRequestTimedOut via errors.Join, the way
+// notSent does for errRequestNotSent.
+func timedOut(err error) error {
+	return errors.Join(err, errRequestTimedOut)
+}
+
+// isTimeout reports whether err is a net.Error whose deadline expired —
+// what c.conn.SetDeadline (requestTimeout) produces on a read or write.
+func isTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func connectionLost(context string, cause error) error {

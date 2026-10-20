@@ -12,6 +12,17 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `SetMany`/`SetManyBytes` in cluster mode return `ErrConnectionLost`
+  (wrapped, naming how many keys; the returned map still names every
+  key whose primary acknowledged) when a key's primary could not be
+  reached at all on both passes, instead of `ErrWrongNode`, which is now
+  reserved for a primary that actually answered `W`. A caller that
+  reacted to `ErrWrongNode` by refreshing and retrying did so for a dead
+  node, and the message claimed the node had answered (#722).
+- A request that timed out is no longer redialed and resent once: the
+  peer was reachable and simply did not answer, so the resend waited out
+  a second full deadline — a cluster `Set` whose replica had stopped
+  reading took 60 s instead of 30 s (#725).
 - Forced node-list refreshes are single-flight: callers that hit a dead
   node at the same time used to run one full refresh each, one after
   another behind the refresh gate (5 s each when discovery is slow); a
