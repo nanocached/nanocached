@@ -7,9 +7,21 @@ import java.io.ObjectInputFilter;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
+import org.springframework.core.ConfigurableObjectInputStream;
 
 /**
  * The default {@link CacheValueSerializer}: plain JDK serialization.
+ *
+ * <p><b>Class loading.</b> Classes named in a cached value are resolved
+ * with the class loader given to {@link #JdkCacheValueSerializer(ClassLoader)}
+ * (the cache manager's {@code classLoader(...)} builder option, which the
+ * Spring Boot starter sets to the application context's loader), or, when
+ * none was given, the calling thread's context class loader at the time
+ * of each read, falling back to this class's own loader. A plain {@code
+ * ObjectInputStream} resolves with the loader that defined this adapter,
+ * which cannot see application classes when the adapter sits in a parent
+ * loader (a Boot devtools restart, a shared server library directory):
+ * every cache hit then failed with {@code ClassNotFoundException}.
  *
  * <p><b>Trust boundary.</b> {@link #deserialize} runs {@link ObjectInputStream#readObject()}
  * over whatever bytes are read back from the namespace — see this module's README
@@ -35,12 +47,20 @@ public final class JdkCacheValueSerializer implements CacheValueSerializer {
 
     private final ObjectInputFilter explicitFilter;
     private final boolean useGlobalFilter;
+    /** Null = the calling thread's context class loader at read time. */
+    private final ClassLoader classLoader;
 
     /** Uses the JVM-wide serial filter ({@link ObjectInputFilter.Config#getSerialFilter()}),
-     * re-read on every {@link #deserialize} call — see the class javadoc. */
+     * re-read on every {@link #deserialize} call — see the class javadoc — and the
+     * context class loader of the thread that reads. */
     public JdkCacheValueSerializer() {
-        this.explicitFilter = null;
-        this.useGlobalFilter = true;
+        this(null, true, null);
+    }
+
+    /** As {@link #JdkCacheValueSerializer()}, resolving value classes with
+     * {@code classLoader} — see the class javadoc. */
+    public JdkCacheValueSerializer(ClassLoader classLoader) {
+        this(null, true, classLoader);
     }
 
     /**
@@ -50,8 +70,19 @@ public final class JdkCacheValueSerializer implements CacheValueSerializer {
      * {@code filter} is fixed for this instance's lifetime, not re-read.
      */
     public JdkCacheValueSerializer(ObjectInputFilter filter) {
+        this(filter, false, null);
+    }
+
+    /** As {@link #JdkCacheValueSerializer(ObjectInputFilter)}, resolving
+     * value classes with {@code classLoader} — see the class javadoc. */
+    public JdkCacheValueSerializer(ObjectInputFilter filter, ClassLoader classLoader) {
+        this(filter, false, classLoader);
+    }
+
+    private JdkCacheValueSerializer(ObjectInputFilter filter, boolean useGlobalFilter, ClassLoader classLoader) {
         this.explicitFilter = filter;
-        this.useGlobalFilter = false;
+        this.useGlobalFilter = useGlobalFilter;
+        this.classLoader = classLoader;
     }
 
     @Override
@@ -74,7 +105,14 @@ public final class JdkCacheValueSerializer implements CacheValueSerializer {
 
     @Override
     public Object deserialize(byte[] bytes) {
-        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
+        ClassLoader loader = classLoader;
+        if (loader == null) {
+            loader = Thread.currentThread().getContextClassLoader();
+        }
+        if (loader == null) {
+            loader = JdkCacheValueSerializer.class.getClassLoader();
+        }
+        try (ObjectInputStream in = new ConfigurableObjectInputStream(new ByteArrayInputStream(bytes), loader)) {
             // Re-read the JVM-wide filter here rather than at construction
             // time (issue #365): setSerialFilter may run after this
             // serializer was built but before it is ever used, and a value

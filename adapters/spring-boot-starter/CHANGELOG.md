@@ -9,6 +9,13 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Fixed
+
+- The auto-configured cache manager deserializes cached values with the
+  application context's class loader, so a devtools restart (whose
+  application classes live in a child loader) no longer fails every
+  cache hit with `ClassNotFoundException` (#674).
+
 ## [0.4.7] - 2026-10-19
 
 No changes. Version aligned with the rest of the project: every release

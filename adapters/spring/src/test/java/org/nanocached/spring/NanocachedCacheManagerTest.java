@@ -248,30 +248,26 @@ class NanocachedCacheManagerTest {
     }
 
     @Test
-    void getWithLoaderWrapsStoreFailuresFromTheSuccessfulLoad() {
-        // Regression (issue #417): put(key, loaded) used to sit outside
-        // the try/catch that wraps the loader call, so a store-side
-        // failure for an otherwise-successful load (a non-Serializable
-        // value with the default serializer, here) escaped unwrapped
-        // instead of being reported as Spring's own ConcurrentMapCache
-        // reports it: a ValueRetrievalException.
+    void getWithLoaderThrowsAStoreFailureAsIsAfterASuccessfulLoad() {
+        // A store-side failure for an otherwise-successful load (a
+        // non-Serializable value with the default serializer, here) is
+        // thrown as-is, not as a ValueRetrievalException: Spring's cache
+        // interceptor rethrows a ValueRetrievalException without
+        // consulting the application's CacheErrorHandler, while any
+        // other runtime exception reaches the handler — the same shape
+        // Spring's Redis cache has. (This used to be wrapped, which hid
+        // a failed put from the handler under sync = true.)
         Cache cache = manager().build().getCache("users");
         Object notSerializable = new Object();
 
-        Cache.ValueRetrievalException thrown = assertThrows(
-                Cache.ValueRetrievalException.class,
-                () -> cache.get("k", () -> notSerializable));
-        assertInstanceOf(IllegalArgumentException.class, thrown.getCause());
+        assertThrows(IllegalArgumentException.class, () -> cache.get("k", () -> notSerializable));
     }
 
     @Test
-    void getWithLoaderWrapsStoreFailuresFromANullValueWhenDisallowed() {
+    void getWithLoaderThrowsTheNullStoreFailureAsIsWhenDisallowed() {
         Cache cache = manager().allowNullValues(false).build().getCache("users");
 
-        Cache.ValueRetrievalException thrown = assertThrows(
-                Cache.ValueRetrievalException.class,
-                () -> cache.get("k", () -> null));
-        assertInstanceOf(IllegalArgumentException.class, thrown.getCause());
+        assertThrows(IllegalArgumentException.class, () -> cache.get("k", () -> null));
         // The failed store must not have left a half-written entry behind.
         assertNull(cache.get("k"));
     }

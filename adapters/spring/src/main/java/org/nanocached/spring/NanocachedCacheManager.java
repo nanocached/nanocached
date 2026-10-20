@@ -89,7 +89,8 @@ public final class NanocachedCacheManager implements CacheManager {
 
     public static final class Builder {
         private final NanocachedClient client;
-        private CacheValueSerializer serializer = new JdkCacheValueSerializer();
+        private CacheValueSerializer serializer;
+        private ClassLoader classLoader;
         private CacheKeyConverter keyConverter = new DefaultCacheKeyConverter();
         private Duration defaultTtl = Duration.ZERO;
         private final Map<String, Duration> ttlByCache = new HashMap<>();
@@ -104,6 +105,19 @@ public final class NanocachedCacheManager implements CacheManager {
          * ({@link JdkCacheValueSerializer}). */
         public Builder serializer(CacheValueSerializer serializer) {
             this.serializer = Objects.requireNonNull(serializer, "serializer");
+            return this;
+        }
+
+        /** The class loader the default {@link JdkCacheValueSerializer}
+         * resolves cached values' classes with — the application's
+         * context loader when the adapter lives in a parent loader (a
+         * Spring Boot devtools restart, a shared server library
+         * directory); the Boot starter sets it. Ignored when a custom
+         * {@link #serializer} is configured, which resolves classes its
+         * own way. Without it the serializer uses each reading thread's
+         * context class loader. */
+        public Builder classLoader(ClassLoader classLoader) {
+            this.classLoader = Objects.requireNonNull(classLoader, "classLoader");
             return this;
         }
 
@@ -146,6 +160,9 @@ public final class NanocachedCacheManager implements CacheManager {
         }
 
         public NanocachedCacheManager build() {
+            if (serializer == null) {
+                serializer = classLoader == null ? new JdkCacheValueSerializer() : new JdkCacheValueSerializer(classLoader);
+            }
             return new NanocachedCacheManager(this);
         }
 
