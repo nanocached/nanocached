@@ -453,7 +453,10 @@ namespace-scoped: `client.namespace(ns).getMany(...)`/`.setMany(...)`,
 same as `get`/`set`. Batch keys are always `string` — unlike single-key
 `get`/`set`, `getMany`/`setMany` don't accept `Uint8Array` keys, since a
 `Uint8Array` can't safely key a `Map` (reference, not content,
-identity). A key repeated in a `getMany` is read once (the result is a
+identity). A `setMany` batch is a plain object, so a key named
+`__proto__` has to be added on a prototype-less one
+(`Object.create(null)`) — an object literal drops that key before the
+SDK sees it. A key repeated in a `getMany` is read once (the result is a
 `Map`), so a list of many copies of one key costs one key's worth of
 request and reply.
 

@@ -2523,6 +2523,26 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
     }
   });
 
+  it("setMany stores a key named __proto__ instead of dropping it from the batch", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const values: Record<string, string> = Object.create(null) as Record<string, string>;
+        values["__proto__"] = "p";
+        values.normal = "n";
+        await client.setMany(values, 0);
+        const read = await client.getMany(["__proto__", "normal"]);
+        assert.equal(read.get("__proto__"), "p");
+        assert.equal(read.get("normal"), "n");
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("enforces a cumulative decompressed budget across the batch", async () => {
     // Regression (pass-7 audit): the per-value decompression cap can be
     // amplified across a batch. The cumulative budget is lowered here so

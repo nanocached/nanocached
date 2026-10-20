@@ -1890,7 +1890,10 @@ export class NanocachedClient {
   }
 
   private async setManyStringInNamespace(namespace: Uint8Array, values: Record<string, string>, ttlSeconds: number): Promise<void> {
-    const raw: Record<string, Uint8Array> = {};
+    // Prototype-less: on a plain `{}`, `raw["__proto__"] = ...` sets the
+    // prototype instead of adding an own property, so a key with that
+    // name would be silently dropped from the batch (`set` stores it).
+    const raw: Record<string, Uint8Array> = Object.create(null) as Record<string, Uint8Array>;
     for (const [key, value] of Object.entries(values)) raw[key] = Buffer.from(value, "utf8");
     return this.setManyInNamespace(namespace, raw, ttlSeconds);
   }

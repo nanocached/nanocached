@@ -93,6 +93,12 @@ export interface NanocachedStoreConfig extends Config {
 // different from a negative per-call value — both are "already expired"
 // — so `effectiveMs` (whichever of the two won) is now checked for
 // negativity the same way, after the per-call short-circuit above.
+// cache-manager's own default (its memory store: `value => value !==
+// undefined`), used when the config sets no `isCacheable`.
+function defaultIsCacheable(value: unknown): boolean {
+  return value !== undefined;
+}
+
 const DO_NOT_CACHE = Symbol("nanocached-cache-manager: do not write, delete instead");
 
 function resolveTtlSeconds(
@@ -120,16 +126,44 @@ export class NotSupportedError extends Error {
 }
 
 /**
+ * Thrown by `set()`/`mset()` for a value the store's `isCacheable`
+ * predicate rejects — by default `undefined`, the one value a miss
+ * already means. The same shape cache-manager's own memory store and
+ * `cache-manager-redis-yet` (`NoCacheableError`) throw, so `wrap()`
+ * treats all three stores alike: it catches the rejection and emits it
+ * on the cache's `error` event instead of failing the wrapped call.
+ */
+export class NoCacheableError extends Error {
+  constructor(key: string, value: unknown) {
+    super(
+      `nanocached-cache-manager: no cacheable value for key ${JSON.stringify(key)}: ${describe(value)} ` +
+        "(the store's `isCacheable` predicate rejected it; by default only `undefined` is rejected)",
+    );
+    this.name = "NoCacheableError";
+  }
+}
+
+function describe(value: unknown): string {
+  try {
+    const text = JSON.stringify(value);
+    return text === undefined ? String(value) : text;
+  } catch {
+    return String(value);
+  }
+}
+
+/**
  * A cache-manager v5 `Store` backed by a nanocached namespace. Returned by
  * `nanocachedStore` (the factory `caching()` expects); see that function
  * and the module README for how the two fit together.
  *
  * Values are JSON-serialized (`JSON.stringify`/`JSON.parse`) — the
  * convention cache-manager's own stores use (its Redis store does the
- * same) so any JSON-safe value round-trips, `null` included. Storing
- * `undefined` is a no-op, matching the Redis store's behavior, since
- * `undefined` is exactly what a miss already means here — there is
- * nothing meaningful to write.
+ * same) so any JSON-safe value round-trips, `null` included. A value the
+ * `isCacheable` predicate rejects — by default `undefined`, which is
+ * exactly what a miss already means here — makes `set`/`mset` throw
+ * `NoCacheableError` without writing anything, as cache-manager's own
+ * memory store and `cache-manager-redis-yet` do.
  */
 export class NanocachedStore implements Store {
   private readonly ns: NanocachedNamespace;
@@ -142,6 +176,9 @@ export class NanocachedStore implements Store {
     readonly client: NanocachedClient,
     namespace: string,
     private readonly defaultTtlMs: Milliseconds | undefined,
+    /** cache-manager's own `Config.isCacheable`, applied by `set`/`mset`
+     * exactly as its memory store applies it. */
+    private readonly isCacheable: (value: unknown) => boolean = defaultIsCacheable,
   ) {
     this.ns = client.namespace(namespace);
   }
@@ -152,11 +189,11 @@ export class NanocachedStore implements Store {
   }
 
   async set<T>(key: string, data: T, ttl?: Milliseconds): Promise<void> {
-    // A no-op, not a delete: cache-manager's Store.set is never asked to
-    // remove a key (that's del()), and undefined is already what a miss
-    // means for this store — writing it would be indistinguishable from
-    // writing nothing (matching the Redis store's own convention).
-    if (data === undefined) return;
+    // Rejected before anything else is looked at, the way the memory
+    // store does it: a non-cacheable value is a caller error, not a
+    // delete (that's del()) and not a silent skip — `wrap()` relies on
+    // the rejection to report it through its `error` event.
+    if (!this.isCacheable(data)) throw new NoCacheableError(key, data);
     const wireTtl = resolveTtlSeconds(ttl, this.defaultTtlMs);
     // Issue #300: a negative ttl means "already expired" — don't write an
     // immortal entry the framework will just keep hiding forever; delete
@@ -273,22 +310,29 @@ export class NanocachedStore implements Store {
 
   /** One wire round trip per involved node (issue #152), via the SDK's
    * `setMany` — vs. a `set` per key. `ttl` (if given) applies to every
-   * entry, matching `setMany`'s own single-TTL-per-call signature.
-   * `undefined` values are skipped, same no-op convention as `set`. */
+   * entry, matching `setMany`'s own single-TTL-per-call signature. A
+   * non-cacheable value anywhere in the batch throws `NoCacheableError`
+   * before any entry is written, same rule as `set`. */
   async mset(entries: Array<[string, unknown]>, ttl?: Milliseconds): Promise<void> {
+    for (const [key, value] of entries) {
+      if (!this.isCacheable(value)) throw new NoCacheableError(key, value);
+    }
     const wireTtl = resolveTtlSeconds(ttl, this.defaultTtlMs);
     // Issue #300: same "already expired" handling as set() — one ttl
     // applies to the whole batch (mset's own signature), so a negative
     // ttl deletes every entry the call would otherwise have written.
     if (wireTtl === DO_NOT_CACHE) {
-      const keys = entries.filter(([, value]) => value !== undefined).map(([key]) => key);
-      if (keys.length === 0) return;
-      await this.mdel(...keys);
+      if (entries.length === 0) return;
+      await this.mdel(...entries.map(([key]) => key));
       return;
     }
-    const values: Record<string, string> = {};
+    // A prototype-less object, not a literal: assigning `values["__proto__"]`
+    // on a plain object sets its prototype instead of adding an own
+    // property, so an entry under that key would silently never reach
+    // `setMany` while `set("__proto__", ...)` works — the same key would
+    // behave differently in the two calls.
+    const values: Record<string, string> = Object.create(null) as Record<string, string>;
     for (const [key, value] of entries) {
-      if (value === undefined) continue;
       // Issue #333: same JSON.stringify-can-return-undefined guard as set().
       const serialized = JSON.stringify(value);
       if (serialized === undefined) {
@@ -334,7 +378,7 @@ export class NanocachedStore implements Store {
     } catch (error) {
       if (error instanceof PartialConnectionLostError) {
         const succeeded = new Set(error.partialValues as string[]);
-        const remaining: Record<string, string> = {};
+        const remaining: Record<string, string> = Object.create(null) as Record<string, string>;
         for (const key of Object.keys(values)) {
           if (!succeeded.has(key)) remaining[key] = values[key];
         }
@@ -450,5 +494,5 @@ export async function nanocachedStore(config?: NanocachedStoreConfig): Promise<N
     readHedgeAfterMs: config.readHedgeAfterMs,
     reconnectCooldownMs: config.reconnectCooldownMs,
   });
-  return new NanocachedStore(client, config.namespace ?? DEFAULT_NAMESPACE, config.ttl);
+  return new NanocachedStore(client, config.namespace ?? DEFAULT_NAMESPACE, config.ttl, config.isCacheable);
 }

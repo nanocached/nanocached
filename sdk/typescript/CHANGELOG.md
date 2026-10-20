@@ -11,6 +11,14 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `setMany` stores an entry whose key is `"__proto__"` instead of
+  silently dropping it: the string-to-bytes conversion collected the
+  batch on a plain object, where assigning that key sets the prototype.
+  `set` and `setManyBytes` were unaffected. Callers building a batch
+  themselves need a prototype-less object (`Object.create(null)`) for
+  that key, since an object literal drops it before the SDK sees it
+  (#730).
+
 - `setMany`/`setManyBytes` in cluster mode throw
   `PartialConnectionLostError` (with the keys whose primary did store
   them in `partialValues`) when a key's primary could not be reached at
