@@ -41,8 +41,20 @@ to all R owners), transparent reconnect with a single retry, always-on
 keep-alive, opt-in transparent value compression, opt-in fire-and-forget
 replica writes, opt-in read repair, and the same rendezvous-hashing
 pipeline verified against shared cross-language test vectors. Values are
-strings first: every <code>get</code> returns a string (strict UTF-8),
-with a <code>get_bytes</code>-style companion for raw byte values.</p>
+strings first: every <code>get</code> returns a string, with a
+<code>get_bytes</code>-style companion for raw byte values. The text
+getter is strict UTF-8 in five SDKs (a stored value that is not valid
+UTF-8 raises); in Go, where a <code>string</code> can hold any bytes,
+<code>Get</code> returns the bytes unchanged and <code>GetBytes</code>
+is the <code>[]byte</code> form.</p>
+
+<p>A TTL is whole seconds; <code>0</code> (or omitting it) means no
+expiry. The wire field is an unsigned 64-bit decimal, and the largest
+value an SDK accepts is set by its integer type: <code>2^64 − 1</code>
+in Python and Rust, <code>2^63 − 1</code> in Go, Java and .NET, and
+<code>2^53 − 1</code> (<code>Number.MAX_SAFE_INTEGER</code>) in
+TypeScript, which throws <code>RangeError</code> above that. Any value
+up to <code>2^53 − 1</code> works in every SDK.</p>
 
 <div class="table-wrap">
 <table>
@@ -59,8 +71,9 @@ with a <code>get_bytes</code>-style companion for raw byte values.</p>
 </div>
 
 <p>None of the SDKs has runtime dependencies outside its language's
-standard library (Rust's client uses tokio; its TLS support is a default
-cargo feature that can be compiled out).</p>
+standard library, except Rust: its client uses tokio, futures-util and
+sha2, plus flate2 and rustls behind the default <code>compression</code>
+and <code>tls</code> cargo features, which can be compiled out.</p>
 
 <div class="note">The SDKs are pre-1.0 (currently 0.4.x), and all of them ship
 at one version together with the server; what 1.0.0 will promise is on the
@@ -141,7 +154,7 @@ client.close().await;</code></pre>
 <pre><code>dotnet add package Nanocached</code></pre>
 <pre><code>using Nanocached;
 
-using NanocachedClient client = await NanocachedClient.ConnectAsync(new Options {
+using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options {
     Addresses = { ("127.0.0.1", 8357) },
 });
 
@@ -220,8 +233,13 @@ existed, err := client.Delete("greeting")</code></pre>
   (<code>Incr</code>/<code>IncrAsync</code> in Go/.NET) adds a signed
   <code>delta</code> to a key's stored value atomically on the node that
   owns it and returns the new value; a negative <code>delta</code>
-  decrements, so there is no separate <code>decr</code>. Available on a
-  namespace handle too. As volatile as a plain <code>set</code> — LRU
+  decrements, and every SDK's <code>decr</code> negates the delta for
+  you — there is no separate decrement command on the wire. Available on
+  a namespace handle too. In TypeScript a counter is limited to the
+  safe-integer range: a stored value beyond ±(2^53 − 1) makes
+  <code>incr</code>/<code>decr</code> throw
+  <code>CounterOutOfRangeError</code> even though the node applied the
+  increment. As volatile as a plain <code>set</code> — LRU
   eviction and TTL expiry reclaim a counter the same as any other entry,
   so this is a fit for rate limiting and approximate counters, not for
   counts that must survive. In a cluster only the primary owner runs the
@@ -232,6 +250,17 @@ existed, err := client.Delete("greeting")</code></pre>
   outright on a client with <code>compress</code> enabled, since the protocol
   has no way to tell a compressed value from a plain integer. See
   <a href="protocol.html#incr">i</a>.</li>
+  <li><b>Batched reads and writes</b> — <code>getMany</code> and
+  <code>setMany</code> (<code>get_many</code>/<code>set_many</code>,
+  <code>GetManyAsync</code>/<code>SetManyAsync</code>) fetch or store
+  many keys in one round trip per owning node, available on a namespace
+  handle too. A missing key is simply absent from the result, never an
+  error, and so is a key the node could not include: the values in one
+  batch reply total at most 16 MiB, and a hit past that budget is
+  answered as a miss. A caller reading many large keys at once should
+  not take an absent key for evicted; read it again on its own. Hedged
+  reads and read repair apply to single-key reads only. See
+  <a href="protocol.html#multi">m / o</a>.</li>
   <li><b>Compare-and-set</b> — <code>putIfAbsent</code>,
   <code>replace</code> (present-only and exact-match forms), and a
   digest-conditioned delete, all atomic on the node that owns the key. An
@@ -275,7 +304,8 @@ existed, err := client.Delete("greeting")</code></pre>
   each SDK's README has a "Fire-and-forget replica writes" section.</li>
   <li><b>Read repair</b> — off by default; when enabled, a clean miss
   probes the remaining owners before being accepted as final, repairing
-  the primary in the background (no TTL) if one still holds the value.
+  the primary in the background, with a fixed 60-second TTL, if one
+  still holds the value.
   Closes the post-restart window client-side replication otherwise
   leaves open, at the cost of extra reads on the misses it applies to;
   each SDK's README has a "Read repair" section.</li>

@@ -211,7 +211,11 @@ values = await client.get_many(["a", "b", "missing"])
 ```
 
 A missing key is simply absent from the returned dict, the same "a miss
-is not an error" shape `get`/`get_bytes` use. Keys may be `str` or
+is not an error" shape `get`/`get_bytes` use — and so is a key the node
+could not fit: the values in one batch reply total at most 16 MiB, and a
+hit past that budget is answered as a miss, so a batch of many large
+keys can come back with fewer keys than exist (read such a key again on
+its own rather than taking it for evicted). Keys may be `str` or
 `bytes`, freely mixed within one call — the result dict is keyed by
 whichever original object was passed in, not by its encoded bytes. A
 key repeated in a `get_many` (the same key twice, or `"a"` and `b"a"`,

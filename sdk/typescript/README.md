@@ -23,7 +23,7 @@ import { NanocachedClient } from "nanocached";
 // Point at a single node, or at a discovery server fronting a cluster —
 // same options either way. `addresses` is always a list; a one-element
 // list is the single-target case.
-const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: 11311 }] });
+const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: 8357 }] });
 
 await client.set("greeting", "hello", 60); // ttlSeconds; omit or pass 0 for no expiry
 
@@ -105,7 +105,7 @@ secret:
 
 ```ts
 const client = await NanocachedClient.connect({
-  addresses: [{ host: "cache.internal", port: 11311 }],
+  addresses: [{ host: "cache.internal", port: 8357 }],
   authSecret: process.env.NANOCACHED_AUTH_SECRET,
 });
 ```
@@ -448,7 +448,11 @@ const values = await client.getMany(["a", "b", "missing"]);
 ```
 
 A missing key is simply absent from the returned `Map`, the same "a
-miss is not an error" shape `get`/`getBytes` use. Both are also
+miss is not an error" shape `get`/`getBytes` use — and so is a key the
+node could not fit: the values in one batch reply total at most 16 MiB,
+and a hit past that budget is answered as a miss, so a batch of many
+large keys can come back with fewer keys than exist (read such a key
+again on its own rather than taking it for evicted). Both are also
 namespace-scoped: `client.namespace(ns).getMany(...)`/`.setMany(...)`,
 same as `get`/`set`. Batch keys are always `string` — unlike single-key
 `get`/`set`, `getMany`/`setMany` don't accept `Uint8Array` keys, since a

@@ -304,7 +304,11 @@ values, err := client.GetMany([]string{"a", "b", "missing"})
 ```
 
 A missing key is simply absent from the returned map, the same "a miss
-is not an error" shape `Get`/`GetBytes` use. Both are also
+is not an error" shape `Get`/`GetBytes` use — and so is a key the node
+could not fit: the values in one batch reply total at most 16 MiB, and a
+hit past that budget is answered as a miss, so a batch of many large
+keys can come back with fewer keys than exist (read such a key again on
+its own rather than taking it for evicted). Both are also
 namespace-scoped: `client.Namespace(ns).GetMany(...)`/`.SetMany(...)`,
 same as `Get`/`Set`.
 

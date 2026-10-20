@@ -176,7 +176,11 @@ Map<String, String> values = client.getMany(List.of("a", "b", "missing"));
 ```
 
 A missing key is simply absent from the returned `Map`, the same "a
-miss is not an error" shape `get`/`getBytes` use. Both are also
+miss is not an error" shape `get`/`getBytes` use — and so is a key the
+node could not fit: the values in one batch reply total at most 16 MiB,
+and a hit past that budget is answered as a miss, so a batch of many
+large keys can come back with fewer keys than exist (read such a key
+again on its own rather than taking it for evicted). Both are also
 namespace-scoped: `client.namespace(ns).getMany(...)`/`.setMany(...)`,
 same as `get`/`set`.
 
