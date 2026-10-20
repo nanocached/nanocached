@@ -700,7 +700,25 @@ public class NanocachedClientTests
                 Interlocked.Increment(ref dials);
                 using (accepted)
                 {
-                    await Wire.WriteAsync(accepted.GetStream(), "B\n");
+                    var stream = accepted.GetStream();
+                    await Wire.WriteAsync(stream, "B\n");
+                    // Wait (bounded) for the client to hang up before closing: a close
+                    // with the client's identify frame still unread is a reset on Linux,
+                    // and a reset discards the B it is queued behind.
+                    using var drain = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    var sink = new byte[256];
+                    try
+                    {
+                        while (await stream.ReadAsync(sink, drain.Token) > 0)
+                        {
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                    catch (System.IO.IOException)
+                    {
+                    }
                 }
             }
         });
