@@ -461,14 +461,21 @@ impl Command {
                 Response::Stored
             }
 
-            Self::Delete { key }
-            | Self::HandoffDelete {
+            Self::Delete { key } => {
+                if cache.delete(&key) {
+                    Response::Deleted
+                } else {
+                    Response::NotFound
+                }
+            }
+
+            Self::HandoffDelete {
                 key,
                 // Verified by the connection handler before this ever
                 // reaches `execute` — see `Command::HandoffDelete::token`.
                 token: _,
             } => {
-                if cache.delete(&key) {
+                if cache.handoff_delete(&key) {
                     Response::Deleted
                 } else {
                     Response::NotFound
