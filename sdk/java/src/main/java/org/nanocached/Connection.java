@@ -14,6 +14,9 @@ import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 /**
@@ -83,6 +86,38 @@ final class Connection {
      * poisoning. 0 means unarmed. */
     private final Object deadlineLock = new Object();
     private long requestDeadlineNanos = 0;
+    /** The check scheduled on {@link #WATCHDOG} for the armed deadline,
+     * guarded by {@link #deadlineLock}; null while none is armed. */
+    private ScheduledFuture<?> deadlineTask;
+    /** Bumped by every {@link #clearDeadline}, and by every schedule, so a
+     * check that was already running when its deadline was cleared and
+     * re-armed sees it is not the current one and does nothing — the
+     * newer check owns the deadline. Guarded by {@link #deadlineLock}. */
+    private long deadlineGeneration;
+
+    /** One request-timeout watchdog for every connection in the process.
+     * A connection used to carry a watchdog thread of its own, parked in
+     * {@code wait()} between requests, so a roster of N nodes cost 2N
+     * platform threads (20,062 threads and 1 GiB of RSS at N = 10,000,
+     * measured). A deadline is now one scheduled task on this
+     * single-thread pool, and the thread each connection owns is its
+     * reader alone. The task only decides and re-schedules; the expiry
+     * itself (closing the socket, failing every pending request, which
+     * runs their continuations) goes to a thread of its own, so one
+     * connection's slow continuation cannot hold up every other
+     * connection's deadline. Daemon, so it never keeps a JVM alive;
+     * remove-on-cancel, so a cleared deadline leaves nothing queued. */
+    private static final ScheduledThreadPoolExecutor WATCHDOG = newWatchdogPool();
+
+    private static ScheduledThreadPoolExecutor newWatchdogPool() {
+        ScheduledThreadPoolExecutor pool = new ScheduledThreadPoolExecutor(1, runnable -> {
+            Thread thread = new Thread(runnable, "nanocached-request-watchdog");
+            thread.setDaemon(true);
+            return thread;
+        });
+        pool.setRemoveOnCancelPolicy(true);
+        return pool;
+    }
     /** Set by the watchdog just before it closes the socket, so the
      * poison() that actually wins — often the reader's, reacting to the
      * close with a generic IOException — still reports the timeout. */
@@ -109,9 +144,6 @@ final class Connection {
         Thread reader = new Thread(this::readLoop, "nanocached-connection-reader");
         reader.setDaemon(true);
         reader.start();
-        Thread watchdog = new Thread(this::watchdogLoop, "nanocached-request-watchdog");
-        watchdog.setDaemon(true);
-        watchdog.start();
     }
 
     /** Called with the monitor held (see {@link #deadlineLock}'s lock
@@ -119,7 +151,13 @@ final class Connection {
     private void armDeadline() {
         synchronized (deadlineLock) {
             requestDeadlineNanos = System.nanoTime() + requestTimeoutMillis * 1_000_000L;
-            deadlineLock.notifyAll();
+            // Re-arming on progress moves the deadline, not the task: the
+            // check re-schedules itself for whatever remains when it
+            // fires, so a busy connection costs one wake-up per timeout
+            // window, not a cancel and a schedule per response.
+            if (deadlineTask == null) {
+                schedule(requestTimeoutMillis * 1_000_000L);
+            }
         }
     }
 
@@ -128,32 +166,48 @@ final class Connection {
     private void clearDeadline() {
         synchronized (deadlineLock) {
             requestDeadlineNanos = 0;
-            deadlineLock.notifyAll();
+            deadlineGeneration++;
+            if (deadlineTask != null) {
+                deadlineTask.cancel(false);
+                deadlineTask = null;
+            }
         }
     }
 
-    /** Sleeps until the armed deadline expires (poisoning the connection,
-     * which unblocks the reader — and any blocked writer — with a socket
-     * error) or the connection closes for another reason. Parked in
-     * {@code wait()} whenever no deadline is armed, so an idle connection
-     * is never closed by this. */
-    private void watchdogLoop() {
+    /** With {@link #deadlineLock} held: queues the deadline check on the
+     * shared watchdog, {@code delayNanos} from now. */
+    private void schedule(long delayNanos) {
+        long generation = ++deadlineGeneration;
+        deadlineTask = WATCHDOG.schedule(() -> checkDeadline(generation), delayNanos, TimeUnit.NANOSECONDS);
+    }
+
+    /** Runs on the shared watchdog when a scheduled check comes due. The
+     * deadline has since been cleared (nothing to do), or moved on with
+     * progress (come back for what remains), or expired with requests
+     * still pending (expire, on a thread of this connection's own).
+     * Takes {@link #deadlineLock} alone and releases it before expiring,
+     * as the per-connection watchdog did. */
+    private void checkDeadline(long generation) {
         synchronized (deadlineLock) {
-            while (!closed) {
-                try {
-                    if (requestDeadlineNanos == 0) {
-                        deadlineLock.wait();
-                    } else {
-                        long remainingMillis = (requestDeadlineNanos - System.nanoTime()) / 1_000_000;
-                        if (remainingMillis <= 0) break;
-                        deadlineLock.wait(remainingMillis + 1);
-                    }
-                } catch (InterruptedException interrupted) {
-                    return;
-                }
+            if (generation != deadlineGeneration) return;
+            deadlineTask = null;
+            if (closed || requestDeadlineNanos == 0) return;
+            long remainingNanos = requestDeadlineNanos - System.nanoTime();
+            if (remainingNanos > 0) {
+                schedule(remainingNanos + 1_000_000L);
+                return;
             }
-            if (closed) return;
         }
+        Thread expiry = new Thread(this::expireDeadline, "nanocached-request-timeout");
+        expiry.setDaemon(true);
+        expiry.start();
+    }
+
+    /** The deadline expired with requests still pending: poisons the
+     * connection, which unblocks the reader — and any blocked writer —
+     * with a socket error. */
+    private void expireDeadline() {
+        if (closed) return;
         // The deadline expired with requests still pending. Record the
         // timeout error first (so whichever thread's poison() wins the
         // race reports the timeout, not a bare "Socket closed"), then

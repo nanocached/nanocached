@@ -19,6 +19,13 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
   identity read short, which was taken for a legacy server's door-slam,
   so the dial was retried with the two lesser `A` forms and came out as
   a closed connection.
+- A connection costs one platform thread, its reader, instead of two.
+  Every connection carried a request-timeout watchdog thread of its own,
+  parked between requests, so a client connected to a roster of N nodes
+  held 2N threads (20,062 threads and 1 GiB of RSS at N = 10,000). One
+  scheduled-executor thread per process now watches every connection's
+  deadline; the timeout itself, its error and its effect on pending
+  requests are unchanged.
 
 - The error for a namespace, key or value over the request limit names
   the limit ("the server accepts requests of up to 1 MiB") instead of a
