@@ -47,6 +47,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- `nanocached-node` charges each entry 180 bytes and each non-default
+  namespace 750 bytes of overhead against `--max-memory` (was 100 and
+  256), the figures measured on the container image. A node filled with
+  tiny entries used 1.6× its budget in resident memory, one filled with
+  tiny namespaces 2.3×, so the documented sizing (a 512 MiB cache in a
+  1 GiB task) did not hold for them. Capacity in entries at a given
+  `--max-memory` drops accordingly: about 1.4M small entries at the
+  default 256 MiB instead of 2–3M (#697).
 - `nanocached-proxy` answers the fatal `E` (and closes) instead of the
   retryable `R` when its connection to a node fails after an `i`, `k` or
   `x` may have reached the node. `R` is defined as "not applied, re-send",

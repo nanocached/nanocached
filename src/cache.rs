@@ -19,12 +19,17 @@ use std::time::{Duration, Instant};
 pub(crate) const SWEEP_BUDGET: usize = 2_000;
 
 /// Added to `used_bytes` per stored entry, on top of its key+value bytes,
-/// to approximate the `HashMap` bucket and intrusive LRU list node
-/// `LruCache` allocates for it — invisible to plain key+value accounting,
-/// but real RSS a small-value workload pays for every entry. A rough,
-/// documented estimate rather than a measured constant (issue #19); if a
-/// closer figure is measured later, this is the only place to change it.
-pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 100;
+/// for the `HashMap` bucket, the intrusive LRU list node and the
+/// allocator's share that `LruCache` costs per entry — invisible to plain
+/// key+value accounting, but real RSS a small-value workload pays for
+/// every entry. Measured on the shipped container image (Linux, the
+/// image's allocator): RSS minus an empty node's, per entry, minus the
+/// key and value bytes, was 168 B at 1.5M entries and 178 B at 2.1M
+/// (just past a table doubling, the costliest point of the resize
+/// cycle); the constant takes the larger figure, so a node filled with
+/// tiny entries stays at about its `--max-memory` in RSS instead of 1.6×
+/// it. If the allocator or the map changes, re-measure here.
+pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 180;
 
 struct Entry {
     value: Bytes,
@@ -55,9 +60,15 @@ const TAILS_SLACK: usize = 64;
 /// namespaces (a name may be ~1 MiB) with a 1-byte key and value was
 /// accounted ~102 bytes apiece while RSS grew by the whole name, so
 /// `--max-memory` never evicted. A rough, documented estimate like
-/// `ENTRY_OVERHEAD_BYTES`. The default (empty) namespace is a single
+/// `ENTRY_OVERHEAD_BYTES`: measured on the shipped image as 750 B per
+/// namespace beyond its name and its entries (RSS per namespace minus
+/// an entry's share was 830 B at 400k namespaces and 930 B at 600k,
+/// past a doubling of the namespace maps; the constant takes the larger
+/// figure, minus the one entry each measured namespace held), so a node
+/// filled with tiny namespaces stays at about its `--max-memory` in RSS
+/// instead of 2.3× it. The default (empty) namespace is a single
 /// process-lifetime sub-map nobody can multiply, so it is not charged.
-pub(crate) const NAMESPACE_OVERHEAD_BYTES: usize = 256;
+pub(crate) const NAMESPACE_OVERHEAD_BYTES: usize = 750;
 
 /// What a live namespace named `name` costs `Cache::used_bytes`.
 fn name_charge(name: &[u8]) -> usize {
@@ -2713,7 +2724,8 @@ mod tests {
 
     #[test]
     fn eviction_follows_recency_within_a_namespace_too() {
-        let mut cache = Cache::new(3 * 106 + name_charge(b"x") + name_charge(b"y"));
+        let mut cache =
+            Cache::new(3 * (2 + 4 + ENTRY_OVERHEAD_BYTES) + name_charge(b"x") + name_charge(b"y"));
 
         cache.set(namespaced(b"x", b"k1"), Bytes::from_static(b"vvvv"));
         cache.set(namespaced(b"x", b"k2"), Bytes::from_static(b"vvvv"));
