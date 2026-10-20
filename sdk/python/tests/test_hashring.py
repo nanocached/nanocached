@@ -25,6 +25,44 @@ class CrossLanguageVectorTests(unittest.TestCase):
         self.assertEqual(ring.owners(b"", 3), ["node-a", "node-b", "node-c"])
 
 
+class NamespaceStateTests(unittest.TestCase):
+    def test_continuing_the_namespace_state_equals_the_one_shot_hash(self):
+        from nanocached._hashring import _fnv1a_continue, key_hash, namespace_state
+
+        for namespace in (b"", b"users", b"\xff\x00", bytes(range(256)) * 10):
+            state = namespace_state(namespace)
+            for key in (b"", b"alpha", b"k" * 100):
+                self.assertEqual(_fnv1a_continue(state, key), key_hash(namespace, key))
+
+    def test_a_batch_under_a_large_namespace_hashes_it_once(self):
+        # A 900 KB namespace costs about 70 ms to hash in pure Python.
+        # 400 keys under it used to re-hash it per key — 27 s on the
+        # event loop for one get_many; the ring now hashes it once per
+        # namespace change, so the batch costs the keys' own bytes.
+        import time
+
+        from nanocached._hashring import key_hash
+
+        ring = HashRing(["node-a", "node-b", "node-c"])
+        namespace = b"n" * 900_000
+        keys = [f"key-{i}".encode() for i in range(400)]
+        started = time.monotonic()
+        owners = [ring.owners(key, 2, namespace=namespace) for key in keys]
+        elapsed = time.monotonic() - started
+        self.assertTrue(all(len(o) == 2 for o in owners))
+        self.assertLess(elapsed, 3.0, f"400 keys under a 900 KB namespace took {elapsed:.1f} s")
+        # The cached state gives the same placement as the one-shot hash.
+        self.assertEqual(
+            ring.owners(keys[7], 2, namespace=namespace),
+            HashRing(["node-a", "node-b", "node-c"]).owners(keys[7], 2, namespace=namespace),
+        )
+        self.assertEqual(ring._key_hash(namespace, keys[7]), key_hash(namespace, keys[7]))
+        # Switching namespaces (by value, not identity) re-hashes.
+        other = b"m" * 10
+        self.assertEqual(ring._key_hash(other, b"k"), key_hash(other, b"k"))
+        self.assertEqual(ring._key_hash(bytes(other), b"k"), key_hash(other, b"k"))
+
+
 class HashRingTests(unittest.TestCase):
     NODES = ["node-a", "node-b", "node-c"]
 

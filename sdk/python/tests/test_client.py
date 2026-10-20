@@ -1217,6 +1217,107 @@ class RequestTimeoutTests(unittest.IsolatedAsyncioTestCase):
             await node.close()
 
 
+class StalledPeerTests(unittest.IsolatedAsyncioTestCase):
+    """A node that completes the handshake and then never reads, with a
+    4 KiB receive buffer so the kernel absorbs almost nothing: large
+    writes stay unsent in the client's transport and drain() blocks."""
+
+    def setUp(self):
+        from nanocached import _connection as connection_module
+
+        self._connection_module = connection_module
+        self._default_timeout = connection_module._REQUEST_TIMEOUT
+
+    def tearDown(self):
+        self._connection_module._REQUEST_TIMEOUT = self._default_timeout
+
+    async def stalled_node(self) -> MockNode:
+        node = await MockNode().start(recv_buffer=4096)
+        node.stop_reading_after_handshake = True
+        return node
+
+    async def test_a_write_blocked_in_drain_fails_at_the_request_deadline(self):
+        # Eight 900 KiB sets to a node that never reads. The deadline
+        # used to poison the connection with a graceful close, which
+        # keeps the unsent bytes — and the caller suspended in drain()
+        # — until the peer reads: the set never returned. The transport
+        # is aborted instead, so every caller fails at the deadline
+        # (twice, with the retry layer's redial in between).
+        node = await self.stalled_node()
+        try:
+            self._connection_module._REQUEST_TIMEOUT = 0.3
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                value = b"x" * 900_000
+                started = asyncio.get_running_loop().time()
+                outcomes = await asyncio.wait_for(
+                    asyncio.gather(
+                        *(client.set(f"k{i}", value) for i in range(8)), return_exceptions=True
+                    ),
+                    6.0,
+                )
+                elapsed = asyncio.get_running_loop().time() - started
+                self.assertTrue(
+                    all(isinstance(outcome, ConnectionError) for outcome in outcomes), outcomes
+                )
+                self.assertLess(elapsed, 4.0)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_close_settles_callers_blocked_in_a_write(self):
+        # close() with eight callers blocked in drain(): they must all be
+        # settled right away and their socket closed, not left pending
+        # with the socket open until the peer reads.
+        node = await self.stalled_node()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            value = b"x" * 900_000
+            tasks = [asyncio.ensure_future(client.set(f"k{i}", value)) for i in range(8)]
+            await asyncio.sleep(0.3)
+            self.assertFalse(any(task.done() for task in tasks))
+            await asyncio.wait_for(client.close(), 5.0)
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), 2.0
+            )
+            self.assertTrue(
+                all(isinstance(outcome, ConnectionError) for outcome in outcomes), outcomes
+            )
+        finally:
+            await node.close()
+
+    async def test_close_returns_while_a_fire_and_forget_replica_is_stalled(self):
+        # fire_and_forget_replicas: the replica leg runs in the
+        # background and close() waits for it. With the replica never
+        # reading, that leg used to sit in drain() for good and close()
+        # never returned; it now ends at the request deadline.
+        good = await MockNode().start()
+        bad = await MockNode().start(recv_buffer=4096)
+        bad.stop_reading_after_handshake = True
+        discovery = await MockDiscovery(
+            [(NAMES[0], good.address), (NAMES[1], bad.address)], replication=2
+        ).start()
+        try:
+            self._connection_module._REQUEST_TIMEOUT = 0.5
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], fire_and_forget_replicas=True
+            )
+            ring = HashRing(NAMES)
+            keys = [f"k{i}" for i in range(40) if ring.route(f"k{i}".encode()) == NAMES[0]][:4]
+            self.assertEqual(len(keys), 4)
+            value = b"x" * 400_000
+            for key in keys:
+                await client.set(key, value)
+            started = asyncio.get_running_loop().time()
+            await asyncio.wait_for(client.close(), 5.0)
+            self.assertLess(asyncio.get_running_loop().time() - started, 3.0)
+        finally:
+            await discovery.close()
+            await good.close()
+            await bad.close()
+
+
 class AddressesTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_empty_addresses(self):
         with self.assertRaisesRegex(ValueError, "needs a non-empty addresses list"):
@@ -5488,6 +5589,30 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
     async def connect(self, **kwargs):
         return await NanocachedClient.connect([("127.0.0.1", self.node.port)], **kwargs)
 
+    async def test_get_many_collapses_duplicate_keys_and_reads_each_once(self):
+        # A repeated key — the same str twice, or "a" and b"a", which
+        # encode identically — is read once and keyed by its first
+        # occurrence, as the other five SDKs do; it used to raise
+        # ValueError. One `m` frame carries the two distinct keys.
+        client = await self.connect()
+        try:
+            await client.set("a", "va")
+            await client.set("b", "vb")
+            self.node.multi_get_count = 0
+            self.assertEqual(
+                await client.get_many(["a", b"a", "a", "b", "b"]), {"a": "va", "b": "vb"}
+            )
+            self.assertEqual(self.node.multi_get_count, 1)
+            self.assertEqual(await client.get_many_bytes([b"a", "a"]), {b"a": b"va"})
+            # A list that is nothing but copies of one key costs one
+            # key's worth of request and reply.
+            self.node.multi_get_frame_sizes.clear()
+            self.assertEqual(await client.get_many(["a"] * 20_000), {"a": "va"})
+            self.assertEqual(len(self.node.multi_get_frame_sizes), 1)
+            self.assertLess(self.node.multi_get_frame_sizes[0], 64)
+        finally:
+            await client.close()
+
     async def test_get_many_mixes_hits_and_misses(self):
         client = await self.connect()
         try:
@@ -5561,11 +5686,14 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
-    async def test_duplicate_key_after_encoding_is_rejected(self):
+    async def test_duplicate_key_after_encoding_is_rejected_for_set_many_only(self):
+        # Two values for one encoded key is ambiguous, so set_many still
+        # refuses it; a repeated key in a read is collapsed (see
+        # test_get_many_collapses_duplicate_keys_and_reads_each_once).
         client = await self.connect()
         try:
-            with self.assertRaisesRegex(ValueError, "duplicate key after encoding"):
-                await client.get_many(["a", b"a"])
+            await client.set("a", "va")
+            self.assertEqual(await client.get_many(["a", b"a"]), {"a": "va"})
             with self.assertRaisesRegex(ValueError, "duplicate key after encoding"):
                 await client.set_many({"a": "1", b"a": "2"})
         finally:
@@ -5978,6 +6106,49 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
                 tail = replica.multi_get_frame_sizes[0]
                 self.assertLess(tail, sizes[0], f"the moved frame should carry only the tail: {sizes} / {tail}")
                 self.assertEqual(tail, sizes[1], f"the moved frame should equal the failed chunk: {sizes} / {tail}")
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_set_many_retries_only_the_legs_that_failed(self):
+        # One owner closes the connection on every `o`. The keys whose
+        # primary it is are retried after a refresh — but only to it:
+        # the other owner, which acknowledged every key as primary or
+        # replica in the first pass, used to be sent the retried keys a
+        # second time (duplicate traffic, and a chance to re-apply an
+        # older value over a newer concurrent write).
+        nodes, discovery = await self.start_cluster()
+        try:
+            good_name, bad_name = NAMES[0], NAMES[1]
+            good, bad = nodes[good_name], nodes[bad_name]
+            bad.fail_all_multi_sets = True
+            keys: list[str] = []
+            i = 0
+            while len(keys) < 12:
+                candidate = f"leg-{i}"
+                primary = self.owners_of(candidate)[0]
+                # Six keys per primary.
+                if sum(1 for k in keys if self.owners_of(k)[0] == primary) < 6:
+                    keys.append(candidate)
+                i += 1
+            values = {key: f"v-{key}" for key in keys}
+
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                with self.assertRaises(WrongNodeError):
+                    await client.set_many(values)
+                # The good owner saw one frame carrying all 12 keys and
+                # nothing more; the bad one saw the first pass and the
+                # retry of its six primary keys.
+                self.assertEqual(good.multi_set_key_counts, [12])
+                self.assertEqual(bad.multi_set_key_counts, [12, 6])
+                self.assertEqual(
+                    {k: v for k, v in good.store.items()},
+                    {k.encode(): v.encode() for k, v in values.items()},
+                )
             finally:
                 await client.close()
         finally:

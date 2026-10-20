@@ -75,10 +75,28 @@ def key_hash(namespace: bytes, key: bytes) -> int:
     # _MAX_REQUEST_BYTES), so this always fits a u32; the 4-byte
     # big-endian encoding is the canonical width every implementation
     # uses, not a truncation that could ever occur in practice.
+    return _fnv1a_continue(namespace_state(namespace), key)
+
+
+def namespace_state(namespace: bytes) -> int:
+    """The FNV-1a state after the namespace part of key_hash() —
+    ``be32(len(namespace)) || namespace`` for a named namespace, the
+    offset basis for the default one — which a key's own bytes then
+    continue from. FNV-1a is a streaming hash, so hashing the namespace
+    once per namespace and continuing per key gives the same value as
+    key_hash() while costing the namespace's bytes once rather than once
+    per key: a 900 KB namespace fed through this pure-Python loop costs
+    about 70 ms, and get_many/set_many used to pay it for every key of
+    the batch, on the event loop — 27 s for 400 keys."""
+    if not namespace:
+        return _FNV_OFFSET_BASIS
+    # A namespace is bounded by the request-size limit (see client.py's
+    # _MAX_REQUEST_BYTES), so this always fits a u32; the 4-byte
+    # big-endian encoding is the canonical width every implementation
+    # uses, not a truncation that could ever occur in practice.
     namespace_length = len(namespace).to_bytes(4, "big")
     value = _fnv1a_continue(_FNV_OFFSET_BASIS, namespace_length)
-    value = _fnv1a_continue(value, namespace)
-    return _fnv1a_continue(value, key)
+    return _fnv1a_continue(value, namespace)
 
 
 def fmix64(value: int) -> int:
@@ -110,13 +128,27 @@ class HashRing:
                 deduped.append(node)
         self._nodes = deduped
         self._node_hashes = [fnv1a(node.encode("utf-8")) for node in self._nodes]
+        # The last namespace looked up and its namespace_state(): the keys
+        # of one batch share a namespace, so each pays for its own bytes
+        # only. Compared by identity first (a namespace handle passes
+        # the same bytes object every time), then by value.
+        self._namespace_state: tuple[bytes, int] | None = None
+
+    def _key_hash(self, namespace: bytes, key: bytes) -> int:
+        """key_hash() with the namespace part computed once per
+        namespace change rather than per call — see namespace_state()."""
+        cached = self._namespace_state
+        if cached is None or (cached[0] is not namespace and cached[0] != namespace):
+            cached = (namespace, namespace_state(namespace))
+            self._namespace_state = cached
+        return _fnv1a_continue(cached[1], key)
 
     def owners(self, key: bytes, replicas: int, *, namespace: bytes = b"") -> list[str]:
         """The key's owners: the ``replicas`` highest-scoring nodes, primary
         first. Returns fewer when the cluster is smaller. ``namespace``
         defaults to the empty (default) namespace, which hashes
         byte-identically to the pre-namespace form — see key_hash()."""
-        hashed_key = key_hash(namespace, key)
+        hashed_key = self._key_hash(namespace, key)
         # Ranked as (-score, name) ascending: descending by score, ties
         # toward the lexicographically smaller name — a total order every
         # implementation agrees on.

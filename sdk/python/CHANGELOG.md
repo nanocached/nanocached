@@ -9,6 +9,28 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- A write whose bytes the node has not taken (a node that stopped
+  reading) no longer outlives the 30 s request deadline, and `close()`
+  no longer leaves such callers pending with their socket open: the
+  connection's transport is aborted when it is torn down with unsent
+  bytes, so callers blocked in the write fail at once. `close()` with
+  `fire_and_forget_replicas=True` therefore returns within the request
+  deadline when a replica has stopped reading, instead of never.
+- `set_many` in cluster mode retries only the legs that failed. A key
+  whose primary leg failed used to be re-sent to every owner after the
+  refresh, including the replica that had already acknowledged it.
+- `get_many`/`get_many_bytes` collapse a repeated key (the same key
+  twice, or `"a"` and `b"a"`, which encode identically) and read it
+  once, keyed by its first occurrence, as the other SDKs do, instead of
+  raising `ValueError`. A list of many copies of one key no longer
+  sends one `m` per 400 copies and retains one reply per chunk.
+  `set_many` still rejects two values for one encoded key.
+- A namespace is hashed once per batch rather than once per key:
+  `get_many`/`set_many` under a 900 KB namespace took 27 s for 400 keys
+  and blocked the event loop for the whole call.
+
 ## [0.4.7] - 2026-10-19
 
 ### Fixed

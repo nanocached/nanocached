@@ -1212,25 +1212,26 @@ class NanocachedClient:
     # Both str and bytes keys are accepted, matching every other method
     # on this client — the returned dict is keyed by whichever original
     # object the caller passed, indexed by position rather than by
-    # encoded bytes, so a batch may freely mix the two; because "a" and
-    # b"a" encode identically, a batch containing both is rejected
-    # up-front with ValueError rather than silently colliding.
+    # encoded bytes, so a batch may freely mix the two. A key given more
+    # than once (the same str twice, or "a" and b"a", which encode
+    # identically) is read once and keyed by its first occurrence: a
+    # batched read is a set query, which is what the other five SDKs
+    # do, and sending every copy to the node would also retain one
+    # reply per copy — 20,000 copies of one key naming a large value is
+    # 50 frames and hundreds of MB of replies for 60 KB of request.
 
     def _dedupe_batch_keys(
         self, keys: Sequence[str | bytes], namespace: bytes
     ) -> tuple[list[str | bytes], list[bytes]]:
         originals: list[str | bytes] = []
         key_bytes_list: list[bytes] = []
-        seen: dict[bytes, str | bytes] = {}
+        seen: set[bytes] = set()
         for original in keys:
             key_bytes = _to_bytes(original)
             _check_key(key_bytes, namespace)
             if key_bytes in seen:
-                raise ValueError(
-                    f"nanocached: duplicate key after encoding: {original!r} and "
-                    f"{seen[key_bytes]!r} both encode to {key_bytes!r}"
-                )
-            seen[key_bytes] = original
+                continue
+            seen.add(key_bytes)
             originals.append(original)
             key_bytes_list.append(key_bytes)
         return originals, key_bytes_list
@@ -1640,14 +1641,22 @@ class NanocachedClient:
                 raise WrongNodeError()
             return
 
+        # Which owners acknowledged which key, shared across both passes
+        # so the retry sends only the legs that failed: before this, a
+        # key whose primary leg failed was re-sent to every owner
+        # including the replica that had already stored it — duplicate
+        # traffic, and a chance to re-apply an older value over a newer
+        # concurrent write. get_many keeps its completed chunks the same
+        # way.
+        acknowledged: dict[int, set[str]] = {}
         retry = await self._multi_set_pass(
-            namespace, key_bytes_list, value_bytes_list, ttl_seconds, None
+            namespace, key_bytes_list, value_bytes_list, ttl_seconds, None, acknowledged
         )
         if not retry:
             return
         await self._maybe_refresh(force=True)
         retry = await self._multi_set_pass(
-            namespace, key_bytes_list, value_bytes_list, ttl_seconds, retry
+            namespace, key_bytes_list, value_bytes_list, ttl_seconds, retry, acknowledged
         )
         if retry:
             raise WrongNodeError()
@@ -1696,6 +1705,7 @@ class NanocachedClient:
         value_bytes_list: list[bytes],
         ttl_seconds: int,
         retry_indices: list[int] | None,
+        acknowledged: dict[int, set[str]],
     ) -> list[int]:
         """Runs one pass of set_many's cluster routing: for every key
         still needing resolution (every key, when retry_indices is None,
@@ -1711,7 +1721,13 @@ class NanocachedClient:
         _dispatch_replica_writes' stance for a single-key set(). A leg
         that is a pure replica for every key it holds is eligible for
         fire_and_forget_replicas, exactly like a single-key replica
-        write."""
+        write.
+
+        ``acknowledged`` (key index -> owner names that stored it) is
+        read and extended here: an owner that already acknowledged a key
+        in an earlier pass is not sent it again, so a retry carries only
+        the legs that failed. A key every current owner of which has
+        already acknowledged needs nothing more and is not retried."""
         indices = retry_indices if retry_indices is not None else list(range(len(key_bytes_list)))
 
         owners: dict[str, tuple[list[int], list[bool]]] = {}
@@ -1721,7 +1737,10 @@ class NanocachedClient:
             if not names:
                 retry.append(idx)
                 continue
+            done = acknowledged.get(idx, ())
             for rank, name in enumerate(names):
+                if name in done:
+                    continue
                 owner_indices, owner_is_primary = owners.setdefault(name, ([], []))
                 owner_indices.append(idx)
                 owner_is_primary.append(rank == 0)
@@ -1748,6 +1767,7 @@ class NanocachedClient:
             leg_retry: list[int] = []
             for idx, primary, entry in zip(leg_indices, is_primary, entries):
                 if entry is True:
+                    acknowledged.setdefault(idx, set()).add(name)
                     continue
                 # WRONG_NODE (a real per-key answer) or the untouched
                 # False default (this key's sub-chunk was never reached

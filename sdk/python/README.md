@@ -213,11 +213,14 @@ values = await client.get_many(["a", "b", "missing"])
 A missing key is simply absent from the returned dict, the same "a miss
 is not an error" shape `get`/`get_bytes` use. Keys may be `str` or
 `bytes`, freely mixed within one call — the result dict is keyed by
-whichever original object was passed in, not by its encoded bytes, so a
-batch containing both `"a"` and `b"a"` is rejected up front with
-`ValueError` rather than silently colliding. Both are also
-namespace-scoped: `client.namespace(ns).get_many(...)`/`.set_many(...)`,
-same as `get`/`set`.
+whichever original object was passed in, not by its encoded bytes. A
+key repeated in a `get_many` (the same key twice, or `"a"` and `b"a"`,
+which encode identically) is read once and keyed by its first
+occurrence, as in the other SDKs; `set_many` still rejects two values
+for one encoded key with `ValueError`, since which should win is
+ambiguous. Both are also namespace-scoped:
+`client.namespace(ns).get_many(...)`/`.set_many(...)`, same as
+`get`/`set`.
 
 **A batch never fails as a whole.** Each key's outcome is independent,
 and a batched read survives an unreachable owner the way a single `get`
