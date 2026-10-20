@@ -74,7 +74,11 @@ and alerting.</p>
 <code>nanocached_proxy_client_connections</code> against
 <code>…_client_connections_max</code> (plus CPU).
 <code>…_requests_total</code> and <code>…_upstream_failures_total</code>
-give request and error rates.</p>
+give request and error rates. <code>…_replica_refusals_total</code>
+counts replica legs of a write a node answered <code>W</code> or
+<code>E</code>: the client saw success, but that replica's copy is
+missing or stale until the next write — a rise after a membership
+change is the proxy-side trace of a stale owner.</p>
 <p><strong>Discovery</strong> exports roster sizes
 (<code>nanocached_discovery_members</code>, <code>…_proxies</code>,
 <code>…_waiting_nodes</code>, <code>…_joining_nodes</code>) and join

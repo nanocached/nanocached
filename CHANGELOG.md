@@ -12,6 +12,16 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Added
+
+- `nanocached-proxy` logs a replica leg of `S`/`D` (and of the result
+  write after `i`/`k`/`x`) that a node answered `W` or `E`, naming the
+  node, and counts every such leg in a new
+  `nanocached_proxy_replica_refusals_total` metric. Before, only a leg
+  that failed at the transport level or a multi-set leg left a line;
+  a refused leg changed nothing the client could see and nothing the
+  operator could see either (#719).
+
 ### Fixed
 
 - Text a user sees no longer carries issue numbers or references to
