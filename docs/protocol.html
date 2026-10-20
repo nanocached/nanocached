@@ -411,9 +411,12 @@ window is the same one the pre-tags protocol always had.</p>
     only): the key exists but its stored value isn't a decimal-ASCII
     <code>i64</code>, or applying <code>&lt;delta&gt;</code> would
     overflow one.</td></tr>
-    <tr><td><code>E\n</code></td><td>Error — authentication required or
-    failed, or the request was malformed. Usually followed by the server
-    closing the connection.</td></tr>
+    <tr><td><code>E\n</code></td><td>Error — <code>En\n</code> from a
+    node, <code>Ed\n</code> from a discovery server: a failed
+    <code>A</code>, a command sent before authentication (a discovery
+    server closes such a connection with no reply instead), or the
+    request was malformed. Usually followed by the server closing the
+    connection.</td></tr>
   </tbody>
 </table>
 </div>
@@ -457,12 +460,13 @@ one more line, <code>K\n</code> (still registered, or not known to be
 gone) or <code>G\n</code> (on record as having left, been evicted or
 abandoned, and not registered since), and on <code>G</code> the node
 abandons that handoff. A sender that put the field in must read that
-line. These are versioned with the
-server and not part of
-the public caching API, so the
+line. Two of these are part of what SDKs send and are frozen by the
+<a href="compatibility.html">compatibility policy</a> like the caching
+commands: <code>L</code> (the node list) and <code>Q</code> (the proxy
+list). The rest are versioned with the server and not part of the
+public caching API, so the
 <a href="compatibility.html#internal">compatibility policy</a> does not
-freeze them; the server
-source documents them in detail.</p>
+freeze them; the server source documents them in detail.</p>
 
 <h2 id="example">A complete session</h2>
 <pre><code>$ printf 'S 4 5\nnameAliceG 4\nname' | nc 127.0.0.1 8356

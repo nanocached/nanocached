@@ -38,8 +38,9 @@
       <h1><b>nano</b><span>cached</span></h1>
       <p class="tagline">A tiny distributed in-memory cache written in Rust.
       One small binary per role, a wire protocol you can read with
-      <code>nc</code>, and clients that do the clustering — no proxies,
-      no coordinators.</p>
+      <code>nc</code>, and clients that do the clustering themselves —
+      a discovery server only serves the node list, and a proxy is an
+      option for clients that cannot route.</p>
       <div class="actions">
         <a class="button primary" href="getting-started.html">Get started</a>
         <a class="button ghost" href="https://github.com/nanocached/nanocached">Source on GitHub</a>
@@ -48,20 +49,26 @@
   </section>
 
   <div class="warn"><b>Experimental.</b> nanocached is not ready for
-  production use yet. The protocol and APIs are stable within v1, but the
-  project is young — treat it accordingly.</div>
+  production use yet. The releases are 0.x: nothing is frozen before
+  1.0.0 (what it will promise is on the
+  <a href="compatibility.html">compatibility</a> page), and the project
+  is young — treat it accordingly.</div>
 
   <section class="feature-grid">
     <div class="feature">
       <h3>Small on purpose</h3>
       <p>An in-memory key-value store with <code>get</code> / <code>set</code> /
       <code>delete</code>, optional TTL, and LRU eviction under a memory
-      bound. Nothing else.</p>
+      bound — plus atomic counters, compare-and-set, batched get/set,
+      and namespaces with a clear. No persistence, no queries, no
+      scripting.</p>
     </div>
     <div class="feature">
       <h3>Client-side clustering</h3>
       <p>Clients route keys with rendezvous hashing over a node list served
-      by a lightweight discovery server. No proxy hop on the data path.</p>
+      by a lightweight discovery server. No proxy hop on the data path
+      unless you run the optional proxy for clients that cannot hold the
+      node list themselves.</p>
     </div>
     <div class="feature">
       <h3>Replication built in</h3>
