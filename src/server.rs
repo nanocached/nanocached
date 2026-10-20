@@ -695,6 +695,19 @@ struct NodeContext {
     /// yet (a joiner before promotion rejects everything regardless, see
     /// `promoted`).
     known_ring: KnownRing,
+    /// The newest roster discovery published to this node, as a ring,
+    /// whether or not `adopt_membership` took it: the heartbeat loop
+    /// adopts a change only on its next tick and not at all while a join
+    /// is pending here, and in that lag a client that already routes by
+    /// the new `L` reaches this node for a key it will own. `wrong_node`
+    /// accepts such a key (it never refuses one `known_ring` grants), so a
+    /// replica write in the window after a leave or an eviction is stored
+    /// instead of answered `W` and dropped by the SDK — the entrant used
+    /// to keep the re-replicated older copy for the key's lifetime.
+    latest_published: KnownRing,
+    /// The on-demand refresh of `latest_published` — see
+    /// `refresh_published_roster`.
+    roster_refresh: Arc<RosterRefresh>,
     /// Whether discovery has promoted this node (the `R` to its `J`, see
     /// `register_with_discovery`). Until then no client's `L` names this
     /// node, so a key request that reaches it anyway arrived on a
@@ -901,6 +914,8 @@ pub(crate) async fn run(
         discovery_addr: config.discovery_addrs[0].clone(),
         active_migration: Arc::clone(&active_migration),
         known_ring: Arc::clone(&known_ring),
+        latest_published: Arc::new(Mutex::new(None)),
+        roster_refresh: Arc::default(),
         promoted: Arc::new(AtomicBool::new(false)),
         auth_secret: config.auth_secret.clone(),
         tls_connector: config.tls_connector.clone(),
@@ -2309,7 +2324,7 @@ async fn handle_connection(
             }
             Ok((Command::Get { key }, tag)) => {
                 if let Some(node_context) = &config.node_context
-                    && wrong_node(node_context, &key)
+                    && wrong_node_refreshed(node_context, &key).await
                 {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
@@ -2338,14 +2353,17 @@ async fn handle_connection(
                 // be ~1 MiB, so its share of the key hash is computed once
                 // (`KeyHasher`), not per key.
                 let mut hasher = KeyHasher::default();
+                let hashes: Vec<KeyHash> = keys
+                    .iter()
+                    .map(|name| hasher.hash(&Key::new(namespace.clone(), name.clone())))
+                    .collect();
+                let wrong = match &config.node_context {
+                    Some(node_context) => wrong_nodes_refreshed(node_context, &hashes).await,
+                    None => vec![false; keys.len()],
+                };
 
                 for (position, name) in keys.into_iter().enumerate() {
-                    let wrong = config.node_context.as_ref().is_some_and(|node_context| {
-                        let key_hash = hasher.hash(&Key::new(namespace.clone(), name.clone()));
-                        wrong_node_hashed(node_context, key_hash)
-                    });
-
-                    if wrong {
+                    if wrong[position] {
                         entries[position] = Some(MultiEntry::WrongNode);
                     } else {
                         owned_positions.push(position);
@@ -2401,14 +2419,17 @@ async fn handle_connection(
                 // See `MultiGet`'s arm: the namespace's share of each key's
                 // hash is computed once per frame.
                 let mut hasher = KeyHasher::default();
+                let hashes: Vec<KeyHash> = keys
+                    .iter()
+                    .map(|name| hasher.hash(&Key::new(namespace.clone(), name.clone())))
+                    .collect();
+                let wrong = match &config.node_context {
+                    Some(node_context) => wrong_nodes_refreshed(node_context, &hashes).await,
+                    None => vec![false; keys.len()],
+                };
 
                 for (position, (name, value)) in keys.into_iter().zip(values).enumerate() {
-                    let wrong = config.node_context.as_ref().is_some_and(|node_context| {
-                        let key_hash = hasher.hash(&Key::new(namespace.clone(), name.clone()));
-                        wrong_node_hashed(node_context, key_hash)
-                    });
-
-                    if wrong {
+                    if wrong[position] {
                         entries[position] = Some(MultiAckEntry::WrongNode);
                     } else {
                         owned_positions.push(position);
@@ -2556,7 +2577,7 @@ async fn handle_connection(
             }
             Ok((Command::Set { key, value, ttl }, tag)) => {
                 if let Some(node_context) = &config.node_context
-                    && wrong_node(node_context, &key)
+                    && wrong_node_refreshed(node_context, &key).await
                 {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
@@ -2820,7 +2841,7 @@ async fn handle_connection(
             }
             Ok((Command::Delete { key }, tag)) => {
                 if let Some(node_context) = &config.node_context
-                    && wrong_node(node_context, &key)
+                    && wrong_node_refreshed(node_context, &key).await
                 {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
@@ -2859,7 +2880,7 @@ async fn handle_connection(
             }
             Ok((Command::Incr { key, delta }, tag)) => {
                 if let Some(node_context) = &config.node_context
-                    && not_the_primary(node_context, &key)
+                    && not_the_primary_refreshed(node_context, &key).await
                 {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
@@ -2931,7 +2952,7 @@ async fn handle_connection(
                 tag,
             )) => {
                 if let Some(node_context) = &config.node_context
-                    && not_the_primary(node_context, &key)
+                    && not_the_primary_refreshed(node_context, &key).await
                 {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
@@ -3002,7 +3023,7 @@ async fn handle_connection(
                 tag,
             )) => {
                 if let Some(node_context) = &config.node_context
-                    && not_the_primary(node_context, &key)
+                    && not_the_primary_refreshed(node_context, &key).await
                 {
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
@@ -3834,6 +3855,11 @@ async fn register_with_discovery(
                                 && matches!(role, DiscoveryRole::Primary(_))
                             {
                                 let published = members.clone();
+                                note_published_roster(
+                                    &node_context.latest_published,
+                                    &published,
+                                    replication,
+                                );
                                 let change = adopt_membership(
                                     &node_context.known_ring,
                                     &node_context.active_migration,
@@ -4293,6 +4319,24 @@ fn published_membership(
 }
 
 /// What `adopt_membership` actually applied — see its own doc comment.
+/// Records the roster discovery just published as `NodeContext::latest_published`,
+/// ahead of (and regardless of) its adoption — see that field.
+fn note_published_roster(latest_published: &KnownRing, roster: &[String], replication: usize) {
+    let mut latest = latest_published
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if latest
+        .as_ref()
+        .is_some_and(|current| same_members(current, roster, replication))
+    {
+        return;
+    }
+    *latest = Some(Arc::new(Membership {
+        ring: Arc::new(HashRing::new(roster.to_vec())),
+        replication,
+    }));
+}
+
 struct RingChange {
     before: Option<Arc<Membership>>,
     after: Arc<Membership>,
@@ -8603,6 +8647,108 @@ async fn forward_with_retries(
 /// over a connection a client opened to this address under an evicted
 /// member's name, and a `W` — not a local `N` for a key the handoff hasn't
 /// delivered yet — is what sends it to refresh and retry elsewhere.
+/// How often `refresh_published_roster` asks discovery at most, and how
+/// long one ask may take. A refresh happens only for a key the adopted
+/// ring does not grant — in steady state a client with a stale list — so
+/// a flood of such keys costs one fetch a second, and a key answered
+/// while one is in flight waits for that fetch rather than starting its
+/// own.
+const ROSTER_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
+const ROSTER_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// State of `refresh_published_roster`: one fetch in flight at a time,
+/// and when the last one finished (whether or not it succeeded).
+#[derive(Default)]
+struct RosterRefresh {
+    in_flight: AsyncMutex<()>,
+    last: Mutex<Option<Instant>>,
+}
+
+impl RosterRefresh {
+    fn cooling_down(&self) -> bool {
+        self.last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some_and(|at| at.elapsed() < ROSTER_REFRESH_COOLDOWN)
+    }
+}
+
+/// Brings `NodeContext::latest_published` up to what discovery publishes
+/// now, by asking it (`T`), when the last ask is older than
+/// `ROSTER_REFRESH_COOLDOWN`. The heartbeat loop learns a membership
+/// change only on its next tick, up to `HEARTBEAT_INTERVAL` after
+/// discovery published it — and withholds adopting it for as long as a
+/// join is pending here — while a client that fetched `L` in between
+/// already routes by it; asked for a key it does not own under its
+/// adopted ring, this node asks discovery before answering `W`. Bounded
+/// by `ROSTER_REFRESH_TIMEOUT`; a failed or slow ask leaves the view as
+/// it was and starts the cooldown too, so an unreachable discovery costs
+/// a misrouted key one bounded wait a second, not one each.
+async fn refresh_published_roster(node_context: &NodeContext) {
+    let refresh = &node_context.roster_refresh;
+    if refresh.cooling_down() {
+        return;
+    }
+    let _in_flight = refresh.in_flight.lock().await;
+    // The fetch that was in flight while this waited counts for it.
+    if refresh.cooling_down() {
+        return;
+    }
+    let fetched = timeout(
+        ROSTER_REFRESH_TIMEOUT,
+        fetch_roster_once(node_context, &node_context.discovery_addr),
+    )
+    .await;
+    *refresh
+        .last
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+    if let Ok(Ok((members, replication))) = fetched {
+        let names: Vec<String> = members.into_iter().map(|(name, _, _)| name).collect();
+        note_published_roster(&node_context.latest_published, &names, replication);
+    }
+}
+
+/// `wrong_node` for a request that will be answered `W` if it holds:
+/// before it is, the published roster is refreshed
+/// (`refresh_published_roster`) and the key judged again, so a key this
+/// node owns under what discovery publishes now is served rather than
+/// refused. A node discovery has not promoted yet refuses without
+/// asking: nothing discovery publishes grants it a key.
+async fn wrong_node_refreshed(node_context: &NodeContext, key: &Key) -> bool {
+    let key_hash = KeyHash::of(key);
+    if !wrong_node_hashed(node_context, key_hash) {
+        return false;
+    }
+    if !node_context.promoted.load(Ordering::SeqCst) {
+        return true;
+    }
+    refresh_published_roster(node_context).await;
+    wrong_node_hashed(node_context, key_hash)
+}
+
+/// `wrong_node_refreshed` for the keys of one `m`/`o` frame: one refresh
+/// for the frame if any key came out wrong, then those keys judged again.
+async fn wrong_nodes_refreshed(node_context: &NodeContext, hashes: &[KeyHash]) -> Vec<bool> {
+    let mut wrong: Vec<bool> = hashes
+        .iter()
+        .map(|hash| wrong_node_hashed(node_context, *hash))
+        .collect();
+    if wrong.iter().any(|wrong| *wrong) && node_context.promoted.load(Ordering::SeqCst) {
+        refresh_published_roster(node_context).await;
+        for (wrong, hash) in wrong.iter_mut().zip(hashes) {
+            if *wrong {
+                *wrong = wrong_node_hashed(node_context, *hash);
+            }
+        }
+    }
+    wrong
+}
+
+/// `wrong_node_hashed` by key — what the request arms used before every
+/// `W` came to ask discovery first (`wrong_node_refreshed`); tests still
+/// judge a key by the rings alone with it.
+#[cfg(test)]
 fn wrong_node(node_context: &NodeContext, key: &Key) -> bool {
     wrong_node_hashed(node_context, KeyHash::of(key))
 }
@@ -8622,6 +8768,12 @@ fn wrong_node(node_context: &NodeContext, key: &Key) -> bool {
 /// The unconfirmed-join exception stays as it is: until discovery lists
 /// the joiner, clients cannot route to it, so the displaced node keeps
 /// serving exactly what `wrong_node` lets it serve.
+///
+/// Judged by the adopted ring when it grants the key at all, and by the
+/// newest published ring (`NodeContext::latest_published`) when only
+/// that one does — the entrant after a leave or an eviction, whose own
+/// ring still lags: it is the key's primary under what discovery
+/// publishes, and the client already routes by it.
 fn not_the_primary(node_context: &NodeContext, key: &Key) -> bool {
     let key_hash = KeyHash::of(key);
     if wrong_node_hashed(node_context, key_hash) {
@@ -8630,17 +8782,45 @@ fn not_the_primary(node_context: &NodeContext, key: &Key) -> bool {
     if serving_locally_for_unconfirmed_join(node_context, key_hash) {
         return false;
     }
-    let primary = node_context
+    let primary_under = |membership: &Membership| {
+        membership
+            .ring
+            .is_owner_hashed(key_hash, &node_context.name, 1)
+    };
+    let adopted = node_context
         .known_ring
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(adopted) = adopted else {
+        return false; // no ring adopted: everything is this node's, as for a plain write
+    };
+    if adopted
+        .ring
+        .is_owner_hashed(key_hash, &node_context.name, adopted.replication)
+    {
+        return !primary_under(&adopted);
+    }
+    !node_context
+        .latest_published
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
-        .is_none_or(|membership| {
-            membership
-                .ring
-                .is_owner_hashed(key_hash, &node_context.name, 1)
-        });
-    !primary
+        .is_some_and(|published| primary_under(published))
+}
+
+/// `not_the_primary` for a request that will be answered `W` if it
+/// holds: the published roster is refreshed first, as
+/// `wrong_node_refreshed` does for a plain write.
+async fn not_the_primary_refreshed(node_context: &NodeContext, key: &Key) -> bool {
+    if !not_the_primary(node_context, key) {
+        return false;
+    }
+    if !node_context.promoted.load(Ordering::SeqCst) {
+        return true;
+    }
+    refresh_published_roster(node_context).await;
+    not_the_primary(node_context, key)
 }
 
 /// Issue #601: whether this node owns `key` under the membership it has
@@ -8684,7 +8864,29 @@ fn wrong_node_hashed(node_context: &NodeContext, key_hash: KeyHash) -> bool {
                 .is_owner_hashed(key_hash, &node_context.name, membership.replication)
         });
 
-    displaced && !serving_locally_for_unconfirmed_join(node_context, key_hash)
+    displaced
+        && !serving_locally_for_unconfirmed_join(node_context, key_hash)
+        && !owns_under_latest_published(node_context, key_hash)
+}
+
+/// Whether this node owns the key under the newest roster discovery
+/// published (`NodeContext::latest_published`), which the adopted ring
+/// may lag by up to a heartbeat — longer while a join is pending here.
+/// Only ever widens what this node accepts: a key the adopted ring grants
+/// is never re-examined, and the key is served from this node's own store
+/// either way (a copy it does not hold yet is a miss, as for any new
+/// owner until re-replication).
+fn owns_under_latest_published(node_context: &NodeContext, key_hash: KeyHash) -> bool {
+    node_context
+        .latest_published
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|membership| {
+            membership
+                .ring
+                .is_owner_hashed(key_hash, &node_context.name, membership.replication)
+        })
 }
 
 /// `wrong_node`'s exception: a handoff this node ran is still forwarding
@@ -9139,6 +9341,8 @@ mod tests {
             discovery_addr,
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: Some(Bytes::from_static(b"shared-secret")),
             tls_connector: None,
@@ -9497,6 +9701,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: Some(Bytes::from_static(b"shared-secret")),
             tls_connector: None,
@@ -9588,6 +9794,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -9671,6 +9879,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -9750,6 +9960,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -9823,6 +10035,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -9920,6 +10134,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -10047,6 +10263,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -10198,6 +10416,8 @@ mod tests {
                 remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -10347,6 +10567,8 @@ mod tests {
                 remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -11556,6 +11778,290 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
+    /// A key that `ring` ranks `node` at `rank` (1 = primary) for, and
+    /// that `other_ring` does not rank it among `other_r` owners for.
+    fn key_owned_only_under(
+        ring: &HashRing,
+        node: &str,
+        r: usize,
+        other: &HashRing,
+        other_r: usize,
+    ) -> Key {
+        (0..10_000)
+            .map(|i| key(format!("key-{i}").as_bytes()))
+            .find(|k| ring.is_owner(k, node, r) && !other.is_owner(k, node, other_r))
+            .expect("some key is owned only under the first ring")
+    }
+
+    #[test]
+    fn a_key_this_node_owns_only_under_the_newest_published_ring_is_not_refused() {
+        // After a leave or an eviction discovery publishes the shrunken
+        // roster at once; this node adopts it on its next heartbeat tick.
+        // A client that already routes by the new `L` must not be told
+        // `W` for a key this node is about to own.
+        let adopted = membership_of(&["a", "b", "c"], 2);
+        let published = membership_of(&["b", "c"], 2);
+        let theirs = key_owned_only_under(&published.ring, "c", 2, &adopted.ring, 2);
+        let node_context = test_node_context(
+            "c",
+            "tk-c",
+            Arc::new(Mutex::new(Some(Arc::clone(&adopted)))),
+            Arc::new(Mutex::new(None)),
+        );
+
+        assert!(
+            wrong_node(&node_context, &theirs),
+            "stale adopted ring alone refuses"
+        );
+        note_published_roster(
+            &node_context.latest_published,
+            &["b".to_string(), "c".to_string()],
+            2,
+        );
+        assert!(
+            !wrong_node(&node_context, &theirs),
+            "owned under the published ring"
+        );
+
+        // The published ring only ever widens what is accepted. With a
+        // join published instead (a new member takes keys from this
+        // node), a key the adopted ring still grants is accepted, and a
+        // key neither ring grants is still refused.
+        let adopted = membership_of(&["b", "c"], 1);
+        let published = membership_of(&["a", "b", "c"], 1);
+        let node_context = test_node_context(
+            "c",
+            "tk-c",
+            Arc::new(Mutex::new(Some(Arc::clone(&adopted)))),
+            Arc::new(Mutex::new(None)),
+        );
+        note_published_roster(
+            &node_context.latest_published,
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            1,
+        );
+        let only_adopted = key_owned_only_under(&adopted.ring, "c", 1, &published.ring, 1);
+        assert!(!wrong_node(&node_context, &only_adopted));
+        let neither = (0..10_000)
+            .map(|i| key(format!("key-{i}").as_bytes()))
+            .find(|k| !adopted.ring.is_owner(k, "c", 1) && !published.ring.is_owner(k, "c", 1))
+            .expect("some key is owned by neither");
+        assert!(wrong_node(&node_context, &neither));
+    }
+
+    #[test]
+    fn note_published_roster_keeps_the_ring_it_has_for_an_unchanged_roster() {
+        let latest: KnownRing = Arc::new(Mutex::new(None));
+        note_published_roster(&latest, &["a".to_string(), "b".to_string()], 2);
+        let first = latest.lock().unwrap().clone().expect("recorded");
+        note_published_roster(&latest, &["b".to_string(), "a".to_string()], 2);
+        assert!(Arc::ptr_eq(
+            &first,
+            latest.lock().unwrap().as_ref().unwrap()
+        ));
+        note_published_roster(&latest, &["b".to_string()], 2);
+        assert!(!Arc::ptr_eq(
+            &first,
+            latest.lock().unwrap().as_ref().unwrap()
+        ));
+        assert_eq!(
+            latest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ring
+                .route(&key(b"any")),
+            "b"
+        );
+    }
+
+    /// A discovery server that answers every `T` with `roster` (names,
+    /// addresses, tokens) at replication `r`, counting the asks.
+    async fn fake_discovery_serving(
+        roster: Vec<(&'static str, &'static str, &'static str)>,
+        replication: usize,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let asks = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&asks);
+        let serving = tokio::spawn(async move {
+            loop {
+                let Ok((connection, _)) = listener.accept().await else {
+                    return;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut connection = tokio::io::BufReader::new(connection);
+                let mut header = Vec::new();
+                if read_line_capped(&mut connection, 4096, &mut header)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let header = String::from_utf8_lossy(&header).into_owned();
+                let lengths: Vec<usize> = header
+                    .trim_end()
+                    .trim_start_matches("T ")
+                    .split(' ')
+                    .map(|part| part.parse().unwrap())
+                    .collect();
+                let mut body = vec![0_u8; lengths[0] + lengths[1]];
+                if connection.read_exact(&mut body).await.is_err() {
+                    continue;
+                }
+                let mut response = format!("N {} {replication}\n", roster.len()).into_bytes();
+                for (name, address, token) in &roster {
+                    response.extend_from_slice(
+                        format!(
+                            "{} {} {}\n{name}{address}{token}\n",
+                            name.len(),
+                            address.len(),
+                            token.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+                let _ = connection.get_mut().write_all(&response).await;
+            }
+        });
+        (addr, asks, serving)
+    }
+
+    /// `handle_connection` for node "c" whose adopted ring still lists
+    /// "a", against a discovery that publishes `roster`; sends `S` for
+    /// `theirs` and returns the first reply byte(s) and the dispatched
+    /// request, if any.
+    async fn write_as_c_with_published(
+        roster: Vec<(&'static str, &'static str, &'static str)>,
+        theirs: &Key,
+    ) -> (Vec<u8>, usize) {
+        let (discovery_addr, asks, serving) = fake_discovery_serving(roster, 2).await;
+        let mut node_context = test_node_context(
+            "c",
+            "tk-c",
+            Arc::new(Mutex::new(Some(membership_of(&["a", "b", "c"], 2)))),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.discovery_addr = discovery_addr;
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        let n = theirs.name.len();
+        client
+            .write_all(format!("S {n} 1\n{}v", String::from_utf8_lossy(&theirs.name)).as_bytes())
+            .await
+            .unwrap();
+        // Either the write is dispatched (answer it `S`) or `W` comes
+        // back; both bounded, so a hang is a failure rather than a wait.
+        let dispatched = tokio::select! {
+            request = request_rx.recv() => {
+                let request = request.unwrap();
+                assert!(matches!(request.command, Command::Set { .. }));
+                request.response_tx.send(Response::Stored).unwrap();
+                true
+            }
+            _ = tokio::time::sleep(Duration::from_secs(3)) => false,
+        };
+        let mut reply = vec![0_u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("a reply within 5 s")
+            .unwrap();
+        assert_eq!(dispatched, reply == b"S\n", "{reply:?}");
+
+        shutdown_tx.send_replace(true);
+        connection_task.await.unwrap().unwrap();
+        serving.abort();
+        (reply, asks.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_for_a_key_this_node_owns_under_the_roster_discovery_publishes_now_is_stored() {
+        // "a" left; discovery publishes {b, c} at once while c's own ring
+        // still lists a (its next heartbeat is up to 5 s away). A client
+        // that routes by the fresh list writes to c, and c asks discovery
+        // before refusing — one ask — and stores the write.
+        let adopted = membership_of(&["a", "b", "c"], 2);
+        let published = membership_of(&["b", "c"], 2);
+        let theirs = key_owned_only_under(&published.ring, "c", 2, &adopted.ring, 2);
+        let roster = vec![("b", "127.0.0.1:1", "tk-b"), ("c", "127.0.0.1:2", "tk-c")];
+        let (reply, asks) = write_as_c_with_published(roster, &theirs).await;
+        assert_eq!(reply, b"S\n");
+        assert_eq!(asks, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_for_a_key_discovery_does_not_grant_this_node_either_is_still_refused() {
+        // Discovery still publishes {a, b, c}: the ask changes nothing and
+        // the misrouted write is refused as before.
+        let adopted = membership_of(&["a", "b", "c"], 2);
+        let theirs = (0..10_000)
+            .map(|i| key(format!("key-{i}").as_bytes()))
+            .find(|k| !adopted.ring.is_owner(k, "c", 2))
+            .expect("some key c does not own");
+        let roster = vec![
+            ("a", "127.0.0.1:1", "tk-a"),
+            ("b", "127.0.0.1:2", "tk-b"),
+            ("c", "127.0.0.1:3", "tk-c"),
+        ];
+        let (reply, asks) = write_as_c_with_published(roster, &theirs).await;
+        assert_eq!(reply, b"W\n");
+        assert_eq!(asks, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_roster_refresh_asks_discovery_at_most_once_per_cooldown() {
+        let roster = vec![("b", "127.0.0.1:1", "tk-b"), ("c", "127.0.0.1:2", "tk-c")];
+        let (discovery_addr, asks, serving) = fake_discovery_serving(roster, 2).await;
+        let mut node_context = test_node_context(
+            "c",
+            "tk-c",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.discovery_addr = discovery_addr;
+        let node_context = Arc::new(node_context);
+
+        // Concurrent refreshes share one ask; later ones inside the
+        // cooldown ask nothing.
+        let first = {
+            let node_context = Arc::clone(&node_context);
+            tokio::spawn(async move { refresh_published_roster(&node_context).await })
+        };
+        refresh_published_roster(&node_context).await;
+        first.await.unwrap();
+        refresh_published_roster(&node_context).await;
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
+        assert!(
+            node_context
+                .latest_published
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|m| m.ring.route(&key(b"any")) != "a")
+        );
+        serving.abort();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn handle_connection_rejects_an_incorrect_auth_secret() {
         let (mut client, server) = tcp_pair().await;
@@ -12311,6 +12817,8 @@ mod tests {
                 remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -12578,6 +13086,8 @@ mod tests {
             discovery_addr,
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -12684,6 +13194,8 @@ mod tests {
                 ring: Arc::new(HashRing::new(vec!["other".to_string()])),
                 replication: 1,
             })))),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -12753,6 +13265,8 @@ mod tests {
                 ring: Arc::new(HashRing::new(vec!["other".to_string()])),
                 replication: 1,
             })))),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -12840,6 +13354,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(Some(active_migration))),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -13021,6 +13537,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -13776,6 +14294,8 @@ mod tests {
                 remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -13907,6 +14427,8 @@ mod tests {
                 remnant: false,
             }))),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -14021,6 +14543,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -14151,6 +14675,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -14283,6 +14809,8 @@ mod tests {
             // the `MultiSet` has already left `handle_connection`.
             active_migration: Arc::clone(&active_migration),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -14434,6 +14962,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -14768,6 +15298,8 @@ mod tests {
             discovery_addr: "127.0.0.1:1".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -14935,6 +15467,8 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -15027,6 +15561,8 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -15122,6 +15658,8 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -15219,6 +15757,8 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::clone(&active_migration),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -15360,6 +15900,8 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -15622,6 +16164,8 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: Some(Bytes::from_static(b"shared-secret")),
             tls_connector: None,
@@ -15820,6 +16364,8 @@ mod tests {
             discovery_addr,
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -16112,6 +16658,8 @@ mod tests {
                 ring: Arc::new(stale_belief),
                 replication,
             })))),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -16348,6 +16896,8 @@ mod tests {
             discovery_addr: "d".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -16720,6 +17270,8 @@ mod tests {
                 ring: Arc::clone(&after_ring),
                 replication: 2,
             })))),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -16792,6 +17344,69 @@ mod tests {
         // Not promoted yet: nothing is, as for a plain write.
         node_context.promoted.store(false, Ordering::SeqCst);
         assert!(not_the_primary(&node_context, &mine));
+    }
+
+    #[test]
+    fn counters_and_cas_follow_the_primary_of_the_newest_published_ring_when_only_it_grants_the_key()
+     {
+        // "a" left; discovery publishes the shrunken roster while c's
+        // adopted ring still lists a. Rendezvous ranks keep their order
+        // when a member goes, so a key c did not own at R = 2 is one it
+        // follows b on at R = 2 after the leave — a replica, so not c's to
+        // run `i`/`k`/`x` for — while at R = 1 a key a led and c ranked
+        // second on becomes c's own, and c is its primary under the
+        // published ring.
+        let as_replica = |published_known: bool| {
+            let adopted = membership_of(&["a", "b", "c"], 2);
+            let published = membership_of(&["b", "c"], 2);
+            let node_context = test_node_context(
+                "c",
+                "tk-c",
+                Arc::new(Mutex::new(Some(Arc::clone(&adopted)))),
+                Arc::new(Mutex::new(None)),
+            );
+            if published_known {
+                note_published_roster(
+                    &node_context.latest_published,
+                    &["b".to_string(), "c".to_string()],
+                    2,
+                );
+            }
+            let theirs = (0..10_000)
+                .map(|i| key(format!("key-{i}").as_bytes()))
+                .find(|k| !adopted.ring.is_owner(k, "c", 2) && published.ring.is_owner(k, "c", 2))
+                .expect("some key c follows b on after the leave");
+            assert!(
+                !published.ring.is_owner(&theirs, "c", 1),
+                "never the primary"
+            );
+            not_the_primary(&node_context, &theirs)
+        };
+        assert!(as_replica(false));
+        assert!(
+            as_replica(true),
+            "a replica under the published ring is still not the primary"
+        );
+
+        let adopted = membership_of(&["a", "b", "c"], 1);
+        let published = membership_of(&["b", "c"], 1);
+        let node_context = test_node_context(
+            "c",
+            "tk-c",
+            Arc::new(Mutex::new(Some(Arc::clone(&adopted)))),
+            Arc::new(Mutex::new(None)),
+        );
+        let now_its_own = (0..10_000)
+            .map(|i| key(format!("key-{i}").as_bytes()))
+            .find(|k| !adopted.ring.is_owner(k, "c", 1) && published.ring.is_owner(k, "c", 1))
+            .expect("some key c leads only under the published ring");
+        assert!(not_the_primary(&node_context, &now_its_own));
+        note_published_roster(
+            &node_context.latest_published,
+            &["b".to_string(), "c".to_string()],
+            1,
+        );
+        assert!(!not_the_primary(&node_context, &now_its_own));
     }
 
     #[test]
@@ -17048,6 +17663,8 @@ mod tests {
             discovery_addr: "127.0.0.1:1".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -17473,6 +18090,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: slot,
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -17890,6 +18509,8 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    latest_published: Arc::new(Mutex::new(None)),
+                    roster_refresh: Arc::default(),
                     promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
@@ -18036,6 +18657,8 @@ mod tests {
                     discovery_addr: "127.0.0.1:1".to_string(),
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    latest_published: Arc::new(Mutex::new(None)),
+                    roster_refresh: Arc::default(),
                     promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
@@ -18170,6 +18793,8 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    latest_published: Arc::new(Mutex::new(None)),
+                    roster_refresh: Arc::default(),
                     promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
@@ -18297,6 +18922,8 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    latest_published: Arc::new(Mutex::new(None)),
+                    roster_refresh: Arc::default(),
                     promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
@@ -18482,6 +19109,8 @@ mod tests {
             discovery_addr: "127.0.0.1:1".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -18602,6 +19231,8 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::clone(&active_migration),
                     known_ring: Arc::new(Mutex::new(None)),
+                    latest_published: Arc::new(Mutex::new(None)),
+                    roster_refresh: Arc::default(),
                     promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
@@ -18762,6 +19393,8 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    latest_published: Arc::new(Mutex::new(None)),
+                    roster_refresh: Arc::default(),
                     promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
@@ -18951,6 +19584,8 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    latest_published: Arc::new(Mutex::new(None)),
+                    roster_refresh: Arc::default(),
                     promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
@@ -19090,6 +19725,8 @@ mod tests {
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
+                    latest_published: Arc::new(Mutex::new(None)),
+                    roster_refresh: Arc::default(),
                     promoted: Arc::new(AtomicBool::new(true)),
                     auth_secret: None,
                     tls_connector: None,
@@ -19839,6 +20476,8 @@ mod tests {
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration,
             known_ring,
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -20094,6 +20733,8 @@ mod tests {
                 discovery_addr: discovery_addr.clone(),
                 active_migration: Arc::new(Mutex::new(None)),
                 known_ring: Arc::new(Mutex::new(None)),
+                latest_published: Arc::new(Mutex::new(None)),
+                roster_refresh: Arc::default(),
                 promoted: Arc::new(AtomicBool::new(true)),
                 auth_secret: None,
                 tls_connector: None,
@@ -20647,6 +21288,8 @@ mod tests {
             discovery_addr: discovery_addr.clone(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(true)),
             auth_secret: None,
             tls_connector: None,
@@ -21303,6 +21946,8 @@ mod tests {
                 ring: Arc::clone(&after_ring),
                 replication: 2,
             })))),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
             promoted: Arc::new(AtomicBool::new(false)),
             auth_secret: None,
             tls_connector: None,

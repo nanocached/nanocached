@@ -59,6 +59,16 @@ framework adapters at one version, whether or not a component changed.
   and reads the client's bytes away, briefly, so the close is a FIN that
   follows the `B` (#663).
 - Text a user sees no longer carries issue numbers or references to
+- `nanocached-node` asks discovery for the current member list before
+  answering `W` for a key its own ring does not grant (at most once a
+  second, each ask bounded at a second), and serves the key when the
+  published list makes it an owner. A node's ring followed discovery
+  only on its next heartbeat — up to 5 s after a leave or an eviction
+  was published, and not at all while a join was pending on the node —
+  so a client that already routed by the new list had its write to the
+  new owner refused; the SDKs drop a refused replica leg, and the owner
+  kept the older copy it had been re-replicated for the key's lifetime
+  (#681; the kill-window stale owners of #689 are the same refusal). or references to
   documentation sections that do not exist: the `/metrics` HELP lines
   for `connections_max`, `incrs_total`, `cas_sets_total`,
   `cas_deletes_total` and `namespace_budget_bytes`, five discovery
