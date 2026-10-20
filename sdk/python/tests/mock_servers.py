@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import socket
 
 
 def _digest(value: bytes) -> str:
@@ -73,6 +74,15 @@ class MockNode:
         # stage (T R -> T) as opposed to close_on_extended_auth's oldest-
         # server stage (T -> plain).
         self.close_on_retryable_auth = close_on_retryable_auth
+        # A node that completes the handshake and then never reads: the
+        # peer's receive window closes once its buffers fill, so a
+        # client's large writes stay unsent in its own transport. Pair
+        # with start(recv_buffer=...) so the kernel absorbs little.
+        self.stop_reading_after_handshake = False
+        self._stopped = asyncio.Event()
+        # A node that closes the connection on every `o` it receives
+        # (not just the next one, as fail_multi_set_after does).
+        self.fail_all_multi_sets = False
         self.connection_count = 0
         # Retryable-error status `R` (issue #125): the exact `A` header
         # line received on the most recent connection (without the
@@ -125,6 +135,8 @@ class MockNode:
         # more than one frame went out.
         self.multi_get_frame_sizes: list[int] = []
         self.multi_set_frame_sizes: list[int] = []
+        # Keys per `o` frame received, in order.
+        self.multi_set_key_counts: list[int] = []
         # issue #411: closes the connection instead of replying to the
         # `m`/`o` request that arrives after this many have already been
         # answered normally — simulates a connection drop on a chunked
@@ -374,10 +386,22 @@ class MockNode:
         of the same name."""
         self._silent = True
 
-    async def start(self, port: int = 0) -> "MockNode":
+    async def start(self, port: int = 0, recv_buffer: int | None = None) -> "MockNode":
         """``port`` pins the listener — for a node that comes back on the
-        address discovery already advertised (issue #67 tests)."""
-        self._server = await asyncio.start_server(self._serve, "127.0.0.1", port)
+        address discovery already advertised (issue #67 tests).
+        ``recv_buffer`` sets SO_RCVBUF on the listener before it listens,
+        which accepted connections inherit — for a node that stops
+        reading, so the kernel absorbs only a few KB of what a client
+        writes."""
+        if recv_buffer is None:
+            self._server = await asyncio.start_server(self._serve, "127.0.0.1", port)
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, recv_buffer)
+            sock.bind(("127.0.0.1", port))
+            sock.listen(128)
+            sock.setblocking(False)
+            self._server = await asyncio.start_server(self._serve, sock=sock)
         self.port = self._server.sockets[0].getsockname()[1]
         return self
 
@@ -387,6 +411,7 @@ class MockNode:
             writer.close()
 
     async def close(self) -> None:
+        self._stopped.set()
         self.drop_connections()
         if self._server is not None:
             self._server.close()
@@ -458,6 +483,9 @@ class MockNode:
                     writer.write(b"OnT\n" if tagged else (b"On\n" if accepted else b"En\n"))
                     await writer.drain()
                     if not accepted:
+                        return
+                    if self.stop_reading_after_handshake:
+                        await self._stopped.wait()
                         return
 
                 elif parts[0] in (b"G", b"g"):
@@ -873,8 +901,12 @@ class MockNode:
                     self.multi_set_frame_sizes.append(
                         len(header) + len(namespace) + sum(key_lengths) + sum(value_lengths)
                     )
+                    self.multi_set_key_counts.append(count)
                     if self._silent:
                         continue
+                    if self.fail_all_multi_sets:
+                        writer.close()
+                        return
                     if self._multi_set_fail_after is not None:
                         if self._multi_set_fail_after > 0:
                             self._multi_set_fail_after -= 1

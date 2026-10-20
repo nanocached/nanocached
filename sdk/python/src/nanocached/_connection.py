@@ -619,8 +619,21 @@ class Connection:
         # close waiter, and only that one is waited for (a healthy TLS
         # connection closed from here would otherwise wait on the
         # shutdown handshake).
-        self._peer_closed = self._writer.transport.is_closing()
-        self._writer.close()
+        transport = self._writer.transport
+        self._peer_closed = transport.is_closing()
+        if transport.get_write_buffer_size() > 0:
+            # Bytes the peer has not taken: a graceful close() would keep
+            # them until the peer reads or TCP gives up, and with them
+            # the socket and every caller suspended in drain() — a
+            # 900 KiB set to a node that stopped reading outlived the
+            # request deadline, and close() left such callers unsettled
+            # with their sockets open. abort() drops the buffer and
+            # fails the drain waiters at once; nothing in the protocol
+            # needs the tail delivered once the connection is being
+            # torn down.
+            transport.abort()
+        else:
+            self._writer.close()
         for slot in pending:
             if not slot.future.cancelled():
                 slot.future.set_exception(self._error_for(slot, error))
