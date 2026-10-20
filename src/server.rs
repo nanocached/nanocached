@@ -9915,14 +9915,15 @@ mod tests {
 
     #[test]
     fn metrics_list_the_largest_namespaces_only_and_elide_long_names() {
-        // 300 namespaces, each with a 1 MB name: the body used to carry
-        // every name twice and was built in two or three copies — a
-        // scrape of a few hundred MB that killed a 1 GiB node. Only the
-        // largest 256 get series, the rest are counted, and a long name
-        // is cut to a bounded, still-distinct label.
+        // 300 namespaces with long names (1 MB each in the field; 300 KB
+        // here to keep the test quick): the body used to carry every
+        // name twice and was built in two or three copies — a scrape of
+        // a few hundred MB that killed a 1 GiB node. Only the largest
+        // 256 get series, the rest are counted, and a long name is cut
+        // to a bounded, still-distinct label.
         let mut cache = Cache::new(usize::MAX);
         for index in 0..300u32 {
-            let mut name = vec![b'n'; 1_000_000];
+            let mut name = vec![b'n'; 300_000];
             name[..4].copy_from_slice(&index.to_be_bytes());
             cache.set(
                 Key::new(Bytes::from(name), Bytes::from_static(b"k")),
@@ -9960,7 +9961,7 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .all(|label| label.contains("[1000000 bytes, fnv1a "))
+                .all(|label| label.contains("[300000 bytes, fnv1a "))
         );
         assert!(!labels.contains("orders"));
     }
