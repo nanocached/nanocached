@@ -37,7 +37,7 @@ one with a literal `?`). `get`/`get(byte[])` decode the value as strict UTF-8
 and return `Optional<String>` (a value that isn't valid UTF-8 throws
 `java.io.UncheckedIOException`); `getBytes`/`getBytes(byte[])` return the
 raw `Optional<byte[]>` without decoding. The client is thread-safe;
-requests are pipelined per connection (request pipelining) — concurrent
+requests are pipelined per connection — concurrent
 callers on the same connection each pay only their own network latency,
 not everyone else's ahead of them.
 
@@ -315,7 +315,7 @@ happens once the request may have reached the server — they throw
 Off by default. `set`/`delete` normally wait for every replica leg to
 finish, same as the primary. Enabling `fireAndForgetReplicas` returns
 as soon as the primary acks, letting replica legs finish in the
-background (fire-and-forget replica writes):
+background:
 
 ```java
 NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
@@ -337,7 +337,7 @@ connections.
 Off by default. A clean miss (the key's first-reached owner reports it
 missing) is normally accepted as-is. Enabling `readRepair` probes the
 remaining owners before accepting that, and repairs the primary in the
-background if one still has the value (read repair):
+background if one still has the value:
 
 ```java
 NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
@@ -499,7 +499,7 @@ path / `java.io.File` via convenience overloads.
 
 Off by default. When enabled, values at or above `compressionThreshold`
 bytes are transparently DEFLATE-compressed on `set` and decompressed on
-`get`/`getBytes` (value compression):
+`get`/`getBytes`:
 
 ```java
 NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()

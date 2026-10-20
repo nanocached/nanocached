@@ -343,7 +343,7 @@ never replayed.
 Off by default. `set`/`delete` normally wait for every replica leg to
 finish, same as the primary. Enabling `fire_and_forget_replicas` returns
 as soon as the primary acks, letting replica legs finish in the
-background (fire-and-forget replica writes):
+background:
 
 ```python
 client = await NanocachedClient.connect(
@@ -366,7 +366,7 @@ tearing down their connections.
 Off by default. A clean miss (the key's first-reached owner reports it
 missing) is normally accepted as-is. Enabling `read_repair` probes the
 remaining owners before accepting that, and repairs the primary in the
-background if one still has the value (read repair):
+background if one still has the value:
 
 ```python
 client = await NanocachedClient.connect(
@@ -474,7 +474,7 @@ observable instead of silently invisible:
 ```python
 stats = client.stats()
 stats.replica_write_failures  # swallowed dead/disagreeing replica legs (client-side replication)
-stats.read_repair_failures    # swallowed read-repair write-back failures (read repair)
+stats.read_repair_failures    # swallowed read-repair write-back failures
 stats.refresh_failures        # failed node-list refresh attempts / per-node reconnects
 stats.transient_retries       # every `R` received, whether the retry that followed succeeded
                                # or, after 3 attempts running, raised RetryableError
@@ -510,7 +510,7 @@ too.
 
 Off by default. When enabled, values at or above `compression_threshold`
 bytes are transparently DEFLATE-compressed on `set` and decompressed on
-`get`/`get_bytes` (value compression):
+`get`/`get_bytes`:
 
 ```python
 client = await NanocachedClient.connect(
@@ -541,7 +541,7 @@ produce a value the protocol can't safely round-trip — see "Counters
 
 ## Notes
 
-- Requests are pipelined per connection (request pipelining), matching
+- Requests are pipelined per connection, matching
   the TypeScript SDK: concurrent callers on the same connection each pay
   only their own network latency, not everyone else's ahead of them.
 - This SDK speaks the current wire protocol (rendezvous hashing,

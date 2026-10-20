@@ -135,7 +135,7 @@ connect-time error too.
 
 Off by default. When enabled, values at or above `compressionThreshold`
 bytes are transparently DEFLATE-compressed on `set` and decompressed on
-`get`/`getBytes` (value compression):
+`get`/`getBytes`:
 
 ```ts
 const client = await NanocachedClient.connect({
@@ -194,8 +194,7 @@ traffic on the last-known node list.
 
 Off by default. `set`/`delete` normally wait for every replica leg to
 finish, same as the primary. Enabling `fireAndForgetReplicas` returns as
-soon as the primary acks, letting replica legs finish in the background
-(fire-and-forget replica writes):
+soon as the primary acks, letting replica legs finish in the background:
 
 ```ts
 const client = await NanocachedClient.connect({
@@ -218,7 +217,7 @@ tearing down their connections.
 Off by default. A clean miss (the key's first-reached owner reports it
 missing) is normally accepted as-is. Enabling `readRepair` probes the
 remaining owners before accepting that, and repairs the primary in the
-background if one still has the value (read repair):
+background if one still has the value:
 
 ```ts
 const client = await NanocachedClient.connect({
