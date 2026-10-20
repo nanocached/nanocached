@@ -104,8 +104,9 @@ before namespaces are used. The un-namespaced API is unchanged and
 remains the default — every existing key keeps its placement across the
 upgrade.
 
-`tenant.clear()` drops every entry in that one namespace — an O(1)
-sub-map drop on each node, not a key-by-key scan — and
+`tenant.clear()` drops every entry in that one namespace — one sub-map
+removal on each node, with the entries freed off the node's cache
+thread, not a key-by-key scan — and
 `client.clearAll()` drops every namespace, the default one included.
 Neither is key-addressed, so in a cluster the client sends the command
 to *every* node rather than ranking owners for a key; success requires

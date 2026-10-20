@@ -8,8 +8,9 @@ and friends run against a nanocached cluster.
 - **Cache alias ⇄ namespace.** Each `NanocachedCache` instance binds to
   one nanocached namespace (`OPTIONS.NAMESPACE`, default `"django"`) — two
   aliases with different namespaces never collide, even sharing the same
-  node, and `cache.clear()` is that namespace's `CLEAR` (an O(1) sub-map
-  drop on every node, no key scan, and never the whole store).
+  node, and `cache.clear()` is that namespace's `CLEAR` (one sub-map
+  removal on every node with the entries freed off its cache thread, no
+  key scan, and never the whole store).
 - **`get`/`set`/`delete`/`has_key`/`touch`** map onto the SDK's namespaced
   get/set/delete, with all of its routing, replication, and retries.
 - **`add`** is atomic: it is the wire's put-if-absent, evaluated by the

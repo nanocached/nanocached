@@ -128,9 +128,13 @@ F\n</code></pre>
 <p>Both respond <code>C\n</code>. <code>c</code> drops every entry in
 one namespace — a <code>&lt;namespace-length&gt;</code> of 0 clears the
 default namespace — and <code>F</code> drops every namespace, the
-default one included. On the node this is a single sub-map drop (O(1),
-no key scan, memory reclaimed immediately), so neither command stalls
-other requests the way a scan-and-delete would. Neither is
+default one included. On the node this is a single sub-map removal (no
+key scan); the map's entries are then freed on a thread of their own,
+so neither command stalls other requests the way a scan-and-delete
+would. The memory is returned over the moments that follow, in
+proportion to the entries dropped (about 0.3 µs per small entry), and
+until it is the node can sit above its memory limit by the amount it
+just dropped. Neither is
 key-addressed, so <code>W</code> never applies: in a cluster a client
 sends the command to <em>every</em> member node (a namespace's keys are
 spread over all of them by rendezvous hashing) and each node clears its

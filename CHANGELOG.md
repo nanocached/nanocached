@@ -83,6 +83,15 @@ framework adapters at one version, whether or not a component changed.
   and macOS alike. The over-limit path now half-closes after the reply
   and reads the client's bytes away, briefly, so the close is a FIN that
   follows the `B` (#663).
+- `nanocached-node` frees the entries a `c`/`F` (clear) removed on a
+  thread of their own instead of on the cache thread. Dropping the map
+  freed every entry inline, so a clear of 3,000,000 small entries held
+  every other request on the node for 0.9 s; now the cache thread does
+  one map removal and returns, and the memory is returned over the
+  moments that follow (a map under 4,096 entries is still freed inline,
+  in well under a millisecond). The protocol page and the six SDK and
+  adapter READMEs that called this an O(1) drop with memory reclaimed
+  immediately now say what happens (#702, #732).
 - Text a user sees no longer carries issue numbers or references to
 - `nanocached-node` asks discovery for the current member list before
   answering `W` for a key its own ring does not grant (at most once a
