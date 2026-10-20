@@ -1469,6 +1469,49 @@ fn metrics_label_escape(raw: &[u8]) -> String {
         .replace('\n', "\\n")
 }
 
+/// How many namespaces `/metrics` lists per-namespace series for: the
+/// largest by bytes, with the rest counted in
+/// `nanocached_node_namespaces_unlisted`. Any client that can write can
+/// create a namespace, and its name can be up to the request-size limit,
+/// so without this the size of a scrape was chosen by data-port clients:
+/// three hundred 1 MB names made a body several times their size, built
+/// in two or three copies, and a 1 GiB node was killed by one scrape.
+const METRICS_MAX_NAMESPACE_SERIES: usize = 256;
+
+/// The longest namespace name reproduced in a `namespace` label. A longer
+/// one is cut to `METRICS_LABEL_KEEP_BYTES` and suffixed with the hash
+/// of the whole name, so two long names that share a prefix still get
+/// distinct labels, and the same name gets the same label on every
+/// scrape. Together with `METRICS_MAX_NAMESPACE_SERIES` this bounds the
+/// body at a few hundred bytes per listed namespace.
+const METRICS_MAX_LABEL_BYTES: usize = 256;
+const METRICS_LABEL_KEEP_BYTES: usize = 128;
+
+/// The `namespace` label for a name: escaped, and elided past
+/// `METRICS_MAX_LABEL_BYTES` (see the constant).
+fn metrics_namespace_label(name: &[u8]) -> String {
+    if name.len() <= METRICS_MAX_LABEL_BYTES {
+        return metrics_label_escape(name);
+    }
+    // Cut on a char boundary of the lossy decoding, so the kept prefix
+    // is valid text.
+    let text = String::from_utf8_lossy(name);
+    let mut keep = METRICS_LABEL_KEEP_BYTES.min(text.len());
+    while !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in name {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!(
+        "{}…[{} bytes, fnv1a {hash:016x}]",
+        metrics_label_escape(text[..keep].as_bytes()),
+        name.len()
+    )
+}
+
 fn render_node_metrics(
     stats: &crate::cache::CacheStats,
     connections: usize,
@@ -1580,11 +1623,32 @@ fn render_node_metrics(
         format!("nanocached_node_cas_deletes_total {}\n", stats.cas_deletes),
     );
 
+    // `stats.namespaces` is largest-first, so the cap keeps the ones that
+    // matter for capacity.
+    let listed = stats.namespaces.len().min(METRICS_MAX_NAMESPACE_SERIES);
+    metric(
+        "nanocached_node_namespaces",
+        "gauge",
+        "Live namespaces (those holding at least one entry).",
+        format!("nanocached_node_namespaces {}\n", stats.namespaces.len()),
+    );
+    metric(
+        "nanocached_node_namespaces_unlisted",
+        "gauge",
+        "Live namespaces beyond the largest 256 by bytes, which have no \
+         per-namespace series below; their entries and bytes are still \
+         in the node-wide gauges.",
+        format!(
+            "nanocached_node_namespaces_unlisted {}\n",
+            stats.namespaces.len() - listed
+        ),
+    );
+
     let mut namespace_entries = String::new();
     let mut namespace_bytes = String::new();
     let mut namespace_budgets = String::new();
-    for namespace in &stats.namespaces {
-        let label = metrics_label_escape(&namespace.namespace);
+    for namespace in &stats.namespaces[..listed] {
+        let label = metrics_namespace_label(&namespace.namespace);
         namespace_entries.push_str(&format!(
             "nanocached_node_namespace_entries{{namespace=\"{label}\"}} {}\n",
             namespace.entries
@@ -1599,11 +1663,13 @@ fn render_node_metrics(
             ));
         }
     }
-    if !stats.namespaces.is_empty() {
+    if listed > 0 {
         metric(
             "nanocached_node_namespace_entries",
             "gauge",
-            "Live entries per namespace (empty label = the default namespace).",
+            "Live entries per namespace (empty label = the default namespace; \
+             the largest 256 namespaces by bytes are listed, a name over 256 \
+             bytes is cut and suffixed with its length and hash).",
             namespace_entries,
         );
         metric(
@@ -9845,6 +9911,74 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         let (head, body) = response.split_once("\r\n\r\n").unwrap();
         (head.lines().next().unwrap().to_string(), body.to_string())
+    }
+
+    #[test]
+    fn metrics_list_the_largest_namespaces_only_and_elide_long_names() {
+        // 300 namespaces, each with a 1 MB name: the body used to carry
+        // every name twice and was built in two or three copies — a
+        // scrape of a few hundred MB that killed a 1 GiB node. Only the
+        // largest 256 get series, the rest are counted, and a long name
+        // is cut to a bounded, still-distinct label.
+        let mut cache = Cache::new(usize::MAX);
+        for index in 0..300u32 {
+            let mut name = vec![b'n'; 1_000_000];
+            name[..4].copy_from_slice(&index.to_be_bytes());
+            cache.set(
+                Key::new(Bytes::from(name), Bytes::from_static(b"k")),
+                Bytes::from(vec![b'v'; (300 - index) as usize]),
+            );
+        }
+        cache.set(
+            Key::new(Bytes::from_static(b"orders"), Bytes::from_static(b"k")),
+            Bytes::from_static(b"v"),
+        );
+        let stats = cache.stats();
+        assert_eq!(stats.namespaces.len(), 301);
+
+        let body = render_node_metrics(&stats, 0, 8);
+        assert!(body.len() < 256 * 1024, "body is {} bytes", body.len());
+        assert!(body.contains("nanocached_node_namespaces 301\n"), "{body}");
+        assert!(
+            body.contains("nanocached_node_namespaces_unlisted 45\n"),
+            "{body}"
+        );
+        assert_eq!(
+            body.matches("nanocached_node_namespace_entries{").count(),
+            256
+        );
+        // Every listed label is bounded and distinct; the largest
+        // namespaces (by bytes) are the ones listed, so the small
+        // "orders" namespace is not.
+        let labels: std::collections::HashSet<&str> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("nanocached_node_namespace_entries{namespace=\""))
+            .map(|rest| rest.split("\"}").next().unwrap())
+            .collect();
+        assert_eq!(labels.len(), 256);
+        assert!(labels.iter().all(|label| label.len() < 256));
+        assert!(
+            labels
+                .iter()
+                .all(|label| label.contains("[1000000 bytes, fnv1a "))
+        );
+        assert!(!labels.contains("orders"));
+    }
+
+    #[test]
+    fn metrics_namespace_labels_are_stable_and_distinct_when_elided() {
+        let mut a = vec![b'x'; 10_000];
+        let mut b = vec![b'x'; 10_000];
+        a[9_999] = b'a';
+        b[9_999] = b'b';
+        assert_ne!(metrics_namespace_label(&a), metrics_namespace_label(&b));
+        assert_eq!(metrics_namespace_label(&a), metrics_namespace_label(&a));
+        assert_eq!(metrics_namespace_label(b"orders"), "orders");
+        assert_eq!(metrics_namespace_label(b"say \"hi\""), "say \\\"hi\\\"");
+        // A multibyte boundary is respected when cutting.
+        let multibyte = "é".repeat(300);
+        let label = metrics_namespace_label(multibyte.as_bytes());
+        assert!(label.starts_with(&"é".repeat(64)));
     }
 
     #[tokio::test(flavor = "current_thread")]
