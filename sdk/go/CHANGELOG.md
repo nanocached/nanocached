@@ -10,6 +10,24 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Forced node-list refreshes are single-flight: callers that hit a dead
+  node at the same time used to run one full refresh each, one after
+  another behind the refresh gate (5 s each when discovery is slow); a
+  forced caller now reuses a refresh that finished while it waited.
+- `SetMany`/`SetManyBytes` in cluster mode retry only the legs that
+  failed. A key whose primary leg failed used to be re-sent to every
+  owner after the refresh, including a replica that had already
+  acknowledged it.
+- `GetMany`/`GetManyBytes` read a repeated key once, so a list of many
+  copies of one key costs one key's worth of request and reply instead
+  of one `m` frame per 400 copies and one retained reply per frame.
+- Concurrent decompressions are bounded by a client-wide budget
+  (256 MiB of in-flight DEFLATE output; each decompression reserves the
+  64 MiB per-value cap while it runs), so N concurrent reads of a value
+  that inflates to the cap no longer hold N × 64 MiB at once.
+
 ## [0.4.7] - 2026-10-19
 
 ### Fixed

@@ -177,6 +177,12 @@ type mockNode struct {
 	frameSizesMu sync.Mutex
 	mFrameSizes  []int
 	oFrameSizes  []int
+	// oKeyCounts records the key count of every `o` frame, in order.
+	oKeyCounts []int
+	// failAllMultiSets: close the connection on every `o` this node
+	// receives from now on — an owner that stays down for a batched
+	// write's retry pass (closeAfterOFrames closes once).
+	failAllMultiSets atomic.Bool
 	// closeAfterMFrames/closeAfterOFrames (issue #411): when non-zero,
 	// this node closes itself entirely — every open connection plus its
 	// own listener, so a subsequent redial also fails, mirroring close()
@@ -306,6 +312,12 @@ func (m *mockNode) mFrameSizesSeen() []int {
 	m.frameSizesMu.Lock()
 	defer m.frameSizesMu.Unlock()
 	return append([]int(nil), m.mFrameSizes...)
+}
+
+func (m *mockNode) oKeyCountsSeen() []int {
+	m.frameSizesMu.Lock()
+	defer m.frameSizesMu.Unlock()
+	return append([]int(nil), m.oKeyCounts...)
 }
 
 func (m *mockNode) oFrameSizesSeen() []int {
@@ -838,11 +850,16 @@ func (m *mockNode) serve(conn net.Conn) {
 			}
 			m.frameSizesMu.Lock()
 			m.oFrameSizes = append(m.oFrameSizes, frameBytes)
+			m.oKeyCounts = append(m.oKeyCounts, count)
 			m.frameSizesMu.Unlock()
 			if m.silent.Load() {
 				continue
 			}
 			m.oCount.Add(1)
+			if m.failAllMultiSets.Load() {
+				_ = conn.Close()
+				return
+			}
 			m.dataRequestCount.Add(1)
 			var ttlValue int64
 			if hasTTL {
@@ -1198,6 +1215,10 @@ type mockDiscovery struct {
 	// all (issue #122's "no connection is ever made to a node address").
 	lCount atomic.Int32
 	qCount atomic.Int32
+	// laterListDelay delays every `L` reply after the first (the
+	// bootstrap's) by this many nanoseconds — a discovery that is slow
+	// to answer refreshes.
+	laterListDelay atomic.Int64
 }
 
 func startMockDiscovery(t *testing.T, nodes []discoveredNode, replication int) *mockDiscovery {
@@ -1267,7 +1288,11 @@ func (m *mockDiscovery) serve(conn net.Conn) {
 				return
 			}
 		case "L":
-			m.lCount.Add(1)
+			if m.lCount.Add(1) > 1 {
+				if d := m.laterListDelay.Load(); d > 0 {
+					time.Sleep(time.Duration(d))
+				}
+			}
 			m.mu.Lock()
 			warming, nodes := m.warmingUp, append([]discoveredNode(nil), m.nodes...)
 			m.mu.Unlock()
@@ -3440,6 +3465,204 @@ func TestFansDeletesOutToEveryOwner(t *testing.T) {
 }
 
 // ── batched get/set, single node (issues #128/#150/#151) ─────────────
+
+func TestForcedRefreshesAreSingleFlight(t *testing.T) {
+	// Four callers hit a dead node at the same time and each forces a
+	// node-list refresh. They used to run four refreshes one after
+	// another behind the gate (each a full fetch, 400 ms here, 5 s when
+	// discovery is slow), the last caller waiting for all of them; a
+	// forced caller now reuses the refresh that completed while it
+	// waited.
+	node := startMockNode(t, nil)
+	discovery := startMockDiscovery(t, []discoveredNode{{Name: testNames[0], Address: node.address()}}, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	const delay = 400 * time.Millisecond
+	discovery.laterListDelay.Store(int64(delay))
+	node.close()
+
+	const callers = 4
+	var wg sync.WaitGroup
+	started := time.Now()
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = client.Get("k")
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(started)
+	if elapsed >= 3*delay {
+		t.Fatalf("%d concurrent callers took %v: forced refreshes ran one after another", callers, elapsed)
+	}
+	if got := discovery.lCount.Load(); got > 3 {
+		t.Fatalf("discovery saw %d L fetches, want the bootstrap plus one shared refresh (at most 3)", got)
+	}
+}
+
+func TestGetManyReadsARepeatedKeyOnce(t *testing.T) {
+	// A repeated key is read once: sending every copy would cost one
+	// `m` frame per 400 copies and retain one reply per frame.
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Set("a", "1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set("b", "2", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	values, err := client.GetMany([]string{"a", "a", "b", "a", "b"})
+	if err != nil {
+		t.Fatalf("GetMany err = %v", err)
+	}
+	if len(values) != 2 || values["a"] != "1" || values["b"] != "2" {
+		t.Fatalf("GetMany = %v, want a=1 b=2", values)
+	}
+	if got := node.mCount.Load(); got != 1 {
+		t.Fatalf("mCount = %d, want 1", got)
+	}
+
+	copies := make([]string, 20_000)
+	for i := range copies {
+		copies[i] = "a"
+	}
+	values, err = client.GetMany(copies)
+	if err != nil || len(values) != 1 || values["a"] != "1" {
+		t.Fatalf("GetMany of 20,000 copies = %v, %v", values, err)
+	}
+	if got := node.mCount.Load(); got != 2 {
+		t.Fatalf("mCount = %d, want 2: the copies must collapse into one frame", got)
+	}
+	sizes := node.mFrameSizesSeen()
+	if last := sizes[len(sizes)-1]; last >= 64 {
+		t.Fatalf("the frame for 20,000 copies of one key is %d bytes", last)
+	}
+}
+
+func TestConcurrentDecompressionsAreBoundedByTheClientBudget(t *testing.T) {
+	// Decompression is capped per value and per batch, but the caps are
+	// per call: N concurrent reads of a value that expands to the cap
+	// each decompressed in full at once (32 reads of one 61 KB value
+	// that inflates to 60 MiB took a 2 GiB process down). Each
+	// decompression now reserves the per-value cap from a client-wide
+	// budget; with room for two, eight concurrent reads run two at a
+	// time.
+	saved := maxInflightDecompressedBytes
+	maxInflightDecompressedBytes = 2 * (maxDecompressedLength + 1)
+	defer func() { maxInflightDecompressedBytes = saved }()
+	var running, peak atomic.Int32
+	inflateTestHook = func(phase string) {
+		if phase == "start" {
+			now := running.Add(1)
+			for {
+				seen := peak.Load()
+				if now <= seen || peak.CompareAndSwap(seen, now) {
+					break
+				}
+			}
+			time.Sleep(30 * time.Millisecond) // widen the window so the reads overlap
+		} else {
+			running.Add(-1)
+		}
+	}
+	defer func() { inflateTestHook = nil }()
+
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}, Compress: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	value := bytes.Repeat([]byte("z"), 64*1024) // compresses, so Get decompresses
+	if err := client.SetBytes("big", value, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	const readers = 8
+	var wg sync.WaitGroup
+	failures := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, ok, err := client.GetBytes("big")
+			if err != nil || !ok || !bytes.Equal(got, value) {
+				failures <- fmt.Errorf("GetBytes = %d bytes, %v, %v", len(got), ok, err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+	for err := range failures {
+		t.Fatal(err)
+	}
+	if got := peak.Load(); got != 2 {
+		t.Fatalf("peak concurrent decompressions = %d, want 2 (the budget's worth)", got)
+	}
+}
+
+func TestSetManyRetriesOnlyTheLegsThatFailed(t *testing.T) {
+	// One owner closes the connection on every `o`. The keys whose
+	// primary it is are retried after a refresh — but only to it: the
+	// other owner, which acknowledged every key as primary or replica in
+	// the first pass, used to be sent the retried keys a second time.
+	nodes, discovery := startCluster(t, 2)
+	good, bad := nodes[testNames[0]], nodes[testNames[1]]
+	bad.failAllMultiSets.Store(true)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	values := map[string]string{}
+	badPrimary := 0
+	for i := 0; len(values) < 12; i++ {
+		key := fmt.Sprintf("leg-%d", i)
+		primary := ownersOf(key)[0]
+		if primary == testNames[1] {
+			if badPrimary == 6 {
+				continue
+			}
+			badPrimary++
+		} else if len(values)-badPrimary == 6 {
+			continue
+		}
+		values[key] = "v-" + key
+	}
+
+	if _, err := client.SetMany(values, 0); !errors.Is(err, ErrWrongNode) {
+		t.Fatalf("SetMany err = %v, want ErrWrongNode while one primary stays down", err)
+	}
+	// R=2 over two nodes: both own every key. The good owner sees one
+	// frame of all 12 keys and nothing more; the bad one sees the first
+	// pass (and its in-leg redial), then the retry of its six primary
+	// keys (and its redial).
+	if got := good.oKeyCountsSeen(); len(got) != 1 || got[0] != 12 {
+		t.Fatalf("the good owner saw o frames with key counts %v, want [12]", got)
+	}
+	if got := bad.oKeyCountsSeen(); len(got) != 4 || got[0] != 12 || got[1] != 12 || got[2] != 6 || got[3] != 6 {
+		t.Fatalf("the failing owner saw o frames with key counts %v, want [12 12 6 6]", got)
+	}
+	for key := range values {
+		if !good.hasKey(key) {
+			t.Fatalf("the good owner lost %q", key)
+		}
+	}
+}
 
 func TestGetManyReturnsHitsAndMissesInOneCall(t *testing.T) {
 	node := startMockNode(t, nil)
