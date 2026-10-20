@@ -7,16 +7,23 @@ friends run against a nanocached cluster.
 
 - **Named cache ⇄ namespace.** Each Spring cache is one nanocached
   namespace named after it — same key in two caches never collides, and
-  `Cache.clear()` is the namespace's `CLEAR` (an O(1) sub-map drop on every
-  node, no key scan).
+  `Cache.clear()` is the namespace's `CLEAR` on every node (no key scan;
+  the node frees the namespace's entries on its cache thread, which takes
+  time linear in their number and answers nothing else meanwhile — about
+  0.3 µs per small entry).
 - **`get`/`put`/`evict`** map to the SDK's namespaced get/set/delete, with
   all of its routing, replication, hedged reads and retries.
-- **`get(key, valueLoader)`** (read-through) computes on a miss under a
-  per-JVM striped lock: one computation per process per key; processes
-  sharing the cluster may compute concurrently (last write wins) — the
-  usual stampede trade-off, same as Spring's other non-distributed
-  adapters.
-- **Per-cache TTL**, a default TTL, and `Duration.ZERO` = no expiry.
+- **`get(key, valueLoader)`** (read-through) computes on a miss once per
+  key per JVM: concurrent callers for the same key wait for the loader
+  already running and share its result, and no lock is held across the
+  loader or the network, so loaders that read other keys of the same
+  cache never deadlock each other and virtual threads are not pinned.
+  Processes sharing the cluster may compute concurrently (last write
+  wins) — the usual stampede trade-off, same as Spring's other
+  non-distributed adapters.
+- **Per-cache TTL**, a default TTL, and `Duration.ZERO` = no expiry. A
+  TTL rounds up to whole seconds (the wire's unit): 1.2 s becomes 2 s, so
+  an entry never expires earlier than asked.
 - **Null caching** on by default (Spring's `NullValue` marker), like
   Spring's own cache implementations; disable with
   `allowNullValues(false)`.
@@ -42,9 +49,9 @@ Boot applications should use the starter instead
 ## Setup
 
 Two beans set the adapter up — the SDK client and the manager — plus
-`@EnableCaching`. There is no Spring Boot autoconfiguration (yet, see
-below), so nothing happens by merely adding the dependency or editing
-`application.yaml`: these beans are the setup.
+`@EnableCaching`. Without the Spring Boot starter nothing happens by
+merely adding the dependency or editing `application.yaml`: these beans
+are the setup.
 
 ```java
 @Configuration
@@ -136,9 +143,16 @@ class UserService {
 ```
 
 `sync = true` routes through the adapter's `get(key, valueLoader)`
-(per-JVM herding, see below). SpEL keys that name method parameters
-(`key = "#user.name"`) need the `-parameters` compiler flag, as usual
-with Spring.
+(per-JVM herding, see below). If the loader succeeds but storing its
+result fails (the node went away between the miss and the store, or the
+value is over the size limit), the adapter throws that failure as-is
+rather than as a `ValueRetrievalException`, so your `CacheErrorHandler`
+sees it (as a get error) and, if it swallows it, Spring invokes the
+method again to produce the value — the same behaviour as Spring's Redis
+cache. A loader that re-enters `get` for its own key on the same thread
+is reported with an `IllegalStateException` instead of waiting on
+itself. SpEL keys that name method parameters (`key = "#user.name"`)
+need the `-parameters` compiler flag, as usual with Spring.
 
 By default any cache name works — namespaces need no server-side setup, so
 `getCache("anything")` creates the cache on first use. `cacheNames(...)`
@@ -158,7 +172,22 @@ untouched; `String`, boxed numbers, `Boolean`, `Character` and `UUID` to a
 type-prefixed canonical string (so `"42"` and `42L` stay distinct); and
 everything else (Spring's `SimpleKey` included) through JDK serialization.
 Key bytes must be canonical across every JVM sharing the cache — prefer
-simple keys, or plug in a converter that knows your key type.
+simple keys, or plug in a converter that knows your key type. Two
+consequences of JDK serialization: a `String` key that is not well-formed
+UTF-16 (a lone surrogate) is rejected with `IllegalArgumentException`
+rather than being encoded as `?`, which would make it the same key as
+another; and equal collections of different classes (`ArrayList` versus
+`List.of`, `HashSet` versus `TreeSet`) serialize differently and are
+therefore different keys, although Spring would consider them equal —
+use the same collection type for `@Cacheable` and `@CacheEvict`, or a
+converter that canonicalizes your key type.
+
+Values are deserialized with the class loader given to
+`classLoader(...)` on the builder (the Boot starter passes the
+application context's), or, without one, the reading thread's context
+class loader: an application whose classes live in a child loader of the
+adapter's (a Boot devtools restart, a shared server library directory)
+would otherwise fail every cache hit with `ClassNotFoundException`.
 
 ## Trust boundary / deserialization
 
@@ -197,13 +226,32 @@ Mitigate with all of:
 and is genuinely atomic: exactly one of two racing writers for the same
 key stores its value, the other gets back the winner's. Cross-JVM
 `get(key, valueLoader)` stampedes are still possible as described above —
-the per-JVM striped lock only protects one process from computing the
+the per-key in-flight map only protects one process from computing the
 same key twice.
+
+## When the node is unreachable
+
+Every operation fails fast with the SDK's `NanocachedException.ConnectionFailed`
+(a `RuntimeException`); nothing hangs. Spring's default is fail-closed:
+the exception propagates out of the `@Cacheable` method. Configure a
+`CachingConfigurer.errorHandler()` to degrade instead — the handler
+receives get and put errors and the annotated method runs as if
+uncached. `@Cacheable` on a method returning `CompletableFuture` is not
+supported (`Cache.retrieve` is optional in Spring and not implemented
+here) and throws `UnsupportedOperationException`.
+
+## Value size limit
+
+A serialized value must fit the server's request limit of 1 MiB (key
+and value together, after serialization and optional compression); a
+larger one is rejected by the SDK with `IllegalArgumentException` before
+anything is sent, which the error handler sees as a put error.
 
 ## Requirements
 
-Java 17+, Spring Framework 6.x, nanocached server ≥ the release that ships
-namespaces and CLEAR.
+Java 17+, Spring Framework 6.x, nanocached server 0.4.0 or later (the
+first release with namespaces, `CLEAR` and compare-and-set, which
+`putIfAbsent` uses).
 
 ## Policy note
 

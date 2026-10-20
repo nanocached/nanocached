@@ -11,6 +11,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Bean;
+import org.springframework.core.io.ResourceLoader;
 import org.springframework.context.annotation.Conditional;
 
 /**
@@ -94,12 +95,21 @@ public class NanocachedCacheAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean(CacheManager.class)
     public CacheManager nanocachedCacheManager(
-            NanocachedClient client, NanocachedProperties properties) {
+            NanocachedClient client, NanocachedProperties properties, ResourceLoader resourceLoader) {
         NanocachedProperties.Cache cache = properties.getCache();
         NanocachedCacheManager.Builder builder =
                 NanocachedCacheManager.builder(client)
                         .defaultTtl(cache.getDefaultTtl())
                         .allowNullValues(cache.isAllowNullValues());
+        // Cached values are deserialized with the application's own
+        // class loader: with devtools the application classes live in a
+        // restart loader this starter's loader cannot see, and every
+        // cache hit would otherwise fail with ClassNotFoundException —
+        // the same reason Boot's Redis cache configuration passes its
+        // ResourceLoader's class loader to the JDK serializer.
+        if (resourceLoader.getClassLoader() != null) {
+            builder.classLoader(resourceLoader.getClassLoader());
+        }
         cache.getTtl().forEach(builder::ttl);
         if (cache.getCacheNames() != null) {
             builder.cacheNames(cache.getCacheNames());

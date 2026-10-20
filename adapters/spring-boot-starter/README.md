@@ -108,8 +108,8 @@ beyond the two beans; it does not change adapter behavior.
 
 ## Requirements
 
-Java 17+, Spring Boot 3.x, nanocached server ≥ the release that ships
-namespaces and CLEAR.
+Java 17+, Spring Boot 3.x, nanocached server 0.4.0 or later (the first
+release with namespaces, `CLEAR` and compare-and-set).
 
 ## Policy note
 

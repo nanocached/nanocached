@@ -2,6 +2,9 @@ package org.nanocached.spring;
 
 import java.time.Duration;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import org.nanocached.NanocachedClient;
 import org.springframework.cache.Cache.ValueWrapper;
 import org.springframework.cache.support.AbstractValueAdaptingCache;
@@ -23,27 +26,38 @@ import org.springframework.cache.support.AbstractValueAdaptingCache;
  *       putIfAbsent} (issue #141, add-if-absent) — genuinely atomic:
  *       exactly one of two racing writers for the same key stores its
  *       value, the other gets back the winner's;
- *   <li>{@link #get(Object, Callable)} computes on a miss under a
- *       <em>per-JVM</em> striped lock — one computation per process, but
- *       processes sharing the cluster may compute the same key
- *       concurrently (last write wins). That is the usual read-through
- *       cache-stampede trade-off, same as Spring's own non-distributed
- *       adapters.
+ *   <li>{@link #get(Object, Callable)} computes on a miss once per key
+ *       per JVM: concurrent callers for the same key wait for the one
+ *       loader already running and share its result, while callers for
+ *       other keys are never coupled to it. Processes sharing the
+ *       cluster may still compute the same key concurrently (last write
+ *       wins) — the usual read-through cache-stampede trade-off, same as
+ *       Spring's own non-distributed adapters.
  * </ul>
  */
 public final class NanocachedCache extends AbstractValueAdaptingCache {
 
-    /** Bounded per-JVM lock striping for {@link #get(Object, Callable)}:
-     * no per-key lock objects to leak, at the cost of occasional
-     * false sharing between keys on the same stripe. */
-    private static final int LOCK_STRIPES = 64;
+    /** One loader run of {@link #get(Object, Callable)} in flight for a
+     * key: the thread running it (so a loader that re-enters the same
+     * key on the same thread is reported instead of waiting on itself)
+     * and its outcome. */
+    private record InFlightLoad(Thread owner, CompletableFuture<Object> outcome) {}
 
     private final String name;
     private final NanocachedClient.Namespace namespace;
     private final CacheValueSerializer serializer;
     private final CacheKeyConverter keyConverter;
     private final long ttlSeconds;
-    private final Object[] loaderLocks;
+    /** The loader runs of {@link #get(Object, Callable)} in flight in
+     * this JVM, by Spring key. No lock is held while a loader runs: a
+     * lock held across user code coupled unrelated keys (a fixed number
+     * of lock stripes shared by every key), so a sync loader that itself
+     * read another sync-cached key could deadlock against a second
+     * thread doing the reverse, with no logical cycle between the four
+     * keys; and a monitor held across the network round trip pinned
+     * virtual threads. Entries exist only while a load runs, so there is
+     * nothing to leak. */
+    private final ConcurrentHashMap<Object, InFlightLoad> loads = new ConcurrentHashMap<>();
 
     NanocachedCache(
             String name,
@@ -58,10 +72,6 @@ public final class NanocachedCache extends AbstractValueAdaptingCache {
         this.serializer = serializer;
         this.keyConverter = keyConverter;
         this.ttlSeconds = toTtlSeconds(ttl);
-        this.loaderLocks = new Object[LOCK_STRIPES];
-        for (int i = 0; i < LOCK_STRIPES; i++) {
-            loaderLocks[i] = new Object();
-        }
     }
 
     /** {@code Duration.ZERO} means "no expiry" (the SDK's own 0-TTL
@@ -102,6 +112,29 @@ public final class NanocachedCache extends AbstractValueAdaptingCache {
                 .orElse(null);
     }
 
+    /**
+     * Read-through: a miss runs {@code valueLoader} once per key per JVM
+     * — a concurrent caller for the same key waits for that run and
+     * shares its result (or, if the run failed, loads on its own) —
+     * without holding any lock across the loader or the network, so
+     * loaders that read other keys of this cache can never deadlock each
+     * other and a virtual thread is never pinned. A loader that re-enters
+     * {@code get} for its own key on the same thread is a programming
+     * error and throws {@link IllegalStateException} rather than waiting
+     * on itself.
+     *
+     * <p>Only the loader's own failure becomes a {@link
+     * ValueRetrievalException}. A failure of the {@link #put} that
+     * follows a successful load (the node went away between the miss and
+     * the store, or the value is over the server's size limit) is thrown
+     * as-is instead — exactly as Spring's own Redis cache does — because
+     * the cache interceptor rethrows a {@code ValueRetrievalException}
+     * without consulting the application's {@code CacheErrorHandler},
+     * while any other runtime exception from this method reaches that
+     * handler, which then decides (after which the interceptor invokes
+     * the method again to produce the value). The non-sync path reports
+     * the same failure through the handler's put-error callback.
+     */
     @Override
     @SuppressWarnings("unchecked")
     public <T> T get(Object key, Callable<T> valueLoader) {
@@ -110,28 +143,66 @@ public final class NanocachedCache extends AbstractValueAdaptingCache {
             return (T) fromStoreValue(cached);
         }
 
-        // One computation per JVM per stripe: the double-check under the
-        // lock keeps a herd of same-key callers down to one loader call
-        // without a lock object per key.
-        synchronized (lockFor(key)) {
-            cached = lookup(key);
-            if (cached != null) {
-                return (T) fromStoreValue(cached);
+        Object loadKey = key == null ? NullKey.INSTANCE : key;
+        while (true) {
+            InFlightLoad mine = new InFlightLoad(Thread.currentThread(), new CompletableFuture<>());
+            InFlightLoad running = loads.putIfAbsent(loadKey, mine);
+            if (running == null) {
+                try {
+                    return (T) load(key, valueLoader, mine.outcome());
+                } finally {
+                    loads.remove(loadKey, mine);
+                }
             }
-
-            T loaded;
+            if (running.owner() == Thread.currentThread()) {
+                throw new IllegalStateException(
+                        "nanocached-spring: the value loader for key " + key
+                                + " re-entered get(key, valueLoader) for the same key on the same thread");
+            }
             try {
-                loaded = valueLoader.call();
-                put(key, loaded);
-            } catch (Exception e) {
-                throw new ValueRetrievalException(key, valueLoader, e);
+                return (T) fromStoreValue(running.outcome().join());
+            } catch (CompletionException failed) {
+                // The run we waited for failed; its caller got the
+                // exception. Loading on our own is the honest outcome
+                // for this caller — the loop re-checks the cache first.
+                cached = lookup(key);
+                if (cached != null) {
+                    return (T) fromStoreValue(cached);
+                }
             }
-            return loaded;
         }
     }
 
-    private Object lockFor(Object key) {
-        return loaderLocks[Math.floorMod(key == null ? 0 : key.hashCode(), LOCK_STRIPES)];
+    /** The one loader run for a key: double-checks the cache, runs the
+     * loader, stores the value, and settles {@code outcome} (the store
+     * value, so waiters go through {@link #fromStoreValue} exactly like
+     * a hit) for every caller waiting on it. */
+    private Object load(Object key, Callable<?> valueLoader, CompletableFuture<Object> outcome) {
+        try {
+            Object cached = lookup(key);
+            if (cached != null) {
+                outcome.complete(cached);
+                return fromStoreValue(cached);
+            }
+            Object loaded;
+            try {
+                loaded = valueLoader.call();
+            } catch (Exception e) {
+                throw new ValueRetrievalException(key, valueLoader, e);
+            }
+            put(key, loaded);
+            outcome.complete(toStoreValue(loaded));
+            return loaded;
+        } catch (RuntimeException e) {
+            outcome.completeExceptionally(e);
+            throw e;
+        }
+    }
+
+    /** Stand-in map key for a {@code null} Spring key (ConcurrentHashMap
+     * rejects null keys; Spring allows them). */
+    private enum NullKey {
+        INSTANCE
     }
 
     @Override
