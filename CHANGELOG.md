@@ -20,6 +20,14 @@ framework adapters at one version, whether or not a component changed.
   node had acknowledged and queued for its entrant could land there
   after the client's own clear and leave the cleared key on that one
   owner (#688).
+- `nanocached-node` keeps a key deleted when a relayed handoff delete
+  (`u`) and a put-if-absent handoff of the same key (`U … A`) cross: the
+  delete leaves a two-minute tombstone the put-if-absent is refused
+  against. A join transfer and a re-replication read each key as they
+  go and send it on their own connection, so a copy read before a
+  client's delete could land after the relayed delete and bring the key
+  back on the joiner — seen with two joins a few seconds apart, where
+  several old owners send the same key (#690).
 - `nanocached-node`'s sweep no longer reclaims a marked copy of a key
   the node owns again. A join marks the keys it moves as dead copies for
   the sweep; when that joiner is evicted the keys come back to the node,

@@ -189,7 +189,13 @@ are orchestrated by discovery in stages:</p>
   <li>The joining node registers; discovery tells the existing nodes to
   migrate the keys the newcomer now owns.</li>
   <li>While migration runs, existing nodes keep serving those keys and
-  forward concurrent writes to the joiner, so no update is dropped. What
+  forward concurrent writes to the joiner, so no update is dropped. A
+  forwarded delete also leaves a tombstone on the joiner for two
+  minutes: the transfer reads each key as it goes and sends it
+  put-if-absent on its own connection (and with replication, from
+  several old owners at once), so a copy read before the delete can
+  land after it, and the tombstone refuses it; an unconditional forward
+  and a client write are newer than the delete and go in. What
   is queued for one joiner is bounded at 64&nbsp;MiB; once a joiner
   that has stopped answering has that much waiting, a client write for
   it is held before its ack until the queue drains, so the backlog

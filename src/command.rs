@@ -2212,6 +2212,50 @@ mod tests {
     }
 
     #[test]
+    fn a_handoff_delete_then_a_put_if_absent_handoff_leaves_the_key_deleted() {
+        // The joiner's side of a relayed delete racing a transfer's
+        // put-if-absent send of the same key (see `Cache::handoff_delete`).
+        let mut cache = Cache::new(usize::MAX);
+        let k = key(b"raced");
+        assert_eq!(
+            Command::HandoffDelete {
+                key: k.clone(),
+                token: "tok".to_string(),
+            }
+            .execute(&mut cache),
+            Response::NotFound
+        );
+        assert_eq!(
+            Command::HandoffSet {
+                key: k.clone(),
+                value: Bytes::from_static(b"old"),
+                ttl: None,
+                if_absent: true,
+                token: "tok".to_string(),
+                ahead_of_ring: true,
+            }
+            .execute(&mut cache),
+            Response::StoredUnchanged,
+            "refused like a present key: a success for the sender, nothing stored"
+        );
+        assert_eq!(cache.get(&k), None);
+        assert_eq!(
+            Command::HandoffSet {
+                key: k.clone(),
+                value: Bytes::from_static(b"new"),
+                ttl: None,
+                if_absent: false,
+                token: "tok".to_string(),
+                ahead_of_ring: true,
+            }
+            .execute(&mut cache),
+            Response::Stored,
+            "an unconditional handoff is newer than the delete"
+        );
+        assert_eq!(cache.get(&k), Some(Bytes::from_static(b"new")));
+    }
+
+    #[test]
     fn a_reclaim_chunk_under_a_large_namespace_hashes_it_once() {
         // A chunk of 2,000 keys under a 600 KB namespace, judged against
         // two rings. Hashing the namespace again for every key and every

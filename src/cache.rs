@@ -183,6 +183,21 @@ pub struct NamespaceStats {
     pub budget_bytes: Option<usize>,
 }
 
+/// How long a handoff delete (`u`) keeps a later put-if-absent handoff
+/// (`U … A`) of the same key out — see `Cache::handoff_delete`. Longer
+/// than any join transfer or re-replication pass that could still be
+/// carrying the key as it was before the delete.
+pub const HANDOFF_TOMBSTONE_TTL: Duration = Duration::from_secs(120);
+
+/// At most this many handoff tombstones are kept; past it the oldest
+/// goes first. Each is charged to `used_bytes` like a `migrated` mark.
+const MAX_HANDOFF_TOMBSTONES: usize = 65_536;
+
+/// What a tombstone is charged: the key it names, as a mark is.
+fn tombstone_bytes(key: &Key) -> usize {
+    key.namespace.len() + key.name.len()
+}
+
 pub struct Cache {
     /// Index from namespace name to its slot in `slots`. One sub-map per
     /// namespace — the default namespace lives under the empty key (issue
@@ -282,6 +297,18 @@ pub struct Cache {
     /// covered exactly as a client write under that ring is — and leaves
     /// this alone (the caller says which, see `handoff_set`).
     last_handoff_at: Option<Instant>,
+    /// Keys a handoff delete (`u`) removed or found absent, each with when,
+    /// so a put-if-absent handoff of the key that was read before that
+    /// delete and lands after it cannot bring the key back (see
+    /// `handoff_delete`). Global, not per namespace: a namespace is dropped
+    /// with its last entry, which is exactly what the delete may have
+    /// removed. Consulted only when non-empty, so a node that received no
+    /// `u` pays nothing per handoff write.
+    handoff_tombstones: HashMap<Key, Instant, RandomState>,
+    /// The tombstones oldest first, for expiry and the cap. A key deleted
+    /// again is queued again with its newer stamp; the older item is then
+    /// stale and skipped when it surfaces.
+    tombstone_order: VecDeque<(Instant, Key)>,
     /// Issue #594: how many handoff writes that arrived ahead of their
     /// ring (`handoff_set` / `handoff_set_if_absent` with `ahead_of_ring`)
     /// have landed since this cache was created. Reported by
@@ -449,6 +476,8 @@ impl Cache {
             cas_deletes: 0,
             pending_removal: VecDeque::new(),
             last_handoff_at: None,
+            handoff_tombstones: HashMap::with_hasher(RandomState::new()),
+            tombstone_order: VecDeque::new(),
             handoff_writes: 0,
             #[cfg(test)]
             name_lookups: std::cell::Cell::new(0),
@@ -615,9 +644,23 @@ impl Cache {
         ttl: Option<Duration>,
         ahead_of_ring: bool,
     ) -> CasResult {
-        let now = Instant::now();
+        self.handoff_set_if_absent_at(key, value, ttl, ahead_of_ring, Instant::now())
+    }
+
+    /// [`Self::handoff_set_if_absent`] at `now`. A key under a live
+    /// handoff tombstone is refused like a present one: the sender read
+    /// it before the delete that the tombstone records.
+    fn handoff_set_if_absent_at(
+        &mut self,
+        key: &Key,
+        value: Bytes,
+        ttl: Option<Duration>,
+        ahead_of_ring: bool,
+        now: Instant,
+    ) -> CasResult {
         self.note_handoff(now, ahead_of_ring);
-        if !self.condition_holds_at(key, CasCondition::Absent, now) {
+        if self.tombstoned_at(key, now) || !self.condition_holds_at(key, CasCondition::Absent, now)
+        {
             return CasResult::Mismatch;
         }
         let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
@@ -766,10 +809,87 @@ impl Cache {
         removed
     }
 
-    /// A delete relayed by another owner (`X`): the same removal, not
-    /// counted as a client delete.
+    /// A delete relayed by another owner (`u`): the same removal, not
+    /// counted as a client delete. Also leaves a tombstone for the key
+    /// (`HANDOFF_TOMBSTONE_TTL`), whether or not it was present: a join
+    /// transfer or a re-replication reads each key as it goes and sends it
+    /// put-if-absent on its own connection, so a copy read before this
+    /// delete can land after it — and with several old owners sending, the
+    /// relayed delete from one of them cannot be ordered against the
+    /// others' sends. Until the tombstone expires, such a put-if-absent is
+    /// refused (`handoff_set_if_absent`); an unconditional handoff and a
+    /// client write are not affected, they are newer than the delete by
+    /// construction.
     pub fn handoff_delete(&mut self, key: &Key) -> bool {
-        self.delete_at(key, Instant::now())
+        self.handoff_delete_at(key, Instant::now())
+    }
+
+    fn handoff_delete_at(&mut self, key: &Key, now: Instant) -> bool {
+        let removed = self.delete_at(key, now);
+        self.tombstone(key, now);
+        removed
+    }
+
+    /// Records `key` as handoff-deleted at `now` — see `handoff_delete`.
+    fn tombstone(&mut self, key: &Key, now: Instant) {
+        self.prune_tombstones(now);
+        if self.handoff_tombstones.len() >= MAX_HANDOFF_TOMBSTONES {
+            self.forget_oldest_tombstone();
+        }
+        if self.handoff_tombstones.insert(key.clone(), now).is_none() {
+            self.used_bytes += tombstone_bytes(key);
+        }
+        self.tombstone_order.push_back((now, key.clone()));
+        // Re-deletes leave stale items behind the live ones; compact once
+        // they are the majority so the order queue stays bounded too.
+        if self.tombstone_order.len() > 2 * MAX_HANDOFF_TOMBSTONES {
+            let live = &self.handoff_tombstones;
+            self.tombstone_order
+                .retain(|(stamped, key)| live.get(key) == Some(stamped));
+        }
+    }
+
+    /// Whether a live tombstone covers `key` at `now`.
+    fn tombstoned_at(&self, key: &Key, now: Instant) -> bool {
+        !self.handoff_tombstones.is_empty()
+            && self
+                .handoff_tombstones
+                .get(key)
+                .is_some_and(|stamped| now.duration_since(*stamped) < HANDOFF_TOMBSTONE_TTL)
+    }
+
+    /// Drops every tombstone older than `HANDOFF_TOMBSTONE_TTL` at `now`.
+    fn prune_tombstones(&mut self, now: Instant) {
+        while let Some((stamped, _)) = self.tombstone_order.front() {
+            if now.duration_since(*stamped) < HANDOFF_TOMBSTONE_TTL {
+                break;
+            }
+            let (stamped, key) = self
+                .tombstone_order
+                .pop_front()
+                .expect("front was just seen");
+            self.forget_tombstone_if_stamped(&key, stamped);
+        }
+    }
+
+    /// Drops the oldest live tombstone (the cap).
+    fn forget_oldest_tombstone(&mut self) {
+        while let Some((stamped, key)) = self.tombstone_order.pop_front() {
+            if self.forget_tombstone_if_stamped(&key, stamped) {
+                return;
+            }
+        }
+    }
+
+    /// Removes `key`'s tombstone if it still carries `stamped` (a re-delete
+    /// since then made this item stale), crediting its charge back.
+    fn forget_tombstone_if_stamped(&mut self, key: &Key, stamped: Instant) -> bool {
+        if self.handoff_tombstones.get(key) != Some(&stamped) {
+            return false;
+        }
+        self.handoff_tombstones.remove(key);
+        self.used_bytes -= tombstone_bytes(key);
+        true
     }
 
     /// Total entries across every namespace.
@@ -1458,6 +1578,11 @@ impl Cache {
         self.entry_count = 0;
         self.used_bytes = 0;
         self.marked = 0;
+        // Charged to `used_bytes`, which is 0 now; and nothing a handoff
+        // read before this clear is anything the clear would not also
+        // have covered on the sender.
+        self.handoff_tombstones.clear();
+        self.tombstone_order.clear();
         // `used_bytes` is already 0; the marks' duplicate bytes and the
         // namespace name charges went with everything else.
         removed
@@ -3319,6 +3444,116 @@ mod tests {
             "absent, so a change"
         );
         assert_eq!(cache.get(&k), Some(Bytes::from_static(b"v2")));
+    }
+
+    #[test]
+    fn a_handoff_delete_keeps_a_later_put_if_absent_handoff_of_the_key_out() {
+        // A join transfer (or a re-replication) reads a key, a client's
+        // delete is relayed to the joiner as `u` and lands first, then the
+        // transfer's put-if-absent `U … A` of the old value arrives: the
+        // key must stay deleted. With R > 1 several old owners send the
+        // same key, so this cannot be ordered on the sender's side.
+        let mut cache = Cache::new(UNBOUNDED);
+        let k = key(b"k");
+        assert!(
+            !cache.handoff_delete(&k),
+            "nothing here yet, still a tombstone"
+        );
+        assert_eq!(
+            cache.handoff_set_if_absent(&k, Bytes::from_static(b"v0"), None, true),
+            CasResult::Mismatch,
+            "the transfer's copy was read before the delete"
+        );
+        assert!(!cache.contains(&k));
+        // Another key is not covered.
+        assert_eq!(
+            cache.handoff_set_if_absent(&key(b"other"), Bytes::from_static(b"o"), None, true),
+            CasResult::Stored
+        );
+        // An unconditional handoff (a concurrent client write forwarded
+        // after the delete) is newer than the delete and goes in.
+        assert!(cache.handoff_set(k.clone(), Bytes::from_static(b"v1"), None, true));
+        assert_eq!(cache.get(&k), Some(Bytes::from_static(b"v1")));
+        // A present key deleted by `u` is removed and tombstoned alike.
+        assert!(cache.handoff_delete(&k));
+        assert_eq!(
+            cache.handoff_set_if_absent(&k, Bytes::from_static(b"v0"), None, true),
+            CasResult::Mismatch
+        );
+        assert!(!cache.contains(&k));
+    }
+
+    #[test]
+    fn a_handoff_tombstone_expires_and_gives_its_charge_back() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let k = key(b"gone");
+        let deleted_at = Instant::now();
+        let before = cache.used_bytes;
+        cache.handoff_delete_at(&k, deleted_at);
+        assert_eq!(cache.used_bytes, before + tombstone_bytes(&k));
+        assert_eq!(
+            cache.handoff_set_if_absent_at(
+                &k,
+                Bytes::from_static(b"v0"),
+                None,
+                true,
+                deleted_at + HANDOFF_TOMBSTONE_TTL - Duration::from_secs(1)
+            ),
+            CasResult::Mismatch,
+            "still inside the tombstone's life"
+        );
+        assert_eq!(
+            cache.handoff_set_if_absent_at(
+                &k,
+                Bytes::from_static(b"v0"),
+                None,
+                true,
+                deleted_at + HANDOFF_TOMBSTONE_TTL
+            ),
+            CasResult::Stored,
+            "expired: a put-if-absent is a plain put-if-absent again"
+        );
+        // The next tombstone prunes the expired one, charge and all (the
+        // entry just stored stays charged, of course).
+        let with_entry = cache.used_bytes;
+        cache.handoff_delete_at(&key(b"next"), deleted_at + HANDOFF_TOMBSTONE_TTL);
+        assert_eq!(cache.handoff_tombstones.len(), 1);
+        assert_eq!(
+            cache.used_bytes,
+            with_entry - tombstone_bytes(&k) + tombstone_bytes(&key(b"next"))
+        );
+    }
+
+    #[test]
+    fn handoff_tombstones_are_capped_oldest_first_and_a_re_delete_refreshes() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let t0 = Instant::now();
+        let first = key(b"first");
+        cache.handoff_delete_at(&first, t0);
+        for index in 1..MAX_HANDOFF_TOMBSTONES {
+            cache.handoff_delete_at(
+                &key(format!("k{index}").as_bytes()),
+                t0 + Duration::from_millis(1),
+            );
+        }
+        assert_eq!(cache.handoff_tombstones.len(), MAX_HANDOFF_TOMBSTONES);
+        // Deleting `first` again refreshes its stamp rather than adding a
+        // second tombstone; the stale order item is skipped when it
+        // surfaces, so the cap then drops `k1`, the oldest live one.
+        cache.handoff_delete_at(&first, t0 + Duration::from_millis(2));
+        assert_eq!(cache.handoff_tombstones.len(), MAX_HANDOFF_TOMBSTONES);
+        cache.handoff_delete_at(&key(b"one-more"), t0 + Duration::from_millis(3));
+        assert_eq!(cache.handoff_tombstones.len(), MAX_HANDOFF_TOMBSTONES);
+        assert!(cache.tombstoned_at(&first, t0 + Duration::from_millis(3)));
+        assert!(!cache.tombstoned_at(&key(b"k1"), t0 + Duration::from_millis(3)));
+        assert!(cache.tombstoned_at(&key(b"k2"), t0 + Duration::from_millis(3)));
+        let charged: usize = cache.handoff_tombstones.keys().map(tombstone_bytes).sum();
+        assert_eq!(cache.used_bytes, charged);
+        // `clear_all` drops them with the memory they were charged to.
+        cache.clear_all();
+        assert!(cache.handoff_tombstones.is_empty());
+        assert!(cache.tombstone_order.is_empty());
+        assert_eq!(cache.used_bytes, 0);
     }
 
     #[test]
