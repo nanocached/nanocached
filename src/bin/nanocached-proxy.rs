@@ -924,6 +924,12 @@ struct ProxyContext {
     /// Issue #124: requests that ended in the fatal `E` path (upstream
     /// failure that survived the retry) — the error-rate signal.
     upstream_failures_total: std::sync::atomic::AtomicU64,
+    /// Replica legs of a write a node refused (`W`) or rejected (`E`).
+    /// The primary's answer decided the request, so the client saw
+    /// success, but that replica holds no copy, or a stale one, until the
+    /// next write — the one trace a stale owner after a membership
+    /// change leaves on the proxy.
+    replica_refusals_total: std::sync::atomic::AtomicU64,
 }
 
 // ─── shared line/frame helpers ───────────────────────────────────────
@@ -3705,7 +3711,7 @@ async fn dispatch_request(
             value,
             ttl,
         } => {
-            let pending =
+            let enqueued =
                 enqueue_write(&context, &ring, &namespace, &key, Some((&value, ttl))).await;
             tokio::spawn(async move {
                 let write = Some((value, ttl));
@@ -3714,7 +3720,7 @@ async fn dispatch_request(
                     &namespace,
                     &key,
                     write,
-                    pending,
+                    enqueued,
                     tag,
                     retry_capable,
                 )
@@ -3723,14 +3729,14 @@ async fn dispatch_request(
             });
         }
         Request::Delete { namespace, key } => {
-            let pending = enqueue_write(&context, &ring, &namespace, &key, None).await;
+            let enqueued = enqueue_write(&context, &ring, &namespace, &key, None).await;
             tokio::spawn(async move {
                 let result = finish_write(
                     &context,
                     &namespace,
                     &key,
                     None,
-                    pending,
+                    enqueued,
                     tag,
                     retry_capable,
                 )
@@ -4245,6 +4251,36 @@ struct MultiSetBatch<'a> {
 /// below, will have — the authoritative copy). A primary `WrongNode` or
 /// a whole group that failed/came back malformed marks its primary legs
 /// for the same one-bounded-retry pass `finish_multi_get` uses.
+/// Logs and counts a replica leg a node refused (`W`) or rejected (`E`).
+/// The primary's answer decided the request and the client saw success,
+/// so without this line nothing records that the copy on `addr` is
+/// missing or stale until the next write.
+fn note_refused_replica_leg(
+    context: &ProxyContext,
+    what: &str,
+    addr: Option<&str>,
+    reply: &NodeReply,
+) {
+    let status = match reply {
+        NodeReply::WrongNode => "W (wrong node)",
+        NodeReply::Error => "E",
+        _ => return,
+    };
+    context
+        .replica_refusals_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match addr {
+        Some(addr) => eprintln!(
+            "WARN replica {what} to {addr} answered {status} — the client saw success; \
+             that copy is missing or stale until the next write"
+        ),
+        None => eprintln!(
+            "WARN replica {what} answered {status} — the client saw success; \
+             that copy is missing or stale until the next write"
+        ),
+    }
+}
+
 async fn finish_multi_set(
     context: &ProxyContext,
     batch: MultiSetBatch<'_>,
@@ -4272,7 +4308,12 @@ async fn finish_multi_set(
                 for ((position, is_primary), result) in legs.into_iter().zip(results) {
                     if !is_primary {
                         if matches!(result, ProxyAckEntry::WrongNode) {
-                            eprintln!("WARN replica multi-set leg wrong-node for one key");
+                            note_refused_replica_leg(
+                                context,
+                                "multi-set leg",
+                                None,
+                                &NodeReply::WrongNode,
+                            );
                         }
                         continue;
                     }
@@ -4387,7 +4428,12 @@ async fn retry_multi_set(
                     if is_primary {
                         entries[position] = Some(result);
                     } else if matches!(result, ProxyAckEntry::WrongNode) {
-                        eprintln!("WARN replica multi-set leg wrong-node for one key (retry)");
+                        note_refused_replica_leg(
+                            context,
+                            "multi-set leg (retry)",
+                            None,
+                            &NodeReply::WrongNode,
+                        );
                     }
                 }
             }
@@ -4413,14 +4459,23 @@ async fn enqueue_write(
     namespace: &[u8],
     key: &[u8],
     write: Option<(&Bytes, Option<u64>)>,
-) -> Vec<PendingReply> {
+) -> EnqueuedWrite {
     let owners = ring.owners(namespace, key);
     let (frame, expect) = write_frame(namespace, key, write);
     let requests = owners.iter().map(|addr| (addr.as_str(), frame.clone()));
-    context
+    let pending = context
         .backends
         .enqueue_each(context, requests, expect)
-        .await
+        .await;
+    EnqueuedWrite { owners, pending }
+}
+
+/// A write fanned out to its owners: the owner addresses in ring order
+/// (primary first) and the matching replies, so a replica leg's answer
+/// can be attributed to the node that gave it.
+struct EnqueuedWrite {
+    owners: Vec<String>,
+    pending: Vec<PendingReply>,
 }
 
 fn write_frame(
@@ -4444,10 +4499,11 @@ async fn finish_write(
     namespace: &[u8],
     key: &[u8],
     write: Option<(Bytes, Option<u64>)>,
-    pending: Vec<PendingReply>,
+    enqueued: EnqueuedWrite,
     tag: Option<u32>,
     retry_capable: bool,
 ) -> DriverResult {
+    let EnqueuedWrite { owners, pending } = enqueued;
     let write_ref = write.as_ref().map(|(value, ttl)| (value, *ttl));
     let mut replies = Vec::with_capacity(pending.len());
     for reply in pending {
@@ -4458,9 +4514,14 @@ async fn finish_write(
         // dispatch-time check above.
         return Ok(transient_reply(retry_capable, tag));
     };
-    for replica_reply in replies.iter().skip(1) {
-        if let Err(error) = replica_reply {
-            eprintln!("WARN replica write failed: {error}");
+    for (index, replica_reply) in replies.iter().enumerate().skip(1) {
+        let addr = owners.get(index).map(String::as_str);
+        match replica_reply {
+            Err(error) => match addr {
+                Some(addr) => eprintln!("WARN replica write to {addr} failed: {error}"),
+                None => eprintln!("WARN replica write failed: {error}"),
+            },
+            Ok(reply) => note_refused_replica_leg(context, "write", addr, reply),
         }
     }
 
@@ -4590,8 +4651,9 @@ async fn fan_out_to_replicas(
     let requests = replicas.iter().map(|addr| (addr.as_str(), frame.clone()));
     let results = context.backends.call_each(context, requests, expect).await;
     for (addr, result) in replicas.iter().zip(results) {
-        if let Err(error) = result {
-            eprintln!("WARN replica {what} to {addr} failed: {error}");
+        match result {
+            Err(error) => eprintln!("WARN replica {what} to {addr} failed: {error}"),
+            Ok(reply) => note_refused_replica_leg(context, what, Some(addr), &reply),
         }
     }
 }
@@ -5354,6 +5416,7 @@ async fn run(
         backends,
         requests_total: std::sync::atomic::AtomicU64::new(0),
         upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
     });
 
     let listener = TcpListener::bind((args.host.as_str(), args.port)).await?;
@@ -5513,6 +5576,9 @@ async fn serve_metrics_connection(
             let failures = context
                 .upstream_failures_total
                 .load(std::sync::atomic::Ordering::Relaxed);
+            let replica_refusals = context
+                .replica_refusals_total
+                .load(std::sync::atomic::Ordering::Relaxed);
             let body = format!(
                 "# HELP nanocached_proxy_client_connections Client connections currently held.\n\
                  # TYPE nanocached_proxy_client_connections gauge\n\
@@ -5528,7 +5594,10 @@ async fn serve_metrics_connection(
                  nanocached_proxy_requests_total {requests}\n\
                  # HELP nanocached_proxy_upstream_failures_total Requests that failed upstream after retries (answered E).\n\
                  # TYPE nanocached_proxy_upstream_failures_total counter\n\
-                 nanocached_proxy_upstream_failures_total {failures}\n"
+                 nanocached_proxy_upstream_failures_total {failures}\n\
+                 # HELP nanocached_proxy_replica_refusals_total Replica legs of a write a node answered W or E: the client saw success, but that replica's copy is missing or stale until the next write.\n\
+                 # TYPE nanocached_proxy_replica_refusals_total counter\n\
+                 nanocached_proxy_replica_refusals_total {replica_refusals}\n"
             );
             ("200 OK", body)
         }
@@ -7311,6 +7380,12 @@ mod tests {
                             read_exact_into(&mut stream, &mut buf, key_length).await?;
                             (Vec::new(), buf.split_to(key_length).to_vec())
                         };
+                        if wrong_once.swap(false, Ordering::SeqCst) {
+                            stream
+                                .write_all(format!("W {}\n", tag(&fields)).as_bytes())
+                                .await?;
+                            continue;
+                        }
                         let existed = store.lock().unwrap().remove(&(namespace, key)).is_some();
                         let marker = if existed { "D" } else { "N" };
                         stream
@@ -7549,6 +7624,7 @@ mod tests {
             backends,
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -7658,6 +7734,7 @@ mod tests {
             backends,
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -7818,6 +7895,7 @@ mod tests {
             drain: drain_rx,
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -8478,6 +8556,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_replica_leg_answered_w_is_counted_while_the_write_still_succeeds() {
+        // A refused replica leg never changes the client's answer (the
+        // primary decides), so it used to leave no trace at all — the one
+        // place a stale owner after a membership change could have been
+        // seen from the proxy. It is now counted, for S and D alike.
+        let node_a = MockNode::start().await;
+        let node_b = MockNode::start().await;
+        let roster = vec![
+            ("node-a".to_string(), node_a.addr.clone()),
+            ("node-b".to_string(), node_b.addr.clone()),
+        ];
+        let discovery = start_mock_discovery(roster.clone(), 2).await;
+        let (proxy, _drain, context) = start_proxy_with_drain(&discovery, None, 64, None).await;
+        let owners = RingView::new(roster, 2).owners(b"", b"k");
+        let (primary, replica) = if owners[0] == node_a.addr {
+            (&node_a, &node_b)
+        } else {
+            (&node_b, &node_a)
+        };
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        replica.wrong_node_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"S 1 1\nkv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(primary.entry(b"", b"k"), Some(b"v".to_vec()));
+        assert_eq!(replica.entry(b"", b"k"), None);
+        assert_eq!(
+            context
+                .replica_refusals_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        replica.wrong_node_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"D 1\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "D");
+        assert_eq!(
+            context
+                .replica_refusals_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+
+        // An accepted leg is not counted.
+        stream.write_all(b"S 1 1\nkv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(
+            context
+                .replica_refusals_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn clear_fans_out_to_every_member() {
         let (nodes, proxy) = cluster(2).await;
         let (mut stream, mut buf) = connect_and_auth(&proxy).await;
@@ -9055,6 +9188,7 @@ mod tests {
             backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         });
 
         let reply = context
@@ -9108,6 +9242,7 @@ mod tests {
             backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         });
 
         // Dial address A and hold the slot the map hands back — this
@@ -9228,6 +9363,7 @@ mod tests {
             backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         });
 
         // Dial via a normal request and let it complete, so no caller
@@ -9327,6 +9463,7 @@ mod tests {
             backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(7),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(2),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(3),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -9356,6 +9493,10 @@ mod tests {
         );
         assert!(
             body.contains("nanocached_proxy_upstream_failures_total 2\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nanocached_proxy_replica_refusals_total 3\n"),
             "{body}"
         );
         drop(held);
@@ -9394,6 +9535,7 @@ mod tests {
             backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         });
         drop(ring_tx);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9511,6 +9653,7 @@ mod tests {
             backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         });
         ring_tx
             .send(Some(Arc::new(RingView::new(
@@ -9997,6 +10140,7 @@ mod tests {
             backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         };
 
         let pending: PendingReply = PendingReply::failed(not_sent(io::Error::other(
@@ -10045,6 +10189,7 @@ mod tests {
             backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Seed the node directly so the CAS delete's digest condition
@@ -10114,6 +10259,7 @@ mod tests {
             backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         };
 
         node.close_after_cas_set_apply_once
@@ -10162,6 +10308,7 @@ mod tests {
             backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
         };
 
         node.store
@@ -10221,7 +10368,9 @@ mod tests {
         let value = Bytes::from_static(b"value");
 
         let start = std::time::Instant::now();
-        let pending = enqueue_write(&context, &ring, b"", b"key", Some((&value, None))).await;
+        let pending = enqueue_write(&context, &ring, b"", b"key", Some((&value, None)))
+            .await
+            .pending;
         let elapsed = start.elapsed();
 
         assert_eq!(pending.len(), 3);
