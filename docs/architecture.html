@@ -86,7 +86,11 @@ unreachable.</p>
   <li>Every heartbeat acknowledgment carries the current member list, so
   the surviving nodes' own ring view follows that eviction within one
   heartbeat interval too — a key re-homed from the dead node is served
-  by its new owner rather than answered <code>W</code>.</li>
+  by its new owner rather than answered <code>W</code>. Inside that
+  interval, a node asked for a key its own view does not grant asks
+  discovery for the current list before answering <code>W</code> (at
+  most once a second, each ask bounded at a second), so a client that
+  already routes by the new list is served, not refused.</li>
   <li>That same ring-view update triggers <strong>re-replication</strong>:
   rendezvous hashing's removal property means an eviction (or any leave)
   can only ever <em>promote</em> a node into a key's top-R, never leave a
@@ -152,12 +156,15 @@ no confirmed cause and no code fix, and is accepted as it stands:</p>
   client's node list and the nodes' views of the ring disagree) is swallowed by
   the SDK, so the key sits on one copy until its next write. If the node holding
   that copy is decommissioned or killed first, the newest value is lost and the
-  surviving owners serve the older one. How often this happens varies: earlier
-  runs (Python SDK, Docker) saw about 15&ndash;17&nbsp;% of writes with a
-  replica leg refused, a later run on current <code>main</code> about
-  1.5&nbsp;%, and the difference is not explained. Refreshing the node list
-  and retrying does not cure it: with a freshly fetched list the same node
-  refused again in over 99&nbsp;% of the cases.</li>
+  surviving owners serve the older one. The cause was a node whose own ring
+  lagged the list discovery had published — by up to a heartbeat after a leave
+  or an eviction, and for as long as a join was pending on it — refusing a key
+  it was about to own; earlier runs (Python SDK, Docker) saw about
+  15&ndash;17&nbsp;% of writes with a replica leg refused, a later run about
+  1.5&nbsp;%. A node now asks discovery for the current list before refusing
+  such a key, so the refusal is left only for the ask failing or taking over a
+  second (discovery unreachable), and for a client whose list is older than
+  the node's.</li>
 </ul>
 <p>Both are repaired by the next write to the key; a key that is only read is
 not. Spreading the membership changes out does not remove the leftover copies
@@ -361,9 +368,11 @@ here.</p>
   swallowed by the SDK; the key sits on one copy until its next write, and
   if that node dies first the newest value is lost. Seen on
   1.5&ndash;17&nbsp;% of writes in chaos runs that join, decommission and
-  kill nodes back to back, spread unexplained; the cause was still
-  unconfirmed on 2026-10-13 and the behaviour is accepted as it stands,
-  to be revisited if a cause is found.</li>
+  kill nodes back to back. The cause found on 2026-10-20 — a node's own
+  ring lagging the published list by up to a heartbeat, longer while a
+  join is pending on it — is closed by the node asking discovery before
+  it refuses; what remains accepted is the refusal when that ask fails or
+  takes over a second, and when the client's list is the older one.</li>
   <li>The proxy re-enqueues a retried request (stale-view <code>W</code>,
   replica fallback) outside the client&rsquo;s send order; a pipelined
   <code>G</code> then <code>S</code> on one connection can read its own
