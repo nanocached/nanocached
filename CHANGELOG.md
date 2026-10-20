@@ -21,6 +21,14 @@ framework adapters at one version, whether or not a component changed.
   compare-and-set could report failure for a condition it had applied.
   Idempotent writes and requests that provably never left the proxy keep
   getting `R` (#656).
+- `nanocached-node` answers `W` to `i`, `k` and `x` on a key it owns but is
+  not the primary for. Any owner used to run them, so after a join a
+  client with a stale ring and one with the fresh ring could both win the
+  same `put_if_absent` or CAS, or both receive the same counter value,
+  for as long as the stale client kept its ring; concurrent increments in
+  the seconds after a join lost updates the same way. Plain writes are
+  unchanged (every owner accepts them); the SDKs and the proxy already
+  refresh and retry on `W` (#718, #655).
 
 ### Added
 

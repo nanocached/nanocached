@@ -171,6 +171,10 @@ which need an update to survive.</p>
 <p>In a cluster, replication is client-side (see
 <a href="architecture.html">Architecture</a>) and <code>INCR</code> is
 not fanned out like a plain write: only the key's primary owner runs the
+increment, and a node that is one of the key's owners but not its primary
+answers <code>W</code> (unlike a plain write, which every owner accepts),
+so a client whose ring is stale — after a join the old primary is still
+an owner — is sent to refresh rather than served a second, independent
 increment. Once it succeeds, the SDK (or <code>nanocached-proxy</code> in
 proxy mode) writes the <em>result</em> — the new value and its TTL — to
 the remaining owners as an ordinary <code>S</code>/<code>s</code>, never
@@ -206,6 +210,10 @@ that has already elapsed and the entry expires immediately; unlike
 <code>INCR</code>, the new value is supplied whole by the caller, so
 there is no old TTL to preserve.</p>
 <pre><code>x &lt;namespace-length&gt; &lt;key-length&gt; &lt;cond&gt; [&lt;tag&gt;]\n&lt;namespace&gt;&lt;key&gt;</code></pre>
+<p>Both <code>k</code> and <code>x</code> are evaluated by the key's
+primary owner alone, like <code>INCR</code>: an owner that is not the
+primary answers <code>W</code>, so two clients with different rings
+cannot both win the same condition on two owners.</p>
 <p>Removes the key only if <code>&lt;cond&gt;</code> holds — this is the
 two-argument <code>remove(key, old)</code>. <code>&lt;cond&gt;</code> here
 is always a digest: an absent- or present-only conditioned delete is
