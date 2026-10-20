@@ -14871,6 +14871,8 @@ mod tests {
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
