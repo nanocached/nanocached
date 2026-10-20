@@ -468,10 +468,12 @@ a survivor re-replicating a key after a membership change dropped a
 member (an eviction, or a leave it did not itself hand off for — see
 <a href="architecture.html">Architecture</a>) sends it instead of a
 plain overwrite, so a re-replication racing a newer client write on the
-receiver can never regress it — the receiver stores the entry only if it was absent,
-and acks <code>S\n</code> either way, since a key already present there
-is a success for the sender, not a conflict. An ordinary decommission
-handoff never sets it. <code>H</code> takes an optional trailing
+receiver can never regress it — the receiver stores the entry only if it was absent
+and no <code>u</code> removed it within the last two minutes (a relayed
+delete leaves a tombstone, since a sender may have read the key before
+that delete), and acks <code>S\n</code> either way, since a key already
+present there is a success for the sender, not a conflict. An ordinary
+decommission handoff never sets it. <code>H</code> takes an optional trailing
 <code>&lt;joiner-len&gt;</code> header field, with the joiner's name
 after the token in the body, naming a node whose handoff the sender
 completed but has not yet seen in any roster; discovery then follows its
