@@ -6855,6 +6855,16 @@ func TestConnectReportsANodeAtItsConnectionLimitAsBusyOnTheFirstDial(t *testing.
 			}
 			dials.Add(1)
 			_, _ = conn.Write([]byte("B\n"))
+			// Wait (bounded) for the client to hang up before closing: a close
+			// with the client's identify frame still unread is a reset on Linux,
+			// and a reset discards the B it is queued behind.
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			sink := make([]byte, 256)
+			for {
+				if _, err := conn.Read(sink); err != nil {
+					break
+				}
+			}
 			_ = conn.Close()
 		}
 	}()
