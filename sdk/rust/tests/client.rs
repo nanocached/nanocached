@@ -145,6 +145,19 @@ struct NodeState {
     die_after_multi_get_frames: AtomicUsize,
     /// As `die_after_multi_get_frames`, for `o` (multi-set).
     die_after_multi_set_frames: AtomicUsize,
+    /// When set, every `o` frame is read in full and then the connection
+    /// is closed without a reply — an owner that is down for every
+    /// attempt, including the client's own in-leg redial, unlike
+    /// `die_after_multi_set_frames`, which lets the first N frames through.
+    fail_every_multi_set: std::sync::atomic::AtomicBool,
+    /// The total number of key/value pairs carried by every `o` frame
+    /// this node has ever received — lets a test prove a batched set sent
+    /// each key to a node exactly once, where a frame count alone cannot.
+    multi_set_keys: AtomicUsize,
+    /// When set, the node acknowledges the `A` handshake and then never
+    /// reads another byte, holding the socket open — a peer whose receive
+    /// window fills, leaving the client's writer blocked in its write.
+    stop_reading_after_handshake: std::sync::atomic::AtomicBool,
     /// Issue #225: apply the next `i` normally (the store really does
     /// reflect the new value) but then close the connection instead of
     /// replying — the request was fully written and received, so unlike
@@ -266,6 +279,9 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 };
                 if stream.get_mut().write_all(reply).await.is_err() || !accepted {
                     return;
+                }
+                if state.stop_reading_after_handshake.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
                 }
             }
             "G" | "g" => {
@@ -742,6 +758,10 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     continue;
                 }
                 let this_multi_set = state.multi_sets.fetch_add(1, Ordering::SeqCst) + 1;
+                state.multi_set_keys.fetch_add(n, Ordering::SeqCst);
+                if state.fail_every_multi_set.load(Ordering::SeqCst) {
+                    return; // close without replying, every time
+                }
                 let die_after = state.die_after_multi_set_frames.load(Ordering::SeqCst);
                 if die_after != 0 && this_multi_set > die_after {
                     // Issue #411: see die_after_multi_get_frames's own
@@ -6251,5 +6271,232 @@ async fn large_requests_and_responses_pipelined_together_do_not_deadlock() {
         "96 large requests took {elapsed:?}, want far less than the {timeout:?} request timeout"
     );
     client.close().await;
+    node.stop();
+}
+
+// ── get_many reads a repeated key once ────────────────────────────
+
+#[tokio::test]
+async fn get_many_reads_a_repeated_key_once() {
+    // A list of many copies of one key used to be sent as one `m` frame
+    // per 400 copies with every frame's reply retained until the call
+    // returned — hundreds of MB from a 60 KB request.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("k", "value", 0).await.unwrap();
+
+    let keys = vec!["k"; 2_000];
+    let values = client.get_many(&keys).await.unwrap();
+    assert_eq!(
+        values,
+        HashMap::from([("k".to_string(), "value".to_string())])
+    );
+    assert_eq!(node.state.multi_gets.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    node.stop();
+}
+
+// ── set_many retries only the legs that failed ────────────────────
+
+#[tokio::test]
+async fn batched_set_retries_only_the_legs_that_failed_and_reports_an_unreachable_primary_as_a_connection_loss(
+) {
+    // With R=2 every key goes to both nodes. Node B closes on every `o`
+    // frame: the retry pass used to re-send every rank of each key whose
+    // primary (B) leg failed, including node A, which had already stored
+    // it — A received 19 key-sends for 12 keys. And the exhausted retry
+    // used to be reported as `WrongNode` although B never answered `W`:
+    // it was unreachable.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    nodes[1]
+        .1
+        .state
+        .fail_every_multi_set
+        .store(true, Ordering::SeqCst);
+
+    let mut batch = HashMap::new();
+    let mut primary_on_a = std::collections::HashSet::new();
+    for i in 0..12 {
+        let key = format!("key-{i}");
+        if owners_of(&key)[0] == NAMES[0] {
+            primary_on_a.insert(key.clone());
+        }
+        batch.insert(key, format!("v{i}"));
+    }
+    assert!(
+        !primary_on_a.is_empty() && primary_on_a.len() < 12,
+        "want keys with each primary"
+    );
+
+    match client.set_many(&batch, 0).await {
+        Err(Error::PartialConnectionLostKeys(succeeded, cause)) => {
+            assert_eq!(succeeded, primary_on_a);
+            assert!(
+                matches!(*cause, Error::ConnectionLost(_)),
+                "unexpected cause: {cause}"
+            );
+        }
+        other => panic!("want PartialConnectionLostKeys, got {other:?}"),
+    }
+    assert_eq!(
+        nodes[0].1.state.multi_set_keys.load(Ordering::SeqCst),
+        12,
+        "every key sent to A exactly once"
+    );
+    assert_eq!(nodes[0].1.state.store.lock().unwrap().len(), 12);
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+// ── forced refreshes are single-flight ────────────────────────────
+
+#[tokio::test]
+async fn concurrent_callers_on_a_dead_node_share_one_forced_refresh() {
+    // Four callers that find their node dead at the same time used to run
+    // four full refreshes one after another behind the refresh gate, the
+    // last caller waiting through all of them. (The existing coalescing
+    // test covers the staleness-triggered path; this is the forced one.)
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let key = (0..)
+        .map(|i| format!("key-{i}"))
+        .find(|key| owners_of(key)[0] == NAMES[0])
+        .unwrap();
+    client.set(&key, "v", 0).await.unwrap();
+    nodes[0].1.stop();
+    let before = discovery.l_requests.load(Ordering::SeqCst);
+    discovery.l_delay_ms.store(400, Ordering::SeqCst);
+
+    let mut callers = Vec::new();
+    for _ in 0..4 {
+        let client = client.clone();
+        let key = key.clone();
+        callers.push(tokio::spawn(async move {
+            let started = Instant::now();
+            assert!(client.get(&key).await.is_err());
+            started.elapsed()
+        }));
+    }
+    for caller in callers {
+        let elapsed = caller.await.unwrap();
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "a caller waited {elapsed:?} (serialized refreshes?)"
+        );
+    }
+    discovery.l_delay_ms.store(0, Ordering::SeqCst);
+    assert_eq!(
+        discovery.l_requests.load(Ordering::SeqCst) - before,
+        1,
+        "one shared refresh"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+// ── a stalled replica costs one request timeout, not two ──────────
+
+#[tokio::test]
+async fn a_stalled_replica_bounds_a_cluster_set_by_one_request_timeout() {
+    // A replica that acknowledged the handshake and then stopped reading
+    // timed out the replica leg, which was then redialed and re-sent for
+    // a second full timeout — set() returned after twice the request
+    // deadline although the primary had answered at once.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(
+        options(discovery.port).request_timeout(Duration::from_millis(300)),
+    )
+    .await
+    .unwrap();
+    let key = (0..)
+        .map(|i| format!("key-{i}"))
+        .find(|key| owners_of(key)[0] == NAMES[0])
+        .unwrap();
+    client.set(&key, "warm", 0).await.unwrap();
+    let replica = &nodes[1].1;
+    let connections_before = replica.state.connections.load(Ordering::SeqCst);
+    replica.state.silent.store(true, Ordering::SeqCst);
+
+    let started = Instant::now();
+    client.set(&key, "v", 0).await.unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(250) && elapsed < Duration::from_millis(550),
+        "set took {elapsed:?}, want about one timeout"
+    );
+    assert_eq!(
+        replica.state.connections.load(Ordering::SeqCst),
+        connections_before,
+        "no redial after a timeout"
+    );
+    assert_eq!(client.stats().replica_write_failures, 1);
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+// ── close() releases a writer blocked on a peer that does not read ──
+
+#[tokio::test]
+async fn close_releases_writers_blocked_on_a_peer_that_does_not_read() {
+    // A peer that acknowledged the handshake and then never read left
+    // the client's writer blocked in its write with `write_state` held,
+    // so close() could not drop the write half and every caller queued
+    // behind that writer stayed pending until the request deadline.
+    let node = MockNode::start_with(NodeState {
+        stop_reading_after_handshake: std::sync::atomic::AtomicBool::new(true),
+        ..NodeState::default()
+    })
+    .await;
+    let client =
+        NanocachedClient::connect(options(node.port).request_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap();
+
+    let value = vec![b'x'; 1_000_000];
+    let mut sets = Vec::new();
+    for i in 0..24 {
+        let client = client.clone();
+        let value = value.clone();
+        sets.push(tokio::spawn(async move {
+            client.set(format!("big-{i}"), value, 0).await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let closed_at = Instant::now();
+    client.close().await;
+    for set in sets {
+        let outcome = tokio::time::timeout(Duration::from_secs(2), set)
+            .await
+            .expect("a set must settle promptly after close()")
+            .unwrap();
+        assert!(
+            outcome.is_err(),
+            "a set against a peer that never read cannot have succeeded"
+        );
+    }
+    assert!(
+        closed_at.elapsed() < Duration::from_secs(2),
+        "callers settled {:?} after close()",
+        closed_at.elapsed()
+    );
     node.stop();
 }

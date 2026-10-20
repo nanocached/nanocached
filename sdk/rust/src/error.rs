@@ -57,6 +57,16 @@ pub enum Error {
     /// caller as a plain `ConnectionLost` instead. No public method ever
     /// returns this variant; if one does, that's a bug.
     ConnectionLostAfterSend(String),
+    /// Internal-only sibling of [`Self::ConnectionLost`]: the request
+    /// deadline expired with this request still unanswered. The peer was
+    /// reachable and simply did not answer in time, so the client's
+    /// redial-and-retry for idempotent requests does not apply — a second
+    /// attempt would most likely wait out another whole deadline (a
+    /// replica that stopped reading made a cluster `set` take twice the
+    /// request timeout) and would re-send a write the peer may still
+    /// apply. Folded back into a plain `ConnectionLost` before any public
+    /// method returns it, exactly like [`Self::ConnectionLostAfterSend`].
+    ConnectionLostTimedOut(String),
     /// The server rejected the `A` handshake's secret — either the server
     /// requires one and none was configured, or the configured one is
     /// wrong. Never transient: retrying with the same configuration
@@ -124,9 +134,13 @@ pub enum Error {
     /// the UTF-8-decoded counterpart (see [`Self::PartialWrongNodeText`]).
     PartialConnectionLostText(HashMap<String, String>, Box<Error>),
     /// issue #411 — `set_many`/`set_many_bytes`' write-side analogue of
-    /// [`Self::PartialConnectionLost`] (single-node/proxy mode only): a
+    /// [`Self::PartialConnectionLost`]. In single-node/proxy mode: a
     /// chunked batch's connection was lost on chunk N>1 after the SDK's
-    /// own reconnect-and-retry for that chunk also failed. Unlike
+    /// own reconnect-and-retry for that chunk also failed. In cluster
+    /// mode: some keys' primary could not be reached at the connection
+    /// level on both passes (no `W` was ever received — a dead node is
+    /// never reported as a wrong-node answer); carries the keys whose
+    /// primary did acknowledge. Unlike
     /// [`Self::WrongNode`] (which `set_many`/`set_many_bytes` return
     /// plain, with nothing to attach, since a successful set has no
     /// value to return), this condition DOES have something meaningful
@@ -157,6 +171,7 @@ impl fmt::Display for Error {
             ),
             Error::ConnectionLost(message)
             | Error::ConnectionLostAfterSend(message)
+            | Error::ConnectionLostTimedOut(message)
             | Error::Protocol(message)
             | Error::Authentication(message)
             | Error::Retryable(message) => write!(f, "{message}"),
@@ -173,13 +188,13 @@ impl fmt::Display for Error {
             Error::PartialConnectionLost(_, cause)
             | Error::PartialConnectionLostText(_, cause) => write!(
                 f,
-                "nanocached: connection lost partway through a chunked batch, after some \
-                 chunks already succeeded: {cause}"
+                "nanocached: some keys in this batch could not be read because their \
+                 connection was lost (the keys that did resolve are attached): {cause}"
             ),
             Error::PartialConnectionLostKeys(_, cause) => write!(
                 f,
-                "nanocached: connection lost partway through a chunked batch, after some \
-                 keys were already stored: {cause}"
+                "nanocached: some keys in this batch could not be stored because their \
+                 primary's connection was lost (the keys that were stored are attached): {cause}"
             ),
         }
     }
