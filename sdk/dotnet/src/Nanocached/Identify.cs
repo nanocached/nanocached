@@ -195,8 +195,20 @@ internal static class Identify
             // '\n', untagged); echoed response tags stretches it to 4 bytes
             // with a `T` before the final '\n' when the server echoes the
             // tag capability our extended `A` asked for.
+            // A node at its connection limit answers a bare `B\n` — two
+            // bytes, then it closes — instead of the three-byte identity.
+            // Read two first so that reply is seen as what it is; a
+            // three-byte read would end short and be taken for a pre-tags
+            // server's door-slam, retried with the lesser `A` forms and
+            // reported as a closed connection.
             var ack = new byte[3];
-            await stream.ReadExactlyAsync(ack, cancel).ConfigureAwait(false);
+            await stream.ReadExactlyAsync(ack.AsMemory(0, 2), cancel).ConfigureAwait(false);
+            if (ack[0] == (byte)'B' && ack[1] == (byte)'\n')
+            {
+                throw new ConnectionLostException(
+                    $"nanocached: {host}:{port} is at its connection limit (busy)", requestNotSent: true);
+            }
+            await stream.ReadExactlyAsync(ack.AsMemory(2, 1), cancel).ConfigureAwait(false);
             bool shapedPrefix = ack[0] is (byte)'O' or (byte)'E' && ack[1] is (byte)'n' or (byte)'d';
             if (!shapedPrefix || (ack[2] != (byte)'\n' && ack[2] != (byte)'T'))
             {
