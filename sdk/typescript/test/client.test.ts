@@ -923,11 +923,14 @@ describe("NanocachedClient reconnect-on-use", () => {
 
   it("remainingDeadline subtracts elapsed time from the shared budget, clamped at zero", async () => {
     const { remainingDeadline } = await import("../src/identify.js");
+    // The clock is passed in: read it inside the function and a
+    // millisecond ticking between the two reads makes 500 into 499.
     const now = Date.now();
-    assert.equal(remainingDeadline(500, now), 500);
+    assert.equal(remainingDeadline(500, now, now), 500);
+    assert.equal(remainingDeadline(500, now - 450, now), 50);
+    assert.equal(remainingDeadline(500, now - 999_999, now), 0);
+    // The default clock is the real one.
     assert.ok(remainingDeadline(500, now - 450) <= 50);
-    assert.ok(remainingDeadline(500, now - 450) > 0);
-    assert.equal(remainingDeadline(500, now - 999_999), 0);
   });
 
   it("an `N` header with no newline fails promptly instead of buffering forever", async () => {

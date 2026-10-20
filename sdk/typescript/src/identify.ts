@@ -534,8 +534,8 @@ function isLegacyServerSignal(error: unknown): boolean {
 // every read phase after it must draw from what's left of that same
 // budget (issue #47 audit item 3: two independent full-length timers
 // could add up to ~2x the intended per-attempt deadline).
-export function remainingDeadline(budgetMs: number, startedAt: number): number {
-  return Math.max(0, budgetMs - (Date.now() - startedAt));
+export function remainingDeadline(budgetMs: number, startedAt: number, nowMs = Date.now()): number {
+  return Math.max(0, budgetMs - (nowMs - startedAt));
 }
 
 interface Authenticated {
