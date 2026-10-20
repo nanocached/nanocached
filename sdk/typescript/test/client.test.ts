@@ -5724,6 +5724,64 @@ describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
     };
   }
 
+  it("setMany retries only the legs that failed", async () => {
+    // One owner closes the connection on every `o`. The keys whose
+    // primary it is are retried after a refresh — but only to it: the
+    // owners that acknowledged those keys as replicas in the first pass
+    // used to be sent them a second time.
+    // Three nodes at R=2 (the describe's own cluster runs at R=1, where
+    // there are no replica legs to re-send).
+    const mocks = await Promise.all([startMockNode(), startMockNode(), startMockNode()]);
+    const nodes = names.map((name, i) => ({ name, mock: mocks[i] }));
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+    const cluster = {
+      nodes,
+      discovery,
+      close: async () => {
+        await Promise.all([discovery.close(), ...mocks.map((m) => m.close())]);
+      },
+    };
+    try {
+      const ring = new HashRing(names);
+      const bad = cluster.nodes[2];
+      bad.mock.failAllMultiSets();
+      const keys: string[] = [];
+      for (let i = 0; keys.length < 12; i++) {
+        const key = `leg-${i}`;
+        const primary = ring.owners(Buffer.from(key), 1)[0];
+        const sameSoFar = keys.filter((k) => ring.owners(Buffer.from(k), 1)[0] === primary).length;
+        if (sameSoFar < 4) keys.push(key);
+      }
+      const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+      try {
+        await assert.rejects(client.setMany(values), WrongNodeError);
+        // R=2 over three nodes: every key has one primary and one
+        // replica. Each good owner sees exactly one frame (its primary
+        // and replica keys of the first pass) — nothing is sent to it
+        // again; the bad one sees its first-pass frame and then the
+        // retry of its four primary keys only.
+        for (const { name, mock } of cluster.nodes.slice(0, 2)) {
+          const counts = mock.multiSetKeyCounts();
+          assert.equal(counts.length, 1, `${name} must see one frame, saw ${JSON.stringify(counts)}`);
+          assert.ok(counts[0] >= 4, `${name} holds at least its four primary keys`);
+        }
+        const badCounts = bad.mock.multiSetKeyCounts();
+        assert.equal(badCounts.length, 2, `the failing owner sees the first pass and the retry: ${JSON.stringify(badCounts)}`);
+        assert.equal(badCounts[1], 4, "the retry carries only its four primary keys");
+        const sent = cluster.nodes.map(({ mock }) => mock.multiSetKeyCounts()[0]).reduce((a, b) => a + b, 0);
+        assert.equal(sent, 24, "the first pass sends each key to its two owners once");
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
+
   it("fans a namespaced clear out to every node in the cluster, not just the key's owners", async () => {
     const cluster = await startCluster();
     try {
@@ -6100,6 +6158,32 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
       assert.equal(proxy.getCount(), 0);
     } finally {
       await Promise.all([discovery.close(), proxy.close()]);
+    }
+  });
+
+  it("getMany reads a repeated key once", async () => {
+    // A repeated key is read once and the result keyed once: sending
+    // every copy would cost one `m` frame per 400 copies and retain one
+    // reply per frame — hundreds of MB for 60 KB of request.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.setMany({ a: "1", b: "2" });
+        const values = await client.getMany(["a", "a", "b", "a", "b"]);
+        assert.deepEqual([...values.entries()], [["a", "1"], ["b", "2"]]);
+        assert.equal(node.multiGetCount(), 1);
+
+        const copies = await client.getMany(Array(20_000).fill("a"));
+        assert.deepEqual([...copies.entries()], [["a", "1"]]);
+        assert.equal(node.multiGetCount(), 2);
+        const frames = node.multiGetFrameBytes();
+        assert.ok(frames[frames.length - 1] < 64, `the frame for 20,000 copies of one key is ${frames[frames.length - 1]} bytes`);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
     }
   });
 

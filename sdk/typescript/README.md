@@ -453,7 +453,9 @@ namespace-scoped: `client.namespace(ns).getMany(...)`/`.setMany(...)`,
 same as `get`/`set`. Batch keys are always `string` — unlike single-key
 `get`/`set`, `getMany`/`setMany` don't accept `Uint8Array` keys, since a
 `Uint8Array` can't safely key a `Map` (reference, not content,
-identity).
+identity). A key repeated in a `getMany` is read once (the result is a
+`Map`), so a list of many copies of one key costs one key's worth of
+request and reply.
 
 **A batch never fails as a whole.** Each key's outcome is independent,
 and a batched read survives an unreachable owner the way a single `get`
@@ -624,7 +626,12 @@ never replayed.
   background replica writes finish and all connections are closed; later
   calls reject with `AlreadyClosedError`; a second `close()` warns but
   stays idempotent. Awaiting it is optional — un-awaited, teardown still
-  happens once the drain settles. `connect()` warns (`was close()
+  happens once the drain settles. An idle client does not keep the Node
+  process alive (its sockets are `unref`'d while no request is pending,
+  and `ref`'d again while one is), so a script that ends without calling
+  `close()` exits once its last request has been answered, as with the
+  other SDKs; `close()` is still how to release the connections promptly
+  in a long-running process. `connect()` warns (`was close()
   forgotten?`) when called again for a single address whose previous
   connection is still open; the check is skipped for multi-address
   configs, where concurrent clients sharing an address list are

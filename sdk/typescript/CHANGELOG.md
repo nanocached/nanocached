@@ -9,6 +9,34 @@ tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- A namespace is hashed once per batch rather than once per key:
+  `getMany`/`setMany` under a 900 KB namespace took 8.8 s for 400 keys
+  and blocked the event loop for the whole call.
+- The pending-request queue is drained from a head index instead of
+  `Array.shift()`, which is O(n): 200,000 concurrent requests on one
+  connection spent 52 s in `shift` alone.
+- A reply is received into one buffer sized from its header, filled in
+  place, instead of one `Buffer` object per `data` event held until the
+  frame completes: a peer trickling a 2 MiB reply one byte at a time held
+  the client at about 450 MiB (a 64 MiB batch reply at 2.4 GB). The
+  buffer is released once a large frame has been parsed.
+- Socket writes respect backpressure: a request waits for the socket's
+  `drain` before its frame is written (in call order, so wire order is
+  unchanged), so a burst of requests to a stalled node no longer sits in
+  the stream's buffer in full (600 queued 900 KiB sets held 1.1 GB).
+- An idle client no longer keeps the Node process alive: a connection's
+  socket is `unref`'d while no request is pending and `ref`'d while one
+  is, so a script that never calls `close()` exits once its last request
+  has been answered, as with the other SDKs.
+- `getMany`/`getManyBytes` read a repeated key once, so a list of many
+  copies of one key costs one key's worth of request and reply instead
+  of one `m` frame per 400 copies and one retained reply per frame.
+- `setMany` in cluster mode retries only the legs that failed. A key
+  whose primary leg failed used to be re-sent to every owner after the
+  refresh, including the replica that had already acknowledged it.
+
 ## [0.4.7] - 2026-10-19
 
 ### Fixed

@@ -1579,6 +1579,18 @@ export class NanocachedClient {
     if (keys.length === 0) {
       throw new RangeError("nanocached: getMany/getManyBytes requires at least one key");
     }
+    // A repeated key is read once: a batched read is a set query (the
+    // result is a Map), and sending every copy would retain one reply
+    // per copy — 20,000 copies of one key naming a large value is 50
+    // frames and hundreds of MB of replies for 60 KB of request.
+    const seen = new Set<string>();
+    const distinct: string[] = [];
+    for (const key of keys) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      distinct.push(key);
+    }
+    keys = distinct;
     // Eager, up-front, before any network I/O — the same fail-fast
     // contract every other public method already gets from its own
     // encoder; a bad key deep in a 900-key batch must not leave earlier
@@ -1946,11 +1958,18 @@ export class NanocachedClient {
       return;
     }
 
-    let retryIndices = await this.multiSetPass(namespace, keyBytes, valueBytes, ttlSeconds, undefined);
+    // Which owners acknowledged which key, shared across both passes so
+    // the retry sends only the legs that failed: a key whose primary leg
+    // failed used to be re-sent to every owner after the refresh,
+    // including the replica that had already stored it — duplicate
+    // traffic, and a chance to re-apply an older value over a newer
+    // concurrent write. getMany keeps its completed chunks the same way.
+    const acknowledged = new Map<number, Set<string>>();
+    let retryIndices = await this.multiSetPass(namespace, keyBytes, valueBytes, ttlSeconds, undefined, acknowledged);
     if (retryIndices.length === 0) return;
 
     await this.maybeRefreshNodeList({ force: true });
-    retryIndices = await this.multiSetPass(namespace, keyBytes, valueBytes, ttlSeconds, retryIndices);
+    retryIndices = await this.multiSetPass(namespace, keyBytes, valueBytes, ttlSeconds, retryIndices, acknowledged);
     if (retryIndices.length > 0) throw new WrongNodeError();
   }
 
@@ -2009,6 +2028,7 @@ export class NanocachedClient {
     valueBytes: readonly Buffer[],
     ttlSeconds: number,
     retryIndices: readonly number[] | undefined,
+    acknowledged: Map<number, Set<string>>,
   ): Promise<number[]> {
     const indices = retryIndices ?? keyBytes.map((_, index) => index);
 
@@ -2020,7 +2040,12 @@ export class NanocachedClient {
         retry.push(index);
         continue;
       }
+      // An owner that already acknowledged this key in an earlier pass
+      // is not sent it again; a key every current owner of which has
+      // acknowledged needs nothing more.
+      const done = acknowledged.get(index);
       names.forEach((name, rank) => {
+        if (done?.has(name)) return;
         let group = groups.get(name);
         if (!group) {
           group = { indices: [], isPrimary: [] };
@@ -2037,6 +2062,14 @@ export class NanocachedClient {
     // fire-and-forget branch below and the drain after Promise.all(legs).
     const backgroundLegs: Promise<void>[] = [];
     for (const [name, group] of groups) {
+      const acknowledge = (index: number): void => {
+        let owners = acknowledged.get(index);
+        if (!owners) {
+          owners = new Set();
+          acknowledged.set(index, owners);
+        }
+        owners.add(name);
+      };
       const runLeg = async (): Promise<void> => {
         let entries: MultiAckEntry[];
         try {
@@ -2058,6 +2091,7 @@ export class NanocachedClient {
             const partial = error.partialValues as MultiAckEntry[];
             for (let i = 0; i < group.indices.length; i++) {
               if (i < partial.length) {
+                if (partial[i].kind === "stored") acknowledge(group.indices[i]);
                 if (!group.isPrimary[i]) {
                   if (partial[i].kind === "wrongNode") this.replicaWriteFailures++;
                   continue;
@@ -2082,6 +2116,7 @@ export class NanocachedClient {
           return;
         }
         for (let i = 0; i < group.indices.length; i++) {
+          if (entries[i].kind === "stored") acknowledge(group.indices[i]);
           if (!group.isPrimary[i]) {
             if (entries[i].kind === "wrongNode") this.replicaWriteFailures++;
             continue;

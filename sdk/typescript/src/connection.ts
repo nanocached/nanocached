@@ -23,6 +23,50 @@ import {
   type ParsedResponse,
 } from "./protocol.js";
 
+/** A FIFO drained from a moving head index rather than `Array.shift()`,
+ * which is O(n) on a large array: with the pending queue as a plain
+ * array, 200,000 concurrent requests on one connection spent 52 s in
+ * `shift` alone (quadratic), where Python's `deque.popleft` and Go's
+ * reslice are O(1). Consumed slots are released in bulk once the head
+ * has passed half of the backing array. */
+export class HeadQueue<T> {
+  private items: (T | undefined)[] = [];
+  private head = 0;
+
+  get length(): number {
+    return this.items.length - this.head;
+  }
+
+  push(item: T): void {
+    this.items.push(item);
+  }
+
+  shift(): T | undefined {
+    if (this.head >= this.items.length) return undefined;
+    const item = this.items[this.head];
+    this.items[this.head] = undefined;
+    this.head++;
+    if (this.head >= 1024 && this.head * 2 >= this.items.length) {
+      this.items = this.items.slice(this.head);
+      this.head = 0;
+    }
+    return item;
+  }
+
+  /** Every queued item, in order, leaving the queue empty. */
+  drain(): T[] {
+    const drained = this.items.slice(this.head) as T[];
+    this.items = [];
+    this.head = 0;
+    return drained;
+  }
+}
+
+/** Past this capacity an emptied receive buffer is released rather than
+ * kept for the next frame, so one large reply does not pin its size for
+ * the connection's life. */
+const RECEIVE_BUFFER_RELEASE_BYTES = 64 * 1024;
+
 interface Waiter {
   resolve: (response: ParsedResponse) => void;
   reject: (error: Error) => void;
@@ -187,10 +231,14 @@ export class Connection {
   // a previous incomplete parse said it was waiting for (0 while unknown,
   // i.e. while the header itself is still incomplete): until that many
   // bytes are buffered, a new chunk is just appended.
-  private chunks: Buffer[] = [];
-  private chunksLength = 0;
+  private receive: Buffer = Buffer.alloc(0);
+  private receiveLength = 0;
   private neededLength = 0;
-  private readonly pending: Waiter[] = [];
+  private readonly pending = new HeadQueue<Waiter>();
+  /** Serialises `sendOnce`'s writes so each waits for the socket to be
+   * writable (`writableNeedDrain` false) before claiming its tag and
+   * writing — see `whenWritable`. */
+  private writeGate: Promise<void> = Promise.resolve();
   private closed = false;
   private lastError: Error | null = null;
   private lastUsed = Date.now();
@@ -221,6 +269,11 @@ export class Connection {
     this.socket.on("data", (chunk: Buffer) => this.onData(chunk));
     this.socket.on("error", (error: Error) => this.onError(error));
     this.socket.on("close", () => this.onClose());
+    // An idle connection does not keep the process alive: a script that
+    // ends without close() exits, as it does with the other SDKs. The
+    // socket is ref'd again for as long as a request is pending (see
+    // sendOnce/onData), so a reply in flight is always waited for.
+    this.socket.unref();
     // A socket whose "close" has already been emitted never emits it
     // again (issue #574): a peer RST that lands between a dial's identify
     // handshake and the end of its round — the round only builds
@@ -520,23 +573,50 @@ export class Connection {
     this.lastUsed = Date.now();
 
     return new Promise((resolve, reject) => {
-      // The tag is claimed in the same synchronous span that enqueues the
-      // waiter and writes the frame (request pipelining's enqueue+write atomicity),
-      // so tag order can never skew from queue/wire order (echoed response tags).
-      const tag = this.tagged ? this.claimTag() : undefined;
-      // Build before enqueueing: an encoder that rejects its input (e.g.
-      // encodeSet's TTL check) must fail with nothing queued, or the next
-      // response would resolve an orphaned waiter and desync the stream.
-      const frame = build(tag);
-      const waiter: Waiter = { resolve, reject, tag };
-      this.pending.push(waiter);
-      // Armed only on the empty→non-empty transition: arming on *every*
-      // request would let a continuous stream of new requests push the
-      // deadline forever ahead of a server that has stopped answering —
-      // exactly the half-open hang the timeout exists to catch.
-      if (this.pending.length === 1) this.armRequestTimer();
+      // Runs once the socket is writable (its buffered writes are under
+      // the high-water mark): `socket.write` never refuses, so without
+      // waiting for `drain` a burst of requests sat in the stream's own
+      // buffer in full — 600 queued 900 KiB sets held 1.1 GB with the
+      // node stalled. Requests are gated in call order, so queue order
+      // still equals wire order.
+      const start = (): void => {
+        if (this.closed) {
+          // Nothing was written for this call: see the check at entry.
+          const cause = this.lastError;
+          reject(
+            new ConnectionLostError(
+              cause ? `nanocached: connection is closed: ${cause.message}` : "nanocached: connection is closed",
+              { requestWasSent: false },
+            ),
+          );
+          return;
+        }
+        // The tag is claimed in the same synchronous span that enqueues the
+        // waiter and writes the frame (request pipelining's enqueue+write atomicity),
+        // so tag order can never skew from queue/wire order (echoed response tags).
+        const tag = this.tagged ? this.claimTag() : undefined;
+        // Build before enqueueing: an encoder that rejects its input (e.g.
+        // encodeSet's TTL check) must fail with nothing queued, or the next
+        // response would resolve an orphaned waiter and desync the stream.
+        let frame: Buffer;
+        try {
+          frame = build(tag);
+        } catch (error) {
+          reject(error as Error);
+          return;
+        }
+        const waiter: Waiter = { resolve, reject, tag };
+        this.pending.push(waiter);
+        // Armed only on the empty→non-empty transition: arming on *every*
+        // request would let a continuous stream of new requests push the
+        // deadline forever ahead of a server that has stopped answering —
+        // exactly the half-open hang the timeout exists to catch.
+        if (this.pending.length === 1) {
+          this.armRequestTimer();
+          this.socket.ref();
+        }
 
-      this.socket.write(frame, (error) => {
+        this.socket.write(frame, (error) => {
         if (error) {
           // A write can fail (EPIPE, ECONNRESET, ...) after the frame
           // went only partially onto the wire — desyncing every request
@@ -550,7 +630,30 @@ export class Connection {
           // by the 'close' handler this triggers.
           this.poison(new ConnectionLostError(`nanocached: connection failed: ${error.message}`));
         }
-      });
+        });
+      };
+
+      const turn = this.writeGate.then(() => this.whenWritable()).then(start);
+      // The gate never rejects: a failure is delivered to this call's
+      // promise above, and the next sender must still get its turn.
+      this.writeGate = turn.catch(() => {});
+    });
+  }
+
+  /** Resolves once the socket's buffered writes are under its high-water
+   * mark again (or the socket closed, which ends every wait): what a
+   * sender waits for before writing, so the stream's own buffer holds at
+   * most about one frame over the mark. */
+  private whenWritable(): Promise<void> {
+    if (this.closed || !this.socket.writableNeedDrain) return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = (): void => {
+        this.socket.off("drain", done);
+        this.socket.off("close", done);
+        resolve();
+      };
+      this.socket.on("drain", done);
+      this.socket.on("close", done);
     });
   }
 
@@ -560,18 +663,37 @@ export class Connection {
     return tag;
   }
 
+  /** Appends `chunk` to the receive buffer, growing it to the frame's
+   * known total (`neededLength`) in one step or by doubling while the
+   * header is still incomplete. Received bytes used to be kept as one
+   * `Buffer` object per `data` event until the frame was complete, so a
+   * peer trickling a 2 MiB reply one byte at a time held the client at
+   * about 450 MiB (and a 64 MiB batch reply at 2.4 GB) — about 390 bytes
+   * of bookkeeping per event. One buffer of the frame's size, filled in
+   * place, holds the frame's bytes and nothing more. */
+  private receiveChunk(chunk: Buffer): void {
+    const needed = this.receiveLength + chunk.length;
+    if (needed > this.receive.length) {
+      const capacity = Math.max(needed, this.neededLength, Math.min(this.receive.length * 2, MAX_RESPONSE_FRAME_LENGTH), 4096);
+      const grown = Buffer.allocUnsafe(capacity);
+      this.receive.copy(grown, 0, 0, this.receiveLength);
+      this.receive = grown;
+    }
+    chunk.copy(this.receive, this.receiveLength);
+    this.receiveLength = needed;
+  }
+
   private onData(chunk: Buffer): void {
-    this.chunks.push(chunk);
-    this.chunksLength += chunk.length;
+    this.receiveChunk(chunk);
     // The body of a frame whose header is already parsed is still short:
-    // nothing to parse (or copy) until the rest of it has arrived. Safe
-    // for the incomplete-frame backstop below too — `neededLength` is
-    // itself already within it (a `V`/`I` length is capped, a batch
-    // reply's total is what the backstop widens to).
-    if (this.chunksLength < this.neededLength) return;
+    // nothing to parse until the rest of it has arrived. Safe for the
+    // incomplete-frame backstop below too — `neededLength` is itself
+    // already within it (a `V`/`I` length is capped, a batch reply's
+    // total is what the backstop widens to).
+    if (this.receiveLength < this.neededLength) return;
 
     for (;;) {
-      const buffer = this.chunks.length === 1 ? this.chunks[0] : Buffer.concat(this.chunks, this.chunksLength);
+      const buffer = this.receive.subarray(0, this.receiveLength);
 
       let parsed;
       const incomplete = { needed: 0 };
@@ -612,17 +734,30 @@ export class Connection {
           this.poison(new NanocachedError("nanocached: response frame exceeds maximum size (connection desynced)"));
           return;
         }
-        // Collapse back to a single stored chunk so later onData calls
-        // don't re-concat bytes already merged here.
-        this.chunks = [buffer];
-        this.chunksLength = buffer.length;
+        // The frame's total is known once its header is: size the
+        // buffer for it now, so the rest of the body is copied straight
+        // into place as it arrives.
         this.neededLength = incomplete.needed;
+        if (this.neededLength > this.receive.length) {
+          const grown = Buffer.allocUnsafe(this.neededLength);
+          this.receive.copy(grown, 0, 0, this.receiveLength);
+          this.receive = grown;
+        }
         return;
       }
 
-      const remainder = buffer.subarray(parsed.consumed);
-      this.chunks = remainder.length > 0 ? [remainder] : [];
-      this.chunksLength = remainder.length;
+      // Parsed values are copies (see tryParseResponse), so the buffer
+      // can be reused in place: the unparsed remainder moves to the
+      // front. An emptied buffer past the release threshold is dropped,
+      // so a large reply's buffer is not pinned for the connection's
+      // life.
+      const remaining = this.receiveLength - parsed.consumed;
+      if (remaining > 0) {
+        this.receive.copyWithin(0, parsed.consumed, this.receiveLength);
+      } else if (this.receive.length > RECEIVE_BUFFER_RELEASE_BYTES) {
+        this.receive = Buffer.alloc(0);
+      }
+      this.receiveLength = remaining;
       this.neededLength = 0;
 
       // An unsolicited "busy" response means the server hit its connection
@@ -643,9 +778,14 @@ export class Connection {
       // Progress-based deadline (see send()): a dispatched response is
       // progress, so the next-oldest request gets a fresh window; with
       // nothing left waiting, clear it so an otherwise-idle connection is
-      // never closed by it.
-      if (this.pending.length === 0) this.clearRequestTimer();
-      else this.armRequestTimer();
+      // never closed by it — and let go of the process (see the
+      // constructor's unref).
+      if (this.pending.length === 0) {
+        this.clearRequestTimer();
+        this.socket.unref();
+      } else {
+        this.armRequestTimer();
+      }
 
       // Echoed response tags: on a tagged connection, verify the echoed tag against
       // the request this response is about to answer — *before* it can
@@ -699,7 +839,7 @@ export class Connection {
     this.closeEmitted = true;
     this.clearRequestTimer();
     const error = this.closeError();
-    const waiters = this.pending.splice(0);
+    const waiters = this.pending.drain();
     for (const waiter of waiters) waiter.reject(error);
   }
 
