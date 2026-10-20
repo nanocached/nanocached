@@ -14,6 +14,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node` no longer hangs a client connection on a forward
+  queue that has no drainer. A write forwarded to a joiner or an
+  entrant waits for room when that target's queue is full, until the
+  queue's drainer makes some; a queue whose drainer could not be
+  started (the drainer channel full with its waiters at their cap) or
+  died kept its writes and had no drainer, so the next forward to that
+  target that did not fit waited forever, and with it the client
+  request behind it. Such a queue now admits the write and the forward
+  starts the drainer.
 - `nanocached-node` no longer sends a clear or a handed-off write around
   in circles between two nodes. A clear forwarded to another node was
   byte-identical to a client's, so a node decommissioning while its
