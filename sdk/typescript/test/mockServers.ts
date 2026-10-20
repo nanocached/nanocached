@@ -134,6 +134,12 @@ export interface MockNode extends MockServerBase {
    * size (header line plus namespace plus every key's and every value's
    * bytes) received so far, in receipt order. */
   multiSetFrameBytes(): number[];
+  /** Keys per `o` frame received, in receipt order. */
+  multiSetKeyCounts(): number[];
+  /** Close the connection on every `o` this node receives from now on
+   * (not just the next one) — an owner that stays down for a batched
+   * write's retry pass. */
+  failAllMultiSets(): void;
   /** Makes every `m`/`o` roster containing `key` answer just that key
    * `W`, for the next `times` such requests (consumed one per match,
    * across as many separate `m`/`o` calls as it takes) — the batched
@@ -182,6 +188,11 @@ export interface MockNode extends MockServerBase {
    * timeout (issue #42), mirroring the Go suite's hook of the same
    * name. */
   goSilentAfterHandshake(): void;
+  /** Stop reading the socket after the handshake (`socket.pause()`):
+   * once the kernel's receive buffer fills, the peer's window closes and
+   * a client's writes stay in its own buffers — a stalled node, from the
+   * client's side. */
+  stopReadingAfterHandshake(): void;
 }
 
 export interface MockDiscovery extends MockServerBase {
@@ -392,6 +403,9 @@ export async function startMockNode(
   // multiGetFrameBytes/multiSetFrameBytes above.
   const multiGetFrameBytes: number[] = [];
   const multiSetFrameBytes: number[] = [];
+  const multiSetKeyCounts: number[] = [];
+  let failAllMultiSets = false;
+  let stopReading = false;
   // multiWrongNodeKey/multiWrongNodeLeft: when multiWrongNodeKey is set,
   // every `m`/`o` roster containing that exact key answers just that key
   // `W`, for as long as multiWrongNodeLeft has budget left (consumed one
@@ -454,6 +468,10 @@ export async function startMockNode(
               setTimeout(sendAuthReply, options.authDelayMs);
             } else {
               sendAuthReply();
+            }
+            if (stopReading) {
+              socket.pause();
+              return;
             }
             break;
           }
@@ -733,8 +751,13 @@ export async function startMockNode(
             // above for why this is the header-inclusive wire size, not
             // just the body.
             multiSetFrameBytes.push(bodyStart + namespaceLength + totalBodyLength);
+            multiSetKeyCounts.push(count);
 
             if (silent) break;
+            if (failAllMultiSets) {
+              socket.destroy();
+              return;
+            }
 
             if (retryableReplies > 0) {
               retryableReplies--;
@@ -1120,6 +1143,10 @@ export async function startMockNode(
     multiSetCount: () => multiSets,
     multiGetFrameBytes: () => [...multiGetFrameBytes],
     multiSetFrameBytes: () => [...multiSetFrameBytes],
+    multiSetKeyCounts: () => [...multiSetKeyCounts],
+    failAllMultiSets: () => {
+      failAllMultiSets = true;
+    },
     answerMultiWrongNodeTimes: (key, times) => {
       multiWrongNodeKey = key;
       multiWrongNodeLeft += times;
@@ -1140,6 +1167,9 @@ export async function startMockNode(
     },
     goSilentAfterHandshake: () => {
       silent = true;
+    },
+    stopReadingAfterHandshake: () => {
+      stopReading = true;
     },
     close,
   };
