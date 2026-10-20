@@ -1425,6 +1425,13 @@ class DialFailureTests(unittest.IsolatedAsyncioTestCase):
             dials += 1
             writer.write(b"B\n")
             await writer.drain()
+            # Wait (bounded) for the client to hang up before closing: a close with
+            # the client's identify frame still unread is a reset on Linux, and a
+            # reset discards the B it is queued behind.
+            try:
+                await asyncio.wait_for(reader.read(), 2)
+            except (asyncio.TimeoutError, ConnectionError):
+                pass
             writer.close()
 
         server = await asyncio.start_server(busy, "127.0.0.1", 0)
