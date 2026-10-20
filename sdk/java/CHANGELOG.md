@@ -13,6 +13,9 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- The error for a namespace, key or value over the request limit names
+  the limit ("the server accepts requests of up to 1 MiB") instead of a
+  server source constant and file (#734).
 - A `String` key, namespace or value that is not well-formed UTF-16 (a
   lone surrogate) now throws `IllegalArgumentException`. Before,
   `String.getBytes(UTF_8)` silently encoded the lone surrogate as `?`,

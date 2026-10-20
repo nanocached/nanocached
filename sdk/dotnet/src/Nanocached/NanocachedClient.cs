@@ -2874,10 +2874,10 @@ public sealed class NanocachedClient : IDisposable
                 nameof(key),
                 namespaceBytes.Length == 0
                     ? $"nanocached: key is {key.Length} bytes, which exceeds the {MaxRequestBytes}-byte "
-                      + "request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)"
+                      + "request limit (the server accepts requests of up to 1 MiB)"
                     : $"nanocached: namespace ({namespaceBytes.Length} bytes) + key ({key.Length} bytes) = "
-                      + $"{total} bytes, which exceeds the {MaxRequestBytes}-byte request limit (server "
-                      + "MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
+                      + $"{total} bytes, which exceeds the {MaxRequestBytes}-byte request limit (the server "
+                      + "accepts requests of up to 1 MiB)");
         }
     }
 
@@ -2898,11 +2898,11 @@ public sealed class NanocachedClient : IDisposable
                 nameof(value),
                 namespaceBytes.Length == 0
                     ? $"nanocached: key ({key.Length} bytes) + value ({value.Length} bytes) = {total} bytes, "
-                      + $"which exceeds the {MaxRequestBytes}-byte request limit (server MAX_REQUEST_SIZE, "
-                      + "src/server.rs, is 1 MiB)"
+                      + $"which exceeds the {MaxRequestBytes}-byte request limit (the server "
+                      + "accepts requests of up to 1 MiB)"
                     : $"nanocached: namespace ({namespaceBytes.Length} bytes) + key ({key.Length} bytes) + "
                       + $"value ({value.Length} bytes) = {total} bytes, which exceeds the "
-                      + $"{MaxRequestBytes}-byte request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
+                      + $"{MaxRequestBytes}-byte request limit (the server accepts requests of up to 1 MiB)");
         }
     }
 

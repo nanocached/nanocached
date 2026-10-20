@@ -1099,7 +1099,7 @@ fn apply_announce_to_existing(
         Some(info) if !constant_time_eq(info.token.as_bytes(), token.as_bytes()) => {
             eprintln!(
                 "WARN rejected announce for {name} from {peer_ip}: wrong token — either \
-                 an impersonation attempt (issue #34) or a node reusing another's name"
+                 an impersonation attempt or a node reusing another's name"
             );
             Some(Err(
                 "announce with a token that does not match the registered one",
@@ -2888,7 +2888,7 @@ async fn handle_complete(
                 "WARN ignored handoff-complete report from {reporting_name} for \
                  {for_joining_name}: generation {reported_generation} does not match the \
                  in-progress join's generation {} — a stale report from a since-abandoned, \
-                 superseded incarnation of this join (issue #421(c))",
+                 superseded incarnation of this join",
                 pending.generation
             );
             return;
@@ -2910,7 +2910,7 @@ async fn handle_complete(
         let Some(expected_token) = pending.expected.get(reporting_name) else {
             eprintln!(
                 "WARN ignored handoff-complete report from {reporting_name} for \
-                 {for_joining_name}: not a ready member of this join (issue #34)"
+                 {for_joining_name}: not a ready member of this join"
             );
             return;
         };
@@ -2919,7 +2919,7 @@ async fn handle_complete(
                 "WARN ignored handoff-complete report from {reporting_name} for \
                  {for_joining_name}: presented token does not match the one recorded \
                  when this join started — either a forged report or a stale one from a \
-                 node that re-registered under this name since (issue #34)"
+                 node that re-registered under this name since"
             );
             return;
         }
@@ -4369,7 +4369,8 @@ async fn handle_connection(
                     eprintln!(
                         "WARN node {name} reports replication factor {reported}, but this \
                          discovery replica is configured with --replication-factor \
-                         {} — every replica must agree (see discovery HA); a client \
+                         {} — every replica must agree, since replicas never reconcile \
+                         with each other; a client \
                          or node that learned R from a different replica may be running \
                          with a different fan-out/failover width right now",
                         config.replication
@@ -4771,7 +4772,7 @@ async fn handle_connection(
                         eprintln!(
                             "WARN rejected join for {name} from {peer_ip}: wrong token for \
                              an already-registered name — either an impersonation attempt \
-                             (issue #34) or a node reusing another's name"
+                             or a node reusing another's name"
                         );
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,

@@ -12,6 +12,15 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Text a user sees no longer carries issue numbers or references to
+  documentation sections that do not exist: the `/metrics` HELP lines
+  for `connections_max`, `incrs_total`, `cas_sets_total`,
+  `cas_deletes_total` and `namespace_budget_bytes`, five discovery
+  `WARN` lines, the node's `--help` text and its `--max-memory` error
+  now state the reason in words (#669, #737).
+
 ## [0.4.7] - 2026-10-19
 
 ### Fixed
