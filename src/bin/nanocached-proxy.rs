@@ -81,9 +81,12 @@
 //!   connection with nothing written for `BACKEND_KEEPALIVE_INTERVAL`
 //!   probes the node itself (the SDKs' reserved keep-alive key), so a
 //!   proxy with no client connected never lets the node's idle timeout
-//!   close its connections underneath it, and a connection the node
-//!   closed anyway is found by the probe rather than by the next
-//!   request.
+//!   close its connections underneath it. A connection the node closed
+//!   anyway (restart, scale-in ahead of the roster refresh) is noticed
+//!   the moment its EOF arrives: the reader watches the socket while no
+//!   reply is pending, so the close is never found by the next request
+//!   — which, for an INCR/CAS, would have been written into a dead
+//!   socket and answered `E` although it never reached a node.
 //!   Thin-client mode falls out of the client-facing contract above
 //!   (one proxy address, no ring view, no discovery client) and shipped
 //!   with #109/#122 (`via_proxy`).
@@ -2204,6 +2207,7 @@ async fn run_backend(
     // roster hasn't caught up yet), and no client saw it.
     let clients_affected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_clients_affected = Arc::clone(&clients_affected);
+    let reader_addr = addr.clone();
 
     // The reader half: resolves pending replies in FIFO order. The
     // per-reply timeout is a *progress* bound (each reply must arrive
@@ -2213,7 +2217,45 @@ async fn run_backend(
     // backpressure `MAX_BACKEND_IN_FLIGHT` exists to bound.
     let reader = tokio::spawn(async move {
         let mut buf = buf;
-        while let Some((tag, expect, reply)) = pending_rx.recv().await {
+        loop {
+            // While no reply is pending the socket is watched for the
+            // node closing it (or sending something unsolicited, which
+            // means the stream is desynced). Without this the reader sat
+            // in `recv` alone and a close from the node went unnoticed
+            // until the next frame — up to a whole keep-alive interval —
+            // was written into the dead connection and answered with a
+            // plain error: for an INCR/CAS one the client could not
+            // retry, although the frame never reached a node. `biased`
+            // so a reservation that is already queued is always taken
+            // first, and the idle read is a readiness poll that consumes
+            // nothing unless it completes.
+            let next = tokio::select! {
+                biased;
+                slot = pending_rx.recv() => slot,
+                idle = watch_idle_backend(&mut read_half, &mut buf) => {
+                    // Nothing was pending, so no client request is on
+                    // this connection: the writer's next reservation
+                    // fails before it writes (`not_sent`, redialled).
+                    eprintln!(
+                        "INFO backend connection to {reader_addr} {idle}; will redial on next request"
+                    );
+                    pending_rx.close();
+                    while let Some((_, _, reply)) = pending_rx.recv().await {
+                        let Some(reply) = reply else {
+                            continue;
+                        };
+                        reader_clients_affected.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = reply.send(Err(io::Error::other(
+                            "backend connection poisoned after the request was written",
+                        )));
+                    }
+                    reader_poisoned.notify_one();
+                    return;
+                }
+            };
+            let Some((tag, expect, reply)) = next else {
+                return;
+            };
             let result = timeout(
                 UPSTREAM_IO_TIMEOUT,
                 read_reply(&mut read_half, &mut buf, tag, expect),
@@ -2393,6 +2435,25 @@ async fn run_backend(
         None => {
             dialed.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+}
+
+/// Waits, while no reply is pending on a shared backend connection, for
+/// the node to close it (EOF) or to fail it; resolves to what happened,
+/// for the log line. Data arriving with nothing pending is a desynced
+/// stream (the node never speaks unsolicited once authenticated), so it
+/// counts as a failure too rather than being parsed against a later
+/// reply. Cancel-safe: `read` consumes bytes only when it completes, so
+/// a reservation winning the `select!` leaves the stream untouched.
+async fn watch_idle_backend<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut BytesMut) -> String {
+    let mut chunk = [0u8; 64];
+    match stream.read(&mut chunk).await {
+        Ok(0) => "closed by the node while idle".to_string(),
+        Ok(n) => {
+            buf.extend_from_slice(&chunk[..n]);
+            "sent data with no request pending".to_string()
+        }
+        Err(error) => format!("failed while idle ({error})"),
     }
 }
 
@@ -5968,6 +6029,10 @@ mod tests {
         /// Issue #514: when set, a connection with no frame for this long
         /// is closed — the real node's `IDLE_TIMEOUT`, shrunk.
         close_when_idle_for: Arc<StdMutex<Option<Duration>>>,
+        /// Closes the connection being served the moment it is notified,
+        /// with no frame from the proxy involved — a node restarting or
+        /// scaled in while the shared connection sits idle.
+        close_now: Arc<tokio::sync::Notify>,
     }
 
     impl MockNode {
@@ -5993,6 +6058,7 @@ mod tests {
                 cas_deletes: Arc::new(AtomicUsize::new(0)),
                 keepalives: Arc::new(AtomicUsize::new(0)),
                 close_when_idle_for: Arc::new(StdMutex::new(None)),
+                close_now: Arc::new(tokio::sync::Notify::new()),
             };
             let store = Arc::clone(&node.store);
             let cleared = Arc::clone(&node.cleared);
@@ -6012,6 +6078,7 @@ mod tests {
             let cas_deletes = Arc::clone(&node.cas_deletes);
             let keepalives = Arc::clone(&node.keepalives);
             let close_when_idle_for = Arc::clone(&node.close_when_idle_for);
+            let close_now = Arc::clone(&node.close_now);
             tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -6041,6 +6108,7 @@ mod tests {
                             cas_deletes: Arc::clone(&cas_deletes),
                             keepalives: Arc::clone(&keepalives),
                             close_when_idle_for: Arc::clone(&close_when_idle_for),
+                            close_now: Arc::clone(&close_now),
                         },
                     ));
                 }
@@ -6091,6 +6159,7 @@ mod tests {
         cas_deletes: Arc<AtomicUsize>,
         keepalives: Arc<AtomicUsize>,
         close_when_idle_for: Arc<StdMutex<Option<Duration>>>,
+        close_now: Arc<tokio::sync::Notify>,
     }
 
     /// Issue #141: same content-digest algorithm as the real node's
@@ -6125,19 +6194,29 @@ mod tests {
             cas_deletes,
             keepalives,
             close_when_idle_for,
+            close_now,
         } = state;
         let mut buf = BytesMut::new();
         let result: io::Result<()> = async {
             loop {
                 let idle_limit = *close_when_idle_for.lock().unwrap();
-                let line = match idle_limit {
-                    Some(limit) => match timeout(limit, read_line(&mut stream, &mut buf)).await {
-                        Ok(line) => line?,
-                        // Issue #514: the real node's idle timeout —
-                        // nothing arrived in time, close the connection.
-                        Err(_) => return Ok(()),
+                let line = tokio::select! {
+                    line = async {
+                        match idle_limit {
+                            Some(limit) => match timeout(limit, read_line(&mut stream, &mut buf)).await {
+                                Ok(line) => line.map(Some),
+                                // Issue #514: the real node's idle timeout —
+                                // nothing arrived in time, close the connection.
+                                Err(_) => Ok(None),
+                            },
+                            None => read_line(&mut stream, &mut buf).await.map(Some),
+                        }
+                    } => match line? {
+                        Some(line) => line,
+                        None => return Ok(()),
                     },
-                    None => read_line(&mut stream, &mut buf).await?,
+                    // A close with nothing from the proxy involved.
+                    () = close_now.notified() => return Ok(()),
                 };
                 let mut parts = line.split(' ');
                 let command = parts.next().unwrap_or_default().to_string();
@@ -8168,6 +8247,54 @@ mod tests {
             node.auth_count.load(Ordering::SeqCst),
             2,
             "exactly one redial, made by the request rather than by the probe"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_backend_connection_the_node_closed_while_idle_is_noticed_before_the_next_request() {
+        // The node closes the shared connection while it is idle, long
+        // before the next keep-alive probe would be sent. The reader
+        // used to be parked on the pending queue alone, so the close
+        // went unseen and the next INCR was written into the dead
+        // connection and answered `E` without ever reaching a node. Now
+        // the EOF is noticed as it arrives: the slot is cleared with no
+        // frame sent, and the INCR dials fresh and is applied once.
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let backends = Arc::new(SharedBackends::with_keepalive_interval(
+            Duration::from_secs(60),
+        ));
+        let (proxy, context) = start_proxy_with_backends(&discovery, backends).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 7 1\ncounter1").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(context.backends.dialed.load(Ordering::Relaxed), 1);
+
+        node.close_now.notify_one();
+        timeout(Duration::from_secs(2), async {
+            while context.backends.dialed.load(Ordering::Relaxed) != 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the idle close must be noticed without a probe or a request");
+        assert_eq!(
+            node.keepalives.load(Ordering::SeqCst),
+            0,
+            "no keep-alive probe was due; the EOF itself was noticed"
+        );
+
+        stream.write_all(b"i 0 7 5\ncounter").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"6");
+        assert_eq!(node.incrs(), 1, "one attempt, on a fresh connection");
+        assert_eq!(
+            node.auth_count.load(Ordering::SeqCst),
+            2,
+            "exactly one redial, made by the request"
         );
     }
 
