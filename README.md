@@ -12,7 +12,10 @@ uses a small, binary-safe TCP protocol and supports optional time-to-live
 ## Features
 
 - In-memory storage for binary keys and values
-- `G`, `S`, and `D` commands
+- `G`, `S`, and `D` commands, and their namespaced forms `g`, `s`, `d`
+  with `c`/`F` to clear one namespace or all of them
+- `i` atomic counters, `k`/`x` compare-and-set and compare-and-delete,
+  `m`/`o` batched get and set
 - Optional TTL for stored values
 - Optional shared-secret authentication (`A` command)
 - Optional TLS (required for every connection once configured, no
@@ -34,7 +37,7 @@ toolchain and installs the Clippy and rustfmt components automatically.
 
 ## Command-line tools
 
-Building the project produces three binaries:
+Building the project produces five binaries:
 
 - `ncd` — a thin dispatcher: `ncd node start [options]` runs the cache node,
   `ncd discovery start [options]` runs the discovery server. Convenient for
@@ -44,6 +47,11 @@ Building the project produces three binaries:
 - `nanocached-node` — the cache server itself.
 - `nanocached-discovery` — the standalone cluster-membership registry (see
   [Discovery server](#discovery-server) below).
+- `nanocached-proxy` — an optional stateless proxy that routes for clients
+  that cannot hold the cluster's node list themselves (see the
+  [proxy guide](https://nanocached.org/deployment-proxy.html)).
+- `verify-staged-join` — a development tool that drives a staged join
+  against a running cluster; not part of a deployment.
 
 `ncd` looks up `nanocached-node`/`nanocached-discovery` next to its own
 executable, so it only works once both have been built into the same
@@ -70,20 +78,19 @@ cargo run --bin nanocached-node -- --port 8356 --discovery 127.0.0.1:8357
 
 The node sends a heartbeat every 5 seconds; the discovery server derives
 the node's reachable address from that connection's own source IP plus
-the node's port (addresses derived from the registration connection), so containerized deployments need
-no address configuration. Each heartbeat is acknowledged with the
+the node's port, so containerized deployments need no address
+configuration. Each heartbeat is acknowledged with the
 discovery server's current member list, so a node's own view of the
 ring — what it uses to answer `W` for keys it doesn't own — follows
-evictions within one heartbeat interval, not only joins. (This makes the
-heartbeat acknowledgment longer than the bare `A` that nodes before
-v0.3.0 expect: when upgrading a cluster, upgrade nodes before discovery
-servers — a new node accepts either form, an old node redials on every
-heartbeat when given the new one.) Omit `--discovery` to run standalone.
+evictions within one heartbeat interval, not only joins. The order to
+upgrade a cluster in is in the
+[operations guide](https://nanocached.org/deployment-operations.html#upgrade).
+Omit `--discovery` to run standalone.
 (Asymmetric port mapping — e.g. Docker's `-p 9999:8356` — is
 unsupported: it is NAT, which the cluster design already excludes.)
 
-`--discovery` accepts a comma-separated list of discovery replicas
-(discovery HA): the node registers with and heartbeats to all of
+`--discovery` accepts a comma-separated list of discovery replicas:
+the node registers with and heartbeats to all of
 them, but only the first — the primary — ever orchestrates its join. Every
 node in a cluster must list the same addresses in the same order:
 
@@ -217,9 +224,9 @@ cargo build --release
 
 ### Docker
 
-The included `Dockerfile` builds two separate, minimal Alpine-based images
-via multi-stage targets — each contains only its own binary, not `ncd` and
-not the other role's binary:
+The included `Dockerfile` builds three separate, minimal Alpine-based
+images via multi-stage targets — each contains only its own binary, not
+`ncd` and not another role's binary:
 
 ```sh
 docker build --target node --tag nanocached-node .
@@ -227,6 +234,9 @@ docker run --rm --publish 8356:8356 nanocached-node
 
 docker build --target discovery --tag nanocached-discovery .
 docker run --rm --publish 8357:8357 nanocached-discovery
+
+docker build --target proxy --tag nanocached-proxy .
+docker run --rm --publish 8358:8358 nanocached-proxy --discovery disc:8357
 ```
 
 `--target` is required; the Dockerfile has no default final stage.
@@ -276,20 +286,22 @@ A <secret-length>\n<secret>
 Responses:
 
 ```text
-O\n
+On\n
 ```
 
-or, if the secret doesn't match:
+(`Od\n` from a discovery server) or, if the secret doesn't match:
 
 ```text
-E\n
+En\n
 ```
 
-immediately followed by the server closing the connection. If the server
-has no auth secret configured, `A` always responds `O\n` regardless of what
-secret is sent. If it does, every other command on that connection is
-rejected with `E\n` (and the connection closed) until a matching `A` has
-been sent — `A` itself is always accepted before authentication.
+(`Ed\n` from a discovery server) immediately followed by the server
+closing the connection. If the server has no auth secret configured, `A`
+always responds `On\n` regardless of what secret is sent. If it does,
+every other command on that connection is rejected until a matching `A`
+has been sent — a node answers `En\n` and closes the connection, a
+discovery server closes it without a reply — and `A` itself is always
+accepted before authentication.
 
 SDKs additionally append a `T` field (`A <secret-length> T\n<secret>`) to
 request response tags; a server that supports them echoes the capability
@@ -371,8 +383,7 @@ above carry nothing to verify against. A connection whose `A` carried the
 `T` flag and was answered `OnT\n` runs in tagged mode: every `G`/`S`/`D`
 header must end with a client-chosen tag (a u32 in decimal), and the
 response echoes it as its own last field, so a client can verify the
-pairing before trusting the answer
-(echoed response tags).
+pairing before trusting the answer.
 
 ```text
 G <key-length> <tag>\n<key>
@@ -487,8 +498,8 @@ make mutants-diff MUTANTS_BASE=origin/main MUTANTS_JOBS=2
 
 `src/bin/nanocached-discovery.rs` is a standalone cluster-membership
 registry that cache nodes and client SDKs use to find each other for
-horizontal scaling (see client-side consistent hashing with a discovery server for the design rationale). It
-has no dependency on nanocached's own protocol modules.
+horizontal scaling. It has no dependency on nanocached's own protocol
+modules.
 
 ```sh
 cargo run --bin nanocached-discovery -- --help
@@ -509,8 +520,8 @@ cluster capacity is total memory ÷ R; `--replication-factor 1` restores
 single-copy behavior.
 
 Discovery's registry is soft state, rebuilt from node announces, so it can
-run as several independent replicas with no coordination between them
-(discovery HA): point every node's `--discovery` (and every SDK
+run as several independent replicas with no coordination between them:
+point every node's `--discovery` (and every SDK
 client's `addresses`) at the same list of replicas, and losing any one replica
 — including the primary — costs neither cache traffic nor client
 bootstrap. Only *joins* need the primary up. After a (re)start, a replica
