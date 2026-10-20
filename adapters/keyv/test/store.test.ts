@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import Keyv from "keyv";
 import { createCache } from "cache-manager";
-import { AlreadyClosedError } from "nanocached";
+import { AlreadyClosedError, ConnectionLostError } from "nanocached";
 import { nanocachedKeyvStore, NanocachedKeyvStore } from "../src/index.js";
 import { startMockNode, type MockNode } from "./mockNode.js";
 
@@ -339,6 +339,63 @@ describe("nanocached-keyv, through Keyv's own API", () => {
         await assert.rejects(() => store.set("k", "v"), AlreadyClosedError);
       } finally {
         await node.close();
+      }
+    });
+  });
+
+  describe("failure shapes Keyv's own policy turns into results", () => {
+    it("an oversize value is a RangeError: swallowed into an error event and set() resolving false by default, thrown with throwOnErrors", async () => {
+      const node = await startMockNode();
+      try {
+        const store = await connectStore(node);
+        const tooBig = "x".repeat(1024 * 1024); // over the request limit (1 MiB minus a 256-byte header)
+        try {
+          const keyv = new Keyv({ store, useKeyPrefix: false });
+          const seen: unknown[] = [];
+          keyv.on("error", (error: unknown) => seen.push(error));
+          assert.equal(await keyv.set("big", tooBig), false);
+          assert.equal(seen.length, 1);
+          assert.ok(seen[0] instanceof RangeError, `expected a RangeError, got ${String(seen[0])}`);
+          assert.equal(node.store("keyv").has("big"), false);
+
+          const strict = new Keyv({ store, useKeyPrefix: false, throwOnErrors: true });
+          strict.on("error", () => {});
+          await assert.rejects(() => strict.set("big", tooBig), RangeError);
+        } finally {
+          await store.disconnect();
+        }
+      } finally {
+        await node.close();
+      }
+    });
+
+    // The SDK reports a node that went away as `ConnectionLostError`, or as
+    // the operating system's own connect error (ECONNREFUSED here) when a
+    // redial could not open a connection at all; both are "the node is
+    // unreachable" for this test's purpose.
+    const isOutage = (error: unknown): boolean =>
+      error instanceof ConnectionLostError || (error as { code?: string }).code === "ECONNREFUSED";
+
+    it("an unreachable node: get() resolves undefined with no event, set() false with an error event, both thrown with throwOnErrors", async () => {
+      const node = await startMockNode();
+      const store = await connectStore(node);
+      try {
+        await node.close(); // the node goes away after the store connected
+        const keyv = new Keyv({ store, useKeyPrefix: false });
+        const seen: unknown[] = [];
+        keyv.on("error", (error: unknown) => seen.push(error));
+        assert.equal(await keyv.get("k"), undefined);
+        assert.equal(seen.length, 0); // keyv 5.x swallows a get() rejection without emitting anything
+        assert.equal(await keyv.set("k", "v"), false);
+        assert.equal(seen.length, 1); // set() does emit it
+        assert.ok(isOutage(seen[0]), `expected a connection failure, got ${String(seen[0])}`);
+
+        const strict = new Keyv({ store, useKeyPrefix: false, throwOnErrors: true });
+        strict.on("error", () => {});
+        await assert.rejects(() => strict.get("k"), isOutage);
+        await assert.rejects(() => strict.set("k", "v"), isOutage);
+      } finally {
+        await store.disconnect();
       }
     });
   });
