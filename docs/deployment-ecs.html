@@ -227,8 +227,11 @@ The choices that matter:</p>
   <a href="deployment-operations.html#graceful-scale-in">sizing the stop grace</a>).</li>
   <li><b><code>--max-memory 536870912</code></b> (512&nbsp;MiB) in a
   1&nbsp;GiB task. Fargate kills a task that exceeds its memory
-  reservation; the cache budget must leave room for connection
-  buffers and the handoff's in-flight copies.</li>
+  reservation, and <code>--max-memory</code> bounds the cache only:
+  the task must also cover what connections hold outside it
+  (<code>--max-in-flight-bytes</code>, 256&nbsp;MiB by default) plus
+  the process's own headroom — 512 + 256 + headroom fits 1&nbsp;GiB.
+  Raise the two flags together with the task size.</li>
   <li><b>Images pinned by digest</b>, as in the EC2 guide; these are the
   <code>latest</code> builds this guide was verified with.</li>
 </ul>
