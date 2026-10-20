@@ -12,6 +12,9 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- The error for a namespace, key or value over the request limit names
+  the limit ("the server accepts requests of up to 1 MiB") instead of a
+  server source constant and file (#734).
 - A `string` key, namespace or value that is not well-formed UTF-16 (a
   lone surrogate) now throws `ArgumentException`. Before,
   `Encoding.UTF8.GetBytes` silently encoded the lone surrogate as U+FFFD,

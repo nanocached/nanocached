@@ -1686,7 +1686,7 @@ fn render_node_metrics(
     metric(
         "nanocached_node_connections_max",
         "gauge",
-        "The --max-connections bound (issue #126) — the proxy exports the \
+        "The --max-connections bound — the proxy exports the \
          same pair, so utilization dashboards can treat both tiers alike.",
         format!("nanocached_node_connections_max {max_connections}\n"),
     );
@@ -1735,7 +1735,7 @@ fn render_node_metrics(
     metric(
         "nanocached_node_incrs_total",
         "counter",
-        "Successful INCR operations (issue #129) — a stored value that \
+        "Successful INCR operations — a stored value that \
          wasn't INCR's counter grammar, or an overflowing delta, isn't \
          counted here.",
         format!("nanocached_node_incrs_total {}\n", stats.incrs),
@@ -1743,16 +1743,16 @@ fn render_node_metrics(
     metric(
         "nanocached_node_cas_sets_total",
         "counter",
-        "Successful k (compare-and-set) writes (issue #141) — a mismatched \
+        "Successful k (compare-and-set) writes — a mismatched \
          condition isn't counted here, and neither are internal \
-         re-replication handoffs (issue #394): this counts client k \
+         re-replication handoffs: this counts client k \
          frames only.",
         format!("nanocached_node_cas_sets_total {}\n", stats.cas_sets),
     );
     metric(
         "nanocached_node_cas_deletes_total",
         "counter",
-        "Successful x (compare-and-delete) removals (issue #141) — a \
+        "Successful x (compare-and-delete) removals — a \
          mismatched condition or missing key isn't counted here.",
         format!("nanocached_node_cas_deletes_total {}\n", stats.cas_deletes),
     );
@@ -1817,8 +1817,7 @@ fn render_node_metrics(
         metric(
             "nanocached_node_namespace_budget_bytes",
             "gauge",
-            "The --namespace-budget cap, for namespaces that have one \
-             (issue #127).",
+            "The --namespace-budget cap, for namespaces that have one.",
             namespace_budgets,
         );
     }

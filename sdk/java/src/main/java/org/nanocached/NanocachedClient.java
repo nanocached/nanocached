@@ -3414,7 +3414,7 @@ public final class NanocachedClient implements AutoCloseable {
             throw new IllegalArgumentException(
                     "nanocached: namespace (" + namespace.length + " bytes) + key (" + key.length
                             + " bytes) = " + total + " bytes, which exceeds the " + MAX_REQUEST_BYTES
-                            + "-byte request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
+                            + "-byte request limit (the server accepts requests of up to 1 MiB)");
         }
     }
 
@@ -3433,7 +3433,7 @@ public final class NanocachedClient implements AutoCloseable {
                     "nanocached: namespace (" + namespace.length + " bytes) + key (" + key.length
                             + " bytes) + value (" + value.length + " bytes) = " + total
                             + " bytes, which exceeds the " + MAX_REQUEST_BYTES
-                            + "-byte request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
+                            + "-byte request limit (the server accepts requests of up to 1 MiB)");
         }
     }
 
@@ -3447,7 +3447,7 @@ public final class NanocachedClient implements AutoCloseable {
             throw new IllegalArgumentException(
                     "nanocached: namespace (" + namespace.length + " bytes) exceeds the "
                             + MAX_REQUEST_BYTES
-                            + "-byte request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
+                            + "-byte request limit (the server accepts requests of up to 1 MiB)");
         }
     }
 

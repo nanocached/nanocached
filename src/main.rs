@@ -183,7 +183,7 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                     return Err(format!(
                         "--max-memory must be at least {MIN_MAX_MEMORY_BYTES} bytes \
                          ({} MiB); {raw_max_memory} is too small for the cache to ever \
-                         hold more than a single entry (see MIN_MAX_MEMORY_BYTES)",
+                         hold more than a single entry",
                         MIN_MAX_MEMORY_BYTES / (1024 * 1024)
                     )
                     .into());
@@ -312,7 +312,7 @@ Usage: nanocached-node [options]
                                <addrs>, a comma-separated list (see
                                nanocached-discovery). The first address is
                                the primary, the only one asked to
-                               orchestrate a join (discovery HA) — every node
+                               orchestrate a join — every node
                                in a cluster must list the same addresses
                                in the same order. Omit to run standalone
   --tls-cert <path>           PEM certificate chain; requires TLS on every
