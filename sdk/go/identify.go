@@ -301,8 +301,22 @@ func identify(conn net.Conn, address string, authSecret []byte, probe authProbe,
 	}
 
 	reader := bufio.NewReader(conn)
+	// A node at its connection limit answers a bare `B\n` — two bytes,
+	// then it closes — instead of the three-byte identity. Read two first
+	// so that reply is seen as what it is; a three-byte read would end
+	// short, match the legacy-server signal, be retried with the lesser
+	// `A` forms and come out as a closed connection.
 	ack := make([]byte, 3)
-	if _, err := readFull(reader, ack); err != nil {
+	if _, err := readFull(reader, ack[:2]); err != nil {
+		if extended && isLegacyServerSignal(err) {
+			return nil, err
+		}
+		return nil, connectionLost("handshake read failed", err)
+	}
+	if ack[0] == 'B' && ack[1] == '\n' {
+		return nil, connectionLost(address+" is at its connection limit (busy)", nil)
+	}
+	if _, err := readFull(reader, ack[2:]); err != nil {
 		if extended && isLegacyServerSignal(err) {
 			return nil, err
 		}

@@ -6838,3 +6838,35 @@ func TestAStalledReplicaBoundsAClusterSetByOneRequestTimeout(t *testing.T) {
 		t.Fatalf("ReplicaWriteFailures = %d, want 1", got)
 	}
 }
+
+// A node over --max-connections answers a bare `B\n` and closes: two
+// bytes, not the three-byte identity. Seen for what it is on the first
+// probe — not retried with the lesser `A` forms the way a
+// close-before-reply door-slam is.
+func TestConnectReportsANodeAtItsConnectionLimitAsBusyOnTheFirstDial(t *testing.T) {
+	listener := listenLoopback(t)
+	defer listener.Close()
+	var dials atomic.Int32
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			dials.Add(1)
+			_, _ = conn.Write([]byte("B\n"))
+			_ = conn.Close()
+		}
+	}()
+
+	_, err := Connect(Config{Addresses: []Address{addr(listener.Addr().String())}})
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Connect against a busy node = %v, want ErrConnectionLost", err)
+	}
+	if !strings.Contains(err.Error(), "connection limit") {
+		t.Fatalf("Connect against a busy node = %v, want the connection limit named", err)
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dials = %d, want 1 (a busy reply is not a legacy door-slam to retry)", got)
+	}
+}
