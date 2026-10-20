@@ -878,12 +878,6 @@ pub(crate) async fn run(
     // running standalone never touches this beyond the initial `None`.
     let active_migration: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
 
-    let sweep_task = tokio::spawn(run_sweep(
-        request_tx.clone(),
-        Arc::clone(&active_migration),
-        shutdown_rx.clone(),
-    ));
-
     // Shared with `node_context` so the heartbeat tasks can report the
     // replication factor half of this node's belief to discovery (issue
     // #30), the same belief `wrong_node` rejects client requests against.
@@ -926,6 +920,20 @@ pub(crate) async fn run(
         rereplication_tx: rereplication_tx.clone(),
         shutdown_rx: shutdown_rx.clone(),
     });
+    // After `node_context`: the sweep judges a marked copy by the ring this
+    // node has adopted (`Command::Sweep::owned`); standalone it has none.
+    let sweep_task = tokio::spawn(run_sweep(
+        request_tx.clone(),
+        Arc::clone(&active_migration),
+        node_context.as_ref().map(|node_context| {
+            (
+                Arc::clone(&node_context.known_ring),
+                node_context.name.clone(),
+            )
+        }),
+        shutdown_rx.clone(),
+    ));
+
     // Issue #582: the ownership reclaim pass, cluster mode only.
     let reclaim_task = node_context
         .as_ref()
@@ -4772,7 +4780,7 @@ struct ActiveMigration {
     /// is abandoned after this node's own share was done — an `X` on a
     /// completed slot, or a later `M` whose roster shows the joiner never
     /// made it. Until `confirmed`, `run_sweep` leaves marked entries
-    /// alone (`Command::Sweep { marked: false }`).
+    /// alone (`Command::Sweep { marked: false, owned: None }`).
     marked_keys: Vec<Key>,
     /// Issue #62: discovery has completed this join — the joiner showed
     /// up in the primary's heartbeat-ack roster (`adopt_membership`) or
@@ -7547,6 +7555,7 @@ fn reclaim_checks(node_context: &NodeContext) -> Option<(Vec<OwnerCheck>, u64)> 
 async fn run_sweep(
     request_tx: mpsc::Sender<CacheRequest>,
     active_migration: Arc<Mutex<Option<ActiveMigration>>>,
+    ownership: Option<(KnownRing, String)>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -7575,8 +7584,22 @@ async fn run_sweep(
                 break;
             }
 
+            // The ring as adopted now: a marked copy of a key this node
+            // owns under it — its joiner evicted since — is kept, not
+            // reclaimed (`Cache::sweep_keeping`).
+            let owned = ownership.as_ref().and_then(|(known_ring, name)| {
+                known_ring
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    .map(|membership| OwnerCheck {
+                        ring: Arc::clone(&membership.ring),
+                        name: name.clone(),
+                        replication: membership.replication,
+                    })
+            });
             tokio::select! {
-                result = sweep(&request_tx, !marks_held) => match result {
+                result = sweep(&request_tx, !marks_held, owned) => match result {
                     Some(removed) if removed >= SWEEP_BUDGET => continue,
                     _ => break,
                 },
@@ -7586,12 +7609,16 @@ async fn run_sweep(
     }
 }
 
-async fn sweep(request_tx: &mpsc::Sender<CacheRequest>, marked: bool) -> Option<usize> {
+async fn sweep(
+    request_tx: &mpsc::Sender<CacheRequest>,
+    marked: bool,
+    owned: Option<OwnerCheck>,
+) -> Option<usize> {
     let (response_tx, response_rx) = oneshot::channel();
 
     request_tx
         .send(CacheRequest {
-            command: Command::Sweep { marked },
+            command: Command::Sweep { marked, owned },
             response_tx,
         })
         .await
@@ -16626,7 +16653,14 @@ mod tests {
 
         // The displaced copy — and only it — is reclaimed by the sweep.
         assert_eq!(
-            send_command(&request_tx, Command::Sweep { marked: true }).await,
+            send_command(
+                &request_tx,
+                Command::Sweep {
+                    marked: true,
+                    owned: None
+                }
+            )
+            .await,
             Response::Swept(1)
         );
         match send_command(&request_tx, Command::PeekEntry { key: key(b"key-0") }).await {
@@ -19485,7 +19519,14 @@ mod tests {
         }
         // What `run_sweep` does while the join is undecided: TTL only.
         assert_eq!(
-            send_command(&request_tx, Command::Sweep { marked: false }).await,
+            send_command(
+                &request_tx,
+                Command::Sweep {
+                    marked: false,
+                    owned: None
+                }
+            )
+            .await,
             Response::Swept(0)
         );
 
@@ -19501,7 +19542,14 @@ mod tests {
         // The mark is gone: a full sweep reclaims nothing and the key is
         // still served.
         assert_eq!(
-            send_command(&request_tx, Command::Sweep { marked: true }).await,
+            send_command(
+                &request_tx,
+                Command::Sweep {
+                    marked: true,
+                    owned: None
+                }
+            )
+            .await,
             Response::Swept(0)
         );
         assert_eq!(
@@ -19662,7 +19710,14 @@ mod tests {
             Response::Value(Bytes::from_static(b"Alice"))
         );
         assert_eq!(
-            send_command(&request_tx, Command::Sweep { marked: true }).await,
+            send_command(
+                &request_tx,
+                Command::Sweep {
+                    marked: true,
+                    owned: None
+                }
+            )
+            .await,
             Response::Swept(0)
         );
 
@@ -19973,7 +20028,14 @@ mod tests {
             Response::Value(Bytes::from_static(b"Alice"))
         );
         assert_eq!(
-            send_command(&request_tx, Command::Sweep { marked: true }).await,
+            send_command(
+                &request_tx,
+                Command::Sweep {
+                    marked: true,
+                    owned: None
+                }
+            )
+            .await,
             Response::Swept(0)
         );
 
@@ -22211,7 +22273,14 @@ mod tests {
         assert!(rereplication_rx.try_recv().is_err(), "exactly one");
         // The mark is gone and the copy is still there.
         assert_eq!(
-            send_command(&request_tx, Command::Sweep { marked: true }).await,
+            send_command(
+                &request_tx,
+                Command::Sweep {
+                    marked: true,
+                    owned: None
+                }
+            )
+            .await,
             Response::Swept(0)
         );
         assert_eq!(
