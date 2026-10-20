@@ -3330,17 +3330,38 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                // A forwarded clear goes on only to a join this node still
-                // has unconfirmed (queued behind its transfer, or on its
-                // forwarding connection) — see `route_handoff_clear`.
+                // A forwarded clear goes on to a join this node still has
+                // unconfirmed (queued behind its transfer, or on its
+                // forwarding connection) — see `route_handoff_clear` —
+                // and, while this node is decommissioning, to its
+                // entrants, behind the writes already queued for them
+                // (`leave_clear_targets`): a write this node took and
+                // mirrored to an entrant must not land there after the
+                // clear. Only a clear that removed something here goes on
+                // to the entrants, the clear's twin of the `U` arm's
+                // `StoredUnchanged` guard: a node that held nothing has
+                // nothing queued the clear must follow, and the clear
+                // that comes back through two decommissions pointing at
+                // each other removes nothing on its second pass.
                 if let ClearRoute::Forward(target) = route_handoff_clear(&node_context, &scope) {
                     spawn_forward(
                         &config,
                         node_context.clone(),
                         target,
-                        OwnedForwardedWrite::Clear(scope),
+                        OwnedForwardedWrite::Clear(scope.clone()),
                     )
                     .await;
+                }
+                if matches!(response, Response::Cleared(removed) if removed > 0) {
+                    for target in leave_clear_targets(&node_context) {
+                        spawn_forward(
+                            &config,
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::Clear(scope.clone()),
+                        )
+                        .await;
+                    }
                 }
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
 
@@ -8167,8 +8188,9 @@ impl ClearScope {
     /// The `f` frame that replays this clear on another node, carrying
     /// that node's membership `token` — see `Command::HandoffClear`. Not
     /// a `c`/`F`: the receiver must know this clear was forwarded, so it
-    /// relays it only to a join it still has unconfirmed and never back
-    /// through a decommission's window.
+    /// relays it only to a join it still has unconfirmed and, when it
+    /// removed something there, to a decommission's entrants — never on
+    /// from a node it changed nothing on.
     fn handoff_message(&self, token: &str) -> Vec<u8> {
         match self {
             ClearScope::Namespace(namespace) => {
@@ -15660,6 +15682,130 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forwarded_clear_that_removed_something_follows_the_writes_queued_for_the_entrant() {
+        // This draining node took a write (from a client, or relayed by
+        // the node whose joiner it is) and queued it for its entrant.
+        // The clear then reaches it forwarded (`f`), from the node that
+        // forwards to it; it must follow that write on the entrant's
+        // queue, or the write lands there after the entrant's own clear.
+        // A forwarded clear that removed nothing here is not passed on:
+        // nothing is queued it must follow, and that is what ends a
+        // clear circling between two decommissions pointing at each
+        // other.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let before_ring = Arc::new(HashRing::new(vec![
+            "leaver".to_string(),
+            "peer".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec!["peer".to_string()]));
+        let owned = (0u32..1000)
+            .map(|index| format!("key-{index}"))
+            .find(|name| before_ring.is_owner(&key(name.as_bytes()), "leaver", 1))
+            .expect("an owned key in range");
+
+        let mut addresses = HashMap::new();
+        addresses.insert("leaver".to_string(), "127.0.0.1:1".to_string());
+        addresses.insert("peer".to_string(), peer_addr);
+        let mut tokens = HashMap::new();
+        tokens.insert("peer".to_string(), "tok-peer".to_string());
+
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(Some(LeaveState {
+                before_ring,
+                after_ring,
+                replication: 1,
+                addresses,
+                tokens,
+                connections: Mutex::new(HashMap::new()),
+            }))),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        // The write (relayed here as a handoff, as the node whose
+        // confirmed joiner this is relays it), then the forwarded clear,
+        // then the same clear again, which finds nothing.
+        let n = owned.len();
+        let mut reply = [0_u8; 2];
+        for (frame, expected_reply) in [
+            (format!("U 0 {n} 2 9\ntk-leaver{owned}v1"), b"S\n"),
+            ("f 0 9 A\ntk-leaver".to_string(), b"C\n"),
+            ("f 0 9 A\ntk-leaver".to_string(), b"C\n"),
+        ] {
+            client.write_all(frame.as_bytes()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+                .await
+                .expect("a reply within 5 s")
+                .unwrap();
+            assert_eq!(&reply, expected_reply, "{frame:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        client.shutdown().await.unwrap();
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+        peer_task.abort();
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(
+            frames,
+            vec![
+                format!("U 0 {n} 2 8\ntok-peer{owned}v1").into_bytes(),
+                b"f 0 8 A\ntok-peer".to_vec(),
+            ],
+            "the clear that removed the key follows it to the entrant; the one that found \
+             nothing stays here"
+        );
+    }
+
     /// A `RereplicationForward` for tests: `dead` was evicted, `me` is the
     /// surviving old owner of every key and `peer` the owner the change
     /// promoted (R = 2 over two names), reachable at `peer_addr`.
@@ -16463,8 +16609,9 @@ mod tests {
         // client clear, S forwarded it to L again, … and every write
         // either of them took meanwhile was wiped on each pass until a
         // window closed. A forwarded clear (`f`) is not a client's: L
-        // applies it and does not mirror it, so the client's next write
-        // to S stays.
+        // applies it, and passes it on to its entrant only when it
+        // removed something here (it holds nothing), so the client's
+        // next write to S stays.
         let s_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let l_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let s_addr = s_listener.local_addr().unwrap().to_string();
