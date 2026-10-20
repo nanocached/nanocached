@@ -273,6 +273,37 @@ class RoundTripTests(unittest.TestCase):
         self.cache.set("flag", True)
         self.assertIs(self.cache.get("flag"), True)
 
+    def test_ints_beyond_the_counter_range_are_pickled_and_round_trip(self) -> None:
+        import pickle
+        from nanocached import NotNumericError
+
+        def stored(key: str) -> bytes:
+            wire_key = self.cache.make_key(key, version=self.cache.version)
+            return ROUNDTRIP_NODE.ns_store[(b"django", wire_key.encode())]
+
+        # The edges of the wire counter's range still take the decimal fast path.
+        self.cache.set("max", 2**63 - 1)
+        self.assertEqual(stored("max"), b"9223372036854775807")
+        self.assertEqual(self.cache.get("max"), 2**63 - 1)
+        self.cache.set("min", -(2**63))
+        self.assertEqual(stored("min"), b"-9223372036854775808")
+
+        # One past the edge is pickled (0x80 PROTO opcode first), and so
+        # is an int whose decimal form CPython refuses to produce at all.
+        self.cache.set("over", 2**63)
+        self.assertEqual(stored("over")[:1], b"\x80")
+        self.assertEqual(self.cache.get("over"), 2**63)
+        big = 10**4300
+        self.cache.set("big", big)
+        self.assertEqual(pickle.loads(stored("big")), big)
+        self.assertEqual(self.cache.get("big"), big)
+        self.cache.set("many", {"n": big})
+        self.assertEqual(self.cache.get("many"), {"n": big})
+
+        # A pickled int is not a counter the wire can add to.
+        with self.assertRaises(NotNumericError):
+            self.cache.incr("big")
+
     def test_wire_key_matches_pickled_value(self) -> None:
         # OPTIONS.NAMESPACE ("django", the default here) is what actually
         # isolates this alias's keys from any other namespace sharing the
