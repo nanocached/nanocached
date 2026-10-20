@@ -412,18 +412,39 @@ fn fmix64(mut hash: u64) -> u64 {
     hash
 }
 
-/// The canonical key-side hash (issue #105): the legacy form for the
-/// default namespace, `fnv1a(be32(len(ns)) || ns || key)` otherwise.
-fn key_hash(namespace: &[u8], key: &[u8]) -> u64 {
-    if namespace.is_empty() {
-        return fnv1a(key);
+/// The hash state after a namespace: what `key_hash` continues with the
+/// key's own bytes. Computed once per frame and reused for every key of
+/// an `m`/`o`, because hashing the whole namespace again per key made a
+/// 1 MiB frame (512 KiB namespace, 174,000 keys) cost 230 CPU-seconds
+/// on the connection's task, stalling every other client of the proxy.
+/// The node's ring does the same (`KeyHasher`).
+#[derive(Clone, Copy)]
+struct NamespaceHash(u64);
+
+impl NamespaceHash {
+    /// The legacy form for the default namespace (`fnv1a(key)` continues
+    /// from the offset basis), `fnv1a(be32(len(ns)) || ns)` otherwise.
+    fn of(namespace: &[u8]) -> Self {
+        if namespace.is_empty() {
+            return Self(0xcbf29ce484222325);
+        }
+        let length = u32::try_from(namespace.len())
+            .expect("a namespace is bounded by the request-size limit")
+            .to_be_bytes();
+        Self(fnv1a_continue(fnv1a(&length), namespace))
     }
-    let length = u32::try_from(namespace.len())
-        .expect("a namespace is bounded by the request-size limit")
-        .to_be_bytes();
-    let hash = fnv1a(&length);
-    let hash = fnv1a_continue(hash, namespace);
-    fnv1a_continue(hash, key)
+
+    fn key(self, key: &[u8]) -> u64 {
+        fnv1a_continue(self.0, key)
+    }
+}
+
+/// The canonical key-side hash (issue #105): the legacy form for the
+/// default namespace, `fnv1a(be32(len(ns)) || ns || key)` otherwise. The
+/// one-shot form, which the tests check the per-frame form against.
+#[cfg(test)]
+fn key_hash(namespace: &[u8], key: &[u8]) -> u64 {
+    NamespaceHash::of(namespace).key(key)
 }
 
 /// One fetched roster: the cluster members (name, addr) and discovery's
@@ -473,14 +494,22 @@ impl RingView {
     /// per-key allocation once `top` has grown): a large `m`/`o` frame
     /// calls this once per key, on a tokio worker, so the old sort-everything
     /// `owners` was O(N log N) per key — hundreds of thousands of times.
-    /// `top` is caller-owned scratch so a loop reuses one buffer.
-    fn rank_owners(&self, namespace: &[u8], key: &[u8], limit: usize, top: &mut Vec<(u64, usize)>) {
+    /// `top` is caller-owned scratch so a loop reuses one buffer, and
+    /// `namespace` is hashed once by the caller (`NamespaceHash::of`) so
+    /// a loop over a frame's keys never re-hashes it.
+    fn rank_owners(
+        &self,
+        namespace: NamespaceHash,
+        key: &[u8],
+        limit: usize,
+        top: &mut Vec<(u64, usize)>,
+    ) {
         top.clear();
         let limit = limit.min(self.replication).min(self.nodes.len());
         if limit == 0 {
             return;
         }
-        let key_hash = key_hash(namespace, key);
+        let key_hash = namespace.key(key);
         let scores = self
             .node_hashes
             .iter()
@@ -521,7 +550,12 @@ impl RingView {
     /// total order every implementation uses (see `outranks`).
     fn owners(&self, namespace: &[u8], key: &[u8]) -> Vec<String> {
         let mut top = Vec::new();
-        self.rank_owners(namespace, key, self.replication, &mut top);
+        self.rank_owners(
+            NamespaceHash::of(namespace),
+            key,
+            self.replication,
+            &mut top,
+        );
         top.into_iter()
             .map(|(_, index)| self.nodes[index].1.clone())
             .collect()
@@ -3651,9 +3685,10 @@ async fn dispatch_request(
             let mut groups: AddrGroups<(Vec<usize>, Vec<Bytes>)> = AddrGroups::new(&ring);
             let mut missing = Vec::new();
             let mut top = Vec::new();
+            let namespace_hash = NamespaceHash::of(&namespace);
 
             for (position, key) in keys.iter().enumerate() {
-                ring.rank_owners(&namespace, key, 1, &mut top);
+                ring.rank_owners(namespace_hash, key, 1, &mut top);
                 let Some(&(_, primary)) = top.first() else {
                     missing.push(position);
                     continue;
@@ -3708,9 +3743,10 @@ async fn dispatch_request(
             let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(&ring);
             let mut missing = Vec::new();
             let mut top = Vec::new();
+            let namespace_hash = NamespaceHash::of(&namespace);
 
             for (position, key) in keys.iter().enumerate() {
-                ring.rank_owners(&namespace, key, ring.replication, &mut top);
+                ring.rank_owners(namespace_hash, key, ring.replication, &mut top);
                 if top.is_empty() {
                     missing.push(position);
                     continue;
@@ -3957,9 +3993,10 @@ async fn retry_multi_get(
     let mut owners_by_position: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut unresolved: Vec<usize> = Vec::new();
     let mut top = Vec::new();
+    let namespace_hash = NamespaceHash::of(namespace);
     for &position in retry_positions {
         let key = &keys[position];
-        ring.rank_owners(namespace, key, ring.replication, &mut top);
+        ring.rank_owners(namespace_hash, key, ring.replication, &mut top);
         if top.is_empty() {
             entries[position] = Some(ProxyMultiEntry::WrongNode);
             continue;
@@ -4140,9 +4177,10 @@ async fn retry_multi_set(
 
     let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(&ring);
     let mut top = Vec::new();
+    let namespace_hash = NamespaceHash::of(namespace);
     for &position in retry_positions {
         let key = &keys[position];
-        ring.rank_owners(namespace, key, ring.replication, &mut top);
+        ring.rank_owners(namespace_hash, key, ring.replication, &mut top);
         if top.is_empty() {
             entries[position] = Some(ProxyAckEntry::WrongNode);
             continue;
@@ -5679,6 +5717,39 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_of_many_keys_under_a_large_namespace_is_routed_in_milliseconds() {
+        // A 512 KiB namespace and 170,000 one-byte keys — one 1 MiB `m`
+        // frame — used to hash the namespace again for every key:
+        // about 10^11 byte-steps, 230 CPU-seconds on the connection's
+        // task. The namespace is hashed once per frame now, so the
+        // routing is bounded by the keys' own bytes and the ring size.
+        let ring = RingView::new(
+            (0..3)
+                .map(|i| (format!("node-{i}"), format!("10.0.0.{i}:8356")))
+                .collect(),
+            2,
+        );
+        let namespace = vec![b'n'; 512 * 1024];
+        let namespace_hash = NamespaceHash::of(&namespace);
+        let keys: Vec<Vec<u8>> = (0..170_000u32).map(|i| i.to_le_bytes().to_vec()).collect();
+        let started = std::time::Instant::now();
+        let mut top = Vec::new();
+        let mut routed = 0usize;
+        for key in &keys {
+            ring.rank_owners(namespace_hash, key, ring.replication, &mut top);
+            routed += top.len();
+        }
+        assert_eq!(routed, keys.len() * 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "routing 170,000 keys under a 512 KiB namespace took {:?}",
+            started.elapsed()
+        );
+        // The per-frame state is the one-shot hash.
+        assert_eq!(namespace_hash.key(b"k"), key_hash(&namespace, b"k"));
+    }
+
+    #[test]
     fn requires_discovery_and_paired_tls_flags() {
         assert!(matches!(args(&[]), Err(ArgsError::Invalid(_))));
         assert!(matches!(
@@ -5814,6 +5885,14 @@ mod tests {
             names(ring.owners(b"", b"beta")),
             vec!["node-a", "node-c", "node-b"]
         );
+        assert_eq!(
+            NamespaceHash::of(b"users").key(b"alpha"),
+            key_hash(b"users", b"alpha")
+        );
+        assert_eq!(
+            NamespaceHash::of(b"").key(b"alpha"),
+            key_hash(b"", b"alpha")
+        );
         assert_eq!(key_hash(b"users", b"alpha"), 0xfd4ab55027c21df6);
         assert_eq!(key_hash(b"users", b""), 0xa9e9bbca44bb502e);
         assert_eq!(key_hash(b"\xff\x00", b"beta"), 0x8f7c097eccb8e792);
@@ -5868,7 +5947,7 @@ mod tests {
                         // The primary-only selection the batch paths use is
                         // the head of the same order.
                         let mut top = Vec::new();
-                        ring.rank_owners(namespace, key.as_bytes(), 1, &mut top);
+                        ring.rank_owners(NamespaceHash::of(namespace), key.as_bytes(), 1, &mut top);
                         assert_eq!(
                             top.first().map(|&(_, index)| &ring.nodes[index].1),
                             expected.first()

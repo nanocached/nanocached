@@ -7861,11 +7861,56 @@ struct TargetQueue {
     next_seq: u64,
     /// For each key, the sequence number of the write in `ops` that a new
     /// write to it replaces.
-    slots: HashMap<Key, u64>,
+    slots: HashMap<SlotKey, u64>,
+    /// Hashes the slot keys: a namespace is hashed once per run of keys
+    /// sharing its allocation (a multi-key frame's keys do), not once
+    /// per lookup — see `SlotKey`.
+    hasher: KeyHasher,
     /// A drainer (`drain_forward_queue`) is running or has been handed to
     /// `run`; at most one runs per queue, which is what keeps the order.
     draining: bool,
 }
+
+/// `TargetQueue::slots`' key: the key plus its canonical hash, which is
+/// what the map hashes and compares first. `Key`'s derived `Hash` feeds
+/// the whole namespace to the map's hasher on every `get`/`insert`/
+/// `remove`, so queuing the keys of one `o` frame under a 100 KB
+/// namespace cost 2 × keys × 100 KB of hashing on the thread that serves
+/// every connection — an 8 s stall for 100,000 keys. The canonical hash
+/// is computed once per key by the queue's `KeyHasher`, and equality
+/// checks the namespace by allocation identity before its bytes.
+#[derive(Debug)]
+struct SlotKey {
+    hash: u64,
+    key: Key,
+}
+
+impl SlotKey {
+    fn of(hasher: &mut KeyHasher, key: &Key) -> Self {
+        Self {
+            hash: hasher.hash(key).as_u64(),
+            key: key.clone(),
+        }
+    }
+}
+
+impl std::hash::Hash for SlotKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl PartialEq for SlotKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+            && self.key.name == other.key.name
+            && (self.key.namespace.as_ptr() == other.key.namespace.as_ptr()
+                && self.key.namespace.len() == other.key.namespace.len()
+                || self.key.namespace == other.key.namespace)
+    }
+}
+
+impl Eq for SlotKey {}
 
 impl TargetQueue {
     fn new(node_context: NodeContext, target: ForwardTarget) -> Self {
@@ -7875,6 +7920,7 @@ impl TargetQueue {
             ops: BTreeMap::new(),
             next_seq: 0,
             slots: HashMap::new(),
+            hasher: KeyHasher::default(),
             draining: false,
         }
     }
@@ -7888,19 +7934,20 @@ impl TargetQueue {
 
     fn push(&mut self, write: OwnedForwardedWrite) {
         if let Some(key) = coalescing_key(&write) {
-            if let Some(waiting) = self.slots.get(key).and_then(|seq| self.ops.get_mut(seq)) {
+            let slot = SlotKey::of(&mut self.hasher, key);
+            if let Some(waiting) = self.slots.get(&slot).and_then(|seq| self.ops.get_mut(seq)) {
                 *waiting = write;
                 return;
             }
-            let key = key.clone();
             let seq = self.append(write);
-            self.slots.insert(key, seq);
+            self.slots.insert(slot, seq);
             return;
         }
         match &write {
             OwnedForwardedWrite::Clear(_) => self.slots.clear(),
             OwnedForwardedWrite::HandoffSet { key, .. } => {
-                self.slots.remove(key);
+                let slot = SlotKey::of(&mut self.hasher, key);
+                self.slots.remove(&slot);
             }
             _ => {}
         }
@@ -7909,10 +7956,11 @@ impl TargetQueue {
 
     fn pop(&mut self) -> Option<OwnedForwardedWrite> {
         let (seq, write) = self.ops.pop_first()?;
-        if let Some(key) = coalescing_key(&write)
-            && self.slots.get(key) == Some(&seq)
-        {
-            self.slots.remove(key);
+        if let Some(key) = coalescing_key(&write) {
+            let slot = SlotKey::of(&mut self.hasher, key);
+            if self.slots.get(&slot) == Some(&seq) {
+                self.slots.remove(&slot);
+            }
         }
         Some(write)
     }
@@ -12429,6 +12477,83 @@ mod tests {
         }
         assert_eq!(queue.ops.len(), 100);
         assert_eq!(queue.slots.len(), 100);
+    }
+
+    #[test]
+    fn queuing_a_frame_of_many_keys_under_a_large_namespace_hashes_it_once() {
+        // The keys of one `o` frame share the namespace allocation. The
+        // slot map used to hash the whole namespace on every push and
+        // pop (`Key`'s derived `Hash`): 100,000 keys under a 100 KB
+        // namespace cost about 20 GB of hashing on the thread that
+        // serves every connection, an 8 s stall. With the canonical hash
+        // computed once per namespace run this is bounded by the keys'
+        // own bytes.
+        let mut queue = test_target_queue();
+        let namespace = Bytes::from(vec![b'n'; 100_000]);
+        let started = Instant::now();
+        for i in 0..100_000u32 {
+            queue.push(OwnedForwardedWrite::Set {
+                key: Key::new(namespace.clone(), Bytes::from(i.to_le_bytes().to_vec())),
+                value: Bytes::new(),
+                ttl: None,
+            });
+        }
+        // A second write to each key coalesces into its slot.
+        for i in 0..100_000u32 {
+            queue.push(OwnedForwardedWrite::Set {
+                key: Key::new(namespace.clone(), Bytes::from(i.to_le_bytes().to_vec())),
+                value: Bytes::from_static(b"2"),
+                ttl: None,
+            });
+        }
+        assert_eq!(queue.ops.len(), 100_000);
+        let mut popped = 0;
+        while queue.pop().is_some() {
+            popped += 1;
+        }
+        assert_eq!(popped, 100_000);
+        assert!(queue.slots.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "queuing and draining 100,000 keys under a 100 KB namespace took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn slot_keys_compare_by_content_across_namespace_allocations() {
+        // The same key from two frames (two allocations of the same
+        // namespace bytes) must share a slot; the pointer check is only
+        // a fast path.
+        let mut hasher = KeyHasher::default();
+        let first = Key::new(Bytes::from(vec![b'n'; 64]), Bytes::from_static(b"k"));
+        let second = Key::new(Bytes::from(vec![b'n'; 64]), Bytes::from_static(b"k"));
+        let other = Key::new(Bytes::from(vec![b'm'; 64]), Bytes::from_static(b"k"));
+        assert_eq!(
+            SlotKey::of(&mut hasher, &first),
+            SlotKey::of(&mut hasher, &second)
+        );
+        assert_ne!(
+            SlotKey::of(&mut hasher, &first),
+            SlotKey::of(&mut hasher, &other)
+        );
+
+        let mut queue = test_target_queue();
+        queue.push(OwnedForwardedWrite::Set {
+            key: first,
+            value: Bytes::from_static(b"1"),
+            ttl: None,
+        });
+        queue.push(OwnedForwardedWrite::Set {
+            key: second,
+            value: Bytes::from_static(b"2"),
+            ttl: None,
+        });
+        assert_eq!(
+            queue.ops.len(),
+            1,
+            "the second write replaces the first's slot"
+        );
     }
 
     #[test]
