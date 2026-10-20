@@ -14,6 +14,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node` forwards a clear it receives while decommissioning to
+  every surviving node, behind the writes it has already queued for
+  them. The clear used to go only to a join's targets, so a write this
+  node had acknowledged and queued for its entrant could land there
+  after the client's own clear and leave the cleared key on that one
+  owner (#688).
 - `nanocached-node`'s sweep no longer reclaims a marked copy of a key
   the node owns again. A join marks the keys it moves as dead copies for
   the sweep; when that joiner is evicted the keys come back to the node,
