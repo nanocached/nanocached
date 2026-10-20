@@ -213,7 +213,9 @@ leaves room under the limit, images pinned by digest):</p>
   <li><b><code>resources</code></b> — the 1&nbsp;GiB memory limit is
   <code>--max-memory</code> (512&nbsp;MiB) plus what connections may
   hold outside the cache (<code>--max-in-flight-bytes</code>,
-  256&nbsp;MiB by default) plus the process's own headroom, and the
+  256&nbsp;MiB by default), up to 64&nbsp;MiB of writes queued for each
+  node a join or decommission is forwarding to, plus the process's own
+  headroom, and the
   CPU request is what the scheduler packs by (and what a later HPA
   would compute its percentage of).</li>
   <li><b>The Secret</b> is <code>envFrom</code>, so the auth secret

@@ -92,6 +92,16 @@ framework adapters at one version, whether or not a component changed.
   in well under a millisecond). The protocol page and the six SDK and
   adapter READMEs that called this an O(1) drop with memory reclaimed
   immediately now say what happens (#702, #732).
+- `nanocached-node` bounds what it queues for a node it is forwarding
+  writes to (a joiner during a join, an entrant during a decommission)
+  at 64 MiB per target, counting each queued write's key and value, a
+  per-entry overhead and each namespace allocation once. The queue had
+  no bound and a queued write pinned the whole client frame it came
+  from, so a joiner that stopped answering let a few hundred tiny writes
+  under a 1 MB namespace take a 256 MiB node down. A client write that
+  does not fit is held, before its ack, until the queue has room; to
+  make that possible every forward is now queued before the client's
+  reply is written rather than after (#694).
 - Text a user sees no longer carries issue numbers or references to
 - `nanocached-node` asks discovery for the current member list before
   answering `W` for a key its own ring does not grant (at most once a

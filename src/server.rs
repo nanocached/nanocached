@@ -379,6 +379,23 @@ const MAX_PENDING_CLEAR_NAMESPACES: usize = 1024;
 /// one handoff and small against any task size.
 const MAX_PENDING_CLEAR_BYTES: usize = 16 * MAX_REQUEST_SIZE;
 
+/// What one forward target's queue (`TargetQueue`) may hold, in the bytes
+/// its writes pin (`TargetQueue::bytes`), before a connection with a
+/// write for that target waits for room instead of queuing it. Per
+/// target, not per node: a joiner that has stopped answering bounds what
+/// its own queue costs, and what is queued for it waits in the clients
+/// rather than in this process. The queue used to be unbounded, and a
+/// client write holds slices of its request frame, so 186 tiny writes
+/// under a 1 MB namespace queued for a paused joiner took a 256 MiB node
+/// down.
+const MAX_FORWARD_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+
+/// What a queued write costs beyond its key and value bytes: its
+/// `OwnedForwardedWrite`, its `BTreeMap` node and its coalescing slot —
+/// about 320 bytes per pair of a queued `o` frame, measured (45 MB of
+/// queue for 140,000 pairs).
+const FORWARD_ENTRY_OVERHEAD_BYTES: usize = 320;
+
 fn request_is_too_large(size: usize) -> bool {
     size > MAX_REQUEST_SIZE
 }
@@ -533,27 +550,34 @@ fn clear_forward_failure(addr: &str, token: &str) {
 
 /// Queues a per-write forward (a `Set`/`Delete`/`Clear` racing a migration
 /// or decommission drain) for `target` and makes sure a drainer is running
-/// for it. Never blocks and never drops the write, so the connection that
-/// triggered it (which has already written the client's response; see
-/// issue #219) is not held up and the joiner/entrant does not miss it.
-fn spawn_forward(
+/// for it. Never drops the write, so the joiner/entrant does not miss it,
+/// and never waits for the send itself (see issue #219) — but it does
+/// wait for room in the target's queue when `MAX_FORWARD_QUEUE_BYTES` is
+/// reached, which is why every caller runs it before writing the
+/// client's response: a client whose write cannot be queued yet does not
+/// get its ack yet, and the backlog waits in the clients, not here.
+async fn spawn_forward(
     config: &ConnectionConfig,
     node_context: NodeContext,
     target: ForwardTarget,
     write: OwnedForwardedWrite,
 ) {
-    enqueue_forwards(config, node_context, target, std::iter::once(write));
+    enqueue_forwards(config, node_context, target, std::iter::once(write)).await;
 }
 
 /// `spawn_forward` for many writes to one target, under a single hold of
 /// the queue lock (a `MultiSet` can carry hundreds of thousands of keys).
-fn enqueue_forwards(
+async fn enqueue_forwards(
     config: &ConnectionConfig,
     node_context: NodeContext,
     target: ForwardTarget,
     writes: impl IntoIterator<Item = OwnedForwardedWrite>,
 ) {
-    let Some(id) = config.forward_queues.push(&node_context, target, writes) else {
+    let Some(id) = config
+        .forward_queues
+        .push(&node_context, target, writes)
+        .await
+    else {
         return; // a drainer is already running for this target
     };
 
@@ -1912,8 +1936,8 @@ async fn handle_clear(
         ClearScope::All => Command::ClearAll,
     };
     let response = execute_command(request_tx, command).await?;
-    write_response(stream, &encode_response(&response, tag)).await?;
 
+    // Queued before the ack, like every forward (see `spawn_forward`).
     if let Some(node_context) = &config.node_context {
         // Issue #564: earlier joiners still inside their forwarding grace
         // need the clear as well, not just the slot's own joiner.
@@ -1923,7 +1947,8 @@ async fn handle_clear(
                 node_context.clone(),
                 target,
                 OwnedForwardedWrite::Clear(scope.clone()),
-            );
+            )
+            .await;
         }
         if let ClearRoute::Forward(target) = route_clear(node_context, &scope) {
             spawn_forward(
@@ -1931,9 +1956,11 @@ async fn handle_clear(
                 node_context.clone(),
                 target,
                 OwnedForwardedWrite::Clear(scope),
-            );
+            )
+            .await;
         }
     }
+    write_response(stream, &encode_response(&response, tag)).await?;
 
     Ok(())
 }
@@ -2561,7 +2588,8 @@ async fn handle_connection(
                                     node_context.clone(),
                                     batch.target,
                                     writes,
-                                );
+                                )
+                                .await;
                             }
                         }
                     }
@@ -2601,8 +2629,6 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                write_response(&mut stream, &encode_response(&response, tag)).await?;
-
                 // Staged node join: this key may be one an in-progress handoff is
                 // moving to a joining node — see `migration_targets_for`.
                 if let Some(node_context) = &config.node_context {
@@ -2620,7 +2646,8 @@ async fn handle_connection(
                                 value: value.clone(),
                                 ttl,
                             },
-                        );
+                        )
+                        .await;
                     }
                 }
 
@@ -2642,8 +2669,11 @@ async fn handle_connection(
                             ttl,
                             if_absent: false,
                         },
-                    );
+                    )
+                    .await;
                 }
+
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 continue;
             }
@@ -2713,8 +2743,6 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                write_response(&mut stream, &encode_response(&response, tag)).await?;
-
                 // If this node is itself mid-join-handoff for the key,
                 // relay it to the joining owner too.
                 //
@@ -2751,7 +2779,7 @@ async fn handle_connection(
                                 ttl,
                             }
                         };
-                        spawn_forward(&config, node_context.clone(), target, forward);
+                        spawn_forward(&config, node_context.clone(), target, forward).await;
                     }
                 }
 
@@ -2790,8 +2818,11 @@ async fn handle_connection(
                             ttl,
                             if_absent,
                         },
-                    );
+                    )
+                    .await;
                 }
+
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 continue;
             }
@@ -2832,8 +2863,6 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                write_response(&mut stream, &encode_response(&response, tag)).await?;
-
                 // If this node is itself mid-join-handoff for the key,
                 // propagate like any other delete.
                 if let Some(node_context) = &config.node_context {
@@ -2843,7 +2872,8 @@ async fn handle_connection(
                             node_context.clone(),
                             target,
                             OwnedForwardedWrite::Delete { key: key.clone() },
-                        );
+                        )
+                        .await;
                     }
                 }
 
@@ -2861,8 +2891,11 @@ async fn handle_connection(
                         node_context.clone(),
                         target,
                         OwnedForwardedWrite::HandoffDelete { key: key.clone() },
-                    );
+                    )
+                    .await;
                 }
+
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 continue;
             }
@@ -2877,8 +2910,6 @@ async fn handle_connection(
 
                 let response =
                     execute_command(&request_tx, Command::Delete { key: key.clone() }).await?;
-                write_response(&mut stream, &encode_response(&response, tag)).await?;
-
                 if let Some(node_context) = &config.node_context {
                     for target in migration_targets_for(node_context, &key) {
                         spawn_forward(
@@ -2886,7 +2917,8 @@ async fn handle_connection(
                             node_context.clone(),
                             target,
                             OwnedForwardedWrite::Delete { key: key.clone() },
-                        );
+                        )
+                        .await;
                     }
                 }
 
@@ -2900,8 +2932,11 @@ async fn handle_connection(
                         node_context.clone(),
                         target,
                         OwnedForwardedWrite::HandoffDelete { key: key.clone() },
-                    );
+                    )
+                    .await;
                 }
+
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 continue;
             }
@@ -2922,8 +2957,6 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                write_response(&mut stream, &encode_response(&response, tag)).await?;
-
                 // Issue #129: only a `Response::Incremented` — i.e. INCR
                 // actually wrote a new value — needs forwarding;
                 // `NotFound`/`NotNumeric` changed nothing. Forwarded as
@@ -2946,7 +2979,8 @@ async fn handle_connection(
                                     value: value.clone(),
                                     ttl,
                                 },
-                            );
+                            )
+                            .await;
                         }
                     }
 
@@ -2963,9 +2997,12 @@ async fn handle_connection(
                                 ttl,
                                 if_absent: false,
                             },
-                        );
+                        )
+                        .await;
                     }
                 }
+
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 continue;
             }
@@ -2996,8 +3033,6 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                write_response(&mut stream, &encode_response(&response, tag)).await?;
-
                 // Issue #141: only `Response::Stored` — i.e. the condition
                 // held and CAS actually wrote — needs forwarding; a
                 // `NotFound` (mismatch) changed nothing. Forwarded as an
@@ -3019,7 +3054,8 @@ async fn handle_connection(
                                     value: value.clone(),
                                     ttl,
                                 },
-                            );
+                            )
+                            .await;
                         }
                     }
 
@@ -3036,9 +3072,12 @@ async fn handle_connection(
                                 ttl,
                                 if_absent: false,
                             },
-                        );
+                        )
+                        .await;
                     }
                 }
+
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 continue;
             }
@@ -3065,8 +3104,6 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                write_response(&mut stream, &encode_response(&response, tag)).await?;
-
                 // Same "forward the literal result, never `x` itself"
                 // rule as `CasSet`.
                 if matches!(response, Response::Deleted) {
@@ -3077,7 +3114,8 @@ async fn handle_connection(
                                 node_context.clone(),
                                 target,
                                 OwnedForwardedWrite::Delete { key: key.clone() },
-                            );
+                            )
+                            .await;
                         }
                     }
 
@@ -3089,9 +3127,12 @@ async fn handle_connection(
                             node_context.clone(),
                             target,
                             OwnedForwardedWrite::HandoffDelete { key: key.clone() },
-                        );
+                        )
+                        .await;
                     }
                 }
+
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 continue;
             }
@@ -8237,8 +8278,20 @@ impl ForwardTarget {
 struct TargetQueue {
     node_context: NodeContext,
     target: ForwardTarget,
-    ops: BTreeMap<u64, OwnedForwardedWrite>,
+    ops: BTreeMap<u64, Queued>,
     next_seq: u64,
+    /// What the queued writes pin, as `MAX_FORWARD_QUEUE_BYTES` counts
+    /// it: each write's key name and value plus
+    /// `FORWARD_ENTRY_OVERHEAD_BYTES`, and each namespace allocation
+    /// once — the keys of one frame share theirs, and a client write's
+    /// slices pin its frame whether one key references it or a hundred
+    /// thousand do. Kept exact by `charge`/`release`.
+    bytes: usize,
+    /// Namespace allocations the queued writes reference, by (pointer,
+    /// length), with how many writes share each: the namespace's bytes
+    /// are charged when the first arrives and released when the last
+    /// leaves.
+    namespaces: HashMap<(usize, usize), usize>,
     /// For each key, the sequence number of the write in `ops` that a new
     /// write to it replaces.
     slots: HashMap<SlotKey, u64>,
@@ -8292,6 +8345,63 @@ impl PartialEq for SlotKey {
 
 impl Eq for SlotKey {}
 
+/// A write in a `TargetQueue` with what it was charged (`entry_bytes`
+/// at the time), so its release is exact whatever the write is replaced
+/// by or popped as.
+struct Queued {
+    write: OwnedForwardedWrite,
+    bytes: usize,
+}
+
+/// What `write` costs a queue on its own: its key name and value (a
+/// clear's namespace name), plus `FORWARD_ENTRY_OVERHEAD_BYTES`. The
+/// namespace is charged separately, once per allocation — see
+/// `TargetQueue::namespaces`.
+fn entry_bytes(write: &OwnedForwardedWrite) -> usize {
+    let own = match write {
+        OwnedForwardedWrite::Set { key, value, .. }
+        | OwnedForwardedWrite::HandoffSet { key, value, .. } => key.name.len() + value.len(),
+        OwnedForwardedWrite::Delete { key } | OwnedForwardedWrite::HandoffDelete { key } => {
+            key.name.len()
+        }
+        OwnedForwardedWrite::Clear(ClearScope::Namespace(namespace)) => namespace.len(),
+        OwnedForwardedWrite::Clear(ClearScope::All) => 0,
+    };
+    own + FORWARD_ENTRY_OVERHEAD_BYTES
+}
+
+/// The namespace allocation `write` references, as `TargetQueue::namespaces`
+/// keys it; none for the default namespace or a clear.
+fn namespace_allocation(write: &OwnedForwardedWrite) -> Option<(usize, usize)> {
+    let key = match write {
+        OwnedForwardedWrite::Set { key, .. }
+        | OwnedForwardedWrite::HandoffSet { key, .. }
+        | OwnedForwardedWrite::Delete { key }
+        | OwnedForwardedWrite::HandoffDelete { key } => key,
+        OwnedForwardedWrite::Clear(_) => return None,
+    };
+    if key.namespace.is_empty() {
+        return None;
+    }
+    Some((key.namespace.as_ptr() as usize, key.namespace.len()))
+}
+
+/// What a batch of writes will add to a queue's `bytes` if queued now:
+/// every write's `entry_bytes`, and each namespace allocation in the
+/// batch once. Over by a namespace the queue already holds; never under.
+fn batch_bytes(writes: &[OwnedForwardedWrite]) -> usize {
+    let mut namespaces = std::collections::HashSet::new();
+    writes
+        .iter()
+        .map(|write| {
+            entry_bytes(write)
+                + namespace_allocation(write)
+                    .filter(|allocation| namespaces.insert(*allocation))
+                    .map_or(0, |(_, len)| len)
+        })
+        .sum()
+}
+
 impl TargetQueue {
     fn new(node_context: NodeContext, target: ForwardTarget) -> Self {
         Self {
@@ -8299,27 +8409,59 @@ impl TargetQueue {
             target,
             ops: BTreeMap::new(),
             next_seq: 0,
+            bytes: 0,
+            namespaces: HashMap::new(),
             slots: HashMap::new(),
             hasher: KeyHasher::default(),
             draining: false,
         }
     }
 
-    fn append(&mut self, write: OwnedForwardedWrite) -> u64 {
+    /// Accounts `write` into `bytes`; returns what the entry itself was
+    /// charged, to hand back to `release` with it.
+    fn charge(&mut self, write: &OwnedForwardedWrite) -> usize {
+        let bytes = entry_bytes(write);
+        self.bytes += bytes;
+        if let Some(allocation) = namespace_allocation(write) {
+            let sharers = self.namespaces.entry(allocation).or_insert(0);
+            if *sharers == 0 {
+                self.bytes += allocation.1;
+            }
+            *sharers += 1;
+        }
+        bytes
+    }
+
+    fn release(&mut self, write: &OwnedForwardedWrite, bytes: usize) {
+        self.bytes -= bytes;
+        if let Some(allocation) = namespace_allocation(write)
+            && let Some(sharers) = self.namespaces.get_mut(&allocation)
+        {
+            *sharers -= 1;
+            if *sharers == 0 {
+                self.namespaces.remove(&allocation);
+                self.bytes -= allocation.1;
+            }
+        }
+    }
+
+    fn append(&mut self, queued: Queued) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.ops.insert(seq, write);
+        self.ops.insert(seq, queued);
         seq
     }
 
     fn push(&mut self, write: OwnedForwardedWrite) {
+        let bytes = self.charge(&write);
         if let Some(key) = coalescing_key(&write) {
             let slot = SlotKey::of(&mut self.hasher, key);
             if let Some(waiting) = self.slots.get(&slot).and_then(|seq| self.ops.get_mut(seq)) {
-                *waiting = write;
+                let replaced = std::mem::replace(waiting, Queued { write, bytes });
+                self.release(&replaced.write, replaced.bytes);
                 return;
             }
-            let seq = self.append(write);
+            let seq = self.append(Queued { write, bytes });
             self.slots.insert(slot, seq);
             return;
         }
@@ -8331,18 +8473,19 @@ impl TargetQueue {
             }
             _ => {}
         }
-        self.append(write);
+        self.append(Queued { write, bytes });
     }
 
     fn pop(&mut self) -> Option<OwnedForwardedWrite> {
-        let (seq, write) = self.ops.pop_first()?;
-        if let Some(key) = coalescing_key(&write) {
+        let (seq, queued) = self.ops.pop_first()?;
+        self.release(&queued.write, queued.bytes);
+        if let Some(key) = coalescing_key(&queued.write) {
             let slot = SlotKey::of(&mut self.hasher, key);
             if self.slots.get(&slot) == Some(&seq) {
                 self.slots.remove(&slot);
             }
         }
-        Some(write)
+        Some(queued.write)
     }
 }
 
@@ -8353,40 +8496,69 @@ impl TargetQueue {
 #[derive(Default)]
 struct ForwardQueues {
     targets: Mutex<HashMap<usize, TargetQueue>>,
+    /// Woken whenever a queue gives bytes back (a pop, a removal), for
+    /// the pushes waiting on `MAX_FORWARD_QUEUE_BYTES`.
+    room: tokio::sync::Notify,
 }
 
 impl ForwardQueues {
-    /// Queues `writes` for `target`. Returns the queue's id if the caller
-    /// must now start a drainer for it, `None` if one is already running.
-    fn push(
+    /// Queues `writes` for `target`, waiting while the target's queue is
+    /// at `MAX_FORWARD_QUEUE_BYTES` until a drainer has popped enough
+    /// for the batch to fit (a batch larger than the whole bound is
+    /// admitted into an empty queue, so it can never wait forever).
+    /// Returns the queue's id if the caller must now start a drainer for
+    /// it, `None` if one is already running.
+    async fn push(
         &self,
         node_context: &NodeContext,
         target: ForwardTarget,
         writes: impl IntoIterator<Item = OwnedForwardedWrite>,
     ) -> Option<usize> {
         let id = Arc::as_ptr(&target.connection) as usize;
-        let mut targets = self
-            .targets
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Decided by the target this push resolved, not the one the queue
         // was created with: the same connection serves a joiner first as
         // the slot's own and later as a lingering one.
         let as_handoff = target.as_handoff;
-        let queue = targets
-            .entry(id)
-            .or_insert_with(|| TargetQueue::new(node_context.clone(), target));
-        for write in writes {
-            queue.push(if as_handoff {
-                write.into_handoff_frame()
-            } else {
-                write
-            });
-        }
-        if std::mem::replace(&mut queue.draining, true) {
-            None
-        } else {
-            Some(id)
+        let writes: Vec<OwnedForwardedWrite> = writes
+            .into_iter()
+            .map(|write| {
+                if as_handoff {
+                    write.into_handoff_frame()
+                } else {
+                    write
+                }
+            })
+            .collect();
+        let wanted = batch_bytes(&writes);
+        let mut target = Some(target);
+        loop {
+            // Registered before the lock is taken, so a pop between the
+            // check and the wait still wakes this.
+            let room = self.room.notified();
+            {
+                let mut targets = self
+                    .targets
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let used = targets.get(&id).map_or(0, |queue| queue.bytes);
+                if used == 0 || used + wanted <= MAX_FORWARD_QUEUE_BYTES {
+                    let queue = targets.entry(id).or_insert_with(|| {
+                        TargetQueue::new(
+                            node_context.clone(),
+                            target.take().expect("the queue is created once"),
+                        )
+                    });
+                    for write in writes {
+                        queue.push(write);
+                    }
+                    return if std::mem::replace(&mut queue.draining, true) {
+                        None
+                    } else {
+                        Some(id)
+                    };
+                }
+            }
+            room.await;
         }
     }
 
@@ -8399,13 +8571,16 @@ impl ForwardQueues {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let queue = targets.get_mut(&id)?;
-        match queue.pop() {
+        let next = match queue.pop() {
             Some(write) => Some((queue.node_context.clone(), queue.target.duplicate(), write)),
             None => {
                 targets.remove(&id);
                 None
             }
-        }
+        };
+        drop(targets);
+        self.room.notify_waiters();
+        next
     }
 
     /// Marks queue `id` as having no drainer, so the next `push` starts
@@ -8421,6 +8596,8 @@ impl ForwardQueues {
                 targets.remove(&id);
             }
         }
+        drop(targets);
+        self.room.notify_waiters();
     }
 }
 
@@ -13923,8 +14100,8 @@ mod tests {
         assert_eq!(drain_all(&mut queue), ["set a 3", "del b"]);
     }
 
-    #[test]
-    fn forwards_to_a_lingering_joiner_are_queued_into_handoff_frames() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn forwards_to_a_lingering_joiner_are_queued_into_handoff_frames() {
         // A lingering joiner's target (`ForwardTarget::as_handoff`) answers
         // a plain `S` with `W` while its own ring lags the slot's, so its
         // forwards go out as `U`/`u`; a put-if-absent relay and a clear are
@@ -13953,6 +14130,7 @@ mod tests {
                     forward_set("a", "2"),
                 ],
             )
+            .await
             .expect("first push starts a drainer");
         let sent = drain_all(queues.targets.lock().unwrap().get_mut(&id).unwrap());
         assert_eq!(
@@ -13973,13 +14151,14 @@ mod tests {
                 own_joiner,
                 [forward_set("a", "1"), forward_delete("b")],
             )
+            .await
             .expect("first push starts a drainer");
         let sent = drain_all(queues.targets.lock().unwrap().get_mut(&id).unwrap());
         assert_eq!(sent, ["set a 1", "del b"]);
     }
 
-    #[test]
-    fn a_lingering_joiner_target_sends_handoff_frames_once_it_stops_being_the_slots_own() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lingering_joiner_target_sends_handoff_frames_once_it_stops_being_the_slots_own() {
         // The same connection serves a joiner first as the slot's own and
         // later as a lingering one; the frame is decided per push, by the
         // target that resolved it, not by the queue's first target.
@@ -13997,10 +14176,12 @@ mod tests {
         };
         let id = queues
             .push(&node_context, own, [forward_set("a", "1")])
+            .await
             .expect("first push starts a drainer");
         assert!(
             queues
                 .push(&node_context, lingering, [forward_set("b", "1")])
+                .await
                 .is_none()
         );
         let sent = drain_all(queues.targets.lock().unwrap().get_mut(&id).unwrap());
@@ -14144,8 +14325,8 @@ mod tests {
         assert_eq!(drain_all(&mut queue), ["set a 2"]);
     }
 
-    #[test]
-    fn exactly_one_drainer_is_started_per_queue_until_it_is_deactivated() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn exactly_one_drainer_is_started_per_queue_until_it_is_deactivated() {
         let queues = ForwardQueues::default();
         let node_context = test_node_context(
             "ready-node",
@@ -14158,11 +14339,13 @@ mod tests {
 
         let id = queues
             .push(&node_context, target.duplicate(), [forward_set("a", "1")])
+            .await
             .expect("the first write starts a drainer");
         assert_eq!(id, Arc::as_ptr(&connection) as usize);
         assert!(
             queues
                 .push(&node_context, target.duplicate(), [forward_set("b", "1")])
+                .await
                 .is_none(),
             "a drainer is already running"
         );
@@ -14173,6 +14356,7 @@ mod tests {
         assert!(
             queues
                 .push(&node_context, target.duplicate(), [forward_set("c", "1")])
+                .await
                 .is_some()
         );
         let mut drained = 0;
@@ -14183,6 +14367,127 @@ mod tests {
         assert!(
             queues.targets.lock().unwrap().is_empty(),
             "an empty queue is removed"
+        );
+    }
+
+    fn namespaced_set(namespace: &Bytes, name: &str, value: &'static str) -> OwnedForwardedWrite {
+        OwnedForwardedWrite::Set {
+            key: Key::new(namespace.clone(), Bytes::copy_from_slice(name.as_bytes())),
+            value: Bytes::from_static(value.as_bytes()),
+            ttl: None,
+        }
+    }
+
+    #[test]
+    fn the_queue_charges_each_write_and_a_shared_namespace_once() {
+        let mut queue = test_target_queue();
+        let namespace = Bytes::from(vec![b'n'; 1000]);
+        let entry =
+            |name: &str, value: &str| name.len() + value.len() + FORWARD_ENTRY_OVERHEAD_BYTES;
+
+        queue.push(namespaced_set(&namespace, "a", "1"));
+        queue.push(namespaced_set(&namespace, "bb", "22"));
+        queue.push(namespaced_set(&namespace, "ccc", "333"));
+        // Three keys of one frame share its namespace allocation: it is
+        // pinned once, so it is charged once.
+        assert_eq!(
+            queue.bytes,
+            entry("a", "1") + entry("bb", "22") + entry("ccc", "333") + namespace.len()
+        );
+
+        // Coalescing replaces the entry's charge, it does not add to it.
+        queue.push(namespaced_set(&namespace, "a", "1-longer"));
+        assert_eq!(
+            queue.bytes,
+            entry("a", "1-longer") + entry("bb", "22") + entry("ccc", "333") + namespace.len()
+        );
+
+        // A write under its own copy of the same name is another
+        // allocation, charged on its own.
+        let own_copy = Bytes::copy_from_slice(&namespace);
+        queue.push(namespaced_set(&own_copy, "d", "4"));
+        assert_eq!(
+            queue.bytes,
+            entry("a", "1-longer")
+                + entry("bb", "22")
+                + entry("ccc", "333")
+                + entry("d", "4")
+                + 2 * namespace.len()
+        );
+
+        // Popping releases each entry, and the namespace with its last sharer.
+        queue.pop();
+        queue.pop();
+        assert_eq!(
+            queue.bytes,
+            entry("ccc", "333") + entry("d", "4") + 2 * namespace.len()
+        );
+        queue.pop();
+        assert_eq!(queue.bytes, entry("d", "4") + own_copy.len());
+        queue.pop();
+        assert_eq!(queue.bytes, 0);
+        assert!(queue.namespaces.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_push_waits_for_room_in_a_full_queue_and_a_pop_makes_it() {
+        let queues = Arc::new(ForwardQueues::default());
+        let node_context = test_node_context(
+            "ready-node",
+            "tk-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let target = test_forward_target("127.0.0.1:9");
+
+        // One write that fills the bound on its own (admitted: the queue
+        // was empty), with the drainer deliberately not started.
+        let filling = OwnedForwardedWrite::Set {
+            key: Key::unnamespaced(Bytes::from_static(b"big")),
+            value: Bytes::from(vec![
+                0_u8;
+                MAX_FORWARD_QUEUE_BYTES
+                    - FORWARD_ENTRY_OVERHEAD_BYTES
+                    - 3
+            ]),
+            ttl: None,
+        };
+        let id = queues
+            .push(&node_context, target.duplicate(), [filling])
+            .await
+            .expect("the first write starts a drainer");
+        assert_eq!(
+            queues.targets.lock().unwrap()[&id].bytes,
+            MAX_FORWARD_QUEUE_BYTES
+        );
+
+        // The next write does not fit: its push waits ...
+        let waiting = tokio::spawn({
+            let queues = Arc::clone(&queues);
+            let target = target.duplicate();
+            async move {
+                queues
+                    .push(&node_context, target, [forward_set("a", "1")])
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "a push into a full queue must wait");
+        assert_eq!(queues.targets.lock().unwrap()[&id].ops.len(), 1);
+
+        // ... until the drainer takes the write that filled the queue.
+        let (_, _, popped) = queues.next(id).expect("the filling write");
+        assert!(matches!(popped, OwnedForwardedWrite::Set { .. }));
+        let started = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiting push completes once there is room")
+            .unwrap();
+        assert!(started.is_none(), "the queue already has its drainer");
+        assert_eq!(queues.targets.lock().unwrap()[&id].ops.len(), 1);
+        // The entry, plus its "ns" namespace charged once.
+        assert_eq!(
+            queues.targets.lock().unwrap()[&id].bytes,
+            entry_bytes(&forward_set("a", "1")) + b"ns".len()
         );
     }
 
@@ -14231,7 +14536,8 @@ mod tests {
                     node_context.clone(),
                     target.duplicate(),
                     forward_set(&format!("k{key:05}"), value),
-                );
+                )
+                .await;
             }
         }
         assert_eq!(
