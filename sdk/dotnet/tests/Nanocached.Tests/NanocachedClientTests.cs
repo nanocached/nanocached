@@ -810,9 +810,10 @@ public class NanocachedClientTests
             node.GoSilentAfterHandshake();
 
             var started = System.Diagnostics.Stopwatch.StartNew();
-            // The client's retry layer redials once after the first
-            // timeout; the redialed connection times out too, so this
-            // settles after roughly two windows — still bounded.
+            // A request timeout is surfaced as-is: the client's retry
+            // layer does not redial and resend after one (the peer is
+            // reachable and simply not answering), so this settles after
+            // one window.
             var error = await Assert.ThrowsAsync<ConnectionLostException>(() => client.GetAsync("k"));
             Assert.Contains("request timed out", error.Message);
             Assert.True(started.ElapsedMilliseconds < 2_000,
@@ -4489,6 +4490,212 @@ public class NanocachedClientTests
         }));
         Assert.Contains("Ca is only used when Tls is true", error.Message);
     }
+    // ── a string with a lone surrogate is rejected, not encoded as U+FFFD ──
+
+    [Fact]
+    public async Task AStringWithALoneSurrogateIsRejectedInsteadOfCollidingWithTheReplacementCharacter()
+    {
+        // Encoding.UTF8.GetBytes silently turns a lone surrogate into
+        // U+FFFD, so "x\uD800" and "x�" used to address the same
+        // entry: a read under one key returned the other key's value.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("x�", "replacement");
+        await Assert.ThrowsAsync<ArgumentException>(() => client.SetAsync("x\uD800", "surrogate"));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.GetAsync("x\uD800"));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.SetAsync("k", "v\uDC00"));
+        Assert.Throws<ArgumentException>(() => client.Namespace("ns\uD800"));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.SetManyAsync(new Dictionary<string, string> { ["x\uD800"] = "v" }));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.GetManyAsync(new[] { "x\uD800" }));
+        Assert.Equal("replacement", await client.GetAsync("x�"));
+        Assert.Single(node.Store);
+
+        // A well-formed pair is an ordinary key.
+        await client.SetAsync("x😀", "emoji");
+        Assert.Equal("emoji", await client.GetAsync("x😀"));
+    }
+
+    // ── GetMany reads a repeated key once ───────────────────────────
+
+    [Fact]
+    public async Task GetManyReadsARepeatedKeyOnce()
+    {
+        // A list of many copies of one key used to be sent as one `m`
+        // frame per 400 copies with every frame's reply retained until
+        // the call returned — hundreds of MB from a 60 KB request.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "value");
+        Dictionary<string, string> values = await client.GetManyAsync(Enumerable.Repeat("k", 2_000).ToList());
+        Assert.Equal(new Dictionary<string, string> { ["k"] = "value" }, values);
+        Assert.Equal(1, node.MultiGetRequestCount);
+    }
+
+    // ── SetMany retries only the legs that failed ───────────────────
+
+    [Fact]
+    public async Task BatchedSetRetriesOnlyTheLegsThatFailedAndReportsAnUnreachablePrimaryAsAConnectionLoss()
+    {
+        // With R=2 every key goes to both nodes. Node B closes on every
+        // `o` frame: the retry pass used to re-send every rank of each
+        // key whose primary (B) leg failed, including node A, which had
+        // already stored it — A received 19 key-sends for 12 keys. And
+        // the exhausted retry used to be reported as WrongNodeException
+        // although B never answered `W`: it was unreachable.
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        MockNode nodeA = cluster.Nodes[Names[0]];
+        MockNode nodeB = cluster.Nodes[Names[1]];
+        nodeB.FailMultiSetFromRequestOnward(1);
+
+        var batch = new Dictionary<string, string>();
+        var primaryOnA = new HashSet<string>();
+        var ring = new HashRing(Names);
+        for (int i = 0; i < 12; i++)
+        {
+            string key = $"key-{i}";
+            batch[key] = $"v{i}";
+            if (ring.Route(Bytes(key)) == Names[0]) primaryOnA.Add(key);
+        }
+        Assert.True(primaryOnA.Count > 0 && primaryOnA.Count < 12, "want keys with each primary");
+
+        var failure = await Assert.ThrowsAsync<PartialConnectionLostException<HashSet<string>>>(
+            () => client.SetManyAsync(batch));
+        Assert.Equal(primaryOnA, failure.PartialValues);
+        Assert.Contains("could not reach the primary of", failure.Message);
+        Assert.Equal(12, nodeA.MultiSetKeyCount);
+        Assert.Equal(12, nodeA.Store.Count);
+    }
+
+    // ── forced refreshes are single-flight ──────────────────────────
+
+    [Fact]
+    public async Task ConcurrentCallersOnADeadNodeShareOneForcedRefresh()
+    {
+        // Four callers that find their node dead at the same time used to
+        // run four full refreshes one after another behind the refresh
+        // gate, the last caller waiting through all of them.
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        string key = KeyOwnedBy(Names[0]);
+        await client.SetAsync(key, "v");
+        cluster.Nodes[Names[0]].Dispose();
+        cluster.Discovery.LaterListDelayMillis = 400;
+        Assert.Equal(1, cluster.Discovery.ConnectionCount);
+
+        Task<long>[] callers = Enumerable.Range(0, 4).Select(_ => Task.Run(async () =>
+        {
+            var started = System.Diagnostics.Stopwatch.StartNew();
+            await Assert.ThrowsAnyAsync<NanocachedException>(() => client.GetAsync(key));
+            return started.ElapsedMilliseconds;
+        })).ToArray();
+        foreach (long millis in await Task.WhenAll(callers))
+        {
+            Assert.True(millis < 1_000, $"a caller waited {millis}ms (serialized refreshes?)");
+        }
+        Assert.Equal(2, cluster.Discovery.ConnectionCount);
+    }
+
+    /// <summary>A key whose primary under <see cref="Names"/> (R=1) is
+    /// <paramref name="owner"/>.</summary>
+    private static string KeyOwnedBy(string owner)
+    {
+        var ring = new HashRing(Names);
+        for (int i = 0; ; i++)
+        {
+            string candidate = $"key-{i}";
+            if (ring.Route(Bytes(candidate)) == owner) return candidate;
+        }
+    }
+
+    // ── concurrent decompressions share one budget ──────────────────
+
+    [Fact]
+    public async Task ConcurrentDecompressionsAreBoundedByTheClientWideBudget()
+    {
+        // N concurrent reads of a compressed value each decompressed in
+        // full at once, N × the per-value cap. With the budget lowered
+        // to one byte, every reservation clamps to the whole budget, so
+        // decompressions run one at a time.
+        long savedBudget = Compression.MaxInflightDecompressedBytes;
+        Compression.MaxInflightDecompressedBytes = 1;
+        int inFlight = 0;
+        int peak = 0;
+        Compression.InflateTestHook = phase =>
+        {
+            if (phase == "start")
+            {
+                int now = Interlocked.Increment(ref inFlight);
+                int seen;
+                while ((seen = Volatile.Read(ref peak)) < now && Interlocked.CompareExchange(ref peak, now, seen) != seen)
+                {
+                }
+                Thread.Sleep(30);
+            }
+            else
+            {
+                Interlocked.Decrement(ref inFlight);
+            }
+        };
+        try
+        {
+            using var node = new MockNode();
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port));
+            string value = string.Concat(Enumerable.Repeat("0123456789", 200));
+            await client.SetAsync("k", value);
+
+            Task<string?>[] reads = Enumerable.Range(0, 8).Select(_ => Task.Run(() => client.GetAsync("k"))).ToArray();
+            foreach (string? read in await Task.WhenAll(reads)) Assert.Equal(value, read);
+            Assert.Equal(1, Volatile.Read(ref peak));
+        }
+        finally
+        {
+            Compression.InflateTestHook = null;
+            Compression.MaxInflightDecompressedBytes = savedBudget;
+        }
+    }
+
+    // ── a stalled replica costs one request timeout, not two ────────
+
+    [Fact]
+    public async Task AStalledReplicaBoundsAClusterSetByOneRequestTimeout()
+    {
+        // A replica that acknowledged the handshake and then stopped
+        // reading timed out the replica leg, which was then redialed and
+        // re-sent for a second full timeout — SetAsync returned after
+        // twice the request deadline although the primary had answered
+        // at once.
+        TimeSpan defaultTimeout = Connection.RequestTimeout;
+        Connection.RequestTimeout = TimeSpan.FromMilliseconds(300);
+        try
+        {
+            using Cluster cluster = StartCluster(replication: 2);
+            using NanocachedClient client =
+                await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+            string key = KeyOwnedBy(Names[0]);
+            await client.SetAsync(key, "warm");
+            MockNode replica = cluster.Nodes[Names[1]];
+            int connectionsBefore = replica.ConnectionCount;
+            replica.GoSilentAfterHandshake();
+
+            var started = System.Diagnostics.Stopwatch.StartNew();
+            await client.SetAsync(key, "v");
+            long elapsed = started.ElapsedMilliseconds;
+            Assert.True(elapsed >= 250 && elapsed < 550, $"SetAsync took {elapsed}ms, want about one timeout");
+            Assert.Equal(connectionsBefore, replica.ConnectionCount);
+            Assert.Equal(1, client.Stats().ReplicaWriteFailures);
+        }
+        finally
+        {
+            Connection.RequestTimeout = defaultTimeout;
+        }
+    }
+
 }
 
 /// <summary>

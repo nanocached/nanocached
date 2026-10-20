@@ -10,6 +10,42 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- A `string` key, namespace or value that is not well-formed UTF-16 (a
+  lone surrogate) now throws `ArgumentException`. Before,
+  `Encoding.UTF8.GetBytes` silently encoded the lone surrogate as U+FFFD,
+  so `"x\uD800"` and `"x\uFFFD"` were the same cache entry (#731).
+- `GetManyAsync`/`GetManyBytesAsync` fetch a repeated key once. A list of
+  many copies of one key used to be sent as one `m` frame per 400 copies
+  with every frame's reply retained until the call returned, so about
+  60 KB of request could hold hundreds of MB of replies (#698).
+- `SetManyAsync`/`SetManyBytesAsync` in cluster mode retry only the legs
+  that failed: a key whose primary leg failed used to be re-sent to every
+  owner after the refresh, including a replica that had already stored
+  it (#720). And a key whose primary could not be reached at all (no `W`
+  was ever received) now throws
+  `PartialConnectionLostException<HashSet<string>>`, with the keys whose
+  primary acknowledged in `PartialValues`, instead of `WrongNodeException`
+  (#722).
+- A cluster `GetManyAsync`/`GetManyBytesAsync` whose unresolved keys had
+  no reachable owner says "could not reach any owner of N of M keys"
+  instead of describing a chunked batch interrupted partway, which was
+  not what happened (#671).
+- Forced node-list refreshes are single-flight: callers that hit a dead
+  node at the same time used to run one full refresh each, one after
+  another behind the refresh gate; a forced caller now reuses a refresh
+  that finished while it waited (#721).
+- Concurrent decompressions are bounded by a client-wide budget (256 MiB
+  of in-flight DEFLATE output; each decompression reserves the 64 MiB
+  per-value cap while it runs), so N concurrent reads of a value that
+  inflates to the cap no longer hold N × 64 MiB at once (#712).
+- A request that timed out is no longer redialed and resent once: the
+  peer was reachable and simply did not answer, so the resend waited out
+  a second full deadline — a cluster `SetAsync` whose replica had stopped
+  reading took 60 s instead of 30 s (#725).
+  `ConnectionLostException.TimedOut` tells such a failure apart.
+
 ## [0.4.7] - 2026-10-19
 
 ### Fixed

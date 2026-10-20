@@ -37,6 +37,66 @@ internal static class Compression
     // cap as the other five SDKs.
     internal static long MaxMultiGetDecompressedBytes = 256L * 1024 * 1024;
 
+    // Bounds how many bytes of DEFLATE output one client may be producing
+    // at any one time, across every concurrent Get/GetMany. The two caps
+    // above are per call: N concurrent reads of a value that expands to
+    // the per-value cap each decompressed in full at the same time, so 32
+    // concurrent reads of one 61 KB value that inflates to 60 MiB failed
+    // most of them with OutOfMemoryException in a 2 GiB process. Each
+    // DEFLATE decompression reserves the per-value cap from this budget
+    // (its output size is not known in advance) and releases it when it
+    // returns, so at most four run at once by default; the rest wait.
+    // What a caller holds after a read returns is the caller's. A mutable
+    // field, not a const, only so a test can lower it; read once, when a
+    // client is built.
+    internal static long MaxInflightDecompressedBytes = 256L * 1024 * 1024;
+
+    /// <summary><see cref="MaxInflightDecompressedBytes"/> as a counting
+    /// semaphore of bytes, one per <c>NanocachedClient</c>. Decompression
+    /// is synchronous CPU work on the calling thread, so a caller that
+    /// must wait for budget blocks that thread, the same way the
+    /// decompression itself does.</summary>
+    internal sealed class InflateBudget
+    {
+        private readonly long _limit;
+        private long _available;
+
+        internal InflateBudget(long limit)
+        {
+            _limit = limit;
+            _available = limit;
+        }
+
+        /// <summary>Reserves <paramref name="n"/> bytes (clamped to the
+        /// whole budget, so a reservation can always be met), waiting
+        /// until they are free.</summary>
+        internal long Acquire(long n)
+        {
+            n = Math.Min(n, _limit);
+            lock (this)
+            {
+                while (_available < n) Monitor.Wait(this);
+                _available -= n;
+            }
+            return n;
+        }
+
+        internal void Release(long n)
+        {
+            lock (this)
+            {
+                _available += n;
+                Monitor.PulseAll(this);
+            }
+        }
+    }
+
+    /// <summary>When set, called with <c>"start"</c> once a DEFLATE
+    /// decompression holds its reservation and with <c>"end"</c> when it
+    /// releases it — only so a test can observe how many decompressions
+    /// run at once.</summary>
+    internal static Action<string>? InflateTestHook;
+
     /// <summary>Below <paramref name="threshold"/>, or when compressing
     /// doesn't actually shrink the value (incompressible data), the
     /// marker byte alone is added and the value is stored unchanged.
@@ -63,7 +123,14 @@ internal static class Compression
     /// <summary>The GetAsync/GetBytesAsync counterpart to
     /// <see cref="CompressValue"/>. Only ever called when <c>Compress</c>
     /// is enabled on this client — see value compression.</summary>
-    internal static byte[] DecompressValue(byte[] value)
+    internal static byte[] DecompressValue(byte[] value) => DecompressValue(value, null);
+
+    /// <summary>As <see cref="DecompressValue(byte[])"/>, charging a
+    /// DEFLATE value's expansion against <paramref name="budget"/>
+    /// (<see cref="MaxInflightDecompressedBytes"/>) for as long as it
+    /// runs; a null budget skips the accounting (tests of the codec
+    /// itself).</summary>
+    internal static byte[] DecompressValue(byte[] value, InflateBudget? budget)
     {
         if (value.Length == 0)
         {
@@ -81,6 +148,11 @@ internal static class Compression
 
         if (marker == MarkerDeflate)
         {
+            long reserved = budget?.Acquire(MaxDecompressedLength + 1L) ?? 0;
+            // Only a charged decompression is observable: the codec's own
+            // tests (no budget) run in parallel with the client's.
+            Action<string>? hook = budget is null ? null : InflateTestHook;
+            hook?.Invoke("start");
             try
             {
                 using var input = new MemoryStream(value, 1, value.Length - 1);
@@ -111,6 +183,11 @@ internal static class Compression
                     "nanocached: failed to decompress a value marked as compressed — did every "
                     + $"client sharing this key enable compress (value compression)? ({error.Message})",
                     error);
+            }
+            finally
+            {
+                hook?.Invoke("end");
+                budget?.Release(reserved);
             }
         }
 

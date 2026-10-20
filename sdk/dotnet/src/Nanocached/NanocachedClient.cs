@@ -319,6 +319,9 @@ public sealed class NanocachedClient : IDisposable
     private readonly byte[]? _authSecret;
     private readonly SslClientAuthenticationOptions? _tls;
     private readonly bool _compress;
+    /// <summary>This client's share of in-flight DEFLATE output — see
+    /// <see cref="Compression.MaxInflightDecompressedBytes"/>.</summary>
+    private readonly Compression.InflateBudget _inflateBudget = new(Compression.MaxInflightDecompressedBytes);
     private readonly int _compressionThreshold;
     private readonly bool _fireAndForgetReplicas;
     private readonly bool _readRepair;
@@ -890,11 +893,33 @@ public sealed class NanocachedClient : IDisposable
 
     /// <summary>As <see cref="Namespace(byte[])"/>, with
     /// <paramref name="namespaceName"/> UTF-8 encoded.</summary>
-    public NanocachedNamespace Namespace(string namespaceName) => Namespace(Encoding.UTF8.GetBytes(namespaceName));
+    public NanocachedNamespace Namespace(string namespaceName) => Namespace(Utf8(namespaceName, "namespace"));
 
     // Strict — never silently replaces a malformed byte with U+FFFD; a
     // non-UTF-8 value raises DecoderFallbackException instead.
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+    /// <summary>The UTF-8 encoding every <c>string</c> key, namespace
+    /// and value overload uses. <c>Encoding.UTF8.GetBytes</c> silently
+    /// replaces a lone surrogate (half of a UTF-16 pair with no partner)
+    /// with U+FFFD, so <c>"x\uD800"</c> and <c>"x\uFFFD"</c> would
+    /// address the same cache entry and a read under one key would
+    /// return the other's value. A string that is not well-formed
+    /// UTF-16 is rejected instead, the way every other caller mistake
+    /// is.</summary>
+    private static byte[] Utf8(string text, string what)
+    {
+        try
+        {
+            return StrictUtf8.GetBytes(text);
+        }
+        catch (EncoderFallbackException error)
+        {
+            throw new ArgumentException(
+                $"nanocached: {what} is not well-formed UTF-16 (a lone surrogate at index {error.Index} "
+                + "cannot be encoded as UTF-8)", what, error);
+        }
+    }
 
     public Task<string?> GetAsync(string key) => GetAsync(EmptyNamespace, key);
 
@@ -909,7 +934,7 @@ public sealed class NanocachedClient : IDisposable
     /// <see cref="NanocachedNamespace"/> forwards to, rather than
     /// duplicating this client's networking.</summary>
     internal Task<string?> GetAsync(byte[] namespaceBytes, string key) =>
-        GetAsync(namespaceBytes, Encoding.UTF8.GetBytes(key));
+        GetAsync(namespaceBytes, Utf8(key, "key"));
 
     /// <summary>issue #105: as <see cref="GetAsync(byte[])"/>, scoped to
     /// <paramref name="namespaceBytes"/>.</summary>
@@ -931,7 +956,7 @@ public sealed class NanocachedClient : IDisposable
     /// <summary>issue #105: as <see cref="GetBytesAsync(string)"/>, scoped
     /// to <paramref name="namespaceBytes"/>.</summary>
     internal Task<byte[]?> GetBytesAsync(byte[] namespaceBytes, string key) =>
-        GetBytesAsync(namespaceBytes, Encoding.UTF8.GetBytes(key));
+        GetBytesAsync(namespaceBytes, Utf8(key, "key"));
 
     /// <summary>issue #105: as <see cref="GetBytesAsync(byte[])"/>, scoped
     /// to <paramref name="namespaceBytes"/> — this is the internal method
@@ -940,7 +965,7 @@ public sealed class NanocachedClient : IDisposable
     internal async Task<byte[]?> GetBytesAsync(byte[] namespaceBytes, byte[] key)
     {
         byte[]? value = await GetRawBytesAsync(namespaceBytes, key).ConfigureAwait(false);
-        return value is null || !_compress ? value : Compression.DecompressValue(value);
+        return value is null || !_compress ? value : Compression.DecompressValue(value, _inflateBudget);
     }
 
     /// <summary>The shared read path behind <see cref="GetBytesAsync(byte[], byte[])"/>
@@ -983,7 +1008,7 @@ public sealed class NanocachedClient : IDisposable
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<(string Value, string Token)?> GetWithTokenAsync(byte[] namespaceBytes, string key) =>
-        GetWithTokenAsync(namespaceBytes, Encoding.UTF8.GetBytes(key));
+        GetWithTokenAsync(namespaceBytes, Utf8(key, "key"));
 
     /// <summary>issue #141: as <see cref="GetWithTokenAsync(byte[])"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
@@ -992,7 +1017,7 @@ public sealed class NanocachedClient : IDisposable
         byte[]? raw = await GetRawBytesAsync(namespaceBytes, key).ConfigureAwait(false);
         if (raw is null) return null;
         string token = ContentDigest(raw);
-        byte[] value = _compress ? Compression.DecompressValue(raw) : raw;
+        byte[] value = _compress ? Compression.DecompressValue(raw, _inflateBudget) : raw;
         return (StrictUtf8.GetString(value), token);
     }
 
@@ -1010,7 +1035,7 @@ public sealed class NanocachedClient : IDisposable
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(byte[] namespaceBytes, string key) =>
-        GetBytesWithTokenAsync(namespaceBytes, Encoding.UTF8.GetBytes(key));
+        GetBytesWithTokenAsync(namespaceBytes, Utf8(key, "key"));
 
     /// <summary>issue #141: as <see cref="GetBytesWithTokenAsync(byte[])"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
@@ -1019,7 +1044,7 @@ public sealed class NanocachedClient : IDisposable
         byte[]? raw = await GetRawBytesAsync(namespaceBytes, key).ConfigureAwait(false);
         if (raw is null) return null;
         string token = ContentDigest(raw);
-        byte[] value = _compress ? Compression.DecompressValue(raw) : raw;
+        byte[] value = _compress ? Compression.DecompressValue(raw, _inflateBudget) : raw;
         return (value, token);
     }
 
@@ -1217,10 +1242,24 @@ public sealed class NanocachedClient : IDisposable
             throw new ArgumentException(
                 "nanocached: GetManyAsync/GetManyBytesAsync requires at least one key", nameof(keys));
         }
+        // A key that appears more than once is fetched once (the result
+        // is a dictionary anyway). Without this, a list of many copies
+        // of one key sent one `m` frame per 400 copies and retained
+        // every frame's reply until the call returned, so about 60 KB of
+        // request could hold hundreds of MB of replies.
+        var distinct = new HashSet<string>(keys.Count);
+        foreach (string key in keys)
+        {
+            if (!distinct.Add(key))
+            {
+                keys = keys.Distinct().ToList();
+                break;
+            }
+        }
         var keyBytes = new byte[keys.Count][];
         for (int i = 0; i < keys.Count; i++)
         {
-            byte[] bytes = Encoding.UTF8.GetBytes(keys[i]);
+            byte[] bytes = Utf8(keys[i], "key");
             ValidateKey(namespaceBytes, bytes);
             keyBytes[i] = bytes;
         }
@@ -1301,7 +1340,10 @@ public sealed class NanocachedClient : IDisposable
                 : lastError ?? new ConnectionLostException("nanocached: no owner is reachable for these keys");
             if (values.Count > 0)
             {
-                throw new PartialConnectionLostException<Dictionary<string, byte[]>>(values, cause);
+                throw new PartialConnectionLostException<Dictionary<string, byte[]>>(
+                    values, cause,
+                    $"nanocached: could not reach any owner of {stillUnreachable.Count} of {keys.Count} keys: "
+                    + cause.Message);
             }
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cause).Throw();
         }
@@ -1313,11 +1355,11 @@ public sealed class NanocachedClient : IDisposable
     /// <see cref="GetManyBytesAsync(byte[], IReadOnlyList{string})"/>'s
     /// per-entry splicing can share it: a no-op when <c>Compress</c> is
     /// off.</summary>
-    private byte[] MaybeDecompress(byte[] value) => _compress ? Compression.DecompressValue(value) : value;
+    private byte[] MaybeDecompress(byte[] value) => _compress ? Compression.DecompressValue(value, _inflateBudget) : value;
 
     /// <summary>Decompresses one hit value for a <c>GetMany</c> batch and
     /// charges its decompressed size against the response's cumulative
-    /// budget (issue #386). <see cref="Compression.DecompressValue"/>
+    /// budget (issue #386). <see cref="Compression.DecompressValue(byte[], Compression.InflateBudget?)"/>
     /// already caps a single value; this bounds the whole response so a
     /// batch of highly compressible values can't amplify that per-value
     /// cap into gigabytes of allocation. Locked on the budget holder
@@ -1625,7 +1667,7 @@ public sealed class NanocachedClient : IDisposable
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task SetAsync(byte[] namespaceBytes, string key, string value, long ttlSeconds = 0) =>
-        SetAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), ttlSeconds);
+        SetAsync(namespaceBytes, Utf8(key, "key"), Utf8(value, "value"), ttlSeconds);
 
     /// <summary>issue #105: as <see cref="SetAsync(byte[], byte[], long)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
@@ -1659,7 +1701,7 @@ public sealed class NanocachedClient : IDisposable
     /// <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<bool> DeleteAsync(byte[] namespaceBytes, string key) =>
-        DeleteAsync(namespaceBytes, Encoding.UTF8.GetBytes(key));
+        DeleteAsync(namespaceBytes, Utf8(key, "key"));
 
     /// <summary>issue #105: as <see cref="DeleteAsync(byte[])"/>, scoped to
     /// <paramref name="namespaceBytes"/>. Returns whether the key existed
@@ -1684,7 +1726,7 @@ public sealed class NanocachedClient : IDisposable
         var raw = new Dictionary<string, byte[]>(values.Count);
         foreach ((string key, string value) in values)
         {
-            raw[key] = Encoding.UTF8.GetBytes(value);
+            raw[key] = Utf8(value, "value");
         }
         return SetManyBytesAsync(namespaceBytes, raw, ttlSeconds);
     }
@@ -1744,7 +1786,7 @@ public sealed class NanocachedClient : IDisposable
         int i = 0;
         foreach ((string key, byte[] original) in values)
         {
-            byte[] kb = Encoding.UTF8.GetBytes(key);
+            byte[] kb = Utf8(key, "key");
             ValidateKeyAndValue(namespaceBytes, kb, original);
             keys.Add(key);
             keyBytes[i] = kb;
@@ -1780,13 +1822,73 @@ public sealed class NanocachedClient : IDisposable
             return;
         }
 
-        List<int> retry =
-            await MultiSetPassAsync(namespaceBytes, keys, keyBytes, valueBytes, ttlSeconds, null).ConfigureAwait(false);
+        var tracker = new MultiSetTracker();
+        List<int> retry = await MultiSetPassAsync(namespaceBytes, keys, keyBytes, valueBytes, ttlSeconds, null, tracker)
+            .ConfigureAwait(false);
         if (retry.Count == 0) return;
         await MaybeRefreshAsync(force: true).ConfigureAwait(false);
-        retry = await MultiSetPassAsync(namespaceBytes, keys, keyBytes, valueBytes, ttlSeconds, retry)
+        retry = await MultiSetPassAsync(namespaceBytes, keys, keyBytes, valueBytes, ttlSeconds, retry, tracker)
             .ConfigureAwait(false);
-        if (retry.Count > 0) throw new WrongNodeException();
+        if (retry.Count == 0) return;
+        // A key is still unresolved after the retry pass. Only a real `W`
+        // from its primary is a wrong-node outcome; a primary that could
+        // not be reached at the connection level on both passes (the
+        // leg's connection closed or timed out, no `W` ever received) is
+        // a connection failure and is reported as one, with the keys
+        // whose primary did acknowledge attached — a caller that reacts
+        // to WrongNodeException by refreshing and retrying must not do
+        // that for a dead node, and one that logs the message must not
+        // be told the node answered.
+        if (retry.Any(idx => !tracker.PrimaryUnreachable.Contains(idx))) throw new WrongNodeException();
+        Exception cause = tracker.LastCause ?? new ConnectionLostException("nanocached: no owner is reachable for these keys");
+        var acknowledgedKeys = new HashSet<string>(tracker.PrimaryAcknowledged.Select(idx => keys[idx]));
+        throw new PartialConnectionLostException<HashSet<string>>(
+            acknowledgedKeys, cause,
+            $"nanocached: could not reach the primary of {retry.Count} of {keys.Count} keys: {cause.Message}");
+    }
+
+    /// <summary>What one <see cref="SetManyBytesAsync(byte[], IReadOnlyDictionary{string, byte[]}, long)"/>
+    /// call learns across its two <see cref="MultiSetPassAsync"/> passes.
+    /// <see cref="Acknowledged"/> records, per position, every owner (by
+    /// name) that answered <c>S</c> for it, so the retry pass sends a
+    /// position only to the owners that have not acknowledged it yet — a
+    /// key whose primary leg failed used to be re-sent to every owner
+    /// after the refresh, including a replica that had already stored it,
+    /// which was duplicate traffic and a chance to re-apply an older
+    /// value over a newer concurrent write. <see cref="PrimaryUnreachable"/>
+    /// holds the positions whose primary leg's latest outcome was a
+    /// connection failure rather than a <c>W</c>;
+    /// <see cref="PrimaryAcknowledged"/> the positions whose primary
+    /// stored them; <see cref="LastCause"/> the most recent leg-level
+    /// connection failure. Legs run concurrently, so every member is
+    /// used under <c>lock (this)</c>.</summary>
+    private sealed class MultiSetTracker
+    {
+        public readonly Dictionary<int, HashSet<string>> Acknowledged = new();
+        public readonly HashSet<int> PrimaryUnreachable = new();
+        public readonly HashSet<int> PrimaryAcknowledged = new();
+        public Exception? LastCause;
+
+        public bool IsAcknowledged(int idx, string owner)
+        {
+            lock (this)
+            {
+                return Acknowledged.TryGetValue(idx, out HashSet<string>? owners) && owners.Contains(owner);
+            }
+        }
+
+        public void Acknowledge(int idx, string owner)
+        {
+            lock (this)
+            {
+                if (!Acknowledged.TryGetValue(idx, out HashSet<string>? owners))
+                {
+                    owners = new HashSet<string>();
+                    Acknowledged[idx] = owners;
+                }
+                owners.Add(owner);
+            }
+        }
     }
 
     /// <summary><see cref="MultiGetChunkedAsync"/>'s write-side twin: one
@@ -1871,7 +1973,7 @@ public sealed class NanocachedClient : IDisposable
     /// <see cref="RunMultiSetLegAsync"/>.</summary>
     private async Task<List<int>> MultiSetPassAsync(
         byte[] namespaceBytes, List<string> keys, byte[][] keyBytes, byte[][] valueBytes,
-        long ttlSeconds, List<int>? retryIndices)
+        long ttlSeconds, List<int>? retryIndices, MultiSetTracker tracker)
     {
         List<int> indices = retryIndices ?? Enumerable.Range(0, keys.Count).ToList();
 
@@ -1887,6 +1989,9 @@ public sealed class NanocachedClient : IDisposable
             }
             for (int rank = 0; rank < names.Count; rank++)
             {
+                // An owner that already stored this position on the
+                // previous pass is not sent it again (see MultiSetTracker).
+                if (tracker.IsAcknowledged(idx, names[rank])) continue;
                 if (!owners.TryGetValue(names[rank], out OwnerBatch? batch))
                 {
                     batch = new OwnerBatch();
@@ -1900,18 +2005,23 @@ public sealed class NanocachedClient : IDisposable
         var legs = new List<Task>();
         foreach ((string name, OwnerBatch batch) in owners)
         {
-            Task RunLegAsync() => RunMultiSetLegAsync(namespaceBytes, name, batch, keyBytes, valueBytes, ttlSeconds, retry);
+            // A fire-and-forget leg's outcome is never waited for, so it
+            // records nothing in the tracker: the retry pass (if any)
+            // sends that owner its positions again, as before.
+            bool pureReplica = !batch.IsPrimary.Contains(true);
+            bool background = _fireAndForgetReplicas && pureReplica && _backgroundReplicaPermits.Wait(0);
+            Task RunLegAsync() => RunMultiSetLegAsync(
+                namespaceBytes, name, batch, keyBytes, valueBytes, ttlSeconds, retry, background ? null : tracker);
 
             // Fire-and-forget replica writes: with FireAndForgetReplicas,
             // up to MaxInFlightBackgroundReplicaWrites legs run in the
             // background instead of being waited for below — mirrors
             // WriteAsync's own fire-and-forget branch exactly, including
             // its Close()-race fallback.
-            bool pureReplica = !batch.IsPrimary.Contains(true);
-            if (_fireAndForgetReplicas && pureReplica && _backgroundReplicaPermits.Wait(0))
+            if (background)
             {
-                Task background = Task.Run(RunLegAsync);
-                _ = background.ContinueWith(
+                Task backgroundLeg = Task.Run(RunLegAsync);
+                _ = backgroundLeg.ContinueWith(
                     completed =>
                     {
                         if (completed.Exception is not null)
@@ -1958,7 +2068,7 @@ public sealed class NanocachedClient : IDisposable
     /// <c>lock (retry)</c>.</summary>
     private async Task RunMultiSetLegAsync(
         byte[] namespaceBytes, string name, OwnerBatch batch, byte[][] keyBytes, byte[][] valueBytes,
-        long ttlSeconds, List<int> retry)
+        long ttlSeconds, List<int> retry, MultiSetTracker? tracker)
     {
         var groupKeys = new byte[batch.Indices.Count][];
         var groupValues = new byte[batch.Indices.Count][];
@@ -1985,25 +2095,9 @@ public sealed class NanocachedClient : IDisposable
             // real result instead, and fall back to the old whole-failure
             // treatment only for the keys that were never attempted (the
             // chunk that failed, or a later one still queued behind it).
-            int completed = partial.CompletedEntries.Count;
-            lock (retry)
-            {
-                for (int i = 0; i < batch.Indices.Count; i++)
-                {
-                    if (i < completed)
-                    {
-                        if (!batch.IsPrimary[i])
-                        {
-                            if (partial.CompletedEntries[i].WrongNode) Interlocked.Increment(ref _replicaWriteFailures);
-                            continue;
-                        }
-                        if (partial.CompletedEntries[i].WrongNode) retry.Add(batch.Indices[i]);
-                        continue;
-                    }
-                    if (batch.IsPrimary[i]) retry.Add(batch.Indices[i]);
-                    else Interlocked.Increment(ref _replicaWriteFailures);
-                }
-            }
+            var outcomes = new Connection.MultiEntry?[batch.Indices.Count];
+            for (int i = 0; i < partial.CompletedEntries.Count; i++) outcomes[i] = partial.CompletedEntries[i];
+            ApplyLegOutcome(name, batch, outcomes, retry, tracker, partial.InnerException!);
             return;
         }
         catch (Exception error) when (error is NanocachedException or IOException
@@ -2015,27 +2109,70 @@ public sealed class NanocachedClient : IDisposable
             // to the connection layer's own failure types, so a genuine
             // programming bug propagates instead of being treated like a
             // dead owner.
-            lock (retry)
-            {
-                for (int i = 0; i < batch.Indices.Count; i++)
-                {
-                    if (batch.IsPrimary[i]) retry.Add(batch.Indices[i]);
-                    else Interlocked.Increment(ref _replicaWriteFailures);
-                }
-            }
+            ApplyLegOutcome(name, batch, new Connection.MultiEntry?[batch.Indices.Count], retry, tracker, error);
             return;
         }
 
+        var resolved = new Connection.MultiEntry?[batch.Indices.Count];
+        for (int i = 0; i < entries.Count; i++) resolved[i] = entries[i];
+        ApplyLegOutcome(name, batch, resolved, retry, tracker, null);
+    }
+
+    /// <summary>Shared by <see cref="RunMultiSetLegAsync"/>'s three
+    /// outcomes (a clean multi-set reply, a total connection failure, and
+    /// a chunked partial failure): a <c>null</c> entry (every position, on
+    /// a total failure; only the positions from the failing chunk onward,
+    /// on a partial one) is treated exactly like a <c>W</c> — unresolved.
+    /// Only a primary-held unresolved position is appended to
+    /// <paramref name="retry"/>; a replica-held one is counted into
+    /// <see cref="_replicaWriteFailures"/> instead. A position with a real
+    /// <c>S</c> answer is recorded as acknowledged by this owner in
+    /// <paramref name="tracker"/> (when there is one — a fire-and-forget
+    /// leg passes <c>null</c>) so the retry pass skips it.</summary>
+    private void ApplyLegOutcome(
+        string owner, OwnerBatch batch, Connection.MultiEntry?[] entries, List<int> retry,
+        MultiSetTracker? tracker, Exception? cause)
+    {
+        if (tracker is not null && cause is not null)
+        {
+            lock (tracker) tracker.LastCause = cause;
+        }
         lock (retry)
         {
             for (int i = 0; i < batch.Indices.Count; i++)
             {
-                if (!batch.IsPrimary[i])
+                Connection.MultiEntry? entry = entries[i];
+                int idx = batch.Indices[i];
+                bool primary = batch.IsPrimary[i];
+                bool unresolved = entry is null || entry.Value.WrongNode;
+                if (!unresolved)
                 {
-                    if (entries[i].WrongNode) Interlocked.Increment(ref _replicaWriteFailures);
+                    if (tracker is not null)
+                    {
+                        tracker.Acknowledge(idx, owner);
+                        if (primary)
+                        {
+                            lock (tracker) tracker.PrimaryAcknowledged.Add(idx);
+                        }
+                    }
                     continue;
                 }
-                if (entries[i].WrongNode) retry.Add(batch.Indices[i]);
+                if (primary)
+                {
+                    if (tracker is not null)
+                    {
+                        lock (tracker)
+                        {
+                            if (entry is null) tracker.PrimaryUnreachable.Add(idx);
+                            else tracker.PrimaryUnreachable.Remove(idx);
+                        }
+                    }
+                    retry.Add(idx);
+                }
+                else
+                {
+                    Interlocked.Increment(ref _replicaWriteFailures);
+                }
             }
         }
     }
@@ -2096,7 +2233,7 @@ public sealed class NanocachedClient : IDisposable
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<long?> IncrAsync(byte[] namespaceBytes, string key, long delta) =>
-        IncrAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), delta);
+        IncrAsync(namespaceBytes, Utf8(key, "key"), delta);
 
     /// <summary>issue #129: as <see cref="IncrAsync(byte[], long)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — this is the internal
@@ -2372,7 +2509,7 @@ public sealed class NanocachedClient : IDisposable
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<bool> PutIfAbsentAsync(byte[] namespaceBytes, string key, string value, long ttlSeconds = 0) =>
-        PutIfAbsentAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), ttlSeconds);
+        PutIfAbsentAsync(namespaceBytes, Utf8(key, "key"), Utf8(value, "value"), ttlSeconds);
 
     /// <summary>issue #141: as <see cref="PutIfAbsentAsync(byte[], byte[], long)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
@@ -2396,7 +2533,7 @@ public sealed class NanocachedClient : IDisposable
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<bool> ReplaceIfPresentAsync(byte[] namespaceBytes, string key, string value, long ttlSeconds = 0) =>
-        ReplaceIfPresentAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), ttlSeconds);
+        ReplaceIfPresentAsync(namespaceBytes, Utf8(key, "key"), Utf8(value, "value"), ttlSeconds);
 
     /// <summary>issue #141: as <see cref="ReplaceIfPresentAsync(byte[], byte[], long)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
@@ -2434,7 +2571,7 @@ public sealed class NanocachedClient : IDisposable
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<bool> ReplaceAsync(byte[] namespaceBytes, string key, string token, string newValue, long ttlSeconds = 0) =>
-        ReplaceAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), token, Encoding.UTF8.GetBytes(newValue), ttlSeconds);
+        ReplaceAsync(namespaceBytes, Utf8(key, "key"), token, Utf8(newValue, "value"), ttlSeconds);
 
     /// <summary>issue #141: as <see cref="ReplaceAsync(byte[], string, byte[], long)"/>,
     /// scoped to <paramref name="namespaceBytes"/>. issue #223: validates
@@ -2477,7 +2614,7 @@ public sealed class NanocachedClient : IDisposable
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<bool> DeleteIfMatchesAsync(byte[] namespaceBytes, string key, string token) =>
-        DeleteIfMatchesAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), token);
+        DeleteIfMatchesAsync(namespaceBytes, Utf8(key, "key"), token);
 
     /// <summary>issue #141: as <see cref="DeleteIfMatchesAsync(byte[], string)"/>,
     /// scoped to <paramref name="namespaceBytes"/>. issue #223: validates
@@ -2959,7 +3096,14 @@ public sealed class NanocachedClient : IDisposable
         {
             return await op(await SlotConnectionAsync(slot).ConfigureAwait(false)).ConfigureAwait(false);
         }
-        catch (ConnectionLostException)
+        // A request timeout is not the idle-FIN case this retry exists
+        // for: the peer accepted the frame and simply never answered
+        // within the request deadline, so a redial-and-resend would most
+        // likely stall for another full deadline (a replica that stopped
+        // reading made a cluster SetAsync take twice the request timeout)
+        // and would re-send a write the peer may still apply. The timeout
+        // is surfaced as-is instead.
+        catch (ConnectionLostException error) when (!error.TimedOut)
         {
             return await op(await SlotConnectionAsync(slot).ConfigureAwait(false)).ConfigureAwait(false);
         }
@@ -3673,10 +3817,21 @@ public sealed class NanocachedClient : IDisposable
         if (_ring is null) return;
         if (!force && DateTime.UtcNow - _lastFetch < NodeListStaleAfter) return;
 
+        // Forced refreshes are single-flight: a forced caller that waited
+        // for the gate while another refresh ran reuses that refresh
+        // instead of running its own. Without this, N callers hitting the
+        // same dead node ran N full refreshes one after another (each a
+        // discovery round trip, up to the connect timeout when discovery
+        // is slow), and the last caller waited behind N - 1 results it
+        // did not need. A refresh that completed — including one whose
+        // fetch failed, which also advances _lastFetch — is what the
+        // waiter would have got from its own attempt moments later.
+        DateTime observed = _lastFetch;
         await _refreshGate.WaitAsync().ConfigureAwait(false);
         try
         {
             if (!force && DateTime.UtcNow - _lastFetch < NodeListStaleAfter) return;
+            if (force && _lastFetch > observed) return;
             await RefreshNodeListAsync().ConfigureAwait(false);
         }
         finally
