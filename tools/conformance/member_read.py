@@ -7,7 +7,8 @@ the verdicts by (command class, offset bucket). The offset is the start of the s
 
 Per key, one of: ok | lost (absent where a value was expected) | wrong (another value) |
 resurrected (present where absent was expected) | partial (owners disagree) | counter (wrong total) |
-ttl_extended | ttl_shortened | ttl_spread | cas_bad | pia_bad.  Keys whose sequence raised are counted as
+ttl_extended | ttl_shortened | ttl_spread | ttl_unreadable (no owner reported a TTL; a replica's W on the
+increment-by-0 probe is expected, the primary alone answers it) | cas_bad | pia_bad.  Keys whose sequence raised are counted as
 `err` and not judged.
 """
 import base64
@@ -63,12 +64,17 @@ class Conn:
         return (line.decode(), None)
 
     def ttl(self, ns, key):
+        """The key's remaining TTL as the node reports it on an increment by 0: an int, None when the node
+        answered without one, or "W" when it declined because it is an owner but not the key's primary
+        (i is the primary's alone: a replica answers W even though it holds the copy)."""
         self.s.sendall(f"i {len(ns)} {len(key)} 0\n".encode() + ns + key)
         line = self._line()
         if line.startswith(b"I "):
             p = line.split()
             self._bytes(int(p[1]))
             return int(p[2]) if len(p) > 2 else None
+        if line == b"W":
+            return "W"
         return None
 
 
@@ -137,9 +143,9 @@ for r in ops:
                 break
             if k == "ttl":
                 ttls = {n: conns[n].ttl(ns, key) for n in present}
-                vs = [t for t in ttls.values() if t is not None]
+                vs = [t for t in ttls.values() if isinstance(t, int)]
                 expect = e["ttl"] - (time.time() - e["tw"])
-                if len(vs) < len(ttls):
+                if not vs or any(t is None for t in ttls.values()):  # a replica's W is expected; no TTL at all is not
                     bad = ("ttl_unreadable", {"ttls": ttls})
                     break
                 if max(vs) - min(vs) > 2:
