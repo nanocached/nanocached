@@ -595,10 +595,20 @@ including `AuthenticationFailedException` for a rejected secret,
 `NotNumericException` for an `IncrAsync`/`DecrAsync` whose stored value
 isn't an integer, and `CompressionIncompatibleException` for
 `IncrAsync`/`DecrAsync` called on a `Compress`-enabled client — so one
-catch clause covers "an expected nanocached failure". Caller mistakes
-(an invalid TTL, an empty address list) throw `ArgumentException`
-instead: they indicate a bug in the calling code, not a nanocached
-failure, a convention shared across the SDKs.
+catch clause covers "an expected nanocached failure". A dial that fails
+— the port refused the connection, the host did not resolve, the server
+reset or closed the connection during the handshake, the 5 s connect
+deadline, or a node that answers `B` because it is at its connection
+limit — throws `ConnectionLostException`, with the
+`SocketException`/`IOException` that caused it as `InnerException`; from
+`ConnectAsync` when no address could be reached, and from any operation
+whose redial of a dead node fails. A TLS certificate the client rejects
+is the one dial failure `ConnectAsync` leaves as the original
+`AuthenticationException`: it is a configuration error, not a server
+that is away. Caller mistakes (an invalid TTL, an
+empty address list) throw `ArgumentException` instead: they indicate a
+bug in the calling code, not a nanocached failure, a convention shared
+across the SDKs.
 
 ### Retryable errors and `TransientRetries`
 

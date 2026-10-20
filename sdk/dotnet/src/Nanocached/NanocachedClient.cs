@@ -560,12 +560,23 @@ public sealed class NanocachedClient : IDisposable
             // not an IOException, so it needs naming here: an address whose
             // handshake fails is an unreachable address — try the next one,
             // like the other SDKs. It stays the thrown error if it is the
-            // last one, so a single-address connect still surfaces the cause
-            // as the original exception.
+            // last one: a rejected certificate is a configuration error, and
+            // a single-address connect surfaces it as the original exception.
+            // A failed dial of the other kinds — refused, unresolvable, reset
+            // or closed mid-handshake — becomes this SDK's own
+            // ConnectionLostException (the original as InnerException, and
+            // in the message), the shape every redial already throws
+            // (OpenNodeConnectionAsync), so a `catch (NanocachedException)`
+            // covers a connect that found no address reachable. The SDK's
+            // own errors (a refused secret, a busy discovery server, a
+            // malformed reply) are kept as they are.
             catch (Exception error) when (error is NanocachedException or IOException
                 or System.Net.Sockets.SocketException or AuthenticationException)
             {
-                lastError = error;
+                lastError = error is IOException or System.Net.Sockets.SocketException
+                    ? new ConnectionLostException(
+                        $"nanocached: could not connect to {key}: {error.Message}", error, requestNotSent: true)
+                    : error;
                 continue;
             }
 

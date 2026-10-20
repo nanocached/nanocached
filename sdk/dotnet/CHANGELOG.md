@@ -12,6 +12,15 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- `ConnectAsync` throws `ConnectionLostException` (the
+  `SocketException`/`IOException` as `InnerException`) when no address
+  could be reached, instead of the raw exception of the last address
+  tried, so `catch (NanocachedException)` covers it as it already covered
+  a failed redial; a rejected TLS certificate stays an
+  `AuthenticationException`. A node at its
+  connection limit, which answers `B` and closes, is reported as busy
+  instead of as a connection closed during the handshake.
+
 - The error for a namespace, key or value over the request limit names
   the limit ("the server accepts requests of up to 1 MiB") instead of a
   server source constant and file (#734).

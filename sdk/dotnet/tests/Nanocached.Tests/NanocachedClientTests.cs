@@ -660,6 +660,65 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task ARefusedConnectIsAConnectionLostExceptionWithTheSocketErrorInside()
+    {
+        int dead = Wire.UnusedPort();
+        var error = await Assert.ThrowsAsync<ConnectionLostException>(
+            () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", dead)));
+        Assert.IsType<System.Net.Sockets.SocketException>(error.InnerException);
+        Assert.Contains($"127.0.0.1:{dead}", error.Message);
+    }
+
+    [Fact]
+    public async Task ANodeAtItsConnectionLimitIsReportedBusyOnTheFirstDial()
+    {
+        // A node over --max-connections answers a bare `B\n` and closes:
+        // two bytes, not the three-byte identity. Seen for what it is on
+        // the first probe — not retried with the lesser `A` forms the way
+        // a close-before-reply door-slam is.
+        var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        int dials = 0;
+        var serving = Task.Run(async () =>
+        {
+            while (true)
+            {
+                System.Net.Sockets.TcpClient accepted;
+                try
+                {
+                    accepted = await listener.AcceptTcpClientAsync();
+                }
+                catch (ObjectDisposedException)
+                {
+                    return;
+                }
+                catch (System.Net.Sockets.SocketException)
+                {
+                    return;
+                }
+                Interlocked.Increment(ref dials);
+                using (accepted)
+                {
+                    await Wire.WriteAsync(accepted.GetStream(), "B\n");
+                }
+            }
+        });
+        try
+        {
+            var error = await Assert.ThrowsAsync<ConnectionLostException>(
+                () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", port)));
+            Assert.Contains("connection limit", error.Message);
+            Assert.Equal(1, Volatile.Read(ref dials));
+        }
+        finally
+        {
+            listener.Stop();
+            await serving;
+        }
+    }
+
+    [Fact]
     public async Task ZeroReconnectCooldownMeansTheDefaultNotDisabled()
     {
         // Cross-SDK contract change: TimeSpan.Zero used to disable the
