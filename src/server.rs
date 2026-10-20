@@ -1438,6 +1438,50 @@ async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
 }
 
+/// How long `reject_oversized_request` keeps reading after its `En\n`
+/// for the client to close first.
+const REJECTED_REQUEST_DRAIN_WINDOW: Duration = Duration::from_secs(1);
+
+/// A request this node will not run — one `parse` rejected, or one over
+/// its size limit — is answered `En\n` before the connection closes, as
+/// `docs/protocol.html` promises and as the proxy already does: a
+/// hand-written client that only sees the close cannot tell a rejected
+/// request from a dropped connection. The reply is best effort (a peer
+/// that already went away gets nothing, and that is not worth reporting
+/// over `reason`); the returned error is what the WARN line carries.
+async fn reject_request(stream: &mut ServerStream, reason: String) -> io::Error {
+    let _ = write_response(stream, &Response::Malformed.encode()).await;
+    io::Error::new(io::ErrorKind::InvalidData, reason)
+}
+
+/// `reject_request` for a request the node stopped reading part-way
+/// because it passed `MAX_REQUEST_SIZE`. The client has usually sent
+/// more than was read, and closing a socket with unread bytes in its
+/// receive buffer sends a reset, which can discard the `En\n` on the
+/// client's side before it is read. So: reply, half-close (the client
+/// sees the reply and EOF at once), then read and discard what is still
+/// arriving — until the client closes, for at most
+/// `REJECTED_REQUEST_DRAIN_WINDOW` and a request's worth of bytes —
+/// before the socket is dropped. Not used for the unauthenticated form
+/// of the same limit: a peer that has not authenticated does not get to
+/// hold a connection permit for that long.
+async fn reject_oversized_request(stream: &mut ServerStream, reason: String) -> io::Error {
+    let error = reject_request(stream, reason).await;
+    let _ = stream.shutdown().await;
+    let drain = async {
+        let mut sink = [0_u8; 8192];
+        let mut discarded = 0;
+        while discarded < MAX_REQUEST_SIZE {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => discarded += n,
+            }
+        }
+    };
+    let _ = timeout(REJECTED_REQUEST_DRAIN_WINDOW, drain).await;
+    error
+}
+
 /// Echoed response tags: a `G`/`S`/`D` response on a tagged-mode connection echoes
 /// the request's tag; untagged connections keep the original encoding.
 /// Issue #124: the node's operations endpoint — a deliberately minimal,
@@ -3029,17 +3073,15 @@ async fn handle_connection(
                 // and secret together must fit — see
                 // `UNAUTHENTICATED_MAX_REQUEST_SIZE`.
                 if !authenticated && received.len() > UNAUTHENTICATED_MAX_REQUEST_SIZE {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unauthenticated request is too large",
-                    ));
+                    return Err(reject_request(
+                        &mut stream,
+                        "unauthenticated request is too large".to_string(),
+                    )
+                    .await);
                 }
             }
             Err(error) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{error:?}"),
-                ));
+                return Err(reject_request(&mut stream, format!("{error:?}")).await);
             }
         }
 
@@ -3138,10 +3180,9 @@ async fn handle_connection(
         }
 
         if request_is_too_large(received.len()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "request is too large",
-            ));
+            return Err(
+                reject_oversized_request(&mut stream, "request is too large".to_string()).await,
+            );
         }
     }
 }
@@ -11540,6 +11581,15 @@ mod tests {
             .await
             .unwrap();
 
+        // Refused with the same `En\n` as any other rejected request, so
+        // the peer is told rather than just dropped.
+        let mut response = [0_u8; 3];
+        timeout(Duration::from_secs(5), client.read_exact(&mut response))
+            .await
+            .expect("En within 5 s")
+            .unwrap();
+        assert_eq!(&response, b"En\n");
+
         let error = connection_task.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
@@ -11805,6 +11855,83 @@ mod tests {
 
         let error = connection_task.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Reads whatever the server still sends, bounded: a node that
+    /// closes without the promised `En\n` makes these tests fail, not
+    /// hang.
+    async fn read_until_close(client: &mut TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+            .await
+            .expect("the server closes within 5 s")
+            .unwrap();
+        response
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_the_node_cannot_parse_is_answered_en_before_the_close() {
+        // An unknown command, a malformed TTL, a non-numeric length and
+        // an empty key: each used to close the connection with no reply,
+        // while `docs/protocol.html` promised `E` and the proxy sent it.
+        for malformed in [
+            &b"Z\n"[..],
+            &b"hello\n"[..],
+            &b"S 1 1 -1\nkv"[..],
+            &b"S 1 abc\nkv"[..],
+            &b"S 0 1\nv"[..],
+        ] {
+            let (mut client, server) = tcp_pair().await;
+            let (connection_task, cache_task, senders) =
+                spawn_secret_connection(server, b"correct-secret", IDLE_TIMEOUT);
+
+            client.write_all(b"A 14\ncorrect-secret").await.unwrap();
+            let mut ack = [0_u8; 3];
+            client.read_exact(&mut ack).await.unwrap();
+            assert_eq!(&ack, b"On\n");
+
+            client.write_all(malformed).await.unwrap();
+            assert_eq!(
+                read_until_close(&mut client).await,
+                b"En\n",
+                "{malformed:?}"
+            );
+
+            let error = connection_task.await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{malformed:?}");
+
+            drop(senders);
+            cache_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_over_the_size_limit_is_answered_en_before_the_close() {
+        let (mut client, server) = tcp_pair().await;
+        let (connection_task, cache_task, senders) =
+            spawn_secret_connection(server, b"correct-secret", IDLE_TIMEOUT);
+
+        client.write_all(b"A 14\ncorrect-secret").await.unwrap();
+        let mut ack = [0_u8; 3];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"On\n");
+
+        // Header plus key plus value is one byte over the limit; the
+        // node stops reading once it is past it, answers, and half-closes
+        // — the client sees `En\n` and EOF, then its own close lets the
+        // node drop the socket without a reset.
+        let mut request = format!("S 4 {}\nname", MAX_REQUEST_SIZE).into_bytes();
+        request.extend_from_slice(&vec![b'v'; MAX_REQUEST_SIZE]);
+        client.write_all(&request).await.unwrap();
+        assert_eq!(read_until_close(&mut client).await, b"En\n");
+        drop(client);
+
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "request is too large");
+
+        drop(senders);
+        cache_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
