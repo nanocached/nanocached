@@ -564,6 +564,14 @@ loud `WARN` if that disagrees with its own configured value.
   (1,048,576 bytes) — a budget that low can never actually be satisfied
   (the cache always keeps at least one entry), so it would just evict
   everything else on every write instead of caching anything
+- In-flight bytes: what client connections hold outside the cache —
+  replies being written and requests still arriving — is bounded
+  node-wide at 256 MiB by default, configurable with
+  `--max-in-flight-bytes <bytes>` (at least 1 MiB). A reply's values
+  are charged before it is built and released once written; a receive
+  buffer's growth past 64 KiB is charged before it is allocated. A
+  connection that cannot get its share in time is closed, like a
+  stalled one. Size a process at `--max-memory` plus this plus headroom
 - Per-namespace caps: `--namespace-budget <ns>=<bytes>` (repeatable)
   caps one namespace's share — over its cap it evicts from *itself*,
   oldest first, so a churny namespace (a session store, say) can't

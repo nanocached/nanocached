@@ -74,6 +74,9 @@ struct Args {
     /// Issue #126: `--max-connections`. Previously the compile-time
     /// `MAX_CONNECTIONS` constant.
     max_connections: usize,
+    /// `--max-in-flight-bytes`: the node-wide budget for reply and
+    /// receive buffers (`server::DEFAULT_MAX_IN_FLIGHT_BYTES`).
+    max_in_flight_bytes: usize,
     /// Issue #127: `--namespace-budget <name>=<bytes>`, repeatable — a
     /// per-namespace memory cap. Kept in flag order; `parse_args_from`
     /// rejects a duplicate name outright rather than silently letting
@@ -102,6 +105,7 @@ impl Default for Args {
             metrics_port: None,
             drain_timeout: std::time::Duration::from_secs(25),
             max_connections: server::DEFAULT_MAX_CONNECTIONS,
+            max_in_flight_bytes: server::DEFAULT_MAX_IN_FLIGHT_BYTES,
             max_connections_per_ip: None,
             namespace_budgets: Vec::new(),
         }
@@ -208,6 +212,22 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                         .into());
                 }
                 args.max_connections_per_ip = Some(per_ip);
+            }
+            "--max-in-flight-bytes" => {
+                let raw = value()?;
+                let bytes: usize = raw
+                    .parse()
+                    .map_err(|_| format!("invalid value for --max-in-flight-bytes: {raw}"))?;
+                if bytes < server::MIN_MAX_IN_FLIGHT_BYTES {
+                    return Err(format!(
+                        "--max-in-flight-bytes must be at least {} bytes (one request-sized \
+                         frame); {raw} would serialise every large request instead of \
+                         bounding memory",
+                        server::MIN_MAX_IN_FLIGHT_BYTES
+                    )
+                    .into());
+                }
+                args.max_in_flight_bytes = bytes;
             }
             "--namespace-budget" => {
                 let raw = value()?;
@@ -317,7 +337,15 @@ Usage: nanocached-node [options]
                                small per-entry accounting overhead
                                (default {} — 256 MiB, minimum {} — {} MiB);
                                least-recently-used entries are evicted
-                               first once over budget
+                               first once over budget. The cache only:
+                               give the process this plus
+                               --max-in-flight-bytes plus headroom
+  --max-in-flight-bytes <bytes> what client connections may hold outside
+                               the cache, node-wide: replies being
+                               written and requests still arriving
+                               (default {} — 256 MiB, minimum {} — 1 MiB).
+                               A connection that cannot get its share
+                               in time is closed, like a stalled one
   --max-connections <n>       accepted client connections at once
                                (default {}); over the cap new
                                connections get a Busy reply
@@ -342,6 +370,8 @@ Usage: nanocached-node [options]
         MIN_MAX_MEMORY_BYTES / (1024 * 1024),
         server::DEFAULT_MAX_CONNECTIONS,
         server::DEFAULT_MAX_CONNECTIONS_PER_IP,
+        server::DEFAULT_MAX_IN_FLIGHT_BYTES,
+        server::MIN_MAX_IN_FLIGHT_BYTES,
         MIN_NAMESPACE_BUDGET_BYTES,
     )
 }
@@ -357,6 +387,7 @@ fn connection_limits(args: &Args) -> server::ConnectionLimits {
         max_connections_per_ip: args
             .max_connections_per_ip
             .unwrap_or_else(|| server::DEFAULT_MAX_CONNECTIONS_PER_IP.min(args.max_connections)),
+        max_in_flight_bytes: args.max_in_flight_bytes,
     }
 }
 
@@ -565,6 +596,29 @@ mod tests {
         let limits = connection_limits(&parsed);
         assert_eq!(limits.max_connections, 4096);
         assert_eq!(limits.max_connections_per_ip, 1000);
+    }
+
+    #[test]
+    fn max_in_flight_bytes_flag_parses_defaults_and_is_floored() {
+        let parsed = parse_args_from(args(&[])).unwrap();
+        assert_eq!(
+            connection_limits(&parsed).max_in_flight_bytes,
+            server::DEFAULT_MAX_IN_FLIGHT_BYTES
+        );
+
+        let parsed = parse_args_from(args(&["--max-in-flight-bytes", "67108864"])).unwrap();
+        assert_eq!(connection_limits(&parsed).max_in_flight_bytes, 67_108_864);
+
+        for bad in [
+            (server::MIN_MAX_IN_FLIGHT_BYTES - 1).to_string(),
+            "0".to_string(),
+            "lots".to_string(),
+        ] {
+            assert!(
+                parse_args_from(args(&["--max-in-flight-bytes", &bad])).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     #[test]

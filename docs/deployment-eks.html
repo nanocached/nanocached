@@ -211,9 +211,11 @@ leaves room under the limit, images pinned by digest):</p>
   broken. Liveness stays at the default threshold; a process that
   stops answering <code>/healthz</code> should be restarted.</li>
   <li><b><code>resources</code></b> — the 1&nbsp;GiB memory limit is
-  <code>--max-memory</code> (512&nbsp;MiB) plus the process's own
-  headroom, and the CPU request is what the scheduler packs by (and
-  what a later HPA would compute its percentage of).</li>
+  <code>--max-memory</code> (512&nbsp;MiB) plus what connections may
+  hold outside the cache (<code>--max-in-flight-bytes</code>,
+  256&nbsp;MiB by default) plus the process's own headroom, and the
+  CPU request is what the scheduler packs by (and what a later HPA
+  would compute its percentage of).</li>
   <li><b>The Secret</b> is <code>envFrom</code>, so the auth secret
   becomes <code>NANOCACHED_AUTH_SECRET</code> without appearing in
   the pod spec. Rotating it is <code>kubectl apply</code> of the new

@@ -190,6 +190,10 @@ and clustered production use identical code. See
     <tr><td>Cache memory bound</td><td>256 MiB by default (<code>--max-memory</code>), LRU eviction;
     per-namespace caps via <code>--namespace-budget &lt;ns&gt;=&lt;bytes&gt;</code>
     (a namespace over its cap evicts from itself first)</td><td>—</td></tr>
+    <tr><td>In-flight bytes (replies being written, requests still
+    arriving)</td><td>256 MiB by default (<code>--max-in-flight-bytes</code>),
+    node-wide, outside <code>--max-memory</code>; a connection that cannot
+    get its share in time is closed</td><td>—</td></tr>
     <tr><td>Idle connection timeout</td><td>60 s</td><td>60 s</td></tr>
   </tbody>
 </table>

@@ -56,11 +56,15 @@ pub(crate) const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 256;
 pub(crate) struct ConnectionLimits {
     pub(crate) max_connections: usize,
     pub(crate) max_connections_per_ip: usize,
+    /// `--max-in-flight-bytes`: the node-wide budget for what client
+    /// connections hold outside the cache — see `InFlightBudget`.
+    pub(crate) max_in_flight_bytes: usize,
 }
 
 impl Default for ConnectionLimits {
     fn default() -> Self {
         Self {
+            max_in_flight_bytes: DEFAULT_MAX_IN_FLIGHT_BYTES,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP,
         }
@@ -72,6 +76,121 @@ impl Default for ConnectionLimits {
 /// (`tools/capacity-planner.html`) already modeled capacity as a function
 /// of it.
 pub(crate) const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+
+/// Default for `--max-in-flight-bytes`: what client connections may hold
+/// outside the cache budget, node-wide — reply buffers being written and
+/// receive buffers of requests still arriving. `--max-memory` bounds the
+/// cache only; these were bounded by nothing but the connection count,
+/// and the product was the problem: 1,024 connections each holding a
+/// 1 MiB unfinished frame, or a hundred holding a 16 MiB `M` reply they
+/// do not read, is more than the 1 GiB task the deployment guides size
+/// a 512 MiB cache into. Half of that cache budget; a task's memory has
+/// to cover `--max-memory` plus this plus the process's own headroom.
+pub(crate) const DEFAULT_MAX_IN_FLIGHT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Floor on `--max-in-flight-bytes`: one request-sized frame. A charge
+/// above the budget takes the whole budget and runs alone, so a smaller
+/// budget would serialise every large request rather than bound memory.
+pub(crate) const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
+
+/// A node-wide budget of bytes that client connections hold outside the
+/// cache: a semaphore whose permits are bytes. A connection charges a
+/// reply's bytes before encoding it (the encoded copy is what the write
+/// holds for up to `WRITE_TIMEOUT` while a client does not read) and a
+/// receive buffer's growth beyond `REQUEST_BUFFER_SHRINK_THRESHOLD`
+/// before allocating it (an unfinished frame is held until the frame
+/// deadline), and releases both as soon as the bytes are gone. A cost
+/// above the budget is clamped to it, so such a request takes the whole
+/// budget and runs alone rather than waiting forever; a connection that
+/// cannot get its charge in time is closed, the way a stalled write or a
+/// trickled frame is.
+#[derive(Clone)]
+pub(crate) struct InFlightBudget {
+    permits: Arc<Semaphore>,
+    bytes: usize,
+}
+
+impl InFlightBudget {
+    pub(crate) fn new(bytes: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(bytes)),
+            bytes,
+        }
+    }
+
+    /// Reserves `cost` bytes (clamped to the budget), waiting for them.
+    async fn charge(&self, cost: usize) -> tokio::sync::OwnedSemaphorePermit {
+        self.charge_exact(self.clamp(cost)).await
+    }
+
+    /// `charge` without the clamp, for a holder that grows its charge in
+    /// steps and clamps the total itself (`handle_connection`'s receive
+    /// buffer) — clamping each step would let one holder ask for more
+    /// than exists, waiting for itself.
+    async fn charge_exact(&self, cost: usize) -> tokio::sync::OwnedSemaphorePermit {
+        let permits = u32::try_from(cost).unwrap_or(u32::MAX);
+        Arc::clone(&self.permits)
+            .acquire_many_owned(permits)
+            .await
+            .expect("the in-flight budget is never closed")
+    }
+
+    /// The most one holder can charge: a cost above the budget takes
+    /// all of it.
+    fn clamp(&self, cost: usize) -> usize {
+        cost.min(self.bytes)
+    }
+
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+}
+
+/// The bytes a reply's encoded copy will hold: the values of a `V` or
+/// `M`; every other reply is a short header and is not charged.
+fn reply_bytes(response: &Response) -> usize {
+    match response {
+        Response::Value(value) => value.len(),
+        Response::Multi(entries) => entries
+            .iter()
+            .map(|entry| match entry {
+                MultiEntry::Value(value) => value.len(),
+                MultiEntry::Miss | MultiEntry::WrongNode => 0,
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// Encodes and writes a reply that may carry values, holding its bytes
+/// against the in-flight budget from before the encoded copy exists
+/// until it has been written. Waits at most `WRITE_TIMEOUT` for the
+/// budget — the same bound a stalled write gets — and fails the
+/// connection like one if it runs out.
+async fn write_reply(
+    stream: &mut ServerStream,
+    config: &ConnectionConfig,
+    response: &Response,
+    tag: Option<u32>,
+) -> io::Result<()> {
+    let bytes = reply_bytes(response);
+    let _charge = if bytes == 0 {
+        None
+    } else {
+        Some(
+            timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge(bytes))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "in-flight byte budget exhausted while answering",
+                    )
+                })?,
+        )
+    };
+    write_response(stream, &encode_response(response, tag)).await
+}
 /// How long a connection may go without completing a full request before
 /// `handle_connection` disconnects it. Slowloris resistance: the deadline
 /// this bounds is anchored to the last time a full command was *parsed*
@@ -283,6 +402,9 @@ type RereplicationTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 struct ConnectionConfig {
     idle_timeout: Duration,
     auth_secret: Option<Bytes>,
+    /// The node-wide in-flight byte budget this connection charges its
+    /// reply and receive buffers against.
+    in_flight_bytes: InFlightBudget,
     /// When set, every accepted connection must complete a TLS handshake
     /// before speaking the cache protocol; there is no plaintext fallback.
     tls_acceptor: Option<TlsAcceptor>,
@@ -855,6 +977,7 @@ pub(crate) async fn run(
     let connection_config = ConnectionConfig {
         idle_timeout: IDLE_TIMEOUT,
         auth_secret,
+        in_flight_bytes: InFlightBudget::new(limits.max_in_flight_bytes),
         tls_acceptor,
         node_context: node_context.clone(),
         migration_tx,
@@ -1732,6 +1855,11 @@ async fn handle_connection(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut received = BytesMut::new();
+    // What `received`'s capacity beyond `REQUEST_BUFFER_SHRINK_THRESHOLD`
+    // is charged against the in-flight budget, and the permit holding it
+    // (see `InFlightBudget`): grown before the buffer is, shrunk with it.
+    let mut receive_charge: Option<tokio::sync::OwnedSemaphorePermit> = None;
+    let mut receive_charged = 0usize;
     // No secret configured means auth isn't required, so every connection
     // starts already authenticated.
     let mut authenticated = config.auth_secret.is_none();
@@ -2069,7 +2197,7 @@ async fn handle_connection(
                 }
 
                 let response = execute_command(&request_tx, Command::Get { key }).await?;
-                write_response(&mut stream, &encode_response(&response, tag)).await?;
+                write_reply(&mut stream, &config, &response, tag).await?;
 
                 continue;
             }
@@ -2128,11 +2256,7 @@ async fn handle_connection(
                     .into_iter()
                     .map(|entry| entry.expect("every position filled by one of the two branches"))
                     .collect();
-                write_response(
-                    &mut stream,
-                    &encode_response(&Response::Multi(entries), tag),
-                )
-                .await?;
+                write_reply(&mut stream, &config, &Response::Multi(entries), tag).await?;
 
                 continue;
             }
@@ -2865,15 +2989,52 @@ async fn handle_connection(
             let mut shrunk = BytesMut::with_capacity(received.len());
             shrunk.extend_from_slice(&received);
             received = shrunk;
+            // The released capacity is released from the budget too.
+            receive_charge = None;
+            receive_charged = 0;
         }
-
-        received.reserve(READ_CHUNK_SIZE);
 
         // Bounded by time remaining until `deadline`, not by a fresh
         // `config.idle_timeout` on every read — see `deadline`'s own
         // comment above. If `deadline` has already passed (a trickled
         // read landed after it), `remaining` is zero and this fires
         // immediately instead of granting another read.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+
+        // Grow the buffer under control: a doubling, charged against the
+        // in-flight budget *before* it is allocated, so that what a
+        // thousand connections mid-frame hold is bounded by the budget
+        // rather than by the connection count. The first 64 KiB of every
+        // connection are free; a connection that cannot get the growth
+        // by its frame deadline is closed, like one that trickled.
+        if received.capacity() - received.len() < READ_CHUNK_SIZE {
+            let grown = (received.capacity() * 2).max(received.len() + READ_CHUNK_SIZE);
+            let want = config
+                .in_flight_bytes
+                .clamp(grown.saturating_sub(REQUEST_BUFFER_SHRINK_THRESHOLD));
+            if want > receive_charged {
+                let more = timeout(
+                    remaining,
+                    config.in_flight_bytes.charge_exact(want - receive_charged),
+                )
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "in-flight byte budget exhausted while receiving a request",
+                    )
+                })?;
+                receive_charged = want;
+                receive_charge = Some(match receive_charge.take() {
+                    Some(mut held) => {
+                        held.merge(more);
+                        held
+                    }
+                    None => more,
+                });
+            }
+            received.reserve(grown - received.len());
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
 
         let bytes_read = tokio::select! {
@@ -8599,6 +8760,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -8646,6 +8808,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -8703,6 +8866,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -8786,6 +8950,225 @@ mod tests {
         );
     }
 
+    /// `tcp_pair` with a client whose receive buffer is tiny, so a reply
+    /// larger than the kernel's loopback buffers blocks the node's write
+    /// for as long as the client does not read.
+    async fn tcp_pair_with_small_client_buffer() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let (client, server) = tokio::join!(socket.connect(address), listener.accept());
+        (client.unwrap(), server.unwrap().0)
+    }
+
+    fn connection_config_with_budget(
+        budget: &InFlightBudget,
+        idle_timeout: Duration,
+    ) -> ConnectionConfig {
+        ConnectionConfig {
+            idle_timeout,
+            auth_secret: None,
+            tls_acceptor: None,
+            node_context: None,
+            migration_tx: mpsc::channel(1).0,
+            forward_tx: mpsc::channel(1).0,
+            forward_queues: Arc::new(ForwardQueues::default()),
+            in_flight_bytes: budget.clone(),
+        }
+    }
+
+    #[test]
+    fn reply_bytes_counts_the_values_a_reply_carries() {
+        assert_eq!(reply_bytes(&Response::Value(Bytes::from(vec![0; 10]))), 10);
+        assert_eq!(
+            reply_bytes(&Response::Multi(vec![
+                MultiEntry::Value(Bytes::from(vec![0; 7])),
+                MultiEntry::Miss,
+                MultiEntry::WrongNode,
+                MultiEntry::Value(Bytes::from(vec![0; 5])),
+            ])),
+            12
+        );
+        assert_eq!(reply_bytes(&Response::Stored), 0);
+        assert_eq!(reply_bytes(&Response::NotFound), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replies_are_charged_against_the_in_flight_budget_before_they_are_built() {
+        // A client that asks for 16 MiB and does not read holds its
+        // reply for up to WRITE_TIMEOUT. With a 17 MiB budget a second
+        // such client is not even answered until the first reply is
+        // gone, while a 1 MiB read still fits and is served at once.
+        const MIB: usize = MAX_REQUEST_SIZE;
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        for index in 0..16 {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key(format!("key{index:02}").as_bytes()),
+                    value: Bytes::from(vec![b'v'; MIB]),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: key(b"one"),
+                value: Bytes::from(vec![b'o'; MIB]),
+                ttl: None,
+            },
+        )
+        .await;
+        let budget = InFlightBudget::new(17 * MIB);
+        let mut batch = b"m 0 16".to_vec();
+        batch.extend(std::iter::repeat_n(b" 5", 16).flatten());
+        batch.push(b'\n');
+        for index in 0..16 {
+            batch.extend(format!("key{index:02}").as_bytes());
+        }
+
+        let (mut stalled, server) = tcp_pair_with_small_client_buffer().await;
+        let stalled_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        stalled.write_all(&batch).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            budget.available(),
+            MIB,
+            "the stalled 16 MiB reply must hold its bytes"
+        );
+
+        // A read that fits the remaining budget is served meanwhile.
+        let (mut small, server) = tcp_pair().await;
+        let small_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        small.write_all(b"G 3\none").await.unwrap();
+        let mut reply = vec![0u8; 10 + MIB];
+        timeout(Duration::from_secs(5), small.read_exact(&mut reply))
+            .await
+            .expect("a 1 MiB read fits the budget and is answered")
+            .unwrap();
+        assert!(reply.starts_with(b"V 1048576\n"));
+        drop(small);
+        let _ = timeout(Duration::from_secs(5), small_task).await;
+        assert_eq!(
+            budget.available(),
+            MIB,
+            "the served reply's bytes are released"
+        );
+
+        // A second 16 MiB batch is not answered while the first holds
+        // the budget. (It queues for the bytes fairly, reserving what is
+        // free while it waits, so from here on the budget reads as 0.)
+        let (mut waiting, server) = tcp_pair_with_small_client_buffer().await;
+        let waiting_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        waiting.write_all(&batch).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        let mut probe = [0u8; 16];
+        assert!(
+            timeout(Duration::from_millis(100), waiting.read(&mut probe))
+                .await
+                .is_err(),
+            "the second batch must not be answered while the budget is held"
+        );
+        assert_eq!(budget.available(), 0);
+
+        // The stalled client goes away: its write fails, its bytes are
+        // released, and the waiting batch is answered.
+        drop(stalled);
+        let _ = timeout(Duration::from_secs(5), stalled_task).await;
+        let mut header = [0u8; 5];
+        timeout(Duration::from_secs(5), waiting.read_exact(&mut header))
+            .await
+            .expect("the waiting batch is answered once the budget frees")
+            .unwrap();
+        assert_eq!(&header, b"M 16 ");
+        drop(waiting);
+        let _ = timeout(Duration::from_secs(5), waiting_task).await;
+        assert_eq!(budget.available(), 17 * MIB);
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_buffers_are_charged_against_the_in_flight_budget_before_they_grow() {
+        // An unfinished frame is held until the frame deadline. With a
+        // 16 KiB budget, one connection mid-frame holds all of it; a
+        // second one cannot grow its buffer and is closed at its own
+        // deadline with the budget error — not with the idle error a
+        // connection that was simply slow would get.
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let budget = InFlightBudget::new(16 * 1024);
+        let mut partial = b"S 1 300000\nk".to_vec();
+        partial.extend(std::iter::repeat_n(b'x', 100_000));
+
+        let (mut first, server) = tcp_pair().await;
+        let first_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, Duration::from_secs(10)),
+            shutdown_rx.clone(),
+        ));
+        first.write_all(&partial).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            budget.available(),
+            0,
+            "the first partial frame holds the budget"
+        );
+
+        let (mut second, server) = tcp_pair().await;
+        let second_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, Duration::from_secs(1)),
+            shutdown_rx.clone(),
+        ));
+        second.write_all(&partial).await.unwrap();
+        let error = timeout(Duration::from_secs(5), second_task)
+            .await
+            .expect("the second connection is closed at its deadline")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error.to_string().contains("in-flight byte budget"),
+            "unexpected error: {error}"
+        );
+
+        // The first connection is still being served: its client going
+        // away is what ends it, and that releases the budget.
+        assert!(!first_task.is_finished());
+        drop(first);
+        let _ = timeout(Duration::from_secs(5), first_task).await;
+        assert_eq!(budget.available(), 16 * 1024);
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn handle_connection_times_out_when_client_is_idle() {
         let (_client, server) = tcp_pair().await;
@@ -8805,6 +9188,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -8843,6 +9227,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -9652,6 +10037,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -9785,6 +10171,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -10237,6 +10624,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx.clone(),
             &mut connection_tasks,
@@ -10265,6 +10653,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
             &mut connection_tasks,
@@ -10328,6 +10717,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx.clone(),
             &mut connection_tasks,
@@ -10360,6 +10750,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
             &mut connection_tasks,
@@ -10442,6 +10833,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -10470,6 +10862,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -10515,6 +10908,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -10561,6 +10955,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -10606,6 +11001,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -10655,6 +11051,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -10687,6 +11084,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -10732,6 +11130,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -10834,6 +11233,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -10891,6 +11291,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -10947,6 +11348,7 @@ mod tests {
                     migration_tx: mpsc::channel(1).0,
                     forward_tx: mpsc::channel(1).0,
                     forward_queues: Arc::new(ForwardQueues::default()),
+                    in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
                 },
                 shutdown_rx,
             ));
@@ -10984,6 +11386,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -11026,6 +11429,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -11062,6 +11466,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -11095,6 +11500,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -11206,6 +11612,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -11266,6 +11673,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -11686,6 +12094,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -11754,6 +12163,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -11849,6 +12259,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -11920,6 +12331,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -12021,6 +12433,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -12185,6 +12598,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -12551,6 +12965,7 @@ mod tests {
             migration_tx: mpsc::channel(1).0,
             forward_tx,
             forward_queues: Arc::new(ForwardQueues::default()),
+            in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
         };
         let target = test_forward_target(&joining_addr);
 
@@ -12710,6 +13125,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -12834,6 +13250,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -12958,6 +13375,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -13083,6 +13501,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -13248,6 +13667,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -13377,6 +13797,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -16740,6 +17161,7 @@ mod tests {
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx.clone(),
         ));
@@ -16885,6 +17307,7 @@ mod tests {
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx.clone(),
         ));
@@ -17018,6 +17441,7 @@ mod tests {
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx.clone(),
         ));
@@ -17144,6 +17568,7 @@ mod tests {
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx.clone(),
         ));
@@ -17448,6 +17873,7 @@ mod tests {
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx.clone(),
         ));
@@ -17607,6 +18033,7 @@ mod tests {
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx.clone(),
         ));
@@ -17795,6 +18222,7 @@ mod tests {
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx.clone(),
         ));
@@ -17933,6 +18361,7 @@ mod tests {
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx.clone(),
         ));
@@ -18359,6 +18788,7 @@ mod tests {
                 migration_tx: mpsc::channel(1).0,
                 forward_tx,
                 forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             shutdown_rx,
         ));
@@ -20905,6 +21335,7 @@ mod tests {
             migration_tx: mpsc::channel(1).0,
             forward_tx: mpsc::channel(1).0,
             forward_queues: Arc::new(ForwardQueues::default()),
+            in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
         };
 
         let server_task = tokio::spawn(async move {

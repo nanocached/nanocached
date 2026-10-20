@@ -180,7 +180,9 @@ systemctl enable --now nanocached-node</code></pre>
   <a href="getting-started.html#auth">authentication</a>).</li>
   <li><b><code>--max-memory</code></b> — the cache's budget in bytes.
   1&nbsp;GiB is right for a 2&nbsp;GiB <code>t3.small</code>: leave
-  the kernel, Docker and the per-connection buffers the rest. Scale it
+  the kernel, Docker, the in-flight budget (what connections hold
+  outside the cache, <code>--max-in-flight-bytes</code>, 256&nbsp;MiB
+  by default) and the process's headroom the rest. Scale both flags
   with the instance; the <a href="capacity-planner.html">capacity
   planner</a> turns a hit-rate target into a number.</li>
   <li><b>The image</b> — pinned by digest so an instance replacement
