@@ -58,6 +58,11 @@ pub enum Response {
     /// request produces an `O`-leading reply.
     MultiAck(Vec<MultiAckEntry>),
     Stored,
+    /// `Stored`, for a `U` (handoff) that found the key already holding
+    /// exactly that value: the same `S\n` on the wire, told apart only
+    /// so a leaving node does not relay to its entrant what changed
+    /// nothing here — see `Cache::handoff_set`.
+    StoredUnchanged,
     Deleted,
     NotFound,
     Busy,
@@ -225,7 +230,7 @@ fn encode_multi_ack(entries: &[MultiAckEntry], tag: Option<u32>) -> Vec<u8> {
 impl Response {
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Stored => b"S\n".to_vec(),
+            Self::Stored | Self::StoredUnchanged => b"S\n".to_vec(),
             Self::Deleted => b"D\n".to_vec(),
             Self::NotFound => b"N\n".to_vec(),
             Self::Busy => b"B\n".to_vec(),
@@ -287,7 +292,7 @@ impl Response {
     /// form; everything else stays on `encode`.
     pub fn encode_with_tag(&self, tag: u32) -> Vec<u8> {
         match self {
-            Self::Stored => format!("S {tag}\n").into_bytes(),
+            Self::Stored | Self::StoredUnchanged => format!("S {tag}\n").into_bytes(),
             Self::Deleted => format!("D {tag}\n").into_bytes(),
             Self::NotFound => format!("N {tag}\n").into_bytes(),
             Self::WrongNode => format!("W {tag}\n").into_bytes(),

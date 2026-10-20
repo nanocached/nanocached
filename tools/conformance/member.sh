@@ -9,6 +9,7 @@
 #   join       start node d                         evict      SIGKILL node a
 #   leave      SIGTERM node a                       joinjoin   start d, 3 s later start e
 #   joinleave  SIGTERM a, 2 s later start e         leavejoin  start e, 3 s later SIGTERM a
+#   joinfresh  start d, 6 s after it is listed SIGTERM d (inside its join's forwarding window)
 # After the workload ended (75 s after the change) and the cluster was quiet for 62 s, member_read.py reads
 # every judged key from every live node. `budget` starts the nodes with --namespace-budget nsA=8000000.
 # Env: RUN, WATCHDOG, LOOP_AFTER_GO. Output: tools/conformance/results/<RUN>/member-<scenario>-R<R>[-budget]/
@@ -19,7 +20,7 @@ RUN=${RUN:-$(date +%H%M%S)}
 NODE=${NODE:-nanocached-node:conformance}; DISC=${DISC:-nanocached-discovery:conformance}
 NET=conf-$RUN-mb; P=cm$RUN
 OUT=${OUT:-$HERE/results/$RUN/member-$SCEN-R$R${BUDGET:+-budget}}; WATCHDOG=${WATCHDOG:-1500}
-case $SCEN in join|joinjoin) N0=3;; *) N0=4;; esac
+case $SCEN in join|joinjoin|joinfresh) N0=3;; *) N0=4;; esac
 NARGS=(); [ -n "$BUDGET" ] && NARGS=(--namespace-budget nsA=8000000)
 mkdir -p "$OUT"; rm -f "$OUT/ctl"
 cleanup() { exec 3>&- 2>/dev/null; docker rm -f $(docker ps -aq --filter "name=$P-") >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
@@ -63,6 +64,7 @@ case $SCEN in
   joinjoin) start_node d; sleep 3; echo go2 >&3; start_node e ;;
   joinleave) docker kill -s TERM $P-a >/dev/null; sleep 2; echo go2 >&3; start_node e ;;
   leavejoin) start_node e; sleep 3; echo go2 >&3; docker kill -s TERM $P-a >/dev/null ;;
+  joinfresh) start_node d; wait_members $P-disc:8357 4; sleep 6; echo go2 >&3; docker kill -s TERM $P-d >/dev/null ;;
   *) echo "unknown scenario $SCEN" >&2; exit 2 ;;
 esac
 for _ in $(seq 1 60); do [ "$(docker inspect -f '{{.State.Running}}' $P-wl 2>/dev/null)" = true ] || break; sleep 5; done

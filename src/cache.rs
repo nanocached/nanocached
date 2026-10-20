@@ -531,19 +531,31 @@ impl Cache {
     /// write pauses `reclaim_unowned` and counts toward its
     /// `handoff_writes`: a key this node already owns is kept by the pass
     /// for the same reason a client write of it is, so it moves nothing.
+    ///
+    /// Returns whether the store's content changed: false when the key
+    /// already held exactly `value` (live, not expired). The write goes
+    /// in either way — a repeated handoff refreshes the TTL — but a
+    /// leaving node relays a handoff it receives to its entrant only
+    /// when it changed something here: its own drain comes back to it
+    /// through the entrant's join relay, and relaying that again is the
+    /// loop that overwrote newer writes (see the `U` arm in `server.rs`).
     pub fn handoff_set(
         &mut self,
         key: Key,
         value: Bytes,
         ttl: Option<Duration>,
         ahead_of_ring: bool,
-    ) {
+    ) -> bool {
         // Same TTL-overflow stance as `set_with_ttl`: too far out to
         // represent is "never expires", not a panic.
         let now = Instant::now();
         let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
         self.note_handoff(now, ahead_of_ring);
+        let unchanged = self
+            .peek(&key)
+            .is_some_and(|entry| !entry.is_expired_at(now) && entry.value == value);
         self.insert(key, value, expires_at);
+        !unchanged
     }
 
     fn note_handoff(&mut self, now: Instant, ahead_of_ring: bool) {
@@ -3150,6 +3162,33 @@ mod tests {
             cache.reclaim_unowned(&[key(b"again")], &none, Duration::from_secs(60)),
             report(0, true, 2)
         );
+    }
+
+    #[test]
+    fn handoff_set_reports_whether_it_changed_the_stored_value() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let k = key(b"k");
+        assert!(cache.handoff_set(k.clone(), Bytes::from_static(b"v1"), None, false));
+        assert!(
+            !cache.handoff_set(k.clone(), Bytes::from_static(b"v1"), None, false),
+            "the same value again changes nothing"
+        );
+        assert!(
+            !cache.handoff_set(
+                k.clone(),
+                Bytes::from_static(b"v1"),
+                Some(Duration::from_secs(60)),
+                false
+            ),
+            "a TTL alone is not a change of content"
+        );
+        assert!(cache.handoff_set(k.clone(), Bytes::from_static(b"v2"), None, false));
+        assert!(cache.handoff_delete(&k));
+        assert!(
+            cache.handoff_set(k.clone(), Bytes::from_static(b"v2"), None, false),
+            "absent, so a change"
+        );
+        assert_eq!(cache.get(&k), Some(Bytes::from_static(b"v2")));
     }
 
     #[test]

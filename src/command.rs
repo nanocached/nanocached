@@ -456,13 +456,17 @@ impl Command {
                     // handoff variants leave the client-visible
                     // `sets`/`cas_sets` counters alone — no client asked
                     // for this write.
+                    // `StoredUnchanged` carries the one distinction a
+                    // leaving node needs (see `Cache::handoff_set`).
                     match cache.handoff_set_if_absent(&key, value, ttl, ahead_of_ring) {
-                        CasResult::Stored | CasResult::Mismatch => {}
+                        CasResult::Stored => Response::Stored,
+                        CasResult::Mismatch => Response::StoredUnchanged,
                     }
+                } else if cache.handoff_set(key, value, ttl, ahead_of_ring) {
+                    Response::Stored
                 } else {
-                    cache.handoff_set(key, value, ttl, ahead_of_ring);
+                    Response::StoredUnchanged
                 }
-                Response::Stored
             }
 
             Self::Delete { key } => {
@@ -3141,7 +3145,9 @@ mod tests {
                 ahead_of_ring: false,
             }
             .execute(&mut cache),
-            Response::Stored
+            // Present already: the same `S` on the wire, told apart for a
+            // leaving node's relay (see `Cache::handoff_set`).
+            Response::StoredUnchanged
         );
         assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"first")));
     }
