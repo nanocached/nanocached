@@ -448,9 +448,24 @@ async fn do_connect_and_identify(
     // server understood the extended `A` and is about to echo tags on
     // this connection; read one more byte to confirm its `\n` terminator
     // (`OnT\n`/`EnT\n`/`OdT\n`/`EdT\n`).
+    // A node at its connection limit answers a bare `B\n` — two bytes,
+    // then it closes — instead of the three-byte identity. Read two first
+    // so that reply is seen as what it is; a three-byte read would end
+    // in `UnexpectedEof`, be classified as a legacy server's door-slam,
+    // retried with the lesser `A` forms and come out as a closed
+    // connection.
     let mut ack = [0u8; 3];
     stream
-        .read_exact(&mut ack)
+        .read_exact(&mut ack[..2])
+        .await
+        .map_err(classify_auth_io_error)?;
+    if &ack[..2] == b"B\n" {
+        return Err(AuthFailure::Other(Error::ConnectionLost(format!(
+            "nanocached: {host}:{port} is at its connection limit (busy)"
+        ))));
+    }
+    stream
+        .read_exact(&mut ack[2..])
         .await
         .map_err(classify_auth_io_error)?;
 

@@ -8,6 +8,13 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Fixed
 
+- A node at its connection limit, which answers `B` and closes, is
+  reported as busy (`Error::ConnectionLost`, naming the limit) after one
+  dial. The two-byte reply used to end the three-byte identity read in
+  `UnexpectedEof`, which was classified as a legacy server's door-slam,
+  so the dial was retried with the two lesser `A` forms and came out as
+  a closed connection.
+
 - `get_many`/`get_many_bytes` fetch a repeated key once. A list of many
   copies of one key used to be sent as one `m` frame per 400 copies with
   every frame's reply retained until the call returned, so about 60 KB of

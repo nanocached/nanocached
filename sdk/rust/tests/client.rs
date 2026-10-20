@@ -6500,3 +6500,46 @@ async fn close_releases_writers_blocked_on_a_peer_that_does_not_read() {
     );
     node.stop();
 }
+
+/// A node over --max-connections answers a bare `B\n` and closes: two
+/// bytes, not the three-byte identity. Seen for what it is on the first
+/// probe — not retried with the lesser `A` forms the way a
+/// close-before-reply door-slam is.
+#[tokio::test]
+async fn connect_reports_a_node_at_its_connection_limit_as_busy_on_the_first_dial() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let accepted_dials = Arc::clone(&dials);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            accepted_dials.fetch_add(1, Ordering::SeqCst);
+            let _ = socket.write_all(b"B\n").await;
+            drop(socket);
+        }
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        NanocachedClient::connect(options(port)),
+    )
+    .await
+    .expect("connect must fail fast on a busy node");
+    match result {
+        Err(Error::ConnectionLost(message)) => {
+            assert!(message.contains("connection limit"), "{message}");
+        }
+        other => panic!(
+            "expected ConnectionLost naming the limit, got {:?}",
+            other.err()
+        ),
+    }
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        1,
+        "a busy reply is not a legacy door-slam to retry"
+    );
+}
