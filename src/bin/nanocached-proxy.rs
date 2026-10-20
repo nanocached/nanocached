@@ -339,8 +339,65 @@ const DIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// How many responses one client connection may have outstanding (the
 /// reader stops parsing new requests once this many are undelivered) —
 /// both the per-client in-flight cap and the per-client share bound on
-/// any shared backend.
+/// any shared backend. A count alone does not bound memory (see
+/// `CLIENT_IN_FLIGHT_BYTES`); it bounds the share of a shared backend
+/// connection's reply ledger.
 const CLIENT_IN_FLIGHT: usize = 256;
+
+/// The most bytes one client connection may hold in flight: the worst
+/// case of every undelivered request and its reply, as `request_cost`
+/// charges it, reserved before the request is dispatched and released
+/// once its reply has been written to the client. `CLIENT_IN_FLIGHT`
+/// counts requests, and a count bounds nothing when a 79-byte `m`
+/// naming a 1 MiB value seventeen times is answered with 16 MiB: 256 of
+/// those, pipelined by one client that then stops reading, used to
+/// sit in the writer's FIFO as 4 GiB. Likewise 256 pipelined 1 MiB
+/// `S` frames against a stalled node pinned their values plus one
+/// re-framed copy per owner.
+///
+/// Four largest `M` replies. Pipelined single `G`s are charged a full
+/// value each, so this admits 64 of them at once instead of 256 — far
+/// above the bandwidth-delay product of a proxy on the application's
+/// network, and the reader resumes the moment a reply has gone out.
+/// A request charged more than the budget takes the whole budget and
+/// runs alone; nothing is refused.
+#[cfg(not(test))]
+const CLIENT_IN_FLIGHT_BYTES: usize = 4 * MAX_MULTI_REPLY_VALUE_BYTES;
+/// Shrunk under test to three single-value reads, so the admission
+/// tests can fill it with a handful of pipelined `G`s.
+#[cfg(test)]
+const CLIENT_IN_FLIGHT_BYTES: usize = 3 * MAX_REQUEST_SIZE + 4096;
+
+/// Default for `--max-in-flight-bytes`: the proxy-wide counterpart of
+/// `CLIENT_IN_FLIGHT_BYTES`, shared by every client connection, so the
+/// process's working memory is bounded regardless of how many
+/// connections pipeline at once (1,024 × 64 MiB is not a bound). Half
+/// the 512 MiB the deployment guides size a proxy at; the rest is
+/// connection buffers, the backend reply ledgers and the runtime.
+const DEFAULT_MAX_IN_FLIGHT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Smallest accepted `--max-in-flight-bytes`: one request-sized frame.
+/// Below that every request would run alone (a request costing more
+/// than the budget takes all of it), which is a serialising proxy, not
+/// a bound worth configuring.
+const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
+
+/// What one key of an `m`/`o` frame costs the proxy beyond its wire
+/// bytes while the frame is in flight: the key handle, its slot in the
+/// per-owner grouping, the position map and its entry in the reassembled
+/// reply. Measured at about 77 bytes per key while a frame waits and
+/// about 140 once the reply has landed (a 1 MiB frame of 349,500
+/// one-byte keys cost 27 MB waiting, 50 MB answered); rounded up.
+const MULTI_KEY_OVERHEAD_BYTES: usize = 160;
+
+/// A client connection's read buffer grows to fit whatever request it
+/// is mid-receiving, up to `MAX_REQUEST_SIZE`, and `BytesMut` never
+/// shrinks it back on its own — so a connection that once sent one
+/// large request kept about 1 MiB allocated for the rest of its life,
+/// and 256 idle connections from one source IP held 250 MB. Once the
+/// unparsed remainder is at or under this, an oversized buffer is
+/// reallocated down to it. The node's own threshold.
+const REQUEST_BUFFER_SHRINK_THRESHOLD: usize = 64 * 1024;
 
 /// Bounds on the `L` response, mirroring `verify-staged-join`'s: a
 /// corrupt header must not drive allocations or blocking reads.
@@ -603,6 +660,9 @@ struct Args {
     /// default silently shrinks to fit a lowered total instead of
     /// failing (the node's own shape, issue #126).
     max_connections_per_ip: Option<usize>,
+    /// `--max-in-flight-bytes`: the proxy-wide in-flight byte budget
+    /// (`DEFAULT_MAX_IN_FLIGHT_BYTES`).
+    max_in_flight_bytes: usize,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_ca: Option<String>,
@@ -624,6 +684,7 @@ impl Default for Args {
             discovery: Vec::new(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_connections_per_ip: None,
+            max_in_flight_bytes: DEFAULT_MAX_IN_FLIGHT_BYTES,
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
@@ -647,7 +708,7 @@ impl From<String> for ArgsError {
 fn usage() -> String {
     "usage: nanocached-proxy --discovery <host:port>[,<host:port>...] \
      [--host <host>] [--port <port>] [--max-connections <n>] \
-     [--max-connections-per-ip <n>] \
+     [--max-connections-per-ip <n>] [--max-in-flight-bytes <bytes>] \
      [--tls-cert <pem> --tls-key <pem>] [--tls-ca <pem>] [--metrics-port <port>]\n\
      [--drain-timeout <secs>]\n\
      The shared auth secret is read from NANOCACHED_AUTH_SECRET."
@@ -693,6 +754,19 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                         .into());
                 }
                 args.max_connections_per_ip = Some(parsed);
+            }
+            "--max-in-flight-bytes" => {
+                let parsed: usize = value()?
+                    .parse()
+                    .map_err(|_| "--max-in-flight-bytes must be a number of bytes".to_string())?;
+                if parsed < MIN_MAX_IN_FLIGHT_BYTES {
+                    return Err(format!(
+                        "--max-in-flight-bytes must be at least {MIN_MAX_IN_FLIGHT_BYTES} \
+                         (one request-sized frame)"
+                    )
+                    .into());
+                }
+                args.max_in_flight_bytes = parsed;
             }
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
@@ -749,6 +823,10 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
 struct ConnectionLimits {
     max_connections: usize,
     max_connections_per_ip: usize,
+    /// `--max-in-flight-bytes`: the proxy-wide in-flight byte budget
+    /// every client connection draws on (see `CLIENT_IN_FLIGHT_BYTES`
+    /// for the per-connection one).
+    max_in_flight_bytes: usize,
 }
 
 /// An unset per-IP cap follows a lowered total down (a 100-connection
@@ -761,6 +839,7 @@ fn connection_limits(args: &Args) -> ConnectionLimits {
         max_connections_per_ip: args
             .max_connections_per_ip
             .unwrap_or_else(|| DEFAULT_MAX_CONNECTIONS_PER_IP.min(args.max_connections)),
+        max_in_flight_bytes: args.max_in_flight_bytes,
     }
 }
 
@@ -4693,18 +4772,135 @@ fn secrets_match(a: &[u8], b: &[u8]) -> bool {
 /// that delivers each driver's response in FIFO order — see the module
 /// docs on pipelining. Any parse error or fatal driver result answers
 /// `E` and closes, the node's own stance.
-async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::Result<()> {
+/// A budget of in-flight bytes: a semaphore whose permits are bytes
+/// (`CLIENT_IN_FLIGHT_BYTES` per connection, `--max-in-flight-bytes`
+/// proxy-wide). `charge` reserves a request's worst case before it is
+/// dispatched and the permit rides the writer's FIFO with the reply, so
+/// the bytes are released exactly when the reply has been written and
+/// dropped. A cost above the budget is clamped to it: such a request
+/// takes the whole budget and runs alone, rather than being refused or
+/// waiting forever.
+#[derive(Clone)]
+struct InFlightBudget {
+    permits: Arc<Semaphore>,
+    bytes: usize,
+}
+
+impl InFlightBudget {
+    fn new(bytes: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(bytes)),
+            bytes,
+        }
+    }
+
+    /// Waits until `cost` bytes (clamped to the budget) are free and
+    /// reserves them. `None` only if the semaphore was closed, which
+    /// nothing does.
+    async fn charge(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let permits = u32::try_from(cost.min(self.bytes)).unwrap_or(u32::MAX);
+        Arc::clone(&self.permits)
+            .acquire_many_owned(permits)
+            .await
+            .ok()
+    }
+}
+
+/// What a client request is charged against the in-flight byte budgets
+/// while it is undelivered: its own frame plus the worst case of what
+/// the proxy will hold for it. `frame_bytes` is what the request took
+/// on the wire (its value slices are pinned until the backend legs are
+/// written), `replication` the ring's owner count.
+///
+/// - a read is answered with up to one full value (`G`) or up to
+///   `MAX_MULTI_REPLY_VALUE_BYTES` (`m`, less when the batch is small);
+/// - a write is re-framed once per owner leg on top of its pinned slice;
+/// - an `m`/`o` key costs `MULTI_KEY_OVERHEAD_BYTES` of bookkeeping
+///   beyond its bytes.
+fn request_cost(request: &Request, frame_bytes: usize, replication: usize) -> usize {
+    let legs = replication.max(1) + 1;
+    match request {
+        Request::Get { .. } => frame_bytes.saturating_add(MAX_REQUEST_SIZE),
+        Request::Set { .. }
+        | Request::Delete { .. }
+        | Request::Incr { .. }
+        | Request::CasSet { .. }
+        | Request::CasDelete { .. }
+        | Request::Clear { .. }
+        | Request::ClearAll => frame_bytes.saturating_mul(legs),
+        Request::MultiGet { keys, .. } => frame_bytes
+            .saturating_add(keys.len().saturating_mul(MULTI_KEY_OVERHEAD_BYTES))
+            .saturating_add(
+                keys.len()
+                    .saturating_mul(MAX_REQUEST_SIZE)
+                    .min(MAX_MULTI_REPLY_VALUE_BYTES),
+            ),
+        Request::MultiSet { keys, .. } => frame_bytes
+            .saturating_mul(legs)
+            .saturating_add(keys.len().saturating_mul(MULTI_KEY_OVERHEAD_BYTES)),
+    }
+}
+
+/// Reallocates a client read buffer that grew for a large request back
+/// down once its unparsed remainder fits `REQUEST_BUFFER_SHRINK_THRESHOLD`
+/// (see the constant). Checked on the remainder rather than on exact
+/// emptiness so a connection whose next header always lands in the same
+/// read as the previous frame's tail still releases the allocation.
+fn shrink_drained_buffer(buf: &mut BytesMut) {
+    if buf.capacity() > REQUEST_BUFFER_SHRINK_THRESHOLD
+        && buf.len() <= REQUEST_BUFFER_SHRINK_THRESHOLD
+    {
+        let mut shrunk = BytesMut::with_capacity(buf.len());
+        shrunk.extend_from_slice(buf);
+        *buf = shrunk;
+    }
+}
+
+/// One entry of a client connection's writer FIFO: the reply to send
+/// and, for a dispatched request, the in-flight bytes it holds until
+/// that reply has been written.
+struct ClientReply {
+    result: oneshot::Receiver<DriverResult>,
+    charge: Option<InFlightCharge>,
+}
+
+impl ClientReply {
+    /// A reply the connection produced itself (handshake, protocol
+    /// error): nothing was reserved for it.
+    fn uncharged(result: oneshot::Receiver<DriverResult>) -> Self {
+        Self {
+            result,
+            charge: None,
+        }
+    }
+}
+
+/// The per-connection and proxy-wide reservations of one request, in
+/// the order they were taken.
+struct InFlightCharge {
+    _connection: tokio::sync::OwnedSemaphorePermit,
+    _proxy: tokio::sync::OwnedSemaphorePermit,
+}
+
+async fn handle_client(
+    stream: ServerStream,
+    context: Arc<ProxyContext>,
+    proxy_in_flight_bytes: InFlightBudget,
+) -> io::Result<()> {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
     // The FIFO between reader and writer: each entry resolves to the
     // bytes to send. Bounded, so a client that pipelines without reading
     // responses back-pressures the reader instead of growing a queue.
-    let (fifo_tx, mut fifo_rx) = mpsc::channel::<oneshot::Receiver<DriverResult>>(CLIENT_IN_FLIGHT);
+    let (fifo_tx, mut fifo_rx) = mpsc::channel::<ClientReply>(CLIENT_IN_FLIGHT);
+    // This connection's share of in-flight bytes; the proxy-wide budget
+    // is charged after it (see `InFlightCharge`).
+    let connection_in_flight_bytes = InFlightBudget::new(CLIENT_IN_FLIGHT_BYTES);
 
     let writer_context = Arc::clone(&context);
     let writer = tokio::spawn(async move {
-        while let Some(pending) = fifo_rx.recv().await {
-            match pending.await {
+        while let Some(ClientReply { result, charge }) = fifo_rx.recv().await {
+            match result.await {
                 Ok(Ok(response)) => {
                     // Issue #420: bounded like every other write in this
                     // module. A client that stops reading its socket
@@ -4719,6 +4915,10 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                         Ok(Ok(())) => {}
                         _ => return write_half,
                     }
+                    // Written and about to be dropped: the bytes this
+                    // request was charged are free again.
+                    drop(response);
+                    drop(charge);
                 }
                 Ok(Err(Fatal)) | Err(_) => {
                     writer_context
@@ -4751,6 +4951,14 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
     // amount of slow trickling extends it. Irrelevant in no-secret mode,
     // where `authenticated` starts true and is never consulted.
     let auth_deadline = tokio::time::Instant::now() + AUTH_DEADLINE;
+    // The read deadline after the handshake: anchored to accept time
+    // here and re-anchored to `now + IDLE_TIMEOUT` only when a frame
+    // completes (the handshake, or a request as it is dispatched) —
+    // never on a bare read, which used to let a client that trickled
+    // one byte every few seconds hold the connection, its permits and a
+    // ~1 MiB unfinished frame forever. The node anchors its deadline
+    // the same way.
+    let mut deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
 
     let result: io::Result<()> = 'connection: loop {
         // Parse everything already buffered before reading more.
@@ -4763,6 +4971,7 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
             } else {
                 PREAUTH_MAX_BYTES
             };
+            let buffered = buf.len();
             match parse_request_limited(&mut buf, tagged, &mut scan, max_frame) {
                 Ok(ParseOutcome::Incomplete) => break,
                 Ok(ParseOutcome::Auth {
@@ -4770,6 +4979,7 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                     tagging,
                     retry_capable: retryable,
                 }) => {
+                    deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
                     if auth_negotiated {
                         // A repeat `A` after the handshake is a protocol
                         // violation — answer `E` and close (the node's
@@ -4777,7 +4987,7 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                         // re-negotiate tagging on a live connection.
                         let (response_tx, response_rx) = oneshot::channel();
                         let _ = response_tx.send(Err(Fatal));
-                        let _ = fifo_tx.send(response_rx).await;
+                        let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
                         break 'connection Ok(());
                     }
                     let accepted = match &context.secret {
@@ -4797,7 +5007,11 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                         b"En\n"
                     };
                     let _ = response_tx.send(Ok(reply.to_vec()));
-                    if fifo_tx.send(response_rx).await.is_err() {
+                    if fifo_tx
+                        .send(ClientReply::uncharged(response_rx))
+                        .await
+                        .is_err()
+                    {
                         break 'connection Ok(());
                     }
                     if !accepted {
@@ -4808,7 +5022,7 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                     if !authenticated {
                         let (response_tx, response_rx) = oneshot::channel();
                         let _ = response_tx.send(Err(Fatal));
-                        let _ = fifo_tx.send(response_rx).await;
+                        let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
                         break 'connection Ok(());
                     }
                     // The writer is gone (it answered `E`, or a write
@@ -4819,23 +5033,52 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                     if fifo_tx.is_closed() {
                         break 'connection Ok(());
                     }
+                    // Admission: reserve the request's worst-case bytes
+                    // (this connection's share first, then the proxy's)
+                    // before it is dispatched, so a client that
+                    // pipelines faster than its replies drain stops
+                    // here instead of growing the proxy. Stops waiting
+                    // for the same reasons the read below does.
+                    let replication = current_ring(&context).map_or(1, |ring| ring.replication);
+                    let cost = request_cost(&request, buffered - buf.len(), replication);
+                    let charge = tokio::select! {
+                        charge = async {
+                            let connection = connection_in_flight_bytes.charge(cost).await?;
+                            let proxy = proxy_in_flight_bytes.charge(cost).await?;
+                            Some(InFlightCharge { _connection: connection, _proxy: proxy })
+                        } => charge,
+                        () = drained(&mut drain) => break 'connection Ok(()),
+                        () = fifo_tx.closed() => break 'connection Ok(()),
+                    };
+                    let Some(charge) = charge else {
+                        break 'connection Ok(());
+                    };
+                    deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
                     // Dispatch inline (awaiting the ordered backend
                     // enqueues) before parsing the next request — see
                     // `dispatch_request` on why order matters here.
-                    let response_rx =
+                    let result =
                         dispatch_request(Arc::clone(&context), request, tag, retry_capable).await;
-                    if fifo_tx.send(response_rx).await.is_err() {
+                    if fifo_tx
+                        .send(ClientReply {
+                            result,
+                            charge: Some(charge),
+                        })
+                        .await
+                        .is_err()
+                    {
                         break 'connection Ok(());
                     }
                 }
                 Err(_) => {
                     let (response_tx, response_rx) = oneshot::channel();
                     let _ = response_tx.send(Err(Fatal));
-                    let _ = fifo_tx.send(response_rx).await;
+                    let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
                     break 'connection Ok(());
                 }
             }
         }
+        shrink_drained_buffer(&mut buf);
 
         // Issue #124: a drain stops the intake — everything already
         // dispatched still flows back through the writer's FIFO below.
@@ -4845,7 +5088,7 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
 
         let mut chunk = [0u8; 4096];
         let read_deadline = if authenticated {
-            tokio::time::Instant::now() + IDLE_TIMEOUT
+            deadline
         } else {
             auth_deadline
         };
@@ -5026,9 +5269,12 @@ async fn run(
         listener,
         context,
         tls_acceptor,
-        permits,
-        per_ip_connections,
-        limits.max_connections_per_ip,
+        ClientAdmission {
+            permits,
+            per_ip_connections,
+            max_connections_per_ip: limits.max_connections_per_ip,
+            in_flight_bytes: InFlightBudget::new(limits.max_in_flight_bytes),
+        },
         args.drain_timeout,
     )
     .await?;
@@ -5205,15 +5451,29 @@ fn reply_busy_and_close(stream: TcpStream, tls_configured: bool) {
     });
 }
 
+/// What `serve` admits a client connection against: the global and
+/// per-IP connection caps and the proxy-wide in-flight byte budget.
+#[derive(Clone)]
+struct ClientAdmission {
+    permits: Arc<Semaphore>,
+    per_ip_connections: PerIpConnections,
+    max_connections_per_ip: usize,
+    in_flight_bytes: InFlightBudget,
+}
+
 async fn serve(
     listener: TcpListener,
     context: Arc<ProxyContext>,
     tls_acceptor: Option<TlsAcceptor>,
-    permits: Arc<Semaphore>,
-    per_ip_connections: PerIpConnections,
-    max_connections_per_ip: usize,
+    admission: ClientAdmission,
     drain_timeout: Duration,
 ) -> io::Result<()> {
+    let ClientAdmission {
+        permits,
+        per_ip_connections,
+        max_connections_per_ip,
+        in_flight_bytes,
+    } = admission;
     let mut connections = tokio::task::JoinSet::new();
     let mut drain = context.drain.clone();
 
@@ -5271,6 +5531,7 @@ async fn serve(
 
         let context = Arc::clone(&context);
         let acceptor = tls_acceptor.clone();
+        let in_flight_bytes = in_flight_bytes.clone();
         connections.spawn(async move {
             let _permit = permit;
             let _per_ip_permit = per_ip_permit;
@@ -5296,7 +5557,7 @@ async fn serve(
                     }
                 }
             };
-            if let Err(error) = handle_client(stream, context).await {
+            if let Err(error) = handle_client(stream, context, in_flight_bytes).await {
                 eprintln!("WARN connection error from {peer}: {error}");
             }
         });
@@ -5740,6 +6001,308 @@ mod tests {
         );
         assert_eq!(limits.max_connections, 100);
         assert_eq!(limits.max_connections_per_ip, 100);
+    }
+
+    #[test]
+    fn max_in_flight_bytes_flag_is_parsed_and_floored() {
+        let parsed = args(&[
+            "--discovery",
+            "d:1",
+            "--max-in-flight-bytes",
+            &(64 * 1024 * 1024).to_string(),
+        ])
+        .ok()
+        .unwrap();
+        assert_eq!(parsed.max_in_flight_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            connection_limits(&parsed).max_in_flight_bytes,
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            connection_limits(&args(&["--discovery", "d:1"]).ok().unwrap()).max_in_flight_bytes,
+            DEFAULT_MAX_IN_FLIGHT_BYTES
+        );
+
+        for bad in [
+            (MIN_MAX_IN_FLIGHT_BYTES - 1).to_string(),
+            "0".to_string(),
+            "lots".to_string(),
+        ] {
+            assert!(
+                matches!(
+                    args(&["--discovery", "d:1", "--max-in-flight-bytes", &bad]),
+                    Err(ArgsError::Invalid(_))
+                ),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn request_cost_charges_the_worst_case_of_request_and_reply() {
+        let key = Bytes::from_static(b"k");
+        let get = Request::Get {
+            namespace: Bytes::new(),
+            key: key.clone(),
+        };
+        // A read is its frame plus one full value.
+        assert_eq!(request_cost(&get, 7, 2), 7 + MAX_REQUEST_SIZE);
+
+        let set = Request::Set {
+            namespace: Bytes::new(),
+            key: key.clone(),
+            value: Bytes::from_static(b"v"),
+            ttl: None,
+        };
+        // A write is pinned once and re-framed once per owner.
+        assert_eq!(request_cost(&set, 1000, 2), 3000);
+        assert_eq!(request_cost(&set, 1000, 0), 2000);
+
+        let keys = |n: usize| vec![key.clone(); n];
+        let small = Request::MultiGet {
+            namespace: Bytes::new(),
+            keys: keys(3),
+        };
+        // A small batch can be answered with one value per key...
+        assert_eq!(
+            request_cost(&small, 20, 1),
+            20 + 3 * MULTI_KEY_OVERHEAD_BYTES + 3 * MAX_REQUEST_SIZE
+        );
+        let large = Request::MultiGet {
+            namespace: Bytes::new(),
+            keys: keys(100_000),
+        };
+        // ...a large one with at most the reply cap, plus per-key
+        // bookkeeping that dwarfs its wire size.
+        assert_eq!(
+            request_cost(&large, 200_000, 1),
+            200_000 + 100_000 * MULTI_KEY_OVERHEAD_BYTES + MAX_MULTI_REPLY_VALUE_BYTES
+        );
+
+        let multi_set = Request::MultiSet {
+            namespace: Bytes::new(),
+            keys: keys(4),
+            values: vec![Bytes::from_static(b"v"); 4],
+            ttl: None,
+        };
+        assert_eq!(
+            request_cost(&multi_set, 100, 2),
+            300 + 4 * MULTI_KEY_OVERHEAD_BYTES
+        );
+    }
+
+    #[test]
+    fn a_drained_oversized_read_buffer_is_released() {
+        let mut buf = BytesMut::with_capacity(MAX_REQUEST_SIZE);
+        buf.extend_from_slice(&[b'x'; 10]);
+        shrink_drained_buffer(&mut buf);
+        assert!(buf.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD);
+        assert_eq!(&buf[..], &[b'x'; 10]);
+
+        // A buffer still holding most of a large frame keeps its room.
+        let mut mid_frame = BytesMut::with_capacity(MAX_REQUEST_SIZE);
+        mid_frame.extend_from_slice(&vec![b'x'; REQUEST_BUFFER_SHRINK_THRESHOLD + 1]);
+        shrink_drained_buffer(&mut mid_frame);
+        assert!(mid_frame.capacity() >= MAX_REQUEST_SIZE);
+
+        // An ordinary small buffer is left alone (no churn).
+        let mut small = BytesMut::with_capacity(4096);
+        shrink_drained_buffer(&mut small);
+        assert_eq!(small.capacity(), 4096);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_client_that_trickles_a_frame_is_closed_at_the_deadline_of_its_last_complete_frame() {
+        // Slowloris: the read deadline used to be re-anchored on every
+        // read, so a client sending one byte of an unfinished frame
+        // every few seconds held the connection, its permits and up to
+        // a 1 MiB partial frame forever. The deadline is now anchored
+        // to the last complete frame (here the handshake).
+        let (mut client, server) = tcp_pair().await;
+        let context = Arc::new(bare_context());
+        let connection = tokio::spawn(handle_client(
+            ServerStream::Plain(server),
+            context,
+            InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+        ));
+
+        // The handshake runs in real time: pausing the clock before an
+        // await on the socket would let the runtime auto-advance to the
+        // 60 s deadline while the reply is in flight. From here on only
+        // writes (which complete at once on loopback) and virtual sleeps
+        // await, so the deadline fires when the virtual clock says so.
+        let mut buf = BytesMut::new();
+        client.write_all(b"A 1\nx").await.unwrap();
+        assert_eq!(read_line(&mut client, &mut buf).await.unwrap(), "On");
+        tokio::time::pause();
+
+        // One byte of a `G` every 10 s for two minutes: twelve reads,
+        // each of which used to buy another full IDLE_TIMEOUT. Each
+        // virtual sleep parks the runtime, which is when the proxy's
+        // read of the previous byte is delivered and runs.
+        let mut closed_at = None;
+        for (step, byte) in b"G 11\nkey-trick".iter().enumerate() {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            // A fired deadline wakes the connection task; let it (and
+            // its writer, which it awaits) run before looking.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            if connection.is_finished() {
+                closed_at = Some((step + 1) * 10);
+                break;
+            }
+            // A write after the proxy closed may still succeed (the
+            // peer's RST has not arrived) or fail; neither matters.
+            let _ = client.write_all(&[*byte]).await;
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        if closed_at.is_none() && connection.is_finished() {
+            closed_at = Some(130);
+        }
+
+        // Closed at IDLE_TIMEOUT after the handshake (an expired timer
+        // is processed at the next park, so up to two steps later), not
+        // kept alive by the trickle: with the deadline re-anchored on
+        // every read the task is still running after two minutes.
+        assert!(
+            matches!(closed_at, Some(60..=80)),
+            "the trickling client must be closed at the handshake's deadline, not at {closed_at:?}"
+        );
+        assert!(read_line(&mut client, &mut buf).await.is_err());
+    }
+
+    /// Fills `node`'s store with `key` and returns a proxy in front of
+    /// it whose node answers each read after `delay`.
+    async fn slow_single_node(
+        key: &[u8],
+        delay: Duration,
+        limits: Option<ConnectionLimits>,
+    ) -> (MockNode, String, Arc<ProxyContext>) {
+        let node = MockNode::start().await;
+        node.store
+            .lock()
+            .unwrap()
+            .insert((Vec::new(), key.to_vec()), b"v".to_vec());
+        *node.get_delay.lock().unwrap() = delay;
+        let roster = vec![("node".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let (proxy, _drain, context) = start_proxy_full(
+            &discovery,
+            None,
+            limits.unwrap_or_else(|| test_limits(8)),
+            None,
+            Arc::new(SharedBackends::new()),
+        )
+        .await;
+        (node, proxy, context)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connection_stops_being_read_once_its_in_flight_bytes_are_spent() {
+        // Six pipelined `G`s against a node that answers each after
+        // 300 ms. Each read is charged a full value, and the test-sized
+        // per-connection budget holds three: the fourth is not even
+        // dispatched until the first reply has been written to the
+        // client. Count-based admission alone would dispatch all six.
+        let (node, proxy, context) = slow_single_node(b"k", Duration::from_millis(300), None).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        for _ in 0..6 {
+            stream.write_all(b"G 1\nk").await.unwrap();
+        }
+        sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            context.requests_total.load(Ordering::Relaxed),
+            3,
+            "only the budget's worth of reads may be dispatched while none is answered"
+        );
+
+        for _ in 0..6 {
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1");
+            read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+            let _ = buf.split_to(1);
+        }
+        assert_eq!(context.requests_total.load(Ordering::Relaxed), 6);
+        drop(node);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_over_the_budget_runs_alone() {
+        // An `m` naming 20 keys is charged more than the test-sized
+        // budget (it could be answered with 16 MiB), so it takes the
+        // whole budget: the `G` pipelined behind it waits until the `M`
+        // reply has been written, then is answered too. Nothing is
+        // refused.
+        let (node, proxy, context) = slow_single_node(b"k", Duration::from_millis(300), None).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        let mut frame = b"m 0 20".to_vec();
+        frame.extend(std::iter::repeat_n(b" 1", 20).flatten());
+        frame.push(b'\n');
+        frame.extend(std::iter::repeat_n(b'k', 20));
+        stream.write_all(&frame).await.unwrap();
+        stream.write_all(b"G 1\nk").await.unwrap();
+        sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            context.requests_total.load(Ordering::Relaxed),
+            1,
+            "the oversized batch must hold the whole budget"
+        );
+
+        let header = read_line(&mut stream, &mut buf).await.unwrap();
+        assert!(header.starts_with("M 20 "), "{header}");
+        read_exact_into(&mut stream, &mut buf, 20).await.unwrap();
+        let _ = buf.split_to(20);
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        let _ = buf.split_to(1);
+        assert_eq!(context.requests_total.load(Ordering::Relaxed), 2);
+        drop(node);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_proxy_wide_budget_caps_in_flight_bytes_across_connections() {
+        // `--max-in-flight-bytes` sized for two reads: two connections
+        // pipelining three `G`s each get two dispatched between them,
+        // whichever connection they come from; all six are answered
+        // once replies drain.
+        let (node, proxy, context) = slow_single_node(
+            b"k",
+            Duration::from_millis(300),
+            Some(ConnectionLimits {
+                max_connections: 8,
+                max_connections_per_ip: 8,
+                max_in_flight_bytes: 2 * MAX_REQUEST_SIZE + 4096,
+            }),
+        )
+        .await;
+        let (mut first, mut first_buf) = connect_and_auth(&proxy).await;
+        let (mut second, mut second_buf) = connect_and_auth(&proxy).await;
+
+        for _ in 0..3 {
+            first.write_all(b"G 1\nk").await.unwrap();
+            second.write_all(b"G 1\nk").await.unwrap();
+        }
+        sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            context.requests_total.load(Ordering::Relaxed),
+            2,
+            "the proxy-wide budget must hold across connections"
+        );
+
+        for (stream, buf) in [(&mut first, &mut first_buf), (&mut second, &mut second_buf)] {
+            for _ in 0..3 {
+                assert_eq!(read_line(stream, buf).await.unwrap(), "V 1");
+                read_exact_into(stream, buf, 1).await.unwrap();
+                let _ = buf.split_to(1);
+            }
+        }
+        assert_eq!(context.requests_total.load(Ordering::Relaxed), 6);
+        drop(node);
     }
 
     #[test]
@@ -6236,6 +6799,10 @@ mod tests {
                                 .map(|key| store.get(&(namespace.clone(), key.clone())).cloned())
                                 .collect()
                         };
+                        let pause = *delay.lock().unwrap();
+                        if !pause.is_zero() {
+                            sleep(pause).await;
+                        }
 
                         // Issue #150: simulates the real node's own
                         // per-key wrong-node check catching a stale
@@ -6731,6 +7298,7 @@ mod tests {
         ConnectionLimits {
             max_connections,
             max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP.min(max_connections),
+            max_in_flight_bytes: DEFAULT_MAX_IN_FLIGHT_BYTES,
         }
     }
 
@@ -6773,9 +7341,12 @@ mod tests {
             listener,
             Arc::clone(&context),
             None,
-            Arc::new(Semaphore::new(limits.max_connections)),
-            Arc::new(std::sync::Mutex::new(HashMap::new())),
-            limits.max_connections_per_ip,
+            ClientAdmission {
+                permits: Arc::new(Semaphore::new(limits.max_connections)),
+                per_ip_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                max_connections_per_ip: limits.max_connections_per_ip,
+                in_flight_bytes: InFlightBudget::new(limits.max_in_flight_bytes),
+            },
             Duration::from_secs(5),
         ));
 
@@ -6880,9 +7451,12 @@ mod tests {
             listener,
             Arc::clone(&context),
             Some(tls_acceptor),
-            Arc::new(Semaphore::new(limits.max_connections)),
-            Arc::new(std::sync::Mutex::new(HashMap::new())),
-            limits.max_connections_per_ip,
+            ClientAdmission {
+                permits: Arc::new(Semaphore::new(limits.max_connections)),
+                per_ip_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                max_connections_per_ip: limits.max_connections_per_ip,
+                in_flight_bytes: InFlightBudget::new(limits.max_in_flight_bytes),
+            },
             Duration::from_secs(5),
         ));
 
@@ -7007,6 +7581,15 @@ mod tests {
     /// tests that drive `SharedBackends`/the request drivers directly
     /// (`enqueue_write`, `finish_get`, ...) rather than through a full
     /// proxy listener.
+    /// A connected client/server socket pair on loopback, for driving
+    /// `handle_client` directly. Mirrors the node's own helper.
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(address), listener.accept());
+        (client.unwrap(), server.unwrap().0)
+    }
+
     fn bare_context() -> ProxyContext {
         let (_ring_tx, ring_rx) = watch::channel(None);
         let (refresh_tx, _refresh_rx) = mpsc::channel(1);
@@ -9633,6 +10216,7 @@ mod tests {
             ConnectionLimits {
                 max_connections: 10,
                 max_connections_per_ip: 1,
+                max_in_flight_bytes: DEFAULT_MAX_IN_FLIGHT_BYTES,
             },
         )
         .await;

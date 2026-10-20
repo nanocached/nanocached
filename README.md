@@ -588,7 +588,16 @@ loud `WARN` if that disagrees with its own configured value.
   Kubernetes caveat above applies with more force here: when every
   application pod reaches the proxy through one egress IP, the per-IP
   cap is the whole fleet's ceiling — raise it
-- Idle connection timeout: 60 seconds
+- In-flight bytes: a client connection may hold 64 MiB of undelivered
+  requests and replies, counted at their worst case (a batched read is
+  charged the largest reply it could get), and the proxy as a whole
+  holds 256 MiB across every connection, configurable with
+  `--max-in-flight-bytes <bytes>` (at least 1 MiB). A client that
+  pipelines past either budget is read more slowly until its replies
+  have been written; nothing is refused
+- Idle connection timeout: 60 seconds, measured from the last complete
+  frame (a frame trickled in a byte at a time does not extend it), the
+  node's own rule
 
 ### nanocached-discovery
 
