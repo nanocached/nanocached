@@ -42,6 +42,20 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- A node decommissioned inside its own join's forwarding window no
+  longer overwrites newer acknowledged writes on the surviving owners.
+  Its drain reached an entrant, which applied each key and relayed it to
+  its join targets — the leaver itself, still inside that window — and
+  the leaver relayed the echo back to the entrant, so the drained value
+  circled between the two until the entrant's heartbeat revoked the
+  forward, overwriting on each pass whatever a client had written to the
+  entrant in between: sets, deletes, counters, compare-and-sets and
+  multi-sets acknowledged in those seconds came back as the older value.
+  A leaving node now relays a handoff (`U`/`u`) to its entrant only when
+  it changed the leaver's own store; an echo of its drain, or a delete
+  of a key it does not hold, stops there (#680, #717). The conformance
+  harness gains a `joinfresh` scenario (a joiner decommissioned 6 s
+  after it is listed) for it.
 - `nanocached-node` answers `En\n` before closing the connection on a
   request it cannot parse (an unknown command, a malformed length or TTL,
   an empty key) or one over the request-size limit. It used to close
