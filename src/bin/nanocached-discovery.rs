@@ -731,6 +731,20 @@ struct RegistryState {
     /// Issue #122 — keyed by proxy name, swept by `sweep_expired` on the
     /// same liveness timeout as heartbeats.
     proxies: Mutex<FxHashMap<String, ProxyInfo>>,
+    /// Moves on every change to what `Q` lists (`bump_proxies`); what
+    /// `proxy_list_cache` is keyed by. Separate from `generation`, which
+    /// tracks node membership: a proxy announce must not rebuild the
+    /// heartbeat ack, nor a join the proxy list.
+    proxy_generation: AtomicU64,
+    /// The `Q` response, rendered once per `proxy_generation` and shared
+    /// (`Arc`) by every connection writing it. `Q` used to build its
+    /// reply per request — every entry cloned into a `Vec`, then the
+    /// whole text — and hold both copies for as long as the write was
+    /// blocked, so a few hundred clients that asked and never read held
+    /// a full registry's reply each (150 KB and the clones, about 0.4 MB
+    /// a connection) and a 256 MiB discovery was killed by 700 of them.
+    /// A blocked writer now holds one reference to one shared buffer.
+    proxy_list_cache: Mutex<Option<ProxyListCache>>,
     /// Issue #124: joins completed (nodes promoted to `Joined`) and
     /// joins abandoned, for the metrics endpoint.
     joins_total: AtomicU64,
@@ -781,6 +795,8 @@ impl Default for RegistryState {
         RegistryState {
             nodes: Mutex::new(FxHashMap::default()),
             proxies: Mutex::new(FxHashMap::default()),
+            proxy_generation: AtomicU64::new(0),
+            proxy_list_cache: Mutex::new(None),
             joins_total: AtomicU64::new(0),
             joins_abandoned_total: AtomicU64::new(0),
             generation: AtomicU64::new(0),
@@ -814,6 +830,76 @@ type Registry = Arc<RegistryState>;
 /// requests the caches serve.
 fn bump_roster(registry: &Registry) {
     registry.generation.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Marks the proxy registry changed, so the next `Q` re-renders
+/// `proxy_list_cache` (see that field). Called on every insert, address
+/// change and removal of a `ProxyInfo` — a re-announce that changes
+/// nothing `Q` lists (only `last_seen`) does not call it.
+fn bump_proxies(registry: &Registry) {
+    registry.proxy_generation.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `RegistryState::proxy_list_cache`'s entry: the rendered `Q` reply and
+/// the `proxy_generation` it was built at.
+struct ProxyListCache {
+    generation: u64,
+    response: Arc<[u8]>,
+}
+
+/// The `Q` reply: the shared buffer for the current `proxy_generation`,
+/// rendered now if the registry changed since the last render. Same
+/// double-check shape as `cached_by_generation`, over the proxy map and
+/// its own generation.
+fn cached_proxy_list(registry: &Registry) -> Arc<[u8]> {
+    let generation = registry.proxy_generation.load(Ordering::Relaxed);
+    {
+        let cached = registry
+            .proxy_list_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(current) = cached.as_ref()
+            && current.generation == generation
+        {
+            return Arc::clone(&current.response);
+        }
+    }
+
+    let (built_generation, response) = {
+        let proxies = registry
+            .proxies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = registry.proxy_generation.load(Ordering::Relaxed);
+        (generation, render_proxy_list(&proxies))
+    };
+    let response: Arc<[u8]> = Arc::from(response.into_bytes());
+
+    let mut cached = registry
+        .proxy_list_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cached
+        .as_ref()
+        .is_none_or(|current| current.generation <= built_generation)
+    {
+        *cached = Some(ProxyListCache {
+            generation: built_generation,
+            response: Arc::clone(&response),
+        });
+    }
+    response
+}
+
+/// `Q`'s wire form: `N <count>\n` then `<name-len> <addr-len>\n<name><addr>\n`
+/// per proxy.
+fn render_proxy_list(proxies: &FxHashMap<String, ProxyInfo>) -> String {
+    let mut response = format!("N {}\n", proxies.len());
+    for (name, info) in proxies {
+        let addr = &info.address;
+        response.push_str(&format!("{} {}\n{name}{addr}\n", name.len(), addr.len()));
+    }
+    response
 }
 
 /// One cached response serialization and the `generation` it was built at
@@ -3923,6 +4009,7 @@ async fn sweep_expired(
                 // registration with nothing behind it), so they're also
                 // reaped here once `waiting_timeout_for` has elapsed.
                 // Issue #122: proxies that stopped re-announcing.
+                let mut proxies_dropped = false;
                 registry
                     .proxies
                     .lock()
@@ -3931,9 +4018,13 @@ async fn sweep_expired(
                         let keep = now.duration_since(info.last_seen) < liveness_timeout;
                         if !keep {
                             println!("INFO proxy dropped after missed announces: {name}");
+                            proxies_dropped = true;
                         }
                         keep
                     });
+                if proxies_dropped {
+                    bump_proxies(&registry);
+                }
 
                 let mut heartbeat_evicted = Vec::new();
                 let mut waiting_evicted = Vec::new();
@@ -4545,6 +4636,7 @@ async fn handle_connection(
                             if constant_time_eq(existing.token.as_bytes(), token.as_bytes()) =>
                         {
                             proxies.remove(&name);
+                            bump_proxies(&registry);
                             Ok(true)
                         }
                         Some(_) => Err(()),
@@ -4589,7 +4681,10 @@ async fn handle_connection(
                         Some(existing)
                             if constant_time_eq(existing.token.as_bytes(), token.as_bytes()) =>
                         {
-                            existing.address = addr;
+                            if existing.address != addr {
+                                existing.address = addr;
+                                bump_proxies(&registry);
+                            }
                             existing.last_seen = Instant::now();
                             true
                         }
@@ -4606,6 +4701,7 @@ async fn handle_connection(
                                     last_seen: Instant::now(),
                                 },
                             );
+                            bump_proxies(&registry);
                             true
                         }
                     }
@@ -4633,21 +4729,11 @@ async fn handle_connection(
                     return Ok(());
                 }
 
-                let entries: Vec<(String, String)> = {
-                    let proxies = registry
-                        .proxies
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    proxies
-                        .iter()
-                        .map(|(name, info)| (name.clone(), info.address.clone()))
-                        .collect()
-                };
-                let mut response = format!("N {}\n", entries.len());
-                for (name, addr) in &entries {
-                    response.push_str(&format!("{} {}\n{name}{addr}\n", name.len(), addr.len()));
-                }
-                write_response(&mut stream, response.as_bytes()).await?;
+                // One shared buffer per registry state, so a blocked
+                // write holds a reference, not a copy — see
+                // `RegistryState::proxy_list_cache`.
+                let response = cached_proxy_list(&registry);
+                write_response(&mut stream, &response).await?;
                 continue;
             }
             Ok(DiscoveryCommand::Join { name, port, token }) => {
@@ -6016,6 +6102,61 @@ mod tests {
             "a membership change must invalidate the cache"
         );
         assert!(third.starts_with(b"N 3 2\n"));
+    }
+
+    #[test]
+    fn cached_proxy_list_reuses_the_buffer_until_the_registry_changes() {
+        // `Q`'s sibling of the `L` cache test: the same buffer is handed
+        // out while the proxy registry is unchanged, its bytes match a
+        // fresh render, and an insert, an address change or a removal
+        // (each followed by `bump_proxies`, as the handlers and the
+        // sweep do) forces a rebuild.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let insert = |name: &str, addr: &str| {
+            registry.proxies.lock().unwrap().insert(
+                name.to_string(),
+                ProxyInfo {
+                    address: addr.to_string(),
+                    token: format!("tk-{name}"),
+                    last_seen: Instant::now(),
+                },
+            );
+            bump_proxies(&registry);
+        };
+        insert("proxy-a", "10.0.0.1:8358");
+        insert("proxy-b", "10.0.0.2:8358");
+
+        let first = cached_proxy_list(&registry);
+        let second = cached_proxy_list(&registry);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged registry must reuse the buffer"
+        );
+        assert_eq!(
+            &*first,
+            render_proxy_list(&registry.proxies.lock().unwrap()).as_bytes()
+        );
+        assert!(first.starts_with(b"N 2\n"));
+        let text = String::from_utf8_lossy(&first).into_owned();
+        assert!(text.contains("7 13\nproxy-a10.0.0.1:8358\n"), "{text}");
+
+        insert("proxy-c", "10.0.0.3:8358");
+        let third = cached_proxy_list(&registry);
+        assert!(
+            !Arc::ptr_eq(&second, &third),
+            "an insert must invalidate the cache"
+        );
+        assert!(third.starts_with(b"N 3\n"));
+
+        registry.proxies.lock().unwrap().remove("proxy-a");
+        bump_proxies(&registry);
+        let fourth = cached_proxy_list(&registry);
+        assert!(
+            !Arc::ptr_eq(&third, &fourth),
+            "a removal must invalidate the cache"
+        );
+        assert!(fourth.starts_with(b"N 2\n"));
+        assert!(!String::from_utf8_lossy(&fourth).contains("proxy-a"));
     }
 
     #[test]
