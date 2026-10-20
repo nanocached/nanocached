@@ -261,4 +261,54 @@ class NanocachedCachingProviderTest {
             assertThrows(CacheException.class, provider::getCacheManager);
         }
     }
+
+    // ── properties are validated and reported by name ───────────────
+
+    @Test
+    void aPropertyThatCannotBeParsedFailsWithACacheExceptionNamingIt() {
+        try (CachingProvider provider = new NanocachedCachingProvider()) {
+            Properties threshold = propertiesFor(node);
+            threshold.setProperty("nanocached.compression-threshold", "abc");
+            CacheException error = assertThrows(CacheException.class,
+                    () -> provider.getCacheManager(URI.create("test:bad-threshold"), null, threshold));
+            assertTrue(error.getMessage().contains("nanocached.compression-threshold"), error.getMessage());
+
+            Properties hedge = propertiesFor(node);
+            hedge.setProperty("nanocached.read-hedge-after-millis", "0");
+            error = assertThrows(CacheException.class,
+                    () -> provider.getCacheManager(URI.create("test:bad-hedge"), null, hedge));
+            assertTrue(error.getMessage().contains("nanocached.read-hedge-after-millis"), error.getMessage());
+        }
+    }
+
+    @Test
+    void aBooleanPropertyAcceptsOnlyTrueOrFalse() {
+        // Boolean.parseBoolean("yes") is false, so nanocached.tls=yes used
+        // to connect in plaintext without a word.
+        try (CachingProvider provider = new NanocachedCachingProvider()) {
+            Properties properties = propertiesFor(node);
+            properties.setProperty("nanocached.tls", "yes");
+            CacheException error = assertThrows(CacheException.class,
+                    () -> provider.getCacheManager(URI.create("test:tls-yes"), null, properties));
+            assertTrue(error.getMessage().contains("nanocached.tls"), error.getMessage());
+        }
+    }
+
+    @Test
+    void aZeroReconnectCooldownDisablesTheCooldown() throws Exception {
+        // The SDK reads Duration.ZERO as "use the default"; the Boot
+        // starter routes a zero through disableReconnectCooldown(), and so
+        // does this provider now.
+        try (CachingProvider provider = new NanocachedCachingProvider()) {
+            Properties properties = propertiesFor(node);
+            properties.setProperty("nanocached.reconnect-cooldown-millis", "0");
+            CacheManager manager = provider.getCacheManager(URI.create("test:zero-cooldown"), null, properties);
+            java.lang.reflect.Field clientField = NanocachedCacheManager.class.getDeclaredField("client");
+            clientField.setAccessible(true);
+            Object client = clientField.get(manager);
+            java.lang.reflect.Field disabled = client.getClass().getDeclaredField("reconnectCooldownDisabled");
+            disabled.setAccessible(true);
+            assertTrue(disabled.getBoolean(client), "a zero cooldown must disable the cooldown");
+        }
+    }
 }

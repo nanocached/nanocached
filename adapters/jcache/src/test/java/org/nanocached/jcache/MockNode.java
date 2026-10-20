@@ -39,6 +39,11 @@ final class MockNode implements AutoCloseable {
     private final Thread acceptLoop;
     final Map<ByteBuffer, Map<ByteBuffer, Entry>> stores = new ConcurrentHashMap<>();
     final AtomicInteger clearCount = new AtomicInteger();
+    /** Plain, unconditional {@code s} (set) frames — a compare-and-set
+     * loop that gave up and overwrote would show up here. */
+    final AtomicInteger setCount = new AtomicInteger();
+    /** Plain, unconditional {@code d} (delete) frames — likewise. */
+    final AtomicInteger deleteCount = new AtomicInteger();
     final AtomicInteger casSetCount = new AtomicInteger();
     final AtomicInteger casDeleteCount = new AtomicInteger();
     final AtomicInteger multiGetCount = new AtomicInteger();
@@ -101,6 +106,7 @@ final class MockNode implements AutoCloseable {
             while (true) {
                 try {
                     Socket socket = server.accept();
+                    accepted.add(socket);
                     Thread serve = new Thread(() -> serve(socket));
                     serve.setDaemon(true);
                     serve.start();
@@ -131,9 +137,17 @@ final class MockNode implements AutoCloseable {
         return store(namespace).get(ByteBuffer.wrap(key));
     }
 
+    /** Every accepted socket, so {@link #close()} can sever live
+     * connections too — a stopped node, not just one that accepts
+     * nothing new. */
+    private final java.util.List<Socket> accepted = new java.util.concurrent.CopyOnWriteArrayList<>();
+
     @Override
     public void close() throws IOException {
         server.close();
+        for (Socket socket : accepted) {
+            socket.close();
+        }
     }
 
     private void serve(Socket socket) {
@@ -172,10 +186,12 @@ final class MockNode implements AutoCloseable {
                     }
                     case "s" -> {
                         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
+                        setCount.incrementAndGet();
                         set(in, out, ns(namespace), parts, tagged, tagSuffix);
                     }
                     case "d" -> {
                         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
+                        deleteCount.incrementAndGet();
                         delete(in, ns(namespace), Integer.parseInt(parts[2]), tagSuffix, deleteReplies);
                     }
                     case "c" -> {

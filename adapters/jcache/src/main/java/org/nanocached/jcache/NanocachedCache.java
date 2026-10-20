@@ -88,7 +88,7 @@ import org.nanocached.NanocachedException;
  * issue #141 shipped compare-and-set: each is a bounded compare-and-set
  * retry loop (read the current value and the digest it was read with,
  * attempt the conditioned write, retry on a concurrent change) — see
- * {@link #MAX_CAS_RETRIES}. The two-value-argument pair compares the
+ * {@link #casRetryDeadlineMillis}. The two-value-argument pair compares the
  * read value against the caller's {@code oldValue} with {@code
  * equals()} (issue #186) — not a digest of {@code oldValue}'s own
  * re-serialized form, which would reject a value that is {@code
@@ -98,22 +98,57 @@ import org.nanocached.NanocachedException;
  */
 final class NanocachedCache<K, V> implements Cache<K, V> {
 
-    /** Bound on the {@code getAnd*}/{@code replace(K,V,V)}/{@code
-     * remove(K,V)} CAS retry loops — see the class doc. Under
-     * pathological sustained contention on one key, {@code getAndPut}/
-     * {@code getAndReplace} fall back to a single unconditional
-     * write/delete so the call still makes progress, documented in the
-     * README as a best-effort fallback; {@code replace(K,V,V)}/{@code
-     * remove(K,V)} do not fall back — their contract is the comparison
-     * itself, so exhausting the retry budget there just reports
-     * failure. */
-    private static final int MAX_CAS_RETRIES = 10;
+    /** Bound on how long the {@code getAnd*}/{@code replace(K,V,V)}/
+     * {@code remove(K,V)} compare-and-set loops keep retrying when the
+     * value keeps changing between the read and the conditioned write —
+     * see the class doc. A loop that is still losing the race when this
+     * much time has passed fails with {@link CacheException} rather than
+     * falling back to an unconditional write or delete: four writers on
+     * one key exhausted a fixed budget of ten attempts in ordinary use,
+     * and the fallback then returned the same "previous value" to more
+     * than one caller and let a {@code getAndRemove} hand out a value it
+     * had not removed. JSR-107 specifies these operations as atomic, so
+     * the only honest outcomes are the atomic one and a loud failure.
+     * Package-private and mutable only so a test can shorten it. */
+    static volatile long casRetryDeadlineMillis = 5_000;
+
+    /** Longest pause between two attempts of a CAS loop; the pause starts
+     * at tens of microseconds and doubles, so a brief collision retries
+     * at once and a sustained one stops spinning. */
+    private static final long CAS_BACKOFF_MAX_NANOS = 2_000_000;
+
+    /** One run of a compare-and-set loop: counts attempts, pauses between
+     * them, and enforces {@link #casRetryDeadlineMillis}. */
+    private static final class CasLoop {
+        private final String operation;
+        private final Object key;
+        private final long started = System.nanoTime();
+        private int attempts;
+
+        CasLoop(String operation, Object key) {
+            this.operation = operation;
+            this.key = key;
+        }
+
+        /** Called after an attempt lost the race: pauses, or gives up. */
+        void lostTheRace() {
+            attempts++;
+            long elapsedNanos = System.nanoTime() - started;
+            if (elapsedNanos > TimeUnit.MILLISECONDS.toNanos(casRetryDeadlineMillis)) {
+                throw new CacheException("nanocached-jcache: " + operation + " on key " + key + " gave up after "
+                        + attempts + " attempts over " + TimeUnit.NANOSECONDS.toMillis(elapsedNanos)
+                        + " ms: the stored value kept changing between the read and the compare-and-set");
+            }
+            long pause = Math.min(CAS_BACKOFF_MAX_NANOS, 20_000L << Math.min(attempts, 20));
+            java.util.concurrent.locks.LockSupport.parkNanos(pause);
+        }
+    }
 
     /** Bound on {@link #getAll}/{@link #putAll} retrying the remainder of
      * a batch that is still wrong-node after the SDK's own {@code
      * getManyBytes}/{@code setManyBytes} built-in one bounded
      * refresh-and-retry (issue #415) — the same role {@link
-     * #MAX_CAS_RETRIES} plays for the CAS loops above: a ring that keeps
+     * #casRetryDeadlineMillis} plays for the CAS loops above: a ring that keeps
      * moving under one batch for this long is pathological, so this stays
      * small and a batch still unresolved after it propagates instead of
      * retrying forever. */
@@ -165,7 +200,12 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
     private final NanocachedCacheManager manager;
     private final String name;
-    private final NanocachedClient.Namespace namespace;
+    private final Wire namespace;
+    /** Resolves cached values' classes — the loader the manager was
+     * created with (a {@code CachingProvider.getCacheManager(uri,
+     * classLoader, props)} argument), as JSR-107 asks, or, when none was
+     * given, the reading thread's context class loader. */
+    private final ClassLoader classLoader;
     private final CompleteConfiguration<K, V> configuration;
     private final ExpiryPolicy expiryPolicy;
     private final CopyOnWriteArrayList<RegisteredListener<K, V>> listeners = new CopyOnWriteArrayList<>();
@@ -180,7 +220,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             CompleteConfiguration<K, V> configuration) {
         this.manager = manager;
         this.name = name;
-        this.namespace = namespace;
+        this.namespace = new Wire(namespace);
+        this.classLoader = manager.getClassLoader();
         this.configuration = configuration;
         this.expiryPolicy = configuration.getExpiryPolicyFactory().create();
         for (CacheEntryListenerConfiguration<K, V> listenerConfig :
@@ -209,7 +250,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         }
         statistics.recordHit();
         refreshAccessExpiryIfConfigured(keyBytes, raw.get());
-        return ValueCodec.deserialize(raw.get());
+        return decode(raw.get());
     }
 
     /**
@@ -265,7 +306,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                     namespace.delete(wireKeys[i]);
                 }
             }
-            result.put(ordered.get(i), ValueCodec.deserialize(value));
+            result.put(ordered.get(i), decode(value));
         }
 
         if (refreshesToPositiveTtl && !refreshKeys.isEmpty()) {
@@ -325,7 +366,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                     result[positions[i]] = partial.partialValues[i];
                 }
                 if (attempt >= MAX_BULK_WRONG_NODE_RETRIES) {
-                    throw partial;
+                    throw Wire.failure(partial);
                 }
                 int[] unresolved = partial.unresolvedIndices;
                 int[] nextPositions = new int[unresolved.length];
@@ -415,14 +456,14 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             if (existing.isPresent()) {
                 namespace.delete(keyBytes);
                 statistics.recordRemove();
-                fireRemoved(key, ValueCodec.deserialize(existing.get().value()));
+                fireRemoved(key, decode(existing.get().value()));
             }
             return;
         }
         namespace.set(keyBytes, valueBytes, ttl.getAsLong());
         statistics.recordPut();
         if (existing.isPresent()) {
-            fireUpdated(key, value, ValueCodec.deserialize(existing.get().value()));
+            fireUpdated(key, value, decode(existing.get().value()));
         } else {
             fireCreated(key, value);
         }
@@ -436,7 +477,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         byte[] keyBytes = KeyCodec.toKeyBytes(key);
         byte[] valueBytes = ValueCodec.serialize(value);
 
-        for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+        CasLoop loop = new CasLoop("getAndPut", key);
+        while (true) {
             Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
             if (existing.isEmpty()) {
                 OptionalLong ttl = wireTtlSeconds(expiryPolicy.getExpiryForCreation());
@@ -448,9 +490,10 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                     fireCreated(key, value);
                     return null;
                 }
+                loop.lostTheRace();
                 continue;
             }
-            V oldValue = ValueCodec.deserialize(existing.get().value());
+            V oldValue = decode(existing.get().value());
             OptionalLong ttl = wireTtlSeconds(expiryPolicy.getExpiryForUpdate());
             if (ttl.isEmpty()) {
                 if (namespace.deleteIfMatches(keyBytes, existing.get().token())) {
@@ -458,6 +501,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                     fireRemoved(key, oldValue);
                     return oldValue;
                 }
+                loop.lostTheRace();
                 continue;
             }
             if (namespace.replace(keyBytes, existing.get().token(), valueBytes, ttl.getAsLong())) {
@@ -465,39 +509,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 fireUpdated(key, value, oldValue);
                 return oldValue;
             }
+            loop.lostTheRace();
         }
-        return fallbackOverwrite(keyBytes, valueBytes, key, value);
-    }
-
-    /** Pathological, sustained contention on one key: give up
-     * compare-and-set and just overwrite unconditionally, so the call
-     * still makes progress. The "previous value" this returns may be
-     * stale by the time the overwrite lands — documented in the README. */
-    private V fallbackOverwrite(byte[] keyBytes, byte[] valueBytes, K key, V value) {
-        Optional<NanocachedClient.CasEntry> fallback = namespace.getWithToken(keyBytes);
-        Duration expiry =
-                fallback.isPresent() ? expiryPolicy.getExpiryForUpdate() : expiryPolicy.getExpiryForCreation();
-        OptionalLong ttl = wireTtlSeconds(expiry);
-        if (ttl.isEmpty()) {
-            if (fallback.isPresent()) {
-                namespace.delete(keyBytes);
-                // Issue #331: mirrors getAndReplace's inline fallback branch
-                // below — deleting an existing entry here must also record
-                // the removal and fire Removed, not just put().
-                statistics.recordRemove();
-                fireRemoved(key, ValueCodec.deserialize(fallback.get().value()));
-            }
-            return fallback.map(entry -> (V) ValueCodec.deserialize(entry.value())).orElse(null);
-        }
-        namespace.set(keyBytes, valueBytes, ttl.getAsLong());
-        statistics.recordPut();
-        V oldValue = fallback.map(entry -> (V) ValueCodec.deserialize(entry.value())).orElse(null);
-        if (oldValue != null) {
-            fireUpdated(key, value, oldValue);
-        } else {
-            fireCreated(key, value);
-        }
-        return oldValue;
     }
 
     @Override
@@ -529,7 +542,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         // transient field, ...), a silent no-op. Instead this reads the
         // current value and the digest it was read with — the same
         // bounded compare-and-set retry loop getAndPut/getAndReplace
-        // use, see MAX_CAS_RETRIES — compares with equals(), and only
+        // use, see casRetryDeadlineMillis — compares with equals(), and only
         // then CASes on the digest that read actually observed.
         requireNotClosed();
         Objects.requireNonNull(key, "key");
@@ -539,12 +552,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         byte[] newValueBytes = ValueCodec.serialize(newValue);
         OptionalLong ttl = wireTtlSeconds(expiryPolicy.getExpiryForUpdate());
 
-        for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+        CasLoop loop = new CasLoop("replace(key, oldValue, newValue)", key);
+        while (true) {
             Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
             if (existing.isEmpty()) {
                 return false;
             }
-            V currentValue = ValueCodec.deserialize(existing.get().value());
+            V currentValue = decode(existing.get().value());
             if (!oldValue.equals(currentValue)) {
                 return false;
             }
@@ -554,6 +568,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                     fireRemoved(key, currentValue);
                     return true;
                 }
+                loop.lostTheRace();
                 continue;
             }
             if (namespace.replace(keyBytes, existing.get().token(), newValueBytes, ttl.getAsLong())) {
@@ -561,14 +576,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 fireUpdated(key, newValue, currentValue);
                 return true;
             }
+            loop.lostTheRace();
         }
-        // Sustained contention exhausted the retry budget. Unlike
-        // getAndPut/getAndReplace's fallbackOverwrite, this op's whole
-        // contract *is* the comparison — an unconditional overwrite
-        // here would silently violate it, so give up and report failure
-        // instead (JSR-107 doesn't require replace(K,V,V) to eventually
-        // succeed under contention).
-        return false;
     }
 
     @Override
@@ -589,7 +598,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             boolean removed = namespace.delete(keyBytes);
             if (removed) {
                 statistics.recordRemove();
-                existing.ifPresent(bytes -> fireRemoved(key, ValueCodec.deserialize(bytes)));
+                existing.ifPresent(bytes -> fireRemoved(key, decode(bytes)));
             }
             return removed;
         }
@@ -612,12 +621,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         byte[] keyBytes = KeyCodec.toKeyBytes(key);
         byte[] valueBytes = ValueCodec.serialize(value);
 
-        for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+        CasLoop loop = new CasLoop("getAndReplace", key);
+        while (true) {
             Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
             if (existing.isEmpty()) {
                 return null;
             }
-            V oldValue = ValueCodec.deserialize(existing.get().value());
+            V oldValue = decode(existing.get().value());
             OptionalLong ttl = wireTtlSeconds(expiryPolicy.getExpiryForUpdate());
             if (ttl.isEmpty()) {
                 if (namespace.deleteIfMatches(keyBytes, existing.get().token())) {
@@ -625,6 +635,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                     fireRemoved(key, oldValue);
                     return oldValue;
                 }
+                loop.lostTheRace();
                 continue;
             }
             if (namespace.replace(keyBytes, existing.get().token(), valueBytes, ttl.getAsLong())) {
@@ -632,33 +643,10 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 fireUpdated(key, value, oldValue);
                 return oldValue;
             }
+            loop.lostTheRace();
         }
-        Optional<NanocachedClient.CasEntry> fallback = namespace.getWithToken(keyBytes);
-        if (fallback.isEmpty()) {
-            return null;
-        }
-        V oldValue = ValueCodec.deserialize(fallback.get().value());
-        OptionalLong ttl = wireTtlSeconds(expiryPolicy.getExpiryForUpdate());
-        if (ttl.isEmpty()) {
-            namespace.delete(keyBytes);
-            statistics.recordRemove();
-            fireRemoved(key, oldValue);
-        } else {
-            namespace.set(keyBytes, valueBytes, ttl.getAsLong());
-            statistics.recordPut();
-            fireUpdated(key, value, oldValue);
-        }
-        return oldValue;
     }
 
-    /**
-     * The batched form of {@link #put} (issue #160): one bulk read tells which entries already exist
-     * (each entry's TTL is {@code expiryForUpdate} vs. {@code expiryForCreation} accordingly, and the
-     * old value feeds the update listeners), then the writes are grouped by resolved TTL — the SDK's
-     * {@code setManyBytes} takes one TTL per call — and issued as one bulk set per distinct TTL. An
-     * entry whose policy resolves to {@link Duration#ZERO} is never stored; if it already existed it
-     * is deleted instead, exactly as {@link #put} does.
-     */
     @Override
     public void putAll(Map<? extends K, ? extends V> map) {
         requireNotClosed();
@@ -698,7 +686,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 if (present) {
                     namespace.delete(wireKeys[i]);
                     statistics.recordRemove();
-                    fireRemoved(keys.get(i), ValueCodec.deserialize(existing[i]));
+                    fireRemoved(keys.get(i), decode(existing[i]));
                 }
                 continue;
             }
@@ -717,7 +705,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             for (int i : positions) {
                 statistics.recordPut();
                 if (existing[i] != null) {
-                    fireUpdated(keys.get(i), values.get(i), ValueCodec.deserialize(existing[i]));
+                    fireUpdated(keys.get(i), values.get(i), decode(existing[i]));
                 } else {
                     fireCreated(keys.get(i), values.get(i));
                 }
@@ -763,7 +751,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 return;
             } catch (NanocachedException.WrongNode error) {
                 if (attempt >= MAX_BULK_WRONG_NODE_RETRIES) {
-                    throw error;
+                    throw Wire.failure(error);
                 }
             } catch (NanocachedException.PartialConnectionFailedSetRaw partial) {
                 boolean[] isSucceeded = new boolean[keys.length];
@@ -815,7 +803,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         boolean deleted = namespace.delete(keyBytes);
         if (deleted) {
             statistics.recordRemove();
-            raw.ifPresent(bytes -> fireRemoved(key, ValueCodec.deserialize(bytes)));
+            raw.ifPresent(bytes -> fireRemoved(key, decode(bytes)));
         }
         return deleted;
     }
@@ -830,12 +818,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         Objects.requireNonNull(oldValue, "oldValue");
         byte[] keyBytes = KeyCodec.toKeyBytes(key);
 
-        for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+        CasLoop loop = new CasLoop("remove(key, oldValue)", key);
+        while (true) {
             Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
             if (existing.isEmpty()) {
                 return false;
             }
-            V currentValue = ValueCodec.deserialize(existing.get().value());
+            V currentValue = decode(existing.get().value());
             if (!oldValue.equals(currentValue)) {
                 return false;
             }
@@ -844,12 +833,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 fireRemoved(key, currentValue);
                 return true;
             }
+            loop.lostTheRace();
         }
-        // Sustained contention exhausted the retry budget — see
-        // replace(K, V, V)'s comment: an unconditional delete here
-        // would silently violate the comparison this op promises, so
-        // give up and report failure instead.
-        return false;
     }
 
     @Override
@@ -858,27 +843,20 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         Objects.requireNonNull(key, "key");
         byte[] keyBytes = KeyCodec.toKeyBytes(key);
 
-        for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+        CasLoop loop = new CasLoop("getAndRemove", key);
+        while (true) {
             Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
             if (existing.isEmpty()) {
                 return null;
             }
-            V oldValue = ValueCodec.deserialize(existing.get().value());
+            V oldValue = decode(existing.get().value());
             if (namespace.deleteIfMatches(keyBytes, existing.get().token())) {
                 statistics.recordRemove();
                 fireRemoved(key, oldValue);
                 return oldValue;
             }
+            loop.lostTheRace();
         }
-        Optional<NanocachedClient.CasEntry> fallback = namespace.getWithToken(keyBytes);
-        if (fallback.isEmpty()) {
-            return null;
-        }
-        namespace.delete(keyBytes);
-        V oldValue = ValueCodec.deserialize(fallback.get().value());
-        statistics.recordRemove();
-        fireRemoved(key, oldValue);
-        return oldValue;
     }
 
     /**
@@ -1175,8 +1153,140 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         }
     }
 
+    /** {@link ValueCodec#deserialize(byte[], ClassLoader)} with this
+     * cache's class loader. */
+    private V decode(byte[] bytes) {
+        return ValueCodec.deserialize(bytes, classLoader);
+    }
+
     private record RegisteredListener<K, V>(
             CacheEntryListenerConfiguration<K, V> config,
             CacheEntryListener<? super K, ? super V> listener,
             CacheEntryEventFilter<? super K, ? super V> filter) {}
+
+    /**
+     * The SDK namespace behind this cache, with every failure reported
+     * the way {@link javax.cache.Cache}'s contract asks: as a {@link
+     * CacheException} that carries the SDK's own exception as its cause.
+     * Without this a stopped node surfaced as the SDK's {@code
+     * ConnectionFailed} and an over-size value as {@code
+     * IllegalArgumentException}, neither of which a JCache caller can
+     * be expected to catch. The two bulk calls let the SDK's partial
+     * and wrong-node outcomes through unwrapped: {@link
+     * #getManyBytesResolvingWrongNode} and {@link
+     * #setManyBytesResolvingWrongNode} act on them and wrap what they
+     * cannot resolve themselves.
+     */
+    private static final class Wire {
+        private final NanocachedClient.Namespace namespace;
+
+        Wire(NanocachedClient.Namespace namespace) {
+            this.namespace = namespace;
+        }
+
+        static CacheException failure(RuntimeException cause) {
+            return new CacheException("nanocached-jcache: " + cause.getMessage(), cause);
+        }
+
+        private static RuntimeException wrapped(RuntimeException error) {
+            boolean backend = error instanceof NanocachedException || error instanceof IllegalArgumentException;
+            return backend ? failure(error) : error;
+        }
+
+        private static RuntimeException wrappedUnlessBulkOutcome(RuntimeException error) {
+            boolean bulkOutcome = error instanceof NanocachedException.PartialWrongNodeRaw
+                    || error instanceof NanocachedException.PartialConnectionFailedRaw
+                    || error instanceof NanocachedException.PartialConnectionFailedSetRaw
+                    || error instanceof NanocachedException.WrongNode;
+            return bulkOutcome ? error : wrapped(error);
+        }
+
+        Optional<byte[]> getBytes(byte[] key) {
+            try {
+                return namespace.getBytes(key);
+            } catch (RuntimeException error) {
+                throw wrapped(error);
+            }
+        }
+
+        Optional<NanocachedClient.CasEntry> getWithToken(byte[] key) {
+            try {
+                return namespace.getWithToken(key);
+            } catch (RuntimeException error) {
+                throw wrapped(error);
+            }
+        }
+
+        void set(byte[] key, byte[] value, long ttlSeconds) {
+            try {
+                namespace.set(key, value, ttlSeconds);
+            } catch (RuntimeException error) {
+                throw wrapped(error);
+            }
+        }
+
+        boolean delete(byte[] key) {
+            try {
+                return namespace.delete(key);
+            } catch (RuntimeException error) {
+                throw wrapped(error);
+            }
+        }
+
+        boolean deleteIfMatches(byte[] key, String token) {
+            try {
+                return namespace.deleteIfMatches(key, token);
+            } catch (RuntimeException error) {
+                throw wrapped(error);
+            }
+        }
+
+        boolean putIfAbsent(byte[] key, byte[] value, long ttlSeconds) {
+            try {
+                return namespace.putIfAbsent(key, value, ttlSeconds);
+            } catch (RuntimeException error) {
+                throw wrapped(error);
+            }
+        }
+
+        boolean replaceIfPresent(byte[] key, byte[] value, long ttlSeconds) {
+            try {
+                return namespace.replaceIfPresent(key, value, ttlSeconds);
+            } catch (RuntimeException error) {
+                throw wrapped(error);
+            }
+        }
+
+        boolean replace(byte[] key, String token, byte[] value, long ttlSeconds) {
+            try {
+                return namespace.replace(key, token, value, ttlSeconds);
+            } catch (RuntimeException error) {
+                throw wrapped(error);
+            }
+        }
+
+        void clear() {
+            try {
+                namespace.clear();
+            } catch (RuntimeException error) {
+                throw wrapped(error);
+            }
+        }
+
+        byte[][] getManyBytes(byte[][] keys) {
+            try {
+                return namespace.getManyBytes(keys);
+            } catch (RuntimeException error) {
+                throw wrappedUnlessBulkOutcome(error);
+            }
+        }
+
+        void setManyBytes(byte[][] keys, byte[][] values, long ttlSeconds) {
+            try {
+                namespace.setManyBytes(keys, values, ttlSeconds);
+            } catch (RuntimeException error) {
+                throw wrappedUnlessBulkOutcome(error);
+            }
+        }
+    }
 }
