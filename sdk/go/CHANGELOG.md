@@ -12,6 +12,12 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A node at its connection limit, which answers `B` and closes, is
+  reported as busy (`ErrConnectionLost`, naming the limit) after one
+  dial. The two-byte reply used to end the three-byte identity read
+  short, which matched the legacy-server signal, so the dial was retried
+  with the two lesser `A` forms and came out as "handshake read failed".
+
 - `SetMany`/`SetManyBytes` in cluster mode return `ErrConnectionLost`
   (wrapped, naming how many keys; the returned map still names every
   key whose primary acknowledged) when a key's primary could not be
