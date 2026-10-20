@@ -379,6 +379,19 @@ here.</p>
   unconditional forwards of one key can interleave at the promoted
   owner, which is the lagging-forward item above. Accepted: both are the
   same exposure the join and decommission windows carry.</li>
+  <li>Concurrent writes to one key have no order across its owners: each
+  owner keeps the write that reached it last, so two callers (threads,
+  tasks, or clients) racing a <code>set</code> or a <code>set</code>
+  against a <code>delete</code> on the same key can leave the owners
+  holding different values, or one holding the key and the other not,
+  with every leg acknowledged and nothing in <code>stats()</code> —
+  until the next write or TTL expiry. Measured at up to a third of the
+  raced keys with 8 concurrent writers per key from one client. Accepted
+  2026-10-20: ordering it would need a version on every write in the
+  server and every SDK, and a per-key lock inside one SDK would not
+  cover two clients. A proxy serialises the writes of one key, so routing
+  through <code>nanocached-proxy</code> removes it; counters and
+  compare-and-set are not affected, they run on the primary alone.</li>
   <li>Re-replication handoff carries no version: when two survivors hold
   different copies, the first to reach the fresh node is kept, newer or
   not. A version would have to ride on every entry and every SDK write
