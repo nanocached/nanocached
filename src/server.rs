@@ -16,7 +16,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -4147,6 +4147,7 @@ async fn register_with_discovery(
                                     &published,
                                     replication,
                                 );
+                                node_context.roster_refresh.note_heartbeat();
                                 let change = adopt_membership(
                                     &node_context.known_ring,
                                     &node_context.active_migration,
@@ -4341,15 +4342,38 @@ async fn read_line_capped<S: AsyncBufReadExt + Unpin>(
 async fn read_heartbeat_ack<S: AsyncBufReadExt + Unpin>(
     stream: &mut S,
 ) -> io::Result<Option<(Vec<String>, usize)>> {
-    let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed heartbeat ack");
+    read_roster(stream, b'A', b"A\n", "malformed heartbeat ack").await
+}
+
+/// Reads the `L` response: what clients route by, in the heartbeat ack's
+/// layout under tag `N` (`build_roster_response` in
+/// `nanocached-discovery`). `B\n` — discovery in its startup grace, or
+/// its replication factor disputed — is `None`, as a bare `A\n` is for
+/// the ack.
+async fn read_published_roster<S: AsyncBufReadExt + Unpin>(
+    stream: &mut S,
+) -> io::Result<Option<(Vec<String>, usize)>> {
+    read_roster(stream, b'N', b"B\n", "malformed L response").await
+}
+
+/// The roster layout the heartbeat ack and `L` share: `<tag> <count>
+/// <replication>\n` then `count` `<name-len> <addr-len>\n<name><addr>\n`
+/// entries; `withheld` alone (`A\n`, `B\n`) is `None`.
+async fn read_roster<S: AsyncBufReadExt + Unpin>(
+    stream: &mut S,
+    tag: u8,
+    withheld: &[u8],
+    what: &'static str,
+) -> io::Result<Option<(Vec<String>, usize)>> {
+    let malformed = || io::Error::new(io::ErrorKind::InvalidData, what);
 
     let mut line = Vec::new();
     read_line_capped(stream, MAX_ROSTER_LINE_LEN, &mut line).await?;
-    if line == b"A\n" {
+    if line == withheld {
         return Ok(None);
     }
     let header = line
-        .strip_prefix(b"A ")
+        .strip_prefix(&[tag, b' '][..])
         .and_then(|rest| rest.strip_suffix(b"\n"))
         .and_then(|rest| std::str::from_utf8(rest).ok())
         .ok_or_else(malformed)?;
@@ -9163,6 +9187,13 @@ const ROSTER_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
 struct RosterRefresh {
     in_flight: AsyncMutex<()>,
     last: Mutex<Option<Instant>>,
+    /// Bumped by the heartbeat loop each time it notes a roster
+    /// (`note_heartbeat`): a fetch that started before such a note holds
+    /// an older view than the heartbeat delivered meanwhile, and must not
+    /// put it back — `latest_published` widens what this node serves, so
+    /// an older roster could re-refuse a key the newer one grants until
+    /// the next heartbeat.
+    heartbeats: AtomicU64,
 }
 
 impl RosterRefresh {
@@ -9172,11 +9203,21 @@ impl RosterRefresh {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some_and(|at| at.elapsed() < ROSTER_REFRESH_COOLDOWN)
     }
+
+    /// The heartbeat loop just noted a roster — see `heartbeats`.
+    fn note_heartbeat(&self) {
+        self.heartbeats.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// Brings `NodeContext::latest_published` up to what discovery publishes
-/// now, by asking it (`T`), when the last ask is older than
-/// `ROSTER_REFRESH_COOLDOWN`. The heartbeat loop learns a membership
+/// now, by asking it for the list clients route by (`L`), when the last
+/// ask is older than `ROSTER_REFRESH_COOLDOWN`. `L`, not `T`: the node
+/// roster lists every registered node, a `Waiting` or `Joining` one
+/// included, and a ring with such a node in it grants this node fewer
+/// keys than the published list does — the refresh would then refuse,
+/// for the rest of a heartbeat, exactly the keys it exists to serve.
+/// The heartbeat loop learns a membership
 /// change only on its next tick, up to `HEARTBEAT_INTERVAL` after
 /// discovery published it — and withholds adopting it for as long as a
 /// join is pending here — while a client that fetched `L` in between
@@ -9195,19 +9236,35 @@ async fn refresh_published_roster(node_context: &NodeContext) {
     if refresh.cooling_down() {
         return;
     }
+    let heartbeats_before = refresh.heartbeats.load(Ordering::SeqCst);
     let fetched = timeout(
         ROSTER_REFRESH_TIMEOUT,
-        fetch_roster_once(node_context, &node_context.discovery_addr),
+        fetch_published_roster_once(node_context, &node_context.discovery_addr),
     )
     .await;
     *refresh
         .last
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
-    if let Ok(Ok((members, replication))) = fetched {
-        let names: Vec<String> = members.into_iter().map(|(name, _, _)| name).collect();
+    if let Ok(Ok(Some((names, replication)))) = fetched
+        // A heartbeat ack that landed while this fetch ran is the newer
+        // view; what the fetch returned must not replace it.
+        && refresh.heartbeats.load(Ordering::SeqCst) == heartbeats_before
+    {
         note_published_roster(&node_context.latest_published, &names, replication);
     }
+}
+
+/// One `L` to discovery at `addr`: the roster clients route by — names
+/// and replication — or `None` while discovery withholds it (`B`).
+async fn fetch_published_roster_once(
+    node_context: &NodeContext,
+    addr: &str,
+) -> io::Result<Option<(Vec<String>, usize)>> {
+    let stream = connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
+    let mut stream = tokio::io::BufReader::new(stream);
+    stream.write_all(b"L\n").await?;
+    read_published_roster(&mut stream).await
 }
 
 /// `wrong_node` for a request that will be answered `W` if it holds:
@@ -12477,11 +12534,25 @@ mod tests {
         );
     }
 
-    /// A discovery server that answers every `T` with `roster` (names,
+    /// A discovery server whose `L` and `T` both list `roster` (names,
     /// addresses, tokens) at replication `r`, counting the asks.
     async fn fake_discovery_serving(
         roster: Vec<(&'static str, &'static str, &'static str)>,
         replication: usize,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let registered = roster.clone();
+        fake_discovery_serving_views(roster, registered, replication, Duration::ZERO).await
+    }
+
+    /// A discovery server that answers `L` with `published` (what clients
+    /// route by: the `Joined` nodes) and `T` with `registered` (every
+    /// registered node, tokens included), each after `delay`, counting
+    /// the asks.
+    async fn fake_discovery_serving_views(
+        published: Vec<(&'static str, &'static str, &'static str)>,
+        registered: Vec<(&'static str, &'static str, &'static str)>,
+        replication: usize,
+        delay: Duration,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -12502,28 +12573,43 @@ mod tests {
                     continue;
                 }
                 let header = String::from_utf8_lossy(&header).into_owned();
-                let lengths: Vec<usize> = header
-                    .trim_end()
-                    .trim_start_matches("T ")
-                    .split(' ')
-                    .map(|part| part.parse().unwrap())
-                    .collect();
-                let mut body = vec![0_u8; lengths[0] + lengths[1]];
-                if connection.read_exact(&mut body).await.is_err() {
-                    continue;
-                }
-                let mut response = format!("N {} {replication}\n", roster.len()).into_bytes();
-                for (name, address, token) in &roster {
-                    response.extend_from_slice(
-                        format!(
-                            "{} {} {}\n{name}{address}{token}\n",
-                            name.len(),
-                            address.len(),
-                            token.len()
-                        )
-                        .as_bytes(),
-                    );
-                }
+                let response = if header == "L\n" {
+                    let mut response =
+                        format!("N {} {replication}\n", published.len()).into_bytes();
+                    for (name, address, _) in &published {
+                        response.extend_from_slice(
+                            format!("{} {}\n{name}{address}\n", name.len(), address.len())
+                                .as_bytes(),
+                        );
+                    }
+                    response
+                } else {
+                    let lengths: Vec<usize> = header
+                        .trim_end()
+                        .trim_start_matches("T ")
+                        .split(' ')
+                        .map(|part| part.parse().unwrap())
+                        .collect();
+                    let mut body = vec![0_u8; lengths[0] + lengths[1]];
+                    if connection.read_exact(&mut body).await.is_err() {
+                        continue;
+                    }
+                    let mut response =
+                        format!("N {} {replication}\n", registered.len()).into_bytes();
+                    for (name, address, token) in &registered {
+                        response.extend_from_slice(
+                            format!(
+                                "{} {} {}\n{name}{address}{token}\n",
+                                name.len(),
+                                address.len(),
+                                token.len()
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    response
+                };
+                tokio::time::sleep(delay).await;
                 let _ = connection.get_mut().write_all(&response).await;
             }
         });
@@ -12627,6 +12713,101 @@ mod tests {
         let (reply, asks) = write_as_c_with_published(roster, &theirs).await;
         assert_eq!(reply, b"W\n");
         assert_eq!(asks, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_roster_refresh_takes_the_list_clients_route_by_not_every_registered_node() {
+        // "a" left and "d" is registered but still waiting to join: `L`
+        // publishes {b, c}, `T` lists {b, c, d}. The refresh used to take
+        // `T`, and under a ring with d in it this node owns fewer keys
+        // than under the published list — the refresh then refused, for
+        // the rest of a heartbeat, keys the published list grants it.
+        let published = vec![("b", "127.0.0.1:1", "tk-b"), ("c", "127.0.0.1:2", "tk-c")];
+        let registered = vec![
+            ("b", "127.0.0.1:1", "tk-b"),
+            ("c", "127.0.0.1:2", "tk-c"),
+            ("d", "127.0.0.1:3", "tk-d"),
+        ];
+        let (discovery_addr, asks, serving) =
+            fake_discovery_serving_views(published, registered, 2, Duration::ZERO).await;
+        let mut node_context = test_node_context(
+            "c",
+            "tk-c",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.discovery_addr = discovery_addr;
+
+        refresh_published_roster(&node_context).await;
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
+        let latest = node_context.latest_published.lock().unwrap().clone();
+        let latest = latest.expect("the refresh noted a roster");
+        assert_eq!(latest.ring.nodes(), ["b", "c"]);
+        assert_eq!(latest.replication, 2);
+        serving.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_heartbeat_noted_while_the_refresh_ran_is_not_replaced_by_the_fetch() {
+        // The fetch started with discovery publishing {b, c}; before it
+        // answered, the heartbeat loop noted {c} (b left too). What the
+        // fetch returns is the older view and must not put b back: with
+        // it, c refuses the keys b's leaving gave it until the next
+        // heartbeat.
+        let published = vec![("b", "127.0.0.1:1", "tk-b"), ("c", "127.0.0.1:2", "tk-c")];
+        let (discovery_addr, asks, serving) = fake_discovery_serving_views(
+            published.clone(),
+            published,
+            2,
+            Duration::from_millis(300),
+        )
+        .await;
+        let mut node_context = test_node_context(
+            "c",
+            "tk-c",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.discovery_addr = discovery_addr;
+        let node_context = Arc::new(node_context);
+
+        let refreshing = {
+            let node_context = Arc::clone(&node_context);
+            tokio::spawn(async move { refresh_published_roster(&node_context).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The heartbeat loop, meanwhile.
+        note_published_roster(&node_context.latest_published, &["c".to_string()], 1);
+        node_context.roster_refresh.note_heartbeat();
+        tokio::time::timeout(Duration::from_secs(5), refreshing)
+            .await
+            .expect("the refresh completes")
+            .unwrap();
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
+        let latest = node_context
+            .latest_published
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(
+            latest.ring.nodes(),
+            ["c"],
+            "the heartbeat's newer roster stays"
+        );
+
+        // With no heartbeat in between, the next fetch (after the
+        // cooldown) is applied.
+        *node_context.roster_refresh.last.lock().unwrap() = None;
+        refresh_published_roster(&node_context).await;
+        let latest = node_context
+            .latest_published
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(latest.ring.nodes(), ["b", "c"]);
+        serving.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
