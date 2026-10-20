@@ -119,9 +119,12 @@ public class NanocachedDistributedCache : IDistributedCache
         if (read is not { } hit) return null;
 
         Envelope envelope = Envelope.Parse(hit.Value);
-        if (envelope.SlidingSeconds == 0) return envelope.Payload; // fixed TTL (or none) — nothing to renew
-
         DateTimeOffset now = DateTimeOffset.UtcNow;
+        // Checked for every entry, sliding or not: the wire TTL is whole
+        // seconds rounded up, so a fixed absolute expiry of 1.2 s lives
+        // 2 s on the node and a Get at 1.8 s would otherwise hit, where
+        // MemoryDistributedCache misses. The envelope carries the exact
+        // millisecond, so the miss can be exact here.
         if (envelope.IsPastAbsoluteExpiry(now))
         {
             // Issue #233: an absolute expiry already in the past (clock
@@ -135,6 +138,7 @@ public class NanocachedDistributedCache : IDistributedCache
             await _namespace.DeleteIfMatchesAsync(keyBytes, hit.Token).ConfigureAwait(false);
             return null;
         }
+        if (envelope.SlidingSeconds == 0) return envelope.Payload; // fixed TTL (or none) — nothing to renew
 
         // Sliding expiration: re-write with the recomputed TTL before
         // returning — awaited, never fire-and-forget (shared spec), so a

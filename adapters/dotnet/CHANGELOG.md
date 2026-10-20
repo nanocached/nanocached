@@ -11,6 +11,15 @@ changed. What 1.0.0 will promise is described on the
 
 ### Fixed
 
+- An entry with an absolute expiry and no sliding window is no longer
+  served up to one second past its deadline: the wire TTL rounds up to
+  whole seconds, so a 1.2 s `AbsoluteExpirationRelativeToNow` lived 2 s
+  on the node and a `Get` at 1.8 s hit. `Get` now checks the envelope's
+  exact deadline for every entry, as `MemoryDistributedCache` misses at
+  the exact time (#679).
+
+### Fixed
+
 - A key that is not well-formed UTF-16 (a lone surrogate) throws
   `ArgumentException` from every member instead of being encoded as
   U+FFFD, under which `"x\uD800"` and `"x\uD801"` shared one entry and
