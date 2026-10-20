@@ -407,6 +407,12 @@ pub fn try_acquire_per_ip(
     })
 }
 
+/// How long, and how much, `reject_over_limit` reads after its busy reply
+/// so the peer's own close arrives before ours. Tight on purpose: this
+/// runs once per rejected connection, which is to say under a flood.
+const BUSY_REPLY_DRAIN_WINDOW: Duration = Duration::from_millis(200);
+const BUSY_REPLY_DRAIN_LIMIT: usize = 8 * 1024;
+
 /// Best-effort busy reply on `stream` before the caller drops it — for an
 /// over-limit rejection (a global connection cap, or, per source IP,
 /// `try_acquire_per_ip`'s cap). `busy_reply` is the wire bytes for that
@@ -419,6 +425,18 @@ pub fn try_acquire_per_ip(
 /// reused rather than a new one: a peer that never reads this reply must
 /// not leak the task by leaving the write pending indefinitely — the same
 /// reasoning as the handshake itself).
+///
+/// After the reply the write side is shut down and whatever the peer
+/// has already sent is read and discarded, briefly
+/// (`BUSY_REPLY_DRAIN_WINDOW`, `BUSY_REPLY_DRAIN_LIMIT`), until it
+/// closes. A client sends its `A` frame the moment it connects, so by
+/// the time the reply is written those bytes are sitting unread in the
+/// socket's receive buffer, and closing a socket with unread bytes sends
+/// a reset rather than a FIN. With the reply written and the socket then
+/// dropped, a client that had already sent `A 0 T R\n` read "connection
+/// reset by peer" and never the reply, on macOS and on Linux alike (the
+/// server test that pins this failed every run without the drain on
+/// both). Draining first makes the close a FIN that follows the reply.
 pub async fn reject_over_limit(
     mut stream: TcpStream,
     address: SocketAddr,
@@ -431,11 +449,25 @@ pub async fn reject_over_limit(
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 eprintln!("WARN failed to send busy response to {address}: {error}");
+                return;
             }
             Err(_) => {
                 eprintln!("WARN sending busy response to {address} timed out");
+                return;
             }
         }
+        let _ = stream.shutdown().await;
+        let drain = async {
+            let mut sink = [0_u8; 1024];
+            let mut discarded = 0;
+            while discarded < BUSY_REPLY_DRAIN_LIMIT {
+                match stream.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => discarded += n,
+                }
+            }
+        };
+        let _ = timeout(BUSY_REPLY_DRAIN_WINDOW, drain).await;
     }
 }
 

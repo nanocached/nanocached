@@ -10999,6 +10999,96 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_rejected_connection_still_delivers_b_to_a_client_that_already_sent_its_a_frame() {
+        let connection_limit = Arc::new(Semaphore::new(1));
+        let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let (request_tx, _request_rx) = mpsc::channel(1);
+
+        let (_first_client, first_server) = tcp_pair().await;
+        let first_address = first_server.peer_addr().unwrap();
+
+        let mut connection_tasks = JoinSet::new();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        dispatch_connection(
+            first_server,
+            first_address,
+            request_tx.clone(),
+            Arc::clone(&connection_limit),
+            Arc::clone(&per_ip_connections),
+            DEFAULT_MAX_CONNECTIONS_PER_IP,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx.clone(),
+            &mut connection_tasks,
+        );
+
+        // The connection is now handled entirely in a spawned task; let it run
+        // far enough to take the sole permit and settle into its read loop.
+        tokio::task::yield_now().await;
+        assert_eq!(connection_limit.available_permits(), 0);
+
+        let (mut second_client, second_server) = tcp_pair().await;
+        let second_address = second_server.peer_addr().unwrap();
+
+        dispatch_connection(
+            second_server,
+            second_address,
+            request_tx.clone(),
+            Arc::clone(&connection_limit),
+            Arc::clone(&per_ip_connections),
+            DEFAULT_MAX_CONNECTIONS_PER_IP,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+            &mut connection_tasks,
+        );
+
+        // Every SDK writes its `A` frame as soon as the connect completes,
+        // before reading anything. Those bytes sit unread at the node when
+        // it writes `B` and closes; closing on unread bytes is a reset, and
+        // a reset can reach the client instead of (or before) the reply.
+        // The over-limit path drains them first, so the client reads the
+        // reply and then a clean EOF — never a reset.
+        second_client.write_all(b"A 0 T R\n").await.unwrap();
+        tokio::task::yield_now().await;
+
+        let mut response = Vec::new();
+        timeout(
+            Duration::from_secs(5),
+            second_client.read_to_end(&mut response),
+        )
+        .await
+        .expect("the node closes within 5 s")
+        .unwrap();
+        assert_eq!(response, b"B\n");
+        assert_eq!(connection_limit.available_permits(), 0);
+
+        connection_tasks.abort_all();
+
+        while connection_tasks.join_next().await.is_some() {}
+
+        assert!(connection_tasks.is_empty());
+        assert_eq!(connection_limit.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn rejects_connection_when_the_per_ip_connection_limit_is_reached() {
         // Regression: `DEFAULT_MAX_CONNECTIONS` alone lets a single source IP hold
         // every one of the global permits by itself, starving every other

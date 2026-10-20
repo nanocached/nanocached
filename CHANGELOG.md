@@ -50,6 +50,14 @@ framework adapters at one version, whether or not a component changed.
   from a dropped connection; for an over-size request the node now also
   waits briefly for the client to close first, so the reply is not lost
   to a reset (#654, #733).
+- `nanocached-node` and `nanocached-discovery` deliver their `B` (busy)
+  reply to a client refused at the connection limit. The reply was
+  written and the socket dropped at once, with the client's own `A`
+  frame still unread in it, and closing on unread bytes is a reset: the
+  client read "connection reset by peer" and never the `B`, on Linux
+  and macOS alike. The over-limit path now half-closes after the reply
+  and reads the client's bytes away, briefly, so the close is a FIN that
+  follows the `B` (#663).
 - Text a user sees no longer carries issue numbers or references to
   documentation sections that do not exist: the `/metrics` HELP lines
   for `connections_max`, `incrs_total`, `cas_sets_total`,
