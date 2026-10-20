@@ -12,6 +12,17 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-node`'s sweep no longer reclaims a marked copy of a key
+  the node owns again. A join marks the keys it moves as dead copies for
+  the sweep; when that joiner is evicted the keys come back to the node,
+  but the marks stayed, so a put-if-absent re-replication arriving while
+  a later join's transfer held the sweep paused was refused as
+  "present", and the sweep then deleted the copy it had refused the
+  write for. A marked copy of a key the adopted ring gives this node is
+  now unmarked and kept (#682).
+
 ### Changed
 
 - `nanocached-proxy` answers the fatal `E` (and closes) instead of the

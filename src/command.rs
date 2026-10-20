@@ -297,6 +297,10 @@ pub enum Command {
     /// is still undecided, see `run_sweep` in `server.rs`.
     Sweep {
         marked: bool,
+        /// This node's ownership under its adopted ring, when it has one:
+        /// a marked copy of a key it owns is kept and unmarked rather than
+        /// reclaimed — see `Cache::sweep_keeping`.
+        owned: Option<OwnerCheck>,
     },
     /// Internal-only (issue #582): one chunk of the ownership reclaim
     /// pass, see `run_reclaim` in `server.rs`. Removes each of `keys` this
@@ -536,8 +540,16 @@ impl Command {
 
             Self::Stats => Response::Stats(Box::new(cache.stats())),
 
-            Self::Sweep { marked: true } => Response::Swept(cache.sweep()),
-            Self::Sweep { marked: false } => Response::Swept(cache.sweep_expired()),
+            Self::Sweep {
+                marked: true,
+                owned,
+            } => Response::Swept(match owned {
+                Some(owned) => cache.sweep_keeping(&|key: &Key| {
+                    owned.ring.is_owner(key, &owned.name, owned.replication)
+                }),
+                None => cache.sweep(),
+            }),
+            Self::Sweep { marked: false, .. } => Response::Swept(cache.sweep_expired()),
             Self::ReclaimUnowned {
                 keys,
                 checks,
@@ -2089,9 +2101,45 @@ mod tests {
         cache.mark_migrated(&key(b"name"));
 
         assert_eq!(
-            Command::Sweep { marked: true }.execute(&mut cache),
+            Command::Sweep {
+                marked: true,
+                owned: None
+            }
+            .execute(&mut cache),
             Response::Swept(1)
         );
+    }
+
+    #[test]
+    fn a_marked_sweep_with_ownership_keeps_the_keys_this_node_owns() {
+        let mut cache = Cache::new(usize::MAX);
+        let ring = Arc::new(HashRing::new(vec!["me".to_string(), "other".to_string()]));
+        let mine = (0..1000)
+            .map(|i| key(format!("k{i}").as_bytes()))
+            .find(|k| ring.is_owner(k, "me", 1))
+            .unwrap();
+        let theirs = (0..1000)
+            .map(|i| key(format!("k{i}").as_bytes()))
+            .find(|k| !ring.is_owner(k, "me", 1))
+            .unwrap();
+        for k in [&mine, &theirs] {
+            cache.set(k.clone(), Bytes::from_static(b"v"));
+            cache.mark_migrated(k);
+        }
+        assert_eq!(
+            Command::Sweep {
+                marked: true,
+                owned: Some(OwnerCheck {
+                    ring,
+                    name: "me".to_string(),
+                    replication: 1,
+                }),
+            }
+            .execute(&mut cache),
+            Response::Swept(1)
+        );
+        assert_eq!(cache.get(&mine), Some(Bytes::from_static(b"v")));
+        assert_eq!(cache.get(&theirs), None);
     }
 
     #[test]
@@ -2220,7 +2268,11 @@ mod tests {
         cache.mark_migrated(&key(b"name"));
 
         assert_eq!(
-            Command::Sweep { marked: false }.execute(&mut cache),
+            Command::Sweep {
+                marked: false,
+                owned: None
+            }
+            .execute(&mut cache),
             Response::Swept(0)
         );
         assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));

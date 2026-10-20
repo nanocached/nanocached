@@ -1423,7 +1423,19 @@ impl Cache {
     /// a client in the meantime) — `< SWEEP_BUDGET` means the backlog is
     /// now fully drained.
     pub fn sweep(&mut self) -> usize {
-        self.sweep_at(Instant::now(), true)
+        self.sweep_at(Instant::now(), true, None)
+    }
+
+    /// `sweep`, keeping — and unmarking — a marked copy of a key `owned`
+    /// says this node owns. A mark means a join took the key away; when
+    /// that joiner is evicted the key is this node's again, and the copy
+    /// it kept is the live one, not a dead one to reclaim. Without this,
+    /// a put-if-absent re-replication arriving while the copy was still
+    /// marked (the sweep pauses for as long as a later join's transfer
+    /// runs) was refused as "present", and the sweep then deleted the
+    /// copy it had refused the write for.
+    pub fn sweep_keeping(&mut self, owned: &dyn Fn(&Key) -> bool) -> usize {
+        self.sweep_at(Instant::now(), true, Some(owned))
     }
 
     /// `sweep` restricted to TTL expiry: marked entries are left alone.
@@ -1432,10 +1444,15 @@ impl Cache {
     /// abandoned join rolls the marks back instead — so the periodic
     /// sweep runs in this mode while that's still undecided.
     pub fn sweep_expired(&mut self) -> usize {
-        self.sweep_at(Instant::now(), false)
+        self.sweep_at(Instant::now(), false, None)
     }
 
-    fn sweep_at(&mut self, now: Instant, include_marked: bool) -> usize {
+    fn sweep_at(
+        &mut self,
+        now: Instant,
+        include_marked: bool,
+        owned: Option<&dyn Fn(&Key) -> bool>,
+    ) -> usize {
         if self.pending_removal.is_empty() {
             self.pending_removal
                 .extend(self.slots.values().flat_map(|sub_map| {
@@ -1475,6 +1492,11 @@ impl Cache {
             let expired = self
                 .peek(&key)
                 .is_some_and(|entry| entry.is_expired_at(now));
+
+            if marked && !expired && owned.is_some_and(|owned| owned(&key)) {
+                self.clear_migrated_mark(&key);
+                continue;
+            }
 
             if (marked || expired) && self.remove_entry(&key).is_some() {
                 removed += 1;
@@ -2552,7 +2574,7 @@ mod tests {
         );
 
         let later = Instant::now() + Duration::from_secs(6);
-        assert_eq!(cache.sweep_at(later, true), 2);
+        assert_eq!(cache.sweep_at(later, true, None), 2);
         assert_eq!(cache.keys_at(later), vec![key(b"a")]);
     }
 
@@ -2902,6 +2924,32 @@ mod tests {
     }
 
     #[test]
+    fn sweep_keeps_and_unmarks_a_marked_copy_of_a_key_this_node_owns() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"mine"), Bytes::from_static(b"1"));
+        cache.set(key(b"theirs"), Bytes::from_static(b"2"));
+        cache.mark_migrated(&key(b"mine"));
+        cache.mark_migrated(&key(b"theirs"));
+
+        // The joiner that took "mine" was evicted: this node owns it again,
+        // so its copy is live and stays; "theirs" is still a dead copy.
+        let removed = cache.sweep_keeping(&|k: &Key| k.name == b"mine"[..]);
+        assert_eq!(removed, 1);
+        assert_eq!(cache.get(&key(b"mine")), Some(Bytes::from_static(b"1")));
+        assert!(!cache.is_marked(&key(b"mine")));
+        assert_eq!(cache.get(&key(b"theirs")), None);
+
+        // Unmarked, the copy is what a put-if-absent re-replication finds
+        // present — correctly — and a later sweep leaves it alone.
+        assert!(matches!(
+            cache.handoff_set_if_absent(&key(b"mine"), Bytes::from_static(b"old"), None, false),
+            CasResult::Mismatch
+        ));
+        assert_eq!(cache.sweep(), 0);
+        assert_eq!(cache.get(&key(b"mine")), Some(Bytes::from_static(b"1")));
+    }
+
+    #[test]
     fn sweep_expired_leaves_marked_entries_alone() {
         // Issue #62: until the join is confirmed, a dead copy must not be
         // reclaimed — only TTL expiry is swept in this mode.
@@ -2915,12 +2963,12 @@ mod tests {
         );
         let later = Instant::now() + Duration::from_secs(2);
 
-        assert_eq!(cache.sweep_at(later, false), 1);
+        assert_eq!(cache.sweep_at(later, false, None), 1);
         assert_eq!(cache.get(&key(b"dead")), Some(Bytes::from_static(b"copy")));
         assert!(cache.get_at(&key(b"ttl"), later).is_none());
 
         // The mark is still in force once marks are swept again.
-        assert_eq!(cache.sweep_at(later, true), 1);
+        assert_eq!(cache.sweep_at(later, true, None), 1);
         assert!(cache.get(&key(b"dead")).is_none());
     }
 
@@ -2988,7 +3036,7 @@ mod tests {
         }
 
         let later = now + Duration::from_secs(60);
-        assert_eq!(cache.sweep_at(later, true), SWEEP_BUDGET);
+        assert_eq!(cache.sweep_at(later, true, None), SWEEP_BUDGET);
 
         // Exactly one expired key remains, and it is still queued. Rewrite
         // it with a fresh, unexpiring value before the next sweep round.
@@ -2999,7 +3047,7 @@ mod tests {
             .expect("one expired entry should remain after the budgeted sweep");
         cache.set(leftover.clone(), Bytes::from_static(b"fresh"));
 
-        cache.sweep_at(later, true);
+        cache.sweep_at(later, true, None);
         assert_eq!(
             cache.get_at(&leftover, later),
             Some(Bytes::from_static(b"fresh"))
@@ -3219,7 +3267,7 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        let removed = cache.sweep_at(Instant::now() + Duration::from_secs(6), true);
+        let removed = cache.sweep_at(Instant::now() + Duration::from_secs(6), true, None);
 
         assert_eq!(removed, 1);
     }
@@ -3249,7 +3297,7 @@ mod tests {
         );
         cache.mark_migrated(&key(b"name"));
 
-        let removed = cache.sweep_at(Instant::now() + Duration::from_secs(6), true);
+        let removed = cache.sweep_at(Instant::now() + Duration::from_secs(6), true, None);
 
         assert_eq!(removed, 1);
     }
