@@ -18,9 +18,12 @@ and friends run against a nanocached cluster.
   that lands between its read and its re-set is overwritten with the
   pre-touch value.
 - **`get_many`/`set_many`** use the wire's batched multi-get/multi-set:
-  one round trip per involved node instead of one per
-  key. **`delete_many`** remains a concurrent client-side fan-out — the
-  wire has no multi-key delete.
+  one round trip per involved node instead of one per key. The values
+  in one batch reply total at most 16 MiB, and a hit past that budget
+  is answered as a miss, so `get_many` over many large keys can omit a
+  key that exists — `get()` it on its own rather than taking it for
+  evicted. **`delete_many`** remains a concurrent client-side fan-out —
+  the wire has no multi-key delete.
 - **`incr`/`decr`** use the wire's own atomic counter (`INCR`): atomic on the
   node that owns the key, unlike `touch()` above. Matches `BaseCache`'s own contract — raises `ValueError` if the
   key doesn't exist — and is exactly as volatile as `set()`: LRU
