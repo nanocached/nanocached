@@ -3644,8 +3644,20 @@ func TestSetManyRetriesOnlyTheLegsThatFailed(t *testing.T) {
 		values[key] = "v-" + key
 	}
 
-	if _, err := client.SetMany(values, 0); !errors.Is(err, ErrWrongNode) {
-		t.Fatalf("SetMany err = %v, want ErrWrongNode while one primary stays down", err)
+	// The bad owner never answered `W` — it was unreachable — so this is
+	// a connection failure, not a wrong-node answer, and the returned
+	// map names the keys whose primary did store them.
+	stored, err := client.SetMany(values, 0)
+	if !errors.Is(err, ErrConnectionLost) || errors.Is(err, ErrWrongNode) {
+		t.Fatalf("SetMany err = %v, want ErrConnectionLost (not ErrWrongNode) while one primary stays unreachable", err)
+	}
+	if !strings.Contains(err.Error(), "could not reach the primary of 6 of 12 keys") {
+		t.Fatalf("SetMany err = %v, want the unreachable-primary message", err)
+	}
+	for key := range values {
+		if want := ownersOf(key)[0] == testNames[0]; stored[key] != want {
+			t.Fatalf("stored[%q] = %v, want %v (primary %s)", key, stored[key], want, ownersOf(key)[0])
+		}
 	}
 	// R=2 over two nodes: both own every key. The good owner sees one
 	// frame of all 12 keys and nothing more; the bad one sees the first
@@ -6778,5 +6790,51 @@ func TestLargeRequestsAndResponsesPipelinedTogetherDoNotDeadlock(t *testing.T) {
 	// requestTimeout.
 	if elapsed := time.Since(start); elapsed > requestTimeout/2 {
 		t.Fatalf("96 large requests took %v, want far less than requestTimeout (%v)", elapsed, requestTimeout)
+	}
+}
+
+func TestAStalledReplicaBoundsAClusterSetByOneRequestTimeout(t *testing.T) {
+	// A replica that acknowledged the handshake and then stopped reading
+	// timed out the replica leg, which was then redialed and re-sent for
+	// a second full timeout — Set returned after twice the request
+	// deadline although the primary had answered at once.
+	original := requestTimeout
+	requestTimeout = 300 * time.Millisecond
+	defer func() { requestTimeout = original }()
+
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var key string
+	for i := 0; key == ""; i++ {
+		candidate := fmt.Sprintf("key-%d", i)
+		if ownersOf(candidate)[0] == testNames[0] {
+			key = candidate
+		}
+	}
+	if err := client.Set(key, "warm", 0); err != nil {
+		t.Fatal(err)
+	}
+	replica := nodes[testNames[1]]
+	connectionsBefore := replica.connectionCount.Load()
+	replica.goSilentAfterHandshake()
+
+	started := time.Now()
+	if err := client.Set(key, "v", 0); err != nil {
+		t.Fatalf("Set = %v, want nil (the primary answered)", err)
+	}
+	elapsed := time.Since(started)
+	if elapsed < 250*time.Millisecond || elapsed >= 550*time.Millisecond {
+		t.Fatalf("Set took %v, want about one request timeout", elapsed)
+	}
+	if got := replica.connectionCount.Load(); got != connectionsBefore {
+		t.Fatalf("the replica was redialed after a timeout: %d connections, had %d", got, connectionsBefore)
+	}
+	if got := client.Stats().ReplicaWriteFailures; got != 1 {
+		t.Fatalf("ReplicaWriteFailures = %d, want 1", got)
 	}
 }

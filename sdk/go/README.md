@@ -319,7 +319,10 @@ per call), `GetManyBytes` returns the partial map together with
 `ErrWrongNode` rather than discarding a mostly-successful batch, and
 `SetManyBytes` returns the map of every key actually confirmed stored
 together with `ErrWrongNode` — every other key in the batch was still
-stored. If some keys' every owner was unreachable, `GetManyBytes`
+stored; a key whose primary could not be reached at all (no `W` was
+ever received) comes back with `ErrConnectionLost` (wrapped, naming how
+many keys) instead, the map still naming every key whose primary did
+acknowledge. If some keys' every owner was unreachable, `GetManyBytes`
 returns the keys that did resolve together with the last connection
 error (`ErrConnectionLost`) — a connection loss is never reported as
 `ErrWrongNode`. This also covers a connection failure partway through a
@@ -422,7 +425,11 @@ that is safe*: for `Get`/`Set`/`Delete`/`Clear`/`ClearAll`/the batched
 get-set calls, which are all idempotent, it always is. `Incr`/`Decr` and
 the compare-and-set calls are not idempotent, so they get a narrower
 guarantee — see "Incr and Decr" and "Compare-and-set" above for the
-at-least-once caveat that applies to them instead.
+at-least-once caveat that applies to them instead. A request that timed
+out (no reply within the request deadline) is never redialed and resent,
+for idempotent requests too: the node was reachable and simply did not
+answer, so a second attempt would most likely wait out another deadline
+— a `Set` whose replica has stopped reading costs one deadline, not two.
 
 An address whose redial just failed is treated as still down for
 `Config.ReconnectCooldown` (default `DefaultReconnectCooldown`, 1 second):

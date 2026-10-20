@@ -792,7 +792,12 @@ func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte
 		c.poison(err)
 		// The Write() call itself failed: no complete frame reached the
 		// server, so it could not have executed this request. Safe to
-		// retry after a redial.
+		// retry after a redial — unless the write failed because the
+		// request deadline passed while the peer was not reading (see
+		// errRequestTimedOut), which the retry layer must not resend.
+		if isTimeout(writeErr) {
+			return 0, nil, 0, nil, timedOut(notSent(err))
+		}
 		return 0, nil, 0, nil, notSent(err)
 	}
 
@@ -825,6 +830,13 @@ func (c *connection) readLoop() {
 			// existing ErrConnectionLost classification.
 			if errors.Is(err, ErrProtocol) {
 				c.poison(err)
+			} else if isTimeout(err) {
+				// The request deadline expired with a request still
+				// unanswered (see errRequestTimedOut): every request this
+				// poison drains is reported as timed out, not merely as a
+				// failed connection.
+				c.poison(timedOut(connectionLost(
+					fmt.Sprintf("no response from server within %s (request timed out)", requestTimeout), nil)))
 			} else {
 				c.poison(connectionLost("connection failed", err))
 			}
