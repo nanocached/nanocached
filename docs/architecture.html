@@ -365,12 +365,19 @@ here.</p>
   a cleared key does not come back from such a forward; the mirror case
   remains: a client whose node list dropped the old owner between its
   write and its clear sends the clear only to the new owners, and the
-  old owner&rsquo;s late forward can bring that one write back. Accepted
-  2026-10-17: the stale is bounded by TTL and needs a membership change,
-  a double write with changed content and a lagging forward to coincide,
-  and removing it would need versioned writes in the server and every
-  SDK. Revisit if a versioned write path is adopted for other
-  reasons.</li>
+  old owner&rsquo;s late forward can bring that one write back. The
+  realistic exposure is a counter incremented concurrently by several
+  callers during the window: the result the primary replicates to an
+  old owner is forwarded back to the primary as an unconditional write,
+  and when it lands after a later increment it rewinds the counter, so
+  one to three increments are lost on about one counter per join in a
+  loaded cluster (serial increments are practically exact, about one
+  in 12,000). The old owner cannot tell a replicated result from a
+  client&rsquo;s write it must forward. Accepted 2026-10-17: the stale
+  is bounded by TTL and needs a membership change, a double write with
+  changed content and a lagging forward to coincide, and removing it
+  would need versioned writes in the server and every SDK. Revisit if a
+  versioned write path is adopted for other reasons.</li>
   <li>During a re-replication&rsquo;s forwarding window (the pass and
   60&nbsp;s after it), a second eviction replaces the window with its
   own snapshot, so a client still routing by the first eviction&rsquo;s
