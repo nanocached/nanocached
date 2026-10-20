@@ -109,18 +109,31 @@ public class ConnectionLostException : NanocachedException
     /// </summary>
     internal bool RequestNotSent { get; }
 
+    /// <summary>True when the request deadline expired with this request
+    /// still unanswered (<c>Connection</c>'s watchdog — also set on a
+    /// write that failed because the watchdog closed the stream under it,
+    /// and on every request the watchdog's close drained). The peer was
+    /// reachable and simply did not answer in time, so the client's own
+    /// redial-and-retry for idempotent requests does not apply: a second
+    /// attempt would most likely wait out another whole deadline. Always
+    /// false on the public constructors.</summary>
+    public bool TimedOut { get; }
+
     public ConnectionLostException(string message) : base(message) { }
 
     public ConnectionLostException(string message, Exception inner) : base(message, inner) { }
 
-    internal ConnectionLostException(string message, bool requestNotSent) : base(message)
+    internal ConnectionLostException(string message, bool requestNotSent, bool timedOut = false) : base(message)
     {
         RequestNotSent = requestNotSent;
+        TimedOut = timedOut;
     }
 
-    internal ConnectionLostException(string message, Exception inner, bool requestNotSent) : base(message, inner)
+    internal ConnectionLostException(string message, Exception inner, bool requestNotSent, bool timedOut = false)
+        : base(message, inner)
     {
         RequestNotSent = requestNotSent;
+        TimedOut = timedOut;
     }
 }
 
@@ -156,10 +169,19 @@ public sealed class PartialConnectionLostException<T> : ConnectionLostException
     public T PartialValues { get; }
 
     public PartialConnectionLostException(T partialValues, Exception inner)
-        : base(
+        : this(
+            partialValues, inner,
             "nanocached: connection lost partway through a chunked batch; " +
-            "PartialValues holds what the batch confirmed before the failing chunk",
-            inner)
+            "PartialValues holds what the batch confirmed before the failing chunk")
+    {
+    }
+
+    /// <summary>As the two-argument form, with a message that says what
+    /// actually happened — a cluster batch whose unresolved keys had no
+    /// reachable owner is not a chunked batch interrupted partway, so it
+    /// says "could not reach any owner of N of M keys" instead.</summary>
+    public PartialConnectionLostException(T partialValues, Exception inner, string message)
+        : base(message, inner)
     {
         PartialValues = partialValues;
     }

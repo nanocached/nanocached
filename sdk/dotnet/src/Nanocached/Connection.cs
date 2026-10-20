@@ -218,7 +218,7 @@ internal sealed class Connection
         // stalled request plus everything pipelined behind it.
         CloseWithReason(new ConnectionLostException(
             $"nanocached: no response from server within {(long)RequestTimeout.TotalMilliseconds}ms "
-            + "(request timed out)"));
+            + "(request timed out)", requestNotSent: false, timedOut: true));
     }
 
     internal bool IsClosed => Volatile.Read(ref _closedFlag) != 0;
@@ -880,9 +880,13 @@ internal sealed class Connection
             //     between the pre-write checks and WriteAsync is also
             //     classified ambiguous — conservative, never unsafe.)
             bool requestNotSent = !frameWritten && !IsClosed;
+            // A write that failed because the request-timeout watchdog
+            // closed the stream under it is that timeout, not a dead
+            // connection (see ConnectionLostException.TimedOut).
+            bool timedOut = _closeReason is ConnectionLostException { TimedOut: true };
             Close();
             throw new ConnectionLostException(
-                $"nanocached: connection failed: {error.Message}", error, requestNotSent);
+                $"nanocached: connection failed: {error.Message}", error, requestNotSent, timedOut);
         }
         finally
         {

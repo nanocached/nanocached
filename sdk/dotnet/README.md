@@ -24,7 +24,12 @@ bool existed = await client.DeleteAsync("greeting");
 
 `GetAsync` decodes the value as UTF-8 with a strict decoder — a value
 that isn't valid UTF-8 throws `DecoderFallbackException` instead of
-silently replacing bad bytes. Use `GetBytesAsync` for the raw bytes:
+silently replacing bad bytes. The `string` overloads encode keys,
+namespaces and values just as strictly: a string that is not
+well-formed UTF-16 (one with a lone surrogate) throws
+`ArgumentException` rather than being encoded with U+FFFD in its place,
+which would make it the same key as the one with a literal U+FFFD. Use
+`GetBytesAsync` for the raw bytes:
 
 ```csharp
 byte[]? raw = await client.GetBytesAsync("greeting");
@@ -242,9 +247,19 @@ connection error), or the bare connection error when nothing resolved —
 a connection loss is never reported as a wrong-node answer.
 `SetManyAsync`/`SetManyBytesAsync` have nothing to return on success, so
 they just throw a plain `WrongNodeException` on the wrong-node condition
-— every other key in the batch was still stored. In single-node/proxy
+— every other key in the batch was still stored; a key whose primary
+could not be reached at all (no `W` was ever received) throws
+`PartialConnectionLostException<HashSet<string>>` instead, with the keys
+whose primary did acknowledge in `PartialValues`. In single-node/proxy
 mode a `W` propagates immediately, exactly like `GetAsync`/`SetAsync`'s
 own single-mode behavior — there is no ring to refresh against.
+
+A key that appears more than once in a `GetManyAsync`/`GetManyBytesAsync`
+list is fetched once (the result is a dictionary anyway). Without this a
+long list of one repeated key would cost one `m` frame per 400 copies
+and hold every frame's reply until the call returned. When a
+`SetManyAsync`/`SetManyBytesAsync` retry pass runs after a refresh, a key
+is re-sent only to the owners that have not acknowledged it yet.
 
 Within one `SetManyAsync`/`SetManyBytesAsync` batch, the same node can
 be one key's primary and another key's replica at once; it receives
@@ -419,7 +434,13 @@ traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
 restart, a network blip) redials and retries once transparently — for
 `GetAsync`/`SetAsync`/`DeleteAsync`/`ClearAsync`/`ClearAllAsync`, which
-are idempotent, so replaying one after a redial is always safe.
+are idempotent, so replaying one after a redial is always safe. A
+request that timed out (no reply within the 30-second request deadline)
+is never redialed and resent, for idempotent requests too: the node was
+reachable and simply did not answer, so a second attempt would most
+likely wait out another deadline — a `SetAsync` whose replica has
+stopped reading costs one deadline, not two.
+`ConnectionLostException.TimedOut` tells such a failure apart.
 
 **`IncrAsync`/`DecrAsync`, `PutIfAbsentAsync`/`ReplaceIfPresentAsync`/
 `ReplaceAsync`, and `DeleteIfMatchesAsync` are NOT idempotent**: replaying a
@@ -533,6 +554,17 @@ path: only turn this on for a fresh keyspace, or only after every
 client touching an existing one has upgraded and enabled it together.
 Incompressible data (already-compressed media, random bytes) is passed
 through unchanged rather than bloated.
+
+Decompression is bounded three ways: one value may expand to at most
+64 MiB, one `GetManyAsync`/`GetManyBytesAsync` response to at most
+256 MiB across the batch, and one client to at most 256 MiB of DEFLATE
+output in flight at a time across every concurrent read. Each
+decompression of a compressed value reserves the 64 MiB per-value cap
+from that last budget while it runs (its output size is not known in
+advance), so at most four run at once per client and further ones wait;
+the budget is released as soon as the value is returned — what a caller
+then holds is the caller's. Before this bound, N concurrent reads of a
+61 KB value that inflates to 60 MiB held N × 60 MiB at once.
 
 **Incompatible with `IncrAsync`/`DecrAsync`** — see [Incr / Decr](#incr--decr).
 A client with `Compress = true` raises immediately rather than produce a

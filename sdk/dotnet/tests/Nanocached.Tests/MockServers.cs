@@ -89,6 +89,13 @@ public sealed class MockNode : IDisposable
     public int MultiSetRequestCount => _multiSetRequestCount;
     private int _multiSetRequestCount;
 
+    /// <summary>The total number of key/value pairs carried by every
+    /// <c>o</c> frame received — lets a test prove a batched set sent
+    /// each key to a node exactly once, where a frame count alone
+    /// cannot.</summary>
+    public int MultiSetKeyCount => _multiSetKeyCount;
+    private int _multiSetKeyCount;
+
     /// <summary>issue #222: the namespace+key byte total (the same wire
     /// bytes <c>MultiGetChunkedAsync</c>'s cumulative-bytes bound counts)
     /// of every <c>m</c> request this server has received, in arrival
@@ -968,6 +975,7 @@ public sealed class MockNode : IDisposable
                             values[i] = await Wire.ReadExactlyAsync(stream, valueLens[i]);
                         }
                         int multiSetRequestNumber = Interlocked.Increment(ref _multiSetRequestCount);
+                        Interlocked.Add(ref _multiSetKeyCount, n);
                         // issue #222: namespace + every key's and value's
                         // bytes — the same total MultiSetChunkedAsync's
                         // cumulative bound tracks, minus its header
@@ -1146,6 +1154,18 @@ public sealed class MockDiscovery : IDisposable
 {
     public volatile bool WarmingUp;
 
+    /// <summary>Every accepted connection, including the client's
+    /// bootstrap one — lets a test count the refreshes a client actually
+    /// ran.</summary>
+    public int ConnectionCount => _connectionCount;
+    private int _connectionCount;
+
+    /// <summary>When positive, every <c>L</c> after the first
+    /// connection's is answered only after this many milliseconds — a
+    /// discovery server that is slow once the client is up, so a test can
+    /// tell N serialized refreshes (N delays) from one shared refresh.</summary>
+    public volatile int LaterListDelayMillis;
+
     private readonly TcpListener _listener;
     private readonly int _replication;
     private volatile IReadOnlyList<(string Name, string Address)> _nodes;
@@ -1201,6 +1221,7 @@ public sealed class MockDiscovery : IDisposable
             while (true)
             {
                 TcpClient client = await _listener.AcceptTcpClientAsync();
+                Interlocked.Increment(ref _connectionCount);
                 _ = ServeAsync(client);
             }
         }
@@ -1242,6 +1263,8 @@ public sealed class MockDiscovery : IDisposable
                         await Wire.WriteAsync(stream, RawListResponse);
                         return;
                     }
+                    int delay = _connectionCount > 1 ? LaterListDelayMillis : 0;
+                    if (delay > 0) await Task.Delay(delay);
                     IReadOnlyList<(string Name, string Address)> snapshot = _nodes;
                     var frame = new StringBuilder($"N {snapshot.Count} {_replication}\n");
                     foreach (var (name, address) in snapshot)
