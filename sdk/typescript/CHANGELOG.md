@@ -11,6 +11,13 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `setMany`/`setManyBytes` in cluster mode throw
+  `PartialConnectionLostError` (with the keys whose primary did store
+  them in `partialValues`) when a key's primary could not be reached at
+  all on both passes, instead of `WrongNodeError`, which is now reserved
+  for a primary that actually answered `W`. A caller that reacted to
+  `WrongNodeError` by refreshing and retrying did so for a dead node, and
+  the message claimed the node had answered (#722).
 - A namespace is hashed once per batch rather than once per key:
   `getMany`/`setMany` under a 900 KB namespace took 8.8 s for 400 keys
   and blocked the event loop for the whole call.

@@ -5758,7 +5758,17 @@ describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
       const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
       try {
-        await assert.rejects(client.setMany(values), WrongNodeError);
+        // The bad owner never answered `W` — it was unreachable — so this
+        // is a connection failure, not a wrong-node answer, carrying the
+        // keys whose primary did store them.
+        await assert.rejects(client.setMany(values), (error: unknown) => {
+          assert.ok(error instanceof PartialConnectionLostError, `want PartialConnectionLostError, got ${String(error)}`);
+          assert.ok(!(error instanceof WrongNodeError));
+          assert.match(error.message, /could not reach the primary of 4 of 12 keys/);
+          const storedByOthers = keys.filter((key) => ring.owners(Buffer.from(key), 1)[0] !== bad.name).sort();
+          assert.deepEqual([...(error.partialValues as string[])].sort(), storedByOthers);
+          return true;
+        });
         // R=2 over three nodes: every key has one primary and one
         // replica. Each good owner sees exactly one frame (its primary
         // and replica keys of the first pass) — nothing is sent to it
