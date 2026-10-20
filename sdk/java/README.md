@@ -37,6 +37,8 @@ one with a literal `?`). `get`/`get(byte[])` decode the value as strict UTF-8
 and return `Optional<String>` (a value that isn't valid UTF-8 throws
 `java.io.UncheckedIOException`); `getBytes`/`getBytes(byte[])` return the
 raw `Optional<byte[]>` without decoding. The client is thread-safe;
+each connection it holds costs one reader thread, and every connection
+in the process shares one request-timeout thread;
 requests are pipelined per connection — concurrent
 callers on the same connection each pay only their own network latency,
 not everyone else's ahead of them.

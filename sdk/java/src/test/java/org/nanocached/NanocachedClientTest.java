@@ -3976,6 +3976,51 @@ class NanocachedClientTest {
         }
     }
 
+    // One request-timeout watchdog thread for the whole process, however
+    // many connections hold an armed deadline — each connection's own
+    // thread is its reader alone (two per connection used to make a
+    // 10,000-node roster cost 20,000 threads).
+    @Test
+    void connectionsShareOneRequestWatchdogThread() throws Exception {
+        int count = 16;
+        List<Connection> connections = new ArrayList<>();
+        List<java.net.Socket> serverSides = new ArrayList<>();
+        ExecutorService callers = Executors.newFixedThreadPool(count);
+        try (java.net.ServerSocket server = new java.net.ServerSocket(0)) {
+            for (int i = 0; i < count; i++) {
+                java.net.Socket clientSocket = new java.net.Socket("127.0.0.1", server.getLocalPort());
+                serverSides.add(server.accept());
+                connections.add(new Connection(clientSocket, false, () -> {}));
+            }
+            // A request in flight on every connection: every deadline is
+            // armed, so the watchdog is at its busiest.
+            List<Future<byte[]>> inFlight = new ArrayList<>();
+            for (Connection connection : connections) {
+                inFlight.add(callers.submit(() -> connection.get("k".getBytes(StandardCharsets.UTF_8))));
+            }
+            for (java.net.Socket serverSide : serverSides) {
+                byte[] frame = "G 1\nk".getBytes(StandardCharsets.US_ASCII);
+                assertArrayEquals(frame, serverSide.getInputStream().readNBytes(frame.length));
+            }
+
+            java.util.Map<String, Long> threads = Thread.getAllStackTraces().keySet().stream()
+                    .map(Thread::getName)
+                    .filter(name -> name.startsWith("nanocached-"))
+                    .collect(java.util.stream.Collectors.groupingBy(
+                            name -> name, java.util.stream.Collectors.counting()));
+            assertEquals(Long.valueOf(count), threads.get("nanocached-connection-reader"), threads.toString());
+            assertTrue(threads.getOrDefault("nanocached-request-watchdog", 0L) <= 1, threads.toString());
+
+            for (Connection connection : connections) connection.close();
+            for (Future<byte[]> call : inFlight) {
+                assertThrows(ExecutionException.class, call::get);
+            }
+        } finally {
+            callers.shutdownNow();
+            for (java.net.Socket serverSide : serverSides) serverSide.close();
+        }
+    }
+
     // ── INCR エンコード/デコード (issue #129) ────────────────────────
     // Exercised directly against Connection (bypassing NanocachedClient)
     // so the exact wire bytes and every response shape (with/without ttl,
