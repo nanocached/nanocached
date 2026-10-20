@@ -108,6 +108,12 @@ impl KeyHash {
     pub fn of(key: &Key) -> Self {
         Self(fnv1a_continue(namespace_state(&key.namespace), &key.name))
     }
+
+    /// The hash itself, for callers that key their own maps by it (the
+    /// forward queue's slot map) instead of re-hashing the key's bytes.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 /// Hashes many keys, paying for each *distinct* namespace once: the state

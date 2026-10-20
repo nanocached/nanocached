@@ -1,5 +1,5 @@
 use crate::cache::{Cache, CasCondition, CasResult, IncrResult, parse_decimal_i64};
-use crate::hash_ring::{HashRing, KeyHash};
+use crate::hash_ring::{HashRing, KeyHash, KeyHasher};
 use crate::key::Key;
 use crate::response::{MultiAckEntry, MultiEntry, Response};
 use bytes::{Buf, Bytes, BytesMut};
@@ -29,9 +29,13 @@ pub struct OwnerCheck {
 }
 
 impl OwnerCheck {
-    pub fn owns(&self, key: &Key) -> bool {
+    /// Whether this node owns a key under this membership — the reclaim pass
+    /// judges every key of a chunk against every check, so it hashes
+    /// each key once (`KeyHasher`, which also pays for a namespace once
+    /// per chunk) rather than once per check.
+    pub fn owns_hashed(&self, key_hash: KeyHash) -> bool {
         self.ring
-            .is_owner_hashed(KeyHash::of(key), &self.name, self.replication)
+            .is_owner_hashed(key_hash, &self.name, self.replication)
     }
 }
 
@@ -539,7 +543,17 @@ impl Command {
                 checks,
                 handoff_quiet_for,
             } => {
-                let owned = |key: &Key| checks.iter().any(|check| check.owns(key));
+                // One hash per key, and one namespace hash per run of
+                // keys sharing a namespace allocation (`Cache::keys()`
+                // groups them so): the whole namespace used to be hashed
+                // again for every key and every check, which stalled the
+                // cache thread for hundreds of milliseconds per chunk
+                // under a namespace of a few hundred KB.
+                let hasher = std::cell::RefCell::new(KeyHasher::default());
+                let owned = |key: &Key| {
+                    let key_hash = hasher.borrow_mut().hash(key);
+                    checks.iter().any(|check| check.owns_hashed(key_hash))
+                };
                 let report = cache.reclaim_unowned(&keys, &owned, handoff_quiet_for);
                 Response::Reclaimed {
                     removed: report.removed,
@@ -2143,6 +2157,60 @@ mod tests {
             }
         );
         assert_eq!(cache.get(&name), Some(Bytes::from_static(b"Bob")));
+    }
+
+    #[test]
+    fn a_reclaim_chunk_under_a_large_namespace_hashes_it_once() {
+        // A chunk of 2,000 keys under a 600 KB namespace, judged against
+        // two rings. Hashing the namespace again for every key and every
+        // check was 2.4 GB of hashing per chunk on the cache thread, a
+        // stall of hundreds of milliseconds for every connection; the
+        // `KeyHasher` pays for the namespace once per chunk.
+        let ring_a = Arc::new(HashRing::new(vec!["a".to_string(), "b".to_string()]));
+        let ring_b = Arc::new(HashRing::new(vec!["a".to_string(), "c".to_string()]));
+        let checks = vec![
+            OwnerCheck {
+                ring: ring_a,
+                name: "a".to_string(),
+                replication: 1,
+            },
+            OwnerCheck {
+                ring: ring_b,
+                name: "a".to_string(),
+                replication: 1,
+            },
+        ];
+        let namespace = Bytes::from(vec![b'n'; 600_000]);
+        let mut cache = Cache::new(usize::MAX);
+        for i in 0..2_000u32 {
+            cache.set(
+                Key::new(namespace.clone(), Bytes::from(i.to_le_bytes().to_vec())),
+                Bytes::from_static(b"v"),
+            );
+        }
+        // The pass judges the cache's own key snapshot, whose keys share
+        // the namespace allocation the cache holds.
+        let keys = cache.keys();
+        assert_eq!(keys.len(), 2_000);
+
+        let started = std::time::Instant::now();
+        let response = Command::ReclaimUnowned {
+            keys: keys.clone(),
+            checks,
+            handoff_quiet_for: Duration::from_secs(60),
+        }
+        .execute(&mut cache);
+        let elapsed = started.elapsed();
+
+        // Only keys that neither ring gives "a" are removed.
+        let Response::Reclaimed { removed, .. } = response else {
+            panic!("unexpected response {response:?}");
+        };
+        assert!(removed > 0 && removed < keys.len(), "{removed}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "reclaiming 2,000 keys under a 600 KB namespace took {elapsed:?}"
+        );
     }
 
     #[test]
