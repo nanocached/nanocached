@@ -844,6 +844,35 @@ impl LeaveState {
             })
             .map(|owner| owner.to_string())
     }
+
+    /// The forward target for survivor `name`: its address and token from
+    /// the drain-start roster, and the one connection every forward to
+    /// it shares (so the forward queue keeps them in order). `None` for a
+    /// name the roster did not carry an address or token for.
+    fn forward_target(&self, name: &str) -> Option<ForwardTarget> {
+        let addr = self.addresses.get(name)?.clone();
+        let token = self.tokens.get(name)?.clone();
+
+        let connection = {
+            let mut connections = self
+                .connections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(
+                connections
+                    .entry(addr.clone())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(None))),
+            )
+        };
+
+        Some(ForwardTarget {
+            addr,
+            connection,
+            token,
+            revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
+        })
+    }
 }
 
 /// Configuration for registering this node with discovery servers (see
@@ -1942,6 +1971,19 @@ async fn handle_clear(
         // Issue #564: earlier joiners still inside their forwarding grace
         // need the clear as well, not just the slot's own joiner.
         for target in lingering_clear_targets(node_context) {
+            spawn_forward(
+                config,
+                node_context.clone(),
+                target,
+                OwnedForwardedWrite::Clear(scope.clone()),
+            )
+            .await;
+        }
+        // A decommission in flight: a write this node acknowledged and
+        // queued for an entrant must not outlive a clear the client then
+        // sent to every node it knows, so the clear rides the same
+        // per-entrant queue, behind that write.
+        for target in leave_clear_targets(node_context) {
             spawn_forward(
                 config,
                 node_context.clone(),
@@ -9244,28 +9286,33 @@ fn leave_target_for_hashed(node_context: &NodeContext, key_hash: KeyHash) -> Opt
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let leave = leaving.as_ref()?;
     let entrant = leave.entrant_for(key_hash, &node_context.name)?;
-    let addr = leave.addresses.get(&entrant)?.clone();
-    let token = leave.tokens.get(&entrant)?.clone();
+    leave.forward_target(&entrant)
+}
 
-    let connection = {
-        let mut connections = leave
-            .connections
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Arc::clone(
-            connections
-                .entry(addr.clone())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(None))),
-        )
+/// Where a clear must also go while a decommission is in flight: every
+/// survivor, since any of them is the entrant for some of this node's
+/// keys and a clear is not tied to a key (the leave-side twin of
+/// `lingering_clear_targets`). Each target shares the entrant's
+/// forwarding connection, so the clear is queued behind the writes
+/// `leave_target_for` already queued for it. Nothing in flight: empty.
+fn leave_clear_targets(node_context: &NodeContext) -> Vec<ForwardTarget> {
+    let leaving = node_context
+        .leaving
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(leave) = leaving.as_ref() else {
+        return Vec::new();
     };
-
-    Some(ForwardTarget {
-        addr,
-        connection,
-        token,
-        revoked: Arc::new(AtomicBool::new(false)),
-        as_handoff: false,
-    })
+    let mut survivors: Vec<&String> = leave
+        .addresses
+        .keys()
+        .filter(|name| **name != node_context.name)
+        .collect();
+    survivors.sort();
+    survivors
+        .into_iter()
+        .filter_map(|name| leave.forward_target(name))
+        .collect()
 }
 
 /// Forwards a client's `D` for `key` to `target`, mirroring
@@ -14981,6 +15028,199 @@ mod tests {
         assert!(frames.contains(&expected_b));
     }
 
+    #[test]
+    fn leave_clear_targets_names_every_survivor_the_roster_can_reach() {
+        let before_ring = Arc::new(HashRing::new(vec![
+            "leaver".to_string(),
+            "peer-a".to_string(),
+            "peer-b".to_string(),
+            "peer-c".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec![
+            "peer-a".to_string(),
+            "peer-b".to_string(),
+            "peer-c".to_string(),
+        ]));
+        let mut addresses = HashMap::new();
+        addresses.insert("leaver".to_string(), "127.0.0.1:1".to_string());
+        addresses.insert("peer-a".to_string(), "127.0.0.1:2".to_string());
+        addresses.insert("peer-b".to_string(), "127.0.0.1:3".to_string());
+        addresses.insert("peer-c".to_string(), "127.0.0.1:4".to_string());
+        let mut tokens = HashMap::new();
+        tokens.insert("leaver".to_string(), "tok-leaver".to_string());
+        tokens.insert("peer-a".to_string(), "tok-a".to_string());
+        tokens.insert("peer-b".to_string(), "tok-b".to_string());
+        // peer-c: no token in the roster — not a target.
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        // No decommission in flight: nothing to forward to.
+        assert!(leave_clear_targets(&node_context).is_empty());
+
+        *node_context.leaving.lock().unwrap() = Some(LeaveState {
+            before_ring,
+            after_ring,
+            replication: 2,
+            addresses,
+            tokens,
+            connections: Mutex::new(HashMap::new()),
+        });
+        let targets = leave_clear_targets(&node_context);
+        let addrs: Vec<&str> = targets.iter().map(|target| target.addr.as_str()).collect();
+        // Every survivor with an address and a token, never this node.
+        assert_eq!(addrs, vec!["127.0.0.1:2", "127.0.0.1:3"]);
+        assert!(targets.iter().all(|target| !target.as_handoff));
+        // The same shared connection a key's own forward uses, so the
+        // queue keeps the clear behind that write.
+        let via_key = {
+            let leaving = node_context.leaving.lock().unwrap();
+            leaving.as_ref().unwrap().forward_target("peer-a").unwrap()
+        };
+        assert!(Arc::ptr_eq(&via_key.connection, &targets[0].connection));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decommission_forwards_a_clear_behind_the_write_it_queued_for_the_entrant() {
+        // A client whose ring still names this draining node writes a key
+        // here and then clears the namespace on every node it knows. The
+        // write is queued for the entrant as a `U`; the clear used to go
+        // only to a join's targets, so the entrant applied the client's
+        // direct clear first and the late `U` brought the key back there,
+        // on that one owner. Now the clear follows the write on the same
+        // queue.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let before_ring = Arc::new(HashRing::new(vec![
+            "leaver".to_string(),
+            "peer".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec!["peer".to_string()]));
+        let owned = (0u32..1000)
+            .map(|index| format!("key-{index}"))
+            .find(|name| before_ring.is_owner(&key(name.as_bytes()), "leaver", 1))
+            .expect("an owned key in range");
+
+        let mut addresses = HashMap::new();
+        addresses.insert("leaver".to_string(), "127.0.0.1:1".to_string());
+        addresses.insert("peer".to_string(), peer_addr);
+        let mut tokens = HashMap::new();
+        tokens.insert("peer".to_string(), "tok-peer".to_string());
+
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(Some(LeaveState {
+                before_ring,
+                after_ring,
+                replication: 1,
+                addresses,
+                tokens,
+                connections: Mutex::new(HashMap::new()),
+            }))),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        // The write, then the clear of its (default) namespace.
+        let request = format!("S {} 2\n{owned}v1c 0\n", owned.len());
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"S\nC\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+
+        // Both forwards are queued before their acks; delivery is async.
+        for _ in 0..500 {
+            if frames.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        peer_task.abort();
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(
+            frames.len(),
+            2,
+            "the write and then the clear must reach the entrant: {frames:?}"
+        );
+        assert!(
+            frames[0].starts_with(b"U "),
+            "the write goes first, as a handoff: {:?}",
+            frames[0]
+        );
+        assert_eq!(
+            frames[1], b"c 0\n",
+            "the clear follows on the same connection"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn decommission_forwards_handoff_frames_it_receives_to_the_entrant() {
         // A draining node can be handed a key by `U`/`u` rather than `S`/`D`:
@@ -16789,6 +17029,11 @@ mod tests {
                             (fields[0] + fields[1] + fields[2] + fields[3], b"S\n")
                         } else if header.starts_with("u ") {
                             (fields[0] + fields[1] + fields[2], b"D\n")
+                        } else if header.starts_with("c ") {
+                            // A forwarded namespace clear: `c <ns-len>`.
+                            (fields[0], b"C\n")
+                        } else if header == "F" {
+                            (0, b"C\n")
                         } else {
                             panic!("unexpected frame {header:?}");
                         };
