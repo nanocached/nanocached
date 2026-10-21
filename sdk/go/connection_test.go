@@ -3,7 +3,9 @@ package nanocached
 import (
 	"errors"
 	"math"
+	"net"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +16,33 @@ import (
 // a leading `-`, and empty input, while still accepting leading zeros
 // ("007") since the server's own parse_length grammar (src/command.rs)
 // allows them.
+func TestARequestOnAConnectionPoisonedByATimeoutIsNotSentAndNotTimedOut(t *testing.T) {
+	// The closed-at-entry branch of attemptRequest reported the poison's
+	// own error for a request that never reached the wire. A poison from
+	// a request timeout carries errRequestTimedOut, which the retry
+	// layer reads as "do not redial": a never-sent Get or Incr on a
+	// connection another request had just timed out failed outright
+	// instead of being redialed.
+	client, server := net.Pipe()
+	defer server.Close()
+	conn := newConnection(client, func() {}, false, nil)
+	conn.poison(timedOut(connectionLost("no response from server within 1s (request timed out)", nil)))
+
+	_, _, _, _, err := conn.attemptRequest(func(uint32) []byte { return []byte("G 1\nk") })
+	if !errors.Is(err, errRequestNotSent) {
+		t.Fatalf("err = %v, want the not-sent marker", err)
+	}
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("err = %v, want ErrConnectionLost", err)
+	}
+	if errors.Is(err, errRequestTimedOut) {
+		t.Fatalf("err = %v, must not carry the earlier request's timed-out marker", err)
+	}
+	if !strings.Contains(err.Error(), "request timed out") {
+		t.Fatalf("err = %v, want the poison's cause kept as text", err)
+	}
+}
+
 func TestParseStrictUintRejectsAnythingButDigits(t *testing.T) {
 	tests := []struct {
 		name    string
