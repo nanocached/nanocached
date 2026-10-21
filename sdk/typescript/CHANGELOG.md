@@ -11,6 +11,12 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `setMany`/`setManyBytes` report a key as stored when the owner that
+  acknowledged it as a replica became its primary between the two
+  passes (the old primary answered `W` and left the roster): the key
+  sits on its primary, but the earlier acknowledgement was recorded as
+  a replica's and the key was missing from
+  `PartialConnectionLostError`'s stored keys.
 - A connection reset or broken pipe while the server answers the
   handshake throws `ConnectionLostError` (`requestWasSent` `false`, the
   system error as `cause`), as a failed dial does. It escaped as the
