@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -377,6 +378,44 @@ class CachingAnnotationsIntegrationTest {
         assertNotNull(cause, "want the re-entrance report in the cause chain, got " + error);
     }
 
+    @Test
+    void syncLoaderFailingWithAnErrorReleasesTheCallerWaitingBehindIt() throws Exception {
+        // Cache.get(key, loader) called directly (the aspect wraps a
+        // method's Error in a RuntimeException; a caller of the Cache
+        // API does not): the first caller's loader throws an Error once
+        // a second caller for the same key waits on that run's outcome,
+        // which only a RuntimeException used to settle — the waiter
+        // parked forever. It must see the run fail and load on its own.
+        Cache cache = context.getBean(CacheManager.class).getCache("users");
+        assertNotNull(cache);
+        CountDownLatch firstLoaderStarted = new CountDownLatch(1);
+        CountDownLatch secondCallerWaiting = new CountDownLatch(1);
+        String key = "erroring";
+        CompletableFuture<Throwable> first = CompletableFuture.supplyAsync(() -> {
+            try {
+                cache.get(key, () -> {
+                    firstLoaderStarted.countDown();
+                    secondCallerWaiting.await(5, TimeUnit.SECONDS);
+                    throw new AssertionError("simulated loader failure");
+                });
+                return null;
+            } catch (Throwable error) {
+                return error;
+            }
+        });
+        assertTrue(firstLoaderStarted.await(5, TimeUnit.SECONDS));
+        CompletableFuture<User> second = CompletableFuture.supplyAsync(
+                () -> cache.get(key, () -> new User(key, key.length())));
+        // The second caller is parked on the first run by now; let the
+        // first loader fail.
+        Thread.sleep(300);
+        secondCallerWaiting.countDown();
+
+        Throwable firstOutcome = first.get(8, TimeUnit.SECONDS);
+        assertTrue(firstOutcome instanceof AssertionError, "the first caller sees its loader's Error: " + firstOutcome);
+        assertEquals(key, second.get(8, TimeUnit.SECONDS).name(), "the waiter loads on its own");
+    }
+
     // ── a failing put after a successful sync load reaches the handler ──
 
     @Test
@@ -444,5 +483,16 @@ class CachingAnnotationsIntegrationTest {
                 "the lookup under the malformed key must have been rejected: " + CacheConfig.errorHandler.getErrors);
         service.findUser("x?");
         assertEquals(2, service.dbCalls(), "\"x?\" must still be a hit, untouched by the rejected key");
+    }
+
+    @Test
+    void aCharacterKeyThatIsALoneSurrogateIsRejectedLikeAStringHoldingOne() {
+        // `Character:` + the char, UTF-8 encoded, turns every lone
+        // surrogate into '?', so '\uD800' and '\uD801' addressed one entry.
+        DefaultCacheKeyConverter converter = new DefaultCacheKeyConverter();
+        IllegalArgumentException error =
+                assertThrows(IllegalArgumentException.class, () -> converter.toKeyBytes('\uD800'));
+        assertTrue(error.getMessage().contains("lone surrogate"), error.getMessage());
+        assertEquals("Character:x", new String(converter.toKeyBytes('x'), StandardCharsets.UTF_8));
     }
 }

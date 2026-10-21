@@ -50,6 +50,11 @@ public final class DefaultCacheKeyConverter implements CacheKeyConverter {
         if (key instanceof String text) {
             requireWellFormed(text);
         }
+        if (key instanceof Character c) {
+            // A lone surrogate char has the same '?' problem as a String
+            // holding one: every such key would address one entry.
+            requireWellFormed(String.valueOf(c));
+        }
         if (key instanceof String
                 || key instanceof Number
                 || key instanceof Boolean

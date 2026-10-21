@@ -152,6 +152,10 @@ public final class NanocachedCache extends AbstractValueAdaptingCache {
                     return (T) load(key, valueLoader, mine.outcome());
                 } finally {
                     loads.remove(loadKey, mine);
+                    // Whatever ended the run, the waiters are released:
+                    // a no-op after load() settled the outcome itself.
+                    mine.outcome().completeExceptionally(new IllegalStateException(
+                            "nanocached-spring: the value loader for key " + key + " did not complete"));
                 }
             }
             if (running.owner() == Thread.currentThread()) {
@@ -193,7 +197,11 @@ public final class NanocachedCache extends AbstractValueAdaptingCache {
             put(key, loaded);
             outcome.complete(toStoreValue(loaded));
             return loaded;
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | Error e) {
+            // An Error too (an assertion, a stack overflow, a failed
+            // class initialisation inside the loader): the callers
+            // waiting on this run used to park forever when only a
+            // RuntimeException settled the outcome.
             outcome.completeExceptionally(e);
             throw e;
         }
