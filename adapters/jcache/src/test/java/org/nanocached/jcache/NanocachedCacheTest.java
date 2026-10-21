@@ -588,6 +588,53 @@ class NanocachedCacheTest {
     }
 
     @Test
+    void getAllKeepsResolvingWhenTheFollowUpAfterAConnectionDropMeetsARingChange() {
+        // Chunk 2's two attempts drop, so the SDK throws
+        // PartialConnectionFailedRaw and the adapter makes its one
+        // follow-up call for the remainder. That call meets a ring
+        // change: the SDK throws PartialWrongNodeRaw, which used to
+        // escape getAll raw (not a CacheException) with chunk 1's 400
+        // resolved values discarded. The remainder now goes on through
+        // the wrong-node retry and the whole map comes back.
+        int keyCount = 401;
+        Map<String, String> seed = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < keyCount; i++) {
+            seed.put("k" + i, "v" + i);
+        }
+        cache.putAll(seed);
+        node.multiGetCount.set(0);
+        node.armMultiGetDrop(1, 2);
+        node.forceWrongNodeCountsForGet.put(
+                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("k400")), new AtomicInteger(2));
+
+        Map<String, String> all = cache.getAll(new java.util.LinkedHashSet<>(seed.keySet()));
+
+        assertEquals(seed, all);
+    }
+
+    @Test
+    void putAllKeepsResolvingWhenTheFollowUpAfterAConnectionDropMeetsARingChange() {
+        // The set-side twin: the adapter's one follow-up for the
+        // positions not yet confirmed stored meets a W, which used to
+        // escape putAll as the SDK's raw WrongNode with those keys never
+        // stored. It is resent through the wrong-node retry instead.
+        int keyCount = 401;
+        Map<String, String> seed = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < keyCount; i++) {
+            seed.put("k" + i, "v" + i);
+        }
+        node.armMultiSetDrop(1, 2);
+        node.forceWrongNodeCountsForSet.put(
+                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("k400")), new AtomicInteger(1));
+
+        cache.putAll(seed);
+
+        for (int i = 0; i < keyCount; i++) {
+            assertEquals("v" + i, cache.get("k" + i), "key k" + i + " must have landed");
+        }
+    }
+
+    @Test
     void putAllRetriesTheRemainderAfterAMidBatchConnectionDropOnSet() {
         // Analogous to getAllRetriesAndMergesTheRemainderAfterAMidBatchConnectionDrop
         // above, but for putAll/setManyBytes: NanocachedException.
@@ -1200,5 +1247,15 @@ class NanocachedCacheTest {
         assertThrows(IllegalArgumentException.class, () -> cache.put("x\uD800", "surrogate"));
         assertThrows(IllegalArgumentException.class, () -> cache.get("x\uD800"));
         assertEquals("question", cache.get("x?"));
+    }
+
+    @Test
+    void aCharacterKeyThatIsALoneSurrogateIsRejectedLikeAStringHoldingOne() {
+        // `Character:` + the char, UTF-8 encoded, turns every lone
+        // surrogate into '?', so '\uD800' and '\uD801' addressed one entry.
+        IllegalArgumentException error =
+                assertThrows(IllegalArgumentException.class, () -> KeyCodec.toKeyBytes('\uD800'));
+        assertTrue(error.getMessage().contains("lone surrogate"), error.getMessage());
+        assertEquals("Character:x", new String(KeyCodec.toKeyBytes('x'), java.nio.charset.StandardCharsets.UTF_8));
     }
 }

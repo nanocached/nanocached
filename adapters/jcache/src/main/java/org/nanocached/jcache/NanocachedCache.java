@@ -345,15 +345,26 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * expect a third or fourth attempt to behave differently. This method
      * therefore makes exactly one direct follow-up call for the remainder
      * named by {@code unresolvedIndices} — not another trip through the
-     * {@code for} loop above, and not gated by {@link
-     * #MAX_BULK_WRONG_NODE_RETRIES} — and either merges its result and
-     * returns, or lets it propagate unchanged so a genuine failure is
-     * never silently reported as a set of misses.
+     * {@code for} loop's wrong-node budget — and either merges its result
+     * and returns, or reports the second failure as the {@link
+     * CacheException} every operation declares, so a genuine failure is
+     * never silently reported as a set of misses. The follow-up is one
+     * more round of the same loop (gated by {@code connectionRetried},
+     * not by {@link #MAX_BULK_WRONG_NODE_RETRIES}), so what it throws is
+     * handled like any round's outcome: a remainder that meets a ring
+     * change goes on through the wrong-node branch with its resolved
+     * values kept, instead of escaping as the SDK's raw partial
+     * exception with those values discarded.
+     *
+     * <p>A whole-batch {@link NanocachedException.WrongNode} (no
+     * per-key outcome attached) is retried like {@link #putAll}'s, under
+     * the same budget.
      */
     private byte[][] getManyBytesResolvingWrongNode(byte[][] wireKeys) {
         byte[][] result = new byte[wireKeys.length][];
         int[] positions = identityPositions(wireKeys.length);
         byte[][] pending = wireKeys;
+        boolean connectionRetried = false;
         for (int attempt = 0; ; attempt++) {
             try {
                 byte[][] values = namespace.getManyBytes(pending);
@@ -368,32 +379,39 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 if (attempt >= MAX_BULK_WRONG_NODE_RETRIES) {
                     throw Wire.failure(partial);
                 }
-                int[] unresolved = partial.unresolvedIndices;
-                int[] nextPositions = new int[unresolved.length];
-                byte[][] nextPending = new byte[unresolved.length][];
-                for (int i = 0; i < unresolved.length; i++) {
-                    nextPositions[i] = positions[unresolved[i]];
-                    nextPending[i] = pending[unresolved[i]];
+                Remainder remainder = Remainder.of(positions, pending, partial.unresolvedIndices);
+                positions = remainder.positions;
+                pending = remainder.pending;
+            } catch (NanocachedException.WrongNode error) {
+                if (attempt >= MAX_BULK_WRONG_NODE_RETRIES) {
+                    throw Wire.failure(error);
                 }
-                positions = nextPositions;
-                pending = nextPending;
             } catch (NanocachedException.PartialConnectionFailedRaw partial) {
                 for (int i = 0; i < positions.length; i++) {
                     result[positions[i]] = partial.partialValues[i];
                 }
-                int[] unresolved = partial.unresolvedIndices;
-                int[] nextPositions = new int[unresolved.length];
-                byte[][] nextPending = new byte[unresolved.length][];
-                for (int i = 0; i < unresolved.length; i++) {
-                    nextPositions[i] = positions[unresolved[i]];
-                    nextPending[i] = pending[unresolved[i]];
+                if (connectionRetried) {
+                    throw Wire.failure(partial);
                 }
-                byte[][] retryValues = namespace.getManyBytes(nextPending);
-                for (int i = 0; i < nextPositions.length; i++) {
-                    result[nextPositions[i]] = retryValues[i];
-                }
-                return result;
+                connectionRetried = true;
+                Remainder remainder = Remainder.of(positions, pending, partial.unresolvedIndices);
+                positions = remainder.positions;
+                pending = remainder.pending;
             }
+        }
+    }
+
+    /** The keys of a batch still unresolved after one round, with the
+     * positions they came from. */
+    private record Remainder(int[] positions, byte[][] pending) {
+        static Remainder of(int[] positions, byte[][] pending, int[] unresolved) {
+            int[] nextPositions = new int[unresolved.length];
+            byte[][] nextPending = new byte[unresolved.length][];
+            for (int i = 0; i < unresolved.length; i++) {
+                nextPositions[i] = positions[unresolved[i]];
+                nextPending[i] = pending[unresolved[i]];
+            }
+            return new Remainder(nextPositions, nextPending);
         }
     }
 
@@ -739,12 +757,17 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * what's outstanding (a successful {@code setManyBytes} has no
      * positional array of its own to splice an answer into — see the
      * exception's own doc), so this builds the complement — the positions
-     * NOT yet confirmed stored — and makes exactly one direct follow-up
+     * NOT yet confirmed stored — and makes exactly one follow-up
      * {@code setManyBytes} call for just that remainder (safe to retry
      * for the same idempotency reason as the whole-group resend above),
-     * letting a genuine second failure propagate unchanged.
+     * reporting a genuine second failure as the {@link CacheException}
+     * every operation declares. The follow-up is one more round of the
+     * same loop (gated by {@code connectionRetried}), so a remainder
+     * that meets a ring change is resent through the wrong-node branch
+     * instead of escaping as the SDK's raw exception.
      */
     private void setManyBytesResolvingWrongNode(byte[][] keys, byte[][] values, long ttlSeconds) {
+        boolean connectionRetried = false;
         for (int attempt = 0; ; attempt++) {
             try {
                 namespace.setManyBytes(keys, values, ttlSeconds);
@@ -754,6 +777,10 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                     throw Wire.failure(error);
                 }
             } catch (NanocachedException.PartialConnectionFailedSetRaw partial) {
+                if (connectionRetried) {
+                    throw Wire.failure(partial);
+                }
+                connectionRetried = true;
                 boolean[] isSucceeded = new boolean[keys.length];
                 for (int index : partial.succeededIndices) {
                     isSucceeded[index] = true;
@@ -777,8 +804,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                         j++;
                     }
                 }
-                namespace.setManyBytes(remainingKeys, remainingValues, ttlSeconds);
-                return;
+                keys = remainingKeys;
+                values = remainingValues;
             }
         }
     }
