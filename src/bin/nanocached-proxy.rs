@@ -5389,6 +5389,11 @@ async fn run(
         "INFO nanocached-proxy listening on {local} (discovery: {})",
         args.discovery.join(",")
     );
+    nanocached::infra::warn_if_exposed_without_secret(
+        "nanocached-proxy",
+        local,
+        context.secret.is_some(),
+    );
 
     let limits = connection_limits(&args);
     let permits = Arc::new(Semaphore::new(limits.max_connections));

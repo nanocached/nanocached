@@ -12,6 +12,17 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Added
+
+- `nanocached-node`, `nanocached-discovery` and `nanocached-proxy` print a
+  one-line `WARN` at startup when they listen on an address that is not
+  loopback and `NANOCACHED_AUTH_SECRET` is unset or empty: anyone who can
+  reach the port can then read and write every entry. The check uses the
+  address the listener actually bound, so `--host localhost` stays silent
+  and a specific private address warns like `0.0.0.0`. Startup is not
+  refused (a container has to listen on `0.0.0.0`); set a secret, bind
+  loopback, or restrict the port at the network layer.
+
 ## [0.4.8] - 2026-10-21
 
 ### Fixed

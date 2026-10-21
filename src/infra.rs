@@ -313,6 +313,34 @@ pub async fn write_http_response(
     stream.shutdown().await
 }
 
+// ─── startup exposure warning ───────────────────────────────────────────
+
+/// Whether a server bound to `local` with (`has_secret`) or without a
+/// shared secret can be reached from off this machine by anyone who can
+/// open a connection. Judged on the address the listener actually bound,
+/// not on the `--host` string: a hostname resolves to whatever was
+/// bound. Any non-loopback address counts, not only a public one — the
+/// question is whether the port is reachable from another host, not
+/// whether the internet can reach it.
+pub fn exposed_without_secret(local: SocketAddr, has_secret: bool) -> bool {
+    // `::ffff:127.0.0.1` is loopback, but `Ipv6Addr::is_loopback` says no.
+    !has_secret && !local.ip().to_canonical().is_loopback()
+}
+
+/// Prints one `WARN` line when `exposed_without_secret`. Never stops
+/// startup: a container has to listen on `0.0.0.0`, and the platform's
+/// network rules (a security group, a NetworkPolicy, a firewall) are a
+/// legitimate way to restrict who connects.
+pub fn warn_if_exposed_without_secret(who: &str, local: SocketAddr, has_secret: bool) {
+    if exposed_without_secret(local, has_secret) {
+        eprintln!(
+            "{who}: WARN listening on {local} with no auth secret: anyone who can reach this \
+             port can read and write every entry; set NANOCACHED_AUTH_SECRET, or make sure the \
+             network (security group, NetworkPolicy, firewall) restricts who can connect"
+        );
+    }
+}
+
 // ─── constant-time comparison ───────────────────────────────────────────
 
 /// Compares two byte strings without leaking, via timing, how many leading
@@ -474,6 +502,56 @@ pub async fn reject_over_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn socket(address: &str) -> SocketAddr {
+        address.parse().unwrap()
+    }
+
+    #[test]
+    fn a_loopback_listener_without_a_secret_is_not_exposed() {
+        assert!(!exposed_without_secret(socket("127.0.0.1:8356"), false));
+        assert!(!exposed_without_secret(socket("[::1]:8356"), false));
+        // Anywhere in 127.0.0.0/8, and the IPv4-mapped spelling a
+        // dual-stack socket reports.
+        assert!(!exposed_without_secret(socket("127.1.2.3:8356"), false));
+        assert!(!exposed_without_secret(
+            socket("[::ffff:127.0.0.1]:8356"),
+            false
+        ));
+    }
+
+    #[test]
+    fn an_all_interfaces_listener_without_a_secret_is_exposed() {
+        assert!(exposed_without_secret(socket("0.0.0.0:8356"), false));
+        assert!(exposed_without_secret(socket("[::]:8356"), false));
+    }
+
+    #[test]
+    fn any_specific_non_loopback_address_without_a_secret_is_exposed() {
+        // Private and public alike: the check is reachability from off the
+        // machine, not whether the address is routable on the internet.
+        assert!(exposed_without_secret(socket("10.0.3.7:8356"), false));
+        assert!(exposed_without_secret(socket("192.168.1.5:8356"), false));
+        assert!(exposed_without_secret(socket("203.0.113.9:8356"), false));
+        assert!(exposed_without_secret(socket("[fd00::1]:8356"), false));
+    }
+
+    #[test]
+    fn a_secret_silences_the_warning_on_every_address() {
+        for address in ["127.0.0.1:1", "0.0.0.0:1", "10.0.3.7:1", "[::]:1"] {
+            assert!(!exposed_without_secret(socket(address), true), "{address}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hostname_is_judged_by_the_address_it_bound() {
+        let listener = tokio::net::TcpListener::bind(("localhost", 0))
+            .await
+            .unwrap();
+        let local = listener.local_addr().unwrap();
+        assert!(local.ip().is_loopback(), "{local}");
+        assert!(!exposed_without_secret(local, false));
+    }
 
     #[test]
     fn constant_time_eq_matches_identical_byte_strings() {
