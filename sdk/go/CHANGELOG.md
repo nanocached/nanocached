@@ -12,6 +12,13 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A request made on a connection another request had just timed out is
+  redialed like any request that never reached the wire. It was
+  reported with the earlier request's timed-out marker, which the retry
+  layer reads as "do not redial", so a `Get` or `Incr` that was never
+  sent failed outright. A write that blocks past the request deadline
+  now also drains the requests pipelined behind it as timed out, so
+  they are not resent against the same stalled peer.
 - A node at its connection limit, which answers `B` and closes, is
   reported as busy (`ErrConnectionLost`, naming the limit) after one
   dial. The two-byte reply used to end the three-byte identity read
