@@ -2061,6 +2061,18 @@ async fn handle_clear(
             )
             .await;
         }
+        // An eviction's re-replication in flight: the same ordering for
+        // the owners the change promoted, which this node mirrors its
+        // client writes to (`rereplication_targets_for_hashed`).
+        for target in rereplication_clear_targets(node_context) {
+            spawn_forward(
+                config,
+                node_context.clone(),
+                target,
+                OwnedForwardedWrite::Clear(scope.clone()),
+            )
+            .await;
+        }
         if let ClearRoute::Forward(target) = route_clear(node_context, &scope) {
             spawn_forward(
                 config,
@@ -3352,7 +3364,10 @@ async fn handle_connection(
                     .await;
                 }
                 if matches!(response, Response::Cleared(removed) if removed > 0) {
-                    for target in leave_clear_targets(&node_context) {
+                    for target in leave_clear_targets(&node_context)
+                        .into_iter()
+                        .chain(rereplication_clear_targets(&node_context))
+                    {
                         spawn_forward(
                             &config,
                             node_context.clone(),
@@ -9673,6 +9688,43 @@ fn rereplication_targets_for_hashed(
     .iter()
     .filter_map(|name| window.forward_target(name))
     .collect()
+}
+
+/// Where a clear must also go while an eviction's re-replication is in
+/// flight (or inside its grace): every member of the ring after the
+/// change except this node, since any of them is the owner the change
+/// promoted for some of the keys this node sends, and a clear is not
+/// tied to a key (the re-replication twin of `leave_clear_targets`).
+/// Each target shares the window's forwarding connection, so the clear
+/// is queued behind the writes `rereplication_targets_for_hashed`
+/// already mirrored to it: a write this node acknowledged and queued for
+/// a promoted owner must not land there after the owner's own clear.
+/// Nothing in flight: empty.
+fn rereplication_clear_targets(node_context: &NodeContext) -> Vec<ForwardTarget> {
+    let mut slot = node_context
+        .rereplication_forward
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|window| !window.forwarding_open())
+    {
+        *slot = None;
+    }
+    let Some(window) = slot.as_ref() else {
+        return Vec::new();
+    };
+    let mut members: Vec<&String> = window
+        .after_ring
+        .nodes()
+        .iter()
+        .filter(|name| **name != node_context.name)
+        .collect();
+    members.sort();
+    members
+        .into_iter()
+        .filter_map(|name| window.forward_target(name))
+        .collect()
 }
 
 /// Every window a client write of `key` must be mirrored through as a
@@ -16157,6 +16209,159 @@ mod tests {
             ..node_context
         };
         assert!(handoff_targets_for(&other, &k).is_empty());
+    }
+
+    #[test]
+    fn rereplication_clear_targets_name_every_other_member_while_the_window_is_open() {
+        let node_context = NodeContext {
+            name: "me".to_string(),
+            token: "tk-me".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+        assert!(rereplication_clear_targets(&node_context).is_empty());
+
+        *node_context.rereplication_forward.lock().unwrap() =
+            Some(rereplication_window("127.0.0.1:2", None));
+        let targets = rereplication_clear_targets(&node_context);
+        assert_eq!(
+            targets.len(),
+            1,
+            "every member of the ring after the change but this node"
+        );
+        assert_eq!(targets[0].addr, "127.0.0.1:2");
+        assert_eq!(targets[0].token, "tok-peer");
+        // The same connection the mirrored writes use, so the clear
+        // queues behind them.
+        assert!(Arc::ptr_eq(
+            &targets[0].connection,
+            &handoff_targets_for(&node_context, &key(b"any"))[0].connection
+        ));
+
+        *node_context.rereplication_forward.lock().unwrap() = Some(rereplication_window(
+            "127.0.0.1:2",
+            Some(Instant::now() - FORWARDING_GRACE_BASE - Duration::from_secs(1)),
+        ));
+        assert!(rereplication_clear_targets(&node_context).is_empty());
+        assert!(node_context.rereplication_forward.lock().unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_survivor_forwards_a_clear_to_the_promoted_owner_behind_the_write_it_mirrored() {
+        // After `dead` was evicted, `me` mirrors a client's write of a key
+        // to `peer`, the owner the change promoted. The client then
+        // clears every node it knows — `peer` directly, and `me`. The
+        // mirrored write used to be the only thing on `peer`'s queue, so
+        // it could land after `peer`'s own clear and leave the cleared
+        // key on that one owner; the clear now follows it on the same
+        // connection. A forwarded clear (`f`) that removed something
+        // here follows too.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let node_context = NodeContext {
+            name: "me".to_string(),
+            token: "tk-me".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            rereplication_forward: Arc::new(Mutex::new(Some(rereplication_window(
+                &peer_addr, None,
+            )))),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        // The client's write and clear, then a handoff write and a
+        // forwarded clear that removes it, then the same forwarded clear
+        // again, which removes nothing.
+        let mut reply = [0_u8; 2];
+        for (frame, expected_reply) in [
+            (&b"S 3 2\nkeyv1"[..], &b"S\n"[..]),
+            (b"c 0\n", b"C\n"),
+            (b"U 0 3 2 5\ntk-mekeyv2", b"S\n"),
+            (b"f 0 5 A\ntk-me", b"C\n"),
+            (b"f 0 5 A\ntk-me", b"C\n"),
+        ] {
+            client.write_all(frame).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+                .await
+                .expect("a reply within 5 s")
+                .unwrap();
+            assert_eq!(&reply, expected_reply, "{frame:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        client.shutdown().await.unwrap();
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+        peer_task.abort();
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(
+            frames,
+            vec![
+                b"U 0 3 2 8\ntok-peerkeyv1".to_vec(),
+                b"f 0 8\ntok-peer".to_vec(),
+                b"U 0 3 2 8\ntok-peerkeyv2".to_vec(),
+                b"f 0 8 A\ntok-peer".to_vec(),
+            ],
+            "each clear follows the write queued before it; the forwarded clear that found \
+             nothing stays here"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

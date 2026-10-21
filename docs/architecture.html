@@ -361,8 +361,9 @@ here.</p>
   a key rewritten or invalidated within seconds of a write via an old
   owner may keep the previous value until the next write or TTL expiry
   (a lagging unconditional forward; relay coalescing). A clear is
-  forwarded through both windows behind the writes queued before it, so
-  a cleared key does not come back from such a forward; the mirror case
+  forwarded through every window (a join&rsquo;s, a decommission&rsquo;s,
+  and an eviction&rsquo;s re-replication) behind the writes queued before
+  it, so a cleared key does not come back from such a forward; the mirror case
   remains: a client whose node list dropped the old owner between its
   write and its clear sends the clear only to the new owners, and the
   old owner&rsquo;s late forward can bring that one write back. The

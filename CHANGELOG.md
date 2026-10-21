@@ -14,6 +14,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node` forwards a clear it receives while re-replicating
+  after an eviction to every other member of the new ring, behind the
+  writes it has already mirrored to the owners the change promoted. The
+  clear used to go through a join's and a decommission's window only,
+  so a write this node had acknowledged and mirrored to a promoted
+  owner could land there after the client's own clear and leave the
+  cleared key on that one owner.
 - `nanocached-node` asks discovery for the list clients route by (`L`)
   when it refreshes the published roster before refusing a key, no
   longer for the node roster (`T`), which lists every registered node,
