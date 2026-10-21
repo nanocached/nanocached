@@ -209,9 +209,19 @@ internal sealed class Connection
     {
         // A stale callback — the deadline was cleared or pushed forward
         // after this fired — does nothing; the re-armed timer covers the
-        // new deadline.
-        long deadline = Volatile.Read(ref _deadlineTicks);
-        if (deadline == 0 || Environment.TickCount64 < deadline) return;
+        // new deadline. Decided under the gate ArmDeadline and
+        // ClearDeadline take, so a response being dispatched right now
+        // (its ClearDeadline, or the re-arm for the next request) has
+        // either already moved the deadline, which this sees, or runs
+        // after this returns; read without it, this could see a deadline
+        // a concurrent ClearDeadline was about to zero and close a
+        // connection that had just answered.
+        lock (_deadlineGate)
+        {
+            long deadline = Volatile.Read(ref _deadlineTicks);
+            if (deadline == 0 || Environment.TickCount64 < deadline) return;
+            if (Volatile.Read(ref _outstanding) == 0) return; // answered, about to be cleared
+        }
         // Poison with the timeout as the drain reason: CloseWithReason
         // disposes the stream, which is what actually unblocks the read
         // loop (and any in-flight write) with an IO error, and rejects the
