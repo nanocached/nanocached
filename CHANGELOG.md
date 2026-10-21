@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node` asks discovery for the list clients route by (`L`)
+  when it refreshes the published roster before refusing a key, no
+  longer for the node roster (`T`), which lists every registered node,
+  a waiting or joining one included: under a ring with such a node in
+  it the node owned fewer keys than under the published list, so the
+  refresh refused, for the rest of a heartbeat, the keys it exists to
+  serve. A refresh also no longer replaces a roster the heartbeat loop
+  noted while the ask was in flight, which is the newer view.
 - `nanocached-node` no longer hangs a client connection on a forward
   queue that has no drainer. A write forwarded to a joiner or an
   entrant waits for room when that target's queue is full, until the
