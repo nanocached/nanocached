@@ -3257,6 +3257,11 @@ async fn run(
     metrics_address: Option<String>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
+    nanocached::infra::warn_if_exposed_without_secret(
+        "discovery",
+        listener.local_addr()?,
+        auth_secret.is_some(),
+    );
     let cluster_state = ClusterState {
         registry: Arc::new(RegistryState::default()),
         current_join: Arc::new(Mutex::new(None)),

@@ -138,7 +138,12 @@ on both roles to protect a cluster:</p>
 <pre><code>NANOCACHED_AUTH_SECRET=change-me nanocached-node --port 8356 --discovery 127.0.0.1:8357
 NANOCACHED_AUTH_SECRET=change-me nanocached-discovery --port 8357</code></pre>
 <p>Nodes reuse the same value to authenticate their own heartbeats.
-Unset (or empty) disables authentication entirely. Authentication is a
+Unset (or empty) disables authentication entirely, and a server that
+then listens on anything but a loopback address prints a one-line
+<code>WARN</code> at startup (it still starts: a container has to listen
+on <code>0.0.0.0</code>). Set a secret, bind to <code>127.0.0.1</code>, or
+make sure the network (a security group, a NetworkPolicy, a firewall)
+restricts who can connect. Authentication is a
 second layer of defense, not a substitute for network isolation: without
 TLS there is no transport encryption, so bind to <code>127.0.0.1</code>
 or a private interface and add TLS when the network is not trusted.</p>

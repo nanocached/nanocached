@@ -1047,6 +1047,11 @@ pub(crate) async fn run(
     namespace_budgets: Vec<(Bytes, usize)>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
+    infra::warn_if_exposed_without_secret(
+        "nanocached-node",
+        listener.local_addr()?,
+        auth_secret.is_some(),
+    );
 
     let (request_tx, request_rx) = mpsc::channel(1024);
     let connection_limit = Arc::new(Semaphore::new(limits.max_connections));
