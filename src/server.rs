@@ -565,6 +565,69 @@ async fn spawn_forward(
     enqueue_forwards(config, node_context, target, std::iter::once(write)).await;
 }
 
+/// What a client write left on this node, as a forward carries it: the
+/// literal result, never the command that produced it. An `i`, `k` or `x`
+/// is not replayed on the receiving node — a joiner that already holds the
+/// key from an earlier transfer would double-apply the increment, and one
+/// re-evaluating a condition against its own copy could reach a different
+/// outcome than the primary just did — so those forward as the `Set` or
+/// `Delete` they resulted in.
+enum ForwardedResult {
+    Set { value: Bytes, ttl: Option<Duration> },
+    Delete,
+}
+
+/// Forwards a client write's `result` for `key` to every node that must
+/// see it while a membership change is in flight, in this order:
+///
+/// * The joiner of a staged node join, if the key is one an in-progress
+///   handoff is moving to it — see `migration_targets_for`. Handed to
+///   `run`'s own loop via `forward_tx` (mirroring the `M` handler, which
+///   uses `migration_tx`), not awaited inline — see
+///   `forward_with_retries`'s own doc comment for why.
+/// * The key's post-leave entrant of a decommission in flight (issue #124),
+///   or the owner an eviction promoted — see `handoff_targets_for`. As a
+///   `U`/`u`, not a plain `S`/`D`: until the post-leave roster publishes
+///   the entrant doesn't own the key yet and answers `S` with `W`.
+///
+/// Every single-key client write (`S`, `D`, `i`, `k`, `x`) goes through
+/// here, so one of them cannot forget either forward by omission (the
+/// bulk `o` once did, issue #176). Two things deliberately do not: the
+/// bulk `o` groups its keys per target and queues them with
+/// `enqueue_forwards`, and a handoff frame this node received (`U`, `u`)
+/// follows its own rules (`unconfirmed_join_target_for`, and an
+/// `if_absent` that is passed on).
+async fn forward_result(config: &ConnectionConfig, key: &Key, result: ForwardedResult) {
+    let Some(node_context) = &config.node_context else {
+        return;
+    };
+
+    for target in migration_targets_for(node_context, key) {
+        let write = match &result {
+            ForwardedResult::Set { value, ttl } => OwnedForwardedWrite::Set {
+                key: key.clone(),
+                value: value.clone(),
+                ttl: *ttl,
+            },
+            ForwardedResult::Delete => OwnedForwardedWrite::Delete { key: key.clone() },
+        };
+        spawn_forward(config, node_context.clone(), target, write).await;
+    }
+
+    for target in handoff_targets_for(node_context, key) {
+        let write = match &result {
+            ForwardedResult::Set { value, ttl } => OwnedForwardedWrite::HandoffSet {
+                key: key.clone(),
+                value: value.clone(),
+                ttl: *ttl,
+                if_absent: false,
+            },
+            ForwardedResult::Delete => OwnedForwardedWrite::HandoffDelete { key: key.clone() },
+        };
+        spawn_forward(config, node_context.clone(), target, write).await;
+    }
+}
+
 /// `spawn_forward` for many writes to one target, under a single hold of
 /// the queue lock (a `MultiSet` can carry hundreds of thousands of keys).
 async fn enqueue_forwards(
@@ -2757,49 +2820,7 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                // Staged node join: this key may be one an in-progress handoff is
-                // moving to a joining node — see `migration_targets_for`.
-                if let Some(node_context) = &config.node_context {
-                    for target in migration_targets_for(node_context, &key) {
-                        // Handed to `run`'s own loop via `forward_tx`
-                        // (mirroring the `M` handler above, which uses
-                        // `migration_tx`), not awaited inline — see
-                        // `forward_with_retries`'s own doc comment for why.
-                        spawn_forward(
-                            &config,
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::Set {
-                                key: key.clone(),
-                                value: value.clone(),
-                                ttl,
-                            },
-                        )
-                        .await;
-                    }
-                }
-
-                // Issue #124: mirror for a decommission in flight — the
-                // key's post-leave entrant must see this write too. As a
-                // `U`, not a plain `S`: until the post-leave roster
-                // publishes, the entrant doesn't own the key yet and
-                // answers `S` with `W`.
-                if let Some(node_context) = &config.node_context {
-                    for target in handoff_targets_for(node_context, &key) {
-                        spawn_forward(
-                            &config,
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::HandoffSet {
-                                key: key.clone(),
-                                value: value.clone(),
-                                ttl,
-                                if_absent: false,
-                            },
-                        )
-                        .await;
-                    }
-                }
+                forward_result(&config, &key, ForwardedResult::Set { value, ttl }).await;
 
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
 
@@ -3042,31 +3063,7 @@ async fn handle_connection(
 
                 let response =
                     execute_command(&request_tx, Command::Delete { key: key.clone() }).await?;
-                if let Some(node_context) = &config.node_context {
-                    for target in migration_targets_for(node_context, &key) {
-                        spawn_forward(
-                            &config,
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::Delete { key: key.clone() },
-                        )
-                        .await;
-                    }
-                }
-
-                // Issue #124: see the `S` arm's decommission mirror —
-                // a `u`, not a plain `D`, for the same wrong-node reason.
-                if let Some(node_context) = &config.node_context {
-                    for target in handoff_targets_for(node_context, &key) {
-                        spawn_forward(
-                            &config,
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::HandoffDelete { key: key.clone() },
-                        )
-                        .await;
-                    }
-                }
+                forward_result(&config, &key, ForwardedResult::Delete).await;
 
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
 
@@ -3091,47 +3088,15 @@ async fn handle_connection(
                 .await?;
                 // Issue #129: only a `Response::Incremented` — i.e. INCR
                 // actually wrote a new value — needs forwarding;
-                // `NotFound`/`NotNumeric` changed nothing. Forwarded as
-                // the resulting *absolute* value via a plain `Set`/
-                // `HandoffSet`, never as `Incr` itself: replaying the
-                // increment on a joining/entrant node that already has
-                // this key from an earlier transfer would double-apply
-                // it (see `Command::Incr`'s doc comment). The remaining
+                // `NotFound`/`NotNumeric` changed nothing. The remaining
                 // TTL rides along so the receiving node's copy doesn't
                 // come back TTL-less.
                 if let Response::Incremented(ref value, ttl) = response {
-                    if let Some(node_context) = &config.node_context {
-                        for target in migration_targets_for(node_context, &key) {
-                            spawn_forward(
-                                &config,
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::Set {
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                    ttl,
-                                },
-                            )
-                            .await;
-                        }
-                    }
-
-                    if let Some(node_context) = &config.node_context {
-                        for target in handoff_targets_for(node_context, &key) {
-                            spawn_forward(
-                                &config,
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::HandoffSet {
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                    ttl,
-                                    if_absent: false,
-                                },
-                            )
-                            .await;
-                        }
-                    }
+                    let result = ForwardedResult::Set {
+                        value: value.clone(),
+                        ttl,
+                    };
+                    forward_result(&config, &key, result).await;
                 }
 
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
@@ -3167,46 +3132,10 @@ async fn handle_connection(
                 .await?;
                 // Issue #141: only `Response::Stored` — i.e. the condition
                 // held and CAS actually wrote — needs forwarding; a
-                // `NotFound` (mismatch) changed nothing. Forwarded as an
-                // ordinary `Set`/`HandoffSet` carrying the literal new
-                // value, never as `k` itself: a joining/entrant node
-                // re-evaluating the same condition against its own
-                // (possibly different) copy could reach a different
-                // outcome than the primary just did (see `Cache::cas_set`'s
-                // doc comment).
+                // `NotFound` (mismatch) changed nothing (see
+                // `Cache::cas_set`'s doc comment).
                 if matches!(response, Response::Stored) {
-                    if let Some(node_context) = &config.node_context {
-                        for target in migration_targets_for(node_context, &key) {
-                            spawn_forward(
-                                &config,
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::Set {
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                    ttl,
-                                },
-                            )
-                            .await;
-                        }
-                    }
-
-                    if let Some(node_context) = &config.node_context {
-                        for target in handoff_targets_for(node_context, &key) {
-                            spawn_forward(
-                                &config,
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::HandoffSet {
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                    ttl,
-                                    if_absent: false,
-                                },
-                            )
-                            .await;
-                        }
-                    }
+                    forward_result(&config, &key, ForwardedResult::Set { value, ttl }).await;
                 }
 
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
@@ -3236,32 +3165,9 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                // Same "forward the literal result, never `x` itself"
-                // rule as `CasSet`.
+                // Same rule as `CasSet`: only a delete that happened.
                 if matches!(response, Response::Deleted) {
-                    if let Some(node_context) = &config.node_context {
-                        for target in migration_targets_for(node_context, &key) {
-                            spawn_forward(
-                                &config,
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::Delete { key: key.clone() },
-                            )
-                            .await;
-                        }
-                    }
-
-                    if let Some(node_context) = &config.node_context {
-                        for target in handoff_targets_for(node_context, &key) {
-                            spawn_forward(
-                                &config,
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::HandoffDelete { key: key.clone() },
-                            )
-                            .await;
-                        }
-                    }
+                    forward_result(&config, &key, ForwardedResult::Delete).await;
                 }
 
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
@@ -16460,6 +16366,274 @@ mod tests {
         // newer than anything the pass carries.
         assert_eq!(frames[0], b"U 0 3 2 8\ntok-peerkeyv1");
         assert_eq!(frames[1], b"u 0 3 8\ntok-peerkey");
+    }
+
+    /// Issue #833: runs `exchanges` (a request frame and the reply it must
+    /// get, and how many frames it must forward to each peer) through one
+    /// client connection of a node that has both kinds of
+    /// forward open at once — a join in flight, whose joiner is a
+    /// migration target (`migration_targets_for`), and an eviction mirror,
+    /// whose promoted owner is a handoff target (`handoff_targets_for`).
+    /// Each exchange waits for its own forwards to arrive before the next
+    /// one starts, since the forward queue replaces a queued write with a
+    /// later one to the same key. Returns the frames each of the two peers
+    /// recorded; a write that forgets one of the two forwards leaves one
+    /// peer short, and a no-op that forwards anyway adds a frame.
+    async fn frames_forwarded_to_joiner_and_promoted_owner(
+        exchanges: &[(&[u8], &[u8], usize)],
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let joiner_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joiner_addr = joiner_listener.local_addr().unwrap().to_string();
+        let (joiner_frames, joiner_task) = spawn_recording_peer(joiner_listener);
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (peer_frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let node_context = NodeContext {
+            name: "me".to_string(),
+            token: "tk-me".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            // Two members at R = 2: the joiner is in every key's top-R.
+            active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
+                joining_name: "joiner-0".to_string(),
+                joining_addr: joiner_addr,
+                joining_token: "tok-joiner-0".to_string(),
+                after_ring: Arc::new(HashRing::new(vec![
+                    "me".to_string(),
+                    "joiner-0".to_string(),
+                ])),
+                replication: 2,
+                generation: None,
+                completed_at: None,
+                forwarding_grace: Duration::from_secs(60),
+                acked_entries: None,
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: Vec::new(),
+                confirmed: false,
+                pre_completion_ring: None,
+                pending_clears: PendingClears::default(),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
+                lingering: Vec::new(),
+                remnant: false,
+            }))),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            rereplication_forward: Arc::new(Mutex::new(Some(rereplication_window(
+                &peer_addr, None,
+            )))),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        let mut expected_frames = 0;
+        for (request, expected_reply, forwards) in exchanges {
+            client.write_all(request).await.unwrap();
+            let mut reply = vec![0u8; expected_reply.len()];
+            let read = tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "no reply within 5 s to {}",
+                        String::from_utf8_lossy(request)
+                    )
+                });
+            read.unwrap();
+            assert_eq!(
+                reply,
+                *expected_reply,
+                "reply to {}",
+                String::from_utf8_lossy(request)
+            );
+            expected_frames += forwards;
+            for _ in 0..500 {
+                if joiner_frames.lock().unwrap().len() >= expected_frames
+                    && peer_frames.lock().unwrap().len() >= expected_frames
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        client.shutdown().await.unwrap();
+        connection_task.await.unwrap().unwrap();
+
+        joiner_task.abort();
+        peer_task.abort();
+        drop(forward_relay);
+        drop(request_tx);
+        cache_task.await.unwrap();
+
+        let joiner_frames = joiner_frames.lock().unwrap().clone();
+        let peer_frames = peer_frames.lock().unwrap().clone();
+        (joiner_frames, peer_frames)
+    }
+
+    /// The frames a write to `name` forwards to the joiner and to the
+    /// promoted owner, in that order: each as the handoff frame carrying
+    /// that peer's own token.
+    fn expected_forwards(name: &[u8], frame: impl Fn(&Key, &str) -> Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+        let key = key(name);
+        (frame(&key, "tok-joiner-0"), frame(&key, "tok-peer"))
+    }
+
+    fn set_forward(name: &[u8], value: &'static [u8]) -> (Vec<u8>, Vec<u8>) {
+        expected_forwards(name, |key, token| {
+            handoff_message(key, value, None, false, token)
+        })
+    }
+
+    fn set_forward_with_ttl(
+        name: &[u8],
+        value: &'static [u8],
+        ttl: Duration,
+    ) -> (Vec<u8>, Vec<u8>) {
+        expected_forwards(name, |key, token| {
+            handoff_message(key, value, Some(ttl), false, token)
+        })
+    }
+
+    fn delete_forward(name: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        expected_forwards(name, handoff_delete_message)
+    }
+
+    /// Splits the pairs `set_forward` / `delete_forward` return into what
+    /// each peer must have recorded.
+    fn per_peer(forwards: Vec<(Vec<u8>, Vec<u8>)>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        forwards.into_iter().unzip()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_set_is_forwarded_to_the_joiner_and_to_the_promoted_owner() {
+        let (joiner, peer) =
+            frames_forwarded_to_joiner_and_promoted_owner(&[(b"S 3 2\nkeyv1", b"S\n", 1)]).await;
+        let (expected_joiner, expected_peer) = per_peer(vec![set_forward(b"key", b"v1")]);
+        assert_eq!(joiner, expected_joiner, "joiner");
+        assert_eq!(peer, expected_peer, "promoted owner");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_set_forwards_its_ttl_so_the_copy_still_expires() {
+        let (joiner, peer) =
+            frames_forwarded_to_joiner_and_promoted_owner(&[(b"S 3 2 60\nkeyv1", b"S\n", 1)]).await;
+        let (expected_joiner, expected_peer) = per_peer(vec![set_forward_with_ttl(
+            b"key",
+            b"v1",
+            Duration::from_secs(60),
+        )]);
+        assert_eq!(joiner, expected_joiner, "joiner");
+        assert_eq!(peer, expected_peer, "promoted owner");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_is_forwarded_even_when_this_node_held_nothing() {
+        // A delete can race ahead of the handoff that would have brought
+        // the key here, so the forward does not depend on the reply.
+        let (joiner, peer) =
+            frames_forwarded_to_joiner_and_promoted_owner(&[(b"D 3\nkey", b"N\n", 1)]).await;
+        let (expected_joiner, expected_peer) = per_peer(vec![delete_forward(b"key")]);
+        assert_eq!(joiner, expected_joiner, "joiner");
+        assert_eq!(peer, expected_peer, "promoted owner");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_incr_forwards_its_result_as_a_set_and_a_no_op_forwards_nothing() {
+        // The result goes out as the absolute value, never as `i` itself.
+        // A miss (`N`) and a non-numeric value (`T`) changed nothing and
+        // forward nothing; the closing set shows where the frames end.
+        let (joiner, peer) = frames_forwarded_to_joiner_and_promoted_owner(&[
+            (b"i 0 1 1\na", b"N\n", 0),
+            (b"S 1 1\na5", b"S\n", 1),
+            (b"i 0 1 2\na", b"I 1\n7", 1),
+            (b"S 1 3\nbabc", b"S\n", 1),
+            (b"i 0 1 1\nb", b"T\n", 0),
+            (b"S 3 1\nendz", b"S\n", 1),
+        ])
+        .await;
+        let (expected_joiner, expected_peer) = per_peer(vec![
+            set_forward(b"a", b"5"),
+            set_forward(b"a", b"7"),
+            set_forward(b"b", b"abc"),
+            set_forward(b"end", b"z"),
+        ]);
+        assert_eq!(joiner, expected_joiner, "joiner");
+        assert_eq!(peer, expected_peer, "promoted owner");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cas_set_forwards_its_value_only_when_the_condition_held() {
+        let (joiner, peer) = frames_forwarded_to_joiner_and_promoted_owner(&[
+            (b"k 0 3 2 A\nkeyv1", b"S\n", 1),
+            (b"k 0 3 2 A\nkeyv2", b"N\n", 0),
+            (b"S 3 1\nendz", b"S\n", 1),
+        ])
+        .await;
+        let (expected_joiner, expected_peer) =
+            per_peer(vec![set_forward(b"key", b"v1"), set_forward(b"end", b"z")]);
+        assert_eq!(joiner, expected_joiner, "joiner");
+        assert_eq!(peer, expected_peer, "promoted owner");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cas_delete_forwards_a_delete_only_when_the_digest_matched() {
+        let hex = |value: &[u8]| -> String {
+            crate::cache::content_digest(value)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+        let wrong = format!("x 0 3 {}\nkey", hex(b"other"));
+        let right = format!("x 0 3 {}\nkey", hex(b"v1"));
+        let (joiner, peer) = frames_forwarded_to_joiner_and_promoted_owner(&[
+            (b"S 3 2\nkeyv1", b"S\n", 1),
+            (wrong.as_bytes(), b"N\n", 0),
+            (right.as_bytes(), b"D\n", 1),
+            (b"S 3 1\nendz", b"S\n", 1),
+        ])
+        .await;
+        let (expected_joiner, expected_peer) = per_peer(vec![
+            set_forward(b"key", b"v1"),
+            delete_forward(b"key"),
+            set_forward(b"end", b"z"),
+        ]);
+        assert_eq!(joiner, expected_joiner, "joiner");
+        assert_eq!(peer, expected_peer, "promoted owner");
     }
 
     #[tokio::test(flavor = "current_thread")]
