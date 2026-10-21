@@ -27,11 +27,34 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - name: Build the node, discovery and proxy images
-        run: |
-          for target in node discovery proxy; do
-            docker build --target "$target" -t "nanocached-$target:hostile" .
-          done
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # The same build the release workflow does, loaded into the local
+      # daemon instead of pushed.
+      - name: Build the node image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: node
+          load: true
+          tags: nanocached-node:hostile
+
+      - name: Build the discovery image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: discovery
+          load: true
+          tags: nanocached-discovery:hostile
+
+      - name: Build the proxy image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: proxy
+          load: true
+          tags: nanocached-proxy:hostile
 
       - name: Run the hostile-load scenarios
         # run.sh puts every scenario under its own watchdog; this is the
