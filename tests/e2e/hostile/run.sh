@@ -60,6 +60,12 @@ for name in "${SCENARIOS[@]}"; do
   esac
   [ "$status" -ne 0 ] && { echo "----- $name"; cat "$log"; }
   summary+=("$(printf '%-24s %-30s %4ss' "$name" "$outcome" "$secs")")
+  # The verdict lines (peak RSS against its ceiling) go in the table too: a
+  # passing run's log is not printed, and the margin is what shows a bound
+  # wearing thin before it fails.
+  while IFS= read -r line; do
+    summary+=("    ${line#*] }")
+  done < <(grep -E '\] (ok  |FAIL) .*(peak RSS|OOMKilled=)' "$log")
 done
 
 # A scenario that died hard may have left containers behind.
