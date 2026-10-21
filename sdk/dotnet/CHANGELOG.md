@@ -12,6 +12,11 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- The request-timeout callback decides under the deadline gate whether
+  the deadline is still armed before closing the connection. Read
+  outside it, the callback could see a deadline a response being
+  dispatched at that moment was about to clear, and close a connection
+  that had just answered.
 - `ConnectAsync` throws `ConnectionLostException` (the
   `SocketException`/`IOException` as `InnerException`) when no address
   could be reached, instead of the raw exception of the last address
