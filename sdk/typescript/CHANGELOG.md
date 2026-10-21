@@ -11,6 +11,12 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A connection reset or broken pipe while the server answers the
+  handshake throws `ConnectionLostError` (`requestWasSent` `false`, the
+  system error as `cause`), as a failed dial does. It escaped as the
+  raw `ECONNRESET`/`EPIPE` system error once the legacy-server
+  fallbacks were spent, the one connect failure
+  `error instanceof NanocachedError` did not catch.
 - A dial that fails — `ECONNREFUSED`, `ENOTFOUND`, a reset during the
   handshake — throws `ConnectionLostError` (`requestWasSent` `false`,
   the Node system error as `cause`) instead of the raw system error, so
