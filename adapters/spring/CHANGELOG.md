@@ -11,6 +11,15 @@ changed. What 1.0.0 will promise is described on the
 
 ### Fixed
 
+- `get(key, valueLoader)` releases the callers waiting on a load whose
+  loader failed with an `Error` (an assertion, a stack overflow, a class
+  that failed to initialise). Only a `RuntimeException` used to settle
+  the in-flight outcome, so those callers parked forever; they now see
+  the failed run and load on their own, as they do after an exception.
+- A `Character` key holding a lone surrogate is rejected with
+  `IllegalArgumentException`, as a `String` key holding one is. It was
+  encoded through UTF-8, which turns every lone surrogate into `?`, so
+  such keys all addressed one entry.
 - `get(key, valueLoader)` (`@Cacheable(sync = true)`) no longer holds a
   lock across the loader. It used 64 lock stripes shared by every key, so
   a sync loader that read another sync-cached key could deadlock against
