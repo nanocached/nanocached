@@ -193,7 +193,7 @@ impl MockNode {
 
     async fn start_on(state: NodeState, port: u16) -> Self {
         let state = Arc::new(state);
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = bind_listener(port).await;
         let port = listener.local_addr().unwrap().port();
         let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -230,6 +230,10 @@ impl MockNode {
     }
 
     fn stop(&self) {
+        // Registered before the listener is dropped, so that no other test's
+        // mock can be given this port while a client still dials it as a
+        // stopped node.
+        DEAD_PORTS.lock().unwrap().push(self.port);
         let _ = self.shutdown.send(true);
     }
 }
@@ -950,7 +954,7 @@ impl MockDiscovery {
             q_requests: Arc::new(AtomicUsize::new(0)),
             l_delay_ms: Arc::new(AtomicUsize::new(0)),
         };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = bind_listener(0).await;
         let port = listener.local_addr().unwrap().port();
         let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -1073,12 +1077,67 @@ fn options(port: u16) -> Options {
     Options::new().addresses([("127.0.0.1", port)])
 }
 
-/// A port nobody is listening on: bind it, then immediately drop the
-/// listener, freeing it back up — for a discovery entry that names a node
-/// which isn't actually reachable (issue #67 tests).
+/// Ports that must not be handed to another mock listener: those
+/// `unused_port` returned, and those a `MockNode` was stopped on. Every mock
+/// listener in this file binds through `bind_listener`, which refuses them.
+static DEAD_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+/// A port nobody is listening on, that no mock listener of this process will
+/// be given: for a discovery entry that names a node which isn't actually
+/// reachable (issue #67 tests).
+///
+/// Binding a port and dropping the listener frees it for the next `bind(0)`
+/// in this process, and `cargo test` runs the tests of this file on parallel
+/// threads whose mocks all bind port 0: one of them could be given the
+/// "dead" port, and the client would then find a live server where the test
+/// needs a refused connection. The port stays registered for the life of the
+/// process, including after a test brings a node up on it with
+/// `MockNode::start_on_port`. A node stopped mid-test leaves the same kind
+/// of port behind, so `MockNode::stop` registers its port too.
 async fn unused_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
+    let listener = bind_listener(0).await;
+    let port = listener.local_addr().unwrap().port();
+    // Registered while the listener still holds the port, so no other
+    // thread can have been given it yet.
+    DEAD_PORTS.lock().unwrap().push(port);
+    port
+}
+
+/// `TcpListener::bind` on 127.0.0.1 for the mocks: with `port` 0, the
+/// ephemeral port it gets is never a registered one.
+async fn bind_listener(port: u16) -> TcpListener {
+    bind_listener_avoiding(port, |got| DEAD_PORTS.lock().unwrap().contains(&got)).await
+}
+
+async fn bind_listener_avoiding(port: u16, avoid: impl Fn(u16) -> bool) -> TcpListener {
+    loop {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        if port != 0 || !avoid(listener.local_addr().unwrap().port()) {
+            return listener;
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_ephemeral_bind_skips_the_ports_it_must_avoid() {
+    let mut held = Vec::new();
+    for _ in 0..200 {
+        let listener = bind_listener_avoiding(0, |port| port % 2 == 0).await;
+        assert_eq!(listener.local_addr().unwrap().port() % 2, 1);
+        held.push(listener);
+    }
+}
+
+#[tokio::test]
+async fn an_unused_port_refuses_connections() {
+    let port = unused_port().await;
+
+    let dial = TcpStream::connect(("127.0.0.1", port)).await;
+
+    assert_eq!(
+        dial.err().map(|e| e.kind()),
+        Some(std::io::ErrorKind::ConnectionRefused)
+    );
 }
 
 // ── 単一ノード ────────────────────────────────────────────────────
@@ -2337,7 +2396,7 @@ async fn a_response_header_without_a_terminator_is_rejected_instead_of_growing_u
     // memory. It now caps the line at MAX_HEADER_LINE_LENGTH and fails
     // fast with a Protocol error, wrapped in an outer test timeout so a
     // regression fails loudly instead of hanging the suite.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = bind_listener(0).await;
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         let Ok((socket, _)) = listener.accept().await else {
@@ -2563,10 +2622,7 @@ async fn a_request_to_a_half_open_server_fails_within_the_timeout_and_close_retu
 async fn fails_over_to_the_second_address() {
     let node = MockNode::start().await;
     let discovery = MockDiscovery::start(vec![(NAMES[0].to_string(), node.address())], 1).await;
-    let dead = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
-    };
+    let dead = unused_port().await;
 
     let client = NanocachedClient::connect(
         Options::new().addresses([("127.0.0.1", dead), ("127.0.0.1", discovery.port)]),
@@ -5552,7 +5608,7 @@ async fn connect_succeeds_with_one_unreachable_node() {
     let dead_port = unused_port().await;
     let live = MockNode::start().await;
     let listed = vec![
-        (NAMES[0].to_string(), format!("127.0.0.1:{dead_port}")),
+        (NAMES[0].to_string(), format!("127.0.0.1:{}", dead_port)),
         (NAMES[1].to_string(), live.address()),
     ];
     let discovery = MockDiscovery::start(listed, 2).await;
@@ -5602,8 +5658,8 @@ async fn connect_fails_only_when_every_listed_node_is_unreachable() {
     let dead_a = unused_port().await;
     let dead_b = unused_port().await;
     let listed = vec![
-        (NAMES[0].to_string(), format!("127.0.0.1:{dead_a}")),
-        (NAMES[1].to_string(), format!("127.0.0.1:{dead_b}")),
+        (NAMES[0].to_string(), format!("127.0.0.1:{}", dead_a)),
+        (NAMES[1].to_string(), format!("127.0.0.1:{}", dead_b)),
     ];
     let discovery = MockDiscovery::start(listed, 2).await;
 
@@ -5622,7 +5678,7 @@ async fn an_unreachable_node_is_redialed_once_the_cooldown_has_passed() {
     let dead_port = unused_port().await;
     let live = MockNode::start().await;
     let listed = vec![
-        (NAMES[0].to_string(), format!("127.0.0.1:{dead_port}")),
+        (NAMES[0].to_string(), format!("127.0.0.1:{}", dead_port)),
         (NAMES[1].to_string(), live.address()),
     ];
     let discovery = MockDiscovery::start(listed, 2).await;
@@ -5667,7 +5723,7 @@ async fn refresh_purges_cooldowns_for_departed_addresses() {
     let dead_port = unused_port().await;
     let live = MockNode::start().await;
     let listed = vec![
-        (NAMES[0].to_string(), format!("127.0.0.1:{dead_port}")),
+        (NAMES[0].to_string(), format!("127.0.0.1:{}", dead_port)),
         (NAMES[1].to_string(), live.address()),
     ];
     let discovery = MockDiscovery::start(listed, 2).await;
@@ -5809,7 +5865,7 @@ async fn via_proxy_fails_over_to_the_live_proxy_when_the_chosen_one_is_down() {
         vec![],
         1,
         vec![
-            ("proxy-dead".to_string(), format!("127.0.0.1:{dead_port}")),
+            ("proxy-dead".to_string(), format!("127.0.0.1:{}", dead_port)),
             ("proxy-live".to_string(), live.address()),
         ],
     )
@@ -6138,7 +6194,7 @@ async fn a_hung_node_does_not_delay_the_other_nodes_keep_alive_pings() {
 /// records how many handshakes it has in flight at the same moment.
 #[tokio::test]
 async fn bootstrap_dials_a_big_roster_with_bounded_concurrency() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = bind_listener(0).await;
     let port = listener.local_addr().unwrap().port();
     let in_flight = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
@@ -6507,7 +6563,7 @@ async fn close_releases_writers_blocked_on_a_peer_that_does_not_read() {
 /// close-before-reply door-slam is.
 #[tokio::test]
 async fn connect_reports_a_node_at_its_connection_limit_as_busy_on_the_first_dial() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = bind_listener(0).await;
     let port = listener.local_addr().unwrap().port();
     let dials = Arc::new(AtomicUsize::new(0));
     let accepted_dials = Arc::clone(&dials);
