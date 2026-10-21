@@ -9,6 +9,8 @@ tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-10-21
+
 ### Fixed
 
 - `setMany`/`setManyBytes` report a key as stored when the owner that
@@ -435,6 +437,7 @@ changes ship without a deprecation cycle and are listed below.
 0.1.2 is the first release published by CI.
 
 [Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.5...HEAD
+[0.4.8]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.7...sdk/typescript/v0.4.8
 [0.4.7]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.6...sdk/typescript/v0.4.7
 [0.4.6]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.5...sdk/typescript/v0.4.6
 [0.4.5]: https://github.com/nanocached/nanocached/compare/sdk/typescript/v0.4.4...sdk/typescript/v0.4.5

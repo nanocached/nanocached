@@ -6,6 +6,8 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-10-21
+
 ### Fixed
 
 - A node at its connection limit, which answers `B` and closes, is
