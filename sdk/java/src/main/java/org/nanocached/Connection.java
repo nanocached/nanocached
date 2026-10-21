@@ -198,16 +198,36 @@ final class Connection {
                 return;
             }
         }
-        Thread expiry = new Thread(this::expireDeadline, "nanocached-request-timeout");
+        Thread expiry = new Thread(() -> expireDeadline(generation), "nanocached-request-timeout");
         expiry.setDaemon(true);
-        expiry.start();
+        try {
+            expiry.start();
+        } catch (Throwable unableToStart) {
+            // No thread to be had (an OutOfMemoryError: unable to create
+            // a native thread): expire on the watchdog itself rather
+            // than leave the stalled requests unbounded. One slow
+            // continuation then holds up the other connections' checks,
+            // which is the lesser harm.
+            expireDeadline(generation);
+        }
     }
 
     /** The deadline expired with requests still pending: poisons the
      * connection, which unblocks the reader — and any blocked writer —
-     * with a socket error. */
-    private void expireDeadline() {
+     * with a socket error. {@code generation} is the check's own: a
+     * response that landed between the check and this running re-armed
+     * (progress) or cleared (nothing left) the deadline, and each of
+     * those moves the generation, so the expiry is decided again here
+     * under the lock rather than closing a connection that is answering. */
+    private void expireDeadline(long generation) {
         if (closed) return;
+        synchronized (deadlineLock) {
+            if (generation != deadlineGeneration
+                    || requestDeadlineNanos == 0
+                    || requestDeadlineNanos - System.nanoTime() > 0) {
+                return;
+            }
+        }
         // The deadline expired with requests still pending. Record the
         // timeout error first (so whichever thread's poison() wins the
         // race reports the timeout, not a bare "Socket closed"), then

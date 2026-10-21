@@ -13,6 +13,14 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- The request-timeout expiry decides again, under the deadline lock,
+  whether the deadline it was started for is still the current one
+  before closing the connection: a response that landed between the
+  watchdog's check and the expiry thread starting re-arms or clears
+  the deadline, and the expiry used to close that answering connection
+  anyway. If the expiry thread cannot be started, the watchdog expires
+  the deadline itself instead of leaving the stalled requests unbounded.
+
 - A node at its connection limit, which answers `B` and closes, is
   reported as busy (`NanocachedException.ConnectionFailed`, naming the
   limit) after one dial. The two-byte reply used to end the three-byte
