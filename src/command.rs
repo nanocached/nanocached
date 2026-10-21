@@ -203,11 +203,11 @@ pub enum Command {
     /// like `U`/`u`, drops the namespace (or, with the trailing `A`,
     /// every namespace), and is acknowledged `C`. Distinct from `c`/`F`
     /// so the receiver can tell a forwarded clear from a client's own: a
-    /// forwarded clear is applied and relayed only to a join still
-    /// unconfirmed and, when it removed something, to a decommission's
-    /// entrants behind the writes queued for them — never on from a
-    /// node it changed nothing on, which is what let two nodes forward
-    /// one clear to each other until a window closed.
+    /// forwarded clear goes on through the receiver's join targets like
+    /// a client's, but through its own decommission's or
+    /// re-replication's window only when it removed something there,
+    /// which is what ends the clear that two nodes forwarding to each
+    /// other used to send around until a window closed.
     HandoffClear {
         all: bool,
         namespace: Bytes,

@@ -378,6 +378,18 @@ here.</p>
   changed content and a lagging forward to coincide, and removing it
   would need versioned writes in the server and every SDK. Revisit if a
   versioned write path is adopted for other reasons.</li>
+  <li>A write a client sends to an old owner is relayed to that
+  owner&rsquo;s joiner, but not on to the joiner&rsquo;s own joiner: a
+  node relays a write that reached it as a handoff only to a joiner
+  discovery has not confirmed yet. With two joins inside one
+  forwarding window and a client whose node list predates both, the
+  write reaches the first joiner and is missing from the second (the
+  key&rsquo;s owner now) until the next write or TTL expiry. Accepted
+  2026-10-21: relaying handoffs to confirmed joiners is what sent a
+  decommissioning node&rsquo;s drained value back to it through its
+  entrant and overwrote the newer value it held, and the two-join
+  case needs a list older than two membership changes within one
+  window. A clear still chains through every joiner.</li>
   <li>During a re-replication&rsquo;s forwarding window (the pass and
   60&nbsp;s after it), a second eviction replaces the window with its
   own snapshot, so a client still routing by the first eviction&rsquo;s

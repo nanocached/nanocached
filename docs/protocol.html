@@ -474,12 +474,13 @@ model implies). <code>M</code>, <code>U</code>, <code>u</code> and
 namespace), verified before the frame acts, since these are exactly
 the frames that skip the wrong-node check. A clear reaches another
 node as <code>f</code> rather than as the client's <code>c</code>/<code>F</code>
-so the receiver knows it was forwarded: it applies it and passes it on
-only to a joiner discovery has not confirmed yet and, when it removed
-something, to the entrants of its own decommission, behind the writes
-queued for them; a clear that changed nothing on a node stops there,
+so the receiver knows it was forwarded: it passes it on through its
+join targets as it would a client's clear, but through its own
+decommission's window (behind the writes queued for the entrants) only
+when it removed something, so a clear that changed nothing stops there,
 where a clear indistinguishable from a client's used to circle between
-two nodes until a window closed.
+a decommissioning node and the node forwarding to it until a window
+closed.
 <code>U</code> also carries an optional trailing <code>A</code> token:
 a survivor re-replicating a key after a membership change dropped a
 member (an eviction, or a leave it did not itself hand off for — see

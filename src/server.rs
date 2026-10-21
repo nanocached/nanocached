@@ -2089,23 +2089,6 @@ enum ClearRoute {
 }
 
 fn route_clear(node_context: &NodeContext, scope: &ClearScope) -> ClearRoute {
-    route_clear_to(node_context, scope, false)
-}
-
-/// `route_clear` for a clear that arrived forwarded from another node
-/// (`f`): it goes on only to a joiner discovery has not confirmed yet —
-/// the one node the clear's origin could not have reached itself. A
-/// confirmed joiner is in every roster, so whoever forwarded the clear
-/// here reached it directly, as it reached this node.
-fn route_handoff_clear(node_context: &NodeContext, scope: &ClearScope) -> ClearRoute {
-    route_clear_to(node_context, scope, true)
-}
-
-fn route_clear_to(
-    node_context: &NodeContext,
-    scope: &ClearScope,
-    only_unconfirmed: bool,
-) -> ClearRoute {
     let mut slot = node_context
         .active_migration
         .lock()
@@ -2119,9 +2102,6 @@ fn route_clear_to(
     let Some(active) = slot.as_mut() else {
         return ClearRoute::None;
     };
-    if only_unconfirmed && active.confirmed {
-        return ClearRoute::None;
-    }
 
     if active.completed_at.is_none() {
         active.pending_clears.push(scope.clone());
@@ -3330,20 +3310,39 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                // A forwarded clear goes on to a join this node still has
-                // unconfirmed (queued behind its transfer, or on its
-                // forwarding connection) — see `route_handoff_clear` —
-                // and, while this node is decommissioning, to its
-                // entrants, behind the writes already queued for them
-                // (`leave_clear_targets`): a write this node took and
-                // mirrored to an entrant must not land there after the
-                // clear. Only a clear that removed something here goes on
-                // to the entrants, the clear's twin of the `U` arm's
-                // `StoredUnchanged` guard: a node that held nothing has
-                // nothing queued the clear must follow, and the clear
-                // that comes back through two decommissions pointing at
-                // each other removes nothing on its second pass.
-                if let ClearRoute::Forward(target) = route_handoff_clear(&node_context, &scope) {
+                // A forwarded clear goes on through this node's join
+                // targets exactly as a client's does — the slot's joiner
+                // (queued behind the transfer, or on the forwarding
+                // connection) and the joiners still inside their grace —
+                // whether or not discovery has confirmed them: the client
+                // writes this node relayed to a joiner sit on that
+                // joiner's queue, and the clear must follow them there
+                // (the ordering #688 arranged), and a client whose list
+                // predates the joiner reaches it only through this chain.
+                // Join targets form a DAG, so this never comes back.
+                //
+                // Through this node's own windows — a decommission's
+                // entrants, an eviction's promoted owners — a forwarded
+                // clear goes on only when it removed something here, the
+                // clear's twin of the `U` arm's `StoredUnchanged` guard: a
+                // leaver's entrant forwards to the leaver (its confirmed
+                // joiner) and the leaver mirrors to the entrant, so an
+                // ungated mirror sent one clear around that pair until a
+                // window closed, wiping every write in between. The gate
+                // ends it on the pass that removes nothing. (It also
+                // skips a mirror for a key this node had mirrored and then
+                // lost to a delete or expiry — that one write can come
+                // back on the entrant, bounded by the next write or TTL.)
+                for target in lingering_clear_targets(&node_context) {
+                    spawn_forward(
+                        &config,
+                        node_context.clone(),
+                        target,
+                        OwnedForwardedWrite::Clear(scope.clone()),
+                    )
+                    .await;
+                }
+                if let ClearRoute::Forward(target) = route_clear(&node_context, &scope) {
                     spawn_forward(
                         &config,
                         node_context.clone(),
@@ -8188,9 +8187,10 @@ impl ClearScope {
     /// The `f` frame that replays this clear on another node, carrying
     /// that node's membership `token` — see `Command::HandoffClear`. Not
     /// a `c`/`F`: the receiver must know this clear was forwarded, so it
-    /// relays it only to a join it still has unconfirmed and, when it
-    /// removed something there, to a decommission's entrants — never on
-    /// from a node it changed nothing on.
+    /// passes it on through its join targets as a client's clear, but
+    /// through its own decommission's or re-replication's window only
+    /// when it removed something there — never around a pair of nodes
+    /// it changed nothing on.
     fn handoff_message(&self, token: &str) -> Vec<u8> {
         match self {
             ClearScope::Namespace(namespace) => {
@@ -13380,14 +13380,16 @@ mod tests {
     }
 
     #[test]
-    fn a_forwarded_clear_goes_on_only_to_an_unconfirmed_joiner() {
-        // A clear that arrived as `f` was forwarded by a node working from
-        // a roster, and a confirmed joiner is in that roster, so the
-        // sender reached it itself. Relaying it there again is what sent
-        // one clear back and forth between a leaver and the node still
-        // forwarding to it, wiping every write in between for the whole
-        // window. A joiner discovery has not confirmed yet is the one
-        // node the sender could not know, so that one still gets it.
+    fn a_handoff_write_goes_on_only_to_an_unconfirmed_joiner() {
+        // A `U`/`u` that arrived here was sent by a node working from a
+        // roster, and a confirmed joiner is in that roster, so the sender
+        // reached it itself. Relaying it there again sent a leaver's
+        // drained value back to the leaver through its entrant, where it
+        // overwrote the newer value the leaver held meanwhile. A joiner
+        // discovery has not confirmed yet is the one node the sender
+        // could not know, so that one still gets it. A clear, which has
+        // no newer value to lose, keeps chaining through every join
+        // target (`route_clear`).
         let after_ring = Arc::new(HashRing::new(vec![
             "ready-node".to_string(),
             "joiner-0".to_string(),
@@ -13433,9 +13435,9 @@ mod tests {
         let scope = ClearScope::Namespace(Bytes::from_static(b"users"));
         let a_key = key(b"k");
 
-        // Unconfirmed, transfer running: queued, like a client's clear.
+        // Unconfirmed, transfer running: a clear is queued.
         assert!(matches!(
-            route_handoff_clear(&node_context, &scope),
+            route_clear(&node_context, &scope),
             ClearRoute::Queued
         ));
         node_context
@@ -13456,7 +13458,7 @@ mod tests {
             .unwrap()
             .completed_at = Some(Instant::now());
         assert!(matches!(
-            route_handoff_clear(&node_context, &scope),
+            route_clear(&node_context, &scope),
             ClearRoute::Forward(_)
         ));
         let target = unconfirmed_join_target_for(&node_context, &a_key)
@@ -13465,9 +13467,8 @@ mod tests {
         assert_eq!(target.token, "tok-joiner-0");
         assert!(target.as_handoff);
 
-        // Confirmed: a client's clear still chains through (the joiner
-        // is a join target of this node), a forwarded one does not, nor
-        // does a `U`/`u`.
+        // Confirmed: a clear still chains through (the joiner is a join
+        // target of this node), a `U`/`u` does not.
         node_context
             .active_migration
             .lock()
@@ -13478,10 +13479,6 @@ mod tests {
         assert!(matches!(
             route_clear(&node_context, &scope),
             ClearRoute::Forward(_)
-        ));
-        assert!(matches!(
-            route_handoff_clear(&node_context, &scope),
-            ClearRoute::None
         ));
         assert!(unconfirmed_join_target_for(&node_context, &a_key).is_none());
         assert_eq!(migration_targets_for(&node_context, &a_key).len(), 1);
@@ -13494,7 +13491,7 @@ mod tests {
             active.forwarding_grace = Duration::ZERO;
         }
         assert!(matches!(
-            route_handoff_clear(&node_context, &scope),
+            route_clear(&node_context, &scope),
             ClearRoute::None
         ));
         assert!(unconfirmed_join_target_for(&node_context, &a_key).is_none());
@@ -16483,16 +16480,17 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn handoff_frames_are_relayed_only_to_a_joiner_discovery_has_not_confirmed() {
-        // A `U`/`u`/`f` arriving here was sent by a node working from a
+        // A `U`/`u` arriving here was sent by a node working from a
         // roster — a leaver draining, a survivor re-replicating, an old
         // owner relaying for its own joiner. Once discovery confirmed
         // this node's joiner it is in that roster and the sender reached
         // it directly; relaying there again sent a leaver's drained `U v1`
         // back to the leaver through its entrant, where it overwrote the
-        // v2 the leaver had taken meanwhile (and the clear equivalent
-        // ping-ponged until a window closed). A client's own `S`/`D`/`F`
-        // still goes to the confirmed joiner: it is this node's join
-        // target, and the client did not know it.
+        // v2 the leaver had taken meanwhile. A clear has no newer value
+        // to lose and must follow the writes this node relayed to the
+        // joiner, so a forwarded clear (`f`) goes on like a client's
+        // `c`/`F`; its loop through a decommission's window is ended by
+        // the removed-something gate instead.
         let unconfirmed = frames_relayed_to_the_slot_joiner(
             false,
             &[
@@ -16512,13 +16510,18 @@ mod tests {
             "an unconfirmed joiner gets every handoff frame relayed"
         );
 
+        // A confirmed joiner: the handoff write and delete stop here, a
+        // forwarded clear goes on — behind the client write this node
+        // relayed to the joiner, which sits on the joiner's queue and
+        // must not land there after the joiner's own clear — and so do
+        // the client's own writes and clears.
         let confirmed = frames_relayed_to_the_slot_joiner(
             true,
             &[
                 ("U 0 5 2 13\ntk-ready-nodekey-av1", b"S\n"),
                 ("u 0 5 13\ntk-ready-nodekey-a", b"D\n"),
-                ("f 0 13 A\ntk-ready-node", b"C\n"),
                 ("S 5 2\nkey-av2", b"S\n"),
+                ("f 0 13 A\ntk-ready-node", b"C\n"),
                 ("c 5\nusers", b"C\n"),
                 ("F\n", b"C\n"),
             ],
@@ -16528,10 +16531,12 @@ mod tests {
             confirmed,
             vec![
                 b"U 0 5 2 12\ntok-joiner-0key-av2".to_vec(),
+                b"f 0 12 A\ntok-joiner-0".to_vec(),
                 b"f 5 12\ntok-joiner-0users".to_vec(),
                 b"f 0 12 A\ntok-joiner-0".to_vec(),
             ],
-            "a confirmed joiner gets only the client's own writes and clears, as handoffs"
+            "a confirmed joiner gets the client's writes and every clear, not the handoff \
+             write or delete"
         );
     }
 
@@ -16610,7 +16615,7 @@ mod tests {
         // either of them took meanwhile was wiped on each pass until a
         // window closed. A forwarded clear (`f`) is not a client's: L
         // applies it, and passes it on to its entrant only when it
-        // removed something here (it holds nothing), so the client's
+        // removed something there (it holds nothing), so the client's
         // next write to S stays.
         let s_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let l_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -24,10 +24,11 @@ framework adapters at one version, whether or not a component changed.
   had already reached, so a leaver's drained value came back to it
   through its entrant and overwrote the newer value it held. Forwarded
   clears now travel as their own frame (`f`, carrying the receiver's
-  membership token), and a node relays a frame that arrived as a
-  handoff only to a joiner discovery has not confirmed yet, and on to a
-  decommission's entrants only when it changed something here (a
-  forwarded clear that removed nothing stops). During a
+  membership token) and go on to a decommission's entrants only when
+  they removed something here, and a node relays a handoff write or
+  delete only to a joiner discovery has not confirmed yet (a client
+  write relayed to that joiner by a node two joins back is now not
+  relayed on; it reaches the joiner on the next write). During a
   rolling upgrade, a node still on an earlier version answers `f` with
   an error, so a clear forwarded to it while the versions are mixed is
   not applied there.
