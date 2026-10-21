@@ -1646,9 +1646,7 @@ fn log_connection_error(address: &SocketAddr, error: &io::Error) {
 /// isn't draining its receive buffer at all), and reusing the 60s read
 /// timeout let a stuck write hold a permit far longer than necessary.
 async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()> {
-    timeout(WRITE_TIMEOUT, stream.write_all(data))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
+    infra::write_all_within(stream, data, WRITE_TIMEOUT).await
 }
 
 /// How long `reject_oversized_request` keeps reading after its `En\n`
@@ -3678,7 +3676,7 @@ async fn read_pending_joiner_verdict<S: AsyncBufReadExt + Unpin>(
     stream: &mut S,
 ) -> io::Result<PendingJoinerVerdict> {
     let mut line = Vec::new();
-    read_line_capped(stream, 2, &mut line).await?;
+    infra::read_line_bounded(stream, 2, outbound_line_deadline(), &mut line).await?;
     match line.as_slice() {
         b"K\n" => Ok(PendingJoinerVerdict::Known),
         b"G\n" => Ok(PendingJoinerVerdict::Gone),
@@ -3950,10 +3948,9 @@ async fn register_with_discovery(
                 let registration = if sending_join { &join } else { &announce };
 
                 let registration_sent = authenticated
-                    && matches!(
-                        timeout(OUTBOUND_IO_TIMEOUT, stream.write_all(registration)).await,
-                        Ok(Ok(()))
-                    );
+                    && infra::write_all_within(&mut stream, registration, OUTBOUND_IO_TIMEOUT)
+                        .await
+                        .is_ok();
                 if registration_sent {
                     // For `J`, staged node join: this connection is held open by
                     // discovery (no idle timeout applies) until this node
@@ -4010,10 +4007,10 @@ async fn register_with_discovery(
                                 pending_joiner.as_ref().map(|(name, _)| name.as_str()),
                             );
 
-                            if !matches!(
-                                timeout(OUTBOUND_IO_TIMEOUT, stream.write_all(&heartbeat)).await,
-                                Ok(Ok(()))
-                            ) {
+                            if infra::write_all_within(&mut stream, &heartbeat, OUTBOUND_IO_TIMEOUT)
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
 
@@ -4212,49 +4209,11 @@ const MAX_ROSTER_FIELD_LEN: usize = 4096;
 /// `MAX_ROSTER_FIELD_LEN`-checked lengths below.
 const MAX_ROSTER_LINE_LEN: usize = 64;
 
-/// Reads one `\n`-terminated line into `line` (cleared first), but errors
-/// with `InvalidData` if it would exceed `limit` bytes before the newline —
-/// the bounded counterpart of `read_until`, which grows without cap (issue
-/// #92). On EOF before a newline, returns what was read (no trailing `\n`);
-/// the caller treats a missing terminator as malformed.
-async fn read_line_capped<S: AsyncBufReadExt + Unpin>(
-    stream: &mut S,
-    limit: usize,
-    line: &mut Vec<u8>,
-) -> io::Result<()> {
-    line.clear();
-    loop {
-        let (consumed, done, too_long) = {
-            let available = stream.fill_buf().await?;
-            if available.is_empty() {
-                (0, true, false) // EOF before newline
-            } else if let Some(pos) = available.iter().position(|&byte| byte == b'\n') {
-                let take = pos + 1; // include the newline
-                if line.len() + take > limit {
-                    (0, true, true)
-                } else {
-                    line.extend_from_slice(&available[..take]);
-                    (take, true, false)
-                }
-            } else if line.len() + available.len() > limit {
-                (0, true, true)
-            } else {
-                let take = available.len();
-                line.extend_from_slice(available);
-                (take, false, false)
-            }
-        };
-        stream.consume(consumed);
-        if too_long {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "heartbeat ack line exceeded its size cap",
-            ));
-        }
-        if done {
-            return Ok(());
-        }
-    }
+/// The deadline for reading one outbound exchange's lines: the same bound
+/// `OUTBOUND_IO_TIMEOUT` puts around the whole exchange, so a peer that
+/// trickles a line in cannot outlast it (`infra::read_line_bounded`).
+fn outbound_line_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + OUTBOUND_IO_TIMEOUT
 }
 
 /// Reads one heartbeat ack. A bare `A\n` means "no membership update"
@@ -4293,8 +4252,9 @@ async fn read_roster<S: AsyncBufReadExt + Unpin>(
 ) -> io::Result<Option<(Vec<String>, usize)>> {
     let malformed = || io::Error::new(io::ErrorKind::InvalidData, what);
 
+    let deadline = outbound_line_deadline();
     let mut line = Vec::new();
-    read_line_capped(stream, MAX_ROSTER_LINE_LEN, &mut line).await?;
+    infra::read_line_bounded(stream, MAX_ROSTER_LINE_LEN, deadline, &mut line).await?;
     if line == withheld {
         return Ok(None);
     }
@@ -4323,7 +4283,7 @@ async fn read_roster<S: AsyncBufReadExt + Unpin>(
 
     let mut names = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
-        read_line_capped(stream, MAX_ROSTER_LINE_LEN, &mut line).await?;
+        infra::read_line_bounded(stream, MAX_ROSTER_LINE_LEN, deadline, &mut line).await?;
         let entry = line
             .strip_suffix(b"\n")
             .and_then(|rest| std::str::from_utf8(rest).ok())
@@ -6790,13 +6750,10 @@ async fn fetch_roster_once(
     const MAX_NAME_ADDR_OR_TOKEN_LENGTH: usize = 1024;
 
     let stream = connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
-    // Buffered so the length-bounded line reads below (`read_line_capped`,
-    // issue #217 — this used to grow a `Vec<u8>` without a cap while
-    // scanning for `\n`, the same class of bug #92 fixed for
-    // `read_heartbeat_ack`) and the fixed-size body `read_exact`s share one
-    // buffer: any bytes `read_line_capped` already buffered past a line's
-    // `\n` are still there for the next read, exactly as `read_heartbeat_ack`
-    // relies on.
+    // Buffered so the bounded line reads below (`infra::read_line_bounded`)
+    // and the fixed-size body `read_exact`s share one buffer: any bytes the
+    // line read already buffered past a line's `\n` are still there for the
+    // next read, exactly as `read_heartbeat_ack` relies on.
     let mut stream = tokio::io::BufReader::new(stream);
     let mut request = format!(
         "T {} {}\n",
@@ -6810,8 +6767,9 @@ async fn fetch_roster_once(
 
     let bad = || io::Error::new(io::ErrorKind::InvalidData, "bad T response");
 
+    let deadline = outbound_line_deadline();
     let mut line = Vec::new();
-    read_line_capped(&mut stream, MAX_ROSTER_LINE_LEN, &mut line).await?;
+    infra::read_line_bounded(&mut stream, MAX_ROSTER_LINE_LEN, deadline, &mut line).await?;
     if line == b"B\n" {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -6837,7 +6795,7 @@ async fn fetch_roster_once(
 
     let mut members = Vec::with_capacity(count);
     for _ in 0..count {
-        read_line_capped(&mut stream, MAX_ROSTER_LINE_LEN, &mut line).await?;
+        infra::read_line_bounded(&mut stream, MAX_ROSTER_LINE_LEN, deadline, &mut line).await?;
         let entry_header = line
             .strip_suffix(b"\n")
             .map(|rest| String::from_utf8_lossy(rest).into_owned())
@@ -9725,6 +9683,22 @@ async fn report_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake peer's request header, read through the shared bounded reader
+    /// (the raw `read_line` is rejected by `clippy.toml`).
+    async fn read_peer_line<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+    ) -> io::Result<String> {
+        let mut line = Vec::new();
+        infra::read_line_bounded(
+            reader,
+            4096,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            &mut line,
+        )
+        .await?;
+        String::from_utf8(line).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8"))
+    }
     use nanocached::infra::{is_fd_exhaustion, server_name_from_addr};
     use rustls::pki_types::{PrivateKeyDer, ServerName};
     use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -12529,9 +12503,14 @@ mod tests {
                 counted.fetch_add(1, Ordering::SeqCst);
                 let mut connection = tokio::io::BufReader::new(connection);
                 let mut header = Vec::new();
-                if read_line_capped(&mut connection, 4096, &mut header)
-                    .await
-                    .is_err()
+                if infra::read_line_bounded(
+                    &mut connection,
+                    4096,
+                    outbound_line_deadline(),
+                    &mut header,
+                )
+                .await
+                .is_err()
                 {
                     continue;
                 }
@@ -14494,18 +14473,9 @@ mod tests {
                     let mut reader = tokio::io::BufReader::new(connection);
                     let mut on_this_connection = 0usize;
                     loop {
-                        let mut header = Vec::new();
-                        match tokio::io::AsyncBufReadExt::read_until(
-                            &mut reader,
-                            b'\n',
-                            &mut header,
-                        )
-                        .await
-                        {
-                            Ok(0) | Err(_) => return,
-                            Ok(_) => {}
-                        }
-                        let header = String::from_utf8(header).unwrap();
+                        let Ok(header) = read_peer_line(&mut reader).await else {
+                            return;
+                        };
                         let fields: Vec<usize> = header
                             .trim_end()
                             .split(' ')
@@ -23327,6 +23297,19 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn read_heartbeat_ack_gives_up_on_a_silent_discovery_at_the_outbound_timeout() {
+        // The roster reads carry their own deadline now, not only the
+        // caller's `timeout` around them: a discovery that accepts the
+        // heartbeat and never answers errors out at `OUTBOUND_IO_TIMEOUT`.
+        let (_discovery, node) = tokio::io::duplex(64);
+        let mut stream = tokio::io::BufReader::new(node);
+        let started = tokio::time::Instant::now();
+        let error = read_heartbeat_ack(&mut stream).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), OUTBOUND_IO_TIMEOUT);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn read_heartbeat_ack_caps_an_unterminated_line() {
         // Issue #92: a hostile/misconfigured/MITM'd discovery that streams a
@@ -24499,11 +24482,8 @@ mod tests {
         let fake_discovery = tokio::spawn(async move {
             let (connection, _) = listener.accept().await.unwrap();
             let mut reader = tokio::io::BufReader::new(connection);
-            let mut line = String::new();
             // `J <name-len> <port> <token-len>`: read it whole, promote.
-            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
-                .await
-                .unwrap();
+            let mut line = read_peer_line(&mut reader).await.unwrap();
             let fields: Vec<usize> = line
                 .trim_end()
                 .split(' ')
@@ -24514,11 +24494,10 @@ mod tests {
             reader.read_exact(&mut body).await.unwrap();
             reader.get_mut().write_all(b"R\n").await.unwrap();
             loop {
-                line.clear();
-                match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(_) => {}
-                }
+                let Ok(next) = read_peer_line(&mut reader).await else {
+                    return;
+                };
+                line = next;
                 // `H <name-len> <repl> <token-len> [<joiner-len>]`.
                 let fields: Vec<usize> = line
                     .trim_end()

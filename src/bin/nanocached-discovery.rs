@@ -260,7 +260,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
@@ -2369,7 +2369,7 @@ async fn send_migrate(
     if let Some(secret) = auth_secret {
         let mut auth = format!("A {}\n", secret.len()).into_bytes();
         auth.extend_from_slice(secret);
-        write_all_timed(&mut stream, &auth, io_timeout).await?;
+        infra::write_all_within(&mut stream, &auth, io_timeout).await?;
 
         let mut ack = [0u8; 3];
         read_exact_timed(&mut stream, &mut ack, io_timeout).await?;
@@ -2392,9 +2392,9 @@ async fn send_migrate(
         generation,
     );
 
-    write_all_timed(&mut stream, &message, io_timeout).await?;
+    infra::write_all_within(&mut stream, &message, io_timeout).await?;
 
-    let line = read_line_timed(&mut stream, io_timeout).await?;
+    let line = read_ack_line(&mut stream, io_timeout).await?;
     let entries = line
         .strip_prefix("A ")
         .and_then(|rest| rest.parse::<usize>().ok())
@@ -2415,65 +2415,29 @@ async fn read_exact_timed(
     Ok(())
 }
 
-/// `write_all` bounded by `io_timeout`. Without this bound a ready node
-/// that accepts the connection but stops draining its receive buffer (a
-/// crashed-but-open, blackholed, or malicious peer) would make this write
-/// block forever — and because `abandon_current_join`/`try_begin_next_join`
-/// await these sends, that would hold `sweep_expired`'s one in-flight join
-/// fan-out slot forever, so no later abandon or join start could run.
-/// Mirrors the read-side bound so the whole `M`/`X` exchange is
-/// time-bounded, exactly like `server.rs`'s `OUTBOUND_IO_TIMEOUT`
-/// machinery.
-async fn write_all_timed(
-    stream: &mut ClientStream,
-    buf: &[u8],
-    io_timeout: Duration,
-) -> io::Result<()> {
-    timeout(io_timeout, stream.write_all(buf))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))??;
-    Ok(())
-}
-
-/// Reads up to (and consuming) the next `\n`, bounded overall by
-/// `io_timeout` — used for `M`'s `A <entries>\n` ack, whose length
-/// varies with the reported entry count (unlike every other ack on this
-/// connection, which is a fixed number of bytes). Bails out past
-/// `MAX_ACK_LINE_LENGTH` rather than growing `line` without bound on a
-/// desynced or malicious peer.
-///
-/// The deadline is computed once, before the loop, and every per-byte read
-/// is raced against that same `Instant` via `timeout_at` — not against a
-/// fresh `io_timeout` window each time. A peer that drips the ack one byte
-/// at a time, each byte arriving just under `io_timeout` apart, would
-/// otherwise never trip a per-read `timeout()`, turning a bounded read into
-/// an effectively unbounded one; because `send_migrate`/`send_cancel` are
-/// awaited inside `sweep_expired`'s one in-flight join fan-out — which blocks
-/// every later abandon or join start until it ends — that would pin it for
-/// as long as the trickle continues.
+/// The longest line `read_ack_line` accepts, newline included. `M`'s ack is
+/// `A <entries>\n`, a few bytes; anything near this is a desynced or
+/// malicious peer.
 const MAX_ACK_LINE_LENGTH: usize = 64;
 
-async fn read_line_timed(stream: &mut ClientStream, io_timeout: Duration) -> io::Result<String> {
-    let deadline = Instant::now() + io_timeout;
+/// Reads `M`'s `A <entries>\n` ack — the one ack on this connection whose
+/// length varies with the reported entry count (every other is a fixed
+/// number of bytes), so the line is read through the shared bounded reader:
+/// at most `MAX_ACK_LINE_LENGTH` bytes, and one `io_timeout` for the whole
+/// line, not one per read (a peer dripping the line a byte at a time must
+/// not keep `sweep_expired`'s one in-flight join fan-out pinned). Nothing is
+/// read after this line, so what the reader buffered past it is dropped.
+async fn read_ack_line(stream: &mut ClientStream, io_timeout: Duration) -> io::Result<String> {
+    let mut carry = BytesMut::new();
     let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-
-    loop {
-        timeout_at(deadline, stream.read_exact(&mut byte))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ack read timed out"))??;
-        if byte[0] == b'\n' {
-            break;
-        }
-        if line.len() >= MAX_ACK_LINE_LENGTH {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ack line too long",
-            ));
-        }
-        line.push(byte[0]);
-    }
-
+    infra::read_line_bounded(
+        &mut infra::CarryReader::new(stream, &mut carry),
+        MAX_ACK_LINE_LENGTH,
+        Instant::now() + io_timeout,
+        &mut line,
+    )
+    .await?;
+    line.pop(); // the newline
     String::from_utf8(line)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ack was not valid utf-8"))
 }
@@ -2499,7 +2463,7 @@ async fn send_cancel(
     if let Some(secret) = auth_secret {
         let mut auth = format!("A {}\n", secret.len()).into_bytes();
         auth.extend_from_slice(secret);
-        write_all_timed(&mut stream, &auth, io_timeout).await?;
+        infra::write_all_within(&mut stream, &auth, io_timeout).await?;
 
         let mut ack = [0u8; 3];
         read_exact_timed(&mut stream, &mut ack, io_timeout).await?;
@@ -2518,7 +2482,7 @@ async fn send_cancel(
     message.extend_from_slice(token.as_bytes());
     message.extend_from_slice(joining_name.as_bytes());
 
-    write_all_timed(&mut stream, &message, io_timeout).await?;
+    infra::write_all_within(&mut stream, &message, io_timeout).await?;
 
     let mut ack = [0u8; 2];
     read_exact_timed(&mut stream, &mut ack, io_timeout).await?;
@@ -4185,15 +4149,14 @@ async fn sweep_expired(
 /// two are different failure modes (a normal gap between requests vs. a
 /// peer that isn't draining its receive buffer at all), and reusing the
 /// 60s read timeout would let a stuck write hold a permit far longer than
-/// necessary. Distinct from `write_all_timed`, which bounds this node's
-/// own *outbound* dials to a node (`M`/`X`) under `OUTBOUND_IO_TIMEOUT` —
+/// necessary. Distinct from the outbound writes of `send_migrate` and
+/// `send_cancel`, which bound this process's dials to a node (`M`/`X`)
+/// under `OUTBOUND_IO_TIMEOUT` —
 /// that one is about this process acting as a client of another node;
 /// this one is about this process, as a server, replying to whoever
 /// dialed it.
 async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()> {
-    timeout(WRITE_TIMEOUT, stream.write_all(data))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
+    infra::write_all_within(stream, data, WRITE_TIMEOUT).await
 }
 
 async fn handle_connection(
@@ -5153,6 +5116,7 @@ mod tests {
     use nanocached::infra::server_name_from_addr;
     use rustls::pki_types::{PrivateKeyDer, ServerName};
     use rustls::{ClientConfig, RootCertStore, ServerConfig};
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn parse_reports_incomplete_before_the_header_is_fully_buffered() {
@@ -10879,8 +10843,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn read_line_timed_fails_within_the_overall_deadline_against_a_trickling_peer() {
-        // Regression for issue #216: read_line_timed used to call
+    async fn read_ack_line_stops_at_the_line_cap_instead_of_buffering_a_flood() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let node_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // No newline, ever: far more than `MAX_ACK_LINE_LENGTH`.
+            let _ = stream.write_all(&vec![b'x'; 1024 * 1024]).await;
+        });
+
+        let mut stream = connect_client_stream(&address, None).await.unwrap();
+        let error = read_ack_line(&mut stream, Duration::from_secs(5))
+            .await
+            .expect_err("an unterminated flood must hit the cap");
+        node_task.abort();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_ack_line_fails_within_the_overall_deadline_against_a_trickling_peer() {
+        // Regression for issue #216: the ack line read used to call
         // read_exact_timed once per byte, re-arming a fresh io_timeout
         // window on every single-byte read instead of racing the whole
         // line against one deadline. A peer that drips the ack slower than
@@ -10905,7 +10888,7 @@ mod tests {
         let mut stream = connect_client_stream(&address, None).await.unwrap();
 
         let started = Instant::now();
-        let result = read_line_timed(&mut stream, io_timeout).await;
+        let result = read_ack_line(&mut stream, io_timeout).await;
         let elapsed = started.elapsed();
 
         node_task.abort();

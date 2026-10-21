@@ -1,0 +1,12 @@
+# An untrusted line is read with `nanocached::infra::read_line_bounded`,
+# which caps its length and bounds it by one deadline. The raw calls below
+# grow without bound, and a timeout wrapped around each read is re-armed by
+# every byte a peer trickles in; both mistakes were made again with each
+# new reader. Only `infra.rs` may implement a reader, and it does not use
+# these.
+disallowed-methods = [
+    { path = "tokio::io::AsyncBufReadExt::read_line", reason = "unbounded: use nanocached::infra::read_line_bounded" },
+    { path = "tokio::io::AsyncBufReadExt::read_until", reason = "unbounded: use nanocached::infra::read_line_bounded" },
+    { path = "std::io::BufRead::read_line", reason = "unbounded: use nanocached::infra::read_line_bounded" },
+    { path = "std::io::BufRead::read_until", reason = "unbounded: use nanocached::infra::read_line_bounded" },
+]
