@@ -576,9 +576,21 @@ impl Command {
                 marked: true,
                 owned,
             } => Response::Swept(match owned {
-                Some(owned) => cache.sweep_keeping(&|key: &Key| {
-                    owned.ring.is_owner(key, &owned.name, owned.replication)
-                }),
+                Some(owned) => {
+                    // One namespace hash per run of marked keys sharing a
+                    // namespace allocation (the sweep queues them so), as
+                    // `ReclaimUnowned` does: hashing a client-chosen
+                    // namespace of hundreds of KB again for every marked
+                    // key stalled the cache thread for over a second per
+                    // chunk.
+                    let hasher = std::cell::RefCell::new(KeyHasher::default());
+                    cache.sweep_keeping(&|key: &Key| {
+                        let key_hash = hasher.borrow_mut().hash(key);
+                        owned
+                            .ring
+                            .is_owner_hashed(key_hash, &owned.name, owned.replication)
+                    })
+                }
                 None => cache.sweep(),
             }),
             Self::Sweep { marked: false, .. } => Response::Swept(cache.sweep_expired()),
@@ -2394,6 +2406,43 @@ mod tests {
             Response::Cleared(1)
         );
         assert_eq!(cache.get(&key(b"k")), None);
+    }
+
+    #[test]
+    fn a_marked_sweep_chunk_under_a_large_namespace_hashes_it_once() {
+        // The ownership-keeping sweep judged every marked key with
+        // `is_owner`, which hashes the whole namespace per key: 2,000
+        // marked keys under a 600 KB namespace took 1.5 s on the cache
+        // thread per chunk (release build). The `KeyHasher` pays for the
+        // namespace once per chunk, as the reclaim pass does.
+        let ring = Arc::new(HashRing::new(vec!["a".to_string(), "b".to_string()]));
+        let namespace = Bytes::from(vec![b'n'; 600_000]);
+        let mut cache = Cache::new(usize::MAX);
+        for i in 0..2_000u32 {
+            let k = Key::new(namespace.clone(), Bytes::from(i.to_le_bytes().to_vec()));
+            cache.set(k.clone(), Bytes::from_static(b"v"));
+            cache.mark_migrated(&k);
+        }
+        let started = std::time::Instant::now();
+        let response = Command::Sweep {
+            marked: true,
+            owned: Some(OwnerCheck {
+                ring,
+                name: "a".to_string(),
+                replication: 1,
+            }),
+        }
+        .execute(&mut cache);
+        let elapsed = started.elapsed();
+        let Response::Swept(swept) = response else {
+            panic!("unexpected response {response:?}");
+        };
+        // The keys "b" owns are swept, the keys "a" owns are kept.
+        assert!(swept > 0 && swept < 2_000, "{swept}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "sweeping 2,000 marked keys under a 600 KB namespace took {elapsed:?}"
+        );
     }
 
     #[test]
