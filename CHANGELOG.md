@@ -65,6 +65,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- `nanocached-node` and `nanocached-proxy` reject a `--max-connections`
+  or `--max-in-flight-bytes` above what the budget can count
+  (`tokio`'s semaphore limit) at argument parsing, instead of panicking
+  after "listening" was printed.
+- `nanocached-node`'s smallest accepted `--namespace-budget` is ten
+  entry overheads and so rises from 1,000 to 1,800 bytes with the
+  overhead change below; a budget in that range is now refused at
+  startup.
 - `nanocached-node` charges each entry 180 bytes and each non-default
   namespace 750 bytes of overhead against `--max-memory` (was 100 and
   256), the figures measured on the container image. A node filled with

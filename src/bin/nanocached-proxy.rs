@@ -385,6 +385,11 @@ const DEFAULT_MAX_IN_FLIGHT_BYTES: usize = 256 * 1024 * 1024;
 /// a bound worth configuring.
 const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
 
+/// The most `--max-connections` or `--max-in-flight-bytes` may ask for:
+/// `tokio::sync::Semaphore::new` panics above `MAX_PERMITS`, and a flag
+/// value is not a reason to crash at startup.
+const MAX_SEMAPHORE_PERMITS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
 /// What one key of an `m`/`o` frame costs the proxy beyond its wire
 /// bytes while the frame is in flight: the key handle, its slot in the
 /// per-owner grouping, the position map and its entry in the reassembled
@@ -779,6 +784,12 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                 if parsed == 0 {
                     return Err("--max-connections must be at least 1".to_string().into());
                 }
+                if parsed > MAX_SEMAPHORE_PERMITS {
+                    return Err(format!(
+                        "--max-connections must be at most {MAX_SEMAPHORE_PERMITS}"
+                    )
+                    .into());
+                }
                 args.max_connections = parsed;
             }
             "--max-connections-per-ip" => {
@@ -800,6 +811,12 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                     return Err(format!(
                         "--max-in-flight-bytes must be at least {MIN_MAX_IN_FLIGHT_BYTES} \
                          (one request-sized frame)"
+                    )
+                    .into());
+                }
+                if parsed > MAX_SEMAPHORE_PERMITS {
+                    return Err(format!(
+                        "--max-in-flight-bytes must be at most {MAX_SEMAPHORE_PERMITS}"
                     )
                     .into());
                 }
