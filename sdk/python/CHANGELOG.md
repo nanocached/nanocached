@@ -11,6 +11,12 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ### Fixed
 
+- `set_many`/`set_many_bytes` report a key as stored when the owner that
+  acknowledged it as a replica became its primary between the two
+  passes (the old primary answered `W` and left the roster): the key
+  sits on its primary, but the earlier acknowledgement was recorded as
+  a replica's and the key was missing from
+  `PartialSetConnectionLostError`'s stored keys.
 - A dial that fails raises `ConnectFailedError` (a `NanocachedError` and
   a `ConnectionError`, with the OS error as `__cause__`) instead of the
   raw `ConnectionRefusedError`, `socket.gaierror` or

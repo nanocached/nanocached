@@ -6237,6 +6237,55 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_set_many_reports_a_key_stored_when_its_acknowledging_replica_becomes_the_primary(self):
+        # R=2 over {a, b, c}, c unreachable. The first key's primary a
+        # answers W and its replica b acknowledges; a then leaves the
+        # roster, so after the refresh the key's owners are [b, c]: b,
+        # already acknowledged, is not sent the key again — and used to
+        # go unrecorded as its primary. The second key's primary is c on
+        # both passes, which is what makes set_many report at all: the
+        # first key must be among the keys reported stored.
+        names = [
+            "aaaaaaaa-1b3d-4e6f-8a90-c1d2e3f4a5b6",
+            "bbbbbbbb-7e2c-4f58-9b31-6a8d0c9e2f47",
+            "cccccccc-3c1a-4d7e-9f20-8b6c5d4e3f21",
+        ]
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        dead_address = f"127.0.0.1:{await unused_port()}"
+        listed = [(names[0], node_a.address), (names[1], node_b.address), (names[2], dead_address)]
+        discovery = await MockDiscovery(listed, replication=2).start()
+        try:
+            before = HashRing(names)
+            promoted_key = next(
+                f"key-{i}" for i in range(10_000)
+                if before.owners(f"key-{i}".encode(), 2) == [names[0], names[1]]
+            )
+            unreachable_key = next(
+                f"key-{i}" for i in range(10_000)
+                if before.owners(f"key-{i}".encode(), 2)[0] == names[2]
+            )
+            node_a.answer_wrong_node_for_keys({promoted_key.encode()}, 1)
+
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                # The refresh the W triggers finds a gone.
+                discovery.nodes = listed[1:]
+                with self.assertRaises(PartialSetConnectionLostError) as raised:
+                    await client.set_many({promoted_key: "v", unreachable_key: "w"})
+                self.assertEqual(
+                    raised.exception.partial_keys,
+                    {promoted_key},
+                    "the key's acknowledging replica is its primary now",
+                )
+                self.assertIn(promoted_key.encode(), node_b.store)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await node_a.close()
+            await node_b.close()
+
     async def test_set_many_stores_on_every_owner_under_replication(self):
         nodes, discovery = await self.start_cluster()
         try:

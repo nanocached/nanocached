@@ -1789,6 +1789,13 @@ class NanocachedClient:
             done = acknowledged.get(idx, ())
             for rank, name in enumerate(names):
                 if name in done:
+                    # If the refresh between the passes promoted this
+                    # owner to the key's primary (the old primary left
+                    # the roster), the key is stored on its primary now
+                    # and is reported so: the earlier pass recorded the
+                    # acknowledgement as a replica's.
+                    if rank == 0:
+                        tracker.primary_acknowledged.add(idx)
                     continue
                 owner_indices, owner_is_primary = owners.setdefault(name, ([], []))
                 owner_indices.append(idx)
