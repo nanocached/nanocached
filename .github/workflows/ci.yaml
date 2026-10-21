@@ -375,9 +375,10 @@ jobs:
           done
 
   e2e-scripts:
-    # Lints the manual E2E scenario scripts under tests/e2e — it never runs
-    # them (they need Docker, minutes-to-an-hour, netem). Just keeps them
-    # syntactically valid and shellcheck-clean so they stay runnable by hand.
+    # Lints the E2E scenario scripts under tests/e2e — it never runs them
+    # (they need Docker, minutes-to-an-hour, netem; the hostile-load suite
+    # runs on a schedule in its own workflow). Just keeps them
+    # syntactically valid and shellcheck-clean so they stay runnable.
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -388,14 +389,14 @@ jobs:
       - name: Shell syntax and shellcheck
         working-directory: tests/e2e
         run: |
-          for f in *.sh; do bash -n "$f"; done
+          for f in *.sh hostile/*.sh; do bash -n "$f"; done
           # Excluded warnings are all intentional in these throwaway-cluster
           # scenario scripts: SC1091 (cl.sh sourced at runtime), SC2086 /
           # SC2046 (deliberate word-splitting of docker arg lists and
           # `$(docker ps -aq ...)` id lists), SC2155 (local x=$(...) in
           # one-liner helpers). Real errors (missing shebang, bad redirect
           # order, undefined-var typos) are still caught.
-          shellcheck -e SC1091,SC2086,SC2046,SC2155 *.sh
+          shellcheck -e SC1091,SC2086,SC2046,SC2155 *.sh hostile/*.sh
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -404,4 +405,4 @@ jobs:
 
       - name: Python syntax
         working-directory: tests/e2e
-        run: python -m py_compile *.py
+        run: python -m py_compile *.py hostile/*.py

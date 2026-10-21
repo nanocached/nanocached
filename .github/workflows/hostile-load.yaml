@@ -1,0 +1,47 @@
+name: Hostile load
+
+# The memory suite under tests/e2e/hostile: the real node, proxy and
+# discovery binaries in Docker containers with a hard memory limit, driven
+# by the inputs that once OOM-killed them. It fails if any is OOM-killed or
+# its peak RSS passes a stated fraction of its limit.
+#
+# Not per push: it builds three images and runs for several minutes, and a
+# Docker memory limit on a shared runner is noisier than a unit test. A
+# nightly run (and a manual one) is enough to catch a new unbounded queue
+# within a day instead of at the next audit.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  memory-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Build the node, discovery and proxy images
+        run: |
+          for target in node discovery proxy; do
+            docker build --target "$target" -t "nanocached-$target:hostile" .
+          done
+
+      - name: Run the hostile-load scenarios
+        # run.sh puts every scenario under its own watchdog; this is the
+        # outer bound for the step.
+        run: timeout 1800 tests/e2e/hostile/run.sh
+
+      - name: Dump the scenario logs
+        if: failure()
+        run: |
+          for f in tests/e2e/logs/hostile/*.log; do
+            echo "===== $f"
+            tail -n 200 "$f"
+          done

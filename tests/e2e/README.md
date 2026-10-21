@@ -4,11 +4,12 @@ Docker-based end-to-end scenarios used to reproduce and regression-check
 cluster-level behaviour (data loss on join/eviction, slow-node tail latency,
 SDK shutdown/leak behaviour, hostile-peer resource exhaustion).
 
-**These are not run in CI.** Several take minutes to an hour and need Docker,
-multiple containers, `NET_ADMIN` (netem), and published images. CI only
-*lints* the scripts (shell syntax + `shellcheck`, Python `py_compile`) so they
-stay runnable; it never executes them. Run them by hand when investigating or
-verifying a fix.
+**These are not run in CI** — except the hostile-load memory suite
+(`hostile/`, below), which has its own nightly workflow. Several take minutes
+to an hour and need Docker, multiple containers, `NET_ADMIN` (netem), and
+published images. CI only *lints* the scripts (shell syntax + `shellcheck`,
+Python `py_compile`) so they stay runnable; it never executes them. Run them
+by hand when investigating or verifying a fix.
 
 ## Prerequisites
 
@@ -36,6 +37,42 @@ Each `i*.sh` is one scenario; the paired `*.py` is its probe/loader.
 | `freshjoin.sh` | #571, #573 | a node that joined seconds earlier is decommissioned or killed under load (`MODE=decom-fresh` / `kill-fresh`, with `GAP` seconds after promotion), with an earlier joiner still lingering (`decom-lingering` / `kill-lingering`), or a join lands while the oldest node drains (`decom-join`); `*-rejoin` adds one more join afterwards. Prints the nodes' entry counts and the WARN/ERROR categories. Found #571 (`decom-fresh GAP=1`: a joiner that leaves within one heartbeat interval was never seen by the senders) and was the regression set for #572/#573. `NODE=... DISC=... MODE=decom-fresh GAP=1 ./freshjoin.sh` |
 | `proxykill.sh` | #570 | via-proxy load (2 proxies, 3 nodes, R=2) while a node is killed, evicted and started again on the same IP. Asserts 0 miss / 0 corrupt and 0 loss on the untouched range; the `RetryableError`s in the load are the proxy's `R` for a dead primary until eviction (#125). Needs `PROXY=...` as well. |
 | `restart.sh` + `load_diag.py` + `analyze_restart.py` | #570 | kill a node and start it again on the same IP the moment it is evicted, under a loader that prints the client's ring and routed owners on every miss; `analyze_restart.py <logdir>` classifies the misses against the node and discovery logs. Must be 0 misses: before #570 a client whose bootstrap dial to the dead member was still pending connected to the restarted process under the dead name and read `N` from it before promotion (150-870 per run). `NEWIP=1` blocks the old IP, `DELAY=n` delays the restart. `PROBE_MAX=0 NODE=... DISC=... ./restart.sh` |
+
+## Hostile-load memory suite (`hostile/`)
+
+The real node, proxy and discovery binaries in containers with a hard memory
+limit, driven by inputs that once OOM-killed them. Each scenario passes when
+the process is **never OOM-killed and its peak RSS (`VmHWM`) stays under a
+stated fraction of its limit**; every wait has a deadline and `run.sh` puts
+each scenario under a watchdog. The clients are plain-socket Python scripts
+in a stock `python:3.12-alpine` container, so nothing but Docker and the
+three images is needed:
+
+```
+docker build --target node      -t nanocached-node:hostile .
+docker build --target discovery -t nanocached-discovery:hostile .
+docker build --target proxy     -t nanocached-proxy:hostile .
+tests/e2e/hostile/run.sh [scenario ...]       # all three by default
+```
+
+`NODE`, `DISC` and `PROXY` override the image names (to point a scenario at
+a build with a fix reverted), `SCENARIO_TIMEOUT` the per-scenario watchdog
+(seconds, default 600). It runs nightly and on demand in the *Hostile load*
+workflow, not per push: three image builds and several minutes, on a runner
+whose memory limits are noisier than a unit test's.
+
+| scenario | container limit | what it does | passes when | history |
+|---|---|---|---|---|
+| `proxy_inflight_bytes.sh` | proxy 512 MiB | one connection pipelines 300 x 1 MB `S` while the node is `docker pause`d (its connection stays open, replies never come) | peak RSS < 50%; the proxy stops reading instead (the client's send blocks) | #691 (in-flight requests bounded by count, not bytes); #657, #658, #692, #693 share the byte budget |
+| `node_stalled_joiner.sh` | node 256 MiB, `--max-memory` 64 MiB | a third node joins and is paused as soon as the handoff starts; 8 connections write `s` frames with a unique ~1 MB namespace and a 2-byte write | peak RSS < 85%; the node holds the clients' acks instead of queueing without bound | #694 (forward queue with no byte bound pinning whole frames); #659 |
+| `discovery_blocked_q.sh` | discovery 256 MiB | 1,024 proxies registered with `Y`, then 4 containers x 256 connections with a 1 KiB receive buffer ask `Q` and never read | peak RSS < 50% | #703 (`Q` reply built per request and held while the write blocks) |
+
+Reverting the fix for #691, #694 or #703 makes its scenario fail (the node
+and discovery are OOM-killed; the proxy reaches ~500 of its 512 MiB). The
+known patterns not yet covered, each a new scenario here: #696 (1,002
+half-open ~1 MiB frames from four source IPs), #701 (`PendingClears`), #695
+(`/metrics` with many namespaces), #697 (`--max-memory` against tiny entries),
+#692 (an `m`/`o` frame of one-byte keys).
 
 ## Shared helpers
 
