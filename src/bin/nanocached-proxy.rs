@@ -2181,7 +2181,7 @@ enum NodeReply {
     /// Issue #129: `INCR`'s new value plus its entry's remaining TTL in
     /// whole seconds, if it had one — carried through so a successful
     /// primary INCR's *result* can be fanned out to replicas as a plain
-    /// `Set` without silently dropping the TTL (see `finish_incr`).
+    /// `Set` without silently dropping the TTL (see `PrimaryCommand`).
     Incremented(Bytes, Option<u64>),
     /// Issue #129: the key exists but its value isn't `INCR`'s counter
     /// grammar, or `delta` would overflow — the wire's `T` status.
@@ -3778,33 +3778,13 @@ async fn dispatch_request(
             key,
             delta,
         } => {
-            let owners = ring.owners(&namespace, &key);
-            let Some(primary) = owners.first() else {
-                let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
-                return result_rx;
+            let request = PrimaryRequest {
+                namespace,
+                key,
+                command: PrimaryCommand::Incr { delta },
             };
-            let pending = context
-                .backends
-                .enqueue(
-                    &context,
-                    primary,
-                    frame_incr(&namespace, &key, delta),
-                    Expect::Incremented,
-                )
+            dispatch_primary_evaluated(context, &ring, request, tag, retry_capable, result_tx)
                 .await;
-            tokio::spawn(async move {
-                let result = finish_incr(
-                    &context,
-                    (&namespace, &key),
-                    delta,
-                    owners,
-                    pending,
-                    tag,
-                    retry_capable,
-                )
-                .await;
-                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
-            });
         }
         Request::CasSet {
             namespace,
@@ -3813,66 +3793,30 @@ async fn dispatch_request(
             value,
             ttl,
         } => {
-            let owners = ring.owners(&namespace, &key);
-            let Some(primary) = owners.first() else {
-                let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
-                return result_rx;
+            let request = PrimaryRequest {
+                namespace,
+                key,
+                command: PrimaryCommand::CasSet {
+                    condition,
+                    value,
+                    ttl,
+                },
             };
-            let pending = context
-                .backends
-                .enqueue(
-                    &context,
-                    primary,
-                    frame_cas_set(&namespace, &key, condition, &value, ttl),
-                    Expect::CasSet,
-                )
+            dispatch_primary_evaluated(context, &ring, request, tag, retry_capable, result_tx)
                 .await;
-            tokio::spawn(async move {
-                let result = finish_cas_set(
-                    &context,
-                    (&namespace, &key),
-                    (condition, &value, ttl),
-                    owners,
-                    pending,
-                    tag,
-                    retry_capable,
-                )
-                .await;
-                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
-            });
         }
         Request::CasDelete {
             namespace,
             key,
             expected_digest,
         } => {
-            let owners = ring.owners(&namespace, &key);
-            let Some(primary) = owners.first() else {
-                let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
-                return result_rx;
+            let request = PrimaryRequest {
+                namespace,
+                key,
+                command: PrimaryCommand::CasDelete { expected_digest },
             };
-            let pending = context
-                .backends
-                .enqueue(
-                    &context,
-                    primary,
-                    frame_cas_delete(&namespace, &key, expected_digest),
-                    Expect::Deleted,
-                )
+            dispatch_primary_evaluated(context, &ring, request, tag, retry_capable, result_tx)
                 .await;
-            tokio::spawn(async move {
-                let result = finish_cas_delete(
-                    &context,
-                    (&namespace, &key),
-                    expected_digest,
-                    owners,
-                    pending,
-                    tag,
-                    retry_capable,
-                )
-                .await;
-                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
-            });
         }
         // Issue #150: group keys by primary owner — this is the one
         // dispatch shape that splits a single client frame across
@@ -4601,29 +4545,156 @@ async fn refan_write(
     }
 }
 
-/// `Incr`'s completion: the primary's ordered `i` reply drives the
-/// result. Unlike `finish_write`, replicas are never sent the increment
-/// itself up front — only once the primary's result is known is that
-/// *result* fanned out to the remaining owners as a plain `Set`,
-/// carrying the TTL the primary's `I` reply itself carried
-/// (`fan_out_to_replicas`). Replaying `i` on a replica instead would let
-/// it drift from the primary (e.g. after an eviction or a replica leg
-/// that missed an earlier write) — the same reasoning
-/// `src/server.rs`'s `Incr` connection handler documents for the
-/// node-local migration/decommission case. A primary `W` or a transport
-/// failure that provably never reached the wire re-runs the whole thing
-/// (primary INCR + replica fan-out) on the refreshed ring (`refan_incr`),
-/// same as a write's own `W`/failure handling — but unlike a write,
-/// INCR is not idempotent: once the frame may have reached the primary,
-/// replaying it risks double-applying the delta (issue #272, mirrors
-/// #225's SDK-side fix), so that case is surfaced to the client instead
-/// of retried.
-async fn finish_incr(
+/// A command the primary evaluates against its own copy of the entry:
+/// `i`, `k` and `x`. Unlike a plain write, the replicas are never sent
+/// the command itself. A replica evaluating it against its own (possibly
+/// different) copy could reach another outcome than the primary just did,
+/// and replaying `i` on one would let it drift (after an eviction, or a
+/// replica leg that missed an earlier write) — the same reasoning
+/// `src/server.rs`'s node-side forwarding documents. Only once the primary
+/// has succeeded is that *result* fanned out to the other owners, as a
+/// plain `Set` (carrying the TTL the primary's reply or the request had)
+/// or `Delete`.
+///
+/// Each command is also not idempotent: once its frame may have reached
+/// the primary, replaying it could apply it twice, or re-evaluate its
+/// condition against a value the first attempt already changed. So it is
+/// retried only when it provably never reached the wire (issues #272,
+/// #293, #322), and any other failure is `Fatal::OutcomeUnknown`.
+enum PrimaryCommand {
+    Incr {
+        delta: i64,
+    },
+    CasSet {
+        condition: CasCondition,
+        value: Bytes,
+        ttl: Option<u64>,
+    },
+    CasDelete {
+        expected_digest: [u8; 16],
+    },
+}
+
+/// What a successful primary-evaluated command hands the replicas.
+struct ReplicaResult {
+    frame: Bytes,
+    expect: Expect,
+    /// Names the write in the log line (`fan_out_to_replicas`).
+    what: &'static str,
+}
+
+/// The primary's reply to a `PrimaryCommand`, read as the client's answer.
+enum PrimaryVerdict {
+    /// What to answer the client. `replicate` is set only when the command
+    /// changed the entry; a no-op (`N`, `T`) fans nothing out.
+    Answer {
+        response: Vec<u8>,
+        replicate: Option<ReplicaResult>,
+    },
+    /// The primary no longer owns the key: refresh the ring, then redo.
+    WrongNode,
+    /// A reply this command can never get.
+    Unexpected,
+}
+
+impl PrimaryCommand {
+    fn frame(&self, namespace: &[u8], key: &[u8]) -> Bytes {
+        match self {
+            Self::Incr { delta } => frame_incr(namespace, key, *delta),
+            Self::CasSet {
+                condition,
+                value,
+                ttl,
+            } => frame_cas_set(namespace, key, *condition, value, *ttl),
+            Self::CasDelete { expected_digest } => {
+                frame_cas_delete(namespace, key, *expected_digest)
+            }
+        }
+    }
+
+    fn expect(&self) -> Expect {
+        match self {
+            Self::Incr { .. } => Expect::Incremented,
+            Self::CasSet { .. } => Expect::CasSet,
+            Self::CasDelete { .. } => Expect::Deleted,
+        }
+    }
+
+    fn verdict(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        reply: NodeReply,
+        tag: Option<u32>,
+    ) -> PrimaryVerdict {
+        let answer = |marker: &str| PrimaryVerdict::Answer {
+            response: respond(marker, tag),
+            replicate: None,
+        };
+        match (self, reply) {
+            (Self::Incr { .. }, NodeReply::NotNumeric) => answer("T"),
+            (Self::Incr { .. }, NodeReply::Incremented(value, ttl)) => PrimaryVerdict::Answer {
+                response: respond_incremented(&value, ttl, tag),
+                replicate: Some(ReplicaResult {
+                    frame: frame_set(namespace, key, &value, ttl),
+                    expect: Expect::Stored,
+                    what: "incr-result",
+                }),
+            },
+            (Self::CasSet { value, ttl, .. }, NodeReply::Stored) => PrimaryVerdict::Answer {
+                response: respond("S", tag),
+                replicate: Some(ReplicaResult {
+                    frame: frame_set(namespace, key, value, *ttl),
+                    expect: Expect::Stored,
+                    what: "cas-result",
+                }),
+            },
+            (Self::CasDelete { .. }, NodeReply::Deleted) => PrimaryVerdict::Answer {
+                response: respond("D", tag),
+                replicate: Some(ReplicaResult {
+                    frame: frame_delete(namespace, key),
+                    expect: Expect::Deleted,
+                    what: "cas-delete",
+                }),
+            },
+            // What every command shares comes last, so a command whose
+            // node reply means something else can put its own arm first.
+            (_, NodeReply::NotFound) => answer("N"),
+            (_, NodeReply::WrongNode) => PrimaryVerdict::WrongNode,
+            _ => PrimaryVerdict::Unexpected,
+        }
+    }
+}
+
+/// Hands a successful result to the replicas, then returns the client's
+/// answer — the replica legs are awaited so a client that reads its own
+/// write through a replica isn't racing them.
+async fn answer_after_fan_out(
     context: &ProxyContext,
+    replicas: &[String],
+    response: Vec<u8>,
+    replicate: Option<ReplicaResult>,
+) -> Vec<u8> {
+    if let Some(result) = replicate {
+        fan_out_to_replicas(context, replicas, result.frame, result.expect, result.what).await;
+    }
+    response
+}
+
+/// A primary-evaluated command's completion: the primary's ordered reply
+/// drives the result (see `PrimaryCommand`). A primary `W`, or a transport
+/// failure that provably never reached the wire (`request_not_sent` — the
+/// "shared connection may simply have been idle-closed" case), re-runs the
+/// whole command (primary leg, then the replica fan-out) on the refreshed
+/// ring via `refan_primary_evaluated`. Any other failure is
+/// `OutcomeUnknown`: the client gets the fatal `E` (never a retryable
+/// `R`) and must read the key to learn what happened.
+async fn finish_primary_evaluated(
+    context: &ProxyContext,
+    command: &PrimaryCommand,
     // `(namespace, key)`, grouped into one parameter purely to stay under
     // clippy's argument-count lint — always used together.
     address: (&[u8], &[u8]),
-    delta: i64,
     owners: Vec<String>,
     pending: PendingReply,
     tag: Option<u32>,
@@ -4631,30 +4702,120 @@ async fn finish_incr(
 ) -> DriverResult {
     let (namespace, key) = address;
     match pending.await {
-        Ok(NodeReply::Incremented(value, ttl)) => {
-            let result = frame_set(namespace, key, &value, ttl);
-            fan_out_to_replicas(context, &owners[1..], result, Expect::Stored, "incr-result").await;
-            Ok(respond_incremented(&value, ttl, tag))
-        }
-        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
-        Ok(NodeReply::NotNumeric) => Ok(respond("T", tag)),
-        Ok(NodeReply::WrongNode) => {
-            force_refresh(context).await;
-            refan_incr(context, address, delta, tag, retry_capable).await
-        }
-        // Issue #272: only safe to retry when the frame provably never
-        // reached the backend socket (`request_not_sent`) — the "shared
-        // connection may simply have been idle-closed" case `finish_write`
-        // relies on. Once the frame may have reached the wire, retrying
-        // would risk a double-apply, so this surfaces `Fatal` instead
-        // (softened to a per-request `R` for a retry-capable client —
-        // the client's own choice whether to re-issue the INCR).
+        Ok(reply) => match command.verdict(namespace, key, reply, tag) {
+            PrimaryVerdict::Answer {
+                response,
+                replicate,
+            } => Ok(answer_after_fan_out(context, &owners[1..], response, replicate).await),
+            PrimaryVerdict::WrongNode => {
+                force_refresh(context).await;
+                refan_primary_evaluated(context, command, address, tag, retry_capable).await
+            }
+            PrimaryVerdict::Unexpected => Err(Fatal::Transient),
+        },
         Err(error) if request_not_sent(&error) => {
-            refan_incr(context, address, delta, tag, retry_capable).await
+            refan_primary_evaluated(context, command, address, tag, retry_capable).await
         }
         Err(_) => Err(Fatal::OutcomeUnknown),
-        Ok(_) => Err(Fatal::Transient),
     }
+}
+
+/// `finish_primary_evaluated`'s retry path for both a primary `W` and a
+/// request-not-sent transport failure: re-fetches the current ring and
+/// runs the whole command (primary leg, then the replica fan-out) again
+/// via `call_non_idempotent`, whose transparent redial recovers a dead
+/// shared connection WITHOUT replaying the frame once it may have reached
+/// the wire — unlike `refan_write`'s `call`, which is safe to retry
+/// unconditionally only because `Set`/`Delete` are idempotent.
+async fn refan_primary_evaluated(
+    context: &ProxyContext,
+    command: &PrimaryCommand,
+    address: (&[u8], &[u8]),
+    tag: Option<u32>,
+    retry_capable: bool,
+) -> DriverResult {
+    let (namespace, key) = address;
+    let Some(ring) = current_ring(context) else {
+        return Err(Fatal::Transient);
+    };
+    let owners = ring.owners(namespace, key);
+    let Some((primary, replicas)) = owners.split_first() else {
+        return Ok(transient_reply(retry_capable, tag));
+    };
+    match context
+        .backends
+        .call_non_idempotent(
+            context,
+            primary,
+            command.frame(namespace, key),
+            command.expect(),
+        )
+        .await
+    {
+        Ok(reply) => match command.verdict(namespace, key, reply, tag) {
+            PrimaryVerdict::Answer {
+                response,
+                replicate,
+            } => Ok(answer_after_fan_out(context, replicas, response, replicate).await),
+            PrimaryVerdict::WrongNode | PrimaryVerdict::Unexpected => Err(Fatal::Transient),
+        },
+        // `call_non_idempotent` already re-sent a frame that provably never
+        // left this proxy; any other failure may have applied the command.
+        Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
+        Err(_) => Err(Fatal::OutcomeUnknown),
+    }
+}
+
+/// A primary-evaluated command and the key it is for.
+struct PrimaryRequest {
+    namespace: Bytes,
+    key: Bytes,
+    command: PrimaryCommand,
+}
+
+/// Sends the first frame of a primary-evaluated command to its primary
+/// inline (so a pipelined connection keeps its request order) and spawns
+/// its completion.
+async fn dispatch_primary_evaluated(
+    context: Arc<ProxyContext>,
+    ring: &RingView,
+    request: PrimaryRequest,
+    tag: Option<u32>,
+    retry_capable: bool,
+    result_tx: oneshot::Sender<DriverResult>,
+) {
+    let PrimaryRequest {
+        namespace,
+        key,
+        command,
+    } = request;
+    let owners = ring.owners(&namespace, &key);
+    let Some(primary) = owners.first() else {
+        let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+        return;
+    };
+    let pending = context
+        .backends
+        .enqueue(
+            &context,
+            primary,
+            command.frame(&namespace, &key),
+            command.expect(),
+        )
+        .await;
+    tokio::spawn(async move {
+        let result = finish_primary_evaluated(
+            &context,
+            &command,
+            (&namespace, &key),
+            owners,
+            pending,
+            tag,
+            retry_capable,
+        )
+        .await;
+        let _ = result_tx.send(soften(result, retry_capable, tag, &context));
+    });
 }
 
 /// Sends `frame` to every replica in `replicas` concurrently via `call`
@@ -4667,7 +4828,7 @@ async fn finish_incr(
 /// Besides a plain write's own re-fan (`refan_write`), this is how a
 /// successful primary `INCR`/`k`/`x` *result* reaches the replicas — as a
 /// plain `Set`/`Delete`, never the `i`/`k`/`x` frame itself (see
-/// `finish_incr`'s and `finish_cas_set`'s doc comments): the primary
+/// `PrimaryCommand`'s doc comment): the primary
 /// computes or accepts a value that a replica must not be left to
 /// (re)derive on its own.
 async fn fan_out_to_replicas(
@@ -4684,244 +4845,6 @@ async fn fan_out_to_replicas(
             Err(error) => eprintln!("WARN replica {what} to {addr} failed: {error}"),
             Ok(reply) => note_refused_replica_leg(context, what, Some(addr), &reply),
         }
-    }
-}
-
-/// `finish_incr`'s retry path for both a primary `W` and a transport
-/// failure provably never sent: re-fetches the current ring and runs the
-/// whole INCR (primary leg, then the replica fan-out) again via
-/// `call_non_idempotent`, whose transparent redial recovers a dead
-/// shared connection WITHOUT replaying the `i` frame once it may have
-/// reached the wire (issue #272) — unlike `refan_write`'s `call`, which
-/// is safe to retry unconditionally only because Set/Delete are
-/// idempotent.
-async fn refan_incr(
-    context: &ProxyContext,
-    address: (&[u8], &[u8]),
-    delta: i64,
-    tag: Option<u32>,
-    retry_capable: bool,
-) -> DriverResult {
-    let (namespace, key) = address;
-    let Some(ring) = current_ring(context) else {
-        return Err(Fatal::Transient);
-    };
-    let owners = ring.owners(namespace, key);
-    let Some((primary, replicas)) = owners.split_first() else {
-        return Ok(transient_reply(retry_capable, tag));
-    };
-    match context
-        .backends
-        .call_non_idempotent(
-            context,
-            primary,
-            frame_incr(namespace, key, delta),
-            Expect::Incremented,
-        )
-        .await
-    {
-        Ok(NodeReply::Incremented(value, ttl)) => {
-            let result = frame_set(namespace, key, &value, ttl);
-            fan_out_to_replicas(context, replicas, result, Expect::Stored, "incr-result").await;
-            Ok(respond_incremented(&value, ttl, tag))
-        }
-        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
-        Ok(NodeReply::NotNumeric) => Ok(respond("T", tag)),
-        // `call_non_idempotent` already re-sent a frame that provably never
-        // left this proxy; any other failure may have applied the command.
-        Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
-        Err(_) => Err(Fatal::OutcomeUnknown),
-        Ok(_) => Err(Fatal::Transient),
-    }
-}
-
-/// `k`'s completion: the primary's ordered reply drives the result.
-/// Unlike `finish_write`, replicas are never sent the compare-and-set
-/// itself up front — a replica evaluating the same condition against its
-/// own (possibly different) copy could reach a different outcome than
-/// the primary just did. Only once the primary's condition holds is the
-/// resulting *value* fanned out to the remaining owners as a plain `Set`
-/// (`fan_out_to_replicas`, shared with `INCR` — see its own doc
-/// comment). A primary `W` re-runs the whole thing on the refreshed ring
-/// (`refan_cas_set`), same as `finish_incr`. A transport failure only
-/// does the same when the frame provably never reached the wire — like
-/// `INCR`, `k` is not idempotent (its condition can flip between
-/// attempts), so once the frame may have reached the primary, replaying
-/// it risks a double-apply and is surfaced to the client instead (issue
-/// #293, mirrors #272's fix for `INCR`) — see the `Err` arm below.
-async fn finish_cas_set(
-    context: &ProxyContext,
-    // `(namespace, key)`, grouped to stay under clippy's argument-count
-    // lint — always used together.
-    address: (&[u8], &[u8]),
-    write: (CasCondition, &[u8], Option<u64>),
-    owners: Vec<String>,
-    pending: PendingReply,
-    tag: Option<u32>,
-    retry_capable: bool,
-) -> DriverResult {
-    let (namespace, key) = address;
-    let (_, value, ttl) = write;
-    match pending.await {
-        Ok(NodeReply::Stored) => {
-            let result = frame_set(namespace, key, value, ttl);
-            fan_out_to_replicas(context, &owners[1..], result, Expect::Stored, "cas-result").await;
-            Ok(respond("S", tag))
-        }
-        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
-        Ok(NodeReply::WrongNode) => {
-            force_refresh(context).await;
-            refan_cas_set(context, address, write, tag, retry_capable).await
-        }
-        // Issue #293: only safe to retry when the frame provably never
-        // reached the backend socket (`request_not_sent`) — same guard
-        // `finish_incr` applies for #272. Once the frame may have
-        // reached the wire, retrying risks a double-apply (e.g.
-        // re-satisfying an "absent" condition against a value the first
-        // attempt already wrote), so this surfaces `Fatal` instead
-        // (softened to a per-request `R` for a retry-capable client —
-        // the client's own choice whether to re-issue the CAS).
-        Err(error) if request_not_sent(&error) => {
-            refan_cas_set(context, address, write, tag, retry_capable).await
-        }
-        Err(_) => Err(Fatal::OutcomeUnknown),
-        Ok(_) => Err(Fatal::Transient),
-    }
-}
-
-/// `finish_cas_set`'s retry path for both a primary `W` and a
-/// request-not-sent transport failure: re-fetches the current ring and
-/// runs the whole compare-and-set (primary leg, then the replica
-/// fan-out) again via `call_non_idempotent`.
-///
-/// Issue #322: this used to call the unconditionally-retrying `call` —
-/// safe for `Set`/`Delete`, but `k` is exactly as non-idempotent here as
-/// it is on `finish_cas_set`'s own first attempt (see that function's
-/// doc comment and #293). Once this refanned `k` may have reached the
-/// primary's socket, replaying it on a redial risks re-evaluating (and
-/// possibly re-satisfying, or falsely failing) the condition against a
-/// value the first attempt already changed — the same double-apply
-/// `call_non_idempotent` exists to rule out for `refan_incr` (#272).
-async fn refan_cas_set(
-    context: &ProxyContext,
-    address: (&[u8], &[u8]),
-    write: (CasCondition, &[u8], Option<u64>),
-    tag: Option<u32>,
-    retry_capable: bool,
-) -> DriverResult {
-    let (namespace, key) = address;
-    let (condition, value, ttl) = write;
-    let Some(ring) = current_ring(context) else {
-        return Err(Fatal::Transient);
-    };
-    let owners = ring.owners(namespace, key);
-    let Some((primary, replicas)) = owners.split_first() else {
-        return Ok(transient_reply(retry_capable, tag));
-    };
-    match context
-        .backends
-        .call_non_idempotent(
-            context,
-            primary,
-            frame_cas_set(namespace, key, condition, value, ttl),
-            Expect::CasSet,
-        )
-        .await
-    {
-        Ok(NodeReply::Stored) => {
-            let result = frame_set(namespace, key, value, ttl);
-            fan_out_to_replicas(context, replicas, result, Expect::Stored, "cas-result").await;
-            Ok(respond("S", tag))
-        }
-        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
-        // `call_non_idempotent` already re-sent a frame that provably never
-        // left this proxy; any other failure may have applied the command.
-        Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
-        Err(_) => Err(Fatal::OutcomeUnknown),
-        Ok(_) => Err(Fatal::Transient),
-    }
-}
-
-/// `x`'s completion — same shape as `finish_cas_set`, but the successful
-/// result is a deletion: fanned out to replicas as a plain `Delete`,
-/// never `x` itself, for the same reason `k`'s result is fanned out as a
-/// plain `Set`. Retry-on-transport-failure carries the same #293 guard
-/// as `finish_cas_set` — see its doc comment and the `Err` arm below.
-async fn finish_cas_delete(
-    context: &ProxyContext,
-    address: (&[u8], &[u8]),
-    expected_digest: [u8; 16],
-    owners: Vec<String>,
-    pending: PendingReply,
-    tag: Option<u32>,
-    retry_capable: bool,
-) -> DriverResult {
-    let (namespace, key) = address;
-    match pending.await {
-        Ok(NodeReply::Deleted) => {
-            let result = frame_delete(namespace, key);
-            fan_out_to_replicas(context, &owners[1..], result, Expect::Deleted, "cas-delete").await;
-            Ok(respond("D", tag))
-        }
-        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
-        Ok(NodeReply::WrongNode) => {
-            force_refresh(context).await;
-            refan_cas_delete(context, address, expected_digest, tag, retry_capable).await
-        }
-        // Issue #293: same `request_not_sent` guard as `finish_cas_set`
-        // — once the `x` frame may have reached the wire, retrying risks
-        // double-applying the delete (e.g. re-satisfying a digest
-        // condition against a value a concurrent write has since put
-        // back), so this surfaces `Fatal` instead.
-        Err(error) if request_not_sent(&error) => {
-            refan_cas_delete(context, address, expected_digest, tag, retry_capable).await
-        }
-        Err(_) => Err(Fatal::OutcomeUnknown),
-        Ok(_) => Err(Fatal::Transient),
-    }
-}
-
-/// `finish_cas_delete`'s retry path for both a primary `W` and a
-/// request-not-sent transport failure: re-runs the whole compare-and-delete
-/// again via `call_non_idempotent`, same #322 reasoning as
-/// `refan_cas_set` — `x` is no more idempotent than `k` once it may have
-/// reached the primary's socket.
-async fn refan_cas_delete(
-    context: &ProxyContext,
-    address: (&[u8], &[u8]),
-    expected_digest: [u8; 16],
-    tag: Option<u32>,
-    retry_capable: bool,
-) -> DriverResult {
-    let (namespace, key) = address;
-    let Some(ring) = current_ring(context) else {
-        return Err(Fatal::Transient);
-    };
-    let owners = ring.owners(namespace, key);
-    let Some((primary, replicas)) = owners.split_first() else {
-        return Ok(transient_reply(retry_capable, tag));
-    };
-    match context
-        .backends
-        .call_non_idempotent(
-            context,
-            primary,
-            frame_cas_delete(namespace, key, expected_digest),
-            Expect::Deleted,
-        )
-        .await
-    {
-        Ok(NodeReply::Deleted) => {
-            let result = frame_delete(namespace, key);
-            fan_out_to_replicas(context, replicas, result, Expect::Deleted, "cas-delete").await;
-            Ok(respond("D", tag))
-        }
-        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
-        // `call_non_idempotent` already re-sent a frame that provably never
-        // left this proxy; any other failure may have applied the command.
-        Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
-        Err(_) => Err(Fatal::OutcomeUnknown),
-        Ok(_) => Err(Fatal::Transient),
     }
 }
 
@@ -6830,6 +6753,11 @@ mod tests {
         /// `a_cas_results_fan_out_never_replays_the_operation_on_a_replica`).
         cas_sets: Arc<AtomicUsize>,
         cas_deletes: Arc<AtomicUsize>,
+        /// The TTL field (if any) of every `S`/`s` this node received, in
+        /// arrival order — shows which TTL a fanned-out result carried.
+        set_ttls: Arc<StdMutex<Vec<Option<u64>>>>,
+        /// The remaining TTL (seconds) an `I` reply carries; 0 = none.
+        incr_reply_ttl: Arc<std::sync::atomic::AtomicU64>,
         /// Issue #514: how many keep-alive probes (`G` on `KEEPALIVE_KEY`)
         /// this node received — proves the proxy pings an idle shared
         /// connection on its own, with no client traffic to carry an
@@ -6865,6 +6793,8 @@ mod tests {
                 incrs: Arc::new(AtomicUsize::new(0)),
                 cas_sets: Arc::new(AtomicUsize::new(0)),
                 cas_deletes: Arc::new(AtomicUsize::new(0)),
+                set_ttls: Arc::new(StdMutex::new(Vec::new())),
+                incr_reply_ttl: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 keepalives: Arc::new(AtomicUsize::new(0)),
                 close_when_idle_for: Arc::new(StdMutex::new(None)),
                 close_now: Arc::new(tokio::sync::Notify::new()),
@@ -6885,6 +6815,8 @@ mod tests {
             let incrs = Arc::clone(&node.incrs);
             let cas_sets = Arc::clone(&node.cas_sets);
             let cas_deletes = Arc::clone(&node.cas_deletes);
+            let set_ttls = Arc::clone(&node.set_ttls);
+            let incr_reply_ttl = Arc::clone(&node.incr_reply_ttl);
             let keepalives = Arc::clone(&node.keepalives);
             let close_when_idle_for = Arc::clone(&node.close_when_idle_for);
             let close_now = Arc::clone(&node.close_now);
@@ -6915,6 +6847,8 @@ mod tests {
                             incrs: Arc::clone(&incrs),
                             cas_sets: Arc::clone(&cas_sets),
                             cas_deletes: Arc::clone(&cas_deletes),
+                            set_ttls: Arc::clone(&set_ttls),
+                            incr_reply_ttl: Arc::clone(&incr_reply_ttl),
                             keepalives: Arc::clone(&keepalives),
                             close_when_idle_for: Arc::clone(&close_when_idle_for),
                             close_now: Arc::clone(&close_now),
@@ -6935,6 +6869,10 @@ mod tests {
 
         fn cas_deletes(&self) -> usize {
             self.cas_deletes.load(Ordering::SeqCst)
+        }
+
+        fn set_ttls(&self) -> Vec<Option<u64>> {
+            self.set_ttls.lock().unwrap().clone()
         }
 
         fn entry(&self, namespace: &[u8], key: &[u8]) -> Option<Vec<u8>> {
@@ -6966,6 +6904,8 @@ mod tests {
         incrs: Arc<AtomicUsize>,
         cas_sets: Arc<AtomicUsize>,
         cas_deletes: Arc<AtomicUsize>,
+        set_ttls: Arc<StdMutex<Vec<Option<u64>>>>,
+        incr_reply_ttl: Arc<std::sync::atomic::AtomicU64>,
         keepalives: Arc<AtomicUsize>,
         close_when_idle_for: Arc<StdMutex<Option<Duration>>>,
         close_now: Arc<tokio::sync::Notify>,
@@ -7001,6 +6941,8 @@ mod tests {
             incrs,
             cas_sets,
             cas_deletes,
+            set_ttls,
+            incr_reply_ttl,
             keepalives,
             close_when_idle_for,
             close_now,
@@ -7226,6 +7168,11 @@ mod tests {
                                 .await?;
                             continue;
                         }
+                        // Fields: lengths, an optional TTL, then the tag (the
+                        // proxy always tags, as everywhere in this mock).
+                        let has_ttl = fields.len() == offset + 4;
+                        let ttl = has_ttl.then(|| fields[offset + 2].parse().unwrap());
+                        set_ttls.lock().unwrap().push(ttl);
                         store.lock().unwrap().insert((namespace, key), value);
                         stream
                             .write_all(format!("S {}\n", tag(&fields)).as_bytes())
@@ -7299,10 +7246,20 @@ mod tests {
                                             }
                                             continue;
                                         }
+                                        let ttl = incr_reply_ttl.load(Ordering::SeqCst);
+                                        let ttl_field = if ttl > 0 {
+                                            format!(" {ttl}")
+                                        } else {
+                                            String::new()
+                                        };
                                         stream
                                             .write_all(
-                                                format!("I {} {}\n", new_bytes.len(), tag(&fields))
-                                                    .as_bytes(),
+                                                format!(
+                                                    "I {}{ttl_field} {}\n",
+                                                    new_bytes.len(),
+                                                    tag(&fields)
+                                                )
+                                                .as_bytes(),
                                             )
                                             .await?;
                                         stream.write_all(&new_bytes).await?;
@@ -9760,7 +9717,7 @@ mod tests {
         // owners start from the same seed) — the real proof is that the
         // replica's `incrs` counter stays 0: only the primary ever
         // receives an `i` frame, the replica only ever sees the result as
-        // a plain `Set` (see `finish_incr`/`fan_out_to_replicas`).
+        // a plain `Set` (see `PrimaryCommand`/`fan_out_to_replicas`).
         let (nodes, proxy) = cluster(2).await;
         let (mut stream, mut buf) = connect_and_auth(&proxy).await;
 
@@ -10169,9 +10126,9 @@ mod tests {
         // above — when `pending` fails with the `request_not_sent`
         // marker (the frame provably never reached the backend's
         // socket, e.g. `enqueue`'s own dial-backoff fast-fail),
-        // `finish_cas_set` must still retry the whole CAS via
-        // `refan_cas_set`, exactly as `finish_incr` does for #272.
-        // Driving `finish_cas_set` directly with a synthetic
+        // `finish_primary_evaluated` must still retry the whole CAS via
+        // `refan_primary_evaluated`, exactly as it does for `i` (#272).
+        // Driving `finish_primary_evaluated` directly with a synthetic
         // not-sent failure isolates that guard deterministically —
         // proven by the retry reaching the real node and landing the
         // write.
@@ -10195,10 +10152,14 @@ mod tests {
         let pending: PendingReply = PendingReply::failed(not_sent(io::Error::other(
             "simulated: never reached the wire",
         )));
-        let outcome = finish_cas_set(
+        let outcome = finish_primary_evaluated(
             &context,
+            &PrimaryCommand::CasSet {
+                condition: CasCondition::Absent,
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
             (b"", b"name"),
-            (CasCondition::Absent, b"Alice", None),
             vec![node.addr.clone()],
             pending,
             None,
@@ -10223,7 +10184,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn cas_delete_retries_in_full_when_the_request_was_never_sent() {
         // Same proof as `cas_set_retries_in_full_when_the_request_was_never_sent`,
-        // for `x`/`finish_cas_delete`.
+        // for `x`.
         let node = MockNode::start().await;
         let ring = Arc::new(RingView::new(
             vec![("node-a".to_string(), node.addr.clone())],
@@ -10258,10 +10219,10 @@ mod tests {
         let pending: PendingReply = PendingReply::failed(not_sent(io::Error::other(
             "simulated: never reached the wire",
         )));
-        let outcome = finish_cas_delete(
+        let outcome = finish_primary_evaluated(
             &context,
+            &PrimaryCommand::CasDelete { expected_digest },
             (b"", b"name"),
-            expected_digest,
             vec![node.addr.clone()],
             pending,
             None,
@@ -10285,11 +10246,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn refan_cas_set_never_replays_once_the_primary_may_have_applied_it() {
-        // Issue #322: `refan_cas_set` used to retry its own primary leg
+        // Issue #322: the `k` refan used to retry its own primary leg
         // via the unconditionally-retrying `call` — safe for
         // `Set`/`Delete`, but `k` is exactly as non-idempotent here as it
-        // is on `finish_cas_set`'s first attempt (#293). Arms
-        // `close_after_cas_set_apply_once` on the node `refan_cas_set`
+        // is on its first attempt (#293). Arms
+        // `close_after_cas_set_apply_once` on the node `refan_primary_evaluated`
         // itself dispatches to, proving the fix (`call_non_idempotent`)
         // stops retrying a `k` that may have reached the primary instead
         // of resending it and re-evaluating (and possibly misreporting)
@@ -10313,10 +10274,14 @@ mod tests {
 
         node.close_after_cas_set_apply_once
             .store(true, Ordering::SeqCst);
-        let outcome = refan_cas_set(
+        let outcome = refan_primary_evaluated(
             &context,
+            &PrimaryCommand::CasSet {
+                condition: CasCondition::Absent,
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
             (b"", b"name"),
-            (CasCondition::Absent, b"Alice", None),
             None,
             false,
         )
@@ -10342,7 +10307,7 @@ mod tests {
     async fn refan_cas_delete_never_replays_once_the_primary_may_have_applied_it() {
         // Same proof as
         // `refan_cas_set_never_replays_once_the_primary_may_have_applied_it`,
-        // for `refan_cas_delete`/`x` (issue #322).
+        // for the `x` refan (issue #322).
         let node = MockNode::start().await;
         let ring = Arc::new(RingView::new(
             vec![("node-a".to_string(), node.addr.clone())],
@@ -10374,8 +10339,14 @@ mod tests {
 
         node.close_after_cas_delete_apply_once
             .store(true, Ordering::SeqCst);
-        let outcome =
-            refan_cas_delete(&context, (b"", b"name"), expected_digest, None, false).await;
+        let outcome = refan_primary_evaluated(
+            &context,
+            &PrimaryCommand::CasDelete { expected_digest },
+            (b"", b"name"),
+            None,
+            false,
+        )
+        .await;
 
         assert!(
             outcome.is_err(),
@@ -10391,6 +10362,567 @@ mod tests {
             None,
             "the delete must be applied exactly once"
         );
+    }
+
+    // ── primary-evaluated commands (`i`, `k`, `x`): the shared skeleton ──
+    //
+    // These pin the behaviour `finish_*` / `refan_*` have in common, one
+    // command at a time, so a change to the skeleton shows up for each.
+
+    fn context_with_ring(ring: Option<Arc<RingView>>) -> ProxyContext {
+        ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: watch::channel(ring).1,
+            refresh_now: mpsc::channel(4).0,
+            drain: watch::channel(false).1,
+            backends: Arc::new(SharedBackends::new()),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn one_node_ring(node: &MockNode) -> Arc<RingView> {
+        Arc::new(RingView::new(
+            vec![("node-a".to_string(), node.addr.clone())],
+            1,
+        ))
+    }
+
+    /// The primary and the replica of `key` in a two-node, R=2 `cluster`.
+    fn primary_and_replica<'a>(nodes: &'a [MockNode], key: &[u8]) -> (&'a MockNode, &'a MockNode) {
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+        if ring.owners(b"", key)[0] == nodes[0].addr {
+            (&nodes[0], &nodes[1])
+        } else {
+            (&nodes[1], &nodes[0])
+        }
+    }
+
+    fn digest_of(value: &[u8]) -> [u8; 16] {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(value);
+        let mut digest = [0u8; 16];
+        digest.copy_from_slice(&hash[..16]);
+        digest
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_incr_answered_w_is_redone_on_the_refreshed_ring_and_fans_out_its_result() {
+        let (nodes, proxy) = cluster(2).await;
+        let (primary, replica) = primary_and_replica(&nodes, b"counter");
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"S 7 2\ncounter10").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        primary.wrong_node_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"i 0 7 5\ncounter").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 2");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"15");
+
+        // The `W` answer applied nothing; the redo applied the delta once.
+        assert!(
+            !primary.wrong_node_once.load(Ordering::SeqCst),
+            "W was served"
+        );
+        assert_eq!(primary.incrs(), 1);
+        assert_eq!(replica.incrs(), 0);
+        assert_eq!(primary.entry(b"", b"counter"), Some(b"15".to_vec()));
+        assert_eq!(replica.entry(b"", b"counter"), Some(b"15".to_vec()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cas_set_answered_w_is_redone_on_the_refreshed_ring_and_fans_out_its_value() {
+        let (nodes, proxy) = cluster(2).await;
+        let (primary, replica) = primary_and_replica(&nodes, b"name");
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"S 4 5\nnameAlice").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        primary.wrong_node_once.store(true, Ordering::SeqCst);
+        let current = mock_content_digest(b"Alice");
+        stream
+            .write_all(format!("k 0 4 3 {current}\nnameBob").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        assert!(
+            !primary.wrong_node_once.load(Ordering::SeqCst),
+            "W was served"
+        );
+        assert_eq!(primary.cas_sets(), 1);
+        assert_eq!(replica.cas_sets(), 0);
+        assert_eq!(primary.entry(b"", b"name"), Some(b"Bob".to_vec()));
+        assert_eq!(replica.entry(b"", b"name"), Some(b"Bob".to_vec()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cas_delete_answered_w_is_redone_on_the_refreshed_ring_and_fans_out_the_delete() {
+        let (nodes, proxy) = cluster(2).await;
+        let (primary, replica) = primary_and_replica(&nodes, b"name");
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"S 4 5\nnameAlice").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        primary.wrong_node_once.store(true, Ordering::SeqCst);
+        let current = mock_content_digest(b"Alice");
+        stream
+            .write_all(format!("x 0 4 {current}\nname").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "D");
+
+        assert!(
+            !primary.wrong_node_once.load(Ordering::SeqCst),
+            "W was served"
+        );
+        assert_eq!(primary.cas_deletes(), 1);
+        assert_eq!(replica.cas_deletes(), 0);
+        assert_eq!(primary.entry(b"", b"name"), None);
+        assert_eq!(replica.entry(b"", b"name"), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redo_after_w_still_reports_a_no_op_and_fans_nothing_out() {
+        let (nodes, proxy) = cluster(2).await;
+        let (primary, replica) = primary_and_replica(&nodes, b"name");
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"S 4 5\nnameAlice").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        let sets_before = replica.set_ttls().len();
+
+        // `i` on a value that is not a number: `T`.
+        primary.wrong_node_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"i 0 4 1\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "T");
+
+        // `i` on a missing key: `N`. That key has its own primary.
+        let (missing_primary, _) = primary_and_replica(&nodes, b"missing");
+        missing_primary
+            .wrong_node_once
+            .store(true, Ordering::SeqCst);
+        stream.write_all(b"i 0 7 1\nmissing").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+
+        // `k` whose digest condition does not hold: `N`.
+        primary.wrong_node_once.store(true, Ordering::SeqCst);
+        let stale = mock_content_digest(b"someone-else");
+        stream
+            .write_all(format!("k 0 4 3 {stale}\nnameBob").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+
+        // `x` whose digest does not match: `N`.
+        primary.wrong_node_once.store(true, Ordering::SeqCst);
+        stream
+            .write_all(format!("x 0 4 {stale}\nname").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+
+        for node in &nodes {
+            assert!(
+                !node.wrong_node_once.load(Ordering::SeqCst),
+                "every armed W was served, so each answer came from a redo"
+            );
+        }
+        assert_eq!(primary.entry(b"", b"name"), Some(b"Alice".to_vec()));
+        assert_eq!(replica.entry(b"", b"name"), Some(b"Alice".to_vec()));
+        assert_eq!(
+            replica.set_ttls().len(),
+            sets_before,
+            "a no-op result is not fanned out"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redo_after_w_forwards_the_ttl_of_the_result() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        // `i`: the TTL the primary's `I` reply carries goes to the replica.
+        let (primary, replica) = primary_and_replica(&nodes, b"counter");
+        stream.write_all(b"S 7 2\ncounter10").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        let sets_before = replica.set_ttls().len();
+        primary.incr_reply_ttl.store(30, Ordering::SeqCst);
+        primary.wrong_node_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"i 0 7 5\ncounter").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 2 30");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"15");
+        assert!(
+            !primary.wrong_node_once.load(Ordering::SeqCst),
+            "W was served"
+        );
+        assert_eq!(replica.set_ttls()[sets_before..], [Some(30)]);
+
+        // `k`: the TTL of the request goes to the replica.
+        let (primary, replica) = primary_and_replica(&nodes, b"name");
+        let sets_before = replica.set_ttls().len();
+        primary.wrong_node_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"k 0 4 3 A 45\nnameBob").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert!(
+            !primary.wrong_node_once.load(Ordering::SeqCst),
+            "W was served"
+        );
+        assert_eq!(replica.set_ttls()[sets_before..], [Some(45)]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cas_set_forwards_its_ttl_to_the_replica() {
+        let (nodes, proxy) = cluster(2).await;
+        let (primary, replica) = primary_and_replica(&nodes, b"name");
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"k 0 4 3 A 30\nnameBob").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        stream.write_all(b"k 0 4 3 P\nnameAmy").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        assert!(
+            primary.set_ttls().is_empty(),
+            "the primary got `k`, not `S`"
+        );
+        assert_eq!(replica.set_ttls(), vec![Some(30), None]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_incr_forwards_the_ttl_its_reply_carried_to_the_replica() {
+        let primary = MockNode::start().await;
+        let replica = MockNode::start().await;
+        let context = context_with_ring(None);
+        let pending: PendingReply =
+            Box::pin(async { Ok(NodeReply::Incremented(Bytes::from_static(b"15"), Some(30))) });
+
+        let outcome = finish_primary_evaluated(
+            &context,
+            &PrimaryCommand::Incr { delta: 5 },
+            (b"", b"counter"),
+            vec![primary.addr.clone(), replica.addr.clone()],
+            pending,
+            None,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.ok(),
+            Some(respond_incremented(b"15", Some(30), None))
+        );
+        assert_eq!(replica.set_ttls(), vec![Some(30)]);
+        assert_eq!(replica.entry(b"", b"counter"), Some(b"15".to_vec()));
+        assert_eq!(replica.incrs(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refan_incr_never_replays_once_the_primary_may_have_applied_it() {
+        // The `i` refan had no test of its own: arms
+        // `close_after_incr_apply_once` on the node it dispatches to, as
+        // `refan_cas_set_never_replays_...` does for `k`.
+        let node = MockNode::start().await;
+        let context = context_with_ring(Some(one_node_ring(&node)));
+        node.store
+            .lock()
+            .unwrap()
+            .insert((b"".to_vec(), b"counter".to_vec()), b"10".to_vec());
+
+        node.close_after_incr_apply_once
+            .store(true, Ordering::SeqCst);
+        let outcome = refan_primary_evaluated(
+            &context,
+            &PrimaryCommand::Incr { delta: 5 },
+            (b"", b"counter"),
+            None,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Err(Fatal::OutcomeUnknown)),
+            "a lost reply after the refanned `i` may have applied must surface OutcomeUnknown"
+        );
+        assert_eq!(node.incrs(), 1, "the refan attempt must not be replayed");
+        assert_eq!(node.entry(b"", b"counter"), Some(b"15".to_vec()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incr_retries_in_full_when_the_request_was_never_sent() {
+        let node = MockNode::start().await;
+        let context = context_with_ring(Some(one_node_ring(&node)));
+        node.store
+            .lock()
+            .unwrap()
+            .insert((b"".to_vec(), b"counter".to_vec()), b"10".to_vec());
+
+        let pending: PendingReply = PendingReply::failed(not_sent(io::Error::other(
+            "simulated: never reached the wire",
+        )));
+        let outcome = finish_primary_evaluated(
+            &context,
+            &PrimaryCommand::Incr { delta: 5 },
+            (b"", b"counter"),
+            vec![node.addr.clone()],
+            pending,
+            None,
+            false,
+        )
+        .await;
+
+        assert_eq!(outcome.ok(), Some(respond_incremented(b"15", None, None)));
+        assert_eq!(
+            node.incrs(),
+            1,
+            "exactly one `i` frame must reach the node — the retry, not a replay"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_first_attempt_that_may_have_reached_the_wire_is_never_retried() {
+        let node = MockNode::start().await;
+        let context = context_with_ring(Some(one_node_ring(&node)));
+        let lost = || -> PendingReply { PendingReply::failed(io::Error::other("lost reply")) };
+        let owners = || vec![node.addr.clone()];
+
+        let incr = finish_primary_evaluated(
+            &context,
+            &PrimaryCommand::Incr { delta: 1 },
+            (b"", b"k"),
+            owners(),
+            lost(),
+            None,
+            false,
+        )
+        .await;
+        let cas_set = finish_primary_evaluated(
+            &context,
+            &PrimaryCommand::CasSet {
+                condition: CasCondition::Absent,
+                value: Bytes::from_static(b"v"),
+                ttl: None,
+            },
+            (b"", b"k"),
+            owners(),
+            lost(),
+            None,
+            false,
+        )
+        .await;
+        let cas_delete = finish_primary_evaluated(
+            &context,
+            &PrimaryCommand::CasDelete {
+                expected_digest: digest_of(b"v"),
+            },
+            (b"", b"k"),
+            owners(),
+            lost(),
+            None,
+            false,
+        )
+        .await;
+
+        for (name, outcome) in [("i", incr), ("k", cas_set), ("x", cas_delete)] {
+            assert!(
+                matches!(outcome, Err(Fatal::OutcomeUnknown)),
+                "{name}: an ambiguous failure is OutcomeUnknown, not a retry"
+            );
+        }
+        assert_eq!(node.incrs() + node.cas_sets() + node.cas_deletes(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unexpected_primary_reply_is_transient_for_every_primary_evaluated_command() {
+        let node = MockNode::start().await;
+        let context = context_with_ring(Some(one_node_ring(&node)));
+        let odd = || -> PendingReply { Box::pin(async { Ok(NodeReply::Error) }) };
+        let owners = || vec![node.addr.clone()];
+
+        let incr = finish_primary_evaluated(
+            &context,
+            &PrimaryCommand::Incr { delta: 1 },
+            (b"", b"k"),
+            owners(),
+            odd(),
+            None,
+            false,
+        )
+        .await;
+        let cas_set = finish_primary_evaluated(
+            &context,
+            &PrimaryCommand::CasSet {
+                condition: CasCondition::Absent,
+                value: Bytes::from_static(b"v"),
+                ttl: None,
+            },
+            (b"", b"k"),
+            owners(),
+            odd(),
+            None,
+            false,
+        )
+        .await;
+        let cas_delete = finish_primary_evaluated(
+            &context,
+            &PrimaryCommand::CasDelete {
+                expected_digest: digest_of(b"v"),
+            },
+            (b"", b"k"),
+            owners(),
+            odd(),
+            None,
+            false,
+        )
+        .await;
+
+        for (name, outcome) in [("i", incr), ("k", cas_set), ("x", cas_delete)] {
+            assert!(
+                matches!(outcome, Err(Fatal::Transient)),
+                "{name}: an unexpected reply is Transient"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refan_without_a_ring_is_transient_for_every_primary_evaluated_command() {
+        let context = context_with_ring(None);
+
+        let incr = refan_primary_evaluated(
+            &context,
+            &PrimaryCommand::Incr { delta: 1 },
+            (b"", b"k"),
+            None,
+            false,
+        )
+        .await;
+        let cas_set = refan_primary_evaluated(
+            &context,
+            &PrimaryCommand::CasSet {
+                condition: CasCondition::Absent,
+                value: Bytes::from_static(b"v"),
+                ttl: None,
+            },
+            (b"", b"k"),
+            None,
+            false,
+        )
+        .await;
+        let cas_delete = refan_primary_evaluated(
+            &context,
+            &PrimaryCommand::CasDelete {
+                expected_digest: digest_of(b"v"),
+            },
+            (b"", b"k"),
+            None,
+            false,
+        )
+        .await;
+
+        for (name, outcome) in [("i", incr), ("k", cas_set), ("x", cas_delete)] {
+            assert!(
+                matches!(outcome, Err(Fatal::Transient)),
+                "{name}: no ring is Transient"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refan_to_an_unreachable_primary_is_transient_not_outcome_unknown() {
+        // Nothing reached the wire, so the caller may be told to retry:
+        // `Transient` (an `R` for a retry-capable client), never the
+        // "may have been applied" `OutcomeUnknown`.
+        // Port 1 on loopback: nothing listens, so the dial is refused, and
+        // there is no released port for a parallel test to pick up.
+        let dead = "127.0.0.1:1".to_string();
+        let ring = Arc::new(RingView::new(vec![("node-a".to_string(), dead)], 1));
+        let context = context_with_ring(Some(ring));
+
+        let incr = refan_primary_evaluated(
+            &context,
+            &PrimaryCommand::Incr { delta: 1 },
+            (b"", b"k"),
+            None,
+            false,
+        )
+        .await;
+        let cas_set = refan_primary_evaluated(
+            &context,
+            &PrimaryCommand::CasSet {
+                condition: CasCondition::Absent,
+                value: Bytes::from_static(b"v"),
+                ttl: None,
+            },
+            (b"", b"k"),
+            None,
+            false,
+        )
+        .await;
+        let cas_delete = refan_primary_evaluated(
+            &context,
+            &PrimaryCommand::CasDelete {
+                expected_digest: digest_of(b"v"),
+            },
+            (b"", b"k"),
+            None,
+            false,
+        )
+        .await;
+
+        for (name, outcome) in [("i", incr), ("k", cas_set), ("x", cas_delete)] {
+            assert!(
+                matches!(outcome, Err(Fatal::Transient)),
+                "{name}: an unsent request is Transient"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refan_answered_w_again_is_transient_for_every_primary_evaluated_command() {
+        // The redo is not repeated: a second `W` is a failure the caller may
+        // retry, never "may have been applied".
+        let node = MockNode::start().await;
+        let context = context_with_ring(Some(one_node_ring(&node)));
+        let commands = [
+            ("i", PrimaryCommand::Incr { delta: 1 }),
+            (
+                "k",
+                PrimaryCommand::CasSet {
+                    condition: CasCondition::Absent,
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            ),
+            (
+                "x",
+                PrimaryCommand::CasDelete {
+                    expected_digest: digest_of(b"v"),
+                },
+            ),
+        ];
+
+        for (name, command) in &commands {
+            node.wrong_node_once.store(true, Ordering::SeqCst);
+            let outcome =
+                refan_primary_evaluated(&context, command, (b"", b"k"), None, false).await;
+            assert!(
+                matches!(outcome, Err(Fatal::Transient)),
+                "{name}: a repeated W is Transient"
+            );
+            assert!(
+                !node.wrong_node_once.load(Ordering::SeqCst),
+                "{name}: W was served"
+            );
+        }
     }
 
     // ── issue #177: concurrent fan-out, dial backoff, failed-primary skip ──
