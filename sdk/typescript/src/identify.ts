@@ -520,7 +520,9 @@ function isLegacyServerSignal(error: unknown): boolean {
   if (error instanceof Error && error.message === "nanocached: connection closed before the expected response arrived") {
     return true;
   }
-  const code = (error as NodeJS.ErrnoException)?.code;
+  // The system error itself, or the one `authenticate` wrapped as the
+  // `cause` of its `ConnectionLostError`.
+  const code = (error as NodeJS.ErrnoException)?.code ?? ((error as Error)?.cause as NodeJS.ErrnoException)?.code;
   return code === "ECONNRESET" || code === "EPIPE";
 }
 
@@ -576,7 +578,19 @@ async function authenticate(
     identity = await readFrame(socket, restartingParser(tryParseIdentity), remainingDeadline(deadlineMs, startedAt));
   } catch (error) {
     socket.destroy();
-    throw error;
+    if (error instanceof NanocachedError) throw error;
+    // The socket's own error between the dial and the identity — a
+    // reset or a broken pipe while `A` was answered — is this SDK's
+    // `ConnectionLostError` like a failed dial (`connectSocket`), with
+    // the system error as `cause`; it used to escape raw, the one
+    // failure of a connect that `error instanceof NanocachedError` did
+    // not catch. `requestWasSent` is false as for a dial: no request of
+    // the caller's was written, only the handshake.
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ConnectionLostError(
+      `nanocached: ${options.host}:${options.port} closed the connection during the handshake: ${message}`,
+      { requestWasSent: false, cause: error },
+    );
   }
 
   if (!identity.accepted) {

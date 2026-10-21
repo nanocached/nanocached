@@ -1,7 +1,7 @@
 import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { connect, createServer, type AddressInfo, type Server, type Socket } from "node:net";
-import { Connection } from "../src/connection.js";
+import { Connection, ConnectionLostError } from "../src/connection.js";
 import { connectAndIdentify, connectAndListProxies } from "../src/identify.js";
 
 // Regression tests for the O(n^2) re-copying of a large response while it
@@ -160,6 +160,26 @@ describe("identify reads a large roster in one pass", () => {
       assert.deepEqual(result.nodes, nodes);
     });
   }
+
+  it("a reset while the handshake is answered is a ConnectionLostError, not the raw system error", async () => {
+    // The dial succeeded; the server resets the connection on reading
+    // `A`. `connectSocket` wraps a failed dial, but the socket error
+    // after it escaped `connectAndIdentify` raw (an ECONNRESET
+    // ErrnoException) once the legacy-server fallbacks were spent: the
+    // one connect failure `error instanceof NanocachedError` missed.
+    const port = await listen((socket) => {
+      socket.on("error", () => {});
+      socket.once("data", () => socket.resetAndDestroy());
+    });
+    await assert.rejects(connectAndIdentify({ host: "127.0.0.1", port }), (error: unknown) => {
+      assert.ok(error instanceof ConnectionLostError, `got ${String(error)}`);
+      assert.equal(error.requestWasSent, false);
+      assert.match(error.message, /during the handshake/);
+      const cause = error.cause as NodeJS.ErrnoException;
+      assert.ok(typeof cause?.code === "string", `cause ${String(cause)} should be the system error`);
+      return true;
+    });
+  });
 
   it("still rejects a malformed entry that arrives after valid ones were already consumed", async () => {
     const good = "4 9\nname127.0.0.1:1\n";
