@@ -4530,6 +4530,59 @@ func TestClusterSetManyRecoversAPerKeyWrongNodeAfterARefresh(t *testing.T) {
 	}
 }
 
+func TestClusterSetManyReportsAKeyStoredWhenItsAcknowledgingReplicaBecomesThePrimary(t *testing.T) {
+	// R=2 over {a, b, c}. The key's primary a answers W and its replica
+	// b acknowledges; a then leaves the roster, so after the refresh the
+	// key's owners are [b, c]: b, already acknowledged, is not sent the
+	// key again — and used to go unrecorded as its primary, so SetMany
+	// reported the key as not stored although it sits on its primary.
+	names := []string{
+		"aaaaaaaa-1b3d-4e6f-8a90-c1d2e3f4a5b6",
+		"bbbbbbbb-7e2c-4f58-9b31-6a8d0c9e2f47",
+		"cccccccc-3c1a-4d7e-9f20-8b6c5d4e3f21",
+	}
+	nodes := map[string]*mockNode{}
+	listed := make([]discoveredNode, 0, len(names))
+	for _, name := range names {
+		nodes[name] = startMockNode(t, nil)
+		listed = append(listed, discoveredNode{Name: name, Address: nodes[name].address()})
+	}
+	discovery := startMockDiscovery(t, listed, 2)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ring := NewHashRing(names)
+	var key string
+	for i := 0; key == ""; i++ {
+		candidate := fmt.Sprintf("key-%d", i)
+		owners := ring.Owners([]byte(candidate), 2)
+		if owners[0] == names[0] && owners[1] == names[1] {
+			key = candidate
+		}
+		if i > 10_000 {
+			t.Fatal("no key with owners [a, b]")
+		}
+	}
+	nodes[names[0]].multiWrongNodeKey.Store(key)
+	nodes[names[0]].multiWrongNodeLeft.Add(1)
+	// The refresh the W triggers finds a gone.
+	discovery.setNodes(listed[1:])
+
+	stored, err := client.SetMany(map[string]string{key: "v"}, 0)
+	if err != nil {
+		t.Fatalf("SetMany = %v, want success", err)
+	}
+	if !stored[key] {
+		t.Fatalf("stored = %v, want %q reported stored: its acknowledging replica is its primary now", stored, key)
+	}
+	if !nodes[names[1]].hasKey(key) || !nodes[names[2]].hasKey(key) {
+		t.Fatal("expected the key on both owners under the refreshed roster")
+	}
+}
+
 // ── issue #67: connect() bootstrap tolerates an unreachable node ──
 
 // keyWithPrimary finds a key whose primary owner is name, against

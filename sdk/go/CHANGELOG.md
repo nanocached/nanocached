@@ -12,6 +12,11 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `SetMany`/`SetManyBytes` report a key as stored when the owner that
+  acknowledged it as a replica became its primary between the two
+  passes (the old primary answered `W` and left the roster): the key
+  sits on its primary, but the earlier acknowledgement was recorded as
+  a replica's and the key was missing from the returned map.
 - A request made on a connection another request had just timed out is
   redialed like any request that never reached the wire. It was
   reported with the earlier request's timed-out marker, which the retry
