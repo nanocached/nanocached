@@ -751,16 +751,21 @@ func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte
 	c.writeMu.Lock()
 	c.mu.Lock()
 	if c.closed {
-		err := c.lastErr
+		lastErr := c.lastErr
 		c.mu.Unlock()
 		c.writeMu.Unlock()
-		if err == nil {
-			err = connectionLost("connection is closed", nil)
-		}
 		// This attempt's frame was never written — regardless of what
 		// originally poisoned the connection (which may itself have been
 		// a "possibly sent" failure for a DIFFERENT, earlier request),
-		// THIS request never got a chance to reach the wire.
+		// THIS request never got a chance to reach the wire. The poison's
+		// own markers belong to that earlier request: carried along by
+		// its chain, errRequestTimedOut made the retry layer treat this
+		// never-sent request as the one that timed out and give up on
+		// it without a redial. The cause is kept as text only.
+		err := connectionLost("connection is closed", nil)
+		if lastErr != nil {
+			err = connectionLost("connection is closed", errors.New(lastErr.Error()))
+		}
 		return 0, nil, 0, nil, notSent(err)
 	}
 	c.lastUsed = time.Now()
@@ -789,15 +794,20 @@ func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte
 
 	if writeErr != nil {
 		err := connectionLost("connection failed", writeErr)
+		// A write that blocked past the request deadline is the peer
+		// not reading: the requests already pipelined behind this one
+		// are drained as timed out too, as readLoop's deadline expiry
+		// reports them, so the retry layer does not redial and resend
+		// them against the same stalled peer.
+		if isTimeout(writeErr) {
+			err = timedOut(err)
+		}
 		c.poison(err)
 		// The Write() call itself failed: no complete frame reached the
 		// server, so it could not have executed this request. Safe to
 		// retry after a redial — unless the write failed because the
 		// request deadline passed while the peer was not reading (see
 		// errRequestTimedOut), which the retry layer must not resend.
-		if isTimeout(writeErr) {
-			return 0, nil, 0, nil, timedOut(notSent(err))
-		}
 		return 0, nil, 0, nil, notSent(err)
 	}
 
