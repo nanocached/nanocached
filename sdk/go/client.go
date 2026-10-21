@@ -1906,8 +1906,15 @@ func (c *Client) multiSetPass(
 		}
 		for rank, name := range names {
 			// An owner that already acknowledged this key in an earlier
-			// pass is not sent it again.
+			// pass is not sent it again. If the refresh between the
+			// passes promoted it to the key's primary (the old primary
+			// left the roster), the key is stored on its primary now and
+			// is reported so: the earlier pass recorded that owner's
+			// acknowledgement as a replica's.
 			if acknowledged.has(idx, name) {
+				if rank == 0 && stored != nil {
+					stored[keys[idx]] = true
+				}
 				continue
 			}
 			batch := owners[name]
