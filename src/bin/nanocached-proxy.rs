@@ -163,7 +163,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 
 /// Mirrors the node's own request-size bound so the proxy never buffers
 /// more per request than a node would accept.
@@ -951,29 +951,22 @@ struct ProxyContext {
 
 // ─── shared line/frame helpers ───────────────────────────────────────
 
+/// One header line (no newline) off `stream`, through the shared bounded
+/// reader: at most `MAX_REQUEST_SIZE` bytes, and `UPSTREAM_IO_TIMEOUT` for
+/// the whole line. Whatever a read pulled in past the newline stays in `buf`
+/// for `read_exact_into` and the next line.
 async fn read_line<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut BytesMut) -> io::Result<String> {
-    loop {
-        if let Some(position) = buf.iter().position(|byte| *byte == b'\n') {
-            let line = buf.split_to(position + 1);
-            return String::from_utf8(line[..position].to_vec())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 header"));
-        }
-        if buf.len() > MAX_REQUEST_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "header exceeds the request-size limit",
-            ));
-        }
-        let mut chunk = [0u8; 4096];
-        let bytes_read = stream.read(&mut chunk).await?;
-        if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "connection closed mid-frame",
-            ));
-        }
-        buf.extend_from_slice(&chunk[..bytes_read]);
-    }
+    let mut line = Vec::new();
+    infra::read_line_bounded(
+        &mut infra::CarryReader::new(stream, buf),
+        MAX_REQUEST_SIZE,
+        Instant::now() + UPSTREAM_IO_TIMEOUT,
+        &mut line,
+    )
+    .await?;
+    line.pop(); // the newline
+    String::from_utf8(line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 header"))
 }
 
 async fn read_exact_into<S: AsyncRead + Unpin>(
@@ -5065,9 +5058,11 @@ async fn handle_client(
                     // permit for good. A timeout is treated exactly like
                     // a write error: stop delivering and let the caller
                     // tear the connection down.
-                    match timeout(CLIENT_WRITE_TIMEOUT, write_half.write_all(&response)).await {
-                        Ok(Ok(())) => {}
-                        _ => return write_half,
+                    if infra::write_all_within(&mut write_half, &response, CLIENT_WRITE_TIMEOUT)
+                        .await
+                        .is_err()
+                    {
+                        return write_half;
                     }
                     // Written and about to be dropped: the bytes this
                     // request was charged are free again.
@@ -5078,7 +5073,8 @@ async fn handle_client(
                     writer_context
                         .upstream_failures_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let _ = timeout(CLIENT_WRITE_TIMEOUT, write_half.write_all(b"E\n")).await;
+                    let _ = infra::write_all_within(&mut write_half, b"E\n", CLIENT_WRITE_TIMEOUT)
+                        .await;
                     return write_half;
                 }
             }
@@ -5604,7 +5600,7 @@ fn reply_busy_and_close(stream: TcpStream, tls_configured: bool) {
     }
     tokio::spawn(async move {
         let mut stream = stream;
-        let _ = timeout(CLIENT_WRITE_TIMEOUT, stream.write_all(b"B\n")).await;
+        let _ = infra::write_all_within(&mut stream, b"B\n", CLIENT_WRITE_TIMEOUT).await;
     });
 }
 
@@ -6489,6 +6485,37 @@ mod tests {
         let _ = buf.split_to(1);
         assert_eq!(context.requests_total.load(Ordering::Relaxed), 2);
         drop(node);
+    }
+
+    #[tokio::test]
+    async fn the_production_read_line_stops_at_the_request_size_limit() {
+        // Through `super::read_line`, not the test helper above.
+        let flood = vec![b'x'; MAX_REQUEST_SIZE + 4096];
+        let mut stream = &flood[..];
+        let mut buf = BytesMut::new();
+        let error = super::read_line(&mut stream, &mut buf).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_production_read_line_gives_up_on_a_silent_peer_after_the_upstream_timeout() {
+        let (_client, mut server) = tokio::io::duplex(64);
+        let mut buf = BytesMut::new();
+        let started = Instant::now();
+        let error = super::read_line(&mut server, &mut buf).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), UPSTREAM_IO_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn the_production_read_line_leaves_the_bytes_after_the_newline_in_the_buffer() {
+        let mut stream = &b"V 3 7\nabc"[..];
+        let mut buf = BytesMut::new();
+        assert_eq!(
+            super::read_line(&mut stream, &mut buf).await.unwrap(),
+            "V 3 7"
+        );
+        assert_eq!(&buf[..], b"abc");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7775,6 +7802,26 @@ mod tests {
         let discovery = start_mock_discovery(roster, replication).await;
         let proxy = start_proxy(&discovery, None, 64).await;
         (vec![node_a, node_b], proxy)
+    }
+
+    /// The production `read_line` bounds one line by `UPSTREAM_IO_TIMEOUT`
+    /// (shrunk under test). A test client waiting on a node it made slow on
+    /// purpose, for replies queued behind each other, waits longer than that.
+    async fn read_line<S: AsyncRead + Unpin>(
+        stream: &mut S,
+        buf: &mut BytesMut,
+    ) -> io::Result<String> {
+        let mut line = Vec::new();
+        infra::read_line_bounded(
+            &mut infra::CarryReader::new(stream, buf),
+            MAX_REQUEST_SIZE,
+            Instant::now() + Duration::from_secs(30),
+            &mut line,
+        )
+        .await?;
+        line.pop();
+        String::from_utf8(line)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 header"))
     }
 
     async fn connect_and_auth(proxy: &str) -> (TcpStream, BytesMut) {

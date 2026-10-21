@@ -1,7 +1,8 @@
 //! Connection- and process-level glue shared by `nanocached-node`,
 //! `nanocached-proxy` and `nanocached-discovery`: TLS setup, the metrics
-//! HTTP responder, shutdown-signal handling, the accept-loop backoff, and
-//! per-source-IP connection limiting. See the crate root docs for what
+//! HTTP responder, shutdown-signal handling, the accept-loop backoff,
+//! per-source-IP connection limiting, and the bounded line read and write
+//! every untrusted peer goes through. See the crate root docs for what
 //! this deliberately excludes (the HRW ring, wire-protocol parsing,
 //! `verify-staged-join`).
 //!
@@ -14,6 +15,7 @@
 //! divergence duplicated infra invites over time). This module now backs
 //! every caller with the more conservative always-back-off behavior.
 
+use bytes::{Buf, BytesMut};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::collections::HashMap;
@@ -24,9 +26,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf,
+};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // ─── TLS-or-plaintext streams ──────────────────────────────────────────
@@ -313,6 +317,123 @@ pub async fn write_http_response(
     stream.shutdown().await
 }
 
+// ─── bounded line reading and writing ───────────────────────────────────
+
+/// Reads one `\n`-terminated line into `line` (cleared first, the newline
+/// kept), bounded two ways: it errors with `InvalidData` if the line would
+/// exceed `limit` bytes (newline included) before the newline arrives, and
+/// with `TimedOut` if the newline has not arrived by `deadline`. EOF before
+/// the newline is `UnexpectedEof`.
+///
+/// This is the one way to read an untrusted line. `read_line` and
+/// `read_until` grow without bound, and a timeout wrapped around each read
+/// is re-armed by every byte a peer trickles in, so neither stops a hostile
+/// or broken peer from holding the task and its memory; both mistakes were
+/// made again with each new reader (`clippy.toml` rejects the raw calls).
+/// The deadline is an absolute instant, so a caller reading several lines
+/// can share one deadline across them.
+pub async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+    deadline: Instant,
+    line: &mut Vec<u8>,
+) -> io::Result<()> {
+    line.clear();
+    loop {
+        let available = timeout_at(deadline, reader.fill_buf())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "line read timed out"))??;
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before the end of the line",
+            ));
+        }
+        let (take, complete) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(position) => (position + 1, true),
+            None => (available.len(), false),
+        };
+        if line.len() + take > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "line exceeded its size cap",
+            ));
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if complete {
+            return Ok(());
+        }
+    }
+}
+
+/// Gives a plain reader the `AsyncBufRead` face `read_line_bounded` needs
+/// while keeping its surplus in a caller-owned buffer, for the readers that
+/// parse a line and then the bytes behind it out of one shared `BytesMut`
+/// (the proxy's backend and discovery clients). Whatever a read pulled in
+/// past the newline stays in `carry` for the next one.
+pub struct CarryReader<'a, S> {
+    stream: &'a mut S,
+    carry: &'a mut BytesMut,
+}
+
+impl<'a, S> CarryReader<'a, S> {
+    pub fn new(stream: &'a mut S, carry: &'a mut BytesMut) -> Self {
+        CarryReader { stream, carry }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CarryReader<'_, S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if !this.carry.is_empty() {
+            let take = this.carry.len().min(buf.remaining());
+            buf.put_slice(&this.carry[..take]);
+            this.carry.advance(take);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut *this.stream).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncBufRead for CarryReader<'_, S> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let this = self.get_mut();
+        if this.carry.is_empty() {
+            let mut chunk = [0u8; 4096];
+            let mut read = ReadBuf::new(&mut chunk);
+            match Pin::new(&mut *this.stream).poll_read(cx, &mut read) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => this.carry.extend_from_slice(read.filled()),
+            }
+        }
+        Poll::Ready(Ok(&this.carry[..]))
+    }
+
+    fn consume(self: Pin<&mut Self>, amount: usize) {
+        self.get_mut().carry.advance(amount);
+    }
+}
+
+/// `write_all` bounded by `limit`: a peer that accepts the connection but
+/// stops draining its receive buffer (crashed-but-open, black-holed, or
+/// hostile) would otherwise park the write, and whatever permit or queue
+/// slot the task holds, forever.
+pub async fn write_all_within<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+    limit: Duration,
+) -> io::Result<()> {
+    timeout(limit, writer.write_all(data))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
+}
+
 // ─── startup exposure warning ───────────────────────────────────────────
 
 /// Whether a server bound to `local` with (`has_secret`) or without a
@@ -502,6 +623,225 @@ pub async fn reject_over_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── bounded line reading and writing ──
+
+    use std::time::Duration as StdDuration;
+    use tokio::io::{BufReader, duplex};
+
+    fn deadline_in(millis: u64) -> Instant {
+        Instant::now() + StdDuration::from_millis(millis)
+    }
+
+    async fn line_from(bytes: &[u8], limit: usize) -> io::Result<Vec<u8>> {
+        let mut reader = BufReader::new(bytes);
+        let mut line = Vec::new();
+        read_line_bounded(&mut reader, limit, deadline_in(5_000), &mut line).await?;
+        Ok(line)
+    }
+
+    #[tokio::test]
+    async fn a_line_is_returned_with_its_newline_and_the_rest_is_left_unread() {
+        let mut reader = BufReader::new(&b"first\nsecond\n"[..]);
+        let mut line = Vec::new();
+        read_line_bounded(&mut reader, 64, deadline_in(5_000), &mut line)
+            .await
+            .unwrap();
+        assert_eq!(line, b"first\n");
+        read_line_bounded(&mut reader, 64, deadline_in(5_000), &mut line)
+            .await
+            .unwrap();
+        assert_eq!(line, b"second\n", "the buffer is cleared first");
+    }
+
+    #[tokio::test]
+    async fn a_line_split_across_reads_is_assembled() {
+        let (mut client, server) = duplex(64);
+        tokio::spawn(async move {
+            client.write_all(b"spl").await.unwrap();
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+            client.write_all(b"it\nnext").await.unwrap();
+        });
+        let mut reader = BufReader::new(server);
+        let mut line = Vec::new();
+        read_line_bounded(&mut reader, 64, deadline_in(5_000), &mut line)
+            .await
+            .unwrap();
+        assert_eq!(line, b"split\n");
+    }
+
+    #[tokio::test]
+    async fn the_cap_counts_the_newline_and_a_line_at_the_cap_is_accepted() {
+        assert_eq!(line_from(b"abcd\n", 5).await.unwrap(), b"abcd\n");
+        let error = line_from(b"abcde\n", 5).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("size cap"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_flood_stops_at_the_cap() {
+        // 10 MiB with no newline: the error is the cap, reached long before
+        // the flood is read, and `line` never holds more than the cap.
+        let flood = vec![b'x'; 10 * 1024 * 1024];
+        let mut reader = BufReader::new(&flood[..]);
+        let mut line = Vec::new();
+        let error = read_line_bounded(&mut reader, 64, deadline_in(5_000), &mut line)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(line.len() <= 64, "held {} bytes", line.len());
+    }
+
+    #[tokio::test]
+    async fn closing_before_the_newline_is_an_unexpected_eof() {
+        for partial in [&b""[..], &b"no newline"[..]] {
+            let error = line_from(partial, 64).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{partial:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_peer_times_out_at_the_deadline() {
+        let (_client, server) = duplex(64);
+        let mut reader = BufReader::new(server);
+        let mut line = Vec::new();
+        let started = Instant::now();
+        let error = read_line_bounded(
+            &mut reader,
+            64,
+            started + StdDuration::from_millis(200),
+            &mut line,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), StdDuration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_trickling_peer_is_cut_off_at_the_one_deadline_not_re_armed_per_byte() {
+        // One byte every 150 ms against a 200 ms deadline: a timeout
+        // re-armed per read would let all four bytes through (600 ms).
+        let (mut client, server) = duplex(64);
+        tokio::spawn(async move {
+            for byte in b"A 0\n" {
+                client.write_all(&[*byte]).await.unwrap();
+                tokio::time::sleep(StdDuration::from_millis(150)).await;
+            }
+        });
+        let mut reader = BufReader::new(server);
+        let mut line = Vec::new();
+        let started = Instant::now();
+        let error = read_line_bounded(
+            &mut reader,
+            64,
+            started + StdDuration::from_millis(200),
+            &mut line,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), StdDuration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_deadline_can_be_shared_across_several_lines() {
+        let (mut client, server) = duplex(64);
+        tokio::spawn(async move {
+            client.write_all(b"a\n").await.unwrap();
+            tokio::time::sleep(StdDuration::from_millis(150)).await;
+            client.write_all(b"b\n").await.unwrap();
+            tokio::time::sleep(StdDuration::from_millis(150)).await;
+            client.write_all(b"c\n").await.unwrap();
+        });
+        let mut reader = BufReader::new(server);
+        let mut line = Vec::new();
+        let deadline = Instant::now() + StdDuration::from_millis(200);
+        read_line_bounded(&mut reader, 64, deadline, &mut line)
+            .await
+            .unwrap();
+        read_line_bounded(&mut reader, 64, deadline, &mut line)
+            .await
+            .unwrap();
+        let error = read_line_bounded(&mut reader, 64, deadline, &mut line)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn a_carry_reader_keeps_what_it_read_past_the_newline() {
+        let mut stream = &b"head\nbody-bytes"[..];
+        let mut carry = BytesMut::new();
+        let mut line = Vec::new();
+        read_line_bounded(
+            &mut CarryReader::new(&mut stream, &mut carry),
+            64,
+            deadline_in(5_000),
+            &mut line,
+        )
+        .await
+        .unwrap();
+        assert_eq!(line, b"head\n");
+        assert_eq!(&carry[..], b"body-bytes");
+    }
+
+    #[tokio::test]
+    async fn a_carry_reader_reads_the_carried_bytes_before_the_stream() {
+        let mut stream = &b"rest\n"[..];
+        let mut carry = BytesMut::from(&b"already "[..]);
+        let mut line = Vec::new();
+        read_line_bounded(
+            &mut CarryReader::new(&mut stream, &mut carry),
+            64,
+            deadline_in(5_000),
+            &mut line,
+        )
+        .await
+        .unwrap();
+        assert_eq!(line, b"already rest\n");
+        assert!(carry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_carry_reader_applies_the_same_cap() {
+        let flood = vec![b'x'; 1024 * 1024];
+        let mut stream = &flood[..];
+        let mut carry = BytesMut::new();
+        let mut line = Vec::new();
+        let error = read_line_bounded(
+            &mut CarryReader::new(&mut stream, &mut carry),
+            64,
+            deadline_in(5_000),
+            &mut line,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_to_a_peer_that_never_reads_times_out() {
+        // A 8-byte pipe nobody drains: the second half of the write parks.
+        let (mut client, _server) = duplex(8);
+        let started = Instant::now();
+        let error = write_all_within(&mut client, &[0u8; 1024], StdDuration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), StdDuration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn a_write_to_a_draining_peer_completes() {
+        let (mut client, mut server) = duplex(64);
+        write_all_within(&mut client, b"hello", StdDuration::from_secs(5))
+            .await
+            .unwrap();
+        let mut received = [0u8; 5];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"hello");
+    }
 
     fn socket(address: &str) -> SocketAddr {
         address.parse().unwrap()
