@@ -9,6 +9,8 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-10-21
+
 ### Fixed
 
 - An entry with an absolute expiry and no sliding window is no longer

@@ -31,14 +31,14 @@ over.
 ## Install
 
 ```groovy
-implementation 'org.nanocached:nanocached-jcache:0.4.7'
+implementation 'org.nanocached:nanocached-jcache:0.4.8'
 ```
 
 ```xml
 <dependency>
   <groupId>org.nanocached</groupId>
   <artifactId>nanocached-jcache</artifactId>
-  <version>0.4.7</version>
+  <version>0.4.8</version>
 </dependency>
 ```
 

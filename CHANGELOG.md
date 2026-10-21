@@ -12,6 +12,8 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-10-21
+
 ### Fixed
 
 - `nanocached-node` forwards a clear it receives while re-replicating
@@ -834,6 +836,7 @@ without a deprecation cycle and are listed here.
   (separate Dockerfile targets).
 
 [Unreleased]: https://github.com/nanocached/nanocached/compare/server/v0.4.5...HEAD
+[0.4.8]: https://github.com/nanocached/nanocached/compare/server/v0.4.7...server/v0.4.8
 [0.4.7]: https://github.com/nanocached/nanocached/compare/server/v0.4.6...server/v0.4.7
 [0.4.6]: https://github.com/nanocached/nanocached/compare/server/v0.4.5...server/v0.4.6
 [0.4.5]: https://github.com/nanocached/nanocached/compare/server/v0.4.4...server/v0.4.5

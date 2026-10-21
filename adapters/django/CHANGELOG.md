@@ -9,6 +9,8 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-10-21
+
 ### Fixed
 
 - `LOCATION = "[::1]:8357"` connects: the brackets around an IPv6

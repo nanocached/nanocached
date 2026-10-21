@@ -9,6 +9,8 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-10-21
+
 ### Fixed
 
 - `get(key, valueLoader)` releases the callers waiting on a load whose

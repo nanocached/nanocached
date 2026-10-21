@@ -9,6 +9,8 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-10-21
+
 ### Fixed
 
 - The auto-configured cache manager deserializes cached values with the
