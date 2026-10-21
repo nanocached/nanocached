@@ -11,6 +11,18 @@ changed. What 1.0.0 will promise is described on the
 
 ### Fixed
 
+- `getAll` and `putAll` keep resolving when their one follow-up call
+  after a mid-batch connection failure meets a ring change: the
+  remainder is resent through the wrong-node retry, and a second
+  connection failure is reported as a `CacheException`. The follow-up's
+  own failure used to escape as the SDK's raw exception, with the
+  values the batch had already resolved discarded. `getAll` also
+  retries a whole-batch wrong-node answer under the same budget
+  `putAll` has.
+- A `Character` key holding a lone surrogate is rejected with
+  `IllegalArgumentException`, as a `String` key holding one is. It was
+  encoded through UTF-8, which turns every lone surrogate into `?`, so
+  such keys all addressed one entry.
 - Backend failures are reported as `CacheException` (with the SDK's
   exception as the cause), as every `javax.cache.Cache` operation
   declares: a stopped node used to surface as
