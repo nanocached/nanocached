@@ -3520,6 +3520,52 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
     }
   });
 
+  it("setMany reports a key stored when its acknowledging replica becomes the primary", async () => {
+    // R=2 over {a, b, c}, c unreachable. The first key's primary a
+    // answers W and its replica b acknowledges; a then leaves the
+    // roster, so after the refresh the key's owners are [b, c]: b,
+    // already acknowledged, is not sent the key again — and used to go
+    // unrecorded as its primary. The second key's primary is c on both
+    // passes, which is what makes setMany throw at all: the first key
+    // must be among the keys reported stored.
+    const names = [
+      "aaaaaaaa-1b3d-4e6f-8a90-c1d2e3f4a5b6",
+      "bbbbbbbb-7e2c-4f58-9b31-6a8d0c9e2f47",
+      "cccccccc-3c1a-4d7e-9f20-8b6c5d4e3f21",
+    ];
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const listed = [
+      { name: names[0], address: nodeA.address },
+      { name: names[1], address: nodeB.address },
+      { name: names[2], address: `127.0.0.1:${unreachablePort()}` },
+    ];
+    const discovery = await startMockDiscovery(listed, { replication: 2 });
+    try {
+      const before = new HashRing(names);
+      const owners = (key: string) => before.owners(Buffer.from(key), 2);
+      const candidates = Array.from({ length: 10_000 }, (_, i) => `key-${i}`);
+      const promotedKey = candidates.find((key) => owners(key)[0] === names[0] && owners(key)[1] === names[1])!;
+      const unreachableKey = candidates.find((key) => owners(key)[0] === names[2])!;
+      nodeA.answerMultiWrongNodeTimes(promotedKey, 1);
+
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        // The refresh the W triggers finds a gone.
+        discovery.setNodes(listed.slice(1));
+        await assert.rejects(client.setMany({ [promotedKey]: "v", [unreachableKey]: "w" }), (error: unknown) => {
+          assert.ok(error instanceof PartialConnectionLostError, `got ${String(error)}`);
+          assert.deepEqual(error.partialValues, [promotedKey], "the key's acknowledging replica is its primary now");
+          return true;
+        });
+        assert.ok(nodeB.store.has(promotedKey));
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+    }
+  });
+
   it("setMany throws plain WrongNodeError (no partial payload) when a per-key W persists", async () => {
     const cluster = await startReplicatedCluster(1);
     const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });

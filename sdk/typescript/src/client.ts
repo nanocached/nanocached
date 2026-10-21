@@ -2091,7 +2091,14 @@ export class NanocachedClient {
       // acknowledged needs nothing more.
       const done = acknowledged.get(index);
       names.forEach((name, rank) => {
-        if (done?.has(name)) return;
+        if (done?.has(name)) {
+          // If the refresh between the passes promoted this owner to
+          // the key's primary (the old primary left the roster), the
+          // key is stored on its primary now and is reported so: the
+          // earlier pass recorded the acknowledgement as a replica's.
+          if (rank === 0) tracker.primaryAcknowledged.add(index);
+          return;
+        }
         let group = groups.get(name);
         if (!group) {
           group = { indices: [], isPrimary: [] };
