@@ -12,12 +12,15 @@
 #   joinfresh  start d, 6 s after it is listed SIGTERM d (inside its join's forwarding window)
 # After the workload ended (75 s after the change) and the cluster was quiet for 62 s, member_read.py reads
 # every judged key from every live node. `budget` starts the nodes with --namespace-budget nsA=8000000.
-# Env: RUN, WATCHDOG, LOOP_AFTER_GO. Output: tools/conformance/results/<RUN>/member-<scenario>-R<R>[-budget]/
+# Exits 1 when member_read.py finds a violation of the invariants in README.md.
+# Env: RUN, WATCHDOG, LOOP_AFTER_GO, CLIENT (the image the workload and the reader run in:
+# python with `python` on the PATH; the SDK comes from the working tree). Output: tools/conformance/results/<RUN>/member-<scenario>-R<R>[-budget]/
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/../.." && pwd)"
 R=${1:?R}; SCEN=${2:?scenario}; BUDGET=${3:-}
 RUN=${RUN:-$(date +%H%M%S)}
 NODE=${NODE:-nanocached-node:conformance}; DISC=${DISC:-nanocached-discovery:conformance}
+CLIENT=${CLIENT:-e2e-client}
 NET=conf-$RUN-mb; P=cm$RUN
 OUT=${OUT:-$HERE/results/$RUN/member-$SCEN-R$R${BUDGET:+-budget}}; WATCHDOG=${WATCHDOG:-1500}
 case $SCEN in join|joinjoin|joinfresh) N0=3;; *) N0=4;; esac
@@ -29,7 +32,7 @@ trap cleanup EXIT
 WD=$!
 docker network create "$NET" >/dev/null
 
-members() { docker run --rm --network "$NET" -v "$REPO/tests/e2e:/w" -w /w e2e-client python disc.py "$1" 2>/dev/null | head -1 | sed -n 's/count=\([0-9]*\).*/\1/p'; }
+members() { docker run --rm --network "$NET" -v "$REPO/tests/e2e:/w" -w /w "$CLIENT" python disc.py "$1" 2>/dev/null | head -1 | sed -n 's/count=\([0-9]*\).*/\1/p'; }
 wait_members() { for _ in $(seq 1 120); do [ "$(members "$1")" = "$2" ] && return 0; sleep 1; done; echo "TIMEOUT waiting for $2 members" >&2; return 1; }
 start_node() { docker run -d --name $P-$1 --network "$NET" "$NODE" --host 0.0.0.0 --port 8356 --discovery $P-disc:8357 ${NARGS[@]+"${NARGS[@]}"} >/dev/null; }
 live_nodes() { local out=""; for n in a b c d e; do
@@ -49,7 +52,7 @@ Q1=$(quiet_wait 300)
 
 mkfifo "$OUT/ctl"
 docker run -i --rm --name $P-wl --network "$NET" -e NANOTEST_ADDRESSES=$P-disc:8357 -e RUN=$RUN -e LOOP_AFTER_GO=${LOOP_AFTER_GO:-75} -e CLEAR_DENSE=${CLEAR_DENSE:-} \
-  -v "$REPO:/repo:ro" -v "$OUT:/out" -w /repo/tools/conformance -e PYTHONPATH=/repo/sdk/python/src e2e-client \
+  -v "$REPO:/repo:ro" -v "$OUT:/out" -w /repo/tools/conformance -e PYTHONPATH=/repo/sdk/python/src "$CLIENT" \
   python member_workload.py /out/ops.jsonl < "$OUT/ctl" > "$OUT/workload.out" 2> "$OUT/workload.err" &
 WL=$!
 exec 3> "$OUT/ctl"
@@ -74,7 +77,9 @@ Q2=$(quiet_wait 400); sleep 10
 NODES=$(live_nodes)
 { echo "run=$RUN R=$R scenario=$SCEN start_nodes=$N0 budget=${BUDGET:-none} commit=$(git -C "$REPO" rev-parse --short HEAD)"
   echo "quiet_before_s=$Q1 quiet_after_s=$Q2 live=$NODES members=$(members $P-disc:8357)"; } > "$OUT/env.txt"
-docker run --rm --network "$NET" -v "$HERE:/h:ro" -v "$OUT:/out" e2e-client python /h/member_read.py /out "$NODES" "$R" 2>&1 | tee "$OUT/reader.txt"
+docker run --rm --network "$NET" -v "$HERE:/h:ro" -v "$OUT:/out" "$CLIENT" python /h/member_read.py /out "$NODES" "$R" 2>&1 | tee "$OUT/reader.txt"
+VERDICT=${PIPESTATUS[0]}
 kill $WD >/dev/null 2>&1
 mkdir -p "$OUT/logs"; for c in $(docker ps -a --format '{{.Names}}' --filter "name=$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
 rm -f "$OUT/ctl"; echo "results in $OUT"
+exit "$VERDICT"

@@ -1,0 +1,81 @@
+name: Membership matrix
+
+# The writing commands around a membership change, on a real cluster:
+# tools/conformance/member.sh starts discovery and nodes in Docker, runs every
+# writing command while a node joins, leaves or is killed, and reads every key
+# back from every live node. It fails on any violation of the invariants
+# listed in tools/conformance/README.md.
+#
+# Not per push: one cell takes up to 25 minutes. Each cell runs on a runner of
+# its own, because the workload is timed against the membership change and
+# four clusters on one runner would share its CPU. A nightly run (and a manual
+# one, for a branch that touches the forwarding, handoff or sweep code) is
+# what this gives the cluster code that the unit tests do not cover.
+#
+# It reports; it does not gate release tagging.
+
+on:
+  schedule:
+    - cron: "43 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  member:
+    name: R=${{ matrix.r }} ${{ matrix.scenario }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { r: 2, scenario: join }
+          - { r: 2, scenario: evict }
+          - { r: 2, scenario: joinjoin }
+          - { r: 2, scenario: leave }
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build the node image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: node
+          load: true
+          tags: nanocached-node:conformance
+          cache-from: type=gha,scope=node
+          cache-to: type=gha,mode=max,scope=node
+
+      - name: Build the discovery image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: discovery
+          load: true
+          tags: nanocached-discovery:conformance
+          cache-from: type=gha,scope=discovery
+          cache-to: type=gha,mode=max,scope=discovery
+
+      - name: Run the cell
+        # member.sh puts the whole cell under its own watchdog (WATCHDOG,
+        # 1500 s); this is the outer bound for the step.
+        env:
+          CLIENT: python:3.12-slim
+          RUN: ci
+        run: timeout 2400 tools/conformance/member.sh ${{ matrix.r }} ${{ matrix.scenario }}
+
+      - name: Upload the cell's logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: member-R${{ matrix.r }}-${{ matrix.scenario }}
+          path: tools/conformance/results/ci/
+          if-no-files-found: warn
+          retention-days: 14
