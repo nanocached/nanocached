@@ -100,6 +100,28 @@ class Conn:
         return None
 
 
+def clear_bad_keys(r, conns):
+    """Every key of a clear sequence whose owners disagree with it (a key set after the clear must be on all
+    live owners, a key set before it on none), with how many owners answered a value."""
+    out = []
+    for e in r["exp"]:
+        key = base64.b64decode(e["key"])
+        ns = e.get("nsraw", r["ns"]).encode()
+        got = {}
+        for name, c in conns.items():
+            st, val = c.get(ns, key)
+            if st != "W":
+                got[name] = (st, val)
+        if e["k"] == "absent":
+            ok = not any(st == "V" for st, _ in got.values())
+        else:
+            want = base64.b64decode(e["v"])
+            ok = bool(got) and all(st == "V" and v == want for st, v in got.values())
+        if not ok:
+            out.append(f"{key.decode('latin-1')}:{sum(1 for st, _ in got.values() if st == 'V')}/{len(got)}")
+    return out
+
+
 ops = []
 marks = {}
 for line in open(os.path.join(out_dir, "ops.jsonl")):
@@ -196,6 +218,9 @@ for r in ops:
                 bad = ("counter", {"want": e["n"], "owners": {n: (st, (v or b"").decode("latin-1")) for n, (st, v) in got.items()}, "results": r.get("results")})
                 break
     if bad:
+        if r["cls"] == "clear":  # the sequence has no key of its own: name every one that broke
+            bad[1]["ns"] = r["ns"]
+            bad[1]["bad_keys"] = clear_bad_keys(r, conns)
         table[cell][bad[0]] += 1
         bad_by_class[cls].append(off)
         within = ACCEPTED.get((cls, bad[0]))

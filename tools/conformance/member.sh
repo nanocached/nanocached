@@ -9,6 +9,7 @@
 #   join       start node d                         evict      SIGKILL node a
 #   leave      SIGTERM node a                       joinjoin   start d, 3 s later start e
 #   joinleave  SIGTERM a, 2 s later start e         leavejoin  start e, 3 s later SIGTERM a
+#   none       no change at all (a control: the workload and the reader on a cluster that stays as it is)
 #   joinfresh  start d, 6 s after it is listed SIGTERM d (inside its join's forwarding window)
 # After the workload ended (75 s after the change) and the cluster was quiet for 62 s, member_read.py reads
 # every judged key from every live node. `budget` starts the nodes with --namespace-budget nsA=8000000.
@@ -64,6 +65,7 @@ case $SCEN in
   join) start_node d ;;
   leave) docker kill -s TERM $P-a >/dev/null ;;
   evict) docker kill $P-a >/dev/null ;;
+  none) : ;;
   joinjoin) start_node d; sleep 3; echo go2 >&3; start_node e ;;
   joinleave) docker kill -s TERM $P-a >/dev/null; sleep 2; echo go2 >&3; start_node e ;;
   leavejoin) start_node e; sleep 3; echo go2 >&3; docker kill -s TERM $P-a >/dev/null ;;
