@@ -36,12 +36,52 @@ Results land in `results/<run>/<topology>-<path>` (git-ignored).
 | `scenarios.sh <v6\|v5\|v7\|v4>` | scenarios that need containers started, stopped or put behind a fixture: connection failures and auth, join / decommission / kill under load, client lifecycle, a node dying before a multi-get |
 | `scenarios_dynamic.sh <v5\|v7>` | the join / decommission / kill and client-lifecycle scenarios, one run per SDK (`report_scen.py` summarises) |
 | `replica.sh` | do all owners of a key hold the same copy after the writes have finished |
+| `scenarios.sh hostile` | every SDK against a fake node that misbehaves (trickles, stalls, oversizes, bombs, backs up); `hostile_check.py` judges time and peak memory against one table; exits 1 when a cell is outside its bounds |
 | `member.sh`, `member_matrix.sh` | every writing command around join / leave / evict (`member_workload.py` writes, `member_read.py` reads back); exits 1 on a violation of the invariants below. Four of its cells run nightly in CI |
 | `wire_probe.py` | raw protocol replies for hand-built frames |
 
 The clients run in containers on the same Docker network as the nodes
 (discovery hands out container IPs, which the host cannot reach on macOS).
 A watchdog removes every container of a run after `WATCHDOG` seconds.
+
+## Hostile servers
+
+Everything above runs against well-behaved servers, so a bound an SDK is
+missing on the client side (a reply cap, a decompression cap, a request
+deadline, backpressure) cannot show up there. `scenarios.sh hostile` starts
+`fixtures/hostile_node.py`, a fake node that completes the SDK handshake and
+then misbehaves differently on each port, and runs every driver's
+`host <case>` against it, each driver in a container of its own.
+`hostile_check.py` judges each cell against the table below, which lives in
+`fixtures/hostile_cases.json` (the fixture, the drivers' arguments and the
+checker all read that one file; a limit changes there only).
+
+```sh
+tools/conformance/scenarios.sh hostile            # all six SDKs, about five minutes
+ONLY=oversize_huge tools/conformance/scenarios.sh hostile go rust
+```
+
+| case | what the fixture does | the SDK must | bound |
+|---|---|---|---|
+| `baseline` | answers a get with a 1 KiB value | return it | 10 s; its peak memory is the SDK's baseline |
+| `trickle_ok` | an honest 40-byte reply, one byte every 100 ms | return it: a slow peer that advances is not failed | 20 s |
+| `stall_after_handshake` | reads the request, never answers | fail | 40 s (the request timeout is 30 s) |
+| `stall_mid_reply` | `V 1000` and 10 bytes of the value, then silence | fail | 40 s |
+| `oversize_just_over` | declares a 2 MiB + 1 B value and sends all of it | fail on the header (the reply cap is 2 MiB) | 5 s; peak 64 MiB over the baseline |
+| `oversize_huge` | declares 4294967295 B and sends none | fail on the header | 5 s; peak 64 MiB over the baseline |
+| `bomb` | a 1 MiB DEFLATE value that expands to 1 GiB, to a `compress` client | fail (the decompression cap is 64 MiB) | 10 s; peak 192 MiB over the baseline |
+| `backpressure` | reads nothing after the handshake; 256 concurrent sets of 512 KiB | return every call, ok or failed | 70 s (a set may be sent again once, each attempt gets the 30 s timeout); peak 96 MiB over the baseline |
+
+Peak memory is the container's cgroup peak (`memory.peak`, cgroup v2), the one
+measure all six runtimes report the same way, minus the same SDK's `baseline`
+run, so a runtime's own footprint (JVM, .NET, Node) is not charged to the
+SDK. A cell with no measurement fails: a bound that cannot be read proves
+nothing. A call that never returns shows as `timeout`: the driver's own limit
+(`LIMIT`, 90 s) is above every bound in the table. The bounds are a statement
+of what the SDKs promise (their own constants agree: 2 MiB, 64 MiB, 30 s), not
+of what each one happens to do; the backpressure memory bound in particular
+says an SDK does not copy the whole queue of writes it was handed into
+buffers of its own.
 
 ## Membership invariants
 

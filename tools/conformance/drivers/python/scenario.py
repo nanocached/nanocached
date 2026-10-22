@@ -9,6 +9,8 @@ Scenarios:
   churn <secs> <label>       get/set loop that records error windows and stale reads
   seed <prefix> <n>          set_many n keys                       (failover)
   gm <prefix> <n> <secs>     get_many of the n keys once a second   (failover)
+  host <case> [args]         one request against a hostile fake node (fixtures/hostile_cases.json); reports the
+                             outcome, the wall time and the container's peak memory
   life <test> [args]         close_inflight | after_close | double_close | concurrent_close
                              | abandon | cycles <n> | reconnect <secs> | storm <secs> | exit_noclose
 """
@@ -267,9 +269,47 @@ async def sc_life(test, *args):
     }[test](*args)
 
 
+# ------------------------------------------------------------- hostile
+def cgroup_peak_kb():
+    """The container's peak memory (cgroup v2), the one measure every runtime can report the same way."""
+    try:
+        return int(open("/sys/fs/cgroup/memory.peak").read()) // 1024
+    except (OSError, ValueError):
+        return None
+
+
+async def sc_host(case, *args):
+    compress = "compress" in args
+    client = await step("connect", NanocachedClient.connect(addresses(), compress=compress))
+    if client is None:
+        emit(event="peak", cgroup_peak_kb=cgroup_peak_kb())
+        return
+    t = time.monotonic()
+    if case == "backpressure":
+        n, size = int(args[0]), int(args[1])
+        value = bytes(size)  # one buffer, owned by the caller and shared by every set
+        done = asyncio.gather(*[client.set(b"host:bp:%d" % i, value) for i in range(n)], return_exceptions=True)
+        try:
+            results = await asyncio.wait_for(done, LIMIT)
+            failed = sum(1 for r in results if isinstance(r, BaseException))
+            emit(event="op", outcome="settled", ok=n - failed, failed=failed, ms=int((time.monotonic() - t) * 1000))
+        except asyncio.TimeoutError:
+            emit(event="op", outcome="timeout", ms=int((time.monotonic() - t) * 1000))
+    else:
+        try:
+            got = await asyncio.wait_for(client.get_bytes(b"host:k"), LIMIT)
+            emit(event="op", outcome="ok", len=None if got is None else len(got), ms=int((time.monotonic() - t) * 1000))
+        except asyncio.TimeoutError:
+            emit(event="op", outcome="timeout", ms=int((time.monotonic() - t) * 1000))
+        except Exception as e:  # noqa: BLE001
+            emit(event="op", ms=int((time.monotonic() - t) * 1000), **err_fields(e))
+    emit(event="peak", cgroup_peak_kb=cgroup_peak_kb())
+    await step("close", client.close(), 10)
+
+
 async def main():
     name, args = sys.argv[1], sys.argv[2:]
-    await {"conn": sc_conn, "churn": sc_churn, "seed": sc_seed, "gm": sc_gm, "life": sc_life}[name](*args)
+    await {"conn": sc_conn, "churn": sc_churn, "seed": sc_seed, "gm": sc_gm, "life": sc_life, "host": sc_host}[name](*args)
 
 
 asyncio.run(main())

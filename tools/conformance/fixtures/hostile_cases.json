@@ -1,0 +1,81 @@
+{
+  "_doc": "The hostile-server cases and the limits every SDK is held to, written once. hostile_node.py serves each case on its port; scenarios.sh hostile runs every driver's `host <id> <args>` against it; hostile_check.py reads this file to judge the result. A limit is checked against the SDK's own constants (all six agree: a reply value of at most 2 MiB, a decompressed value of at most 64 MiB, a request that makes no progress for 30 s fails). The driver's own limit (scenarios.sh LIMIT, 90 s) is above every max_wall_s, so a call that never returns shows as `timeout`, not as a slow answer.",
+  "baseline_ceiling_note": "peak_over_baseline_mib is the cgroup peak of the case minus the cgroup peak of the same SDK's `baseline` case, so a runtime's own footprint (JVM, .NET, Node) is not charged to the SDK.",
+  "cases": [
+    {
+      "id": "baseline",
+      "port": 8401,
+      "what": "an honest node answers a get with a 1 KiB value",
+      "args": [],
+      "expect": "ok",
+      "max_wall_s": 10,
+      "len": 1024
+    },
+    {
+      "id": "trickle_ok",
+      "port": 8402,
+      "what": "an honest reply (40 B value) arrives one byte every 100 ms: a slow but advancing peer must not be failed",
+      "args": [],
+      "expect": "ok",
+      "max_wall_s": 20,
+      "len": 40
+    },
+    {
+      "id": "stall_after_handshake",
+      "port": 8403,
+      "what": "the node completes the handshake, reads the request and never answers",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 40
+    },
+    {
+      "id": "stall_mid_reply",
+      "port": 8404,
+      "what": "the node sends `V 1000` and 10 bytes of the value, then goes silent",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 40
+    },
+    {
+      "id": "oversize_just_over",
+      "port": 8405,
+      "what": "the reply declares a value of 2 MiB + 1 B (one over the reply cap) and sends all of it",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5,
+      "max_peak_over_baseline_mib": 64
+    },
+    {
+      "id": "oversize_huge",
+      "port": 8406,
+      "what": "the reply declares a value of 4294967295 B and sends none of it",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5,
+      "max_peak_over_baseline_mib": 64
+    },
+    {
+      "id": "bomb",
+      "port": 8407,
+      "what": "a compress=true client gets a 1 MiB DEFLATE value that expands to 1 GiB",
+      "args": [
+        "compress"
+      ],
+      "expect": "error",
+      "max_wall_s": 10,
+      "max_peak_over_baseline_mib": 192
+    },
+    {
+      "id": "backpressure",
+      "port": 8408,
+      "what": "the node reads nothing after the handshake; 256 concurrent sets of 512 KiB (128 MiB handed to the client in all) share one buffer owned by the caller. A set may be sent again once on a new connection, so each of the two attempts gets the 30 s request timeout and the bound is 70 s",
+      "args": [
+        "256",
+        "524288"
+      ],
+      "expect": "settles",
+      "max_wall_s": 70,
+      "max_peak_over_baseline_mib": 96
+    }
+  ]
+}

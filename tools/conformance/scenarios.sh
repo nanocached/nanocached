@@ -7,13 +7,14 @@
 #   v5  join / decommission / kill under load: error windows per SDK    (verify: convergence on topology change)
 #   v7  close, after-close, abandon, create/close cycles, restart, ...  (verify: client lifecycle)
 #   v4  a node dies between seeding and get_many                        (verify: multi-get owner fallback)
+#   hostile  a fake node that trickles, stalls, oversizes, bombs, backs up (verify: bounded time and memory, one table for all six SDKs; judged by hostile_check.py)
 #
 # Every client runs in a container on the scenario's network (discovery hands
 # out container IPs). Output: tools/conformance/results/<run>/<scenario>/<case>.<sdk>.jsonl
 # Every wait is bounded; a watchdog removes the run's containers after WATCHDOG s.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/../.." && pwd)"
-WHAT=${1:?v6|v5|v7|v4}; shift
+WHAT=${1:?v6|v5|v7|v4|hostile}; shift
 SDKS=${*:-python typescript go java dotnet rust}
 RUN=${RUN:-$(date +%H%M%S)}
 NODE=${NODE:-nanocached-node:conformance}; DISC=${DISC:-nanocached-discovery:conformance}; PROXY=${PROXY:-nanocached-proxy:conformance}
@@ -85,8 +86,23 @@ v4)
   done
   sleep 12; docker kill $P-b >/dev/null; echo "killed b at ~12s"
   wait $(jobs -p | grep -v "^$WD$") 2>/dev/null ;;
+hostile)
+  # fixtures/hostile_cases.json is the one table: a port, the driver's arguments and the bounds of every case
+  docker run -d --name $P-fx --network "$NET" -v "$HERE/fixtures:/f:ro" e2e-client python /f/hostile_node.py /f/hostile_cases.json >/dev/null
+  ready=0; for _ in $(seq 1 90); do docker logs $P-fx 2>&1 | grep -q '^hostile_node:' && { ready=1; break; }; sleep 1; done
+  [ $ready = 1 ] || { echo "the hostile fixture never came up" >&2; docker logs $P-fx >&2; exit 1; }
+  python3 -c 'import json,sys; [print(c["id"], c["port"], *c["args"]) for c in json.load(open(sys.argv[1]))["cases"]]' "$HERE/fixtures/hostile_cases.json" > "$OUT/cases.txt"
+  while read -r id port cargs; do
+    [ -n "${ONLY:-}" ] && [ "$id" != "$ONLY" ] && continue
+    # the six SDKs at once, each in a container of its own: the case's memory is the container's cgroup peak
+    for sdk in $SDKS; do sc "$sdk" "$OUT/$id.$sdk.jsonl" $P-fx:$port 0 "" "${LIMIT:-90}" host "$id" $cargs & done
+    wait $(jobs -p | grep -v "^$WD$")
+    echo "== $id"
+  done < "$OUT/cases.txt"
+  python3 "$HERE/hostile_check.py" "$OUT"; VERDICT=$? ;;
 *) echo "unknown scenario set $WHAT"; exit 2 ;;
 esac
 kill $WD >/dev/null 2>&1
 mkdir -p "$OUT/logs"; for c in $(docker ps -a --format '{{.Names}}' --filter "name=$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
 echo "results in $OUT"
+exit "${VERDICT:-0}"

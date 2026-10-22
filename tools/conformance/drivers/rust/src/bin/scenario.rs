@@ -125,6 +125,7 @@ async fn main() {
             c.close().await;
         }
         "life" => life(&cx, &a[2], a.get(3).map(String::as_str).unwrap_or("")).await,
+        "host" => host(&cx, &a[2], &a[3..]).await,
         other => eprintln!("unknown scenario {other}"),
     }
 }
@@ -209,4 +210,40 @@ async fn life(cx: &Ctx, test: &str, arg: &str) {
         }
         other => eprintln!("unknown life test {other}"),
     }
+}
+
+fn cgroup_peak_kb() -> String {
+    std::fs::read_to_string("/sys/fs/cgroup/memory.peak").ok().and_then(|s| s.trim().parse::<u64>().ok()).map_or("null".into(), |b| (b / 1024).to_string())
+}
+
+/// One request against a hostile fake node (fixtures/hostile_cases.json); reports the outcome, the wall time and
+/// the container's peak memory.
+async fn host(cx: &Ctx, case: &str, a: &[String]) {
+    let o = options().compress(a.first().map(String::as_str) == Some("compress"));
+    let Some(c) = cx.step("connect", NanocachedClient::connect(o)).await else {
+        cx.emit(Ev::new("peak").raw("cgroup_peak_kb", cgroup_peak_kb()));
+        return;
+    };
+    let t = Instant::now();
+    if case == "backpressure" {
+        let n: usize = a[0].parse().unwrap();
+        let value = vec![0u8; a[1].parse().unwrap()]; // one buffer, owned by the caller and shared by every set
+        let calls = futures::future::join_all((0..n).map(|i| c.set(format!("host:bp:{i}"), &value, 0)));
+        match tokio::time::timeout(cx.limit, calls).await {
+            Ok(results) => {
+                let failed = results.iter().filter(|r| r.is_err()).count();
+                cx.emit(Ev::new("op").s("outcome", "settled").n("ok", n - failed).n("failed", failed).n("ms", t.elapsed().as_millis()));
+            }
+            Err(_) => cx.emit(Ev::new("op").s("outcome", "timeout").n("ms", t.elapsed().as_millis())),
+        }
+    } else {
+        match tokio::time::timeout(cx.limit, c.get_bytes("host:k")).await {
+            Ok(Ok(v)) => cx.emit(Ev::new("op").s("outcome", "ok").n("len", v.map_or(0, |v| v.len())).n("ms", t.elapsed().as_millis())),
+            Ok(Err(e)) => { let ev = cx.err(Ev::new("op"), e).n("ms", t.elapsed().as_millis()); cx.emit(ev) }
+            Err(_) => cx.emit(Ev::new("op").s("outcome", "timeout").n("ms", t.elapsed().as_millis())),
+        }
+    }
+    cx.emit(Ev::new("peak").raw("cgroup_peak_kb", cgroup_peak_kb()));
+    let _ = tokio::time::timeout(Duration::from_secs(10), c.close()).await;
+    std::process::exit(0); // a stalled socket would keep the runtime alive after the case is judged
 }
