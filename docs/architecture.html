@@ -371,7 +371,8 @@ here.</p>
   callers during the window: the result the primary replicates to an
   old owner is forwarded back to the primary as an unconditional write,
   and when it lands after a later increment it rewinds the counter, so
-  one to three increments are lost on about one counter per join in a
+  usually one to three increments are lost (five were seen among twelve
+  parallel increments) on about one counter per join in a
   loaded cluster (serial increments are practically exact, about one
   in 12,000). The old owner cannot tell a replicated result from a
   client&rsquo;s write it must forward. Accepted 2026-10-17: the stale
