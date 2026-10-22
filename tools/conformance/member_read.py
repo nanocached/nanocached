@@ -9,7 +9,10 @@ Per key, one of: ok | lost (absent where a value was expected) | wrong (another 
 resurrected (present where absent was expected) | partial (owners disagree) | counter (wrong total) |
 ttl_extended | ttl_shortened | ttl_spread | ttl_unreadable (no owner reported a TTL; a replica's W on the
 increment-by-0 probe is expected, the primary alone answers it) | cas_bad | pia_bad.  Keys whose sequence raised are counted as
-`err` and not judged.
+`err` and not judged. `owners`: the nodes that claimed the key (answered anything but W) were not R.
+
+Exit status: 1 when any key is judged bad, apart from the accepted behaviour in ACCEPTED, or when too
+little was judged for the run to mean anything (see README.md, "Membership invariants").
 """
 import base64
 import collections
@@ -22,6 +25,22 @@ import time
 out_dir = sys.argv[1]
 nodes = [n.rsplit(":", 1) for n in sys.argv[2].split(",")]
 R = int(sys.argv[3])
+# Verdicts that do not fail the run: behaviour docs/architecture.html lists under "Accepted behaviour".
+# Each entry is a function of the bad key's detail that says whether it is within what was accepted.
+def _parallel_counter_lost_a_few(detail):
+    """Increments of one counter issued in parallel during a join's forwarding window can lose one to three:
+    the owners end below the expected total, never above it."""
+    want = detail["want"]
+    try:
+        held = [int(v) for st, v in detail["owners"].values() if st == "V"]
+    except ValueError:
+        return False
+    return bool(held) and all(want - 3 <= n < want for n in held)
+
+
+ACCEPTED = {("incrpar", "counter"): _parallel_counter_lost_a_few}
+# A run where more than this share of the sequences raised, or none was judged, proves nothing.
+MAX_ERR_SHARE = 0.25
 EDGES = [0, 5, 15, 30, 65]
 LABELS = ["<0", "0-5", "5-15", "15-30", "30-65", ">=65"]
 
@@ -94,6 +113,8 @@ table = collections.defaultdict(lambda: collections.Counter())
 examples = collections.defaultdict(list)
 owner_counts = collections.Counter()
 bad_by_class = collections.defaultdict(list)  # class -> offsets of bad sequences
+violations = []  # (class, verdict, offset, key, detail) for every bad sequence not within ACCEPTED
+accepted_n = collections.Counter()
 
 for r in ops:
     cls = r["cls"] + ("@ns" if r["ns"] and r["cls"] != "clear" else "")
@@ -121,6 +142,9 @@ for r in ops:
             if st != "W":
                 got[name] = (st, val)
         owner_counts[len(got)] += 1
+        if len(got) != R:
+            bad = ("owners", {"owners": sorted(got)})
+            break
         vals = {(st, val) for st, val in got.values()}
         if k == "absent_after" and now < e["tw"] + e["ttl"] + 3:
             continue  # not expired yet when we read: nothing to judge
@@ -169,6 +193,11 @@ for r in ops:
     if bad:
         table[cell][bad[0]] += 1
         bad_by_class[cls].append(off)
+        within = ACCEPTED.get((cls, bad[0]))
+        if within and within(bad[1]):
+            accepted_n[(cls, bad[0])] += 1
+        else:
+            violations.append((cls, bad[0], round(off, 1), base64.b64decode(r["key"]).decode("latin-1") if r["key"] else "", bad[1]))
         if len(examples[(cls, bad[0])]) < 2:
             examples[(cls, bad[0])].append({"off": round(off, 1), "key": base64.b64decode(r["key"]).decode("latin-1")[-30:] if r["key"] else "", **{"detail": bad[1]}})
     else:
@@ -201,3 +230,18 @@ for (c, k), v in sorted(examples.items()):
         print(f"  e.g. {c} {k}:", json.dumps(ex)[:300])
 print("first/last bad offset (s after go):", {c: (report["first_bad_offset"][c], report["last_bad_offset"][c]) for c in report["last_bad_offset"]})
 print("client stats:", report["stats"])
+
+judged = sum(v for t in table.values() for k, v in t.items() if k not in ("err", "skipped"))
+errs = sum(t.get("err", 0) for t in table.values())
+print()
+for (c, k), n in sorted(accepted_n.items()):
+    print(f"accepted behaviour: {n} x {c} {k}")
+if not judged or errs > MAX_ERR_SHARE * (judged + errs):
+    print(f"VERDICT FAIL: {judged} sequences judged, {errs} raised (more than {MAX_ERR_SHARE:.0%} of the run raised, or nothing was judged)")
+    sys.exit(1)
+if violations:
+    print(f"VERDICT FAIL: {len(violations)} of {judged} sequences violate the invariants")
+    for v in violations[:10]:
+        print("  ", json.dumps(v)[:300])
+    sys.exit(1)
+print(f"VERDICT PASS: {judged} sequences judged, {errs} raised, {sum(accepted_n.values())} within accepted behaviour")
