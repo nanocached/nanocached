@@ -26,6 +26,8 @@ function procStats() {
   return { fds: readdirSync("/proc/self/fd").length, threads: Number(/Threads:\s+(\d+)/.exec(st)[1]), rss_kb: Number(/VmRSS:\s+(\d+)/.exec(st)[1]) };
 }
 
+function cgroupPeakKb() { try { return Math.floor(Number(readFileSync("/sys/fs/cgroup/memory.peak", "utf8")) / 1024); } catch { return null; } }
+
 const [name, ...args] = process.argv.slice(2);
 const scenarios = {
   async conn() {
@@ -56,6 +58,28 @@ const scenarios = {
     }
     emit({ event: "summary", ops, errors, stale, miss, corrupt, classes, first_err_ms: first, last_err_ms: last });
     await client.close();
+  },
+  // One request against a hostile fake node (fixtures/hostile_cases.json); reports the outcome, the wall time and the container's peak memory.
+  async host(kase, ...a) {
+    const client = await step("connect", NanocachedClient.connect({ addresses, compress: a.includes("compress") }));
+    if (!client) { emit({ event: "peak", cgroup_peak_kb: cgroupPeakKb() }); return; }
+    const t = Date.now();
+    if (kase === "backpressure") {
+      const [n, size] = [Number(a[0]), Number(a[1])];
+      const value = Buffer.alloc(size); // one buffer, owned by the caller and shared by every set
+      const done = Promise.allSettled(Array.from({ length: n }, (_, i) => client.set(`host:bp:${i}`, value, 0)));
+      try {
+        const results = await withLimit(done);
+        const failed = results.filter((r) => r.status === "rejected").length;
+        emit({ event: "op", outcome: "settled", ok: n - failed, failed, ms: Date.now() - t });
+      } catch (e) { emit({ event: "op", outcome: "timeout", ms: Date.now() - t }); }
+    } else {
+      try { const got = await withLimit(client.getBytes("host:k")); emit({ event: "op", outcome: "ok", len: got === null ? null : got.length, ms: Date.now() - t }); }
+      catch (e) { emit(e?.timeout ? { event: "op", outcome: "timeout", ms: Date.now() - t } : { event: "op", ms: Date.now() - t, ...errFields(e) }); }
+    }
+    emit({ event: "peak", cgroup_peak_kb: cgroupPeakKb() });
+    await step("close", client.close(), 10000);
+    process.exit(0); // a stalled socket would keep the loop alive after the case is judged
   },
   async life(test, a) {
     const t = {

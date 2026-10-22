@@ -52,10 +52,53 @@ Dictionary<string, object?> ProcStats()
     return new() { ["fds"] = Directory.GetFileSystemEntries("/proc/self/fd").Length, ["threads"] = Field("Threads:"), ["rss_kb"] = Field("VmRSS:") };
 }
 
+object? CgroupPeakKb()
+{
+    try { return long.Parse(File.ReadAllText("/sys/fs/cgroup/memory.peak").Trim()) / 1024; } catch { return null; }
+}
+
 var name = args[0];
 var a = args.Skip(1).ToArray();
 switch (name)
 {
+    // One request against a hostile fake node (fixtures/hostile_cases.json); reports the outcome, the wall time and the container's peak memory.
+    case "host":
+    {
+        var kase = a[0];
+        options.Compress = a.Skip(1).Contains("compress");
+        var c = await Step("connect", Connect);
+        if (c is null) { Emit(new() { ["event"] = "peak", ["cgroup_peak_kb"] = CgroupPeakKb() }); break; }
+        var sw = Stopwatch.StartNew();
+        if (kase == "backpressure")
+        {
+            int n = int.Parse(a[1]); var value = new byte[int.Parse(a[2])]; // one buffer, owned by the caller and shared by every set
+            var calls = Enumerable.Range(0, n).Select(async i =>
+            {
+                try { await c.SetAsync(System.Text.Encoding.UTF8.GetBytes($"host:bp:{i}"), value); return true; }
+                catch (Exception) { return false; }
+            }).ToArray();
+            try
+            {
+                var results = await Task.WhenAll(calls).WaitAsync(limit);
+                Emit(new() { ["event"] = "op", ["outcome"] = "settled", ["ok"] = results.Count(r => r), ["failed"] = results.Count(r => !r), ["ms"] = sw.ElapsedMilliseconds });
+            }
+            catch (TimeoutException) { Emit(new() { ["event"] = "op", ["outcome"] = "timeout", ["ms"] = sw.ElapsedMilliseconds }); }
+        }
+        else
+        {
+            try
+            {
+                var got = await c.GetBytesAsync("host:k").WaitAsync(limit);
+                Emit(new() { ["event"] = "op", ["outcome"] = "ok", ["len"] = got?.Length, ["ms"] = sw.ElapsedMilliseconds });
+            }
+            catch (TimeoutException) { Emit(new() { ["event"] = "op", ["outcome"] = "timeout", ["ms"] = sw.ElapsedMilliseconds }); }
+            catch (Exception e) { var m = Err(e); m["event"] = "op"; m["ms"] = sw.ElapsedMilliseconds; Emit(m); }
+        }
+        Emit(new() { ["event"] = "peak", ["cgroup_peak_kb"] = CgroupPeakKb() });
+        await Step("close", async () => { c.Dispose(); return true; }, TimeSpan.FromSeconds(10));
+        Environment.Exit(0); // a stalled socket would keep the process alive after the case is judged
+        break;
+    }
     case "conn":
     {
         var c = await Step("connect", Connect);

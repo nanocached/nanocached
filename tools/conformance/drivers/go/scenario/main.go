@@ -172,7 +172,83 @@ func main() {
 		c.Close()
 	case "life":
 		life(args[0], args[1:])
+	case "host":
+		host(args[0], args[1:])
 	}
+}
+
+func cgroupPeakKB() any {
+	b, err := os.ReadFile("/sys/fs/cgroup/memory.peak")
+	if err != nil {
+		return nil
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return nil
+	}
+	return n / 1024
+}
+
+// host: one request against a hostile fake node (fixtures/hostile_cases.json); reports the outcome, the wall
+// time and the container's peak memory.
+func host(kase string, a []string) {
+	conf := cfg()
+	conf.Compress = len(a) > 0 && a[0] == "compress"
+	c, ok := step("connect", limit, func() (*nanocached.Client, error) { return nanocached.Connect(conf) })
+	if !ok {
+		emit(map[string]any{"event": "peak", "cgroup_peak_kb": cgroupPeakKB()})
+		return
+	}
+	t := time.Now()
+	if kase == "backpressure" {
+		n, _ := strconv.Atoi(a[0])
+		size, _ := strconv.Atoi(a[1])
+		value := make([]byte, size) // one buffer, owned by the caller and shared by every set
+		failed := 0
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				if err := c.SetBytes(fmt.Sprintf("host:bp:%d", i), value, 0); err != nil {
+					mu.Lock()
+					failed++
+					mu.Unlock()
+				}
+			}(i)
+		}
+		_, _, timedOut := bounded(limit, func() (struct{}, error) { wg.Wait(); return struct{}{}, nil })
+		if timedOut {
+			emit(map[string]any{"event": "op", "outcome": "timeout", "ms": time.Since(t).Milliseconds()})
+		} else {
+			mu.Lock()
+			emit(map[string]any{"event": "op", "outcome": "settled", "ok": n - failed, "failed": failed, "ms": time.Since(t).Milliseconds()})
+			mu.Unlock()
+		}
+	} else {
+		type got struct {
+			n   int
+			err error
+		}
+		g, _, to := bounded(limit, func() (got, error) {
+			v, _, err := c.GetBytes("host:k")
+			return got{len(v), err}, nil
+		})
+		ms := time.Since(t).Milliseconds()
+		switch {
+		case to:
+			emit(map[string]any{"event": "op", "outcome": "timeout", "ms": ms})
+		case g.err != nil:
+			e := errf(g.err)
+			e["event"], e["ms"] = "op", ms
+			emit(e)
+		default:
+			emit(map[string]any{"event": "op", "outcome": "ok", "len": g.n, "ms": ms})
+		}
+	}
+	emit(map[string]any{"event": "peak", "cgroup_peak_kb": cgroupPeakKB()})
+	step("close", 10*time.Second, func() (struct{}, error) { c.Close(); return struct{}{}, nil })
 }
 
 func life(test string, a []string) {

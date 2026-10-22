@@ -73,6 +73,42 @@ public final class Scenario {
         return json(ev("fds", Files.list(Paths.get("/proc/self/fd")).count(), "threads", threads, "rss_kb", rss));
     }
 
+    static Object cgroupPeakKb() {
+        try { return Long.parseLong(Files.readString(Paths.get("/sys/fs/cgroup/memory.peak")).trim()) / 1024; } catch (Exception e) { return null; }
+    }
+
+    /** One request against a hostile fake node (fixtures/hostile_cases.json); reports the outcome, the wall time and the container's peak memory. */
+    static void host(String kase, List<Address> addrs, String[] a) throws Exception {
+        NanocachedClient.Options o = NanocachedClient.builder().addresses(addrs).compress(a.length > 0 && a[0].equals("compress"));
+        NanocachedClient c = step("connect", LIMIT_MS, () -> NanocachedClient.connect(o));
+        if (c == null) { emit(ev("event", "peak", "cgroup_peak_kb", cgroupPeakKb())); return; }
+        long t = System.currentTimeMillis();
+        if (kase.equals("backpressure")) {
+            int n = Integer.parseInt(a[0]);
+            byte[] value = new byte[Integer.parseInt(a[1])]; // one buffer, owned by the caller and shared by every set
+            List<Future<?>> calls = new ArrayList<>();
+            for (int i = 0; i < n; i++) { final int k = i; calls.add(POOL.submit(() -> { c.set(("host:bp:" + k).getBytes(), value); return null; })); }
+            int failed = 0; boolean timedOut = false;
+            for (Future<?> f : calls) {
+                try { f.get(Math.max(1, LIMIT_MS - (System.currentTimeMillis() - t)), TimeUnit.MILLISECONDS); }
+                catch (TimeoutException e) { timedOut = true; break; }
+                catch (Throwable e) { failed++; }
+            }
+            if (timedOut) emit(ev("event", "op", "outcome", "timeout", "ms", System.currentTimeMillis() - t));
+            else emit(ev("event", "op", "outcome", "settled", "ok", n - failed, "failed", failed, "ms", System.currentTimeMillis() - t));
+        } else {
+            Future<java.util.Optional<byte[]>> f = POOL.submit(() -> c.getBytes("host:k"));
+            try {
+                var got = f.get(LIMIT_MS, TimeUnit.MILLISECONDS);
+                emit(ev("event", "op", "outcome", "ok", "len", got.map(v -> v.length).orElse(null), "ms", System.currentTimeMillis() - t));
+            } catch (TimeoutException e) { emit(ev("event", "op", "outcome", "timeout", "ms", System.currentTimeMillis() - t)); }
+            catch (Throwable e) { Map<String, Object> m = err(e); m.put("event", "op"); m.put("ms", System.currentTimeMillis() - t); emit(m); }
+        }
+        emit(ev("event", "peak", "cgroup_peak_kb", cgroupPeakKb()));
+        step("close", 10_000, () -> { c.close(); return true; });
+        System.exit(0); // a stalled socket would keep a non-daemon thread alive after the case is judged
+    }
+
     public static void main(String[] args) throws Exception {
         List<Address> addrs = new ArrayList<>();
         for (String part : System.getenv("NANOTEST_ADDRESSES").split(",")) { int i = part.lastIndexOf(':'); addrs.add(new Address(part.substring(0, i), Integer.parseInt(part.substring(i + 1)))); }
@@ -80,6 +116,7 @@ public final class Scenario {
         String secret = System.getenv("NANOTEST_SECRET");
         if (secret != null && !secret.isEmpty()) options = options.authSecret(secret);
         String name = args[0];
+        if (name.equals("host")) { host(args[1], addrs, java.util.Arrays.copyOfRange(args, 2, args.length)); return; }
         switch (name) {
             case "conn": {
                 NanocachedClient c = step("connect", LIMIT_MS, Scenario::connect);
