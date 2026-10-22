@@ -3242,22 +3242,18 @@ async fn handle_connection(
                 // predates the joiner reaches it only through this chain.
                 // Join targets form a DAG, so this never comes back.
                 //
-                // It does not go on through this node's own windows — a
-                // decommission's entrants, an eviction's promoted owners.
-                // Those mirror both ways (an entrant forwards to the
-                // leaver, the survivors of a re-replication to each
-                // other), so a relay there circles for as long as it keeps
-                // removing something, and a clear that removes the writes
-                // the client made after its acknowledged `clear()` counts
-                // as having removed something: one client clear became
-                // dozens of forwarded ones, applied up to a few
-                // milliseconds after the client's next `set` was
-                // acknowledged, and wiped it. The client sends its clear
-                // to every node it knows, and `handle_clear` queues it
-                // behind this node's own mirrored writes; what a relay
-                // here would add is only the ordering behind a write that
-                // reached this node by forward, for a client whose list
-                // misses this node.
+                // Through this node's own windows — a decommission's
+                // entrants, an eviction's promoted owners — a forwarded
+                // clear goes on only when it removed something here, the
+                // clear's twin of the `U` arm's `StoredUnchanged` guard: a
+                // leaver's entrant forwards to the leaver (its confirmed
+                // joiner) and the leaver mirrors to the entrant, so an
+                // ungated mirror sent one clear around that pair until a
+                // window closed, wiping every write in between. The gate
+                // ends it on the pass that removes nothing. (It also
+                // skips a mirror for a key this node had mirrored and then
+                // lost to a delete or expiry — that one write can come
+                // back on the entrant, bounded by the next write or TTL.)
                 for target in lingering_clear_targets(&node_context) {
                     spawn_forward(
                         &config,
@@ -3275,6 +3271,20 @@ async fn handle_connection(
                         OwnedForwardedWrite::Clear(scope.clone()),
                     )
                     .await;
+                }
+                if matches!(response, Response::Cleared(removed) if removed > 0) {
+                    for target in leave_clear_targets(&node_context)
+                        .into_iter()
+                        .chain(rereplication_clear_targets(&node_context))
+                    {
+                        spawn_forward(
+                            &config,
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::Clear(scope.clone()),
+                        )
+                        .await;
+                    }
                 }
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
 
@@ -15866,18 +15876,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_forwarded_clear_is_not_passed_on_to_the_entrant_even_when_it_removed_something() {
+    async fn a_forwarded_clear_that_removed_something_follows_the_writes_queued_for_the_entrant() {
         // This draining node took a write (from a client, or relayed by
         // the node whose joiner it is) and queued it for its entrant.
         // The clear then reaches it forwarded (`f`), from the node that
-        // forwards to it. It is not passed on to the entrant, whether or
-        // not it removed something here: a decommission's entrant
-        // forwards back to the leaver, so a relay circles for as long as
-        // it keeps removing something, and a clear that removes the
-        // writes a client made after its acknowledged `clear()` counts as
-        // removing something. The client's own clear to this node is what
-        // follows the write on the entrant's queue (see
-        // `decommission_forwards_a_clear_behind_the_write_it_queued_for_the_entrant`).
+        // forwards to it; it must follow that write on the entrant's
+        // queue, or the write lands there after the entrant's own clear.
+        // A forwarded clear that removed nothing here is not passed on:
+        // nothing is queued it must follow, and that is what ends a
+        // clear circling between two decommissions pointing at each
+        // other.
         let (request_tx, request_rx) = mpsc::channel(4);
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
 
@@ -15955,7 +15963,7 @@ mod tests {
 
         // The write (relayed here as a handoff, as the node whose
         // confirmed joiner this is relays it), then the forwarded clear,
-        // which removes it, then the same clear again, which finds nothing.
+        // then the same clear again, which finds nothing.
         let n = owned.len();
         let mut reply = [0_u8; 2];
         for (frame, expected_reply) in [
@@ -15982,9 +15990,12 @@ mod tests {
         let frames = frames.lock().unwrap().clone();
         assert_eq!(
             frames,
-            vec![format!("U 0 {n} 2 8\ntok-peer{owned}v1").into_bytes()],
-            "the write is queued for the entrant; neither forwarded clear follows it, the one \
-             that removed the key included"
+            vec![
+                format!("U 0 {n} 2 8\ntok-peer{owned}v1").into_bytes(),
+                b"f 0 8 A\ntok-peer".to_vec(),
+            ],
+            "the clear that removed the key follows it to the entrant; the one that found \
+             nothing stays here"
         );
     }
 
@@ -16130,17 +16141,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_survivor_forwards_a_clients_clear_but_not_a_forwarded_one_to_the_promoted_owner() {
+    async fn a_survivor_forwards_a_clear_to_the_promoted_owner_behind_the_write_it_mirrored() {
         // After `dead` was evicted, `me` mirrors a client's write of a key
         // to `peer`, the owner the change promoted. The client then
         // clears every node it knows — `peer` directly, and `me`. The
         // mirrored write used to be the only thing on `peer`'s queue, so
         // it could land after `peer`'s own clear and leave the cleared
         // key on that one owner; the clear now follows it on the same
-        // connection. A forwarded clear (`f`) does not: the survivors of
-        // a re-replication mirror to each other, so a relay circles for
-        // as long as it keeps removing something, and wipes the writes a
-        // client made after its acknowledged `clear()`.
+        // connection. A forwarded clear (`f`) that removed something
+        // here follows too.
         let (request_tx, request_rx) = mpsc::channel(4);
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
 
@@ -16229,9 +16238,10 @@ mod tests {
                 b"U 0 3 2 8\ntok-peerkeyv1".to_vec(),
                 b"f 0 8\ntok-peer".to_vec(),
                 b"U 0 3 2 8\ntok-peerkeyv2".to_vec(),
+                b"f 0 8 A\ntok-peer".to_vec(),
             ],
-            "the client's clear follows the write queued before it; neither forwarded clear \
-             follows the write the first one removed"
+            "each clear follows the write queued before it; the forwarded clear that found \
+             nothing stays here"
         );
     }
 
