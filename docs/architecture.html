@@ -380,6 +380,27 @@ here.</p>
   changed content and a lagging forward to coincide, and removing it
   would need versioned writes in the server and every SDK. Revisit if a
   versioned write path is adopted for other reasons.</li>
+  <li>During a join&rsquo;s, a decommission&rsquo;s or an eviction&rsquo;s
+  forwarding window, writes a client makes right after
+  <code>clear()</code> returned can be missing on one or more owners until
+  they are written again or expire. A node passes a clear on to the nodes
+  of the window through the same queue as the writes it mirrors, and a
+  forwarded clear is passed on again from there; the client&rsquo;s own
+  clear is acknowledged once the nodes it knows have applied it, not
+  once those copies have, so a copy can land on a node after the
+  client&rsquo;s next writes there and drop them. Measured with a client
+  that sets 20 keys into a namespace, clears it and sets 20 others at
+  once, fifteen times in a run, around a decommission, an eviction and two
+  mixed join/decommission sequences: a clear that broke the invariants in
+  12 of 16 runs, mostly one whose new keys were missing on every owner (a
+  cache miss, not a stale read); the same client with no membership change
+  did not (6 runs). Accepted 2026-10-23: the missing write is a miss on a
+  cache, and acknowledging a clear only after its copies were applied
+  would make every clear wait for every window&rsquo;s queue and needs a
+  delivery signal on the forward path. Not passing a forwarded clear on
+  again was tried and rejected: it removed nearly all of the
+  whole-namespace misses but let a cleared key come back with its old value
+  on a join followed by a decommission, which is the worse outcome.</li>
   <li>A write a client sends to an old owner is relayed to that
   owner&rsquo;s joiner, but not on to the joiner&rsquo;s own joiner: a
   node relays a write that reached it as a handoff only to a joiner
