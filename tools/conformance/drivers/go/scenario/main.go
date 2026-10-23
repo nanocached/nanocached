@@ -199,6 +199,11 @@ func host(kase string, a []string) {
 		emit(map[string]any{"event": "peak", "cgroup_peak_kb": cgroupPeakKB()})
 		return
 	}
+	if strings.HasPrefix(kase, "roster_") { // the connect event is the verdict: a client that connected has nothing more to be asked
+		emit(map[string]any{"event": "peak", "cgroup_peak_kb": cgroupPeakKB()})
+		step("close", 10*time.Second, func() (struct{}, error) { c.Close(); return struct{}{}, nil })
+		return
+	}
 	t := time.Now()
 	if kase == "backpressure" {
 		n, _ := strconv.Atoi(a[0])

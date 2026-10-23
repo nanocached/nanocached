@@ -82,6 +82,11 @@ public final class Scenario {
         NanocachedClient.Options o = NanocachedClient.builder().addresses(addrs).compress(a.length > 0 && a[0].equals("compress"));
         NanocachedClient c = step("connect", LIMIT_MS, () -> NanocachedClient.connect(o));
         if (c == null) { emit(ev("event", "peak", "cgroup_peak_kb", cgroupPeakKb())); return; }
+        if (kase.startsWith("roster_")) { // the connect event is the verdict: a client that connected has nothing more to be asked
+            emit(ev("event", "peak", "cgroup_peak_kb", cgroupPeakKb()));
+            step("close", 10_000, () -> { c.close(); return true; });
+            System.exit(0);
+        }
         long t = System.currentTimeMillis();
         Object harnessFloorKb = null;
         if (kase.equals("backpressure")) {

@@ -1,8 +1,9 @@
-"""hostile_node.py <hostile_cases.json>: a fake nanocached node that misbehaves in a different way on each port.
+"""hostile_node.py <hostile_cases.json>: a fake nanocached node, and a fake discovery server, that misbehave in a
+different way on each port.
 
-It answers the SDKs' handshake (`A <n>[ T]\\n<secret>` -> `On\\n`, no tag capability, so replies are
-untagged) and then, on a `G` (get), does what the case on that port says. Only the cases of
-hostile_cases.json are served; the case ids pick the behaviour:
+It answers the SDKs' handshake (`A <n>[ T]\\n<secret>` -> `On\\n` for a node, `Od\\n` for a discovery server,
+no tag capability, so replies are untagged) and then, on a `G` (get) or an `L` (node list), does what the case on
+that port says. Only the cases of hostile_cases.json are served; the case ids pick the behaviour:
 
   baseline               V 1024, an honest reply
   trickle_ok             an honest 40-byte reply, one byte every 100 ms
@@ -12,6 +13,10 @@ hostile_cases.json are served; the case ids pick the behaviour:
   oversize_huge          declares 4294967295 B and sends nothing
   bomb                   a 1 MiB raw-DEFLATE value (marker 0x01) that expands to 1 GiB
   backpressure           completes the handshake and then reads nothing at all
+
+  roster_count_over      (discovery) `N 65537 2`: one more node than the SDKs accept
+  roster_bytes_over      (discovery) entries of 64 KiB + 64 KiB until the client hangs up, past the 16 MiB cap
+  roster_unreachable     (discovery) 128 entries, none of them reachable (TEST-NET-3 addresses)
 
 Every wait is bounded by the container's lifetime (the run script removes it). Sets are read and
 acknowledged, so a client that writes before it reads is not stuck on a half-open fixture.
@@ -72,11 +77,13 @@ async def serve(case_id, reader, writer):
                 return
             cmd, _ = request
             if cmd == b"A":
-                writer.write(b"On\n")
+                writer.write(b"Od\n" if case_id.startswith("roster_") else b"On\n")
             elif cmd == b"S":
                 writer.write(b"S\n")
             elif cmd == b"G":
                 await answer_get(case_id, writer)
+            elif cmd == b"L":
+                await answer_list(case_id, writer)
             await writer.drain()
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
         pass
@@ -112,6 +119,29 @@ async def answer_get(case_id, writer):
         await asyncio.sleep(3600)
     elif case_id == "bomb":
         writer.write(b"V %d\n" % len(BOMB) + BOMB)
+
+
+def entry(name, addr):
+    return b"%d %d\n%b%b\n" % (len(name), len(addr), name, addr)
+
+
+async def answer_list(case_id, writer):
+    """`N <count> <replication>\\n` and then `<name-len> <addr-len>\\n<name><addr>\\n` per node."""
+    if case_id == "roster_count_over":
+        writer.write(b"N 65537 2\n")
+        await writer.drain()
+        await asyncio.sleep(3600)
+    elif case_id == "roster_bytes_over":
+        writer.write(b"N 65536 2\n")
+        big = entry(b"n" * 65536, b"a" * 65536)
+        for _ in range(65536):  # the client hangs up long before; the write then raises
+            writer.write(big)
+            await writer.drain()
+    elif case_id == "roster_unreachable":
+        writer.write(b"N 128 2\n")
+        for i in range(128):
+            # TEST-NET-3 is reserved for documentation: nothing answers there, so every dial runs into its deadline
+            writer.write(entry(b"hostile-%d" % i, b"203.0.113.%d:%d" % (1 + i % 254, 8356 + i // 254)))
 
 
 async def main():

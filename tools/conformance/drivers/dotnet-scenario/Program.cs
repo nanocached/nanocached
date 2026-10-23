@@ -68,6 +68,12 @@ switch (name)
         options.Compress = a.Skip(1).Contains("compress");
         var c = await Step("connect", Connect);
         if (c is null) { Emit(new() { ["event"] = "peak", ["cgroup_peak_kb"] = CgroupPeakKb() }); break; }
+        if (kase.StartsWith("roster_")) // the connect event is the verdict: a client that connected has nothing more to be asked
+        {
+            Emit(new() { ["event"] = "peak", ["cgroup_peak_kb"] = CgroupPeakKb() });
+            await Step("close", async () => { c.Dispose(); return true; }, TimeSpan.FromSeconds(10));
+            Environment.Exit(0);
+        }
         var sw = Stopwatch.StartNew();
         if (kase == "backpressure")
         {
