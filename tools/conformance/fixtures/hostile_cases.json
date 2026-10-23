@@ -57,13 +57,13 @@
     {
       "id": "bomb",
       "port": 8407,
-      "what": "a compress=true client gets a 1 MiB DEFLATE value that expands to 1 GiB",
+      "what": "a compress=true client gets a 1 MiB DEFLATE value that expands to 1 GiB; the cap is 64 MiB, and a buffer that grows by doubling or append still holds the garbage of its smaller sizes when the peak is read (Go on a CI runner: 257 MiB over, Java up to about 240), so the bound is five times the cap; a client without the cap goes past a GiB",
       "args": [
         "compress"
       ],
       "expect": "error",
       "max_wall_s": 10,
-      "max_peak_over_baseline_mib": 192
+      "max_peak_over_baseline_mib": 320
     },
     {
       "id": "backpressure",

@@ -69,7 +69,7 @@ ONLY=oversize_huge tools/conformance/scenarios.sh hostile go rust
 | `stall_mid_reply` | `V 1000` and 10 bytes of the value, then silence | fail | 40 s |
 | `oversize_just_over` | declares a 2 MiB + 1 B value and sends all of it | fail on the header (the reply cap is 2 MiB) | 5 s; peak 64 MiB over the baseline |
 | `oversize_huge` | declares 4294967295 B and sends none | fail on the header | 5 s; peak 64 MiB over the baseline |
-| `bomb` | a 1 MiB DEFLATE value that expands to 1 GiB, to a `compress` client | fail (the decompression cap is 64 MiB) | 10 s; peak 192 MiB over the baseline |
+| `bomb` | a 1 MiB DEFLATE value that expands to 1 GiB, to a `compress` client | fail (the decompression cap is 64 MiB) | 10 s; peak 320 MiB over the baseline (five times the cap: a buffer that grows by doubling or append still holds the garbage of its smaller sizes when the peak is read) |
 | `backpressure` | reads nothing after the handshake; 256 concurrent sets of 512 KiB | return every call, ok or failed | 70 s (a set may be sent again once, each attempt gets the 30 s timeout); peak 96 MiB over the baseline |
 | `roster_count_over` | a discovery server answers the node list with `N 65537 2` | fail on the header (the SDKs accept 65536 nodes) | 2 s (a client without the cap waits for the 5 s identify deadline); peak 64 MiB over the baseline |
 | `roster_bytes_over` | a discovery server sends 64 KiB + 64 KiB entries without end | fail once the response passes 16 MiB | 10 s; peak 64 MiB over the baseline |
