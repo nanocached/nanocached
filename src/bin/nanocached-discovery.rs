@@ -3210,7 +3210,7 @@ async fn wait_for_promotion(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run(
+pub(crate) async fn run(
     address: &str,
     liveness_timeout: Duration,
     startup_grace: Duration,
