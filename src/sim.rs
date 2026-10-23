@@ -20,23 +20,27 @@
 //! empirical bound, not a proof of quiescence: if a scenario ever flakes,
 //! the fix is an in-memory transport, not a bigger number.
 //!
-//! Nodes are named by a random uuid, so which keys a node owns differs from
-//! run to run; assertions are therefore stated over "the keys this node
-//! owns in this ring", never over fixed key names.
+//! A node is given its name and a shutdown request by the test
+//! (`server::RunHooks`), so which keys it owns is the same on every run and
+//! one node of several can be asked to leave. Assertions are still stated
+//! over "the keys this node owns in this ring", not over fixed key names.
 
 #[path = "bin/nanocached-discovery.rs"]
 #[allow(dead_code, unused_imports)]
 mod discovery;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use nanocached::infra::read_line_bounded;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::server::{self, ConnectionLimits, HeartbeatConfig};
+use crate::server::{self, ConnectionLimits, HeartbeatConfig, RunHooks};
 
 /// A task that is always ready keeps the runtime from ever being idle, so
 /// the paused clock never auto-advances while real loopback I/O is in
@@ -80,8 +84,24 @@ fn start_discovery(port: u16, liveness: Duration) -> JoinHandle<()> {
     })
 }
 
-fn start_node(port: u16, discovery_port: u16) -> JoinHandle<()> {
-    tokio::spawn(async move {
+/// A node running in this process: abort it to kill it, `leave` to ask it to
+/// shut down the way SIGTERM would (a decommission, then exit).
+struct Node {
+    handle: JoinHandle<()>,
+    leave: Arc<Notify>,
+}
+
+impl Node {
+    fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
+fn start_node(port: u16, discovery_port: u16, name: Option<&str>) -> Node {
+    let leave = Arc::new(Notify::new());
+    let signal = Arc::clone(&leave);
+    let name = name.map(str::to_string);
+    let handle = tokio::spawn(async move {
         let address = format!("127.0.0.1:{port}");
         let heartbeat = HeartbeatConfig {
             discovery_addrs: vec![format!("127.0.0.1:{discovery_port}")],
@@ -90,7 +110,24 @@ fn start_node(port: u16, discovery_port: u16) -> JoinHandle<()> {
             auth_secret: None,
             tls_connector: None,
         };
-        let r = server::run(
+        // The first request is the one a test makes; any later one (a
+        // second signal while draining) never comes.
+        let mut first = true;
+        let hooks = RunHooks {
+            shutdown: Box::new(move || {
+                if std::mem::take(&mut first) {
+                    let signal = Arc::clone(&signal);
+                    Box::pin(async move {
+                        signal.notified().await;
+                        Ok(())
+                    })
+                } else {
+                    Box::pin(std::future::pending())
+                }
+            }),
+            node_name: name,
+        };
+        let r = server::run_with_hooks(
             &address,
             Some(heartbeat),
             None,
@@ -100,10 +137,12 @@ fn start_node(port: u16, discovery_port: u16) -> JoinHandle<()> {
             Duration::from_secs(25),
             ConnectionLimits::default(),
             Vec::new(),
+            hooks,
         )
         .await;
         eprintln!("node {port} ended: {r:?}");
-    })
+    });
+    Node { handle, leave }
 }
 
 /// One line, without its newline. Bounded like every other reader here
@@ -186,9 +225,9 @@ async fn scenario_564(write_at: Duration) -> Outcome {
     let (a, b, c) = (free_port(), free_port(), free_port());
     let d = start_discovery(dport, Duration::from_secs(15));
     settle().await;
-    let na = start_node(a, dport);
+    let na = start_node(a, dport, Some("node-a"));
     run_for(Duration::from_secs(20)).await;
-    let nb = start_node(b, dport);
+    let nb = start_node(b, dport, Some("node-b"));
     run_for(Duration::from_secs(25)).await;
     let roster_ab = roster(dport).await;
     assert_eq!(roster_ab.len(), 2, "A and B are members: {roster_ab:?}");
@@ -201,7 +240,7 @@ async fn scenario_564(write_at: Duration) -> Outcome {
     };
     let (name_a, name_b) = (name_of(&roster_ab, a), name_of(&roster_ab, b));
 
-    let nc = start_node(c, dport);
+    let nc = start_node(c, dport, Some("node-c"));
     run_for(write_at).await;
     let mut accepted_keys = Vec::new();
     for i in 0..60 {
@@ -233,8 +272,9 @@ async fn scenario_564(write_at: Duration) -> Outcome {
             }
         }
     }
-    for h in [d, na, nb, nc] {
-        h.abort();
+    d.abort();
+    for node in [na, nb, nc] {
+        node.abort();
     }
     out
 }
@@ -270,4 +310,87 @@ async fn sweep_564_write_offset() {
         );
     }
     eprintln!("{runs} runs in {:?}", started.elapsed());
+}
+
+/// #571: a joiner that is promoted and then leaves before its senders'
+/// next heartbeat ack is never in a roster they see, so its handoff slot
+/// stays unconfirmed. The sender must still learn that it is gone and stop
+/// forwarding to its address. Returns how many connections reached B's old
+/// address from the senders afterwards: a socket listens where B was.
+async fn scenario_571(gap: Duration) -> usize {
+    let dport = free_port();
+    let (a, b) = (free_port(), free_port());
+    let d = start_discovery(dport, Duration::from_secs(15));
+    settle().await;
+    let na = start_node(a, dport, Some("node-a"));
+    run_for(Duration::from_secs(20)).await;
+    let nb = start_node(b, dport, Some("node-b"));
+    // Promoted once discovery lists it.
+    let mut waited = Duration::ZERO;
+    while roster(dport).await.len() < 2 {
+        assert!(waited < Duration::from_secs(30), "B was never promoted");
+        run_for(Duration::from_millis(250)).await;
+        waited += Duration::from_millis(250);
+    }
+    run_for(gap).await;
+    nb.leave.notify_one();
+    let mut waited = Duration::ZERO;
+    while !nb.handle.is_finished() {
+        assert!(waited < Duration::from_secs(90), "B never finished leaving");
+        run_for(Duration::from_millis(250)).await;
+        waited += Duration::from_millis(250);
+    }
+
+    // Whoever still dials B's address now reaches this listener.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind(("127.0.0.1", b)).await.unwrap();
+    let counter = Arc::clone(&attempts);
+    let watcher = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((conn, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            held.push(conn);
+        }
+    });
+    // Writes to A for as long as a forgotten forwarding window would last.
+    for second in 0..75 {
+        for i in 0..10 {
+            raw_set(a, &format!("w{second}-{i}"), "v").await;
+        }
+        run_for(Duration::from_secs(1)).await;
+    }
+    watcher.abort();
+    d.abort();
+    na.abort();
+    attempts.load(Ordering::SeqCst)
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_joiner_that_left_within_a_heartbeat_is_no_longer_forwarded_to() {
+    let _spin = spin();
+    let attempts = scenario_571(Duration::from_secs(1)).await;
+    assert_eq!(attempts, 0, "the sender kept dialling the departed joiner");
+}
+
+/// The gap between B's promotion and its leave, against the 5 s heartbeat.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[ignore]
+async fn sweep_571_leave_gap() {
+    let _spin = spin();
+    let mut dialled = Vec::new();
+    for ms in [0, 1000, 2000, 3000, 4000, 5000, 6000, 8000] {
+        let one = std::time::Instant::now();
+        let attempts = scenario_571(Duration::from_millis(ms)).await;
+        eprintln!(
+            "leave +{ms:>4} ms after promotion: {attempts} dials ({:?})",
+            one.elapsed()
+        );
+        if attempts > 0 {
+            dialled.push(ms);
+        }
+    }
+    assert!(
+        dialled.is_empty(),
+        "dials to the departed joiner after a gap of {dialled:?} ms"
+    );
 }
