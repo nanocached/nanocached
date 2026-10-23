@@ -376,6 +376,17 @@ type Target =
   // member list.
   | { kind: "cluster"; ring: HashRing; members: Map<string, ClusterMember>; replication: number };
 
+/** A value as a `Buffer` over the caller's own bytes. A string is encoded; a
+ * `Uint8Array` is not copied (`Buffer.from(<Uint8Array>)` copies), so a write
+ * that waits behind a slow peer holds a reference to the caller's buffer
+ * and not a second copy of it: 256 pending sets of one 512 KiB buffer held
+ * 130 MiB of copies. The caller must leave the bytes alone until the call
+ * settles; the Go, Java, .NET and Rust SDKs do not copy it either. */
+function valueBytesOf(value: string | Uint8Array): Buffer {
+  if (typeof value === "string") return Buffer.from(value, "utf8");
+  return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+}
+
 function targetKey(options: { host: string; port: number }): string {
   return `${options.host}:${options.port}`;
 }
@@ -1369,7 +1380,10 @@ export class NanocachedClient {
   /** `ttlSeconds` (whole seconds, default 0) is when the key expires; 0
    * means no expiry. Must be a non-negative integer. Transparently
    * compresses values at or above `compressionThreshold` when `compress`
-   * is enabled (value compression). */
+   * is enabled (value compression). A `Uint8Array` value is not copied: it
+   * is read when the request is written, which can be after this call
+   * returns while the connection is busy, so leave it unchanged until the
+   * promise settles. */
   async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<void> {
     return this.setInNamespace(EMPTY_NAMESPACE, key, value, ttlSeconds);
   }
@@ -1496,7 +1510,7 @@ export class NanocachedClient {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
-    const valueBytes = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
+    const valueBytes = valueBytesOf(value);
     // Validate the *original* value's size before compressing, matching
     // Python's Set (issue #47 audit item 3) — an oversized value must be
     // rejected outright, not silently forwarded just because DEFLATE
@@ -2277,7 +2291,7 @@ export class NanocachedClient {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
-    const valueBytes = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
+    const valueBytes = valueBytesOf(value);
     // Same two-layer size check setInNamespace uses: the *original* value
     // must fit MAX_REQUEST_BYTES, not just its compressed form (issue #47
     // audit item 3).

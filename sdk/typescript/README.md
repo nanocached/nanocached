@@ -593,7 +593,11 @@ never replayed.
   (rejects with a `TypeError` if the value isn't valid UTF-8)
 - `client.getBytes(key)` — resolves `Buffer | null`, the raw bytes
 - `client.set(key, value, ttlSeconds = 0)` — `ttlSeconds` must be a
-  non-negative integer; 0 (the default) means no expiry
+  non-negative integer; 0 (the default) means no expiry. A `Uint8Array` or
+  `Buffer` value is not copied: it is read when the request is written,
+  which can be after the call returns while the connection is busy, so
+  leave it unchanged until the promise settles (a string is encoded when
+  `set` is called)
 - `client.delete(key)` — resolves `boolean` (whether the key existed)
 - `client.incr(key, delta = 1)` / `client.decr(key, delta = 1)` — resolves
   `number | null` (`null` on a miss); throws `NotNumericError` if the
