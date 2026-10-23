@@ -8,7 +8,8 @@ wrote <case>.<sdk>.jsonl (events: connect, op, peak). The limits are fixtures/ho
   expect error    the call fails within max_wall_s; a value, or no answer, is a failure
   expect settles  every one of the concurrent calls has returned (ok or failed) within max_wall_s
   max_peak_over_baseline_mib
-                  the container's cgroup peak memory in the case minus the same SDK's `baseline` case
+                  the container's cgroup peak memory in the case minus the same SDK's `baseline` case; or, when
+                  the driver reports `harness_floor_kb` (its own concurrency in place, no SDK call yet), minus that
 
 Cell:  PASS   within every bound
        FAIL   outside one (the reasons are listed below the matrix)
@@ -62,11 +63,15 @@ def judge(case, ev, baseline_peak):
             why.append(f"took {ms} ms, bound {limit_ms} ms")
     bound = case.get("max_peak_over_baseline_mib")
     peak = ev.get("peak", {}).get("cgroup_peak_kb")
+    # a driver whose own concurrency costs memory (a blocked call per platform thread) reports the peak with that
+    # concurrency in place and no SDK call made; the case is then judged against it instead of the baseline run
+    floor = ev.get("peak", {}).get("harness_floor_kb")
+    reference, what = (floor, "the driver's own threads") if floor is not None else (baseline_peak, "the baseline")
     if bound is not None:
-        if peak is None or baseline_peak is None:
+        if peak is None or reference is None:
             why.append("peak memory not measured (no cgroup memory.peak, or no baseline run)")
-        elif (peak - baseline_peak) / 1024 > bound:
-            why.append(f"peak {(peak - baseline_peak) / 1024:.0f} MiB over the baseline, bound {bound} MiB")
+        elif (peak - reference) / 1024 > bound:
+            why.append(f"peak {(peak - reference) / 1024:.0f} MiB over {what}, bound {bound} MiB")
     return why
 
 

@@ -83,11 +83,21 @@ public final class Scenario {
         NanocachedClient c = step("connect", LIMIT_MS, () -> NanocachedClient.connect(o));
         if (c == null) { emit(ev("event", "peak", "cgroup_peak_kb", cgroupPeakKb())); return; }
         long t = System.currentTimeMillis();
+        Object harnessFloorKb = null;
         if (kase.equals("backpressure")) {
             int n = Integer.parseInt(a[0]);
             byte[] value = new byte[Integer.parseInt(a[1])]; // one buffer, owned by the caller and shared by every set
+            // A blocking call holds a platform thread, and 256 of them cost about 150 MiB of the container's memory before the
+            // SDK has done anything. Measure that with no SDK call in it, then run the case on the same threads: what the case adds
+            // on top is the SDK's (hostile_check.py reads the floor).
+            ExecutorService pool = Executors.newFixedThreadPool(n, r -> { Thread th = new Thread(r); th.setDaemon(true); return th; });
+            CountDownLatch started = new CountDownLatch(n), release = new CountDownLatch(1);
+            for (int i = 0; i < n; i++) pool.submit(() -> { started.countDown(); release.await(); return null; });
+            started.await(LIMIT_MS, TimeUnit.MILLISECONDS);
+            harnessFloorKb = cgroupPeakKb();
+            release.countDown();
             List<Future<?>> calls = new ArrayList<>();
-            for (int i = 0; i < n; i++) { final int k = i; calls.add(POOL.submit(() -> { c.set(("host:bp:" + k).getBytes(), value); return null; })); }
+            for (int i = 0; i < n; i++) { final int k = i; calls.add(pool.submit(() -> { c.set(("host:bp:" + k).getBytes(), value); return null; })); }
             int failed = 0; boolean timedOut = false;
             for (Future<?> f : calls) {
                 try { f.get(Math.max(1, LIMIT_MS - (System.currentTimeMillis() - t)), TimeUnit.MILLISECONDS); }
@@ -104,7 +114,8 @@ public final class Scenario {
             } catch (TimeoutException e) { emit(ev("event", "op", "outcome", "timeout", "ms", System.currentTimeMillis() - t)); }
             catch (Throwable e) { Map<String, Object> m = err(e); m.put("event", "op"); m.put("ms", System.currentTimeMillis() - t); emit(m); }
         }
-        emit(ev("event", "peak", "cgroup_peak_kb", cgroupPeakKb()));
+        emit(harnessFloorKb == null ? ev("event", "peak", "cgroup_peak_kb", cgroupPeakKb())
+                : ev("event", "peak", "cgroup_peak_kb", cgroupPeakKb(), "harness_floor_kb", harnessFloorKb));
         step("close", 10_000, () -> { c.close(); return true; });
         System.exit(0); // a stalled socket would keep a non-daemon thread alive after the case is judged
     }
