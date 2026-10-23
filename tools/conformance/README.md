@@ -75,7 +75,10 @@ ONLY=oversize_huge tools/conformance/scenarios.sh hostile go rust
 Peak memory is the container's cgroup peak (`memory.peak`, cgroup v2), the one
 measure all six runtimes report the same way, minus the same SDK's `baseline`
 run, so a runtime's own footprint (JVM, .NET, Node) is not charged to the
-SDK. A cell with no measurement fails: a bound that cannot be read proves
+SDK. A driver whose own concurrency costs memory (the Java driver parks one
+platform thread per blocked call, about 0.6 MiB each) reports the peak with
+that concurrency in place and no SDK call made, and `backpressure` is judged
+against it instead. A cell with no measurement fails: a bound that cannot be read proves
 nothing. A call that never returns shows as `timeout`: the driver's own limit
 (`LIMIT`, 90 s) is above every bound in the table. The bounds are a statement
 of what the SDKs promise (their own constants agree: 2 MiB, 64 MiB, 30 s), not
