@@ -36,7 +36,7 @@ Results land in `results/<run>/<topology>-<path>` (git-ignored).
 | `scenarios.sh <v6\|v5\|v7\|v4>` | scenarios that need containers started, stopped or put behind a fixture: connection failures and auth, join / decommission / kill under load, client lifecycle, a node dying before a multi-get |
 | `scenarios_dynamic.sh <v5\|v7>` | the join / decommission / kill and client-lifecycle scenarios, one run per SDK (`report_scen.py` summarises) |
 | `replica.sh` | do all owners of a key hold the same copy after the writes have finished |
-| `scenarios.sh hostile` | every SDK against a fake node that misbehaves (trickles, stalls, oversizes, bombs, backs up); `hostile_check.py` judges time and peak memory against one table; exits 1 when a cell is outside its bounds |
+| `scenarios.sh hostile` | every SDK against a fake node that misbehaves (trickles, stalls, oversizes, bombs, backs up); `hostile_check.py` judges time and peak memory against one table; exits 1 when a cell is outside its bounds; runs nightly in CI (`hostile-conformance.yaml`) |
 | `member.sh`, `member_matrix.sh` | every writing command around join / leave / evict (`member_workload.py` writes, `member_read.py` reads back); exits 1 on a violation of the invariants below. Four of its cells run nightly in CI |
 | `wire_probe.py` | raw protocol replies for hand-built frames |
 
@@ -57,7 +57,7 @@ then misbehaves differently on each port, and runs every driver's
 checker all read that one file; a limit changes there only).
 
 ```sh
-tools/conformance/scenarios.sh hostile            # all six SDKs, about five minutes
+tools/conformance/scenarios.sh hostile            # all six SDKs, about ten minutes
 ONLY=oversize_huge tools/conformance/scenarios.sh hostile go rust
 ```
 
@@ -71,6 +71,13 @@ ONLY=oversize_huge tools/conformance/scenarios.sh hostile go rust
 | `oversize_huge` | declares 4294967295 B and sends none | fail on the header | 5 s; peak 64 MiB over the baseline |
 | `bomb` | a 1 MiB DEFLATE value that expands to 1 GiB, to a `compress` client | fail (the decompression cap is 64 MiB) | 10 s; peak 192 MiB over the baseline |
 | `backpressure` | reads nothing after the handshake; 256 concurrent sets of 512 KiB | return every call, ok or failed | 70 s (a set may be sent again once, each attempt gets the 30 s timeout); peak 96 MiB over the baseline |
+| `roster_count_over` | a discovery server answers the node list with `N 65537 2` | fail on the header (the SDKs accept 65536 nodes) | 2 s (a client without the cap waits for the 5 s identify deadline); peak 64 MiB over the baseline |
+| `roster_bytes_over` | a discovery server sends 64 KiB + 64 KiB entries without end | fail once the response passes 16 MiB | 10 s; peak 64 MiB over the baseline |
+| `roster_unreachable` | a discovery server lists 128 nodes, none of which answers | come back (with an error) | 60 s: the dials run in waves, each into its 5 s deadline, 64 at a time (Java: 16), so 10 s (Java: 40 s); one after the other would take 640 s |
+
+The roster cases are served as a discovery server (`Od` to the handshake, the
+list to an `L`) and judged on the driver's `connect` event, since a client that
+cannot read the roster never connects.
 
 Peak memory is the container's cgroup peak (`memory.peak`, cgroup v2), the one
 measure all six runtimes report the same way, minus the same SDK's `baseline`
@@ -85,6 +92,14 @@ of what the SDKs promise (their own constants agree: 2 MiB, 64 MiB, 30 s), not
 of what each one happens to do; the backpressure memory bound in particular
 says an SDK does not copy the whole queue of writes it was handed into
 buffers of its own.
+
+What the table does not hold the SDKs to: a cap on one roster entry's name or
+address (65536 bytes in Python, TypeScript, Go and Rust; Java and .NET bound
+only the node count and the whole response, so an entry that declares a longer
+name is read until the 5 s identify deadline instead of being refused), and
+the number of dials in flight (64, except Java's 16). The first would be a
+case that two SDKs fail by design; the second is why the unreachable-roster
+bound is 60 s and not 20 s.
 
 ## Membership invariants
 

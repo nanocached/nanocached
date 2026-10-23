@@ -1,5 +1,5 @@
 {
-  "_doc": "The hostile-server cases and the limits every SDK is held to, written once. hostile_node.py serves each case on its port; scenarios.sh hostile runs every driver's `host <id> <args>` against it; hostile_check.py reads this file to judge the result. A limit is checked against the SDK's own constants (all six agree: a reply value of at most 2 MiB, a decompressed value of at most 64 MiB, a request that makes no progress for 30 s fails). The driver's own limit (scenarios.sh LIMIT, 90 s) is above every max_wall_s, so a call that never returns shows as `timeout`, not as a slow answer.",
+  "_doc": "The hostile-server cases and the limits every SDK is held to, written once. hostile_node.py serves each case on its port; scenarios.sh hostile runs every driver's `host <id> <args>` against it; hostile_check.py reads this file to judge the result. The roster cases are served as a discovery server and judged on the `connect` event (`event`), since a client that cannot read the roster never connects. A limit is checked against the SDK's own constants (all six agree: a reply value of at most 2 MiB, a decompressed value of at most 64 MiB, a request that makes no progress for 30 s fails). The driver's own limit (scenarios.sh LIMIT, 90 s) is above every max_wall_s, so a call that never returns shows as `timeout`, not as a slow answer.",
   "baseline_ceiling_note": "peak_over_baseline_mib is the cgroup peak of the case minus the cgroup peak of the same SDK's `baseline` case, so a runtime's own footprint (JVM, .NET, Node) is not charged to the SDK. A driver that reports harness_floor_kb (its own threads in place, no SDK call yet) is judged against that instead.",
   "cases": [
     {
@@ -76,6 +76,35 @@
       "expect": "settles",
       "max_wall_s": 70,
       "max_peak_over_baseline_mib": 96
+    },
+    {
+      "id": "roster_count_over",
+      "port": 8409,
+      "event": "connect",
+      "what": "a discovery server answers the node list with `N 65537 2`: one node more than the SDKs accept (65536)",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 2,
+      "max_peak_over_baseline_mib": 64
+    },
+    {
+      "id": "roster_bytes_over",
+      "port": 8411,
+      "event": "connect",
+      "what": "a discovery server sends entries of 64 KiB + 64 KiB without end: the response is capped at 16 MiB",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 10,
+      "max_peak_over_baseline_mib": 64
+    },
+    {
+      "id": "roster_unreachable",
+      "port": 8412,
+      "event": "connect",
+      "what": "a discovery server lists 128 nodes and none of them answers: every dial runs into its 5 s deadline, 64 at a time in five SDKs (two rounds, 10 s) and 16 at a time in Java (eight rounds, 40 s); a client that dials them one after the other takes 640 s",
+      "args": [],
+      "expect": "returns",
+      "max_wall_s": 60
     }
   ]
 }

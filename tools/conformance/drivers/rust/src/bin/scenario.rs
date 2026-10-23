@@ -224,6 +224,12 @@ async fn host(cx: &Ctx, case: &str, a: &[String]) {
         cx.emit(Ev::new("peak").raw("cgroup_peak_kb", cgroup_peak_kb()));
         return;
     };
+    if case.starts_with("roster_") {
+        // the connect event is the verdict: a client that connected has nothing more to be asked
+        cx.emit(Ev::new("peak").raw("cgroup_peak_kb", cgroup_peak_kb()));
+        let _ = tokio::time::timeout(Duration::from_secs(10), c.close()).await;
+        std::process::exit(0);
+    }
     let t = Instant::now();
     if case == "backpressure" {
         let n: usize = a[0].parse().unwrap();

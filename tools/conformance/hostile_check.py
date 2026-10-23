@@ -7,6 +7,8 @@ wrote <case>.<sdk>.jsonl (events: connect, op, peak). The limits are fixtures/ho
   expect ok       the call returns the value the fixture sent (len) within max_wall_s
   expect error    the call fails within max_wall_s; a value, or no answer, is a failure
   expect settles  every one of the concurrent calls has returned (ok or failed) within max_wall_s
+  expect returns  the call comes back, with a value or an error, within max_wall_s
+  event           which driver event carries the outcome: `op` (default) or `connect` (the roster cases)
   max_peak_over_baseline_mib
                   the container's cgroup peak memory in the case minus the same SDK's `baseline` case; or, when
                   the driver reports `harness_floor_kb` (its own concurrency in place, no SDK call yet), minus that
@@ -40,10 +42,11 @@ def events(run_dir, case, sdk):
 
 def judge(case, ev, baseline_peak):
     """The reasons this SDK's run of the case is outside its bounds (empty when it is within them)."""
-    op = ev.get("op")
+    what_event = case.get("event", "op")
+    op = ev.get(what_event)
     if op is None:
         conn = ev.get("connect", {})
-        return [f"no op event (connect: {conn.get('outcome', 'none')} {conn.get('error_message', '')})".strip()]
+        return [f"no {what_event} event (connect: {conn.get('outcome', 'none')} {conn.get('error_message', '')})".strip()]
     why = []
     outcome, ms, limit_ms = op.get("outcome"), op.get("ms", 0), case["max_wall_s"] * 1000
     if outcome == "timeout":
@@ -59,6 +62,7 @@ def judge(case, ev, baseline_peak):
                 why.append(f"expected an error, got {outcome}" + (f" with a {op['len']}-byte value" if op.get("len") is not None else ""))
         elif case["expect"] == "settles" and outcome != "settled":
             why.append(f"{outcome}: {op.get('error_message', '')}".strip())
+        # expect returns: any answer, ok or an error, but within max_wall_s
         if ms > limit_ms:
             why.append(f"took {ms} ms, bound {limit_ms} ms")
     bound = case.get("max_peak_over_baseline_mib")

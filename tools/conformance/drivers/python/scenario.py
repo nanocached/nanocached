@@ -284,6 +284,10 @@ async def sc_host(case, *args):
     if client is None:
         emit(event="peak", cgroup_peak_kb=cgroup_peak_kb())
         return
+    if case.startswith("roster_"):  # the connect event is the verdict: a client that connected has nothing more to be asked
+        emit(event="peak", cgroup_peak_kb=cgroup_peak_kb())
+        await step("close", client.close(), 10)
+        return
     t = time.monotonic()
     if case == "backpressure":
         n, size = int(args[0]), int(args[1])

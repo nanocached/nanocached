@@ -63,6 +63,11 @@ const scenarios = {
   async host(kase, ...a) {
     const client = await step("connect", NanocachedClient.connect({ addresses, compress: a.includes("compress") }));
     if (!client) { emit({ event: "peak", cgroup_peak_kb: cgroupPeakKb() }); return; }
+    if (kase.startsWith("roster_")) { // the connect event is the verdict: a client that connected has nothing more to be asked
+      emit({ event: "peak", cgroup_peak_kb: cgroupPeakKb() });
+      await step("close", client.close(), 10000);
+      process.exit(0);
+    }
     const t = Date.now();
     if (kase === "backpressure") {
       const [n, size] = [Number(a[0]), Number(a[1])];
