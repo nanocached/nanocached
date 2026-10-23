@@ -6,7 +6,8 @@ use rustc_hash::FxHashMap;
 use std::cmp::Reverse;
 use std::collections::hash_map::RandomState;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// Caps how many entries a single `sweep` call removes. Scanning for
 /// expired/marked entries is cheap even over a large cache (~4ms/1M

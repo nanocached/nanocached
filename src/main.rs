@@ -4,6 +4,8 @@ mod hash_ring;
 mod key;
 mod response;
 mod server;
+#[cfg(test)]
+mod sim;
 
 use bytes::Bytes;
 use nanocached::infra::{load_tls_acceptor, load_tls_connector};
