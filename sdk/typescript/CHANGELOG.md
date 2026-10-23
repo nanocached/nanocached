@@ -9,6 +9,19 @@ tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Changed
+
+- `set` and the compare-and-set writes no longer copy a `Uint8Array` or
+  `Buffer` value when they are called: a write that waits behind a slow or
+  stalled peer holds a reference to the caller's buffer instead of a second
+  copy of it (256 pending sets of one 512 KiB buffer held 130 MiB; they now
+  hold about 3 MiB, and the container's peak against a node that never
+  reads fell from 155 to 27 MiB). The bytes are read when the request is
+  written, which can be after the call returns, so leave a buffer alone until
+  the promise settles (the Go, Java, .NET and Rust SDKs do not copy it
+  either). A string is still encoded when the call is made, and
+  `setMany`/`setManyBytes` still take their snapshot up front. (#853)
+
 ## [0.4.8] - 2026-10-21
 
 ### Fixed

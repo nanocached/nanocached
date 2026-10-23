@@ -2,6 +2,7 @@ import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { connect, createServer, type AddressInfo, type Server, type Socket } from "node:net";
+import { NanocachedClient } from "../src/client.js";
 import { Connection, HeadQueue } from "../src/connection.js";
 import { startMockNode } from "./mockServers.js";
 
@@ -127,6 +128,51 @@ describe("Connection write backpressure", () => {
     connection.close();
     const outcomes = await Promise.all(sets);
     assert.ok(outcomes.every((outcome) => outcome instanceof Error));
+  });
+});
+
+describe("Client write backpressure", () => {
+  it("does not hold a copy of the value for every pending set", async () => {
+    // The peer completes the handshake and never reads. 64 sets of one
+    // shared 900 KiB buffer: the connection writes one frame at a time, so
+    // what the client holds beyond that is whatever each pending call kept.
+    // A call that copied its value (Buffer.from(value) copies a Buffer too)
+    // held 64 x 900 KiB = 56 MiB of ArrayBuffers until it settled.
+    const node = await startMockNode();
+    node.stopReadingAfterHandshake();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+    try {
+      const value = Buffer.alloc(900 * 1024, 0x78);
+      const before = process.memoryUsage().arrayBuffers;
+      const sets = Array.from({ length: 64 }, (_, i) => client.set(`k${i}`, value).catch((error: Error) => error));
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const held = process.memoryUsage().arrayBuffers - before;
+      assert.ok(held < 16 * 1024 * 1024, `${Math.round(held / 1048576)} MiB of ArrayBuffers held for 64 pending sets of 900 KiB`);
+      await client.close();
+      await Promise.all(sets);
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe("Client set of a view", () => {
+  it("sends exactly the bytes of a Uint8Array view, whatever its offset", async () => {
+    // The value is no longer copied, so a view over a larger ArrayBuffer must
+    // not leak its neighbours: only [byteOffset, byteOffset + byteLength).
+    const node = await startMockNode();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+    try {
+      const backing = new Uint8Array(64).fill(0x41);
+      backing.set(Buffer.from("payload"), 20);
+      await client.set("view", backing.subarray(20, 27));
+      await client.set("plain", new Uint8Array(Buffer.from("plain-bytes")));
+      assert.equal(node.store.get("view")?.toString("utf8"), "payload");
+      assert.equal(node.store.get("plain")?.toString("utf8"), "plain-bytes");
+    } finally {
+      await client.close();
+      await node.close();
+    }
   });
 });
 
