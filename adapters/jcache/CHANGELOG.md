@@ -9,6 +9,21 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Changed
+
+- With an access-based `ExpiryPolicy` (`AccessedExpiryPolicy`,
+  `TouchedExpiryPolicy`), `get()` reads and refreshes the TTL in one wire
+  step (`getAndTouch`) instead of a read followed by a full re-write: the
+  value no longer travels back to the node, and a write landing between
+  the two is no longer overwritten with the value the `get()` observed. An
+  access duration of zero returns the value and expires the entry in the
+  same step. `getAll` keeps its one batched re-set of every hit (the
+  protocol has no batch touch, and one touch per hit would be slower), so
+  that race remains there. Needs a server release that includes the `t`
+  command and a Java SDK release that includes `getAndTouch`; against an
+  older server `get()` under an access policy fails with a
+  `CacheException` caused by the SDK's `ServerTooOld`.
+
 ## [0.4.8] - 2026-10-21
 
 ### Fixed

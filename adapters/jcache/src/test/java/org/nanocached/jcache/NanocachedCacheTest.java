@@ -959,6 +959,141 @@ class NanocachedCacheTest {
         assertEquals(30L, storedTtlSeconds("sliding-widgets", "a"), "a get must refresh the TTL via getExpiryForAccess");
     }
 
+    // ── access expiry through getAndTouch (issue #826) ──────────────
+
+    private Cache<String, String> accessCache(String name, Duration access) {
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        config.setExpiryPolicyFactory(AccessedExpiryPolicy.factoryOf(access));
+        return manager.createCache(name, config);
+    }
+
+    private void seedWithTtl(String namespace, String key, String value, long ttlSeconds) {
+        node.store(namespace)
+                .put(
+                        java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes(key)),
+                        new MockNode.Entry(ValueCodec.serialize(value), ttlSeconds));
+    }
+
+    @Test
+    void anAccessedGetIsOneGetAndTouchNotAReadAndAReSet() {
+        Cache<String, String> sliding =
+                accessCache("touch-once", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
+        sliding.put("a", "1");
+        seedWithTtl("touch-once", "a", "1", 5L);
+        int gets = node.getCount.get();
+        int sets = node.setCount.get();
+
+        assertEquals("1", sliding.get("a"));
+
+        assertEquals(1, node.touchFrames.size());
+        assertTrue(node.touchFrames.get(0).contains(" 30 G"), node.touchFrames.get(0));
+        assertEquals(gets, node.getCount.get(), "no plain get");
+        assertEquals(sets, node.setCount.get(), "no re-set of the value");
+        assertEquals(30L, storedTtlSeconds("touch-once", "a"));
+    }
+
+    @Test
+    void anAccessedGetOfAMissingKeyIsAMissAndCreatesNothing() throws Exception {
+        Cache<String, String> sliding =
+                accessCache("touch-miss", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
+        manager.enableStatistics("touch-miss", true);
+
+        assertNull(sliding.get("absent"));
+
+        assertEquals(1, node.touchFrames.size());
+        assertNull(node.entry("touch-miss", KeyCodec.toKeyBytes("absent")));
+        assertEquals(1, statisticsMBean("touch-miss").getCacheMisses());
+    }
+
+    @Test
+    void anEternalAccessPolicyRemovesTheTtlOnGet() {
+        Cache<String, String> sliding = accessCache("touch-eternal", Duration.ETERNAL);
+        seedWithTtl("touch-eternal", "a", "1", 5L);
+
+        assertEquals("1", sliding.get("a"));
+
+        assertEquals(0L, storedTtlSeconds("touch-eternal", "a"), "0 is the mock's no-TTL");
+        assertFalse(node.touchFrames.get(0).contains(" 0 G"), "no TTL field, not a 0 that would expire it");
+    }
+
+    @Test
+    void aZeroAccessPolicyReturnsTheValueAndExpiresTheEntryInOneStep() {
+        Cache<String, String> sliding = accessCache("touch-zero", Duration.ZERO);
+        seedWithTtl("touch-zero", "a", "1", 30L);
+
+        assertEquals("1", sliding.get("a"));
+
+        assertNull(node.entry("touch-zero", KeyCodec.toKeyBytes("a")));
+        assertEquals(0, node.deleteCount.get(), "no separate delete");
+        assertNull(sliding.get("a"));
+    }
+
+    @Test
+    void aCachelessAccessPolicyStillReadsWithAPlainGet() {
+        // Only a non-null getExpiryForAccess() touches: the default
+        // policies never do, so their reads stay plain gets.
+        cache.put("plain", "1");
+        assertEquals("1", cache.get("plain"));
+        assertEquals(0, node.touchFrames.size());
+    }
+
+    @Test
+    void aWriteLandingDuringAnAccessedGetIsNotOverwritten() throws Exception {
+        // issue #826: the old get() re-sent the value it had read, so a
+        // write that landed between the read and the refresh was lost. The
+        // concurrent write is injected where that gap was: after the node
+        // has looked the value up for the read (the old code) or has seen
+        // the touch (the new one), before answering. It goes over its own
+        // raw connection, as a namespaced `s` frame.
+        Cache<String, String> sliding =
+                accessCache("touch-race", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
+        sliding.put("a", "old");
+        java.util.concurrent.atomic.AtomicBoolean fired = new java.util.concurrent.atomic.AtomicBoolean();
+        node.beforeAccessApplies = () -> {
+            if (fired.compareAndSet(false, true)) {
+                rawSet("touch-race", KeyCodec.toKeyBytes("a"), ValueCodec.serialize("new"), 30L);
+            }
+        };
+
+        sliding.get("a");
+        node.beforeAccessApplies = null;
+
+        assertEquals("new", sliding.get("a"));
+        assertEquals(
+                "new",
+                ValueCodec.deserialize(
+                        node.entry("touch-race", KeyCodec.toKeyBytes("a")).value(),
+                        getClass().getClassLoader()));
+    }
+
+    private void rawSet(String namespace, byte[] key, byte[] value, long ttlSeconds) {
+        byte[] ns = namespace.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        try (java.net.Socket socket = new java.net.Socket("127.0.0.1", node.port())) {
+            java.io.OutputStream out = socket.getOutputStream();
+            java.io.InputStream in = socket.getInputStream();
+            out.write("A 1\nx".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            readLine(in); // On
+            out.write(("s " + ns.length + " " + key.length + " " + value.length + " " + ttlSeconds + "\n")
+                    .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            out.write(ns);
+            out.write(key);
+            out.write(value);
+            out.flush();
+            readLine(in); // S
+        } catch (java.io.IOException failure) {
+            throw new IllegalStateException(failure);
+        }
+    }
+
+    private static String readLine(java.io.InputStream in) throws java.io.IOException {
+        StringBuilder line = new StringBuilder();
+        for (int b = in.read(); b != '\n' && b != -1; b = in.read()) {
+            line.append((char) b);
+        }
+        return line.toString();
+    }
+
     private long storedTtlSeconds(String namespace, String key) {
         MockNode.Entry entry = node.entry(namespace, KeyCodec.toKeyBytes(key));
         return entry.ttlSeconds();

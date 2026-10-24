@@ -243,13 +243,20 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         requireNotClosed();
         Objects.requireNonNull(key, "key");
         byte[] keyBytes = KeyCodec.toKeyBytes(key);
-        Optional<byte[]> raw = namespace.getBytes(keyBytes);
+        // An access-based ExpiryPolicy (issue #826) reads and refreshes the
+        // TTL in one wire step: getAndTouch, not a read followed by a
+        // full re-write — so a write landing between the two can no
+        // longer be overwritten with the value this get observed, and the
+        // value does not travel back to the node.
+        Duration accessExpiry = expiryPolicy.getExpiryForAccess();
+        Optional<byte[]> raw = accessExpiry == null
+                ? namespace.getBytes(keyBytes)
+                : namespace.getAndTouchBytes(keyBytes, touchTtlSeconds(accessExpiry));
         if (raw.isEmpty()) {
             statistics.recordMiss();
             return null;
         }
         statistics.recordHit();
-        refreshAccessExpiryIfConfigured(keyBytes, raw.get());
         return decode(raw.get());
     }
 
@@ -264,6 +271,12 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * each entry can resolve to a different TTL, {@code getExpiryForAccess()} is a single fixed,
      * cache-wide policy — every hit resolves to the exact same outcome, so there is only ever one group
      * to write, never several.
+     *
+     * <p>Unlike a single {@link #get}, which refreshes through {@code getAndTouch} (issue #826), this
+     * keeps that batched re-set: the protocol has no batch touch, and replacing it with one touch per
+     * hit would cost a wire round trip per key where today there is one per owner. The trade-off is that
+     * a write landing between {@code getAll}'s read and its refresh can still be overwritten with the
+     * value {@code getAll} observed, as documented in the README.
      */
     @Override
     public Map<K, V> getAll(Set<? extends K> keys) {
@@ -433,23 +446,18 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     /** {@code getExpiryForAccess()} is evaluated on every {@code get} —
      * unlike the .NET adapter's per-call sliding expiration, JCache's
      * {@link ExpiryPolicy} is fixed per cache, so there is no per-entry
-     * envelope to maintain: a non-null access policy just means
-     * unconditionally re-setting the TTL to that fixed duration. This
-     * re-set is a plain (non-conditional) write, so a concurrent writer
-     * landing between the read and this refresh could, rarely, be
-     * clobbered back to the value this {@code get} observed — documented
-     * in the README. */
-    private void refreshAccessExpiryIfConfigured(byte[] keyBytes, byte[] rawValue) {
-        Duration accessExpiry = expiryPolicy.getExpiryForAccess();
-        if (accessExpiry == null) {
-            return;
-        }
+     * envelope to maintain: a non-null access policy just means touching
+     * the entry to that fixed duration, which is all {@link #get} passes
+     * to {@code getAndTouch} (issue #826). */
+    private static long touchTtlSeconds(Duration accessExpiry) {
         OptionalLong ttl = wireTtlSeconds(accessExpiry);
         if (ttl.isEmpty()) {
-            namespace.delete(keyBytes);
-        } else {
-            namespace.set(keyBytes, rawValue, ttl.getAsLong());
+            // Duration.ZERO: access expires the entry at once — a touch with
+            // a 0 TTL does exactly that (and still returns the value).
+            return 0L;
         }
+        // Eternal: the entry keeps no TTL, which a touch spells as removing it.
+        return ttl.getAsLong() == NO_EXPIRY ? NanocachedClient.REMOVE_TTL : ttl.getAsLong();
     }
 
     // ── writes ──────────────────────────────────────────────────────
@@ -1231,6 +1239,14 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         Optional<byte[]> getBytes(byte[] key) {
             try {
                 return namespace.getBytes(key);
+            } catch (RuntimeException error) {
+                throw wrapped(error);
+            }
+        }
+
+        Optional<byte[]> getAndTouchBytes(byte[] key, long ttlSeconds) {
+            try {
+                return namespace.getAndTouchBytes(key, ttlSeconds);
             } catch (RuntimeException error) {
                 throw wrapped(error);
             }

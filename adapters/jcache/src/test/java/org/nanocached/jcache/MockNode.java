@@ -48,6 +48,17 @@ final class MockNode implements AutoCloseable {
     final AtomicInteger casDeleteCount = new AtomicInteger();
     final AtomicInteger multiGetCount = new AtomicInteger();
     final AtomicInteger multiSetCount = new AtomicInteger();
+    /** Every {@code t} (touch, issue #825) header line received
+     * verbatim, e.g. {@code "t 7 1 30 G 0"} — lets a test assert the exact
+     * frame the adapter sent. */
+    final java.util.List<String> touchFrames = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** Plain {@code g} (get) frames received. */
+    final AtomicInteger getCount = new AtomicInteger();
+    /** Runs when a {@code g} has looked its value up (not yet answered) or
+     * a {@code t} has been read (not yet applied), with no lock held — lets
+     * a test land a concurrent write in the gap between a read (or a
+     * touch) and whatever the client does next with it. */
+    volatile Runnable beforeAccessApplies;
     /** Every accepted TCP connection, whether or not it goes on to
      * authenticate (issue #192: used to prove a raced getCacheManager's
      * "loser" client actually dialed in, rather than the race being
@@ -182,7 +193,12 @@ final class MockNode implements AutoCloseable {
                     }
                     case "g" -> {
                         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
+                        getCount.incrementAndGet();
                         get(in, out, ns(namespace), Integer.parseInt(parts[2]), tagSuffix);
+                    }
+                    case "t" -> {
+                        byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
+                        touch(in, out, ns(namespace), parts, tagged, tagSuffix);
                     }
                     case "s" -> {
                         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
@@ -259,6 +275,10 @@ final class MockNode implements AutoCloseable {
             throws IOException {
         byte[] key = in.readNBytes(keyLength);
         Entry entry = entry(namespace, key);
+        Runnable hook = beforeAccessApplies;
+        if (hook != null) {
+            hook.run();
+        }
         if (entry == null) {
             reply(out, "N" + tagSuffix + "\n");
             return;
@@ -266,6 +286,53 @@ final class MockNode implements AutoCloseable {
         synchronized (out) {
             out.write(("V " + entry.value().length + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
             out.write(entry.value());
+            out.flush();
+        }
+    }
+
+    /** {@code t <ns-len> <key-len> [<ttl>] [G] [<tag>]} (issue #825): a miss
+     * answers {@code N} and never creates the key; ttl 0 expires the entry
+     * at once; no ttl field removes the TTL (stored as 0, like a set
+     * without one). Without {@code G} the reply is {@code S}; with it
+     * {@code V <len> [<ttl-now-in-effect>] [<tag>]}. */
+    private void touch(
+            InputStream in, OutputStream out, String namespace, String[] parts, boolean tagged, String tagSuffix)
+            throws IOException {
+        byte[] key = in.readNBytes(Integer.parseInt(parts[2]));
+        touchFrames.add(String.join(" ", parts));
+        Long ttl = null;
+        boolean withValue = false;
+        for (int i = 3; i < parts.length - (tagged ? 1 : 0); i++) {
+            if (parts[i].equals("G")) {
+                withValue = true;
+            } else {
+                ttl = Long.parseLong(parts[i]);
+            }
+        }
+        Runnable hook = beforeAccessApplies;
+        if (hook != null) {
+            hook.run();
+        }
+        ByteBuffer wrapped = ByteBuffer.wrap(key);
+        Entry existing = store(namespace).get(wrapped);
+        if (existing == null) {
+            reply(out, "N" + tagSuffix + "\n");
+            return;
+        }
+        if (ttl != null && ttl == 0) {
+            store(namespace).remove(wrapped);
+        } else {
+            store(namespace).put(wrapped, new Entry(existing.value(), ttl == null ? 0 : ttl));
+        }
+        if (!withValue) {
+            reply(out, "S" + tagSuffix + "\n");
+            return;
+        }
+        String ttlField = ttl != null && ttl > 0 ? " " + ttl : "";
+        synchronized (out) {
+            out.write(("V " + existing.value().length + ttlField + tagSuffix + "\n")
+                    .getBytes(StandardCharsets.US_ASCII));
+            out.write(existing.value());
             out.flush();
         }
     }
