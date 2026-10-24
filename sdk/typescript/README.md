@@ -434,6 +434,40 @@ call throws `ConnectionLostError` and is **not** retried. The increment
 may still have happened even though the call failed; a caller that must
 know whether it did should `get()` the counter afterwards.
 
+## Touch (`touch` / `getAndTouch`)
+
+`touch` replaces an entry's TTL in place, without rewriting its value, and
+resolves whether the key existed. `getAndTouch` reads the value and replaces
+the TTL in one step (`getAndTouchBytes` is the raw companion):
+
+```ts
+await client.set("session", "abc", 60);
+await client.touch("session", 300);            // true — now expires in 300 s
+await client.touch("session", null);           // true — never expires
+await client.getAndTouch("session", 300);      // "abc", expires in 300 s again
+await client.touch("session", 0);              // true — expires at once
+console.log(await client.touch("missing", 30)); // false — a touch never creates a key
+```
+
+`ttlSeconds` has **no default**: `null` removes the TTL and `0` expires the
+entry at once, which is the opposite of `set()`, where `0` means no expiry.
+Omitting it, or passing a negative or fractional number, throws a
+`RangeError` before any I/O. A miss is `false` for `touch` and `null` for
+`getAndTouch`. `NanocachedNamespace` has all three.
+
+A touch never changes the value, so it cannot overwrite a write that lands
+at the same time. Unlike `incr` and the compare-and-set family it is
+idempotent: it goes to every owner of the key like a `set`, and a request
+whose reply was lost is retried like `get`/`set`/`delete`, never thrown as
+`ConnectionLostError`. `getAndTouch` is a read that writes, so it goes to
+the primary like a write (one refresh and retry on a wrong-node answer or a
+connection failure; no hedging, and no fallback to a replica on a miss) and
+the other owners are sent the plain touch.
+
+Against a node older than the release that added the command, both throw
+`ServerTooOldError`: such a node answers `En` and closes the connection.
+Upgrade every node before using them.
+
 ## Batched get and set
 
 `getMany`/`getManyBytes` and `setMany`/`setManyBytes` (the `m`/`o`
@@ -604,6 +638,12 @@ never replayed.
   stored value isn't an integer `incr` can operate on, or
   `CounterOutOfRangeError` if the new counter exceeds
   `Number.MAX_SAFE_INTEGER`; see [`incr`/`decr`](#incr--decr) above
+- `client.touch(key, ttlSeconds)` — resolves `boolean` (whether the key
+  existed); `ttlSeconds` is required: `null` removes the TTL, `0` expires
+  the entry at once. `client.getAndTouch(key, ttlSeconds)` — resolves
+  `string | null`; `client.getAndTouchBytes(key, ttlSeconds)` — resolves
+  `Buffer | null`; both throw `ServerTooOldError` against a node that
+  predates the command; see [Touch](#touch-touch--getandtouch) above
 - `client.getMany(keys)` — resolves `Map<string, string>`, missing keys
   simply absent; `client.getManyBytes(keys)` — resolves `Map<string,
   Buffer>`; see [Batched get and set](#batched-get-and-set) above
@@ -628,7 +668,7 @@ never replayed.
   `ns` (a `string` or `Uint8Array`), exposing `get`/`getBytes`/
   `getWithToken`/`set`/`delete`/`getMany`/`getManyBytes`/`setMany`/
   `setManyBytes`/`clear`/`incr`/`decr`/`putIfAbsent`/`replaceIfPresent`/
-  `replace`/`deleteIfMatches` with the same signatures and semantics as
+  `replace`/`deleteIfMatches`/`touch`/`getAndTouch`/`getAndTouchBytes` with the same signatures and semantics as
   above; `handle.namespace` exposes the raw namespace bytes
 - `handle.clear()` — resolves (`Promise<void>`) once every node in the
   cluster (or the single node in standalone mode) has cleared that
@@ -666,7 +706,7 @@ Every error the SDK itself raises — `AlreadyClosedError`,
 after one refresh — see [Batched get and set](#batched-get-and-set)),
 `ConnectionLostError`, `RetryableError`,
 `NotNumericError`, `CounterOutOfRangeError`, `CompressionIncompatibleError`,
-`DecompressionError`, `DiscoveryBusyError`, and protocol/auth failures —
+`ServerTooOldError`, `DecompressionError`, `DiscoveryBusyError`, and protocol/auth failures —
 extends the exported `NanocachedError` base class, so `error instanceof
 NanocachedError` distinguishes an expected nanocached failure from
 everything else. A dial that fails — `ECONNREFUSED`, `ENOTFOUND`, a reset

@@ -1,6 +1,6 @@
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
-import { NanocachedError } from "./errors.js";
+import { NanocachedError, ServerRejectedError } from "./errors.js";
 import {
   EMPTY_NAMESPACE,
   encodeCas,
@@ -10,6 +10,7 @@ import {
   encodeDelete,
   encodeGet,
   encodeIncr,
+  encodeTouch,
   encodeMultiGet,
   encodeMultiSet,
   encodeSet,
@@ -173,6 +174,28 @@ export class RetryableError extends NanocachedError {
   }
 }
 
+/** Thrown by touch/getAndTouch (issue #825) when the node answered `En` to
+ * the `t` command: a node that predates it does not know the command and
+ * closes the connection. Every node must be upgraded before a client sends
+ * it; nothing is retried to get past it, since the same node would answer
+ * the same way. */
+export class ServerTooOldError extends NanocachedError {
+  constructor() {
+    super("nanocached: the server does not know the touch command (t) — upgrade every node to a release that includes it");
+    this.name = "ServerTooOldError";
+  }
+}
+
+/** Whether `error` is, or was caused by, the node's `En` (issue #825): a
+ * sent request that fails because the connection was poisoned arrives
+ * wrapped in a `ConnectionLostError`, with the original as its `cause`. */
+export function wasRejectedByServer(error: unknown): boolean {
+  for (let current: unknown = error, depth = 0; current instanceof Error && depth < 8; current = current.cause, depth++) {
+    if (current instanceof ServerRejectedError) return true;
+  }
+  return false;
+}
+
 /** Thrown by incr/decr (issue #129) when the key exists but its stored
  * value isn't INCR's counter grammar, or applying `<delta>` would overflow
  * the representable range — the server answers `T` for either case, since
@@ -299,6 +322,32 @@ export class Connection {
    * see `encodeGet`. */
   async get(key: string | Uint8Array, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<Buffer | null> {
     const response = await this.send((tag) => encodeGet(toBytes(key), tag, namespace));
+    // A `V` carrying a TTL only ever answers a get-and-touch; one answering
+    // a plain get means the streams are misaligned.
+    if (response.kind === "value" && response.ttlSeconds === undefined) return response.value ?? Buffer.alloc(0);
+    if (response.kind === "notFound") return null;
+    if (response.kind === "wrongNode") throw new WrongNodeError();
+    throw this.mismatch(response);
+  }
+
+  /** `t` — touch (issue #825): replaces the entry's TTL in place, to this
+   * node only (cluster fan-out to every owner is `NanocachedClient`'s job,
+   * as for `set`). `null` removes the TTL and `0` expires the entry at
+   * once. Returns whether the key existed (`S`); `N` for a missing or
+   * expired key — a touch never creates one. */
+  async touch(key: string | Uint8Array, ttlSeconds: number | null, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<boolean> {
+    const response = await this.send((tag) => encodeTouch(toBytes(key), ttlSeconds, false, tag, namespace));
+    if (response.kind === "stored") return true;
+    if (response.kind === "notFound") return false;
+    if (response.kind === "wrongNode") throw new WrongNodeError();
+    throw this.mismatch(response);
+  }
+
+  /** `t ... G` — get-and-touch (issue #825): replaces the TTL and returns
+   * the raw value, or `null` for a miss. The reply's own TTL field (the
+   * TTL now in effect) is read and dropped: the caller just set it. */
+  async getAndTouch(key: string | Uint8Array, ttlSeconds: number | null, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<Buffer | null> {
+    const response = await this.send((tag) => encodeTouch(toBytes(key), ttlSeconds, true, tag, namespace));
     if (response.kind === "value") return response.value ?? Buffer.alloc(0);
     if (response.kind === "notFound") return null;
     if (response.kind === "wrongNode") throw new WrongNodeError();
@@ -867,6 +916,8 @@ export class Connection {
     const cause = this.lastError;
     if (cause === null) return new ConnectionLostError("nanocached: connection closed");
     if (cause instanceof ConnectionLostError) return cause;
-    return new ConnectionLostError(`nanocached: connection closed: ${cause.message}`);
+    // `cause` rides along (issue #825) so a caller can still tell why the
+    // connection died — touch/getAndTouch look for the node's `En` in it.
+    return new ConnectionLostError(`nanocached: connection closed: ${cause.message}`, { cause });
   }
 }

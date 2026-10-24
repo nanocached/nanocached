@@ -59,6 +59,17 @@ export interface MockNode extends MockServerBase {
   dropAfterIncrOnce(): void;
   /** `dropAfterIncrOnce`'s CAS (`k`) counterpart (issue #225). */
   dropAfterCasOnce(): void;
+  /** Issue #825: applies the next `t` request that finds its key, then
+   * destroys the connection instead of replying — the reply lost after the
+   * node executed it. A touch is idempotent, so the client may resend it
+   * (unlike an `i`; see `dropAfterIncrOnce`). */
+  dropAfterTouchOnce(): void;
+  /** Every `t` (touch, issue #825) this server has received, in receipt
+   * order; `ttl` is `null` when the field was omitted (remove the TTL). */
+  touches(): Array<{ namespace: string; key: string; ttl: number | null; get: boolean }>;
+  /** The TTL (whole seconds) the entry currently has in `namespace`, or
+   * `undefined` when it has none. */
+  ttlOf(key: string, namespace?: string): number | undefined;
   /** Queue a one-off garbage `V` header for the next G request. */
   answerMalformedValueOnce(): void;
   /** Queue a one-off `V <len>` header for the next G request whose length
@@ -325,6 +336,9 @@ export async function startMockNode(
      * #226: refreshNodeList must dial several such nodes concurrently, not
      * one after another). */
     authDelayMs?: number;
+    /** Issue #825: behave like a node that predates `t` — answer it `En\n`
+     * and close, as the real node does for any command it does not know. */
+    withoutTouch?: boolean;
   } = {},
 ): Promise<MockNode> {
   const store = new Map<string, Buffer>();
@@ -386,6 +400,8 @@ export async function startMockNode(
   let dropAfterIncr = 0;
   let incrTtlOverride: string | undefined; // issue #501, see answerIncrTtlOnce
   let dropAfterCas = 0;
+  let dropAfterTouch = 0;
+  const touchLog: Array<{ namespace: string; key: string; ttl: number | null; get: boolean }> = [];
   let clears = 0;
   let failClearReplies = 0;
   let setDelayMs = 0;
@@ -897,6 +913,76 @@ export async function startMockNode(
             break;
           }
 
+          case "t": {
+            // Touch (issue #825): `t <namespace-length> <key-length>
+            // [<ttl>] [G] [<tag>]\n<namespace><key>` — always namespaced,
+            // like `i`. No ttl field removes the TTL; 0 expires the entry
+            // at once.
+            lastCommand = parts[0];
+            const namespaceLength = Number(parts[1]);
+            const keyLength = Number(parts[2]);
+            let tail = parts.slice(3);
+            if (tagged) tail = tail.slice(0, -1);
+            const get = tail[tail.length - 1] === "G";
+            if (get) tail = tail.slice(0, -1);
+            const ttl = tail.length > 0 ? Number(tail[0]) : null;
+            if (buffer.length < bodyStart + namespaceLength + keyLength) return;
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            const key = buffer.subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength).toString("utf8");
+            buffer = buffer.subarray(bodyStart + namespaceLength + keyLength);
+            touchLog.push({ namespace: namespace.toString("utf8"), key, ttl, get });
+
+            if (options.withoutTouch) {
+              socket.write("En\n");
+              socket.end();
+              return;
+            }
+
+            if (silent) break;
+
+            if (retryableReplies > 0) {
+              retryableReplies--;
+              socket.write(`R${tag}\n`);
+              break;
+            }
+
+            if (wrongNodeReplies > 0) {
+              wrongNodeReplies--;
+              socket.write(`W${tag}\n`);
+              break;
+            }
+
+            const targetStore = storeFor(namespace);
+            const existing = targetStore.get(key);
+            if (existing === undefined) {
+              socket.write(`N${tag}\n`);
+              break;
+            }
+
+            if (ttl === 0) {
+              targetStore.delete(key);
+              ttlsFor(namespace).delete(key);
+            } else if (ttl === null) {
+              ttlsFor(namespace).delete(key);
+            } else {
+              ttlsFor(namespace).set(key, ttl);
+            }
+
+            if (dropAfterTouch > 0) {
+              dropAfterTouch--;
+              socket.destroy();
+              break;
+            }
+
+            if (get) {
+              const ttlField = ttl === null ? "" : ` ${ttl}`;
+              socket.write(Buffer.concat([Buffer.from(`V ${existing.length}${ttlField}${tag}\n`), existing]));
+            } else {
+              socket.write(`S${tag}\n`);
+            }
+            break;
+          }
+
           case "k": {
             // Compare-and-set (issue #141): `k <namespace-length>
             // <key-length> <value-length> <cond> [<ttl-seconds>]
@@ -1114,6 +1200,11 @@ export async function startMockNode(
     dropAfterCasOnce: () => {
       dropAfterCas++;
     },
+    dropAfterTouchOnce: () => {
+      dropAfterTouch++;
+    },
+    touches: () => [...touchLog],
+    ttlOf: (key, namespace = "") => ttlsFor(Buffer.from(namespace, "utf8")).get(key),
     answerMalformedValueOnce: () => {
       malformedValueReplies++;
     },

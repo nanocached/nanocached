@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
-import { Connection, ConnectionLostError, CounterOutOfRangeError, isConnectionError, WrongNodeError } from "./connection.js";
+import { Connection, ConnectionLostError, CounterOutOfRangeError, isConnectionError, wasRejectedByServer, WrongNodeError } from "./connection.js";
+import { ServerTooOldError } from "./connection.js";
 import { connectAndIdentify, connectAndListProxies, type DiscoveredNode } from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue, DecompressionError, maxMultiGetDecompressedBytes } from "./compression.js";
@@ -9,6 +10,7 @@ import { NanocachedError } from "./errors.js";
 import {
   checkKey,
   checkKeyAndValue,
+  checkTouchTtl,
   contentDigest,
   EMPTY_NAMESPACE,
   MAX_REQUEST_BYTES,
@@ -21,7 +23,7 @@ import {
   type MultiEntry,
 } from "./protocol.js";
 
-export { ConnectionLostError, CounterOutOfRangeError, NotNumericError, RetryableError, WrongNodeError } from "./connection.js";
+export { ConnectionLostError, CounterOutOfRangeError, NotNumericError, RetryableError, ServerTooOldError, WrongNodeError } from "./connection.js";
 export { NanocachedError } from "./errors.js";
 export { DecompressionError } from "./compression.js";
 export { contentDigest } from "./protocol.js";
@@ -629,6 +631,9 @@ interface NamespaceOps {
   replaceIfPresent(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<boolean>;
   replace(key: string | Uint8Array, token: string, newValue: string | Uint8Array, ttlSeconds: number): Promise<boolean>;
   deleteIfMatches(key: string | Uint8Array, token: string): Promise<boolean>;
+  touch(key: string | Uint8Array, ttlSeconds: number | null): Promise<boolean>;
+  getAndTouch(key: string | Uint8Array, ttlSeconds: number | null): Promise<string | null>;
+  getAndTouchBytes(key: string | Uint8Array, ttlSeconds: number | null): Promise<Buffer | null>;
 }
 
 /**
@@ -735,6 +740,21 @@ export class NanocachedNamespace {
   /** See `NanocachedClient.deleteIfMatches`. */
   deleteIfMatches(key: string | Uint8Array, token: string): Promise<boolean> {
     return this.ops.deleteIfMatches(key, token);
+  }
+
+  /** See `NanocachedClient.touch`. */
+  touch(key: string | Uint8Array, ttlSeconds: number | null): Promise<boolean> {
+    return this.ops.touch(key, ttlSeconds);
+  }
+
+  /** See `NanocachedClient.getAndTouch`. */
+  getAndTouch(key: string | Uint8Array, ttlSeconds: number | null): Promise<string | null> {
+    return this.ops.getAndTouch(key, ttlSeconds);
+  }
+
+  /** See `NanocachedClient.getAndTouchBytes`. */
+  getAndTouchBytes(key: string | Uint8Array, ttlSeconds: number | null): Promise<Buffer | null> {
+    return this.ops.getAndTouchBytes(key, ttlSeconds);
   }
 }
 
@@ -1393,6 +1413,45 @@ export class NanocachedClient {
     return this.deleteInNamespace(EMPTY_NAMESPACE, key);
   }
 
+  /** Replaces the TTL of an existing entry in place, without rewriting
+   * its value (issue #825). Resolves whether the key existed: `false` for a
+   * missing or expired key, which a touch never creates. `ttlSeconds` is
+   * counted from the moment the node receives the request and has **no
+   * default** — `null` removes the TTL (the entry never expires) and `0`
+   * expires the entry at once, the opposite of `set`, where 0 means no
+   * expiry. A negative or non-integer value is rejected with a
+   * `RangeError` before any I/O, as is omitting it.
+   *
+   * Unlike `incr` and the compare-and-set family a touch is idempotent, so
+   * a request whose reply was lost is retried like `get`/`set`/`delete`
+   * are, never thrown as `ConnectionLostError`. In a cluster it goes to
+   * every owner, like a `set`, and the primary's answer is returned.
+   * Throws `ServerTooOldError` against a node that predates the command. */
+  async touch(key: string | Uint8Array, ttlSeconds: number | null): Promise<boolean> {
+    return this.touchInNamespace(EMPTY_NAMESPACE, key, ttlSeconds);
+  }
+
+  /** Reads a value and replaces its TTL in one step (issue #825); `null` on
+   * a miss, which creates nothing. See `touch` for `ttlSeconds` (no
+   * default; `null` removes the TTL, `0` expires the entry at once).
+   * Strictly UTF-8 decoded like `get`.
+   *
+   * A read that writes: it goes to the key's primary like a write (one
+   * refresh and retry on a wrong-node answer or a connection failure; no
+   * hedging, and no fallback to a replica on a miss) and the other owners
+   * are sent the plain touch, so a replica is never the only owner touched.
+   * It counts as a read on the primary, which makes the entry the most
+   * recently used. */
+  async getAndTouch(key: string | Uint8Array, ttlSeconds: number | null): Promise<string | null> {
+    return this.getAndTouchInNamespace(EMPTY_NAMESPACE, key, ttlSeconds);
+  }
+
+  /** The raw-bytes companion to `getAndTouch`: no decoding. Transparently
+   * decompresses when `compress` is enabled. */
+  async getAndTouchBytes(key: string | Uint8Array, ttlSeconds: number | null): Promise<Buffer | null> {
+    return this.getAndTouchBytesInNamespace(EMPTY_NAMESPACE, key, ttlSeconds);
+  }
+
   /** Atomically adds `delta` (signed, default 1) to `key`'s stored
    * counter and returns the new value — `null` if the key is missing or
    * expired, matching `get`'s own miss convention. Throws
@@ -1535,6 +1594,53 @@ export class NanocachedClient {
         ? this.writeToOwners(key, namespace, (connection) => connection.delete(key, namespace))
         : this.connectionForSingleTarget().then((connection) => connection.delete(key, namespace)),
     );
+  }
+
+  private async touchInNamespace(namespace: Uint8Array, key: string | Uint8Array, ttlSeconds: number | null): Promise<boolean> {
+    if (this.closed) throw new AlreadyClosedError();
+    checkTouchTtl(ttlSeconds);
+    checkKey(typeof key === "string" ? Buffer.from(key, "utf8") : key, namespace);
+    await this.maybeRefreshNodeList();
+    try {
+      return await this.withWrongNodeRetry(() =>
+        this.target.kind === "cluster"
+          ? this.writeToOwners(key, namespace, (connection) => connection.touch(key, ttlSeconds, namespace))
+          : this.connectionForSingleTarget().then((connection) => connection.touch(key, ttlSeconds, namespace)),
+      );
+    } catch (error) {
+      if (wasRejectedByServer(error)) throw new ServerTooOldError();
+      throw error;
+    }
+  }
+
+  private async getAndTouchInNamespace(namespace: Uint8Array, key: string | Uint8Array, ttlSeconds: number | null): Promise<string | null> {
+    const value = await this.getAndTouchBytesInNamespace(namespace, key, ttlSeconds);
+    return value === null ? null : UTF8_DECODER.decode(value);
+  }
+
+  private async getAndTouchBytesInNamespace(namespace: Uint8Array, key: string | Uint8Array, ttlSeconds: number | null): Promise<Buffer | null> {
+    if (this.closed) throw new AlreadyClosedError();
+    checkTouchTtl(ttlSeconds);
+    checkKey(typeof key === "string" ? Buffer.from(key, "utf8") : key, namespace);
+    await this.maybeRefreshNodeList();
+    let value: Buffer | null;
+    try {
+      value = await this.withWrongNodeRetry(() =>
+        this.target.kind === "cluster"
+          ? this.writeToOwners(
+              key,
+              namespace,
+              (connection) => connection.getAndTouch(key, ttlSeconds, namespace),
+              (connection) => connection.touch(key, ttlSeconds, namespace),
+            )
+          : this.connectionForSingleTarget().then((connection) => connection.getAndTouch(key, ttlSeconds, namespace)),
+      );
+    } catch (error) {
+      if (wasRejectedByServer(error)) throw new ServerTooOldError();
+      throw error;
+    }
+    if (value === null || !this.compress) return value;
+    return decompressValue(value);
   }
 
   // ── batched get/set (issues #128/#150/#151) ────────────────────────
@@ -2370,6 +2476,9 @@ export class NanocachedClient {
       replaceIfPresent: (key, value, ttlSeconds) => this.casInNamespace(namespaceBytes, key, value, { kind: "present" }, ttlSeconds),
       replace: (key, token, newValue, ttlSeconds) => this.casInNamespace(namespaceBytes, key, newValue, { kind: "digest", digest: token }, ttlSeconds),
       deleteIfMatches: (key, token) => this.casDeleteInNamespace(namespaceBytes, key, token),
+      touch: (key, ttlSeconds) => this.touchInNamespace(namespaceBytes, key, ttlSeconds),
+      getAndTouch: (key, ttlSeconds) => this.getAndTouchInNamespace(namespaceBytes, key, ttlSeconds),
+      getAndTouchBytes: (key, ttlSeconds) => this.getAndTouchBytesInNamespace(namespaceBytes, key, ttlSeconds),
     });
   }
 
@@ -2583,6 +2692,10 @@ export class NanocachedClient {
     key: string | Uint8Array,
     namespace: Uint8Array,
     op: (connection: Connection) => Promise<T>,
+    /** What the non-primary owners are sent when it differs from the
+     * primary's `op` (issue #825): a get-and-touch asks only the primary
+     * for the value. */
+    replicaOp: (connection: Connection) => Promise<unknown> = op,
   ): Promise<T> {
     const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
     if (primaryName === undefined) {
@@ -2592,7 +2705,7 @@ export class NanocachedClient {
     const replicaWrite = async (name: string): Promise<void> => {
       try {
         const connection = await this.memberConnection(name);
-        await op(connection);
+        await replicaOp(connection);
       } catch (error) {
         // Swallowed by design — see the doc comment. Counted in
         // stats().replicaWriteFailures, whether this leg ran

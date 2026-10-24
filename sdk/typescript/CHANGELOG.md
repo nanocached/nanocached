@@ -9,6 +9,20 @@ tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Added
+
+- `touch(key, ttlSeconds)` replaces an entry's TTL in place and resolves
+  whether the key existed; `getAndTouch(key, ttlSeconds)` and
+  `getAndTouchBytes` read the value and replace the TTL in one step. All
+  three are on `NanocachedNamespace` too. `ttlSeconds` has no default:
+  `null` removes the TTL and `0` expires the entry at once (the opposite of
+  `set`, where `0` means no expiry); omitting it throws a `RangeError`. They
+  are idempotent, so unlike `incr` and the compare-and-set family a lost
+  reply is retried; they go to every owner (`getAndTouch` asks only the
+  primary for the value). Against a node that predates the command they
+  throw the new `ServerTooOldError`. Needs a server release that includes
+  the `t` command.
+
 ### Changed
 
 - `set` and the compare-and-set writes no longer copy a `Uint8Array` or
