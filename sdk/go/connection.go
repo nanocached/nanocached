@@ -217,8 +217,60 @@ func (c *connection) get(key []byte) ([]byte, bool, error) {
 // The response markers (V/N/W) are identical either way — namespaced
 // commands answer exactly like their uppercase counterparts.
 func (c *connection) getNS(namespace, key []byte) ([]byte, bool, error) {
-	marker, value, _, _, err := c.request(func(tag uint32) []byte {
+	marker, value, ttl, _, err := c.request(func(tag uint32) []byte {
 		return appendGetFrame(namespace, key, c.tagged, tag)
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	switch marker {
+	case 'V':
+		// A `V` carrying a TTL only ever answers a get-and-touch; one
+		// answering a plain get means the streams are misaligned.
+		if ttl >= 0 {
+			return nil, false, c.mismatch(marker)
+		}
+		return value, true, nil
+	case 'N':
+		return nil, false, nil
+	case 'W':
+		return nil, false, ErrWrongNode
+	default:
+		return nil, false, c.mismatch(marker)
+	}
+}
+
+// touchNS sends the `t` frame (issue #825) to this node only — cluster
+// fan-out to every owner is the client's job, as for a set. Always
+// namespaced, like `i`. ttlSeconds -1 omits the TTL field (the node removes
+// the TTL); N >= 0 is sent, and 0 expires the entry at once — unlike
+// setNS, where 0 means no expiry. Returns whether the key existed (`S`);
+// `N` for a missing or expired key — a touch never creates one.
+func (c *connection) touchNS(namespace, key []byte, ttlSeconds int64) (bool, error) {
+	marker, _, _, _, err := c.request(func(tag uint32) []byte {
+		return appendTouchFrame(namespace, key, ttlSeconds, false, c.tagged, tag)
+	})
+	if err != nil {
+		return false, err
+	}
+	switch marker {
+	case 'S':
+		return true, nil
+	case 'N':
+		return false, nil
+	case 'W':
+		return false, ErrWrongNode
+	default:
+		return false, c.mismatch(marker)
+	}
+}
+
+// getAndTouchNS sends `t ... G` (issue #825): replaces the entry's TTL and
+// returns its raw value. The reply's own TTL field (the TTL now in effect)
+// is read and dropped — the caller just set it.
+func (c *connection) getAndTouchNS(namespace, key []byte, ttlSeconds int64) ([]byte, bool, error) {
+	marker, value, _, _, err := c.request(func(tag uint32) []byte {
+		return appendTouchFrame(namespace, key, ttlSeconds, true, c.tagged, tag)
 	})
 	if err != nil {
 		return nil, false, err
@@ -233,6 +285,25 @@ func (c *connection) getNS(namespace, key []byte) ([]byte, bool, error) {
 	default:
 		return nil, false, c.mismatch(marker)
 	}
+}
+
+// appendTouchFrame builds a `t` request frame: `t <ns-len> <key-len>
+// [<ttl>][ G][ <tag>]\n<ns><key>`. ttlSeconds < 0 omits the TTL field.
+func appendTouchFrame(namespace, key []byte, ttlSeconds int64, get bool, tagged bool, tag uint32) []byte {
+	frame := append([]byte("t "), strconv.AppendInt(nil, int64(len(namespace)), 10)...)
+	frame = append(frame, ' ')
+	frame = strconv.AppendInt(frame, int64(len(key)), 10)
+	if ttlSeconds >= 0 {
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, ttlSeconds, 10)
+	}
+	if get {
+		frame = append(frame, " G"...)
+	}
+	frame = appendTagField(frame, tagged, tag)
+	frame = append(frame, '\n')
+	frame = append(frame, namespace...)
+	return append(frame, key...)
 }
 
 // appendGetFrame builds a G/g request frame. An empty namespace emits
@@ -944,14 +1015,24 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		}
 		// Untagged wire: `V <len>\n`. Tagged: `V <len> <seq>\n`
 		// (echoed response tags). After the marker byte the header still
-		// carries the leading space.
+		// carries the leading space. A get-and-touch's reply (issue #825)
+		// adds `I`'s optional TTL between them, told apart by field count
+		// for the connection's mode.
 		fields := strings.Fields(header)
-		wantFields := 1
+		minFields := 1
 		if c.tagged {
-			wantFields = 2
+			minFields = 2
 		}
-		if len(fields) != wantFields {
+		if len(fields) != minFields && len(fields) != minFields+1 {
 			return 0, nil, 0, 0, nil, protocolError("invalid value header in response")
+		}
+		valueTTL := int64(-1) // no TTL field
+		if len(fields) == minFields+1 {
+			var ttlErr error
+			valueTTL, ttlErr = parseStrictInt64(fields[1])
+			if ttlErr != nil || valueTTL < 0 {
+				return 0, nil, 0, 0, nil, protocolError("invalid value ttl in response")
+			}
 		}
 		// Lengths beyond the server's own 1 MiB request cap are protocol
 		// garbage — reject before allocating.
@@ -961,7 +1042,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		}
 		var responseTag uint32
 		if c.tagged {
-			responseTag, err = parseTag(fields[1])
+			responseTag, err = parseTag(fields[len(fields)-1])
 			if err != nil {
 				return 0, nil, 0, 0, nil, err
 			}
@@ -970,7 +1051,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		if _, err := readFull(c.reader, value); err != nil {
 			return 0, nil, 0, 0, nil, err
 		}
-		return marker, value, responseTag, 0, nil, nil
+		return marker, value, responseTag, valueTTL, nil, nil
 	// `I` is INCR's success response (issue #129): `I <value-length>
 	// [<ttl-seconds>] [<tag>]\n<value>` — the same "trailing optional
 	// field(s), tagged-mode-aware" shape S's own request-side [ttl] [tag]
@@ -1181,6 +1262,14 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 			return 0, nil, 0, 0, nil, err
 		}
 		return marker, nil, responseTag, 0, nil, nil
+	// `En\n`: the node rejected the request and is closing the connection
+	// (a command it does not know, one too large or malformed). Marked so a
+	// touch can report ErrServerTooOld (issue #825); an ErrProtocol like
+	// any other unexpected marker for everything else.
+	case 'E':
+		_, _ = readLine(c.reader) // the rest of `En\n`, if it arrives
+		return 0, nil, 0, 0, nil, errors.Join(
+			protocolError(fmt.Sprintf("unexpected response from server: %c", marker)), errServerRejected)
 	default:
 		return 0, nil, 0, 0, nil, protocolError(fmt.Sprintf("unexpected response from server: %c", marker))
 	}

@@ -194,7 +194,32 @@ type mockNode struct {
 	// propagates instead of being transparently retried away.
 	closeAfterMFrames atomic.Int32
 	closeAfterOFrames atomic.Int32
+	// touches records every `t` (touch, issue #825) this node received, in
+	// arrival order — which legs were sent `G`, and which TTL.
+	touchesMu sync.Mutex
+	touches   []touchRecord
+	// applyThenCloseTouchLeft: the next N `t` requests that find their key
+	// are applied, then the connection is closed instead of a reply — the
+	// reply lost after the node executed it. A touch is idempotent, so the
+	// client resends it (unlike an `i`; see applyThenCloseLeft).
+	applyThenCloseTouchLeft atomic.Int32
 }
+
+// touchRecord is one `t` frame as a mock node saw it. ttl is -1 when the
+// field was omitted (remove the TTL).
+type touchRecord struct {
+	ns, key string
+	ttl     int64
+	get     bool
+}
+
+func (m *mockNode) touchesSeen() []touchRecord {
+	m.touchesMu.Lock()
+	defer m.touchesMu.Unlock()
+	return append([]touchRecord(nil), m.touches...)
+}
+
+func (m *mockNode) applyThenCloseTouchTimes(n int32) { m.applyThenCloseTouchLeft.Add(n) }
 
 // mockNodeOpts configures a startMockNode server's echoed response tags
 // (response tags) behavior. Immutable for the server's whole lifetime —
@@ -219,6 +244,10 @@ type mockNodeOpts struct {
 	// (`A <len> T R` -> `A <len> T`) in isolation, without also falling
 	// all the way back to the untagged form.
 	closeOnRetryableCapability bool
+	// withoutTouch (issue #825): behave like a node that predates `t` —
+	// answer it `En\n` and close, as the real node does for any command it
+	// does not know.
+	withoutTouch bool
 }
 
 // delaySets makes every future S reply from this node wait d first — for
@@ -1064,6 +1093,85 @@ func (m *mockNode) serve(conn net.Conn) {
 				reply = "D" + tagSuffix + "\n"
 			}
 			if _, err := conn.Write([]byte(reply)); err != nil {
+				return
+			}
+		// Touch (issue #825): `t <ns-len> <key-len> [<ttl>] [G] [<tag>]\n
+		// <ns><key>` — always namespaced, like `i`. No ttl field removes
+		// the TTL; 0 expires the entry at once. Answers `S`, or with `G`
+		// `V <len>[ <ttl>][ <tag>]\n<value>`; `N` for a missing key.
+		case "t":
+			nsLen := atoiOrPanic(parts[1])
+			keyLen := atoiOrPanic(parts[2])
+			tail := parts[3:]
+			if tagged {
+				tail = tail[:len(tail)-1]
+			}
+			get := len(tail) > 0 && tail[len(tail)-1] == "G"
+			if get {
+				tail = tail[:len(tail)-1]
+			}
+			ttl := int64(-1)
+			if len(tail) > 0 {
+				ttl = int64(atoiOrPanic(tail[0]))
+			}
+			namespace := string(mustRead(reader, nsLen))
+			key := string(mustRead(reader, keyLen))
+			m.touchesMu.Lock()
+			m.touches = append(m.touches, touchRecord{namespace, key, ttl, get})
+			m.touchesMu.Unlock()
+			if m.opts.withoutTouch {
+				_, _ = conn.Write([]byte("En\n"))
+				return
+			}
+			if m.silent.Load() {
+				continue
+			}
+			m.dataRequestCount.Add(1)
+			if m.takeOne(&m.retryableLeft) {
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			if m.takeWrongNode() {
+				if _, err := conn.Write([]byte("W" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			sk := storeKey{namespace, key}
+			existing, found := m.store.Load(sk)
+			if !found {
+				if _, err := conn.Write([]byte("N" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			switch {
+			case ttl == 0:
+				m.store.Delete(sk)
+				m.ttls.Delete(sk)
+			case ttl < 0:
+				m.ttls.Delete(sk)
+			default:
+				m.ttls.Store(sk, ttl)
+			}
+			if m.takeOne(&m.applyThenCloseTouchLeft) {
+				return
+			}
+			if get {
+				ttlField := ""
+				if ttl >= 0 {
+					ttlField = fmt.Sprintf(" %d", ttl)
+				}
+				value := existing.([]byte)
+				reply := append([]byte(fmt.Sprintf("V %d%s%s\n", len(value), ttlField, tagSuffix)), value...)
+				if _, err := conn.Write(reply); err != nil {
+					return
+				}
+				continue
+			}
+			if _, err := conn.Write([]byte("S" + tagSuffix + "\n")); err != nil {
 				return
 			}
 		case "D":
