@@ -1035,6 +1035,31 @@ pub(crate) struct HeartbeatConfig {
     pub(crate) tls_connector: Option<TlsConnector>,
 }
 
+/// A shutdown request: resolves when the process is asked to stop.
+pub(crate) type ShutdownSignal = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
+
+/// What `run` takes from its caller instead of from the process, so a test
+/// can run several nodes in one process (see `sim.rs`): when each of them is
+/// asked to stop, and the name it registers under. The binary uses the
+/// default: the process's own termination signals and a random name.
+pub(crate) struct RunHooks {
+    /// Called for the first signal and again each time one is taken (a
+    /// second signal while draining overrides the drain, issue #407), so it
+    /// returns a fresh future every call.
+    pub(crate) shutdown: Box<dyn FnMut() -> ShutdownSignal + Send>,
+    /// The name this node registers with discovery; random when `None`.
+    pub(crate) node_name: Option<String>,
+}
+
+impl Default for RunHooks {
+    fn default() -> Self {
+        Self {
+            shutdown: Box::new(|| Box::pin(shutdown_signal())),
+            node_name: None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     address: &str,
@@ -1046,6 +1071,34 @@ pub(crate) async fn run(
     drain_timeout: Duration,
     limits: ConnectionLimits,
     namespace_budgets: Vec<(Bytes, usize)>,
+) -> io::Result<()> {
+    run_with_hooks(
+        address,
+        heartbeat,
+        auth_secret,
+        tls_acceptor,
+        max_memory_bytes,
+        metrics_address,
+        drain_timeout,
+        limits,
+        namespace_budgets,
+        RunHooks::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_hooks(
+    address: &str,
+    heartbeat: Option<HeartbeatConfig>,
+    auth_secret: Option<Bytes>,
+    tls_acceptor: Option<TlsAcceptor>,
+    max_memory_bytes: usize,
+    metrics_address: Option<String>,
+    drain_timeout: Duration,
+    limits: ConnectionLimits,
+    namespace_budgets: Vec<(Bytes, usize)>,
+    mut hooks: RunHooks,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
     infra::warn_if_exposed_without_secret(
@@ -1087,8 +1140,11 @@ pub(crate) async fn run(
     // there's nothing a stable name would preserve across a restart that
     // isn't already lost anyway. Only meaningful when this node registers
     // with a discovery server at all.
+    let mut node_name = hooks.node_name.take();
     let node_context = heartbeat.as_ref().map(|config| NodeContext {
-        name: Uuid::new_v4().to_string(),
+        name: node_name
+            .take()
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
         // A second, independent UUID: the name is public (`L` lists it),
         // so it can't double as the credential proving this node is the
         // one behind it (issue #34).
@@ -1214,8 +1270,7 @@ pub(crate) async fn run(
     // resolves, and re-polling a completed future is not something the
     // `Future` contract allows, so "listening again" means installing a
     // fresh one, not reusing this one.
-    let mut shutdown: Pin<Box<dyn Future<Output = io::Result<()>> + Send>> =
-        Box::pin(shutdown_signal());
+    let mut shutdown: Pin<Box<dyn Future<Output = io::Result<()>> + Send>> = (hooks.shutdown)();
 
     // Issue #124: set once the decommission has been spawned; its
     // completion signal re-enters the loop below to run the ordinary
@@ -1324,7 +1379,7 @@ pub(crate) async fn run(
                     // Issue #407: re-arm so a second signal during the
                     // drain is still noticed (see the boxed `shutdown`'s
                     // own doc comment above).
-                    shutdown = Box::pin(shutdown_signal());
+                    shutdown = (hooks.shutdown)();
                     continue;
                 }
 
