@@ -14,6 +14,17 @@ framework adapters at one version, whether or not a component changed.
 
 ### Added
 
+- `nanocached-node`: the `t` command refreshes or removes an entry's TTL in
+  place, without rewriting its value, and with `G` also returns the value
+  (`V <len> [<ttl>]`) and counts as a read. `t <ns-len> <key-len> [ttl] [G]`:
+  the TTL counts from receipt, `0` expires the entry at once, and omitting
+  it removes the TTL; a missing or expired key answers `N` and is never
+  created. Unlike `i`/`k`/`x` it is not primary-only: it is idempotent, so
+  every owner of the key accepts it. During a join or a decommission it is
+  forwarded to the joiner or the entrant as the value with its new TTL, like
+  a set. A node older than this release answers `En` and closes the
+  connection, so upgrade every node before a client sends it. No SDK,
+  adapter or the proxy uses it yet.
 - `nanocached-node`, `nanocached-discovery` and `nanocached-proxy` print a
   one-line `WARN` at startup when they listen on an address that is not
   loopback and `NANOCACHED_AUTH_SECRET` is unset or empty: anyone who can

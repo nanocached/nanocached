@@ -130,6 +130,17 @@ pub enum Response {
     /// TTL rounds down to whole seconds, same as every other TTL this
     /// protocol forwards.
     Incremented(Bytes, Option<Duration>),
+    /// In answer to `Touch` (issue #823): the value of the entry whose
+    /// expiry was just replaced, plus the TTL now in effect (`None`: it
+    /// never expires). Wire form, for the `G` (get-and-touch) request:
+    /// `V <value-length> [ttl-seconds] [tag]\n<value>` — a `V` like a
+    /// read's, with `Incremented`'s optional TTL field in the same
+    /// position and disambiguated the same way, by the connection's
+    /// already-known tagged-or-not mode. A touch without `G` answers a
+    /// bare `S`: the connection handler maps this to `Stored` for it, and
+    /// uses the value only to forward the touch's result to a joiner or an
+    /// entrant (see `ForwardedResult`).
+    Touched(Bytes, Option<Duration>),
     /// In answer to `Incr` (issue #129) when the key exists but its
     /// stored value isn't INCR's decimal-ASCII `i64` grammar, or applying
     /// `delta` would overflow `i64`. Deliberately distinct from
@@ -267,6 +278,16 @@ impl Response {
                 encoded
             }
 
+            Self::Touched(value, ttl) => {
+                let header = format!("V {}{}\n", value.len(), ttl_field(*ttl));
+
+                let mut encoded = Vec::with_capacity(header.len() + value.len());
+                encoded.extend_from_slice(header.as_bytes());
+                encoded.extend_from_slice(value);
+
+                encoded
+            }
+
             Self::Multi(entries) => encode_multi(entries, None),
             Self::MultiAck(entries) => encode_multi_ack(entries, None),
 
@@ -319,6 +340,16 @@ impl Response {
                 encoded
             }
 
+            Self::Touched(value, ttl) => {
+                let header = format!("V {}{} {tag}\n", value.len(), ttl_field(*ttl));
+
+                let mut encoded = Vec::with_capacity(header.len() + value.len());
+                encoded.extend_from_slice(header.as_bytes());
+                encoded.extend_from_slice(value);
+
+                encoded
+            }
+
             Self::Multi(entries) => encode_multi(entries, Some(tag)),
             Self::MultiAck(entries) => encode_multi_ack(entries, Some(tag)),
 
@@ -331,7 +362,7 @@ impl Response {
             Self::MigrationRejected => format!("R {tag}\n").into_bytes(),
 
             _ => unreachable!(
-                "only G/S/D/i/m/o/c/F/k/x responses and a rejected U/u have a tagged form \
+                "only G/S/D/i/t/m/o/c/F/k/x responses and a rejected U/u have a tagged form \
                  (echoed response tags)"
             ),
         }
@@ -455,6 +486,23 @@ mod tests {
             Response::Incremented(Bytes::from_static(b"11"), Some(Duration::from_millis(1500)));
 
         assert_eq!(response.encode(), b"I 2 1\n11");
+    }
+
+    #[test]
+    fn encodes_touched_response_as_a_value_with_an_optional_ttl() {
+        let without = Response::Touched(Bytes::from_static(b"Alice"), None);
+        assert_eq!(without.encode(), b"V 5\nAlice");
+        assert_eq!(without.encode_with_tag(4), b"V 5 4\nAlice");
+
+        let with = Response::Touched(Bytes::from_static(b"Alice"), Some(Duration::from_secs(60)));
+        assert_eq!(with.encode(), b"V 5 60\nAlice");
+        assert_eq!(with.encode_with_tag(4), b"V 5 60 4\nAlice");
+
+        let sub_second = Response::Touched(
+            Bytes::from_static(b"Alice"),
+            Some(Duration::from_millis(1500)),
+        );
+        assert_eq!(sub_second.encode(), b"V 5 1\nAlice");
     }
 
     #[test]
