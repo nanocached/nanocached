@@ -300,6 +300,40 @@ whether the write actually happened is unknown — check with a subsequent
 before the call reached it is retried, since nothing could have been
 applied yet.
 
+## Touch and get_and_touch
+
+`touch` replaces an entry's TTL in place, without rewriting its value, and
+returns whether the key existed. `get_and_touch` (and `get_and_touch_bytes`)
+reads the value and replaces the TTL in one step:
+
+```rust
+client.set("session", "abc", 60).await?;
+assert!(client.touch("session", Some(300)).await?);   // now expires in 300 s
+assert!(client.touch("session", None).await?);        // never expires
+assert_eq!(client.get_and_touch("session", Some(300)).await?, Some("abc".to_string()));
+assert!(client.touch("session", Some(0)).await?);     // expires at once
+assert!(!client.touch("missing", Some(30)).await?);   // a touch never creates a key
+```
+
+`ttl_seconds` is a required `Option<u64>` with no default, and it is not
+`set`'s: `None` removes the TTL and `Some(0)` expires the entry at once,
+which is the opposite of `set`, where `0` means no expiry. A miss is
+`false` for `touch` and `None` for `get_and_touch`. `client.namespace(ns)`
+handles have all three.
+
+A touch never changes the value, so it cannot overwrite a write that lands
+at the same time. Unlike `incr` and the compare-and-set family it is
+idempotent: it goes to every owner of the key like a `set`, and a request
+whose reply was lost is retried like `get`/`set`/`delete`, never returned
+as `Error::ConnectionLost`. `get_and_touch` is a read that writes, so it
+goes to the primary like a write (one refresh and retry on a wrong-node
+answer or a connection failure; no hedging, and no fallback to a replica
+on a miss) and the other owners are sent the plain touch.
+
+Against a node older than the release that added the command, both return
+`Error::ServerTooOld`: such a node answers `En` and closes the connection.
+Upgrade every node before using them.
+
 ## Namespaces
 
 A namespace is a flat, opaque byte string that scopes a key: the same

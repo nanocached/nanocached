@@ -214,6 +214,12 @@ pub(crate) enum ResponseKind {
     /// [`ResponseKind::NotFound`] and [`Error::NotNumeric`] respectively,
     /// not as variants here — see `Connection::incr`.
     Incr(i64, Option<u64>),
+    /// `V <len> <ttl>` — issue #825's get-and-touch reply: the value, with
+    /// the TTL now in effect (not surfaced). A plain `get` is never
+    /// answered this way, so `get` treats it as a desync; `get_and_touch`
+    /// accepts it as well as a bare [`ResponseKind::Value`] (no TTL left
+    /// on the entry).
+    TouchedValue(Vec<u8>),
     /// `M` (multi-get) or `O` (multi-set) — issue #151,
     /// docs/protocol.html#multi. One entry per requested key, in request
     /// order; see [`MultiEntry`].
@@ -451,6 +457,63 @@ impl Connection {
             ResponseKind::Value(value) => Ok(Some(value)),
             ResponseKind::NotFound => Ok(None),
             other => Err(self.mismatch(&other)),
+        }
+    }
+
+    /// Sends `t` (issue #825) to this one node only: replaces the TTL of
+    /// the entry at (`namespace`, `key`) without rewriting its value and
+    /// returns whether the key existed (`false` on a miss, which a touch
+    /// never creates). `ttl_seconds` counts from the node's receipt of
+    /// the request: `None` removes the TTL, `Some(0)` expires the entry at
+    /// once. Like `incr`, `t` has no legacy uppercase form. Unlike it, a
+    /// touch is idempotent and not primary-only — this talks to the ONE
+    /// node this connection is dialed to, and [`crate::client::NanocachedClient`]
+    /// sends it to every owner. A node that predates the command answers
+    /// `En`, which surfaces as [`Error::ServerTooOld`].
+    pub(crate) async fn touch(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        ttl_seconds: Option<u64>,
+    ) -> Result<bool> {
+        match self
+            .request(|tag| encode_touch(namespace, key, ttl_seconds, false, tag))
+            .await
+            .map_err(Self::server_too_old)?
+        {
+            ResponseKind::Stored => Ok(true),
+            ResponseKind::NotFound => Ok(false),
+            other => Err(self.mismatch(&other)),
+        }
+    }
+
+    /// As [`Self::touch`] with the `G` flag: also returns the value
+    /// (`None` on a miss).
+    pub(crate) async fn get_and_touch(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        ttl_seconds: Option<u64>,
+    ) -> Result<Option<Vec<u8>>> {
+        match self
+            .request(|tag| encode_touch(namespace, key, ttl_seconds, true, tag))
+            .await
+            .map_err(Self::server_too_old)?
+        {
+            ResponseKind::TouchedValue(value) | ResponseKind::Value(value) => Ok(Some(value)),
+            ResponseKind::NotFound => Ok(None),
+            other => Err(self.mismatch(&other)),
+        }
+    }
+
+    /// Turns the node's `E` (an unknown command) into
+    /// [`Error::ServerTooOld`], leaving every other error as it was. Only
+    /// the touch methods call this, so every other command keeps
+    /// surfacing the `Protocol` error it always did for an `E`.
+    fn server_too_old(error: Error) -> Error {
+        match error {
+            Error::Protocol(message) if message == SERVER_REJECTED_MESSAGE => Error::ServerTooOld,
+            other => other,
         }
     }
 
@@ -889,6 +952,7 @@ impl Connection {
             ResponseKind::Deleted => "deleted",
             ResponseKind::Cleared => "cleared",
             ResponseKind::Incr(_, _) => "incr",
+            ResponseKind::TouchedValue(_) => "touched-value",
             ResponseKind::Multi(_) => "multi",
         };
         self.close();
@@ -1036,6 +1100,35 @@ fn encode_incr(namespace: &[u8], key: &[u8], delta: i64, tag: Option<u32>) -> Ve
         None => format!("i {} {} {delta}\n", namespace.len(), key.len()),
     }
     .into_bytes();
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame
+}
+
+/// Builds a `t` frame (issue #825): `t <namespace-length> <key-length>
+/// [<ttl-seconds>][ G][ <tag>]\n<namespace><key>` — always namespaced, no
+/// legacy uppercase form, exactly like `encode_incr`. `None` omits the TTL
+/// field (removes the TTL); `Some(0)` is sent, and expires the entry at
+/// once — the opposite of `encode_set`, where 0 means no expiry.
+fn encode_touch(
+    namespace: &[u8],
+    key: &[u8],
+    ttl_seconds: Option<u64>,
+    with_value: bool,
+    tag: Option<u32>,
+) -> Vec<u8> {
+    let mut header = format!("t {} {}", namespace.len(), key.len());
+    if let Some(ttl_seconds) = ttl_seconds {
+        let _ = write!(header, " {ttl_seconds}");
+    }
+    if with_value {
+        header.push_str(" G");
+    }
+    if let Some(tag) = tag {
+        let _ = write!(header, " {tag}");
+    }
+    header.push('\n');
+    let mut frame = header.into_bytes();
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
     frame
@@ -1403,18 +1496,24 @@ async fn read_one_response(
             let header = header.trim();
             // Untagged: `V <len>`. Tagged: `V <len> <tag>` (echoed response tags) —
             // the tag rides as a second field on the same header line.
-            let (length_field, tag) = if tagged {
-                let mut fields = header.splitn(2, ' ');
-                match (fields.next(), fields.next()) {
-                    (Some(length), Some(tag)) => (length, Some(parse_tag(tag)?)),
-                    _ => {
-                        return Err(Error::Protocol(
-                            "nanocached: invalid value header in response".to_string(),
-                        ));
-                    }
-                }
-            } else {
-                (header, None)
+            // issue #825: get-and-touch's reply also carries the TTL now in
+            // effect — `V <len> <ttl>`, tagged `V <len> <ttl> <tag>` —
+            // disambiguated by the field count, like `I` below.
+            let fields: Vec<&str> = header.split(' ').collect();
+            let invalid_header =
+                || Error::Protocol("nanocached: invalid value header in response".to_string());
+            let (length_field, ttl_field, tag) = match (tagged, fields.as_slice()) {
+                (false, [length]) => (*length, None, None),
+                (false, [length, ttl]) => (*length, Some(*ttl), None),
+                (true, [length, tag]) => (*length, None, Some(parse_tag(tag)?)),
+                (true, [length, ttl, tag]) => (*length, Some(*ttl), Some(parse_tag(tag)?)),
+                _ => return Err(invalid_header()),
+            };
+            let ttl_seconds = match ttl_field {
+                Some(field) => Some(parse_strict::<u64>(field).ok_or_else(|| {
+                    Error::Protocol("nanocached: invalid ttl in value response".to_string())
+                })?),
+                None => None,
             };
             // The server never stores values above its 1 MiB request
             // limit, so a claimed length beyond MAX_VALUE_LENGTH is a
@@ -1427,7 +1526,7 @@ async fn read_one_response(
                 })?;
             let mut value = vec![0u8; length];
             read_half.read_exact(&mut value).await?;
-            Ok((marker, Some(value), None, tag, None))
+            Ok((marker, Some(value), ttl_seconds, tag, None))
         }
         b'I' => {
             // INCR success (issue #129): `<value-length> [<ttl-seconds>]
@@ -1605,12 +1704,21 @@ async fn read_one_response(
             }
             Ok((marker, None, None, tag, Some(entries)))
         }
+        // issue #825: `En` — a node that does not know the command just
+        // sent. It closes the connection right after; only the touch
+        // methods tell this apart from other garbage (see `server_too_old`).
+        b'E' => Err(Error::Protocol(SERVER_REJECTED_MESSAGE.to_string())),
         other => Err(Error::Protocol(format!(
             "nanocached: unexpected response from server: {}",
             other as char
         ))),
     }
 }
+
+/// The `Protocol` message for a node's `E` — the same text the generic
+/// unknown-marker arm has always produced for that byte, so every command
+/// other than touch keeps surfacing exactly what it did before.
+const SERVER_REJECTED_MESSAGE: &str = "nanocached: unexpected response from server: E";
 
 /// Parses a response's echoed tag (echoed response tags): a `u32` in decimal,
 /// matching the wire width the client itself claims tags from.
@@ -1626,6 +1734,10 @@ impl TryFrom<RawResponse> for ResponseKind {
 
     fn try_from((marker, value, ttl_seconds, entries): RawResponse) -> Result<Self> {
         match marker {
+            // issue #825: a TTL field on `V` marks get-and-touch's reply.
+            b'V' if ttl_seconds.is_some() => {
+                Ok(ResponseKind::TouchedValue(value.unwrap_or_default()))
+            }
             b'V' => Ok(ResponseKind::Value(value.unwrap_or_default())),
             b'N' => Ok(ResponseKind::NotFound),
             b'S' => Ok(ResponseKind::Stored),
@@ -2030,6 +2142,33 @@ mod tests {
             ResponseKind::try_from((b'C', None, None, None)),
             Ok(ResponseKind::Cleared)
         ));
+    }
+
+    // ── touch (issue #825) ───────────────────────────────────────────
+
+    #[test]
+    fn encode_touch_emits_every_ttl_and_get_flag_combination() {
+        for (ttl, with_value, header) in [
+            (Some(30), false, "t 0 4 30\n"),
+            (None, false, "t 0 4\n"),
+            (Some(0), false, "t 0 4 0\n"),
+            (Some(45), true, "t 0 4 45 G\n"),
+            (None, true, "t 0 4 G\n"),
+        ] {
+            assert_eq!(
+                encode_touch(b"", b"hits", ttl, with_value, None),
+                [header.as_bytes(), b"hits"].concat(),
+                "ttl {ttl:?}, G {with_value}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_touch_emits_the_namespace_and_the_tag_last() {
+        assert_eq!(
+            encode_touch(b"ns", b"hits", Some(30), true, Some(7)),
+            [b"t 2 4 30 G 7\n".as_slice(), b"ns", b"hits"].concat()
+        );
     }
 
     // ── incr (issue #129) ────────────────────────────────────────────
