@@ -313,6 +313,32 @@ public sealed class MockNode : IDisposable
     public void FailIncrAfterApplyOnce() => Interlocked.Increment(ref _failIncrAfterApplyReplies);
     private int _failIncrAfterApplyReplies;
 
+    /// <summary>issue #825: every <c>t</c> (touch) header line received
+    /// verbatim (e.g. <c>"t 0 3 30 G"</c>), in arrival order — lets a test
+    /// assert the exact frame (ttl field, <c>G</c>, tag) and which node got
+    /// which form.</summary>
+    public IReadOnlyList<string> TouchFrames => _touchFrames.ToArray();
+    private readonly ConcurrentQueue<string> _touchFrames = new();
+
+    /// <summary>issue #825: the TTL (whole seconds) a stored entry
+    /// currently carries, or <c>null</c> for none — keyed like
+    /// <see cref="Store"/>; for the default namespace, <paramref name="namespaceBytes"/>
+    /// is empty.</summary>
+    public long? TtlOf(byte[] namespaceBytes, byte[] key) =>
+        _ttls.TryGetValue(KeyOf(namespaceBytes, key), out long ttl) && ttl > 0 ? ttl : null;
+
+    /// <summary>issue #825: the <see cref="FailIncrAfterApplyOnce"/>
+    /// counterpart for <c>t</c>: the touch is applied, then the connection
+    /// closes without a reply. A touch is idempotent, so the client
+    /// resends it.</summary>
+    public void FailTouchAfterApplyOnce() => Interlocked.Increment(ref _failTouchAfterApplyReplies);
+    private int _failTouchAfterApplyReplies;
+
+    /// <summary>issue #825: from now on answer every <c>t</c> like a node
+    /// that predates it — <c>En</c>, then close the connection.</summary>
+    public void RejectTouchLikeAnOldServer() => _rejectTouch = true;
+    private volatile bool _rejectTouch;
+
     /// <summary>issue #225: the <see cref="FailIncrAfterApplyOnce"/>
     /// counterpart for <c>k</c> (CAS).</summary>
     public void FailCasAfterApplyOnce() => Interlocked.Increment(ref _failCasAfterApplyReplies);
@@ -1068,6 +1094,73 @@ public sealed class MockNode : IDisposable
                             }
                         }
                         await Wire.WriteAsync(stream, $"C{tag}\n");
+                        break;
+                    }
+                    // issue #825 — `t <ns-len> <key-len>[ <ttl>][ G][ <tag>]\n`,
+                    // always namespaced. A miss answers `N` and never
+                    // creates the key; ttl 0 expires the entry at once; no
+                    // ttl field removes the TTL. Without `G` the reply is
+                    // `S`; with it `V <len>[ <ttl-now-in-effect>][ <tag>]`.
+                    case "t":
+                    {
+                        byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[2]));
+                        _touchFrames.Enqueue(string.Join(' ', parts));
+                        if (_rejectTouch)
+                        {
+                            await Wire.WriteAsync(stream, "En\n");
+                            return;
+                        }
+                        long? ttlSeconds = null;
+                        bool withValue = false;
+                        for (int i = 3; i < parts.Length - (tagged ? 1 : 0); i++)
+                        {
+                            if (parts[i] == "G") withValue = true;
+                            else ttlSeconds = long.Parse(parts[i], CultureInfo.InvariantCulture);
+                        }
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
+                        }
+                        if (TakeWrongNode())
+                        {
+                            await Wire.WriteAsync(stream, $"W{tag}\n");
+                            break;
+                        }
+                        string storeKey = KeyOf(namespaceBytes, key);
+                        if (!Store.TryGetValue(storeKey, out byte[]? existing))
+                        {
+                            await Wire.WriteAsync(stream, $"N{tag}\n");
+                            break;
+                        }
+                        if (ttlSeconds == 0)
+                        {
+                            Store.TryRemove(storeKey, out _);
+                            _ttls.TryRemove(storeKey, out _);
+                        }
+                        else
+                        {
+                            _ttls[storeKey] = ttlSeconds ?? 0;
+                        }
+                        if (TakeOne(ref _failTouchAfterApplyReplies))
+                        {
+                            return; // applied, but the ack never arrives
+                        }
+                        if (!withValue)
+                        {
+                            await Wire.WriteAsync(stream, $"S{tag}\n");
+                        }
+                        else
+                        {
+                            string ttlField = ttlSeconds is > 0 ? $" {ttlSeconds}" : "";
+                            await Wire.WriteAsync(stream, $"V {existing.Length}{ttlField}{tag}\n");
+                            await stream.WriteAsync(existing);
+                        }
                         break;
                     }
                     case "F":
