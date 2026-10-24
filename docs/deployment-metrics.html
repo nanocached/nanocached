@@ -180,7 +180,7 @@ cat &gt; /opt/aws/amazon-cloudwatch-agent/etc/nanocached.json &lt;&lt;'JSON'
               "dimensions": [["host"]],
               "metric_selectors": [
                 "^nanocached_node_(memory_used_bytes|memory_max_bytes|entries|connections|connections_max)$",
-                "^nanocached_node_(hits|misses|sets|deletes|evictions|expirations|incrs|cas_sets|cas_deletes)_total$"
+                "^nanocached_node_(hits|misses|sets|deletes|evictions|expirations|incrs|cas_sets|cas_deletes|touches|touch_misses)_total$"
               ]
             }
           ]
@@ -387,7 +387,7 @@ exporters:
       - dimensions: [[TaskId]]
         metric_name_selectors:
           - "^nanocached_node_(memory_used_bytes|memory_max_bytes|entries|connections|connections_max)$"
-          - "^nanocached_node_(hits|misses|sets|deletes|evictions|expirations|incrs|cas_sets|cas_deletes)_total$"
+          - "^nanocached_node_(hits|misses|sets|deletes|evictions|expirations|incrs|cas_sets|cas_deletes|touches|touch_misses)_total$"
           - "^nanocached_discovery_"
 service:
   pipelines:
