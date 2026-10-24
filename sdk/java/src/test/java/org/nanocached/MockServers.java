@@ -147,6 +147,17 @@ final class MockServers {
          * landed exactly once. */
         private final AtomicInteger dropReplyAfterIncr = new AtomicInteger();
         private final AtomicInteger dropReplyAfterCasSet = new AtomicInteger();
+        /** issue #825: every `t` (touch) header line received verbatim,
+         * e.g. {@code "t 0 3 30 G"}, in receipt order — lets a test assert
+         * the exact frame (ttl field, `G`, tag) and which node got which
+         * form. */
+        final List<String> touchFrames = new CopyOnWriteArrayList<>();
+        /** As {@link #dropReplyAfterIncr}, for `t`: a touch is idempotent, so
+         * the client resends it where it must not resend an INCR. */
+        private final AtomicInteger dropReplyAfterTouch = new AtomicInteger();
+        /** issue #825: behave like a node that predates `t` — an unknown
+         * command is answered `En` and the connection closed. */
+        private volatile boolean rejectTouch = false;
         /** One-off connection resets queued for the next `c`/`F` frame(s)
          * (issue #106), mirroring {@link #wrongNodeReplies}/{@link
          * #takeWrongNode()} rather than {@link #failSets}'s permanent
@@ -444,6 +455,26 @@ final class MockServers {
                 if (pending == 0) return false;
                 if (dropReplyAfterCasSet.compareAndSet(pending, pending - 1)) return true;
             }
+        }
+
+        /** issue #825: apply (and log) the next `t` request as usual, but
+         * close the connection instead of replying. */
+        void dropReplyAfterNextTouch() {
+            dropReplyAfterTouch.incrementAndGet();
+        }
+
+        private boolean takeDropReplyAfterTouch() {
+            while (true) {
+                int pending = dropReplyAfterTouch.get();
+                if (pending == 0) return false;
+                if (dropReplyAfterTouch.compareAndSet(pending, pending - 1)) return true;
+            }
+        }
+
+        /** issue #825: from now on answer every `t` like a node that
+         * predates it — `En`, then close. */
+        void rejectTouchLikeAnOldServer() {
+            rejectTouch = true;
         }
 
         /** Server-side FIN on every open connection, like the idle timeout. */
@@ -1066,6 +1097,64 @@ final class MockServers {
                                 namespacedTtls.remove(ns);
                             }
                             out.write(("C" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                            out.flush();
+                        }
+                        // Touch (issue #825): `t <ns-len> <key-len> [<ttl>] [G]
+                        // [<tag>]`, always namespaced like INCR. A miss
+                        // answers `N` and never creates the key; ttl 0
+                        // expires the entry at once; no ttl field removes
+                        // the TTL. Without `G` the reply is `S`; with it
+                        // `V <len> [<ttl-now-in-effect>] [<tag>]`.
+                        case "t" -> {
+                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            String key = keyOf(in.readNBytes(Integer.parseInt(parts[2])));
+                            touchFrames.add(String.join(" ", parts));
+                            if (rejectTouch) {
+                                out.write("En\n".getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                return;
+                            }
+                            Long ttlSeconds = null;
+                            boolean withValue = false;
+                            for (int i = 3; i < parts.length - (tagged ? 1 : 0); i++) {
+                                if (parts[i].equals("G")) withValue = true;
+                                else ttlSeconds = Long.parseLong(parts[i]);
+                            }
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            if (takeWrongNode()) {
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            byte[] existing = namespacedGet(ns, key);
+                            if (existing == null) {
+                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            if (ttlSeconds != null && ttlSeconds == 0) {
+                                namespacedRemove(ns, key);
+                            } else {
+                                namespacedPutTtl(ns, key, ttlSeconds == null ? 0 : ttlSeconds);
+                            }
+                            if (takeDropReplyAfterTouch()) {
+                                return; // applied, but the ack never arrives
+                            }
+                            if (!withValue) {
+                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                            } else {
+                                String ttlField = ttlSeconds == null || ttlSeconds == 0 ? "" : " " + ttlSeconds;
+                                out.write(("V " + existing.length + ttlField + tagSuffix + "\n")
+                                        .getBytes(StandardCharsets.US_ASCII));
+                                out.write(existing);
+                            }
                             out.flush();
                         }
                         case "F" -> {

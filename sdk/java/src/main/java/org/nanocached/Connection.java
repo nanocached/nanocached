@@ -261,11 +261,58 @@ final class Connection {
     byte[] get(byte[] key) {
         Response response = request(tag -> frame("G " + key.length + tagSuffix(tag) + "\n", key, null));
         return switch (response.marker) {
+            case 'V' -> plainValue(response);
+            case 'N' -> null;
+            case 'W' -> throw new NanocachedException.WrongNode();
+            default -> throw mismatch(response.marker);
+        };
+    }
+
+    /** A {@code V} answering a plain get. One carrying a TTL only ever
+     * answers a get-and-touch (issue #825), so it means the streams are
+     * misaligned. */
+    private byte[] plainValue(Response response) {
+        if (response.ttlSeconds != null) throw mismatch(response.marker);
+        return response.value;
+    }
+
+    // Touch (issue #825): `t` — like INCR, always carries an explicit
+    // <namespace-length>. `ttlSeconds` null omits the TTL field (the node
+    // removes the TTL); 0 is sent and expires the entry at once — unlike
+    // `set`, where 0 never reaches the wire. A hit answers `S` (or, with
+    // `G`, `V <len> [<ttl>]`), a miss `N`; a touch never creates a key.
+
+    /** One plain {@code t} to this node only — cluster fan-out to every
+     * owner is the client's job, as for a set. Returns whether the key
+     * existed. */
+    boolean touch(byte[] namespace, byte[] key, Long ttlSeconds) {
+        Response response = request(tag -> frame(touchHeader(namespace, key, ttlSeconds, false, tag), namespace, key, null));
+        return switch (response.marker) {
+            case 'S' -> true;
+            case 'N' -> false;
+            case 'W' -> throw new NanocachedException.WrongNode();
+            default -> throw mismatch(response.marker);
+        };
+    }
+
+    /** {@code t ... G}: replaces the TTL and returns the raw value, or
+     * {@code null} on a miss. The reply's own TTL field (the TTL now in
+     * effect) is read and dropped — the caller just set it. */
+    byte[] getAndTouch(byte[] namespace, byte[] key, Long ttlSeconds) {
+        Response response = request(tag -> frame(touchHeader(namespace, key, ttlSeconds, true, tag), namespace, key, null));
+        return switch (response.marker) {
             case 'V' -> response.value;
             case 'N' -> null;
             case 'W' -> throw new NanocachedException.WrongNode();
             default -> throw mismatch(response.marker);
         };
+    }
+
+    private static String touchHeader(byte[] namespace, byte[] key, Long ttlSeconds, boolean get, Integer tag) {
+        return "t " + namespace.length + " " + key.length
+                + (ttlSeconds == null ? "" : " " + ttlSeconds)
+                + (get ? " G" : "")
+                + tagSuffix(tag) + "\n";
     }
 
     void set(byte[] key, byte[] value, Long ttlSeconds) {
@@ -304,7 +351,7 @@ final class Connection {
         Response response = request(tag -> frame(
                 "g " + namespace.length + " " + key.length + tagSuffix(tag) + "\n", namespace, key, null));
         return switch (response.marker) {
-            case 'V' -> response.value;
+            case 'V' -> plainValue(response);
             case 'N' -> null;
             case 'W' -> throw new NanocachedException.WrongNode();
             default -> throw mismatch(response.marker);
@@ -1099,9 +1146,13 @@ final class Connection {
         int marker = readByte();
         switch (marker) {
             case 'V' -> {
-                // Untagged: `V <len>`. Tagged: `V <len> <tag>` (echoed response tags).
+                // Untagged: `V <len>`. Tagged: `V <len> <tag>` (echoed response
+                // tags). A get-and-touch's reply (issue #825) adds `I`'s
+                // optional TTL between them — told apart by field count for
+                // the connection's mode, never guessed frame by frame.
                 String[] fields = readLine().split(" ");
-                if (fields.length != (tagged ? 2 : 1)) {
+                int valueFields = tagged ? 2 : 1;
+                if (fields.length != valueFields && fields.length != valueFields + 1) {
                     throw new NanocachedException.ConnectionFailed(
                             "nanocached: invalid value header in response", null);
                 }
@@ -1115,8 +1166,17 @@ final class Connection {
                     throw new NanocachedException.ConnectionFailed(
                             "nanocached: invalid value length in response", null);
                 }
-                int tag = tagged ? parseTag(fields[1]) : -1;
-                return new Response(marker, readExactly(length), tag, null, null);
+                Long valueTtl = null;
+                if (fields.length == valueFields + 1) {
+                    long parsedTtl = parseNonNegativeLong(fields[1]);
+                    if (parsedTtl < 0) {
+                        throw new NanocachedException.ConnectionFailed(
+                                "nanocached: invalid ttl in response", null);
+                    }
+                    valueTtl = parsedTtl;
+                }
+                int tag = tagged ? parseTag(fields[fields.length - 1]) : -1;
+                return new Response(marker, readExactly(length), tag, valueTtl, null);
             }
             // 'I' is INCR's (issue #129) hit reply: `I <value-length>
             // [<ttl-seconds>] [<tag>]`. The ttl field is optional exactly
@@ -1267,6 +1327,18 @@ final class Connection {
                 }
                 int tag = tagged ? parseTag(fields[1 + count]) : -1;
                 return new Response(marker, null, tag, null, entries);
+            }
+            // `En\n`: the node rejects the request and is closing the
+            // connection. Told apart from other unexpected bytes so a touch
+            // can report "server too old" (issue #825); a ConnectionFailed
+            // either way, so every other command is unaffected.
+            case 'E' -> {
+                try {
+                    readLine(); // the rest of `En\n`, if it arrives
+                } catch (IOException ignored) {
+                    // The connection is being poisoned anyway.
+                }
+                throw new NanocachedException.ServerRejected();
             }
             default -> throw new NanocachedException.ConnectionFailed(
                     "nanocached: unexpected response from server: " + (char) marker, null);

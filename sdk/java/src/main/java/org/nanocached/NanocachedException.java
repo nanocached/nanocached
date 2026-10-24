@@ -131,6 +131,35 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
+     * The node answered {@code En} and is closing the connection (issue
+     * #825). A {@link ConnectionFailed}, so every command other than
+     * touch/getAndTouch sees exactly the failure it always did;
+     * those two turn it into {@link ServerTooOld}.
+     */
+    static final class ServerRejected extends ConnectionFailed {
+        ServerRejected() {
+            super("nanocached: unexpected response from server: E", null);
+        }
+    }
+
+    /**
+     * Raised by touch/getAndTouch (issue #825) when the node answered {@code
+     * En} to the {@code t} command: a node that predates it does not know
+     * the command and closes the connection. Every node must be upgraded
+     * before a client sends it; nothing is retried to get past it, since
+     * the same node would answer the same way. {@code En} is also what a
+     * request that is too large or malformed gets, but the SDK validates
+     * size and builds a well-formed frame, so for {@code t} it means the
+     * command is unknown.
+     */
+    public static final class ServerTooOld extends NanocachedException {
+        public ServerTooOld(Throwable cause) {
+            super("nanocached: the server does not know the touch command (t) — upgrade every node to a release "
+                    + "that includes it", cause);
+        }
+    }
+
+    /**
      * Raised by get/getBytes when a value with {@code compress} enabled
      * can't be interpreted — almost always a {@code compress} mismatch
      * between clients sharing this key (value compression's compatibility

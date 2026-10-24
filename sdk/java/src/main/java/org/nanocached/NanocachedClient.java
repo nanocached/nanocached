@@ -1411,6 +1411,39 @@ public final class NanocachedClient implements AutoCloseable {
             return NanocachedClient.this.delete(namespace, key);
         }
 
+        /** As {@link NanocachedClient#touch(String, long)}, scoped to
+         * {@link #namespace()}. */
+        public boolean touch(String key, long ttlSeconds) {
+            return touch(utf8(key, "key"), ttlSeconds);
+        }
+
+        /** As {@link #touch(String, long)}. */
+        public boolean touch(byte[] key, long ttlSeconds) {
+            return NanocachedClient.this.touch(namespace, key, ttlSeconds);
+        }
+
+        /** As {@link NanocachedClient#getAndTouch(String, long)}, scoped to
+         * {@link #namespace()}. */
+        public Optional<String> getAndTouch(String key, long ttlSeconds) {
+            return getAndTouch(utf8(key, "key"), ttlSeconds);
+        }
+
+        /** As {@link #getAndTouch(String, long)}. */
+        public Optional<String> getAndTouch(byte[] key, long ttlSeconds) {
+            return getAndTouchBytes(key, ttlSeconds).map(NanocachedClient::decodeUtf8Strict);
+        }
+
+        /** As {@link NanocachedClient#getAndTouchBytes(String, long)},
+         * scoped to {@link #namespace()}. */
+        public Optional<byte[]> getAndTouchBytes(String key, long ttlSeconds) {
+            return getAndTouchBytes(utf8(key, "key"), ttlSeconds);
+        }
+
+        /** As {@link #getAndTouchBytes(String, long)}. */
+        public Optional<byte[]> getAndTouchBytes(byte[] key, long ttlSeconds) {
+            return NanocachedClient.this.getAndTouchBytes(namespace, key, ttlSeconds);
+        }
+
         public void setMany(Map<String, String> values) {
             setMany(values, 0L);
         }
@@ -2484,6 +2517,132 @@ public final class NanocachedClient implements AutoCloseable {
     /** Returns whether the key existed before this call. */
     public boolean delete(byte[] key) {
         return delete(EMPTY_NAMESPACE, key);
+    }
+
+    // ── Touch (issue #825) ───────────────────────────────────────────
+
+    /**
+     * Passed as {@code ttlSeconds} to {@link #touch}/{@link #getAndTouch},
+     * removes the entry's TTL so it never expires. A named constant rather
+     * than a bare {@code -1} because the parameter has no default and
+     * {@code 0} is a real value there (expire the entry at once) — the
+     * opposite of {@link #set(byte[], byte[], long)}, where 0 means no
+     * expiry.
+     */
+    public static final long REMOVE_TTL = -1L;
+
+    /**
+     * Replaces the TTL of an existing entry in place, without rewriting
+     * its value (issue #825), and returns whether the key existed: {@code
+     * false} for a missing or expired key, which a touch never creates.
+     * {@code ttlSeconds} is counted from the moment the node receives the
+     * request — {@link #REMOVE_TTL} removes the TTL, {@code 0} expires the
+     * entry at once, and any other negative value is rejected before any
+     * I/O with {@link IllegalArgumentException}.
+     *
+     * <p>Unlike INCR and the compare-and-set family a touch is idempotent,
+     * so a request whose reply was lost is retried like get/set/delete are,
+     * never thrown as {@link NanocachedException.ConnectionFailed}. In a
+     * cluster it goes to every owner, like a set, and the primary's answer
+     * is returned.
+     *
+     * @throws NanocachedException.ServerTooOld against a node that predates
+     *         the command
+     */
+    public boolean touch(String key, long ttlSeconds) {
+        return touch(utf8(key, "key"), ttlSeconds);
+    }
+
+    /** As {@link #touch(String, long)}. */
+    public boolean touch(byte[] key, long ttlSeconds) {
+        return touch(EMPTY_NAMESPACE, key, ttlSeconds);
+    }
+
+    /** The namespaced counterpart of {@link #touch(byte[], long)} (issue
+     * #105) — see {@link #namespace}. */
+    boolean touch(byte[] namespace, byte[] key, long ttlSeconds) {
+        validateKey(namespace, key);
+        Long wireTtl = touchWireTtl(ttlSeconds);
+        beforeOperation();
+        try {
+            return withWrongNodeRetry(() -> write(
+                    namespace, key, connection -> connection.touch(namespace, key, wireTtl)));
+        } catch (NanocachedException.ServerRejected rejected) {
+            throw new NanocachedException.ServerTooOld(rejected);
+        }
+    }
+
+    /**
+     * Reads a value and replaces its TTL in one step (issue #825); {@code
+     * Optional.empty()} on a miss, which creates nothing. See {@link
+     * #touch(String, long)} for {@code ttlSeconds}. Decoded as strict
+     * UTF-8, like {@link #get(String)}.
+     *
+     * <p>A read that writes: it goes to the key's primary like a write (one
+     * refresh and retry on a wrong-node answer or a connection failure; no
+     * hedging, and no fallback to a replica on a miss) and the other owners
+     * are sent the plain touch, so a replica is never the only owner
+     * touched. It counts as a read on the primary, which makes the entry
+     * the most recently used.
+     *
+     * @throws UncheckedIOException if the stored value is not valid UTF-8
+     * @throws NanocachedException.ServerTooOld against a node that predates
+     *         the command
+     */
+    public Optional<String> getAndTouch(String key, long ttlSeconds) {
+        return getAndTouch(utf8(key, "key"), ttlSeconds);
+    }
+
+    /** As {@link #getAndTouch(String, long)}. */
+    public Optional<String> getAndTouch(byte[] key, long ttlSeconds) {
+        return getAndTouchBytes(key, ttlSeconds).map(NanocachedClient::decodeUtf8Strict);
+    }
+
+    /** The raw-bytes companion to {@link #getAndTouch(String, long)}: no
+     * decoding. Transparently decompresses when {@code compress} is
+     * enabled. */
+    public Optional<byte[]> getAndTouchBytes(String key, long ttlSeconds) {
+        return getAndTouchBytes(utf8(key, "key"), ttlSeconds);
+    }
+
+    /** As {@link #getAndTouchBytes(String, long)}. */
+    public Optional<byte[]> getAndTouchBytes(byte[] key, long ttlSeconds) {
+        return getAndTouchBytes(EMPTY_NAMESPACE, key, ttlSeconds);
+    }
+
+    /** The namespaced counterpart of {@link #getAndTouchBytes(byte[], long)}
+     * (issue #105) — see {@link #namespace}. */
+    Optional<byte[]> getAndTouchBytes(byte[] namespace, byte[] key, long ttlSeconds) {
+        validateKey(namespace, key);
+        Long wireTtl = touchWireTtl(ttlSeconds);
+        beforeOperation();
+        byte[] raw;
+        try {
+            raw = withWrongNodeRetry(() -> write(
+                    namespace, key,
+                    connection -> connection.getAndTouch(namespace, key, wireTtl),
+                    null,
+                    // A replica is sent the plain touch: it has no value to
+                    // return, and `G` there would only move the value over
+                    // the wire for nothing.
+                    connection -> connection.touch(namespace, key, wireTtl)));
+        } catch (NanocachedException.ServerRejected rejected) {
+            throw new NanocachedException.ServerTooOld(rejected);
+        }
+        if (raw == null) return Optional.empty();
+        return Optional.of(compress ? Compression.decompressValue(raw, inflateBudget) : raw);
+    }
+
+    /** {@code null} on the wire for {@link #REMOVE_TTL} (the TTL field is
+     * omitted); the number of seconds, {@code 0} included, otherwise. */
+    private static Long touchWireTtl(long ttlSeconds) {
+        if (ttlSeconds == REMOVE_TTL) return null;
+        if (ttlSeconds < 0) {
+            throw new IllegalArgumentException(
+                    "nanocached: ttlSeconds must not be negative (pass REMOVE_TTL to remove the TTL), got "
+                            + ttlSeconds);
+        }
+        return ttlSeconds;
     }
 
     /** The namespaced counterpart of {@link #delete(byte[])} (issue #105) —
@@ -4063,6 +4222,20 @@ public final class NanocachedClient implements AutoCloseable {
     private <T> T write(
             byte[] namespace, byte[] key, ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp) {
+        return write(namespace, key, op, backgroundSafeOp, null);
+    }
+
+    /**
+     * As the four-argument {@code write}, with {@code replicaOp} (issue
+     * #825) — when non-null — sent to every non-primary owner, background
+     * legs included, instead of {@code op}: only the primary's answer
+     * decides the result, so a get-and-touch asks just the primary for the
+     * value and sends the others the plain touch.
+     */
+    private <T> T write(
+            byte[] namespace, byte[] key, ConnectionOp<T> op,
+            java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
+            ConnectionOp<?> replicaOp) {
         if (ring == null) {
             return applyReconnecting(this::singleConnection, op);
         }
@@ -4086,7 +4259,7 @@ public final class NanocachedClient implements AutoCloseable {
                 if (backgroundOp == null) {
                     backgroundOp = backgroundSafeOp != null ? backgroundSafeOp.get() : op;
                 }
-                ConnectionOp<T> legOp = backgroundOp;
+                ConnectionOp<?> legOp = replicaOp != null ? replicaOp : backgroundOp;
                 Runnable replicaWrite = () -> {
                     try {
                         applyReconnecting(() -> memberConnection(replica), legOp);
@@ -4127,9 +4300,10 @@ public final class NanocachedClient implements AutoCloseable {
                 continue;
             }
 
+            ConnectionOp<?> syncLegOp = replicaOp != null ? replicaOp : op;
             Runnable replicaWrite = () -> {
                 try {
-                    applyReconnecting(() -> memberConnection(replica), op);
+                    applyReconnecting(() -> memberConnection(replica), syncLegOp);
                 } catch (NanocachedException ignored) {
                     // Swallowed by design (client-side replication) — see the
                     // matching catch in the fire-and-forget branch above for
