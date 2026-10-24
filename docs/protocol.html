@@ -355,6 +355,14 @@ passes each key it touched on as the value it holds with the new TTL, written
 like an <code>S</code>, not as <code>y</code> itself. As for
 <code>m</code>/<code>o</code>, a batch never fails as a whole: a
 <code>W</code> for some keys leaves the answers for the others standing.</p>
+<p>Through <code>nanocached-proxy</code>, a batch spanning several owners is
+split into one sub-frame per node and the answers are put back in the
+client's order, as for <code>m</code>/<code>o</code>. Every owner of a key is
+sent it; with <code>G</code>, a key's primary is sent <code>G</code> for the
+keys it is primary of (its answer is the client's) and every other owner the
+plain form. A key whose primary answers <code>W</code>, or whose sub-frame
+fails, is sent again once over a refreshed ring, and one still wrong after
+that is answered <code>W</code> on its own.</p>
 <p><code>y</code> needs a node that knows it: an older node answers
 <code>En\n</code> and closes the connection, so upgrade every node before
 clients start sending it.</p>
