@@ -719,24 +719,23 @@ class NanocachedCache(BaseCache):
         self._run(lambda handle: handle.set(cache_key, encoded, ttl_seconds=wire_ttl))
 
     def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
-        """get_bytes + re-set with the new timeout — also not atomic (a
-        concurrent write between the two can be overwritten with the
-        pre-touch value); returns False without writing anything if the
-        key is already missing."""
+        """The wire's own touch (issue #826): replaces the entry's TTL in
+        place, without reading or rewriting the value, so a write that
+        lands at the same time is never overwritten. Returns False when
+        the key is missing or expired — a touch never creates one.
+        Django's ``timeout=None`` removes the TTL (the entry never
+        expires); 0 or negative is "don't cache" (``_DO_NOT_CACHE``), so
+        the entry is deleted, as set() does, and the result is whether it
+        existed. Needs a server that knows the ``t`` command; against an
+        older one the SDK raises ``ServerTooOldError``."""
         cache_key = self.make_and_validate_key(key, version=version)
-        raw = self._run(lambda handle: handle.get_bytes(cache_key))
-        if raw is None:
-            return False
         wire_ttl = self.get_backend_timeout(timeout)
         if wire_ttl is _DO_NOT_CACHE:
-            self._run(lambda handle: handle.delete(cache_key))
-            return True
-        # Re-sent as the raw bytes already read back — already encoded
-        # (pickled, or a counter's decimal-ASCII form), so there's
-        # nothing to gain (and a value round-trip to lose) by decoding
-        # and re-encoding it just to change the TTL.
-        self._run(lambda handle: handle.set(cache_key, raw, ttl_seconds=wire_ttl))
-        return True
+            return self._run(lambda handle: handle.delete(cache_key))
+        # get_backend_timeout speaks set()'s wire (0 = no expiry); a
+        # touch's own TTL has no such 0 — None removes the TTL there.
+        touch_ttl = None if wire_ttl == 0 else wire_ttl
+        return self._run(lambda handle: handle.touch(cache_key, touch_ttl))
 
     def delete(self, key, version=None):
         cache_key = self.make_and_validate_key(key, version=version)

@@ -9,6 +9,17 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Changed
+
+- `touch()` is the wire's own touch instead of a read followed by a full
+  re-write: the TTL is replaced on the node in place, no value travels
+  either way, and a write that lands at the same time is no longer
+  overwritten with the pre-touch value. Django's `timeout=None` removes
+  the TTL; `0` or a negative timeout still deletes the entry. Needs a
+  server release that includes the `t` command and a Python SDK release
+  that includes `touch`; against an older server `touch()` raises
+  `ServerTooOldError`.
+
 ## [0.4.8] - 2026-10-21
 
 ### Fixed

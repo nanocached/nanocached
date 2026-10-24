@@ -11,13 +11,19 @@ and friends run against a nanocached cluster.
   node, and `cache.clear()` is that namespace's `CLEAR` (one sub-map
   removal on every node with the entries freed off its cache thread, no
   key scan, and never the whole store).
-- **`get`/`set`/`delete`/`has_key`/`touch`** map onto the SDK's namespaced
+- **`get`/`set`/`delete`/`has_key`** map onto the SDK's namespaced
   get/set/delete, with all of its routing, replication, and retries.
+- **`touch`** is the wire's own touch: it replaces the entry's TTL on the
+  node in place, without reading or rewriting the value, so a write that
+  lands at the same time is never overwritten. It returns `False` for a
+  missing key and never creates one. Django's `timeout=None` removes the
+  TTL; `0` or a negative timeout is "don't cache", so the entry is
+  deleted, as `set()` does. In a cluster it goes to every owner. Against
+  a node that predates the touch command the SDK raises
+  `ServerTooOldError`.
 - **`add`** is atomic: it is the wire's put-if-absent, evaluated by the
   key's primary owner alone, so of several racing `add()` calls exactly
-  one returns `True`. **`touch`** is get-then-set, not atomic — a write
-  that lands between its read and its re-set is overwritten with the
-  pre-touch value.
+  one returns `True`.
 - **`get_many`/`set_many`** use the wire's batched multi-get/multi-set:
   one round trip per involved node instead of one per key. The values
   in one batch reply total at most 16 MiB, and a hit past that budget
@@ -26,7 +32,7 @@ and friends run against a nanocached cluster.
   evicted. **`delete_many`** remains a concurrent client-side fan-out —
   the wire has no multi-key delete.
 - **`incr`/`decr`** use the wire's own atomic counter (`INCR`): atomic on the
-  node that owns the key, unlike `touch()` above. Matches `BaseCache`'s own contract — raises `ValueError` if the
+  node that owns the key. Matches `BaseCache`'s own contract — raises `ValueError` if the
   key doesn't exist — and is exactly as volatile as `set()`: LRU
   eviction or this alias's `TIMEOUT` reclaim a counter the same as any
   other entry, so it suits rate limiting and approximate counts, never a
@@ -185,7 +191,7 @@ def my_view(request):
 
 ## Consistency notes
 
-`touch()` is get-then-set (see above), not atomic; `add()` is.
+`touch()` and `add()` are atomic.
 `get_many`/`set_many` batch by owning node and
 `delete_many` fans out per key — in every case a failure partway through
 leaves whichever keys were already processed changed rather than rolling
@@ -277,7 +283,9 @@ Python 3.11+, Django 4.2+, `nanocached` (Python SDK) 0.4.8+ (what
 `pyproject.toml` pins), a nanocached server 0.4.0 or later — the release
 that added namespaces, `CLEAR`, the put-if-absent `add()` uses, the
 `INCR` behind `incr`/`decr`, and the batched multi-get/multi-set behind
-`get_many`/`set_many`.
+`get_many`/`set_many`. `touch()` additionally needs a server release that
+includes the `t` command, and a Python SDK release that includes
+`touch`.
 
 ## Policy note
 
