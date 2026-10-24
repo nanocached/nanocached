@@ -25,6 +25,13 @@ framework adapters at one version, whether or not a component changed.
   a set. A node older than this release answers `En` and closes the
   connection, so upgrade every node before a client sends it. No SDK,
   adapter or the proxy uses it yet.
+- `nanocached-proxy` routes the `t` command: it goes to every owner of the key
+  like a set, the answer comes from the primary, and a get-and-touch (`G`)
+  asks only the primary for the value (replicas get the plain touch). A stale
+  ring is refreshed and the touch sent again. A touch is idempotent, so unlike
+  `i`/`k`/`x` it is re-sent after a connection that failed once, and a
+  retry-capable client is answered `R` when the node cannot be reached, not
+  the fatal `E`. The proxy needs a node that knows `t`.
 - `nanocached-node`, `nanocached-discovery` and `nanocached-proxy` print a
   one-line `WARN` at startup when they listen on an address that is not
   loopback and `NANOCACHED_AUTH_SECRET` is unset or empty: anyone who can
