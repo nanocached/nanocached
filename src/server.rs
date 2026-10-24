@@ -2081,6 +2081,29 @@ fn render_node_metrics(
         format!("nanocached_node_cas_deletes_total {}\n", stats.cas_deletes),
     );
 
+    metric(
+        "nanocached_node_touches_total",
+        "counter",
+        "Client t (touch and get-and-touch) frames handled, whether or \
+         not the key was there. A touch forwarded to a joining or \
+         entering node travels as a handoff set and is not counted here, \
+         like the handoff frames left out of sets_total. A t with G also \
+         counts in hits_total or misses_total, as g does; a plain one \
+         does not.",
+        format!("nanocached_node_touches_total {}\n", stats.touches),
+    );
+    metric(
+        "nanocached_node_touch_misses_total",
+        "counter",
+        "The t frames counted in touches_total that found no live entry \
+         (missing or expired). One with G is also in misses_total; a \
+         plain one is only here.",
+        format!(
+            "nanocached_node_touch_misses_total {}\n",
+            stats.touch_misses
+        ),
+    );
+
     // `stats.namespaces` is largest-first, so the cap keeps the ones that
     // matter for capacity.
     let listed = stats.namespaces.len().min(METRICS_MAX_NAMESPACE_SERIES);
@@ -11548,6 +11571,26 @@ mod tests {
         )
         .await;
 
+        // Touches count as frames handled, found or not; the two with `G`
+        // are reads too, so they also land in the hit and miss counters, and
+        // the plain ones do not.
+        for (name, get) in [
+            (&b"k"[..], false),
+            (b"absent", false),
+            (b"k", true),
+            (b"absent", true),
+        ] {
+            send_command(
+                &request_tx,
+                Command::Touch {
+                    key: key(name),
+                    ttl: None,
+                    get,
+                },
+            )
+            .await;
+        }
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let metrics_task = tokio::spawn(run_metrics_server(
@@ -11568,8 +11611,13 @@ mod tests {
             body.contains("nanocached_node_namespace_budget_bytes{namespace=\"users\"} 4096\n"),
             "{body}"
         );
-        assert!(body.contains("nanocached_node_hits_total 1\n"), "{body}");
-        assert!(body.contains("nanocached_node_misses_total 1\n"), "{body}");
+        assert!(body.contains("nanocached_node_hits_total 2\n"), "{body}");
+        assert!(body.contains("nanocached_node_misses_total 2\n"), "{body}");
+        assert!(body.contains("nanocached_node_touches_total 4\n"), "{body}");
+        assert!(
+            body.contains("nanocached_node_touch_misses_total 2\n"),
+            "{body}"
+        );
         assert!(body.contains("nanocached_node_sets_total 5\n"), "{body}");
         // The HELP text carries a statement operators act on — a joiner's
         // entries rise while this counter stays flat — so its wording is

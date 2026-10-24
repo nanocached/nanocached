@@ -181,6 +181,13 @@ pub struct CacheStats {
     /// mismatched or absent key isn't counted here — see
     /// `Cache::cas_delete`.
     pub cas_deletes: u64,
+    /// `t` frames handled, plain and `G`, whether the key was there or
+    /// not. A forward of a touch during a join or a decommission travels as
+    /// a handoff set and is not counted — see `Cache::touch`.
+    pub touches: u64,
+    /// The `t` frames counted in `touches` that found no live entry. A
+    /// `G` one is also in `misses`, as for `g`; a plain one only here.
+    pub touch_misses: u64,
     /// Largest first; one row per live namespace.
     pub namespaces: Vec<NamespaceStats>,
 }
@@ -293,6 +300,10 @@ pub struct Cache {
     cas_sets: u64,
     /// Issue #141: successful `x` removals — see `CacheStats::cas_deletes`.
     cas_deletes: u64,
+    /// `t` frames handled — see `CacheStats::touches`.
+    touches: u64,
+    /// `t` frames that found no live entry — see `CacheStats::touch_misses`.
+    touch_misses: u64,
     /// Expired/marked keys queued for removal by `sweep`, in
     /// `SWEEP_BUDGET`-sized bites. Refilled (by scanning the namespaces for
     /// expired keys and collecting their `migrated` marks) only once this drains empty,
@@ -486,6 +497,8 @@ impl Cache {
             incrs: 0,
             cas_sets: 0,
             cas_deletes: 0,
+            touches: 0,
+            touch_misses: 0,
             pending_removal: VecDeque::new(),
             last_handoff_at: None,
             handoff_tombstones: HashMap::with_hasher(RandomState::new()),
@@ -596,6 +609,7 @@ impl Cache {
         promote: bool,
         now: Instant,
     ) -> Option<(Bytes, Option<Duration>)> {
+        self.touches += 1;
         let id = self.find_namespace(&key.namespace);
         let last_used = promote.then(|| self.tick());
         let name = &key.name[..];
@@ -609,6 +623,7 @@ impl Cache {
         };
 
         let Some(entry) = entry else {
+            self.touch_misses += 1;
             if promote {
                 self.misses += 1;
             }
@@ -618,6 +633,7 @@ impl Cache {
         if entry.is_expired_at(now) {
             self.remove_entry_in(id.expect("an entry was found in it"), name);
             self.expirations += 1;
+            self.touch_misses += 1;
             if promote {
                 self.misses += 1;
             }
@@ -1619,6 +1635,8 @@ impl Cache {
             incrs: self.incrs,
             cas_sets: self.cas_sets,
             cas_deletes: self.cas_deletes,
+            touches: self.touches,
+            touch_misses: self.touch_misses,
             namespaces,
         }
     }
@@ -2177,6 +2195,44 @@ mod tests {
         cache.touch(&key(b"nope"), None, true);
         let stats = cache.stats();
         assert_eq!((stats.hits, stats.misses), (1, 1));
+    }
+
+    #[test]
+    fn touch_counts_every_frame_and_the_ones_that_found_nothing() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set_with_ttl(
+            key(b"short"),
+            Bytes::from_static(b"v"),
+            Duration::from_secs(5),
+        );
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+        let now = Instant::now();
+
+        // A hit, a missing key and an expired one, plain and with `G`.
+        cache.touch_at(&key(b"name"), None, false, now);
+        cache.touch_at(&key(b"nope"), None, false, now);
+        cache.touch_at(&key(b"short"), None, false, now + Duration::from_secs(6));
+        cache.touch_at(&key(b"name"), None, true, now);
+        cache.touch_at(&key(b"nope"), None, true, now);
+        let stats = cache.stats();
+        assert_eq!((stats.touches, stats.touch_misses), (5, 3));
+        // The `G` miss is also a get miss; the plain ones are not.
+        assert_eq!((stats.hits, stats.misses), (1, 1));
+        assert_eq!(stats.expirations, 1);
+    }
+
+    #[test]
+    fn a_touch_forwarded_as_a_handoff_set_is_not_counted_as_a_touch() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.handoff_set(
+            key(b"name"),
+            Bytes::from_static(b"Alice"),
+            Some(Duration::from_secs(10)),
+            false,
+        );
+        let stats = cache.stats();
+        assert_eq!((stats.touches, stats.touch_misses), (0, 0));
     }
 
     #[test]

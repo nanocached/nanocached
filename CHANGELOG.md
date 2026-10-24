@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Added
 
+- `nanocached-node`: `nanocached_node_touches_total` counts the `t` frames a
+  node handles, plain and `G`, found or not, and
+  `nanocached_node_touch_misses_total` counts the ones that found no live
+  entry (a plain touch of a missing key shows up only there; a `t ... G`
+  miss is also in `misses_total`, as for `g`). A touch forwarded to a joiner
+  or an entrant travels as a handoff set and is not counted, like
+  `sets_total`. The CloudWatch allow-list selector in the metrics guide
+  matches both.
 - `nanocached-node`: the `t` command refreshes or removes an entry's TTL in
   place, without rewriting its value, and with `G` also returns the value
   (`V <len> [<ttl>]`) and counts as a read. `t <ns-len> <key-len> [ttl] [G]`:
