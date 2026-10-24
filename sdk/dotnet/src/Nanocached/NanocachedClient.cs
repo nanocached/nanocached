@@ -1726,6 +1726,114 @@ public sealed class NanocachedClient : IDisposable
             .ConfigureAwait(false);
     }
 
+    // ── Touch (issue #825) ───────────────────────────────────────────
+
+    /// <summary>Replaces the TTL of an existing entry in place, without
+    /// rewriting its value (issue #825), and returns whether the key
+    /// existed: <c>false</c> for a missing or expired key, which a touch
+    /// never creates. <paramref name="ttlSeconds"/> is counted from the
+    /// moment the node receives the request and has no default:
+    /// <c>null</c> removes the TTL, 0 expires the entry at once (the
+    /// opposite of <see cref="SetAsync(string, string, long)"/>, where 0
+    /// means no expiry), and a negative value throws
+    /// <see cref="ArgumentOutOfRangeException"/> before any I/O.
+    ///
+    /// <para>Unlike INCR and the compare-and-set family a touch is
+    /// idempotent, so a request whose reply was lost is retried like
+    /// get/set/delete are, never thrown as
+    /// <see cref="ConnectionLostException"/>. In a cluster it goes to every
+    /// owner, like a set, and the primary's answer is returned. Throws
+    /// <see cref="ServerTooOldException"/> against a node that predates the
+    /// command.</para></summary>
+    public Task<bool> TouchAsync(string key, long? ttlSeconds) => TouchAsync(EmptyNamespace, key, ttlSeconds);
+
+    /// <summary>As <see cref="TouchAsync(string, long?)"/>.</summary>
+    public Task<bool> TouchAsync(byte[] key, long? ttlSeconds) => TouchAsync(EmptyNamespace, key, ttlSeconds);
+
+    /// <summary>issue #105: as <see cref="TouchAsync(string, long?)"/>, scoped to
+    /// <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal Task<bool> TouchAsync(byte[] namespaceBytes, string key, long? ttlSeconds) =>
+        TouchAsync(namespaceBytes, Utf8(key, "key"), ttlSeconds);
+
+    /// <summary>issue #105: as <see cref="TouchAsync(byte[], long?)"/>, scoped to
+    /// <paramref name="namespaceBytes"/>.</summary>
+    internal async Task<bool> TouchAsync(byte[] namespaceBytes, byte[] key, long? ttlSeconds)
+    {
+        ValidateTouchTtl(ttlSeconds);
+        ValidateKey(namespaceBytes, key);
+        await BeforeOperationAsync().ConfigureAwait(false);
+        return await WithClusterRetryAsync(
+            () => WriteAsync(namespaceBytes, key, connection => connection.TouchAsync(namespaceBytes, key, ttlSeconds)))
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>Reads a value and replaces its TTL in one step (issue
+    /// #825); <c>null</c> on a miss, which creates nothing. See
+    /// <see cref="TouchAsync(string, long?)"/> for
+    /// <paramref name="ttlSeconds"/>. Decoded as strict UTF-8, like
+    /// <see cref="GetAsync(string)"/>.
+    ///
+    /// <para>A read that writes: it goes to the key's primary like a write
+    /// (one refresh and retry on a wrong-node answer or a connection
+    /// failure; no hedging, and no fallback to a replica on a miss) and the
+    /// other owners are sent the plain touch, so a replica is never the
+    /// only owner touched. It counts as a read on the primary, which makes
+    /// the entry the most recently used.</para></summary>
+    public Task<string?> GetAndTouchAsync(string key, long? ttlSeconds) =>
+        GetAndTouchAsync(EmptyNamespace, key, ttlSeconds);
+
+    /// <summary>As <see cref="GetAndTouchAsync(string, long?)"/>.</summary>
+    public Task<string?> GetAndTouchAsync(byte[] key, long? ttlSeconds) =>
+        GetAndTouchAsync(EmptyNamespace, key, ttlSeconds);
+
+    internal Task<string?> GetAndTouchAsync(byte[] namespaceBytes, string key, long? ttlSeconds) =>
+        GetAndTouchAsync(namespaceBytes, Utf8(key, "key"), ttlSeconds);
+
+    internal async Task<string?> GetAndTouchAsync(byte[] namespaceBytes, byte[] key, long? ttlSeconds)
+    {
+        byte[]? value = await GetAndTouchBytesAsync(namespaceBytes, key, ttlSeconds).ConfigureAwait(false);
+        return value is null ? null : StrictUtf8.GetString(value);
+    }
+
+    /// <summary>The raw-bytes companion to
+    /// <see cref="GetAndTouchAsync(string, long?)"/>: no decoding.
+    /// Transparently decompresses when <c>Compress</c> is enabled.</summary>
+    public Task<byte[]?> GetAndTouchBytesAsync(string key, long? ttlSeconds) =>
+        GetAndTouchBytesAsync(EmptyNamespace, key, ttlSeconds);
+
+    /// <summary>As <see cref="GetAndTouchBytesAsync(string, long?)"/>.</summary>
+    public Task<byte[]?> GetAndTouchBytesAsync(byte[] key, long? ttlSeconds) =>
+        GetAndTouchBytesAsync(EmptyNamespace, key, ttlSeconds);
+
+    internal Task<byte[]?> GetAndTouchBytesAsync(byte[] namespaceBytes, string key, long? ttlSeconds) =>
+        GetAndTouchBytesAsync(namespaceBytes, Utf8(key, "key"), ttlSeconds);
+
+    internal async Task<byte[]?> GetAndTouchBytesAsync(byte[] namespaceBytes, byte[] key, long? ttlSeconds)
+    {
+        ValidateTouchTtl(ttlSeconds);
+        ValidateKey(namespaceBytes, key);
+        await BeforeOperationAsync().ConfigureAwait(false);
+        byte[]? raw = await WithClusterRetryAsync(() => WriteAsync(
+            namespaceBytes, key,
+            connection => connection.GetAndTouchAsync(namespaceBytes, key, ttlSeconds),
+            // A replica is sent the plain touch: it has no value to return,
+            // and `G` there would only move the value over the wire for nothing.
+            connection => connection.TouchAsync(namespaceBytes, key, ttlSeconds)))
+            .ConfigureAwait(false);
+        return raw is null || !_compress ? raw : Compression.DecompressValue(raw, _inflateBudget);
+    }
+
+    private static void ValidateTouchTtl(long? ttlSeconds)
+    {
+        if (ttlSeconds < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ttlSeconds),
+                $"nanocached: ttlSeconds must not be negative (pass null to remove the TTL), got {ttlSeconds}");
+        }
+    }
+
     public Task SetManyAsync(IReadOnlyDictionary<string, string> values, long ttlSeconds = 0) =>
         SetManyAsync(EmptyNamespace, values, ttlSeconds);
 
@@ -3438,7 +3546,13 @@ public sealed class NanocachedClient : IDisposable
         })).ConfigureAwait(false);
     }
 
-    private async Task<T> WriteAsync<T>(byte[] namespaceBytes, byte[] key, Func<Connection, Task<T>> op)
+    /// <summary><paramref name="replicaOp"/> (issue #825) — when non-null —
+    /// is sent to every non-primary owner, fire-and-forget legs included,
+    /// instead of <paramref name="op"/>: only the primary's answer decides
+    /// the result, so a get-and-touch asks just the primary for the value
+    /// and sends the others the plain touch.</summary>
+    private async Task<T> WriteAsync<T>(
+        byte[] namespaceBytes, byte[] key, Func<Connection, Task<T>> op, Func<Connection, Task>? replicaOp = null)
     {
         if (_ring is null)
         {
@@ -3460,7 +3574,18 @@ public sealed class NanocachedClient : IDisposable
         {
             try
             {
-                await ApplyReconnectingAsync(name, op).ConfigureAwait(false);
+                if (replicaOp is null)
+                {
+                    await ApplyReconnectingAsync(name, op).ConfigureAwait(false);
+                }
+                else
+                {
+                    await ApplyReconnectingAsync<object?>(name, async connection =>
+                    {
+                        await replicaOp(connection).ConfigureAwait(false);
+                        return null;
+                    }).ConfigureAwait(false);
+                }
             }
             catch (Exception error) when (error is NanocachedException or IOException
                 or System.Net.Sockets.SocketException or ObjectDisposedException)

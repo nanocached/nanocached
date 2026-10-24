@@ -282,9 +282,13 @@ internal sealed class Connection
     /// namespace bytes ahead of the key.</summary>
     internal async Task<byte[]?> GetAsync(byte[] namespaceBytes, byte[] key)
     {
-        var (marker, value, _, _) = await RequestAsync(tag =>
+        var (marker, value, ttlSeconds, _) = await RequestAsync(tag =>
             Frame(GetHeader(namespaceBytes, key.Length, tag), namespaceBytes, key, null))
             .ConfigureAwait(false);
+        // issue #825: a plain get is never answered with a TTL-bearing V
+        // (that is get-and-touch's reply shape) — one means the request and
+        // response streams are misaligned.
+        if (marker == (byte)'V' && ttlSeconds != NoTtlField) throw Mismatch(marker);
         return marker switch
         {
             (byte)'V' => value,
@@ -406,6 +410,62 @@ internal sealed class Connection
         }
     }
 
+    /// <summary>issue #825 — the always-namespaced touch: replaces the TTL
+    /// of the entry at (<paramref name="namespaceBytes"/>, <paramref
+    /// name="key"/>) without rewriting its value and returns whether the key
+    /// existed (<c>false</c> for a miss, which a touch never creates).
+    /// <paramref name="ttlSeconds"/> counts from the node's receipt of the
+    /// request: <c>null</c> removes the TTL, 0 expires the entry at once.
+    /// Like <see cref="IncrAsync"/>, <c>t</c> has no legacy uppercase form.
+    /// Unlike it, a touch is idempotent and not primary-only — it talks to
+    /// the ONE node this connection is dialed to, and
+    /// <see cref="NanocachedClient"/> sends it to every owner. A node that
+    /// predates the command answers <c>En</c>; that surfaces as
+    /// <see cref="ServerTooOldException"/>.</summary>
+    internal async Task<bool> TouchAsync(byte[] namespaceBytes, byte[] key, long? ttlSeconds)
+    {
+        var (marker, _, _, _) = await RequestTouchAsync(namespaceBytes, key, ttlSeconds, withValue: false)
+            .ConfigureAwait(false);
+        return marker switch
+        {
+            (byte)'S' => true,
+            (byte)'N' => false,
+            (byte)'W' => throw new WrongNodeException(),
+            _ => throw Mismatch(marker),
+        };
+    }
+
+    /// <summary>issue #825: as <see cref="TouchAsync"/> with the <c>G</c>
+    /// flag — also returns the value (<c>null</c> on a miss). The reply's
+    /// own TTL field (the TTL now in effect) is parsed and not surfaced.</summary>
+    internal async Task<byte[]?> GetAndTouchAsync(byte[] namespaceBytes, byte[] key, long? ttlSeconds)
+    {
+        var (marker, value, _, _) = await RequestTouchAsync(namespaceBytes, key, ttlSeconds, withValue: true)
+            .ConfigureAwait(false);
+        return marker switch
+        {
+            (byte)'V' => value,
+            (byte)'N' => null,
+            (byte)'W' => throw new WrongNodeException(),
+            _ => throw Mismatch(marker),
+        };
+    }
+
+    private async Task<(byte Marker, byte[]? Value, long TtlSeconds, List<MultiEntry>? Entries)> RequestTouchAsync(
+        byte[] namespaceBytes, byte[] key, long? ttlSeconds, bool withValue)
+    {
+        try
+        {
+            return await RequestAsync(tag =>
+                Frame(TouchHeader(namespaceBytes, key.Length, ttlSeconds, withValue, tag), namespaceBytes, key, null))
+                .ConfigureAwait(false);
+        }
+        catch (ServerRejectedException rejected)
+        {
+            throw new ServerTooOldException(rejected);
+        }
+    }
+
     /// <summary>issue #105: <c>g &lt;ns-len&gt; &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
     /// when namespaced, or the untouched legacy <c>G &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
     /// otherwise.</summary>
@@ -451,6 +511,17 @@ internal sealed class Connection
     /// locale-dependent one.</summary>
     private static string IncrHeader(byte[] namespaceBytes, int keyLength, long delta, uint? tag) =>
         $"i {namespaceBytes.Length} {keyLength} {delta.ToString(CultureInfo.InvariantCulture)}{TagField(tag)}\n";
+
+    /// <summary>issue #825: <c>t &lt;ns-len&gt; &lt;key-len&gt;[ &lt;ttl&gt;][ G][ &lt;tag&gt;]\n</c> —
+    /// always lowercase and always namespaced, like <see cref="IncrHeader"/>.
+    /// A <c>null</c> <paramref name="ttlSeconds"/> omits the TTL field
+    /// (removes the TTL); 0 is sent, and expires the entry at once — the
+    /// opposite of <see cref="SetHeader"/>, where 0 means no expiry.</summary>
+    private static string TouchHeader(byte[] namespaceBytes, int keyLength, long? ttlSeconds, bool withValue, uint? tag)
+    {
+        string ttlField = ttlSeconds is long seconds ? $" {seconds.ToString(CultureInfo.InvariantCulture)}" : "";
+        return $"t {namespaceBytes.Length} {keyLength}{ttlField}{(withValue ? " G" : "")}{TagField(tag)}\n";
+    }
 
     /// <summary>issue #141: <c>k &lt;ns-len&gt; &lt;key-len&gt; &lt;val-len&gt; &lt;cond&gt; [&lt;ttl-seconds&gt;][ &lt;tag&gt;]\n</c> —
     /// always lowercase and always namespaced, like <see cref="IncrHeader"/>.
@@ -741,6 +812,12 @@ internal sealed class Connection
     /// 1 initial attempt plus up to 2 retries. Fixed by the protocol's
     /// spec, not configurable.</summary>
     private const int MaxRequestAttempts = 3;
+
+    /// <summary>issue #825: the <c>TtlSeconds</c> a <c>V</c> response
+    /// carries when its header had no TTL field (a plain get's reply) — 0
+    /// is a real value there (<c>V &lt;len&gt; 0</c>), unlike <c>I</c>'s,
+    /// where 0 stands for "no TTL".</summary>
+    private const long NoTtlField = -1;
 
     /// <summary>issue #125: the delay before each retry —
     /// <c>RetryDelays[0]</c> before the 2nd attempt, <c>RetryDelays[1]</c>
@@ -1070,8 +1147,12 @@ internal sealed class Connection
             case (byte)'V':
             {
                 // Untagged: `V <len>`. Tagged: `V <len> <tag>` (echoed response tags).
+                // issue #825: get-and-touch's reply also carries the TTL now
+                // in effect — `V <len> <ttl>`, tagged `V <len> <ttl> <tag>` —
+                // disambiguated by the field count, like `I` below.
                 string[] fields = (await ReadLineAsync().ConfigureAwait(false)).Split(' ');
-                if (fields.Length != (_tagged ? 2 : 1))
+                int bareFields = _tagged ? 2 : 1;
+                if (fields.Length != bareFields && fields.Length != bareFields + 1)
                 {
                     throw new ConnectionLostException("nanocached: invalid value header in response");
                 }
@@ -1085,11 +1166,19 @@ internal sealed class Connection
                 {
                     throw new ConnectionLostException("nanocached: invalid value length in response");
                 }
-                uint? tag = _tagged ? ParseTag(fields[1]) : null;
+                long ttlSeconds = NoTtlField;
+                if (fields.Length == bareFields + 1)
+                {
+                    if (!long.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out ttlSeconds) || ttlSeconds < 0)
+                    {
+                        throw new ConnectionLostException("nanocached: invalid ttl in value response");
+                    }
+                }
+                uint? tag = _tagged ? ParseTag(fields[^1]) : null;
 
                 var value = new byte[length];
                 await _stream.ReadExactlyAsync(value).ConfigureAwait(false);
-                return (marker, value, 0, tag, null);
+                return (marker, value, ttlSeconds, tag, null);
             }
             case (byte)'I':
             {
@@ -1162,6 +1251,12 @@ internal sealed class Connection
                 uint tag = ParseTag(await ReadLineAsync(stripLeadingSpace: false).ConfigureAwait(false));
                 return (marker, null, 0, tag, null);
             }
+            case (byte)'E':
+                // issue #825: `En` — a node that does not know the command
+                // just sent. It closes the connection right after; consume
+                // the rest of the line so the failure carries its own type.
+                await ReadLineAsync().ConfigureAwait(false);
+                throw new ServerRejectedException();
             case (byte)'B':
                 // Busy is unsolicited and always bare (echoed response tags) — never
                 // tagged, even on a tagged connection.

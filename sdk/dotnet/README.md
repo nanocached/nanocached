@@ -337,6 +337,42 @@ format.
 [Reconnect and keep-alive](#reconnect-and-keep-alive) for what that means
 for a request that loses its connection mid-flight.
 
+## Touch and GetAndTouch
+
+`TouchAsync` replaces an entry's TTL in place, without rewriting its value,
+and returns whether the key existed. `GetAndTouchAsync` (and
+`GetAndTouchBytesAsync`) reads the value and replaces the TTL in one step:
+
+```csharp
+await client.SetAsync("session", "abc", ttlSeconds: 60);
+await client.TouchAsync("session", 300);              // true — now expires in 300 s
+await client.TouchAsync("session", null);             // true — never expires
+await client.GetAndTouchAsync("session", 300);        // "abc"
+await client.TouchAsync("session", 0);                // true — expires at once
+await client.TouchAsync("missing", 30);               // false — a touch never creates a key
+```
+
+`ttlSeconds` is a required `long?` with no default, and it is not
+`SetAsync`'s: `null` removes the TTL and `0` expires the entry at once,
+which is the opposite of `SetAsync`, where `0` means no expiry. A negative
+value throws `ArgumentOutOfRangeException` before any network call. A miss
+is `false` for `TouchAsync` and `null` for `GetAndTouchAsync`.
+`client.Namespace(ns)` handles have all three.
+
+A touch never changes the value, so it cannot overwrite a write that lands
+at the same time. Unlike `IncrAsync` and the compare-and-set family it is
+idempotent: it goes to every owner of the key like a `SetAsync`, and a
+request whose reply was lost is retried like `GetAsync`/`SetAsync`/
+`DeleteAsync`, never thrown as `ConnectionLostException`. `GetAndTouchAsync`
+is a read that writes, so it goes to the primary like a write (one refresh
+and retry on a wrong-node answer or a connection failure; no hedging, and
+no fallback to a replica on a miss) and the other owners are sent the plain
+touch.
+
+Against a node older than the release that added the command, both throw
+`ServerTooOldException`: such a node answers `En` and closes the
+connection. Upgrade every node before using them.
+
 ## Replication
 
 The cluster's replication factor R rides along with the node list, so

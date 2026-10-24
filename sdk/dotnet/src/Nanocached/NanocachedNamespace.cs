@@ -89,6 +89,31 @@ public sealed class NanocachedNamespace
     /// <summary>Returns whether the key existed before this call.</summary>
     public Task<bool> DeleteAsync(byte[] key) => _client.DeleteAsync(_namespace, key);
 
+    /// <summary>issue #825: as <see cref="NanocachedClient.TouchAsync(string, long?)"/>,
+    /// scoped to this handle's namespace.</summary>
+    public Task<bool> TouchAsync(string key, long? ttlSeconds) => _client.TouchAsync(_namespace, key, ttlSeconds);
+
+    /// <summary>issue #825: as <see cref="TouchAsync(string, long?)"/>.</summary>
+    public Task<bool> TouchAsync(byte[] key, long? ttlSeconds) => _client.TouchAsync(_namespace, key, ttlSeconds);
+
+    /// <summary>issue #825: as <see cref="NanocachedClient.GetAndTouchAsync(string, long?)"/>,
+    /// scoped to this handle's namespace.</summary>
+    public Task<string?> GetAndTouchAsync(string key, long? ttlSeconds) =>
+        _client.GetAndTouchAsync(_namespace, key, ttlSeconds);
+
+    /// <summary>issue #825: as <see cref="GetAndTouchAsync(string, long?)"/>.</summary>
+    public Task<string?> GetAndTouchAsync(byte[] key, long? ttlSeconds) =>
+        _client.GetAndTouchAsync(_namespace, key, ttlSeconds);
+
+    /// <summary>issue #825: as <see cref="NanocachedClient.GetAndTouchBytesAsync(string, long?)"/>,
+    /// scoped to this handle's namespace.</summary>
+    public Task<byte[]?> GetAndTouchBytesAsync(string key, long? ttlSeconds) =>
+        _client.GetAndTouchBytesAsync(_namespace, key, ttlSeconds);
+
+    /// <summary>issue #825: as <see cref="GetAndTouchBytesAsync(string, long?)"/>.</summary>
+    public Task<byte[]?> GetAndTouchBytesAsync(byte[] key, long? ttlSeconds) =>
+        _client.GetAndTouchBytesAsync(_namespace, key, ttlSeconds);
+
     /// <summary>issue #151: as <see cref="NanocachedClient.GetManyAsync(IReadOnlyList{string})"/>,
     /// scoped to this handle's namespace.</summary>
     public Task<Dictionary<string, string>> GetManyAsync(IReadOnlyList<string> keys) =>

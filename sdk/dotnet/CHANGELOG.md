@@ -10,6 +10,20 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Added
+
+- `TouchAsync(key, ttlSeconds)` replaces an entry's TTL in place and
+  returns whether the key existed; `GetAndTouchAsync(key, ttlSeconds)` and
+  `GetAndTouchBytesAsync` read the value and replace the TTL in one step.
+  All three are on `NanocachedNamespace` too. `ttlSeconds` is a required
+  `long?`: `null` removes the TTL and `0` expires the entry at once (the
+  opposite of `SetAsync`, where `0` means no expiry). They are idempotent,
+  so unlike `IncrAsync` and the compare-and-set family a lost reply is
+  retried; they go to every owner (`GetAndTouchAsync` asks only the primary
+  for the value). Against a node that predates the command they throw the
+  new `ServerTooOldException`. Needs a server release that includes the
+  `t` command.
+
 ## [0.4.8] - 2026-10-21
 
 ### Fixed

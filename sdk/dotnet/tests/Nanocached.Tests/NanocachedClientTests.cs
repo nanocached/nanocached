@@ -3706,6 +3706,256 @@ public class NanocachedClientTests
         Assert.Empty(unobserved);
     }
 
+    // ── Touch / get-and-touch (issue #825) ──────────────────────────
+
+    [Fact]
+    public async Task TouchFramesCarryTheTtlAndTheGetFlag()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v");
+        await client.TouchAsync("k", 30);
+        await client.TouchAsync("k", null);
+        await client.GetAndTouchAsync("k", 45);
+        await client.GetAndTouchAsync("k", null);
+        await client.Namespace("tenant").TouchAsync("k", 7);
+
+        Assert.Equal(
+            new[] { "t 0 1 30", "t 0 1", "t 0 1 45 G", "t 0 1 G", "t 6 1 7" },
+            node.TouchFrames);
+    }
+
+    [Fact]
+    public async Task TouchReplacesTheTtlInPlaceAndNeverCreatesAKey()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        byte[] none = Array.Empty<byte>();
+
+        await client.SetAsync("k", "v", 100);
+        Assert.Equal(100, node.TtlOf(none, Bytes("k")));
+
+        Assert.True(await client.TouchAsync("k", 30));
+        Assert.Equal(30, node.TtlOf(none, Bytes("k")));
+        Assert.Equal("v", await client.GetAsync("k"));
+
+        Assert.True(await client.TouchAsync("k", null));
+        Assert.Null(node.TtlOf(none, Bytes("k")));
+
+        Assert.False(await client.TouchAsync("missing", 30));
+        Assert.Null(await client.GetAsync("missing"));
+
+        // 0 expires the entry at once — the opposite of SetAsync, where 0 means no expiry.
+        Assert.True(await client.TouchAsync("k", 0));
+        Assert.Null(await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task GetAndTouchReturnsTheValueAndMissesWithoutCreatingAnything()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        byte[] none = Array.Empty<byte>();
+
+        await client.SetAsync("k", "value", 100);
+        Assert.Equal("value", await client.GetAndTouchAsync("k", 30));
+        Assert.Equal(30, node.TtlOf(none, Bytes("k")));
+        Assert.Equal(Bytes("value"), await client.GetAndTouchBytesAsync("k", null));
+        Assert.Null(node.TtlOf(none, Bytes("k")));
+
+        Assert.Null(await client.GetAndTouchAsync("missing", 30));
+        Assert.Null(await client.GetAndTouchBytesAsync("missing", 30));
+        Assert.False(node.Store.ContainsKey(MockNode.KeyOf(Bytes("missing"))));
+    }
+
+    [Fact]
+    public async Task TouchIsScopedToItsNamespace()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        NanocachedNamespace tenant = client.Namespace("tenant");
+
+        await tenant.SetAsync("k", "in-tenant", 100);
+        await client.SetAsync("k", "in-default", 100);
+
+        Assert.True(await tenant.TouchAsync("k", 5));
+        Assert.Equal("in-tenant", await tenant.GetAndTouchAsync("k", 6));
+        Assert.Equal(Bytes("in-tenant"), await tenant.GetAndTouchBytesAsync("k", 7));
+        Assert.False(await tenant.TouchAsync("only-default", 5));
+
+        Assert.Equal(7, node.TtlOf(Bytes("tenant"), Bytes("k")));
+        Assert.Equal(100, node.TtlOf(Array.Empty<byte>(), Bytes("k")));
+    }
+
+    [Fact]
+    public async Task GetAndTouchDecompressesWhenCompressionIsEnabled()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port));
+
+        string value = string.Concat(Enumerable.Repeat("compressible ", 200));
+        await client.SetAsync("k", value);
+        Assert.Equal(value, await client.GetAndTouchAsync("k", 30));
+    }
+
+    [Fact]
+    public async Task TouchRejectsAnInvalidTtlBeforeAnyIo()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v");
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => client.TouchAsync("k", -1));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => client.TouchAsync("k", long.MinValue));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => client.GetAndTouchAsync("k", -1));
+        Assert.Empty(node.TouchFrames);
+    }
+
+    [Fact]
+    public async Task TouchWorksOnATaggedConnection()
+    {
+        using var node = new MockNode(supportTags: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v", 100);
+        Assert.True(await client.TouchAsync("k", 30));
+        Assert.Equal("v", await client.GetAndTouchAsync("k", 40));
+        Assert.False(await client.TouchAsync("missing", 5));
+        Assert.Equal(40, node.TtlOf(Array.Empty<byte>(), Bytes("k")));
+        Assert.Equal(3, node.TouchFrames.Count);
+    }
+
+    [Fact]
+    public async Task AnOldServerIsReportedAsServerTooOldAndTheClientStaysUsable()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v");
+        node.RejectTouchLikeAnOldServer();
+        await Assert.ThrowsAsync<ServerTooOldException>(() => client.TouchAsync("k", 30));
+        await Assert.ThrowsAsync<ServerTooOldException>(() => client.GetAndTouchAsync("k", 30));
+        Assert.Equal("v", await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task TouchAppliedButAcknowledgementLostIsResentUnlikeIncr()
+    {
+        // A touch is idempotent, so a lost reply is resent like get/set/
+        // delete — where INCR throws ConnectionLostException instead.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v", 100);
+        node.FailTouchAfterApplyOnce();
+        Assert.True(await client.TouchAsync("k", 30));
+        Assert.Equal(2, node.TouchFrames.Count);
+
+        await client.SetAsync("counter", "10");
+        node.FailIncrAfterApplyOnce();
+        await Assert.ThrowsAsync<ConnectionLostException>(() => client.IncrAsync("counter", 5));
+    }
+
+    // A touch fans out to every owner like a set; get-and-touch asks the
+    // primary alone for the value.
+
+    [Fact]
+    public async Task TouchGoesToEveryOwner()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "shared-key";
+        await client.SetAsync(key, "v", 100);
+
+        Assert.True(await client.TouchAsync(key, 30));
+
+        foreach (string owner in OwnersOf(key))
+        {
+            MockNode node = cluster.Nodes[owner];
+            Assert.Equal(new[] { "t 0 10 30" }, node.TouchFrames);
+            Assert.Equal(30, node.TtlOf(Array.Empty<byte>(), Bytes(key)));
+        }
+    }
+
+    [Fact]
+    public async Task GetAndTouchSendsGToThePrimaryOnlyAndThePlainTouchToReplicas()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "shared-key";
+        await client.SetAsync(key, "v", 100);
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+
+        Assert.Equal("v", await client.GetAndTouchAsync(key, 30));
+
+        Assert.Equal(new[] { "t 0 10 30 G" }, primary.TouchFrames);
+        Assert.Equal(new[] { "t 0 10 30" }, replica.TouchFrames);
+        Assert.Equal(30, replica.TtlOf(Array.Empty<byte>(), Bytes(key)));
+    }
+
+    [Fact]
+    public async Task GetAndTouchDoesNotFallBackToAReplicaOnAPrimaryMiss()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "shared-key";
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+        // Only the replica holds the value.
+        replica.Store[MockNode.KeyOf(Bytes(key))] = Bytes("v");
+
+        Assert.Null(await client.GetAndTouchAsync(key, 30));
+
+        Assert.Equal(new[] { "t 0 10 30 G" }, primary.TouchFrames);
+        Assert.Equal(new[] { "t 0 10 30" }, replica.TouchFrames); // the replica is never asked for the value
+    }
+
+    [Fact]
+    public async Task TouchRecoversFromAWrongNodeAnswer()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "shared-key";
+        await client.SetAsync(key, "v", 100);
+        MockNode primary = cluster.Nodes[OwnersOf(key)[0]];
+        primary.AnswerWrongNodeOnce();
+
+        Assert.True(await client.TouchAsync(key, 30));
+        Assert.Equal("v", await client.GetAndTouchAsync(key, 31));
+        Assert.True(primary.TouchFrames.Count >= 2, "the touch was re-sent after the refresh");
+    }
+
+    [Fact]
+    public async Task AReplicaThatPredatesTouchDoesNotFailThePrimarysAnswer()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "shared-key";
+        await client.SetAsync(key, "v", 100);
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode primary = cluster.Nodes[owners[0]];
+        cluster.Nodes[owners[1]].RejectTouchLikeAnOldServer();
+
+        Assert.True(await client.TouchAsync(key, 30));
+        Assert.Equal("v", await client.GetAndTouchAsync(key, 40));
+        Assert.Equal(40, primary.TtlOf(Array.Empty<byte>(), Bytes(key)));
+        Assert.True(client.Stats().ReplicaWriteFailures > 0);
+    }
+
     // ── 値の圧縮 (value compression) ──────────────────────────────
 
     private static NanocachedClient.Options CompressingOptions(int port, int threshold = 256) =>

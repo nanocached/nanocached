@@ -234,6 +234,34 @@ public sealed class NotNumericException : NanocachedException
 }
 
 /// <summary>
+/// issue #825 — raised by <c>TouchAsync</c>/<c>GetAndTouchAsync</c> against
+/// a node that predates the <c>t</c> command: such a node answers <c>En</c>
+/// and closes the connection. The SDK only sends frames it has validated,
+/// so a node's <c>En</c> to a touch means it does not know the command —
+/// upgrade every node to a release that includes it. A bare disconnect
+/// with no <c>En</c> cannot be told apart from any other lost connection
+/// and stays a <see cref="ConnectionLostException"/>.
+/// </summary>
+public sealed class ServerTooOldException : NanocachedException
+{
+    internal ServerTooOldException(Exception inner)
+        : base("nanocached: the server does not know the touch command (t) — upgrade every node to a release that includes it", inner) { }
+}
+
+/// <summary>
+/// issue #825 — internal: the node answered <c>E</c> (<c>En</c>). Derives
+/// from <see cref="ConnectionLostException"/> so every command other than
+/// touch keeps surfacing exactly what it always did for an unexpected
+/// response; <c>Connection.TouchAsync</c> alone turns it into
+/// <see cref="ServerTooOldException"/>.
+/// </summary>
+internal sealed class ServerRejectedException : ConnectionLostException
+{
+    internal ServerRejectedException()
+        : base("nanocached: unexpected response from server: E") { }
+}
+
+/// <summary>
 /// issue #321 — INCR/DECR is structurally incompatible with <c>Compress</c>:
 /// a successful increment forwards the primary's literal ASCII result to
 /// replicas as an unmarked <c>Set</c>, while <c>Compress</c> unconditionally
