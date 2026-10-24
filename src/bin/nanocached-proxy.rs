@@ -28,7 +28,10 @@
 //!   key's primary, falling to the next owner if the primary is
 //!   unreachable; writes and deletes fan out to all R owners with the
 //!   primary's ack answering the client (replica failures are logged
-//!   and swallowed, the SDKs' own stance); a `W` from a node means the
+//!   and swallowed, the SDKs' own stance; `t` (issue #824) goes the same
+//!   way, with the value of a `G` touch coming from the primary alone and
+//!   a lost connection re-sent rather than failed, since a touch is
+//!   idempotent); a `W` from a node means the
 //!   proxy's roster is stale — refresh once and retry, never forwarded
 //!   to the client. `c`/`F` (#106) fan out to every member; any failure
 //!   forces one refresh-and-retry before the operation fails. To a
@@ -1463,6 +1466,18 @@ enum Request {
         key: Bytes,
         expected_digest: [u8; 16],
     },
+    /// Issue #824: `t` (refresh or remove a TTL in place, with an
+    /// optional get). Always namespaced, same reasoning as `Incr`.
+    /// `ttl` is `None` when the field was omitted, which asks the node to
+    /// remove the TTL. Unlike `Incr`/CAS this is idempotent, so it is
+    /// written like `Set`: to every owner, with a lost connection
+    /// re-sent (see `finish_touch`).
+    Touch {
+        namespace: Bytes,
+        key: Bytes,
+        ttl: Option<u64>,
+        get: bool,
+    },
     Clear {
         namespace: Bytes,
     },
@@ -2095,6 +2110,54 @@ fn parse_request_body(
             ))
         }
 
+        // Issue #824: `t <ns-len> <key-len> [ttl] [G] [tag]` — see
+        // `Request::Touch`. The tag comes off the end first (tagged mode),
+        // and what is left is `[ttl] [G]`, which content alone tells apart.
+        "t" => {
+            let (rest, tag) = if tagged {
+                let (tag_field, rest) =
+                    fields.split_last().ok_or_else(|| invalid("missing tag"))?;
+                let tag = u32::try_from(parse_length_field(tag_field)?)
+                    .map_err(|_| invalid("tag out of range"))?;
+                (rest, Some(tag))
+            } else {
+                (fields.as_slice(), None)
+            };
+            let [namespace_length, key_length, tail @ ..] = rest else {
+                return Err(invalid("bad touch header"));
+            };
+            let (tail, get) = match tail {
+                [head @ .., "G"] => (head, true),
+                _ => (tail, false),
+            };
+            let ttl = match tail {
+                [] => None,
+                [ttl] => Some(parse_length_field(ttl)? as u64),
+                _ => return Err(invalid("bad touch header")),
+            };
+            let namespace_length = parse_length_field(namespace_length)?;
+            let key_length = parse_length_field(key_length)?;
+            if key_length == 0 {
+                return Err(invalid("empty key"));
+            }
+            let body = body!(
+                namespace_length
+                    .checked_add(key_length)
+                    .ok_or_else(|| invalid("frame length overflow"))?
+            );
+            let namespace = body.slice(..namespace_length);
+            let key = body.slice(namespace_length..);
+            Ok(ParseOutcome::Ready(
+                Request::Touch {
+                    namespace,
+                    key,
+                    ttl,
+                    get,
+                },
+                tag,
+            ))
+        }
+
         "c" => {
             let (lengths, tag) = split_tag(&fields)?;
             let [namespace_length] = lengths.as_slice() else {
@@ -2137,6 +2200,12 @@ enum Expect {
     /// or `W`/`E`. `x`'s reply reuses `Expect::Deleted` unchanged (`D`/`N`
     /// is already exactly that shape).
     CasSet,
+    /// Issue #824: `t`'s reply without `G` — `S` (touched) or `N`, or
+    /// `W`/`E`.
+    Touch,
+    /// Issue #824: `t ... G`'s reply — `V <len> [ttl] <tag>` + body, or
+    /// `N`/`W`/`E`.
+    Touched,
     /// Issues #128/#150: `M <n> <r-1>...<r-n> <tag>` + concatenated hit
     /// values, or `E`. Parsed specially in `read_reply` (a variable
     /// roster, unlike every other reply's fixed field count), never
@@ -2176,6 +2245,11 @@ enum NodeReply {
     /// primary INCR's *result* can be fanned out to replicas as a plain
     /// `Set` without silently dropping the TTL (see `PrimaryCommand`).
     Incremented(Bytes, Option<u64>),
+    /// Issue #824: a get-and-touch's `V <len> <ttl> <tag>` — the value
+    /// with the TTL now in effect in whole seconds. A `V` without a TTL
+    /// field (the entry has none) reads as `Value`, which `Expect::Touched`
+    /// accepts too.
+    Touched(Bytes, u64),
     /// Issue #129: the key exists but its value isn't `INCR`'s counter
     /// grammar, or `delta` would overflow — the wire's `T` status.
     NotNumeric,
@@ -2794,6 +2868,11 @@ async fn read_reply<S: AsyncRead + Unpin>(
     // TTL.
     let (echoed, value_length, ttl) = match (marker, fields.as_slice()) {
         ("V", [length, tag_field]) => (*tag_field, Some(parse_length_field(length)?), None),
+        ("V", [length, ttl_field, tag_field]) => (
+            *tag_field,
+            Some(parse_length_field(length)?),
+            Some(parse_length_field(ttl_field)? as u64),
+        ),
         ("I", [length, tag_field]) => (*tag_field, Some(parse_length_field(length)?), None),
         ("I", [length, ttl_field, tag_field]) => (
             *tag_field,
@@ -2815,7 +2894,11 @@ async fn read_reply<S: AsyncRead + Unpin>(
                 return Err(invalid("backend value exceeds the request-size limit"));
             }
             read_exact_into(stream, buf, length).await?;
-            NodeReply::Value(buf.split_to(length).freeze())
+            let value = buf.split_to(length).freeze();
+            match ttl {
+                Some(ttl) => NodeReply::Touched(value, ttl),
+                None => NodeReply::Value(value),
+            }
         }
         ("I", Some(length)) => {
             if length > MAX_REQUEST_SIZE {
@@ -2841,6 +2924,16 @@ async fn read_reply<S: AsyncRead + Unpin>(
         (
             NodeReply::Value(_) | NodeReply::NotFound | NodeReply::WrongNode | NodeReply::Error,
             Expect::Value
+        ) | (
+            NodeReply::Value(_)
+                | NodeReply::Touched(..)
+                | NodeReply::NotFound
+                | NodeReply::WrongNode
+                | NodeReply::Error,
+            Expect::Touched
+        ) | (
+            NodeReply::Stored | NodeReply::NotFound | NodeReply::WrongNode | NodeReply::Error,
+            Expect::Touch
         ) | (
             NodeReply::Stored | NodeReply::WrongNode | NodeReply::Error,
             Expect::Stored
@@ -2955,6 +3048,22 @@ fn frame_delete(namespace: &[u8], key: &[u8]) -> Bytes {
     } else {
         format!("d {} {} {TAG_PLACEHOLDER}\n", namespace.len(), key.len()).into_bytes()
     };
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame.into()
+}
+
+/// Issue #824: always the lowercase, namespaced `t`. No `ttl` asks the
+/// node to remove the TTL; `get` adds the `G` token.
+fn frame_touch(namespace: &[u8], key: &[u8], ttl: Option<u64>, get: bool) -> Bytes {
+    let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
+    let get_field = if get { " G" } else { "" };
+    let mut frame = format!(
+        "t {} {}{ttl_field}{get_field} {TAG_PLACEHOLDER}\n",
+        namespace.len(),
+        key.len()
+    )
+    .into_bytes();
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
     frame.into()
@@ -3382,6 +3491,24 @@ impl SharedBackends {
         join_all(futs).await
     }
 
+    /// `enqueue_each` for requests that do not all expect the same reply:
+    /// a get-and-touch asks the primary for the value and every replica
+    /// for a bare ack.
+    async fn enqueue_mixed<'a>(
+        &'a self,
+        context: &'a ProxyContext,
+        requests: impl IntoIterator<Item = (&'a str, Bytes, Expect)>,
+    ) -> Vec<PendingReply> {
+        let futs = requests
+            .into_iter()
+            .map(|(addr, frame, expect)| {
+                Box::pin(self.enqueue(context, addr, frame, expect))
+                    as Pin<Box<dyn Future<Output = PendingReply> + Send + 'a>>
+            })
+            .collect();
+        join_all(futs).await
+    }
+
     /// `call` on every `(addr, frame)` in `requests` concurrently — the
     /// retry-path counterpart of `enqueue_each`, same ordering.
     async fn call_each<'a>(
@@ -3601,6 +3728,20 @@ fn respond_multi_ack(entries: &[ProxyAckEntry], tag: Option<u32>) -> Vec<u8> {
     header.into_bytes()
 }
 
+/// Issue #824: a get-and-touch's reply — `V <len> [ttl] [tag]\n<value>`,
+/// mirroring `Response::Touched`'s wire form on the node side
+/// (`src/response.rs`).
+fn respond_touched(value: &[u8], ttl: Option<u64>, tag: Option<u32>) -> Vec<u8> {
+    let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
+    let header = match tag {
+        Some(tag) => format!("V {}{ttl_field} {tag}\n", value.len()),
+        None => format!("V {}{ttl_field}\n", value.len()),
+    };
+    let mut framed = header.into_bytes();
+    framed.extend_from_slice(value);
+    framed
+}
+
 /// Issue #129: `INCR`'s success reply — `I <len> [ttl] [tag]\n<value>`,
 /// mirroring `Response::Incremented`'s own wire form on the node side
 /// (`src/response.rs`).
@@ -3758,6 +3899,27 @@ async fn dispatch_request(
                     &namespace,
                     &key,
                     None,
+                    enqueued,
+                    tag,
+                    retry_capable,
+                )
+                .await;
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
+            });
+        }
+        Request::Touch {
+            namespace,
+            key,
+            ttl,
+            get,
+        } => {
+            let enqueued = enqueue_touch(&context, &ring, &namespace, &key, ttl, get).await;
+            tokio::spawn(async move {
+                let result = finish_touch(
+                    &context,
+                    &namespace,
+                    &key,
+                    (ttl, get),
                     enqueued,
                     tag,
                     retry_capable,
@@ -4538,6 +4700,142 @@ async fn refan_write(
     }
 }
 
+/// The frames of a touch for its owners, primary first, and what each
+/// leg expects back. A replica is always sent the plain touch, whatever
+/// the client asked: the client's answer is the primary's, so a replica
+/// has no value to return, and sending it `G` would only move the value
+/// over the wire for nothing.
+fn touch_legs<'a>(
+    owners: &'a [String],
+    namespace: &[u8],
+    key: &[u8],
+    ttl: Option<u64>,
+    get: bool,
+) -> Vec<(&'a str, Bytes, Expect)> {
+    let primary_expect = if get { Expect::Touched } else { Expect::Touch };
+    let plain = frame_touch(namespace, key, ttl, false);
+    owners
+        .iter()
+        .enumerate()
+        .map(|(index, addr)| match (index, get) {
+            (0, true) => (
+                addr.as_str(),
+                frame_touch(namespace, key, ttl, true),
+                primary_expect,
+            ),
+            (0, false) => (addr.as_str(), plain.clone(), primary_expect),
+            _ => (addr.as_str(), plain.clone(), Expect::Touch),
+        })
+        .collect()
+}
+
+/// Issue #824: enqueues a touch on every owner concurrently, like
+/// `enqueue_write`.
+async fn enqueue_touch(
+    context: &ProxyContext,
+    ring: &RingView,
+    namespace: &[u8],
+    key: &[u8],
+    ttl: Option<u64>,
+    get: bool,
+) -> EnqueuedWrite {
+    let owners = ring.owners(namespace, key);
+    let legs = touch_legs(&owners, namespace, key, ttl, get);
+    let pending = context.backends.enqueue_mixed(context, legs).await;
+    EnqueuedWrite { owners, pending }
+}
+
+/// The client's answer to a touch, from the primary's reply.
+fn touch_answer(reply: &NodeReply, tag: Option<u32>) -> Option<Vec<u8>> {
+    match reply {
+        NodeReply::Stored => Some(respond("S", tag)),
+        NodeReply::Value(value) => Some(respond_touched(value, None, tag)),
+        NodeReply::Touched(value, ttl) => Some(respond_touched(value, Some(*ttl), tag)),
+        NodeReply::NotFound => Some(respond("N", tag)),
+        _ => None,
+    }
+}
+
+/// A touch's completion, shaped like `finish_write`: the primary's reply
+/// answers the client, a replica's failure is logged and swallowed (a
+/// replica that answers `N` simply has no copy to touch, which is not
+/// worth a line), and a primary `W` or transport failure forces one
+/// re-fan over the refreshed ring.
+///
+/// Unlike `i`, `k` and `x` a touch is idempotent (its TTL is absolute from
+/// receipt and it never changes the value), so a connection that failed
+/// after the frame may have reached the node is re-sent, and a second
+/// failure is `Fatal::Transient`, which a client that declared the
+/// retryable-error capability is answered `R` — never `OutcomeUnknown`.
+async fn finish_touch(
+    context: &ProxyContext,
+    namespace: &[u8],
+    key: &[u8],
+    (ttl, get): (Option<u64>, bool),
+    enqueued: EnqueuedWrite,
+    tag: Option<u32>,
+    retry_capable: bool,
+) -> DriverResult {
+    let EnqueuedWrite { owners, pending } = enqueued;
+    let mut replies = Vec::with_capacity(pending.len());
+    for reply in pending {
+        replies.push(reply.await);
+    }
+    let Some(primary_reply) = replies.first() else {
+        return Ok(transient_reply(retry_capable, tag));
+    };
+    for (index, replica_reply) in replies.iter().enumerate().skip(1) {
+        let addr = owners.get(index).map(String::as_str);
+        match replica_reply {
+            Err(error) => match addr {
+                Some(addr) => eprintln!("WARN replica touch to {addr} failed: {error}"),
+                None => eprintln!("WARN replica touch failed: {error}"),
+            },
+            Ok(reply) => note_refused_replica_leg(context, "touch", addr, reply),
+        }
+    }
+
+    match primary_reply {
+        Ok(NodeReply::WrongNode) => {
+            force_refresh(context).await;
+            refan_touch(context, namespace, key, ttl, get, tag, retry_capable).await
+        }
+        Err(_) => refan_touch(context, namespace, key, ttl, get, tag, retry_capable).await,
+        Ok(reply) => touch_answer(reply, tag).ok_or(Fatal::Transient),
+    }
+}
+
+/// `refan_write` for a touch: one whole fan-out over the current ring via
+/// `call` (which redials a dead shared connection).
+async fn refan_touch(
+    context: &ProxyContext,
+    namespace: &[u8],
+    key: &[u8],
+    ttl: Option<u64>,
+    get: bool,
+    tag: Option<u32>,
+    retry_capable: bool,
+) -> DriverResult {
+    let Some(ring) = current_ring(context) else {
+        return Err(Fatal::Transient);
+    };
+    let owners = ring.owners(namespace, key);
+    let Some((primary, replicas)) = owners.split_first() else {
+        return Ok(transient_reply(retry_capable, tag));
+    };
+    let plain = frame_touch(namespace, key, ttl, false);
+    fan_out_to_replicas(context, replicas, plain, Expect::Touch, "touch").await;
+    let (frame, expect) = if get {
+        (frame_touch(namespace, key, ttl, true), Expect::Touched)
+    } else {
+        (frame_touch(namespace, key, ttl, false), Expect::Touch)
+    };
+    match context.backends.call(context, primary, frame, expect).await {
+        Ok(reply) => touch_answer(&reply, tag).ok_or(Fatal::Transient),
+        Err(_) => Err(Fatal::Transient),
+    }
+}
+
 /// A command the primary evaluates against its own copy of the entry:
 /// `i`, `k` and `x`. Unlike a plain write, the replicas are never sent
 /// the command itself. A replica evaluating it against its own (possibly
@@ -4968,7 +5266,13 @@ fn request_cost(request: &Request, frame_bytes: usize, replication: usize) -> us
     let legs = replication.max(1) + 1;
     match request {
         Request::Get { .. } => frame_bytes.saturating_add(MAX_REQUEST_SIZE),
-        Request::Set { .. }
+        // A get-and-touch is answered with up to one full value, like `G`,
+        // and re-framed once per owner leg like a write.
+        Request::Touch { get: true, .. } => frame_bytes
+            .saturating_mul(legs)
+            .saturating_add(MAX_REQUEST_SIZE),
+        Request::Touch { get: false, .. }
+        | Request::Set { .. }
         | Request::Delete { .. }
         | Request::Incr { .. }
         | Request::CasSet { .. }
@@ -6734,6 +7038,9 @@ mod tests {
 
     type Store = Arc<StdMutex<StdHashMap<(Vec<u8>, Vec<u8>), Vec<u8>>>>;
 
+    /// Issue #824: the `(ttl, get)` of every `t` a mock node received.
+    type TouchLog = Arc<StdMutex<Vec<(Option<u64>, bool)>>>;
+
     /// A mock node speaking the tagged-mode slice of the protocol the
     /// proxy produces, with knobs for W and slowness.
     struct MockNode {
@@ -6768,6 +7075,14 @@ mod tests {
         close_after_cas_set_apply_once: Arc<AtomicBool>,
         /// Issue #293: same idea, for the next `x` (CAS delete) request.
         close_after_cas_delete_apply_once: Arc<AtomicBool>,
+        /// Issue #824: the `(ttl, get)` of every `t` this node received, in
+        /// arrival order — shows which legs were sent `G` and which TTL.
+        touches: TouchLog,
+        /// Issue #824: applies the next `t` that finds its key (a touch
+        /// changes nothing the mock stores), then drops the connection
+        /// instead of replying — the reply lost after the node executed
+        /// it. A touch is idempotent, so the proxy must re-send it.
+        close_after_touch_apply_once: Arc<AtomicBool>,
         get_delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
         /// Issue #110: set when a request was already buffered before
@@ -6819,6 +7134,8 @@ mod tests {
                 close_after_incr_applies: Arc::new(AtomicUsize::new(0)),
                 close_after_cas_set_apply_once: Arc::new(AtomicBool::new(false)),
                 close_after_cas_delete_apply_once: Arc::new(AtomicBool::new(false)),
+                touches: Arc::new(StdMutex::new(Vec::new())),
+                close_after_touch_apply_once: Arc::new(AtomicBool::new(false)),
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
                 auth_count: Arc::new(AtomicUsize::new(0)),
                 saw_pipelined: Arc::new(AtomicBool::new(false)),
@@ -6841,6 +7158,8 @@ mod tests {
             let close_after_cas_set_apply_once = Arc::clone(&node.close_after_cas_set_apply_once);
             let close_after_cas_delete_apply_once =
                 Arc::clone(&node.close_after_cas_delete_apply_once);
+            let touches = Arc::clone(&node.touches);
+            let close_after_touch_apply_once = Arc::clone(&node.close_after_touch_apply_once);
             let delay = Arc::clone(&node.get_delay);
             let auth_count = Arc::clone(&node.auth_count);
             let saw_pipelined = Arc::clone(&node.saw_pipelined);
@@ -6873,6 +7192,8 @@ mod tests {
                             close_after_cas_delete_apply_once: Arc::clone(
                                 &close_after_cas_delete_apply_once,
                             ),
+                            touches: Arc::clone(&touches),
+                            close_after_touch_apply_once: Arc::clone(&close_after_touch_apply_once),
                             delay: Arc::clone(&delay),
                             auth_count: Arc::clone(&auth_count),
                             saw_pipelined: Arc::clone(&saw_pipelined),
@@ -6907,6 +7228,10 @@ mod tests {
             self.set_ttls.lock().unwrap().clone()
         }
 
+        fn touches(&self) -> Vec<(Option<u64>, bool)> {
+            self.touches.lock().unwrap().clone()
+        }
+
         fn entry(&self, namespace: &[u8], key: &[u8]) -> Option<Vec<u8>> {
             self.store
                 .lock()
@@ -6930,6 +7255,14 @@ mod tests {
         close_after_incr_applies: Arc<AtomicUsize>,
         close_after_cas_set_apply_once: Arc<AtomicBool>,
         close_after_cas_delete_apply_once: Arc<AtomicBool>,
+        /// Issue #824: the `(ttl, get)` of every `t` this node received, in
+        /// arrival order — shows which legs were sent `G` and which TTL.
+        touches: TouchLog,
+        /// Issue #824: applies the next `t` that finds its key (a touch
+        /// changes nothing the mock stores), then drops the connection
+        /// instead of replying — the reply lost after the node executed
+        /// it. A touch is idempotent, so the proxy must re-send it.
+        close_after_touch_apply_once: Arc<AtomicBool>,
         delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
         saw_pipelined: Arc<AtomicBool>,
@@ -6967,6 +7300,8 @@ mod tests {
             close_after_incr_applies,
             close_after_cas_set_apply_once,
             close_after_cas_delete_apply_once,
+            touches,
+            close_after_touch_apply_once,
             delay,
             auth_count,
             saw_pipelined,
@@ -7396,6 +7731,60 @@ mod tests {
                             stream
                                 .write_all(format!("N {}\n", tag(&fields)).as_bytes())
                                 .await?;
+                        }
+                    }
+                    // Issue #824: mirrors the real node's `t` (no TTL fidelity,
+                    // like `S`/`s` above). The fields after the two lengths are
+                    // `[ttl] [G]` and then the tag, which the proxy always adds.
+                    "t" => {
+                        let ns_length: usize = fields[0].parse().unwrap();
+                        let key_length: usize = fields[1].parse().unwrap();
+                        let tail = &fields[2..fields.len() - 1];
+                        let get = tail.last().is_some_and(|field| field == "G");
+                        let ttl_fields = if get { &tail[..tail.len() - 1] } else { tail };
+                        let ttl: Option<u64> = ttl_fields.first().map(|field| field.parse().unwrap());
+                        read_exact_into(&mut stream, &mut buf, ns_length + key_length).await?;
+                        let body = buf.split_to(ns_length + key_length);
+                        let namespace = body[..ns_length].to_vec();
+                        let key = body[ns_length..].to_vec();
+                        if wrong_once.swap(false, Ordering::SeqCst) {
+                            stream
+                                .write_all(format!("W {}\n", tag(&fields)).as_bytes())
+                                .await?;
+                            continue;
+                        }
+                        touches.lock().unwrap().push((ttl, get));
+                        let current = store.lock().unwrap().get(&(namespace, key)).cloned();
+                        match current {
+                            None => {
+                                stream
+                                    .write_all(format!("N {}\n", tag(&fields)).as_bytes())
+                                    .await?;
+                            }
+                            Some(value) => {
+                                if close_after_touch_apply_once.swap(false, Ordering::SeqCst) {
+                                    return Ok(());
+                                }
+                                if get {
+                                    let ttl_field =
+                                        ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
+                                    stream
+                                        .write_all(
+                                            format!(
+                                                "V {}{ttl_field} {}\n",
+                                                value.len(),
+                                                tag(&fields)
+                                            )
+                                            .as_bytes(),
+                                        )
+                                        .await?;
+                                    stream.write_all(&value).await?;
+                                } else {
+                                    stream
+                                        .write_all(format!("S {}\n", tag(&fields)).as_bytes())
+                                        .await?;
+                                }
+                            }
                         }
                     }
                     "D" | "d" => {
@@ -9799,6 +10188,333 @@ mod tests {
         assert_eq!(replica.incrs(), 0);
         assert_eq!(primary.entry(b"", b"counter"), Some(b"15".to_vec()));
         assert_eq!(replica.entry(b"", b"counter"), Some(b"15".to_vec()));
+    }
+
+    // ── issue #824: `t` ───────────────────────────────────────────────
+
+    fn parsed_touch(frame: &[u8], tagged: bool) -> (Request, Option<u32>) {
+        let mut input = BytesMut::from(frame);
+        let Ok(ParseOutcome::Ready(request, tag)) =
+            parse_request(&mut input, tagged, &mut RequestScanState::default())
+        else {
+            panic!("did not parse: {}", String::from_utf8_lossy(frame));
+        };
+        assert!(input.is_empty());
+        (request, tag)
+    }
+
+    fn touch_request(namespace: &[u8], key: &[u8], ttl: Option<u64>, get: bool) -> Request {
+        Request::Touch {
+            namespace: Bytes::copy_from_slice(namespace),
+            key: Bytes::copy_from_slice(key),
+            ttl,
+            get,
+        }
+    }
+
+    #[test]
+    fn a_touch_parses_with_every_combination_of_ttl_and_get() {
+        for (frame, expected) in [
+            (
+                &b"t 5 4\nusersname"[..],
+                touch_request(b"users", b"name", None, false),
+            ),
+            (
+                b"t 5 4 30\nusersname",
+                touch_request(b"users", b"name", Some(30), false),
+            ),
+            (
+                b"t 5 4 0\nusersname",
+                touch_request(b"users", b"name", Some(0), false),
+            ),
+            (
+                b"t 5 4 G\nusersname",
+                touch_request(b"users", b"name", None, true),
+            ),
+            (
+                b"t 5 4 30 G\nusersname",
+                touch_request(b"users", b"name", Some(30), true),
+            ),
+            (
+                b"t 0 4 30\nname",
+                touch_request(b"", b"name", Some(30), false),
+            ),
+        ] {
+            assert_eq!(parsed_touch(frame, false), (expected, None));
+        }
+    }
+
+    #[test]
+    fn a_touch_carries_its_tag_last_in_tagged_mode() {
+        // `t 5 4 7` is a TTL when untagged and a tag alone when tagged.
+        assert_eq!(
+            parsed_touch(b"t 5 4 7\nusersname", false).0,
+            touch_request(b"users", b"name", Some(7), false)
+        );
+        for (frame, expected) in [
+            (
+                &b"t 5 4 7\nusersname"[..],
+                touch_request(b"users", b"name", None, false),
+            ),
+            (
+                b"t 5 4 30 7\nusersname",
+                touch_request(b"users", b"name", Some(30), false),
+            ),
+            (
+                b"t 5 4 G 7\nusersname",
+                touch_request(b"users", b"name", None, true),
+            ),
+            (
+                b"t 5 4 30 G 7\nusersname",
+                touch_request(b"users", b"name", Some(30), true),
+            ),
+        ] {
+            assert_eq!(parsed_touch(frame, true), (expected, Some(7)));
+        }
+    }
+
+    #[test]
+    fn a_malformed_touch_is_rejected() {
+        for (frame, tagged) in [
+            (&b"t 5 4 G 30\nusersname"[..], false),
+            (b"t 5 4 G G\nusersname", false),
+            (b"t 5 4 g\nusersname", false),
+            (b"t 5 4 abc\nusersname", false),
+            (b"t 5 4 30 30\nusersname", false),
+            (b"t 5 0 30\nusers", false),
+            (b"t 4\nname", false),
+            (b"t 5 4\nusersname", true),
+        ] {
+            let mut input = BytesMut::from(frame);
+            assert!(
+                parse_request(&mut input, tagged, &mut RequestScanState::default()).is_err(),
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+    }
+
+    #[test]
+    fn a_touch_frame_to_the_node_is_always_namespaced_and_names_its_ttl_and_get() {
+        assert_eq!(
+            &frame_touch(b"", b"key", None, false)[..],
+            format!("t 0 3 {TAG_PLACEHOLDER}\nkey").as_bytes()
+        );
+        assert_eq!(
+            &frame_touch(b"ns", b"key", Some(60), true)[..],
+            format!("t 2 3 60 G {TAG_PLACEHOLDER}\nnskey").as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_get_and_touch_is_charged_for_the_value_it_can_return() {
+        let plain = touch_request(b"", b"key", Some(1), false);
+        let get = touch_request(b"", b"key", Some(1), true);
+        assert!(request_cost(&get, 20, 2) >= request_cost(&plain, 20, 2) + MAX_REQUEST_SIZE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_touch_reaches_every_owner_and_only_the_primary_is_asked_for_the_value() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+        let primary_addr = ring.owners(b"", b"key")[0].clone();
+        let (primary, replica) = if primary_addr == nodes[0].addr {
+            (&nodes[0], &nodes[1])
+        } else {
+            (&nodes[1], &nodes[0])
+        };
+
+        stream.write_all(b"S 3 1\nkeyv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        // Plain: both owners get the same plain touch; the answer is `S`.
+        stream.write_all(b"t 0 3 30\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        // No TTL field removes the TTL, and the field is not invented.
+        stream.write_all(b"t 0 3\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        // Get-and-touch: the primary's value and TTL answer the client, and
+        // the replica is sent the plain touch, not `G`.
+        stream.write_all(b"t 0 3 60 G\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1 60");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+        stream.write_all(b"t 0 3 G\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+
+        assert_eq!(
+            primary.touches(),
+            vec![
+                (Some(30), false),
+                (None, false),
+                (Some(60), true),
+                (None, true)
+            ]
+        );
+        assert_eq!(
+            replica.touches(),
+            vec![
+                (Some(30), false),
+                (None, false),
+                (Some(60), false),
+                (None, false)
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_touch_of_a_missing_key_answers_n_and_a_namespaced_touch_finds_its_own_key() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"t 0 4 30\nnope").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+        stream.write_all(b"t 0 4 30 G\nnope").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+
+        stream.write_all(b"s 2 3 1\nnskeyv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        stream.write_all(b"t 0 3 30\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+        stream.write_all(b"t 2 3 30 G\nnskey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1 30");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+        // A touch never creates a key.
+        assert!(nodes.iter().all(|node| node.entry(b"", b"nope").is_none()));
+        assert!(nodes.iter().all(|node| node.entry(b"", b"key").is_none()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tagged_touch_is_answered_with_its_tag_after_the_ttl() {
+        let (_nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+
+        stream.write_all(b"S 3 1 1\nkeyv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 1");
+        stream.write_all(b"t 0 3 30 2\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 2");
+        stream.write_all(b"t 0 3 30 G 3\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1 30 3");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+        stream.write_all(b"t 0 3 G 4\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1 4");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+        stream.write_all(b"t 0 4 30 5\nnope").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N 5");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_ring_answer_to_a_touch_is_refreshed_once_and_the_touch_succeeds() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+        let primary_addr = ring.owners(b"", b"key")[0].clone();
+        let primary = if primary_addr == nodes[0].addr {
+            &nodes[0]
+        } else {
+            &nodes[1]
+        };
+        stream.write_all(b"S 3 1\nkeyv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        primary.wrong_node_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"t 0 3 30 G\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1 30");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+        // The `W` was answered once, then the touch went through.
+        assert_eq!(primary.touches(), vec![(Some(30), true)]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_touch_whose_reply_is_lost_is_re_sent_not_failed() {
+        // Unlike `i`/`k`/`x`, a touch is idempotent: the primary applied it
+        // and the reply never arrived, and re-sending changes nothing, so
+        // the client gets the answer instead of an `E` or an `R`.
+        let (nodes, proxy) = cluster(1).await;
+        let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            1,
+        );
+        let primary_addr = ring.owners(b"", b"key")[0].clone();
+        let primary = if primary_addr == nodes[0].addr {
+            &nodes[0]
+        } else {
+            &nodes[1]
+        };
+        stream.write_all(b"S 3 1 1\nkeyv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 1");
+
+        primary
+            .close_after_touch_apply_once
+            .store(true, Ordering::SeqCst);
+        stream.write_all(b"t 0 3 30 2\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 2");
+        assert_eq!(
+            primary.touches(),
+            vec![(Some(30), false), (Some(30), false)],
+            "one attempt whose reply was lost, one re-send"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_touch_that_cannot_reach_its_node_is_r_to_a_retry_capable_client() {
+        // The retryable status, not the fatal `E` an `i`, `k` or `x` gets
+        // when its outcome is unknown: a touch can always be sent again.
+        let proxy = dead_node_cluster().await;
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        stream.write_all(b"A 1 R\nx").await.unwrap();
+        let mut buf = BytesMut::new();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+
+        stream.write_all(b"t 0 4 30\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R");
+        stream.write_all(b"t 0 4 30 G\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pipelined_touch_then_get_reach_the_node_in_the_clients_order() {
+        let (nodes, proxy) = cluster(1).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"S 3 1\nkeyv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        stream
+            .write_all(b"t 0 3 30\nkeyG 3\nkeyt 0 3 G\nkey")
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+        let touches: usize = nodes.iter().map(|node| node.touches().len()).sum();
+        assert_eq!(touches, 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
