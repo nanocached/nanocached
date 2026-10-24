@@ -1292,6 +1292,7 @@ async fn incr_on_a_non_numeric_stored_value_errors_not_numeric() {
     node.stop();
 }
 
+#[cfg(feature = "compression")]
 #[tokio::test]
 async fn incr_on_a_compressing_client_errors_before_any_io() {
     let node = MockNode::start().await;
@@ -3140,6 +3141,7 @@ async fn touch_is_scoped_to_its_namespace() {
     node.stop();
 }
 
+#[cfg(feature = "compression")]
 #[tokio::test]
 async fn get_and_touch_decompresses_when_compression_is_enabled() {
     let node = MockNode::start().await;

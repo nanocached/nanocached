@@ -2257,15 +2257,7 @@ impl NanocachedClient {
             value
         };
         if compress {
-            let charged =
-                budget.fetch_add(value.len() as u64, Ordering::Relaxed) + value.len() as u64;
-            if charged > cap {
-                return Err(Error::Decompression(
-                    "nanocached: cumulative decompressed size of this get_many response exceeds \
-                     the maximum — possible decompression bomb across the batch"
-                        .to_string(),
-                ));
-            }
+            crate::compression::charge_batch_budget(budget, cap, value.len())?;
         }
         Ok(value)
     }
@@ -4762,12 +4754,16 @@ mod tests {
     // applies when compress is enabled (issue #410b), so these tests pass
     // compress=true and marker-prefix their values (MARKER_RAW = 0x00) so
     // decompress_value accepts them as valid, uncompressed wire values.
+    // They need the `compression` feature (without it a compress=true
+    // client cannot exist), so they are compiled only with it.
+    #[cfg(feature = "compression")]
     fn raw_marked(len: usize) -> Vec<u8> {
         let mut value = vec![0u8];
         value.extend(std::iter::repeat_n(b'x', len));
         value
     }
 
+    #[cfg(feature = "compression")]
     #[test]
     fn a_batch_over_the_cumulative_decompression_budget_is_rejected() {
         let budget = AtomicU64::new(0);
@@ -4789,6 +4785,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compression")]
     #[test]
     fn a_batch_exactly_at_the_cumulative_decompression_budget_passes() {
         let budget = AtomicU64::new(0);
@@ -4801,6 +4798,7 @@ mod tests {
         assert_eq!(budget.load(Ordering::Relaxed), 8);
     }
 
+    #[cfg(feature = "compression")]
     #[test]
     fn a_value_that_pushes_an_exactly_at_cap_budget_over_it_is_rejected() {
         // Regression (pass-9 audit, issue #410a): under the old
@@ -4822,6 +4820,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compression")]
     #[test]
     fn the_crossing_entry_is_caught_even_when_it_is_the_only_and_last_one() {
         // Regression (pass-9 audit, issue #410a): the cumulative budget
