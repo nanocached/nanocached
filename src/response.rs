@@ -39,6 +39,16 @@ pub enum MultiAckEntry {
     WrongNode,
 }
 
+/// One key's outcome inside a `Response::MultiTouch` — a plain `y`'s
+/// per-key roster. `Miss` is a key with no live entry; `WrongNode` is
+/// spliced in by the connection handler like `MultiEntry`'s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiTouchEntry {
+    Touched,
+    Miss,
+    WrongNode,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Response {
     Value(Bytes),
@@ -57,6 +67,12 @@ pub enum Response {
     /// reply on a connection, right after its `A` frame — no other
     /// request produces an `O`-leading reply.
     MultiAck(Vec<MultiAckEntry>),
+    /// Reply to a `y` without `G` (`Command::MultiTouch`) — one
+    /// `MultiTouchEntry` per requested key, in request order. Wire form:
+    /// `Y <n> <r-1>...<r-n> [tag]\n` (no body), where each `<r-i>` is `S`
+    /// (touched), `N` (no live entry) or `W` (wrong node). A `y` with `G`
+    /// answers with `Multi`, like `m`.
+    MultiTouch(Vec<MultiTouchEntry>),
     Stored,
     /// `Stored`, for a `U` (handoff) that found the key already holding
     /// exactly that value: the same `S\n` on the wire, told apart only
@@ -238,6 +254,27 @@ fn encode_multi_ack(entries: &[MultiAckEntry], tag: Option<u32>) -> Vec<u8> {
     header.into_bytes()
 }
 
+/// `Response::MultiTouch`'s shared wire encoding for both `encode` and
+/// `encode_with_tag` — see its doc comment for the frame grammar.
+fn encode_multi_touch(entries: &[MultiTouchEntry], tag: Option<u32>) -> Vec<u8> {
+    let mut header = format!("Y {}", entries.len());
+
+    for entry in entries {
+        match entry {
+            MultiTouchEntry::Touched => header.push_str(" S"),
+            MultiTouchEntry::Miss => header.push_str(" N"),
+            MultiTouchEntry::WrongNode => header.push_str(" W"),
+        }
+    }
+
+    if let Some(tag) = tag {
+        let _ = write!(header, " {tag}");
+    }
+    header.push('\n');
+
+    header.into_bytes()
+}
+
 impl Response {
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -290,6 +327,7 @@ impl Response {
 
             Self::Multi(entries) => encode_multi(entries, None),
             Self::MultiAck(entries) => encode_multi_ack(entries, None),
+            Self::MultiTouch(entries) => encode_multi_touch(entries, None),
 
             Self::Entries(_)
             | Self::Keys(_)
@@ -352,6 +390,7 @@ impl Response {
 
             Self::Multi(entries) => encode_multi(entries, Some(tag)),
             Self::MultiAck(entries) => encode_multi_ack(entries, Some(tag)),
+            Self::MultiTouch(entries) => encode_multi_touch(entries, Some(tag)),
 
             // A `U`/`u` with the wrong membership token (see the
             // connection handler) on a tagged connection: answered with the

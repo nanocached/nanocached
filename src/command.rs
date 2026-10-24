@@ -208,6 +208,28 @@ pub enum Command {
         ttl: Option<Duration>,
         get: bool,
     },
+    /// `y <ns-len> <n> <key-len-1> ... <key-len-n> [ttl] [G] [tag]\n<ns><key-1>
+    /// ...<key-n>`: `t` for `n` keys of one namespace under one frame and
+    /// one cache-actor round trip. **One TTL for the whole batch**, as `o`
+    /// has one: it counts from receipt, `0` expires every key at once and
+    /// omitting it removes the TTL. A missing or expired key is answered as
+    /// a miss and never created. With `get` (`G`) the batch is a read as
+    /// well and answers like `m` (the value of each key it touched, up to
+    /// `MAX_MULTI_REPLY_VALUE_BYTES`); without it the answer carries no
+    /// values.
+    ///
+    /// Idempotent and not primary-only, like `Touch`: every owner of a key
+    /// accepts it, and the SDK sends the `G` form to a key's primary and
+    /// the plain form to the others. `execute` answers like `MultiGet` in
+    /// both forms, so the connection handler can forward each touched key
+    /// during a join or a leave as the `Set` it amounts to; it turns that
+    /// into the plain form's reply itself.
+    MultiTouch {
+        namespace: Bytes,
+        keys: Vec<Bytes>,
+        ttl: Option<Duration>,
+        get: bool,
+    },
     /// `c <namespace-length> [tag]\n<namespace>` (issue #106): drops one
     /// namespace's every entry. A zero-length namespace clears the
     /// default one. Not key-addressed, so no wrong-node check applies:
@@ -563,6 +585,26 @@ impl Command {
                 }
             }
 
+            Self::MultiTouch {
+                namespace,
+                keys,
+                ttl,
+                get,
+            } => {
+                // The values of a plain batch never leave the node, so only a
+                // `G` one is bounded by what a reply may carry.
+                let bound = if get {
+                    MAX_MULTI_REPLY_VALUE_BYTES
+                } else {
+                    usize::MAX
+                };
+                let entries = cache
+                    .touch_many(&namespace, &keys, ttl, get, bound)
+                    .into_iter()
+                    .map(|value| value.map_or(MultiEntry::Miss, MultiEntry::Value))
+                    .collect();
+                Response::Multi(entries)
+            }
             Self::Touch { key, ttl, get } => match cache.touch(&key, ttl, get) {
                 Some((value, remaining_ttl)) => Response::Touched(value, remaining_ttl),
                 None => Response::NotFound,
@@ -971,6 +1013,79 @@ fn parse_with_mode(
                 .collect();
 
             Ok((Command::MultiGet { namespace, keys }, tag))
+        }
+
+        // `y <ns-len> <n> <key-len-1>...<key-len-n> [ttl] [G] [tag]\n<ns><key-1>
+        // ...<key-n>` — see `Command::MultiTouch`'s doc comment. `m`'s shape
+        // with `t`'s `[ttl] [G]` tail, and the same "claimed `n` can't outrun
+        // the header" defense.
+        b"y" => {
+            if progress.frame_end.is_some_and(|end| input.len() < end) {
+                return Err(ParseError::Incomplete);
+            }
+            let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+            let count = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+
+            if count == 0 {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let mut key_lengths = Vec::new();
+            for _ in 0..count {
+                let length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+
+                if length == 0 {
+                    return Err(ParseError::EmptyKey);
+                }
+
+                key_lengths.push(length);
+            }
+
+            let mut tail: Vec<&[u8]> = parts.collect();
+            let tag = if tagged {
+                Some(parse_tag(tail.pop().ok_or(ParseError::InvalidLength)?)?)
+            } else {
+                None
+            };
+            let get = tail.last().is_some_and(|field| *field == b"G");
+            if get {
+                tail.pop();
+            }
+            let ttl = match tail[..] {
+                [] => None,
+                [ttl] => Some(parse_ttl(ttl)?),
+                _ => return Err(ParseError::InvalidLength),
+            };
+
+            let namespace_start = header_end + 1;
+            let mut cursor = namespace_start
+                .checked_add(namespace_length)
+                .ok_or(ParseError::InvalidLength)?;
+            let mut key_spans = Vec::with_capacity(key_lengths.len());
+
+            for length in key_lengths {
+                let start = cursor;
+                cursor = start.checked_add(length).ok_or(ParseError::InvalidLength)?;
+                key_spans.push((start, cursor));
+            }
+
+            progress.frame_end = Some(cursor);
+            let frame = take_frame(input, cursor)?;
+            let namespace = frame.slice(namespace_start..namespace_start + namespace_length);
+            let keys = key_spans
+                .into_iter()
+                .map(|(start, end)| frame.slice(start..end))
+                .collect();
+
+            Ok((
+                Command::MultiTouch {
+                    namespace,
+                    keys,
+                    ttl,
+                    get,
+                },
+                tag,
+            ))
         }
 
         // Issue #150: `o <ns-len> <n> <key-len-1> <value-len-1>...
@@ -3129,6 +3244,149 @@ mod tests {
         }
     }
 
+    fn multi_touch(namespace: &[u8], names: &[&[u8]], ttl: Option<u64>, get: bool) -> Command {
+        Command::MultiTouch {
+            namespace: Bytes::copy_from_slice(namespace),
+            keys: names
+                .iter()
+                .map(|name| Bytes::copy_from_slice(name))
+                .collect(),
+            ttl: ttl.map(Duration::from_secs),
+            get,
+        }
+    }
+
+    #[test]
+    fn parses_a_batch_touch_in_every_combination_of_ttl_and_get() {
+        for (frame, expected) in [
+            (
+                &b"y 5 2 1 2\nusersabc"[..],
+                multi_touch(b"users", &[b"a", b"bc"], None, false),
+            ),
+            (
+                b"y 5 2 1 2 30\nusersabc",
+                multi_touch(b"users", &[b"a", b"bc"], Some(30), false),
+            ),
+            (
+                b"y 5 2 1 2 0\nusersabc",
+                multi_touch(b"users", &[b"a", b"bc"], Some(0), false),
+            ),
+            (
+                b"y 5 2 1 2 G\nusersabc",
+                multi_touch(b"users", &[b"a", b"bc"], None, true),
+            ),
+            (
+                b"y 5 2 1 2 30 G\nusersabc",
+                multi_touch(b"users", &[b"a", b"bc"], Some(30), true),
+            ),
+            (b"y 0 1 1 30\na", multi_touch(b"", &[b"a"], Some(30), false)),
+        ] {
+            let mut input = buf(frame);
+            assert_eq!(
+                parse(&mut input),
+                Ok(expected),
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
+            assert!(input.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_batch_touch_carries_the_tag_last_in_tagged_mode() {
+        // `y 0 1 1 7` is a tag alone when tagged and a TTL when not.
+        for (frame, expected, tag) in [
+            (
+                &b"y 0 1 1 7\na"[..],
+                multi_touch(b"", &[b"a"], None, false),
+                7,
+            ),
+            (
+                b"y 0 1 1 30 7\na",
+                multi_touch(b"", &[b"a"], Some(30), false),
+                7,
+            ),
+            (b"y 0 1 1 G 7\na", multi_touch(b"", &[b"a"], None, true), 7),
+            (
+                b"y 0 1 1 30 G 7\na",
+                multi_touch(b"", &[b"a"], Some(30), true),
+                7,
+            ),
+        ] {
+            let mut input = buf(frame);
+            assert_eq!(
+                parse_tagged(&mut input),
+                Ok((expected, Some(tag))),
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
+            assert!(input.is_empty());
+        }
+
+        let mut input = buf(b"y 0 1 1\na");
+        assert_eq!(parse_tagged(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn a_batch_touch_leaves_the_input_untouched_when_the_body_is_incomplete() {
+        let original = b"y 0 2 3 3 30 G\nabc".to_vec();
+        let mut input = buf(&original);
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn a_batch_touch_rejects_zero_keys_an_empty_key_and_a_malformed_header() {
+        for (frame, error) in [
+            (&b"y 0 0\n"[..], ParseError::InvalidLength),
+            (b"y 0 2 1 0\na", ParseError::EmptyKey),
+            // The claimed count outruns the header; never an allocation
+            // for it.
+            (b"y 0 999999999 1\na", ParseError::InvalidLength),
+            // Two TTLs, a TTL that is not a number, a missing namespace
+            // length or count.
+            (b"y 0 1 1 30 40\na", ParseError::InvalidLength),
+            (b"y 0 1 1 soon\na", ParseError::InvalidLength),
+            (b"y 0\n", ParseError::InvalidLength),
+            (b"y\n", ParseError::InvalidLength),
+        ] {
+            let mut input = buf(frame);
+            assert_eq!(
+                parse(&mut input),
+                Err(error),
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_touch_executes_as_a_value_or_miss_per_key_in_request_order() {
+        let mut cache = Cache::new(1024 * 1024);
+        cache.set(
+            Key::new(Bytes::from_static(b"ns"), Bytes::from_static(b"a")),
+            Bytes::from_static(b"1"),
+        );
+        cache.set(
+            Key::new(Bytes::from_static(b"ns"), Bytes::from_static(b"c")),
+            Bytes::from_static(b"3"),
+        );
+
+        let response = multi_touch(b"ns", &[b"a", b"b", b"c"], Some(60), true).execute(&mut cache);
+
+        assert_eq!(
+            response,
+            Response::Multi(vec![
+                MultiEntry::Value(Bytes::from_static(b"1")),
+                MultiEntry::Miss,
+                MultiEntry::Value(Bytes::from_static(b"3")),
+            ])
+        );
+        // `b` was not created.
+        assert_eq!(cache.stats().entries, 2);
+    }
+
     #[test]
     fn touch_carries_the_tag_last_in_tagged_mode() {
         // `t 5 4 7` is a tag alone when tagged and a TTL when not: the
@@ -4186,6 +4444,19 @@ mod tests {
         );
         assert_eq!(cache.get(&key(b"a")), Some(Bytes::from_static(b"1")));
         assert_eq!(cache.get(&key(b"c")), Some(Bytes::from_static(b"3")));
+    }
+
+    #[test]
+    fn multi_touch_encodes_touched_miss_and_wrong_node_entries() {
+        use crate::response::MultiTouchEntry;
+        let response = Response::MultiTouch(vec![
+            MultiTouchEntry::Touched,
+            MultiTouchEntry::Miss,
+            MultiTouchEntry::WrongNode,
+        ]);
+
+        assert_eq!(response.encode(), b"Y 3 S N W\n");
+        assert_eq!(response.encode_with_tag(9), b"Y 3 S N W 9\n");
     }
 
     #[test]

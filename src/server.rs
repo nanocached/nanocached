@@ -2,7 +2,7 @@ use crate::cache::{Cache, SWEEP_BUDGET};
 use crate::command::{Command, MigrateProgress, OwnerCheck, ParseError, parse_resumable};
 use crate::hash_ring::{HashRing, KeyHash, KeyHasher};
 use crate::key::Key;
-use crate::response::{MultiAckEntry, MultiEntry, Response};
+use crate::response::{MultiAckEntry, MultiEntry, MultiTouchEntry, Response};
 use bytes::{Bytes, BytesMut};
 use nanocached::infra;
 use nanocached::infra::{
@@ -2084,8 +2084,9 @@ fn render_node_metrics(
     metric(
         "nanocached_node_touches_total",
         "counter",
-        "Client t (touch and get-and-touch) frames handled, whether or \
-         not the key was there. A touch forwarded to a joining or \
+        "Client touches handled, whether or not the key was there: each \
+         t (touch and get-and-touch) frame and each key of a y (batch \
+         touch) frame. A touch forwarded to a joining or \
          entering node travels as a handoff set and is not counted here, \
          like the handoff frames left out of sets_total. A t with G also \
          counts in hits_total or misses_total, as g does; a plain one \
@@ -2095,7 +2096,7 @@ fn render_node_metrics(
     metric(
         "nanocached_node_touch_misses_total",
         "counter",
-        "The t frames counted in touches_total that found no live entry \
+        "The touches counted in touches_total that found no live entry \
          (missing or expired). One with G is also in misses_total; a \
          plain one is only here.",
         format!(
@@ -3266,6 +3267,152 @@ async fn handle_connection(
                 }
 
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
+
+                continue;
+            }
+            // `t` for a batch of keys of one namespace, with the per-key
+            // wrong-node filtering of `MultiGet`'s arm and, for the keys it
+            // touched, the forwarding of `MultiSet`'s: a key caught
+            // mid-handoff (staged join) or mid-drain (decommission) gets
+            // the value it holds with its new TTL, as the single-key `t`
+            // arm sends it. A key that was not there changed nothing and is
+            // not forwarded.
+            Ok((
+                Command::MultiTouch {
+                    namespace,
+                    keys,
+                    ttl,
+                    get,
+                },
+                tag,
+            )) => {
+                let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
+                let mut owned_positions = Vec::with_capacity(keys.len());
+                let mut owned_keys = Vec::with_capacity(keys.len());
+                let mut hasher = KeyHasher::default();
+                let hashes: Vec<KeyHash> = keys
+                    .iter()
+                    .map(|name| hasher.hash(&Key::new(namespace.clone(), name.clone())))
+                    .collect();
+                let wrong = match &config.node_context {
+                    Some(node_context) => wrong_nodes_refreshed(node_context, &hashes).await,
+                    None => vec![false; keys.len()],
+                };
+
+                for (position, name) in keys.into_iter().enumerate() {
+                    if wrong[position] {
+                        entries[position] = Some(MultiEntry::WrongNode);
+                    } else {
+                        owned_positions.push(position);
+                        owned_keys.push(name);
+                    }
+                }
+
+                if !owned_keys.is_empty() {
+                    // Kept for the forwarding loop below, which looks for
+                    // targets after the touch, not before it (see the
+                    // `MultiSet` arm on why a snapshot taken first can miss
+                    // a handoff that starts meanwhile).
+                    let forward_names = config.node_context.is_some().then(|| owned_keys.clone());
+
+                    let response = execute_command(
+                        &request_tx,
+                        Command::MultiTouch {
+                            namespace: namespace.clone(),
+                            keys: owned_keys,
+                            ttl,
+                            get,
+                        },
+                    )
+                    .await?;
+
+                    let Response::Multi(results) = response else {
+                        unreachable!("Command::MultiTouch always answers with Response::Multi");
+                    };
+
+                    if let (Some(node_context), Some(forward_names)) =
+                        (&config.node_context, forward_names)
+                    {
+                        let mut join_batches: Vec<ForwardBatch> = Vec::new();
+                        let mut leave_batches: Vec<ForwardBatch> = Vec::new();
+
+                        for (name, result) in forward_names.into_iter().zip(results.iter()) {
+                            let MultiEntry::Value(value) = result else {
+                                continue;
+                            };
+                            let key = Key::new(namespace.clone(), name);
+                            let key_hash = hasher.hash(&key);
+
+                            for target in migration_targets_for_hashed(node_context, key_hash) {
+                                ForwardBatch::add(
+                                    &mut join_batches,
+                                    target,
+                                    key.name.clone(),
+                                    value.clone(),
+                                );
+                            }
+                            for target in handoff_targets_for_hashed(node_context, key_hash) {
+                                ForwardBatch::add(
+                                    &mut leave_batches,
+                                    target,
+                                    key.name.clone(),
+                                    value.clone(),
+                                );
+                            }
+                        }
+
+                        for (batches, handoff) in [(join_batches, false), (leave_batches, true)] {
+                            for batch in batches {
+                                let writes = batch.items.into_iter().map(|(name, value)| {
+                                    let key = Key::new(namespace.clone(), name);
+                                    if handoff {
+                                        OwnedForwardedWrite::HandoffSet {
+                                            key,
+                                            value,
+                                            ttl,
+                                            if_absent: false,
+                                        }
+                                    } else {
+                                        OwnedForwardedWrite::Set { key, value, ttl }
+                                    }
+                                });
+                                enqueue_forwards(
+                                    &config,
+                                    node_context.clone(),
+                                    batch.target,
+                                    writes,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+
+                    for (position, result) in owned_positions.into_iter().zip(results) {
+                        entries[position] = Some(result);
+                    }
+                }
+
+                let entries: Vec<MultiEntry> = entries
+                    .into_iter()
+                    .map(|entry| entry.expect("every position filled by one of the two branches"))
+                    .collect();
+                if get {
+                    write_reply(&mut stream, &config, &Response::Multi(entries), tag).await?;
+                } else {
+                    let roster = entries
+                        .into_iter()
+                        .map(|entry| match entry {
+                            MultiEntry::Value(_) => MultiTouchEntry::Touched,
+                            MultiEntry::Miss => MultiTouchEntry::Miss,
+                            MultiEntry::WrongNode => MultiTouchEntry::WrongNode,
+                        })
+                        .collect();
+                    write_response(
+                        &mut stream,
+                        &encode_response(&Response::MultiTouch(roster), tag),
+                    )
+                    .await?;
+                }
 
                 continue;
             }
@@ -12484,6 +12631,116 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_touch_answers_per_key_and_never_creates_one() {
+        replies_of_a_standalone_node(&[
+            (b"s 2 2 2\nnsk1v1", b"S\n"),
+            (b"s 2 2 2\nnsk2v2", b"S\n"),
+            // Plain: a roster of S / N and no values.
+            (b"y 2 3 2 2 2 60\nnsk1k2k3", b"Y 3 S S N\n"),
+            // `G`: the values of the keys it touched, like `m`.
+            (b"y 2 3 2 2 2 60 G\nnsk1k2k3", b"M 3 2 2 -\nv1v2"),
+            (b"y 2 2 2 2 G\nnsk1k2", b"M 2 2 2\nv1v2"),
+            // Another namespace holds none of them.
+            (b"y 0 2 2 2 60\nk1k2", b"Y 2 N N\n"),
+            // A miss does not create the key.
+            (b"y 2 1 2 5\nnsk3", b"Y 1 N\n"),
+            (b"g 2 2\nnsk3", b"N\n"),
+            // The value is never touched by a touch; a zero TTL ends it.
+            (b"g 2 2\nnsk1", b"V 2\nv1"),
+            (b"y 2 2 2 2 0\nnsk1k2", b"Y 2 S S\n"),
+            (b"g 2 2\nnsk1", b"N\n"),
+            (b"g 2 2\nnsk2", b"N\n"),
+        ])
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_touch_is_answered_w_per_key_for_the_keys_this_node_does_not_own() {
+        // Two nodes at R = 1, as for the single touch: only a key's primary
+        // owns it. The keys this node does not own are answered `W` in
+        // place and never reach the cache; the others are dispatched as one
+        // batch.
+        let ring = HashRing::new(vec!["a".to_string(), "b".to_string()]);
+        let theirs = (0..1000)
+            .map(|i| format!("key-{i}"))
+            .find(|name| ring.route(&key(name.as_bytes())) == "a")
+            .expect("some key routes to a");
+        let mine = (0..1000)
+            .map(|i| format!("key-{i}"))
+            .find(|name| ring.route(&key(name.as_bytes())) == "b")
+            .expect("some key routes to b");
+        let node_context = test_node_context(
+            "b",
+            "tok-b",
+            Arc::new(Mutex::new(Some(membership_of(&["a", "b"], 1)))),
+            Arc::new(Mutex::new(None)),
+        );
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        for (get, expected) in [
+            (false, b"Y 2 W S\n".to_vec()),
+            (true, b"M 2 W 1\nv".to_vec()),
+        ] {
+            let flag = if get { " G" } else { "" };
+            client
+                .write_all(
+                    format!(
+                        "y 0 2 {} {} 30{flag}\n{theirs}{mine}",
+                        theirs.len(),
+                        mine.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let request = request_rx.recv().await.unwrap();
+            assert_eq!(
+                request.command,
+                Command::MultiTouch {
+                    namespace: Bytes::new(),
+                    keys: vec![Bytes::from(mine.clone())],
+                    ttl: Some(Duration::from_secs(30)),
+                    get,
+                },
+            );
+            request
+                .response_tx
+                .send(Response::Multi(vec![MultiEntry::Value(
+                    Bytes::from_static(b"v"),
+                )]))
+                .unwrap();
+            let mut reply = vec![0_u8; expected.len()];
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+                .await
+                .expect("a reply within 5 s")
+                .unwrap();
+            assert_eq!(reply, expected);
+        }
+
+        shutdown_tx.send_replace(true);
+        connection_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_touch_is_answered_w_only_by_a_node_that_owns_no_copy_of_the_key() {
         // Two nodes at R = 1: only the key's primary owns it. Unlike `i`,
         // `k` and `x`, a touch needs no primary (every owner accepts it),
@@ -16094,6 +16351,144 @@ mod tests {
         assert!(frames.contains(&expected_b));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn decommission_batch_touch_forwards_the_touched_keys_to_the_entrant() {
+        // The decommission-drain mirror of `a_batch_touch_forwards_each_
+        // touched_key_as_a_set_and_a_miss_forwards_nothing`: a touch
+        // racing a drain-out must reach the entrant, or its copy keeps the
+        // TTL it was handed. The keys are in the cache before the
+        // connection opens, so nothing but the touch is forwarded.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let before_ring = Arc::new(HashRing::new(vec![
+            "leaver".to_string(),
+            "peer".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec!["peer".to_string()]));
+
+        let mut owned_keys = Vec::new();
+        let mut index = 0u32;
+        while owned_keys.len() < 2 {
+            let name = format!("key-{index}");
+            if before_ring.is_owner(&key(name.as_bytes()), "leaver", 1) {
+                owned_keys.push(name);
+            }
+            index += 1;
+            assert!(index < 1000, "expected at least two owned keys in range");
+        }
+        for (name, value) in owned_keys.iter().zip([&b"v1"[..], b"v2"]) {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key(name.as_bytes()),
+                    value: Bytes::copy_from_slice(value),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let mut addresses = HashMap::new();
+        addresses.insert("peer".to_string(), peer_addr);
+        let mut tokens = HashMap::new();
+        tokens.insert("peer".to_string(), "tok-peer".to_string());
+
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(Some(LeaveState {
+                before_ring,
+                after_ring,
+                replication: 1,
+                addresses,
+                tokens,
+                connections: Mutex::new(HashMap::new()),
+            }))),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        let (name_a, name_b) = (&owned_keys[0], &owned_keys[1]);
+        let request = format!(
+            "y 0 2 {} {} 60\n{name_a}{name_b}",
+            name_a.len(),
+            name_b.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"Y 2 S S\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+        peer_task.abort();
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(frames.len(), 2, "both touched keys must reach the entrant");
+        let ttl = Some(Duration::from_secs(60));
+        assert!(frames.contains(&handoff_message(
+            &key(name_a.as_bytes()),
+            b"v1",
+            ttl,
+            false,
+            "tok-peer"
+        )));
+        assert!(frames.contains(&handoff_message(
+            &key(name_b.as_bytes()),
+            b"v2",
+            ttl,
+            false,
+            "tok-peer"
+        )));
+    }
+
     #[test]
     fn leave_clear_targets_names_every_survivor_the_roster_can_reach() {
         let before_ring = Arc::new(HashRing::new(vec![
@@ -17047,6 +17442,35 @@ mod tests {
         ]);
         assert_eq!(joiner, expected_joiner, "joiner");
         assert_eq!(peer, expected_peer, "promoted owner");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_touch_forwards_each_touched_key_as_a_set_and_a_miss_forwards_nothing() {
+        // Like the single-key touch: the new TTL goes out with the value
+        // each touched key holds, as a `Set`, to the joiner and to the
+        // promoted owner; `G` or not makes no difference to what is
+        // forwarded, and a key that was not there changed nothing.
+        let (joiner, peer) = frames_forwarded_to_joiner_and_promoted_owner(&[
+            (b"S 4 2\nkey1v1", b"S\n", 1),
+            (b"S 4 2\nkey2v2", b"S\n", 1),
+            (b"y 0 3 4 4 4 60\nkey1key2nope", b"Y 3 S S N\n", 2),
+            (b"y 0 3 4 4 4 G\nkey1key2nope", b"M 3 2 2 -\nv1v2", 2),
+        ])
+        .await;
+        let (expected_joiner, expected_peer) = per_peer(vec![
+            set_forward(b"key1", b"v1"),
+            set_forward(b"key2", b"v2"),
+            set_forward_with_ttl(b"key1", b"v1", Duration::from_secs(60)),
+            set_forward_with_ttl(b"key2", b"v2", Duration::from_secs(60)),
+            set_forward(b"key1", b"v1"),
+            set_forward(b"key2", b"v2"),
+        ]);
+        let sorted = |mut frames: Vec<Vec<u8>>| {
+            frames.sort();
+            frames
+        };
+        assert_eq!(sorted(joiner), sorted(expected_joiner), "joiner");
+        assert_eq!(sorted(peer), sorted(expected_peer), "promoted owner");
     }
 
     #[tokio::test(flavor = "current_thread")]

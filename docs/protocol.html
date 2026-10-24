@@ -318,6 +318,47 @@ back the earlier value &mdash; see
 <code>En\n</code> and closes the connection, so upgrade every node
 before clients start sending it.</p>
 
+<h2 id="multi-touch">y — batched touch</h2>
+<pre><code>y &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt; [&lt;ttl-seconds&gt;] [G]\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;</code></pre>
+<p><a href="#touch"><code>t</code></a> for <code>n</code> keys of one
+namespace under one frame and, on the node that owns them, one round trip
+through the cache. <code>&lt;ttl-seconds&gt;</code> means what it means for
+<code>t</code> &mdash; counted from receipt, <code>0</code> expires every key
+at once, omitted removes the TTL &mdash; and is <strong>one TTL for the
+whole batch</strong>, as it is for <a href="#multi"><code>o</code></a>. A
+key that is missing or expired is a miss and is never created.
+<code>&lt;namespace-length&gt;</code> is always present, like
+<code>m</code>.</p>
+<p>Without <code>G</code> the reply carries no values:</p>
+<pre><code>Y &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt;\n</code></pre>
+<p>Each <code>&lt;result-i&gt;</code> is <code>S</code> (touched),
+<code>N</code> (no live entry) or <code>W</code> (this node doesn't own this
+particular key), in the order of the request's keys.</p>
+<p>With <code>G</code> the request is a read as well and the reply is
+<code>m</code>'s, for the keys it touched:</p>
+<pre><code>M &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt;\n&lt;values of the hits, concatenated in request order&gt;</code></pre>
+<p>Each <code>&lt;result-i&gt;</code> is a decimal byte length, <code>-</code>
+or <code>W</code>. Unlike a single <code>t</code> with <code>G</code>, there
+is no per-key TTL in the reply: every key has the TTL the frame carried. The
+values in one reply total at most 16 MiB, as for <code>m</code>, and a key
+whose value does not fit is answered <code>-</code> <em>and left
+untouched</em>, so a reply that leaves a value out never refreshed it. Each
+touched key counts as a hit and becomes the most recently used, as for
+<code>G</code>; a miss counts as a miss. Without <code>G</code> a key counts
+as neither and is not protected from eviction.</p>
+<p><code>y</code> is idempotent and not primary-only, like <code>t</code>:
+every owner of a key accepts it, and a client sends it to each owner of the
+keys in the batch. A client that wants the values sends the
+<code>G</code> form to a key's primary and the plain form to its other
+owners. During a join's or a decommission's forwarding window the old owner
+passes each key it touched on as the value it holds with the new TTL, written
+like an <code>S</code>, not as <code>y</code> itself. As for
+<code>m</code>/<code>o</code>, a batch never fails as a whole: a
+<code>W</code> for some keys leaves the answers for the others standing.</p>
+<p><code>y</code> needs a node that knows it: an older node answers
+<code>En\n</code> and closes the connection, so upgrade every node before
+clients start sending it.</p>
+
 <h2 id="multi">m / o — batched get and set</h2>
 <pre><code>m &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt;\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;</code></pre>
 <p>Gets <code>n</code> keys under one frame and, on the node that owns
@@ -391,7 +432,7 @@ frames above carry nothing to verify against. A connection whose
 <code>A</code> carried the <code>T</code> flag and was answered
 <code>OnT</code> runs in <em>tagged mode</em>: every
 <code>G</code>/<code>S</code>/<code>D</code> (and
-<code>g</code>/<code>s</code>/<code>d</code>/<code>c</code>/<code>F</code>/<code>i</code>/<code>t</code>/<code>k</code>/<code>x</code>/<code>m</code>/<code>o</code>)
+<code>g</code>/<code>s</code>/<code>d</code>/<code>c</code>/<code>F</code>/<code>i</code>/<code>t</code>/<code>k</code>/<code>x</code>/<code>m</code>/<code>o</code>/<code>y</code>)
 header must end with a
 client-chosen tag (a u32 in decimal), and the response echoes it as its
 own last field, so a client can verify the pairing before trusting the
