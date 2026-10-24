@@ -181,12 +181,13 @@ pub struct CacheStats {
     /// mismatched or absent key isn't counted here — see
     /// `Cache::cas_delete`.
     pub cas_deletes: u64,
-    /// `t` frames handled, plain and `G`, whether the key was there or
-    /// not. A forward of a touch during a join or a decommission travels as
-    /// a handoff set and is not counted — see `Cache::touch`.
+    /// Touches handled, plain and `G`, whether the key was there or not:
+    /// one per `t` frame and one per key of a `y` frame. A forward of a
+    /// touch during a join or a decommission travels as a handoff set and
+    /// is not counted — see `Cache::touch`.
     pub touches: u64,
-    /// The `t` frames counted in `touches` that found no live entry. A
-    /// `G` one is also in `misses`, as for `g`; a plain one only here.
+    /// The touches counted in `touches` that found no live entry. A `G`
+    /// one is also in `misses`, as for `g`; a plain one only here.
     pub touch_misses: u64,
     /// Largest first; one row per live namespace.
     pub namespaces: Vec<NamespaceStats>,
@@ -300,9 +301,9 @@ pub struct Cache {
     cas_sets: u64,
     /// Issue #141: successful `x` removals — see `CacheStats::cas_deletes`.
     cas_deletes: u64,
-    /// `t` frames handled — see `CacheStats::touches`.
+    /// Touches handled — see `CacheStats::touches`.
     touches: u64,
-    /// `t` frames that found no live entry — see `CacheStats::touch_misses`.
+    /// Touches that found no live entry — see `CacheStats::touch_misses`.
     touch_misses: u64,
     /// Expired/marked keys queued for removal by `sweep`, in
     /// `SWEEP_BUDGET`-sized bites. Refilled (by scanning the namespaces for
@@ -609,10 +610,22 @@ impl Cache {
         promote: bool,
         now: Instant,
     ) -> Option<(Bytes, Option<Duration>)> {
-        self.touches += 1;
         let id = self.find_namespace(&key.namespace);
+        self.touch_in(id, &key.name, ttl, promote, now)
+    }
+
+    /// `touch` in an already resolved namespace, so a batch resolves it once
+    /// (see `touch_many`).
+    fn touch_in(
+        &mut self,
+        id: Option<u64>,
+        name: &[u8],
+        ttl: Option<Duration>,
+        promote: bool,
+        now: Instant,
+    ) -> Option<(Bytes, Option<Duration>)> {
+        self.touches += 1;
         let last_used = promote.then(|| self.tick());
-        let name = &key.name[..];
         let entries = id
             .and_then(|id| self.slots.get_mut(&id))
             .map(|namespace| &mut namespace.entries);
@@ -650,6 +663,60 @@ impl Cache {
             self.hits += 1;
         }
         Some((value, remaining))
+    }
+
+    /// The length of `name`'s value if it is live, without any effect on
+    /// recency, counters or the entry itself.
+    fn live_value_len(&self, id: Option<u64>, name: &[u8], now: Instant) -> Option<usize> {
+        let namespace = self.slots.get(&id?)?;
+        let entry = namespace.entries.peek(name)?;
+        (!entry.is_expired_at(now)).then(|| entry.value.len())
+    }
+
+    /// Batched `touch` for one namespace (a `y` frame), resolving the
+    /// namespace once, like `get_many`. Every name gets `ttl` (`None` removes
+    /// it); `promote` makes each a read (`G`), counted as a hit or a miss.
+    /// Replies in `names` order: the value of an entry that was touched,
+    /// `None` for one that was not there. As in `get_many`, once the values
+    /// returned so far reach `max_value_bytes` the remaining names are
+    /// answered `None` untouched and uncounted, and so is a hit that would
+    /// push the total past it. Unlike a `get_many` hit, that one is left
+    /// alone too, so a reply that leaves a value out never refreshed it.
+    pub fn touch_many(
+        &mut self,
+        namespace: &Bytes,
+        names: &[Bytes],
+        ttl: Option<Duration>,
+        promote: bool,
+        max_value_bytes: usize,
+    ) -> Vec<Option<Bytes>> {
+        let now = Instant::now();
+        let id = self.find_namespace(namespace);
+        let bounded = max_value_bytes != usize::MAX;
+        let mut value_bytes: usize = 0;
+        let mut results = Vec::with_capacity(names.len());
+
+        for name in names {
+            if bounded {
+                let over = value_bytes >= max_value_bytes
+                    || self
+                        .live_value_len(id, name, now)
+                        .is_some_and(|len| value_bytes.saturating_add(len) > max_value_bytes);
+                if over {
+                    results.push(None);
+                    continue;
+                }
+            }
+            match self.touch_in(id, name, ttl, promote, now) {
+                Some((value, _)) => {
+                    value_bytes = value_bytes.saturating_add(value.len());
+                    results.push(Some(value));
+                }
+                None => results.push(None),
+            }
+        }
+
+        results
     }
 
     /// Issue #141: `k` — compare-and-set. Evaluates `condition` against
@@ -2219,6 +2286,168 @@ mod tests {
         // The `G` miss is also a get miss; the plain ones are not.
         assert_eq!((stats.hits, stats.misses), (1, 1));
         assert_eq!(stats.expirations, 1);
+    }
+
+    #[test]
+    fn touch_many_applies_one_ttl_to_every_live_key_and_creates_none() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = Bytes::from_static(b"ns");
+        cache.set_many(
+            &namespace,
+            [
+                (Bytes::from_static(b"a"), Bytes::from_static(b"1")),
+                (Bytes::from_static(b"c"), Bytes::from_static(b"3")),
+            ],
+            Some(Duration::from_secs(5)),
+        );
+        let names = [
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+            Bytes::from_static(b"c"),
+        ];
+
+        let results = cache.touch_many(
+            &namespace,
+            &names,
+            Some(Duration::from_secs(100)),
+            true,
+            UNBOUNDED,
+        );
+
+        assert_eq!(
+            results,
+            vec![
+                Some(Bytes::from_static(b"1")),
+                None,
+                Some(Bytes::from_static(b"3")),
+            ]
+        );
+        assert_eq!(cache.stats().entries, 2);
+        // Both outlive their old five seconds, and a zero TTL ends them.
+        let later = Instant::now() + Duration::from_secs(50);
+        assert!(cache.get_at(&namespaced(b"ns", b"a"), later).is_some());
+        let results = cache.touch_many(&namespace, &names, Some(Duration::ZERO), false, UNBOUNDED);
+        assert_eq!(results.iter().filter(|value| value.is_some()).count(), 2);
+        assert_eq!(cache.get_at(&namespaced(b"ns", b"a"), Instant::now()), None);
+    }
+
+    #[test]
+    fn touch_many_without_a_ttl_removes_it() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = Bytes::from_static(b"ns");
+        cache.set_many(
+            &namespace,
+            [(Bytes::from_static(b"a"), Bytes::from_static(b"1"))],
+            Some(Duration::from_secs(5)),
+        );
+
+        cache.touch_many(
+            &namespace,
+            &[Bytes::from_static(b"a")],
+            None,
+            false,
+            UNBOUNDED,
+        );
+
+        let far = Instant::now() + Duration::from_secs(1_000_000);
+        assert!(cache.get_at(&namespaced(b"ns", b"a"), far).is_some());
+    }
+
+    #[test]
+    fn touch_many_resolves_the_namespace_once_however_many_keys() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = big_namespace(64 * 1024);
+        let names = names(2_000);
+        cache.set_many(
+            &namespace,
+            names
+                .iter()
+                .cloned()
+                .map(|name| (name, Bytes::from_static(b"v"))),
+            None,
+        );
+        let before = cache.name_lookups.get();
+
+        let results = cache.touch_many(
+            &namespace,
+            &names,
+            Some(Duration::from_secs(60)),
+            true,
+            UNBOUNDED,
+        );
+
+        assert_eq!(cache.name_lookups.get() - before, 1);
+        assert!(
+            results
+                .iter()
+                .all(|value| value.as_deref() == Some(&b"v"[..]))
+        );
+        assert_eq!(cache.stats().touches, 2_000);
+    }
+
+    #[test]
+    fn touch_many_counts_each_key_and_only_a_get_form_counts_hits_and_misses() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = Bytes::from_static(b"ns");
+        cache.set_many(
+            &namespace,
+            [(Bytes::from_static(b"a"), Bytes::from_static(b"1"))],
+            None,
+        );
+        let names = [
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+            Bytes::from_static(b"c"),
+        ];
+
+        cache.touch_many(&namespace, &names, None, false, UNBOUNDED);
+        let stats = cache.stats();
+        assert_eq!((stats.touches, stats.touch_misses), (3, 2));
+        assert_eq!((stats.hits, stats.misses), (0, 0));
+
+        cache.touch_many(&namespace, &names, None, true, UNBOUNDED);
+        let stats = cache.stats();
+        assert_eq!((stats.touches, stats.touch_misses), (6, 4));
+        assert_eq!((stats.hits, stats.misses), (1, 2));
+    }
+
+    #[test]
+    fn touch_many_leaves_a_value_that_does_not_fit_the_reply_untouched() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = Bytes::from_static(b"ns");
+        cache.set_many(
+            &namespace,
+            [
+                (Bytes::from_static(b"a"), Bytes::from_static(b"1234")),
+                (Bytes::from_static(b"b"), Bytes::from_static(b"123456")),
+                (Bytes::from_static(b"c"), Bytes::from_static(b"12")),
+                (Bytes::from_static(b"d"), Bytes::from_static(b"1234")),
+            ],
+            Some(Duration::from_secs(5)),
+        );
+        let names = ["a", "b", "c", "d"].map(|name| Bytes::copy_from_slice(name.as_bytes()));
+
+        // Room for 6 bytes: `a` fits, `b` would pass it, `c` still fits and
+        // reaches it, and `d` is not even looked at.
+        let results = cache.touch_many(&namespace, &names, Some(Duration::from_secs(100)), true, 6);
+
+        assert_eq!(
+            results,
+            vec![
+                Some(Bytes::from_static(b"1234")),
+                None,
+                Some(Bytes::from_static(b"12")),
+                None,
+            ]
+        );
+        let later = Instant::now() + Duration::from_secs(50);
+        assert!(cache.get_at(&namespaced(b"ns", b"a"), later).is_some());
+        // `b` and `d` kept their old five seconds: the reply that left them
+        // out is not one that refreshed them.
+        assert_eq!(cache.get_at(&namespaced(b"ns", b"b"), later), None);
+        assert_eq!(cache.get_at(&namespaced(b"ns", b"d"), later), None);
+        assert!(cache.get_at(&namespaced(b"ns", b"c"), later).is_some());
+        assert_eq!(cache.stats().touches, 2);
     }
 
     #[test]

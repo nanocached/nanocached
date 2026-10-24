@@ -14,10 +14,21 @@ framework adapters at one version, whether or not a component changed.
 
 ### Added
 
-- `nanocached-node`: `nanocached_node_touches_total` counts the `t` frames a
-  node handles, plain and `G`, found or not, and
-  `nanocached_node_touch_misses_total` counts the ones that found no live
-  entry (a plain touch of a missing key shows up only there; a `t ... G`
+- `nanocached-node`: the `y` command touches a batch of keys of one namespace
+  in one frame, `y <ns-len> <n> <key-len>... [ttl] [G]`: one TTL for the whole
+  batch, with `t`'s rules (the TTL counts from receipt, `0` expires every key
+  at once, omitting it removes the TTL, a missing key is a miss and is never
+  created). Without `G` the reply is `Y <n> <result>...` with `S`, `N` or `W`
+  per key; with `G` it is `m`'s `M` reply for the keys it touched, and a value
+  that does not fit the 16 MiB reply limit is answered `-` and left
+  untouched. Like `t` it is idempotent and not primary-only, and each touched
+  key is forwarded during a join or a decommission as the value with its new
+  TTL, like a set. A node older than this release answers `En` and closes the
+  connection. The proxy does not forward it yet.
+- `nanocached-node`: `nanocached_node_touches_total` counts the touches a
+  node handles, each `t` frame and each key of a `y` frame, plain and `G`,
+  found or not, and `nanocached_node_touch_misses_total` counts the ones that
+  found no live entry (a plain touch of a missing key shows up only there; a `t ... G`
   miss is also in `misses_total`, as for `g`). A touch forwarded to a joiner
   or an entrant travels as a handoff set and is not counted, like
   `sets_total`. The CloudWatch allow-list selector in the metrics guide

@@ -120,7 +120,7 @@ fn usage() -> ! {
          bulkbench run <addr> <get|set> <loop|bulk> <keyspace> <batch> <concurrency> \
          <duration-secs> <value-size>\n  \
          bulkbench preload-ns <addr> <namespace> <keyspace> <value-size>\n  \
-         bulkbench refresh <addr> <namespace> <batch-reset|pipelined-touch|serial-touch> \
+         bulkbench refresh <addr> <namespace> <batch-reset|pipelined-touch|serial-touch|batch-get-touch> \
          <keyspace> <batch> <concurrency> <duration-secs> <ttl-secs>\n\n\
          Optional env: BULKBENCH_SECRET (sent as an untagged `A` before either subcommand)."
     );
@@ -227,6 +227,21 @@ fn encode_multi_get_ns(namespace: &[u8], keys: &[Vec<u8>]) -> Vec<u8> {
         header.push_str(&format!(" {}", key.len()));
     }
     header.push('\n');
+    let mut frame = header.into_bytes();
+    frame.extend_from_slice(namespace);
+    for key in keys {
+        frame.extend_from_slice(key);
+    }
+    frame
+}
+
+/// `y <ns-len> <n> <key-len>... <ttl> G\n<ns><keys>` — batch get-and-touch.
+fn encode_multi_get_and_touch(namespace: &[u8], keys: &[Vec<u8>], ttl: u64) -> Vec<u8> {
+    let mut header = format!("y {} {}", namespace.len(), keys.len());
+    for key in keys {
+        header.push_str(&format!(" {}", key.len()));
+    }
+    header.push_str(&format!(" {ttl} G\n"));
     let mut frame = header.into_bytes();
     frame.extend_from_slice(namespace);
     for key in keys {
@@ -498,13 +513,15 @@ async fn preload_ns(args: &[String]) {
 }
 
 /// Issue #871: the refresh `getAll` does for every hit under an access-based
-/// expiry policy, three ways. `batch-reset` is today's: an `m` of the keys,
+/// expiry policy, four ways. `batch-reset` is today's: an `m` of the keys,
 /// then an `o` of the values it returned with the new TTL (two round trips
 /// per owner, and the race #826 removed for `get`). `pipelined-touch` writes
 /// one `t ... G` per key back to back and then reads the replies (one round
 /// trip, N frames). `serial-touch` waits for each reply before the next
-/// frame, which is what a client with one synchronous call per key does. A
-/// batch's latency is from the first frame written to the last reply read.
+/// frame, which is what a client with one synchronous call per key does.
+/// `batch-get-touch` is one `y ... G` frame for all of them (one round trip,
+/// one frame, no value written back). A batch's latency is from the first
+/// frame written to the last reply read.
 async fn refresh(args: &[String]) {
     let [addr, namespace, arm, keyspace, batch, concurrency, duration, ttl] = args else {
         usage()
@@ -517,7 +534,7 @@ async fn refresh(args: &[String]) {
     assert!(
         matches!(
             arm.as_str(),
-            "batch-reset" | "pipelined-touch" | "serial-touch"
+            "batch-reset" | "pipelined-touch" | "serial-touch" | "batch-get-touch"
         ),
         "unknown arm {arm:?}"
     );
@@ -577,6 +594,13 @@ async fn refresh(args: &[String]) {
                             timed(reader.get_mut().write_all(&frame), "write o").await;
                             read_multi_ack_all_stored(&mut reader, entries.len()).await;
                         }
+                    }
+                    "batch-get-touch" => {
+                        let frame = encode_multi_get_and_touch(&namespace, &keys, ttl);
+                        timed(reader.get_mut().write_all(&frame), "write y").await;
+                        let values = read_multi_reply_values(&mut reader).await;
+                        assert_eq!(values.len(), keys.len(), "M roster size mismatch");
+                        local_hits += values.iter().flatten().count() as u64;
                     }
                     "pipelined-touch" => {
                         let mut frame = Vec::new();
