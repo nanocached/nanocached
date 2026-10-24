@@ -1054,6 +1054,10 @@ pub(crate) struct RunHooks {
     pub(crate) shutdown: Box<dyn FnMut() -> ShutdownSignal + Send>,
     /// The name this node registers with discovery; random when `None`.
     pub(crate) node_name: Option<String>,
+    /// A listener the caller already holds, used instead of binding
+    /// `address`: a test that chose the port ahead of time keeps it bound
+    /// until the node takes over, so nothing else can be handed it.
+    pub(crate) listener: Option<TcpListener>,
 }
 
 impl Default for RunHooks {
@@ -1061,6 +1065,7 @@ impl Default for RunHooks {
         Self {
             shutdown: Box::new(|| Box::pin(shutdown_signal())),
             node_name: None,
+            listener: None,
         }
     }
 }
@@ -1105,7 +1110,10 @@ pub(crate) async fn run_with_hooks(
     namespace_budgets: Vec<(Bytes, usize)>,
     mut hooks: RunHooks,
 ) -> io::Result<()> {
-    let listener = TcpListener::bind(address).await?;
+    let listener = match hooks.listener.take() {
+        Some(listener) => listener,
+        None => TcpListener::bind(address).await?,
+    };
     infra::warn_if_exposed_without_secret(
         "nanocached-node",
         listener.local_addr()?,
