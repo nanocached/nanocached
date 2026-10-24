@@ -3221,6 +3221,32 @@ pub(crate) async fn run(
     metrics_address: Option<String>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
+    run_on_listener(
+        listener,
+        liveness_timeout,
+        startup_grace,
+        replication,
+        auth_secret,
+        tls_acceptor,
+        tls_connector,
+        metrics_address,
+    )
+    .await
+}
+
+/// `run` on a listener the caller already holds, so a test that picked the
+/// port ahead of time never gives it up before discovery binds it (`sim.rs`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_on_listener(
+    listener: TcpListener,
+    liveness_timeout: Duration,
+    startup_grace: Duration,
+    replication: usize,
+    auth_secret: Option<Bytes>,
+    tls_acceptor: Option<TlsAcceptor>,
+    tls_connector: Option<TlsConnector>,
+    metrics_address: Option<String>,
+) -> io::Result<()> {
     nanocached::infra::warn_if_exposed_without_secret(
         "discovery",
         listener.local_addr()?,

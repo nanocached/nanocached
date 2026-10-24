@@ -71,15 +71,50 @@ async fn run_for(total: Duration) {
     }
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
+/// A loopback port that stays bound from the moment a test picks it until the
+/// node or discovery that will serve it takes the listener over. Picking a
+/// port by binding `:0` and dropping the listener leaves a window in which
+/// another test process, or an outgoing connection's local port, can be
+/// handed the same number, and the later bind fails with `AddrInUse`.
+struct Port {
+    number: u16,
+    listener: Option<std::net::TcpListener>,
 }
 
-fn start_discovery(port: u16, liveness: Duration) -> JoinHandle<()> {
+impl Port {
+    fn reserve() -> Port {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let number = listener.local_addr().unwrap().port();
+        Port {
+            number,
+            listener: Some(listener),
+        }
+    }
+
+    /// The bound listener, for a tokio server; call it inside the runtime.
+    /// Only once per port.
+    fn take_listener(&mut self) -> TcpListener {
+        let listener = self.listener.take().expect("port already handed over");
+        listener.set_nonblocking(true).unwrap();
+        TcpListener::from_std(listener).unwrap()
+    }
+}
+
+/// The point of `Port`: from `reserve` until the server takes the listener,
+/// no one else can bind the number, which a dropped `:0` listener does not
+/// guarantee.
+#[test]
+fn a_reserved_port_cannot_be_bound_by_anyone_else() {
+    let port = Port::reserve();
+    let err = std::net::TcpListener::bind(("127.0.0.1", port.number)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+}
+
+fn start_discovery(port: &mut Port, liveness: Duration) -> JoinHandle<()> {
+    let listener = port.take_listener();
     tokio::spawn(async move {
-        let address = format!("127.0.0.1:{port}");
-        let r = discovery::run(&address, liveness, liveness, 2, None, None, None, None).await;
+        let r = discovery::run_on_listener(listener, liveness, liveness, 2, None, None, None, None)
+            .await;
         eprintln!("discovery ended: {r:?}");
     })
 }
@@ -97,7 +132,9 @@ impl Node {
     }
 }
 
-fn start_node(port: u16, discovery_port: u16, name: Option<&str>) -> Node {
+fn start_node(port: &mut Port, discovery_port: u16, name: Option<&str>) -> Node {
+    let listener = port.take_listener();
+    let port = port.number;
     let leave = Arc::new(Notify::new());
     let signal = Arc::clone(&leave);
     let name = name.map(str::to_string);
@@ -126,6 +163,7 @@ fn start_node(port: u16, discovery_port: u16, name: Option<&str>) -> Node {
                 }
             }),
             node_name: name,
+            listener: Some(listener),
         };
         let r = server::run_with_hooks(
             &address,
@@ -221,13 +259,14 @@ async fn scenario_564(write_at: Duration) -> Outcome {
     use crate::hash_ring::HashRing;
     use crate::key::Key;
 
-    let dport = free_port();
-    let (a, b, c) = (free_port(), free_port(), free_port());
-    let d = start_discovery(dport, Duration::from_secs(15));
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc) = (Port::reserve(), Port::reserve(), Port::reserve());
+    let (dport, a, b, c) = (dp.number, pa.number, pb.number, pc.number);
+    let d = start_discovery(&mut dp, Duration::from_secs(15));
     settle().await;
-    let na = start_node(a, dport, Some("node-a"));
+    let na = start_node(&mut pa, dport, Some("node-a"));
     run_for(Duration::from_secs(20)).await;
-    let nb = start_node(b, dport, Some("node-b"));
+    let nb = start_node(&mut pb, dport, Some("node-b"));
     run_for(Duration::from_secs(25)).await;
     let roster_ab = roster(dport).await;
     assert_eq!(roster_ab.len(), 2, "A and B are members: {roster_ab:?}");
@@ -240,7 +279,7 @@ async fn scenario_564(write_at: Duration) -> Outcome {
     };
     let (name_a, name_b) = (name_of(&roster_ab, a), name_of(&roster_ab, b));
 
-    let nc = start_node(c, dport, Some("node-c"));
+    let nc = start_node(&mut pc, dport, Some("node-c"));
     run_for(write_at).await;
     let mut accepted_keys = Vec::new();
     for i in 0..60 {
@@ -327,18 +366,19 @@ struct TouchOutcome {
 /// tells it the TTL was shortened. A stale client (one that does not know
 /// B) shortens every key's TTL on A alone; after that TTL, no copy is left.
 async fn scenario_touch_during_a_join(touch_at: Duration) -> TouchOutcome {
-    let dport = free_port();
-    let (a, b) = (free_port(), free_port());
-    let d = start_discovery(dport, Duration::from_secs(15));
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb) = (Port::reserve(), Port::reserve());
+    let (dport, a, b) = (dp.number, pa.number, pb.number);
+    let d = start_discovery(&mut dp, Duration::from_secs(15));
     settle().await;
-    let na = start_node(a, dport, Some("node-a"));
+    let na = start_node(&mut pa, dport, Some("node-a"));
     run_for(Duration::from_secs(20)).await;
     let keys: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
     for key in &keys {
         let req = format!("S {} 1 1000\n{key}v", key.len());
         assert_eq!(raw_line(a, req.as_bytes()).await.0, "S");
     }
-    let nb = start_node(b, dport, Some("node-b"));
+    let nb = start_node(&mut pb, dport, Some("node-b"));
     run_for(Duration::from_secs(25)).await;
     assert_eq!(roster(dport).await.len(), 2, "A and B are members");
     run_for(touch_at).await;
@@ -396,13 +436,14 @@ async fn a_touch_on_the_old_owner_reaches_the_joiner_inside_the_forwarding_windo
 /// forwarding to its address. Returns how many connections reached B's old
 /// address from the senders afterwards: a socket listens where B was.
 async fn scenario_571(gap: Duration) -> usize {
-    let dport = free_port();
-    let (a, b) = (free_port(), free_port());
-    let d = start_discovery(dport, Duration::from_secs(15));
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb) = (Port::reserve(), Port::reserve());
+    let (dport, a, b) = (dp.number, pa.number, pb.number);
+    let d = start_discovery(&mut dp, Duration::from_secs(15));
     settle().await;
-    let na = start_node(a, dport, Some("node-a"));
+    let na = start_node(&mut pa, dport, Some("node-a"));
     run_for(Duration::from_secs(20)).await;
-    let nb = start_node(b, dport, Some("node-b"));
+    let nb = start_node(&mut pb, dport, Some("node-b"));
     // Promoted once discovery lists it.
     let mut waited = Duration::ZERO;
     while roster(dport).await.len() < 2 {
