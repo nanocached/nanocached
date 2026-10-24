@@ -22,8 +22,9 @@ over.
   compare-and-set retry loops built on `getWithToken` + the CAS
   primitives — see "Atomicity" below.
 - **`ExpiryPolicy`** is evaluated on every write (and, for
-  `AccessedExpiryPolicy`/`TouchedExpiryPolicy`, on every read too) and
-  translated to the wire's TTL convention.
+  `AccessedExpiryPolicy`/`TouchedExpiryPolicy`, on every read too: `get`
+  uses the wire's touch, `getAll` a batched re-set — see "Consistency
+  notes") and translated to the wire's TTL convention.
 - **Local-only `CacheEntryListener`s**: this instance's own
   create/update/remove, never a remote client/JVM's changes and never
   `EXPIRED`.
@@ -173,9 +174,18 @@ miss, so `getAll` over many large keys can omit a key that exists —
 `get` it on its own rather than taking it for evicted.
 
 `getExpiryForAccess()` (used by `AccessedExpiryPolicy`/
-`TouchedExpiryPolicy`) turns every `get()` into a read followed by an
-unconditional TTL-refresh write — a concurrent writer landing between the
-two could, rarely, be clobbered back to the value this `get()` observed.
+`TouchedExpiryPolicy`) makes `get()` read and refresh the TTL in one wire
+step (`getAndTouch`): the value does not travel back to the node, and a
+write landing at the same time is never overwritten. `getAll` is the
+exception. The protocol has no batch touch, and one touch per hit would
+cost a round trip per key instead of one per owning node, so `getAll`
+still refreshes every hit with one batched re-set of the values it read —
+a concurrent writer landing between that read and the re-set could,
+rarely, be clobbered back to the value `getAll` observed. A policy whose
+access duration is zero expires the entry on read, in the same step.
+A server older than the touch command makes `get()` fail with the SDK's
+`ServerTooOld` (wrapped in a `CacheException`) under such a policy; the
+default policies never touch.
 
 ## Trust boundary / deserialization
 
