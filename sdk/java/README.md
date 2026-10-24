@@ -317,6 +317,41 @@ happens once the request may have reached the server — they throw
 `NanocachedException.ConnectionFailed` instead. See
 [Reconnect and keep-alive](#reconnect-and-keep-alive) for the full rule.
 
+## Touch and getAndTouch
+
+`touch` replaces an entry's TTL in place, without rewriting its value, and
+returns whether the key existed. `getAndTouch` (and `getAndTouchBytes`)
+reads the value and replaces the TTL in one step:
+
+```java
+client.set("session", "abc", 60);
+client.touch("session", 300);                              // true — now expires in 300 s
+client.touch("session", NanocachedClient.REMOVE_TTL);      // true — never expires
+client.getAndTouch("session", 300);                        // Optional.of("abc")
+client.touch("session", 0);                                // true — expires at once
+client.touch("missing", 30);                               // false — a touch never creates a key
+```
+
+`ttlSeconds` has no default and is not `set`'s: `REMOVE_TTL` removes the TTL
+and `0` expires the entry at once, which is the opposite of `set`, where
+`0` means no expiry. Any other negative value throws
+`IllegalArgumentException` before any network call. A miss is `false` for
+`touch` and `Optional.empty()` for `getAndTouch`. `client.namespace(ns)`
+handles have all three.
+
+A touch never changes the value, so it cannot overwrite a write that lands
+at the same time. Unlike `incr` and the compare-and-set family it is
+idempotent: it goes to every owner of the key like a `set`, and a request
+whose reply was lost is retried like `get`/`set`/`delete`, never thrown as
+`ConnectionFailed`. `getAndTouch` is a read that writes, so it goes to the
+primary like a write (one refresh and retry on a wrong-node answer or a
+connection failure; no hedging, and no fallback to a replica on a miss) and
+the other owners are sent the plain touch.
+
+Against a node older than the release that added the command, both throw
+`NanocachedException.ServerTooOld`: such a node answers `En` and closes the
+connection. Upgrade every node before using them.
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to

@@ -834,6 +834,255 @@ class NanocachedClientTest {
         }
     }
 
+    // ── Touch / get-and-touch (issue #825) ──────────────────────────
+
+    @Test
+    void touchFramesCarryTheTtlAndTheGetFlag() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                client.touch("k", 30);
+                client.touch("k", NanocachedClient.REMOVE_TTL);
+                client.getAndTouch("k", 45);
+                client.getAndTouch("k", NanocachedClient.REMOVE_TTL);
+                client.namespace("tenant").touch("k", 7);
+                assertEquals(
+                        List.of("t 0 1 30", "t 0 1", "t 0 1 45 G", "t 0 1 G", "t 6 1 7"),
+                        node.touchFrames);
+            }
+        }
+    }
+
+    @Test
+    void touchReplacesTheTtlInPlaceAndNeverCreatesAKey() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v", 100);
+                assertEquals(Long.valueOf(100), node.ttls.get("k"));
+
+                assertTrue(client.touch("k", 30));
+                assertEquals(Long.valueOf(30), node.ttls.get("k"));
+                assertEquals(Optional.of("v"), client.get("k"));
+
+                assertTrue(client.touch("k", NanocachedClient.REMOVE_TTL));
+                assertNull(node.ttls.get("k"));
+
+                assertFalse(client.touch("missing", 30));
+                assertFalse(node.store.containsKey("missing"));
+
+                // 0 expires the entry at once — the opposite of set(), where 0 means no expiry.
+                assertTrue(client.touch("k", 0));
+                assertEquals(Optional.empty(), client.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void getAndTouchReturnsTheValueAndMissesWithoutCreatingAnything() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "value", 100);
+                assertEquals(Optional.of("value"), client.getAndTouch("k", 30));
+                assertEquals(Long.valueOf(30), node.ttls.get("k"));
+                assertArrayEquals("value".getBytes(StandardCharsets.UTF_8),
+                        client.getAndTouchBytes("k", NanocachedClient.REMOVE_TTL).orElseThrow());
+                assertNull(node.ttls.get("k"));
+
+                assertEquals(Optional.empty(), client.getAndTouch("missing", 30));
+                assertFalse(node.store.containsKey("missing"));
+            }
+        }
+    }
+
+    @Test
+    void touchIsScopedToItsNamespace() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedClient.Namespace tenant = client.namespace("tenant");
+                tenant.set("k", "in-tenant", 100);
+                client.set("k", "in-default", 100);
+
+                assertTrue(tenant.touch("k", 5));
+                assertEquals(Optional.of("in-tenant"), tenant.getAndTouch("k", 6));
+                assertArrayEquals("in-tenant".getBytes(StandardCharsets.UTF_8),
+                        tenant.getAndTouchBytes("k", 7).orElseThrow());
+                assertFalse(tenant.touch("only-default", 5));
+
+                assertEquals(Long.valueOf(7), node.namespacedTtls.get("tenant").get("k"));
+                assertEquals(Long.valueOf(100), node.ttls.get("k"), "the default keyspace was not touched");
+            }
+        }
+    }
+
+    @Test
+    void getAndTouchDecompressesWhenCompressionIsEnabled() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", node.port()).compress(true))) {
+                String value = "compressible ".repeat(200);
+                client.set("k", value);
+                assertEquals(Optional.of(value), client.getAndTouch("k", 30));
+            }
+        }
+    }
+
+    @Test
+    void touchRejectsAnInvalidTtlBeforeAnyIo() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                assertThrows(IllegalArgumentException.class, () -> client.touch("k", -2));
+                assertThrows(IllegalArgumentException.class, () -> client.touch("k", Long.MIN_VALUE));
+                assertThrows(IllegalArgumentException.class, () -> client.getAndTouch("k", -2));
+                assertTrue(node.touchFrames.isEmpty());
+            }
+        }
+    }
+
+    @Test
+    void touchWorksOnATaggedConnection() throws Exception {
+        try (MockNode node = MockNode.withTagSupport()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v", 100);
+                assertTrue(client.touch("k", 30));
+                assertEquals(Optional.of("v"), client.getAndTouch("k", 40));
+                assertFalse(client.touch("missing", 5));
+                assertEquals(Long.valueOf(40), node.ttls.get("k"));
+                assertEquals(3, node.touchFrames.size());
+            }
+        }
+    }
+
+    @Test
+    void anOldServerIsReportedAsServerTooOldAndTheClientStaysUsable() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                node.rejectTouchLikeAnOldServer();
+                assertThrows(NanocachedException.ServerTooOld.class, () -> client.touch("k", 30));
+                assertThrows(NanocachedException.ServerTooOld.class, () -> client.getAndTouch("k", 30));
+                assertEquals(Optional.of("v"), client.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void touchAppliedButAcknowledgementLostIsResentUnlikeIncr() throws Exception {
+        // A touch is idempotent, so a lost reply is resent like get/set/
+        // delete — where INCR throws ConnectionFailed instead.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v", 100);
+                node.dropReplyAfterNextTouch();
+                assertTrue(client.touch("k", 30));
+                assertEquals(2, node.touchFrames.size());
+
+                client.set("counter", "10");
+                node.dropReplyAfterNextIncr();
+                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.incr("counter", 5));
+            }
+        }
+    }
+
+    // A touch fans out to every owner like a set; get-and-touch asks the
+    // primary alone for the value.
+
+    @Test
+    void touchGoesToEveryOwner() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-key";
+                client.set(key, "v", 100);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
+
+                assertTrue(client.touch(key, 30));
+
+                for (String owner : owners) {
+                    MockNode node = cluster.nodes().get(owner);
+                    assertEquals(List.of("t 0 10 30"), node.touchFrames);
+                    assertEquals(Long.valueOf(30), node.ttls.get(storedKey));
+                }
+            }
+        }
+    }
+
+    @Test
+    void getAndTouchSendsGToThePrimaryOnlyAndThePlainTouchToReplicas() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-key";
+                client.set(key, "v", 100);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                MockNode replica = cluster.nodes().get(owners.get(1));
+                String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
+
+                assertEquals(Optional.of("v"), client.getAndTouch(key, 30));
+
+                assertEquals(List.of("t 0 10 30 G"), primary.touchFrames);
+                assertEquals(List.of("t 0 10 30"), replica.touchFrames);
+                assertEquals(Long.valueOf(30), replica.ttls.get(storedKey));
+            }
+        }
+    }
+
+    @Test
+    void getAndTouchDoesNotFallBackToAReplicaOnAPrimaryMiss() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-key";
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                MockNode replica = cluster.nodes().get(owners.get(1));
+                // Only the replica holds the value.
+                replica.store.put(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8)), new byte[] {'v'});
+
+                assertEquals(Optional.empty(), client.getAndTouch(key, 30));
+
+                assertEquals(List.of("t 0 10 30 G"), primary.touchFrames);
+                assertEquals(List.of("t 0 10 30"), replica.touchFrames, "the replica is never asked for the value");
+            }
+        }
+    }
+
+    @Test
+    void touchRecoversFromAWrongNodeAnswer() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-key";
+                client.set(key, "v", 100);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                primary.answerWrongNodeOnce();
+
+                assertTrue(client.touch(key, 30));
+                assertEquals(Optional.of("v"), client.getAndTouch(key, 31));
+                assertTrue(primary.touchFrames.size() >= 2, "the touch was re-sent after the refresh");
+            }
+        }
+    }
+
+    @Test
+    void aReplicaThatPredatesTouchDoesNotFailThePrimarysAnswer() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-key";
+                client.set(key, "v", 100);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                MockNode replica = cluster.nodes().get(owners.get(1));
+                replica.rejectTouchLikeAnOldServer();
+                String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
+
+                assertTrue(client.touch(key, 30));
+                assertEquals(Optional.of("v"), client.getAndTouch(key, 40));
+                assertEquals(Long.valueOf(40), primary.ttls.get(storedKey));
+                assertTrue(client.stats().replicaWriteFailures() > 0);
+            }
+        }
+    }
+
     // ── Compare-and-set (issue #141) ───────────────────────────────
 
     // The pinned cross-language digest vector (docs/protocol.html#cas):
