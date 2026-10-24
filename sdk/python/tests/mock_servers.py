@@ -111,6 +111,13 @@ class MockNode:
         # (bumping the store, never this counter) and never an `i` of
         # its own.
         self.incr_count = 0
+        # Touch (issue #825): every `t` received as (namespace, key, ttl,
+        # get) — ttl is None when the field was omitted (remove the TTL).
+        self.touches: list[tuple[bytes, bytes, int | None, bool]] = []
+        # Behave like a node that predates `t`: answer it `En\n` and close,
+        # exactly as the real node does for any command it does not know.
+        self.legacy_without_touch = False
+        self._drop_next_touch_reply = False
         # Compare-and-set (issue #141): counts every `k`/`x` frame this
         # node receives, regardless of outcome — the key proof, alongside
         # incr_count above, that a replica leg of a cluster
@@ -290,6 +297,13 @@ class MockNode:
         corrupted reply, or a buggy proxy in front of the server,
         whose body isn't INCR's own decimal-ASCII-i64 grammar."""
         self._malformed_incr_value = body
+
+    def apply_and_drop_next_touch(self) -> None:
+        """Applies the next `t` request, then closes the connection without
+        replying (issue #825) — the reply lost after the node executed it.
+        A touch is idempotent, so the client may resend it, unlike an
+        incr (see apply_and_drop_next_incr)."""
+        self._drop_next_touch_reply = True
 
     def apply_and_drop_next_cas_set(self) -> None:
         """Same as apply_and_drop_next_incr() but for the next matching
@@ -742,6 +756,57 @@ class MockNode:
                         reply_bytes = self._malformed_incr_value
                         self._malformed_incr_value = None
                     writer.write(b"I %d%b%b\n%b" % (len(reply_bytes), ttl_field, tag_suffix, reply_bytes))
+                    await writer.drain()
+
+                elif parts[0] == b"t":
+                    # Touch (issue #825): `t <ns-len> <key-len> [<ttl>]
+                    # [G] [<tag>]` — always namespaced, like `i`. No ttl
+                    # field removes the TTL; 0 expires the entry at once.
+                    namespace = await reader.readexactly(int(parts[1]))
+                    key = await reader.readexactly(int(parts[2]))
+                    tail = list(parts[3:])
+                    if tagged:
+                        tail = tail[:-1]
+                    get = bool(tail) and tail[-1] == b"G"
+                    if get:
+                        tail = tail[:-1]
+                    ttl = int(tail[0]) if tail else None
+                    self.touches.append((namespace, key, ttl, get))
+                    if self.legacy_without_touch:
+                        writer.write(b"En\n")
+                        await writer.drain()
+                        return
+                    if self._silent:
+                        continue
+                    if self._retryable_replies > 0:
+                        self._retryable_replies -= 1
+                        writer.write(b"R" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    if self._wrong_node_replies > 0:
+                        self._wrong_node_replies -= 1
+                        writer.write(b"W" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    current = self._get_entry(namespace, key)
+                    if current is None:
+                        writer.write(b"N" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    if ttl == 0:
+                        self._delete_entry(namespace, key)
+                        self.entry_ttl.pop((namespace, key), None)
+                    else:
+                        self.entry_ttl[(namespace, key)] = ttl or 0
+                    if self._drop_next_touch_reply:
+                        self._drop_next_touch_reply = False
+                        writer.close()
+                        return
+                    if get:
+                        ttl_field = b" %d" % ttl if ttl is not None else b""
+                        writer.write(b"V %d%b%b\n%b" % (len(current), ttl_field, tag_suffix, current))
+                    else:
+                        writer.write(b"S" + tag_suffix + b"\n")
                     await writer.drain()
 
                 elif parts[0] == b"k":

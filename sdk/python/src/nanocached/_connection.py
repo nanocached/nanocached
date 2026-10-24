@@ -183,6 +183,24 @@ def _encode_incr(key: bytes, delta: int, tag: int | None = None, namespace: byte
     return b"i %d %d %d%b\n%b%b" % (len(namespace), len(key), delta, _tag_field(tag), namespace, key)
 
 
+# Touch (issue #825): like i above, always namespaced (0 for the default
+# namespace). `ttl_seconds` None omits the field, which asks the node to
+# remove the TTL; 0 is sent and expires the entry at once — the opposite of
+# _encode_set, where 0 means no expiry. `get` appends the `G` token.
+def _encode_touch(
+    key: bytes,
+    ttl_seconds: int | None,
+    get: bool,
+    tag: int | None = None,
+    namespace: bytes = b"",
+) -> bytes:
+    ttl_field = b"" if ttl_seconds is None else b" %d" % ttl_seconds
+    get_field = b" G" if get else b""
+    return b"t %d %d%b%b%b\n%b%b" % (
+        len(namespace), len(key), ttl_field, get_field, _tag_field(tag), namespace, key
+    )
+
+
 # Compare-and-set (issue #141): like i above, k/x always carry
 # <namespace-length> (0 for the default namespace) — neither op has a
 # pre-namespace legacy uppercase form. <cond> is a bare, un-length-
@@ -289,6 +307,13 @@ class _MultiWrongNode:
 
 
 WRONG_NODE = _MultiWrongNode()
+
+
+class _ServerRejectedError(NanocachedError):
+    """The node answered ``E`` and is closing the connection (issue #825).
+    Private: it travels as the ``__cause__`` of the ConnectionLostError a
+    sent request fails with, and touch()/get_and_touch() turn it into
+    ServerTooOldError."""
 
 
 class _PendingSlot:
@@ -419,11 +444,50 @@ class Connection:
 
     async def get(self, key: bytes, namespace: bytes = b"") -> bytes | None:
         marker, value = await self._request(lambda tag: _encode_get(key, tag, namespace))
-        if marker == b"V":
+        # A `V` with a TTL field only ever answers a get-and-touch; one
+        # answering a plain get means the streams are misaligned.
+        if marker == b"V" and isinstance(value, bytes):
             return value
         if marker == b"N":
             return None
         if marker == b"W":
+            raise WrongNodeError()
+        raise self._mismatch(marker)
+
+    async def touch(self, key: bytes, ttl_seconds: int | None, namespace: bytes = b"") -> bool:
+        """Sends one plain ``t`` request to *this* node only (issue #825)
+        — cluster fan-out to every owner is the client's job, as for
+        set(). Returns ``True`` if the key existed (``S``), ``False`` for
+        a missing or expired key (``N``): a touch never creates one."""
+        marker, _ = await self._request(
+            lambda tag: _encode_touch(key, ttl_seconds, False, tag, namespace)
+        )
+        if marker == b"S":
+            return True
+        if marker == b"N":
+            return False
+        if marker == b"W":
+            raise WrongNodeError()
+        raise self._mismatch(marker)
+
+    async def get_and_touch(
+        self, key: bytes, ttl_seconds: int | None, namespace: bytes = b""
+    ) -> bytes | None:
+        """Sends one ``t ... G`` request to *this* node only (issue #825):
+        replaces the entry's TTL and returns its raw value, or ``None``
+        for a miss. The reply's own TTL field (the TTL now in effect) is
+        read and dropped — the caller just set it."""
+        marker, payload = await self._request(
+            lambda tag: _encode_touch(key, ttl_seconds, True, tag, namespace)
+        )
+        if marker == b"V":
+            if isinstance(payload, tuple):
+                return payload[0]
+            if isinstance(payload, bytes):
+                return payload
+        elif marker == b"N":
+            return None
+        elif marker == b"W":
             raise WrongNodeError()
         raise self._mismatch(marker)
 
@@ -918,7 +982,12 @@ class Connection:
             # (echoed response tags).
             header = await self._reader.readuntil(b"\n")
             fields = header[1:-1].split(b" ")
-            if len(fields) != (2 if self._tagged else 1):
+            # A get-and-touch's reply (issue #825) carries `Incremented`'s
+            # optional TTL field between the length and the tag; a plain
+            # get's never does. Told apart by field count against the
+            # connection's mode, as for `I`.
+            min_fields = 2 if self._tagged else 1
+            if len(fields) not in (min_fields, min_fields + 1):
                 raise NanocachedError("nanocached: invalid value header in response")
             try:
                 length = _parse_strict_uint(fields[0])
@@ -931,8 +1000,17 @@ class Connection:
             # (issue #8).
             if length < 0 or length > _MAX_VALUE_LENGTH:
                 raise NanocachedError("nanocached: invalid value length in response")
-            tag = self._parse_tag(fields[1]) if self._tagged else None
+            has_ttl = len(fields) == min_fields + 1
+            touched_ttl: int | None = None
+            if has_ttl:
+                try:
+                    touched_ttl = _parse_strict_uint(fields[1])
+                except ValueError:
+                    raise NanocachedError("nanocached: invalid ttl in value response") from None
+            tag = self._parse_tag(fields[2 if has_ttl else 1]) if self._tagged else None
             value = await self._reader.readexactly(length)
+            if has_ttl:
+                return marker, (value, touched_ttl), tag
             return marker, value, tag
 
         if marker == b"I":
@@ -1096,6 +1174,18 @@ class Connection:
             # sent before auth, so it never carries a request's tag.
             await self._reader.readexactly(1)  # the trailing '\n'
             return marker, None, None
+
+        if marker == b"E":
+            # `En\n`: the node rejected the request and is closing the
+            # connection (a command it does not know, one too large or
+            # malformed). Told apart from other unexpected bytes so a
+            # touch can report "server too old" (issue #825); every other
+            # command still sees the same NanocachedError as before.
+            try:
+                await self._reader.readuntil(b"\n")
+            except asyncio.IncompleteReadError:
+                pass
+            raise _ServerRejectedError(f"nanocached: unexpected response from server: {marker!r}")
 
         raise NanocachedError(f"nanocached: unexpected response from server: {marker!r}")
 

@@ -18,6 +18,7 @@ from ._errors import (
     PartialSetConnectionLostError,
     PartialWrongNodeError,
     RetryableError,
+    ServerTooOldError,
     WrongNodeError,
 )
 from ._hashring import HashRing
@@ -43,6 +44,7 @@ __all__ = [
     "PartialSetConnectionLostError",
     "PartialWrongNodeError",
     "RetryableError",
+    "ServerTooOldError",
     "WrongNodeError",
     "content_digest",
 ]

@@ -73,6 +73,20 @@ class NotNumericError(NanocachedError):
         )
 
 
+class ServerTooOldError(NanocachedError):
+    """Raised by touch/get_and_touch (issue #825) when the node answered
+    ``En`` to the ``t`` command: a node that predates ``t`` does not know
+    the command and closes the connection. Every node must be upgraded
+    before a client sends it; nothing is retried, since the same node would
+    answer the same way."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "nanocached: the server does not know the touch command (t) — "
+            "upgrade every node to a release that includes it"
+        )
+
+
 class CompressionIncompatibleError(NanocachedError):
     """Raised by incr/decr (issue #321) on a client constructed with
     ``compress=True``, before any I/O. The protocol has no marker byte
