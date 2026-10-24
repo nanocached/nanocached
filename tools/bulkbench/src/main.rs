@@ -1,4 +1,4 @@
-// Issue #128/#150: throwaway benchmark comparing a client-side loop of
+// Issue #128/#150/#871: throwaway benchmark comparing a client-side loop of
 // single-key frames against a batched multi-op frame (`m`/multi-get,
 // `o`/multi-set), direct-to-node and via the proxy. Not a shipped tool —
 // its only job is producing the numbers #128's/#150's decisions rest on.
@@ -118,7 +118,10 @@ fn usage() -> ! {
         "usage:\n  \
          bulkbench preload <addr> <keyspace> <value-size>\n  \
          bulkbench run <addr> <get|set> <loop|bulk> <keyspace> <batch> <concurrency> \
-         <duration-secs> <value-size>\n\n\
+         <duration-secs> <value-size>\n  \
+         bulkbench preload-ns <addr> <namespace> <keyspace> <value-size>\n  \
+         bulkbench refresh <addr> <namespace> <batch-reset|pipelined-touch|serial-touch> \
+         <keyspace> <batch> <concurrency> <duration-secs> <ttl-secs>\n\n\
          Optional env: BULKBENCH_SECRET (sent as an untagged `A` before either subcommand)."
     );
     std::process::exit(2);
@@ -200,6 +203,55 @@ fn encode_multi_set(keys: &[Vec<u8>], value: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// `s <ns-len> <key-len> <value-len>\n<ns><key><value>` — the namespaced
+/// store `preload-ns` fills the keyspace with.
+fn encode_set_ns(namespace: &[u8], key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut frame = format!("s {} {} {}\n", namespace.len(), key.len(), value.len()).into_bytes();
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame.extend_from_slice(value);
+    frame
+}
+
+/// `t <ns-len> <key-len> <ttl> G\n<ns><key>` — get and touch.
+fn encode_get_and_touch(namespace: &[u8], key: &[u8], ttl: u64) -> Vec<u8> {
+    let mut frame = format!("t {} {} {ttl} G\n", namespace.len(), key.len()).into_bytes();
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame
+}
+
+fn encode_multi_get_ns(namespace: &[u8], keys: &[Vec<u8>]) -> Vec<u8> {
+    let mut header = format!("m {} {}", namespace.len(), keys.len());
+    for key in keys {
+        header.push_str(&format!(" {}", key.len()));
+    }
+    header.push('\n');
+    let mut frame = header.into_bytes();
+    frame.extend_from_slice(namespace);
+    for key in keys {
+        frame.extend_from_slice(key);
+    }
+    frame
+}
+
+/// `o` over the hits of an `m`, with one TTL for the whole frame — what the
+/// JCache adapter's `getAll` sends to refresh an access policy.
+fn encode_multi_set_ns(namespace: &[u8], entries: &[(&[u8], &[u8])], ttl: u64) -> Vec<u8> {
+    let mut header = format!("o {} {}", namespace.len(), entries.len());
+    for (key, value) in entries {
+        header.push_str(&format!(" {} {}", key.len(), value.len()));
+    }
+    header.push_str(&format!(" {ttl}\n"));
+    let mut frame = header.into_bytes();
+    frame.extend_from_slice(namespace);
+    for (key, value) in entries {
+        frame.extend_from_slice(key);
+        frame.extend_from_slice(value);
+    }
+    frame
+}
+
 /// Reads one `S` reply (bare `S\n`) and asserts it succeeded.
 async fn read_set_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) {
     let line = timed(read_line_capped(reader), "read reply header").await;
@@ -226,6 +278,27 @@ async fn read_multi_ack_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> (us
         .count();
 
     (count, stored)
+}
+
+/// Reads one `o` reply and asserts all `expected` entries were stored,
+/// naming the first token that was not.
+async fn read_multi_ack_all_stored<R: AsyncBufReadExt + Unpin>(reader: &mut R, expected: usize) {
+    let line = timed(read_line_capped(reader), "read reply header").await;
+    let line = line.trim_end();
+    let mut fields = line.split(' ');
+    assert_eq!(fields.next(), Some("O"), "unexpected reply to o: {line:?}");
+    let count: usize = fields
+        .next()
+        .expect("missing O count field")
+        .parse()
+        .expect("bad O count field");
+    assert_eq!(count, expected, "O roster size mismatch");
+    if let Some(bad) = fields.find(|&token| token != "S") {
+        panic!(
+            "o entry not stored: first non-S token {bad:?} in {:?}",
+            &line[..line.len().min(80)]
+        );
+    }
 }
 
 /// Reads one `G` reply (`V <len>\n<value>` or `N\n`) and discards the
@@ -293,6 +366,83 @@ async fn read_multi_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
     (count, hits)
 }
 
+/// Like `read_multi_reply`, but keeps the values: the access refresh
+/// re-sends exactly what it read. One entry per requested key, `None` for a
+/// miss.
+async fn read_multi_reply_values<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Vec<Option<Vec<u8>>> {
+    let line = timed(read_line_capped(reader), "read reply header").await;
+    let line = line.trim_end();
+    let mut fields = line.split(' ');
+    assert_eq!(fields.next(), Some("M"), "unexpected reply to m: {line:?}");
+    let count: usize = fields
+        .next()
+        .expect("missing M count field")
+        .parse()
+        .expect("bad M count field");
+
+    let mut lengths = Vec::with_capacity(count);
+    let mut total_bytes = 0usize;
+    for _ in 0..count {
+        match fields.next().expect("missing M roster token") {
+            "-" | "W" => lengths.push(None),
+            length => {
+                let length: usize = length.parse().expect("bad M roster length");
+                assert!(
+                    length <= MAX_VALUE_LEN,
+                    "M entry length {length} exceeds sanity cap {MAX_VALUE_LEN}"
+                );
+                total_bytes += length;
+                lengths.push(Some(length));
+            }
+        }
+    }
+    assert!(
+        total_bytes <= MAX_MULTI_RESPONSE_BYTES,
+        "M reply total {total_bytes} exceeds sanity cap {MAX_MULTI_RESPONSE_BYTES}"
+    );
+
+    let mut body = vec![0u8; total_bytes];
+    timed(reader.read_exact(&mut body), "read M values").await;
+    let mut offset = 0;
+    lengths
+        .into_iter()
+        .map(|length| {
+            length.map(|length| {
+                let value = body[offset..offset + length].to_vec();
+                offset += length;
+                value
+            })
+        })
+        .collect()
+}
+
+/// Reads one get-and-touch reply (`V <len> [<ttl>]\n<value>` or `N\n`) and
+/// returns whether it was a hit. The value is discarded, as in `read_get_reply`.
+async fn read_touch_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mut R) -> bool {
+    let line = timed(read_line_capped(reader), "read reply header").await;
+    let line = line.trim_end();
+    if let Some(rest) = line.strip_prefix("V ") {
+        let length: usize = rest
+            .split(' ')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("bad V header: {line:?}"));
+        assert!(
+            length <= MAX_VALUE_LEN,
+            "V length {length} exceeds sanity cap {MAX_VALUE_LEN}"
+        );
+        let mut value = vec![0u8; length];
+        timed(reader.read_exact(&mut value), "read value").await;
+        true
+    } else if line == "N" {
+        false
+    } else {
+        panic!("unexpected reply to t..G: {line:?}");
+    }
+}
+
 fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
     if sorted_ms.is_empty() {
         return 0.0;
@@ -321,6 +471,177 @@ async fn preload(args: &[String]) {
     }
 
     println!("{{\"preloaded\":{keyspace},\"value_size\":{value_size}}}");
+}
+
+async fn preload_ns(args: &[String]) {
+    let [addr, namespace, keyspace, value_size] = args else {
+        usage()
+    };
+    let keyspace: u64 = keyspace.parse().expect("bad keyspace");
+    let value_size: usize = value_size.parse().expect("bad value-size");
+    let value = vec![b'x'; value_size];
+
+    let mut stream = timed(TcpStream::connect(addr), "connect").await;
+    authenticate(&mut stream).await;
+    let mut reader = BufReader::new(stream);
+
+    for index in 0..keyspace {
+        let frame = encode_set_ns(namespace.as_bytes(), &key_bytes(index), &value);
+        timed(reader.get_mut().write_all(&frame), "write set").await;
+        let line = timed(read_line_capped(&mut reader), "read set reply").await;
+        assert_eq!(line.trim_end(), "S", "set failed for key {index}");
+    }
+
+    println!(
+        "{{\"preloaded\":{keyspace},\"namespace\":\"{namespace}\",\"value_size\":{value_size}}}"
+    );
+}
+
+/// Issue #871: the refresh `getAll` does for every hit under an access-based
+/// expiry policy, three ways. `batch-reset` is today's: an `m` of the keys,
+/// then an `o` of the values it returned with the new TTL (two round trips
+/// per owner, and the race #826 removed for `get`). `pipelined-touch` writes
+/// one `t ... G` per key back to back and then reads the replies (one round
+/// trip, N frames). `serial-touch` waits for each reply before the next
+/// frame, which is what a client with one synchronous call per key does. A
+/// batch's latency is from the first frame written to the last reply read.
+async fn refresh(args: &[String]) {
+    let [addr, namespace, arm, keyspace, batch, concurrency, duration, ttl] = args else {
+        usage()
+    };
+    let keyspace: u64 = keyspace.parse().expect("bad keyspace");
+    let batch: usize = batch.parse().expect("bad batch");
+    let concurrency: usize = concurrency.parse().expect("bad concurrency");
+    let duration = Duration::from_secs_f64(duration.parse().expect("bad duration"));
+    let ttl: u64 = ttl.parse().expect("bad ttl");
+    assert!(
+        matches!(
+            arm.as_str(),
+            "batch-reset" | "pipelined-touch" | "serial-touch"
+        ),
+        "unknown arm {arm:?}"
+    );
+
+    let deadline = Instant::now() + duration;
+    let batches = Arc::new(AtomicU64::new(0));
+    let keys_done = Arc::new(AtomicU64::new(0));
+    let hits_done = Arc::new(AtomicU64::new(0));
+    let latencies_ms = Arc::new(StdMutex::new(Vec::<f64>::new()));
+
+    let mut workers = Vec::with_capacity(concurrency);
+    for worker in 0..concurrency {
+        let addr = addr.clone();
+        let namespace = namespace.clone().into_bytes();
+        let arm = arm.clone();
+        let batches = Arc::clone(&batches);
+        let keys_done = Arc::clone(&keys_done);
+        let hits_done = Arc::clone(&hits_done);
+        let latencies_ms = Arc::clone(&latencies_ms);
+
+        workers.push(tokio::spawn(async move {
+            let mut stream = timed(TcpStream::connect(&addr), "connect").await;
+            authenticate(&mut stream).await;
+            let mut reader = BufReader::new(stream);
+            let mut rng = Lcg::new(0x9E37_79B9_7F4A_7C15 ^ (worker as u64 + 1));
+            let mut local_latencies = Vec::new();
+            let mut local_hits = 0u64;
+
+            while Instant::now() < deadline {
+                // Distinct keys, as a `getAll` over a set has.
+                let mut seen = std::collections::HashSet::new();
+                let mut keys: Vec<Vec<u8>> = Vec::with_capacity(batch);
+                while keys.len() < batch {
+                    let index = rng.next() % keyspace;
+                    if seen.insert(index) {
+                        keys.push(key_bytes(index));
+                    }
+                }
+
+                let start = Instant::now();
+                match arm.as_str() {
+                    "batch-reset" => {
+                        let frame = encode_multi_get_ns(&namespace, &keys);
+                        timed(reader.get_mut().write_all(&frame), "write m").await;
+                        let values = read_multi_reply_values(&mut reader).await;
+                        assert_eq!(values.len(), keys.len(), "M roster size mismatch");
+                        let entries: Vec<(&[u8], &[u8])> = keys
+                            .iter()
+                            .zip(&values)
+                            .filter_map(|(key, value)| {
+                                value.as_ref().map(|v| (key.as_slice(), v.as_slice()))
+                            })
+                            .collect();
+                        local_hits += entries.len() as u64;
+                        if !entries.is_empty() {
+                            let frame = encode_multi_set_ns(&namespace, &entries, ttl);
+                            timed(reader.get_mut().write_all(&frame), "write o").await;
+                            read_multi_ack_all_stored(&mut reader, entries.len()).await;
+                        }
+                    }
+                    "pipelined-touch" => {
+                        let mut frame = Vec::new();
+                        for key in &keys {
+                            frame.extend_from_slice(&encode_get_and_touch(&namespace, key, ttl));
+                        }
+                        timed(reader.get_mut().write_all(&frame), "write t").await;
+                        for _ in &keys {
+                            if read_touch_reply(&mut reader).await {
+                                local_hits += 1;
+                            }
+                        }
+                    }
+                    _ => {
+                        for key in &keys {
+                            let frame = encode_get_and_touch(&namespace, key, ttl);
+                            timed(reader.get_mut().write_all(&frame), "write t").await;
+                            if read_touch_reply(&mut reader).await {
+                                local_hits += 1;
+                            }
+                        }
+                    }
+                }
+                local_latencies.push(start.elapsed().as_secs_f64() * 1000.0);
+
+                batches.fetch_add(1, Ordering::Relaxed);
+                keys_done.fetch_add(batch as u64, Ordering::Relaxed);
+            }
+
+            hits_done.fetch_add(local_hits, Ordering::Relaxed);
+            latencies_ms.lock().unwrap().extend(local_latencies);
+        }));
+    }
+
+    let mut failed = 0;
+    for (index, worker) in workers.into_iter().enumerate() {
+        if let Err(error) = worker.await {
+            eprintln!("bulkbench: worker {index} failed: {error}");
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        eprintln!("bulkbench: {failed}/{concurrency} worker(s) failed");
+        std::process::exit(1);
+    }
+
+    let mut latencies_ms = Arc::try_unwrap(latencies_ms)
+        .expect("all workers finished")
+        .into_inner()
+        .expect("mutex not poisoned");
+    latencies_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN latencies"));
+
+    let total_keys = keys_done.load(Ordering::Relaxed);
+    let total_hits = hits_done.load(Ordering::Relaxed);
+    println!(
+        "{{\"op\":\"refresh\",\"arm\":\"{arm}\",\"batch\":{batch},\"concurrency\":{concurrency},\
+         \"batches\":{},\"keys\":{total_keys},\"keys_per_sec\":{:.0},\
+         \"hit_rate\":{:.4},\
+         \"batch_p50_ms\":{:.3},\"batch_p99_ms\":{:.3}}}",
+        batches.load(Ordering::Relaxed),
+        total_keys as f64 / duration.as_secs_f64(),
+        total_hits as f64 / total_keys.max(1) as f64,
+        percentile(&latencies_ms, 0.50),
+        percentile(&latencies_ms, 0.99),
+    );
 }
 
 async fn run(args: &[String]) {
@@ -488,6 +809,8 @@ async fn main() {
     match args.get(1).map(String::as_str) {
         Some("preload") => preload(&args[2..]).await,
         Some("run") => run(&args[2..]).await,
+        Some("preload-ns") => preload_ns(&args[2..]).await,
+        Some("refresh") => refresh(&args[2..]).await,
         _ => usage(),
     }
 }
