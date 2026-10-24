@@ -283,6 +283,18 @@ jobs:
         working-directory: sdk/rust
         run: cargo test --all-features
 
+      # `tls` and `compression` are optional, default-on features, and every
+      # step above builds with all of them on — so a use of a gated item
+      # outside its cfg compiles here and breaks only for a consumer who
+      # turns a feature off. Build and test the crate with each combination.
+      - name: Build and test with features off
+        working-directory: sdk/rust
+        run: |
+          cargo check --no-default-features
+          cargo check --no-default-features --features tls
+          cargo check --no-default-features --features compression
+          cargo test --no-default-features
+
       - name: Install MSRV toolchain (1.85.0)
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (unreleased; no tags to pin instead)
         with:

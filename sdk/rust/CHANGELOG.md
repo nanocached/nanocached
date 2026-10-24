@@ -6,6 +6,14 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+### Fixed
+
+- The crate compiles with the `compression` feature off
+  (`--no-default-features`, or `tls` alone). The cumulative size check for
+  `get_many` named `Error::Decompression`, which exists only with
+  `compression`, outside its cfg, so a consumer who turned the feature off
+  got a compile error. CI now builds and tests every feature combination.
+
 ### Added
 
 - `touch(key, ttl_seconds)` replaces an entry's TTL in place and returns

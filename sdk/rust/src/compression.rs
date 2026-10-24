@@ -35,6 +35,7 @@ mod deflate {
     use flate2::read::{DeflateDecoder, DeflateEncoder};
     use flate2::Compression as Flate2Compression;
     use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const MARKER_RAW: u8 = 0x00;
     const MARKER_DEFLATE: u8 = 0x01;
@@ -46,6 +47,32 @@ mod deflate {
     /// memory on a plain `get` (a decompression bomb). Far above any
     /// realistic cache value.
     const MAX_DECOMPRESSED_LENGTH: u64 = 64 * 1024 * 1024;
+
+    /// Charges one decompressed multi-get entry of `decompressed_len`
+    /// bytes against the batch's running `budget` and fails once the total
+    /// passes `cap` — the cumulative bound across a whole `get_many`
+    /// response, which [`decompress_value`]'s per-value bound cannot give
+    /// (issue #410). The entry is charged before the cap is checked, so
+    /// the entry that crosses it is the one reported. Lives here, next to
+    /// the only error variant it can return (`Error::Decompression`
+    /// exists only with the `compression` feature), so client.rs needs no
+    /// cfg gating of its own.
+    pub(crate) fn charge_batch_budget(
+        budget: &AtomicU64,
+        cap: u64,
+        decompressed_len: usize,
+    ) -> Result<()> {
+        let charged =
+            budget.fetch_add(decompressed_len as u64, Ordering::Relaxed) + decompressed_len as u64;
+        if charged > cap {
+            return Err(Error::Decompression(
+                "nanocached: cumulative decompressed size of this get_many response exceeds \
+                 the maximum — possible decompression bomb across the batch"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
 
     /// Below `threshold`, or when compressing doesn't actually shrink the
     /// value (incompressible data), the marker byte alone is added and
@@ -124,7 +151,7 @@ mod deflate {
 }
 
 #[cfg(feature = "compression")]
-pub(crate) use deflate::{compress_value, decompress_value};
+pub(crate) use deflate::{charge_batch_budget, compress_value, decompress_value};
 
 // Unreachable at runtime without the `compression` feature:
 // `resolve_compression` rejects `compress(true)` at `connect()` time, so
@@ -140,6 +167,15 @@ pub(crate) fn compress_value(_value: &[u8], _threshold: usize) -> Vec<u8> {
 #[cfg(not(feature = "compression"))]
 pub(crate) fn decompress_value(_value: &[u8]) -> Result<Vec<u8>> {
     unreachable!("decompress_value called without the `compression` feature")
+}
+
+#[cfg(not(feature = "compression"))]
+pub(crate) fn charge_batch_budget(
+    _budget: &std::sync::atomic::AtomicU64,
+    _cap: u64,
+    _decompressed_len: usize,
+) -> Result<()> {
+    unreachable!("charge_batch_budget called without the `compression` feature")
 }
 
 #[cfg(test)]
