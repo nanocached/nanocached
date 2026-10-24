@@ -67,6 +67,14 @@ pub enum Error {
     /// apply. Folded back into a plain `ConnectionLost` before any public
     /// method returns it, exactly like [`Self::ConnectionLostAfterSend`].
     ConnectionLostTimedOut(String),
+    /// `touch`/`get_and_touch` (issue #825) against a node that predates
+    /// the `t` command: such a node answers `En` and closes the
+    /// connection. The SDK only sends frames it has validated, so a
+    /// node's `En` to a touch means it does not know the command —
+    /// upgrade every node to a release that includes it. A bare
+    /// disconnect with no `En` cannot be told apart from any other lost
+    /// connection and stays [`Self::ConnectionLost`].
+    ServerTooOld,
     /// The server rejected the `A` handshake's secret — either the server
     /// requires one and none was configured, or the configured one is
     /// wrong. Never transient: retrying with the same configuration
@@ -168,6 +176,10 @@ impl fmt::Display for Error {
             Error::CompressionIncompatible => write!(
                 f,
                 "nanocached: incr/decr is incompatible with value compression (disable compress or use a separate client)"
+            ),
+            Error::ServerTooOld => write!(
+                f,
+                "nanocached: the server does not know the touch command (t) — upgrade every node to a release that includes it"
             ),
             Error::ConnectionLost(message)
             | Error::ConnectionLostAfterSend(message)

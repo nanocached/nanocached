@@ -277,6 +277,23 @@ existed, err := client.Delete("greeting")</code></pre>
   ordinary <code>set</code>/<code>delete</code>. Not a distributed lock —
   LRU eviction can still silently break a lock built on it. See
   <a href="protocol.html#cas">k / x</a>.</li>
+  <li><b>Touch</b> — <code>touch</code> replaces an existing entry's TTL in
+  place without rewriting its value, and <code>getAndTouch</code>
+  (<code>get_and_touch</code>/<code>GetAndTouchAsync</code>) reads the
+  value and replaces the TTL in one step; both are on a namespace handle
+  too. The TTL argument has no default and is not <code>set</code>'s:
+  omitting it (<code>null</code>/<code>None</code>, or the
+  <code>RemoveTTL</code>/<code>REMOVE_TTL</code> constant in Go and Java)
+  removes the TTL and <code>0</code> expires the entry at once, where
+  <code>set</code> reads <code>0</code> as no expiry. A miss creates
+  nothing. Unlike counters and compare-and-set a touch is idempotent: it
+  goes to every owner like a <code>set</code>, a request whose reply was
+  lost is retried, and it cannot overwrite a write that lands at the same
+  time. <code>getAndTouch</code> asks only the primary for the value (no
+  hedging, no fallback to a replica on a miss) and sends the other owners
+  the plain touch. Against a node that predates the command the SDK
+  raises a "server too old" error; upgrade every node before using it.
+  See <a href="protocol.html#touch">t</a>.</li>
   <li><b>Failure recovery</b> — a stale routing table (a node answers
   <code>W</code>) or a dead primary both trigger one node-list refresh
   and one retry; recovery is bounded by discovery's liveness timeout.</li>

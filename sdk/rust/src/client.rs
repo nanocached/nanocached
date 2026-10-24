@@ -698,8 +698,17 @@ struct Member {
 /// `tokio::spawn` task own its own copy of the data, since `op` typically
 /// borrows from the caller's stack frame (see `set`/`delete`).
 enum WriteBody<'a> {
-    Set { value: &'a [u8], ttl_seconds: u64 },
+    Set {
+        value: &'a [u8],
+        ttl_seconds: u64,
+    },
     Delete,
+    /// issue #825: the plain touch every non-primary owner is sent — by
+    /// `touch` itself, and by `get_and_touch`, whose `G` form only the
+    /// primary receives.
+    Touch {
+        ttl_seconds: Option<u64>,
+    },
 }
 
 impl WriteBody<'_> {
@@ -710,6 +719,9 @@ impl WriteBody<'_> {
                 ttl_seconds: *ttl_seconds,
             },
             WriteBody::Delete => OwnedWriteBody::Delete,
+            WriteBody::Touch { ttl_seconds } => OwnedWriteBody::Touch {
+                ttl_seconds: *ttl_seconds,
+            },
         }
     }
 }
@@ -717,6 +729,7 @@ impl WriteBody<'_> {
 enum OwnedWriteBody {
     Set { value: Vec<u8>, ttl_seconds: u64 },
     Delete,
+    Touch { ttl_seconds: Option<u64> },
 }
 
 /// One owner's key/`is_primary` membership across one
@@ -1897,6 +1910,114 @@ impl NanocachedClient {
             })
         })
         .await
+    }
+
+    // ── touch (issue #825) ───────────────────────────────────────────
+
+    /// Replaces the TTL of an existing entry in place, without rewriting
+    /// its value (issue #825), and returns whether the key existed:
+    /// `false` for a missing or expired key, which a touch never creates.
+    /// `ttl_seconds` is counted from the moment the node receives the
+    /// request and has no default: `None` removes the TTL, `Some(0)`
+    /// expires the entry at once (the opposite of [`Self::set`], where 0
+    /// means no expiry).
+    ///
+    /// Unlike `incr` and the compare-and-set family a touch is idempotent,
+    /// so a request whose reply was lost is retried like
+    /// `get`/`set`/`delete` are, never returned as
+    /// [`Error::ConnectionLost`]. In a cluster it goes to every owner,
+    /// like a `set`, and the primary's answer is returned. Returns
+    /// [`Error::ServerTooOld`] against a node that predates the command.
+    pub async fn touch(&self, key: impl AsRef<[u8]>, ttl_seconds: Option<u64>) -> Result<bool> {
+        self.touch_in(DEFAULT_NAMESPACE, key, ttl_seconds).await
+    }
+
+    /// The shared implementation behind [`Self::touch`] and
+    /// [`Namespace::touch`].
+    async fn touch_in(
+        &self,
+        namespace: &[u8],
+        key: impl AsRef<[u8]>,
+        ttl_seconds: Option<u64>,
+    ) -> Result<bool> {
+        let key = key.as_ref();
+        validate_key(namespace, key)?;
+        self.before_operation().await?;
+        self.with_cluster_retry(|| {
+            self.write(
+                namespace,
+                key,
+                WriteBody::Touch { ttl_seconds },
+                |connection| async move { connection.touch(namespace, key, ttl_seconds).await },
+            )
+        })
+        .await
+    }
+
+    /// Reads a value and replaces its TTL in one step (issue #825);
+    /// `None` on a miss, which creates nothing. See [`Self::touch`] for
+    /// `ttl_seconds`. Decoded as strict UTF-8, like [`Self::get`].
+    ///
+    /// A read that writes: it goes to the key's primary like a write (one
+    /// refresh and retry on a wrong-node answer or a connection failure;
+    /// no hedging, and no fallback to a replica on a miss) and the other
+    /// owners are sent the plain touch, so a replica is never the only
+    /// owner touched. It counts as a read on the primary, which makes the
+    /// entry the most recently used.
+    pub async fn get_and_touch(
+        &self,
+        key: impl AsRef<[u8]>,
+        ttl_seconds: Option<u64>,
+    ) -> Result<Option<String>> {
+        match self.get_and_touch_bytes(key, ttl_seconds).await? {
+            Some(bytes) => Ok(Some(decode_utf8_value(bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The raw-bytes companion to [`Self::get_and_touch`]: no decoding.
+    /// Transparently decompresses when `compress` is enabled.
+    pub async fn get_and_touch_bytes(
+        &self,
+        key: impl AsRef<[u8]>,
+        ttl_seconds: Option<u64>,
+    ) -> Result<Option<Vec<u8>>> {
+        self.get_and_touch_bytes_in(DEFAULT_NAMESPACE, key, ttl_seconds)
+            .await
+    }
+
+    /// The shared implementation behind [`Self::get_and_touch_bytes`] and
+    /// [`Namespace::get_and_touch_bytes`].
+    async fn get_and_touch_bytes_in(
+        &self,
+        namespace: &[u8],
+        key: impl AsRef<[u8]>,
+        ttl_seconds: Option<u64>,
+    ) -> Result<Option<Vec<u8>>> {
+        let key = key.as_ref();
+        validate_key(namespace, key)?;
+        self.before_operation().await?;
+        // `WriteBody::Touch`: only the primary's op asks for the value; a
+        // replica is sent the plain touch (it has no value to return, and
+        // `G` there would only move the value over the wire for nothing).
+        let raw = self
+            .with_cluster_retry(|| {
+                self.write(
+                    namespace,
+                    key,
+                    WriteBody::Touch { ttl_seconds },
+                    |connection| async move {
+                        connection.get_and_touch(namespace, key, ttl_seconds).await
+                    },
+                )
+            })
+            .await?;
+        match raw {
+            Some(bytes) if self.inner.compress => {
+                Ok(Some(crate::compression::decompress_value(&bytes)?))
+            }
+            other => Ok(other),
+        }
     }
 
     // ── batched get/set (issue #151) ─────────────────────────────────
@@ -3763,6 +3884,16 @@ impl NanocachedClient {
                                     };
                                     client.apply_reconnecting(Some(&name), &op).await.is_err()
                                 }
+                                OwnedWriteBody::Touch { ttl_seconds } => {
+                                    let op = move |connection: Arc<Connection>| {
+                                        let namespace = Arc::clone(&owned_namespace);
+                                        let key = Arc::clone(&owned_key);
+                                        async move {
+                                            connection.touch(&namespace, &key, ttl_seconds).await
+                                        }
+                                    };
+                                    client.apply_reconnecting(Some(&name), &op).await.is_err()
+                                }
                             };
                             if failed {
                                 client
@@ -3790,6 +3921,10 @@ impl NanocachedClient {
                         connection.set(namespace, key, value, *ttl_seconds).await
                     }
                     WriteBody::Delete => connection.delete(namespace, key).await.map(|_| ()),
+                    WriteBody::Touch { ttl_seconds } => connection
+                        .touch(namespace, key, *ttl_seconds)
+                        .await
+                        .map(|_| ()),
                 }
             }
         };
@@ -4443,6 +4578,37 @@ impl Namespace {
     /// See [`NanocachedClient::delete`]; scoped to this namespace.
     pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         self.client.delete_in(&self.namespace, key).await
+    }
+
+    /// See [`NanocachedClient::touch`]; scoped to this namespace.
+    pub async fn touch(&self, key: impl AsRef<[u8]>, ttl_seconds: Option<u64>) -> Result<bool> {
+        self.client
+            .touch_in(&self.namespace, key, ttl_seconds)
+            .await
+    }
+
+    /// See [`NanocachedClient::get_and_touch`]; scoped to this namespace.
+    pub async fn get_and_touch(
+        &self,
+        key: impl AsRef<[u8]>,
+        ttl_seconds: Option<u64>,
+    ) -> Result<Option<String>> {
+        match self.get_and_touch_bytes(key, ttl_seconds).await? {
+            Some(bytes) => Ok(Some(decode_utf8_value(bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// See [`NanocachedClient::get_and_touch_bytes`]; scoped to this
+    /// namespace.
+    pub async fn get_and_touch_bytes(
+        &self,
+        key: impl AsRef<[u8]>,
+        ttl_seconds: Option<u64>,
+    ) -> Result<Option<Vec<u8>>> {
+        self.client
+            .get_and_touch_bytes_in(&self.namespace, key, ttl_seconds)
+            .await
     }
 
     /// See [`NanocachedClient::get_many`]; scoped to this namespace
