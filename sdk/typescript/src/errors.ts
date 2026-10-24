@@ -15,3 +15,14 @@ export class NanocachedError extends Error {
     this.name = "NanocachedError";
   }
 }
+
+/** The node answered `E` and is closing the connection (issue #825): a
+ * command it does not know, or a request it rejected. Internal — it rides
+ * as the `cause` of the `ConnectionLostError` a sent request fails with,
+ * and `touch`/`getAndTouch` turn it into `ServerTooOldError`. */
+export class ServerRejectedError extends NanocachedError {
+  constructor() {
+    super("nanocached: unexpected response from server: E");
+    this.name = "ServerRejectedError";
+  }
+}

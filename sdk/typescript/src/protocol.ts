@@ -10,7 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { NanocachedError } from "./errors.js";
+import { NanocachedError, ServerRejectedError } from "./errors.js";
 
 /** The default namespace — what the un-namespaced `G`/`S`/`D` commands
  * always address (first-class namespaces, issue #105). Every encoder below
@@ -168,6 +168,40 @@ export function encodeIncr(key: Uint8Array, delta: number, tag?: number, namespa
     throw new RangeError(`nanocached: delta must be a safe integer (got ${delta}) — see README's incr/decr section for the precision caveat`);
   }
   return Buffer.concat([toAscii(`i ${namespace.length} ${key.length} ${delta}${tagField(tag)}\n`), namespace, key]);
+}
+
+/** The TTL argument of touch/getAndTouch (issue #825): `null` removes the
+ * TTL and `0` expires the entry at once (the opposite of set, where 0 means
+ * no expiry), so unlike `set`'s it has no default — `undefined` is rejected,
+ * and a caller who forgets the argument finds out here instead of silently
+ * making an entry immortal. */
+export function checkTouchTtl(ttlSeconds: number | null): void {
+  if (ttlSeconds === null) return;
+  if (typeof ttlSeconds !== "number" || !Number.isSafeInteger(ttlSeconds) || ttlSeconds < 0) {
+    throw new RangeError(
+      `nanocached: ttlSeconds must be a non-negative safe integer, or null to remove the TTL (got ${String(ttlSeconds)})`,
+    );
+  }
+}
+
+/** `t` — touch (issue #825): always namespaced, like `i`. `null` sends no
+ * TTL field (the node removes the TTL); `0` is sent and expires the entry
+ * at once. `get` appends the `G` token. */
+export function encodeTouch(
+  key: Uint8Array,
+  ttlSeconds: number | null,
+  get: boolean,
+  tag?: number,
+  namespace: Uint8Array = EMPTY_NAMESPACE,
+): Buffer {
+  checkKey(key, namespace);
+  checkTouchTtl(ttlSeconds);
+  const ttlField = ttlSeconds === null ? "" : ` ${ttlSeconds}`;
+  return Buffer.concat([
+    toAscii(`t ${namespace.length} ${key.length}${ttlField}${get ? " G" : ""}${tagField(tag)}\n`),
+    namespace,
+    key,
+  ]);
 }
 
 /** The CAS content digest (issue #141): SHA-256 of `value`'s exact bytes,
@@ -474,7 +508,8 @@ export interface ParsedResponse {
    * "ttl then tag" — disambiguated purely by whether the connection is
    * tagged, never guessed frame by frame. Any u64 the wire can carry
    * (issue #501); imprecise as a `number` past 2^53, like an INCR
-   * counter — see parseTtlSeconds. */
+   * counter — see parseTtlSeconds. A `value` response carries one too
+   * when it answers a get-and-touch (issue #825): the TTL now in effect. */
   ttlSeconds?: number;
   /** Batched get's per-key roster (issues #128/#150/#151), present only
    * on a `"multi"` response, one entry per requested key in request
@@ -605,6 +640,7 @@ function parseTag(field: string): number {
 // NanocachedClient, clamps it to Number.MAX_SAFE_INTEGER.
 const TTL_PATTERN = /^[0-9]{1,20}$/;
 const MAX_TTL_SECONDS = 2n ** 64n - 1n;
+const MAX_U64_DIGITS = String(MAX_TTL_SECONDS).length;
 
 function parseTtlSeconds(field: string): number {
   if (!TTL_PATTERN.test(field) || BigInt(field) > MAX_TTL_SECONDS) {
@@ -806,17 +842,24 @@ export function tryParseResponse(
       if (headerEnd === -1) {
         // Keep waiting only while the header could still turn out legal;
         // beyond MAX_VALUE_HEADER_LENGTH with no LF, it never will.
-        if (buf.length > MAX_VALUE_HEADER_LENGTH + (tagged ? 1 + String(MAX_TAG).length : 0)) {
+        // (A get-and-touch's reply can carry a TTL as well — up to a u64's
+        // 20 digits plus its space — issue #825.)
+        if (buf.length > MAX_VALUE_HEADER_LENGTH + 1 + MAX_U64_DIGITS + (tagged ? 1 + String(MAX_TAG).length : 0)) {
           throw new NanocachedError("nanocached: invalid value length in response (missing header terminator)");
         }
         return null;
       }
 
-      // Untagged: `V <len>`. Tagged: `V <len> <tag>` (echoed response tags).
+      // Untagged: `V <len>`. Tagged: `V <len> <tag>` (echoed response
+      // tags). A get-and-touch's reply (issue #825) adds `I`'s optional
+      // TTL between them — told apart by field count for the connection's
+      // mode, never guessed frame by frame.
       const fields = buf.subarray(2, headerEnd).toString("ascii").split(" ");
-      if (fields.length !== (tagged ? 2 : 1)) {
+      const minFields = tagged ? 2 : 1;
+      if (fields.length !== minFields && fields.length !== minFields + 1) {
         throw new NanocachedError("nanocached: invalid value header in response");
       }
+      const valueHasTtl = fields.length === minFields + 1;
 
       // Strict decimal-digits-only (issue #462), same as parseStrictInteger's
       // other call sites — bare `Number(fields[0])` would accept "+5", " 5",
@@ -828,7 +871,8 @@ export function tryParseResponse(
         throw new NanocachedError("nanocached: invalid value length in response");
       }
 
-      const tag = tagged ? parseTag(fields[1]) : undefined;
+      const ttlSeconds = valueHasTtl ? parseTtlSeconds(fields[1]) : undefined;
+      const tag = tagged ? parseTag(fields[fields.length - 1]) : undefined;
 
       const valueStart = headerEnd + 1;
       const valueEnd = valueStart + length;
@@ -837,10 +881,11 @@ export function tryParseResponse(
         return null;
       }
 
-      return {
-        response: { kind: "value", value: Buffer.from(buf.subarray(valueStart, valueEnd)), tag },
-        consumed: valueEnd,
-      };
+      const response: ParsedResponse = { kind: "value", value: Buffer.from(buf.subarray(valueStart, valueEnd)), tag };
+      // Only a get-and-touch's reply has one (issue #825); a plain value
+      // keeps exactly the shape it always had.
+      if (ttlSeconds !== undefined) response.ttlSeconds = ttlSeconds;
+      return { response, consumed: valueEnd };
     }
 
     case MARKER_INCREMENTED: {
@@ -978,6 +1023,12 @@ export function tryParseResponse(
 
       return { response: { kind: "multiAck", ackEntries, tag: header.tag }, consumed: header.headerEnd + 1 };
     }
+
+    // `En\n`: the node rejects the request and closes the connection.
+    // Told apart from other unexpected bytes so a touch can report "server
+    // too old" (issue #825); every other command still fails the same way.
+    case 0x45 /* 'E' */:
+      throw new ServerRejectedError();
 
     default:
       throw new NanocachedError(`nanocached: unexpected response from server: ${String.fromCharCode(buf[0])}`);

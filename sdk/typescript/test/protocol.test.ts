@@ -12,6 +12,7 @@ import {
   encodeMultiGet,
   encodeMultiSet,
   encodeSet,
+  encodeTouch,
   MAX_REQUEST_BYTES,
   MULTI_GET_TUNING,
   parseCounterValue,
@@ -437,6 +438,57 @@ describe("encodeClear / encodeClearAll (issue #106)", () => {
 
   it("accepts a namespace of exactly MAX_REQUEST_BYTES", () => {
     assert.doesNotThrow(() => encodeClear(Buffer.alloc(MAX_REQUEST_BYTES, "n")));
+  });
+});
+
+describe("tryParseResponse of a get-and-touch reply (issue #825)", () => {
+  it("reads a value with and without the TTL now in effect", () => {
+    assert.deepEqual(tryParseResponse(Buffer.from("V 1\nv")), {
+      response: { kind: "value", value: Buffer.from("v"), tag: undefined },
+      consumed: 5,
+    });
+    assert.deepEqual(tryParseResponse(Buffer.from("V 1 30\nv")), {
+      response: { kind: "value", value: Buffer.from("v"), tag: undefined, ttlSeconds: 30 },
+      consumed: 8,
+    });
+    assert.deepEqual(tryParseResponse(Buffer.from("V 1 30 9\nv"), true), {
+      response: { kind: "value", value: Buffer.from("v"), tag: 9, ttlSeconds: 30 },
+      consumed: 10,
+    });
+    assert.equal(tryParseResponse(Buffer.from("V 1 9\nv"), true)?.response.ttlSeconds, undefined);
+  });
+
+  it("rejects a malformed TTL field", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("V 1 +3\nv")), /invalid ttl/);
+    assert.throws(() => tryParseResponse(Buffer.from("V 1 3 3\nv")), /invalid value header/);
+  });
+
+  it("tells the node's En from other unexpected bytes", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("En\n")), (error: Error) => error.name === "ServerRejectedError");
+    assert.throws(() => tryParseResponse(Buffer.from("Z\n")), (error: Error) => error.name === "NanocachedError");
+  });
+});
+
+describe("encodeTouch (issue #825)", () => {
+  const key = Buffer.from("k");
+
+  it("frames every combination of ttl and get; null sends no TTL field and 0 is sent", () => {
+    assert.deepEqual(encodeTouch(key, null, false), Buffer.from("t 0 1\nk"));
+    assert.deepEqual(encodeTouch(key, 30, false), Buffer.from("t 0 1 30\nk"));
+    assert.deepEqual(encodeTouch(key, 0, false), Buffer.from("t 0 1 0\nk"));
+    assert.deepEqual(encodeTouch(key, null, true), Buffer.from("t 0 1 G\nk"));
+    assert.deepEqual(encodeTouch(key, 30, true), Buffer.from("t 0 1 30 G\nk"));
+  });
+
+  it("carries the namespace and the tag last", () => {
+    assert.deepEqual(encodeTouch(key, 30, true, 7, NS), Buffer.from("t 5 1 30 G 7\nusersk"));
+    assert.deepEqual(encodeTouch(key, null, false, 7), Buffer.from("t 0 1 7\nk"));
+  });
+
+  it("rejects a negative, fractional, non-finite or missing TTL before anything is written", () => {
+    for (const bad of [-1, 1.5, NaN, Infinity, 1e21, undefined as unknown as number, "5" as unknown as number]) {
+      assert.throws(() => encodeTouch(key, bad, false), RangeError, String(bad));
+    }
   });
 });
 

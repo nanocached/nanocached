@@ -17,6 +17,7 @@ import {
   PartialConnectionLostError,
   PartialWrongNodeError,
   RetryableError,
+  ServerTooOldError,
   WrongNodeError,
 } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
@@ -1520,10 +1521,10 @@ describe("onData's fatal paths route through poison() (issue #187)", () => {
       });
 
       await waitFor(() => serverSockets.length === 1, "the server to accept the connection");
-      // Two fields where an untagged `V` response must have exactly one
-      // (protocol.ts's fields.length !== 1 check) — a garbage header
-      // that desyncs the stream.
-      serverSockets[0].write("V 5 5\n");
+      // Three fields where an untagged `V` response has one, or two when it
+      // answers a get-and-touch with the TTL now in effect (issue #825) —
+      // a garbage header that desyncs the stream.
+      serverSockets[0].write("V 5 5 5\n");
 
       await assert.rejects(request, /invalid value header/);
       assert.equal(closedWithinDataEvent, true, "isClosed() must already be true within the same 'data' event turn");
@@ -3774,6 +3775,260 @@ describe("NanocachedClient compare-and-set cluster replication (issue #141) — 
       await client.close();
       await cluster.close().catch(() => {});
     }
+  });
+});
+
+describe("NanocachedClient touch/getAndTouch against a single node (issue #825)", () => {
+  async function withClient(
+    run: (client: NanocachedClient, node: MockNode) => Promise<void>,
+    nodeOptions: Parameters<typeof startMockNode>[0] = {},
+  ): Promise<void> {
+    const node = await startMockNode(nodeOptions);
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await run(client, node);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  }
+
+  it("extends, shortens and removes a TTL without touching the value", async () => {
+    await withClient(async (client, node) => {
+      await client.set("k", "v", 10);
+      assert.equal(await client.touch("k", 100), true);
+      assert.equal(node.ttlOf("k"), 100);
+      assert.equal(await client.touch("k", 5), true);
+      assert.equal(node.ttlOf("k"), 5);
+      assert.equal(await client.touch("k", null), true);
+      assert.equal(node.ttlOf("k"), undefined);
+      assert.equal(await client.get("k"), "v");
+    });
+  });
+
+  it("expires the entry at once with 0", async () => {
+    await withClient(async (client) => {
+      await client.set("k", "v");
+      assert.equal(await client.touch("k", 0), true);
+      assert.equal(await client.get("k"), null);
+    });
+  });
+
+  it("answers false for a missing key and never creates one", async () => {
+    await withClient(async (client, node) => {
+      assert.equal(await client.touch("nope", 30), false);
+      assert.equal(await client.get("nope"), null);
+      assert.equal(node.store.size, 0);
+    });
+  });
+
+  it("never overwrites a later set", async () => {
+    await withClient(async (client) => {
+      await client.set("k", "v");
+      await client.touch("k", 30);
+      await client.set("k", "newer");
+      await client.touch("k", 60);
+      assert.equal(await client.get("k"), "newer");
+    });
+  });
+
+  it("is scoped to its namespace", async () => {
+    await withClient(async (client, node) => {
+      const users = client.namespace("users");
+      await users.set("k", "v");
+      assert.equal(await client.touch("k", 30), false);
+      assert.equal(await users.touch("k", 30), true);
+      assert.equal(node.ttlOf("k", "users"), 30);
+      assert.equal(await users.getAndTouch("k", 5), "v");
+      assert.equal(await client.getAndTouch("k", 5), null);
+    });
+  });
+
+  it("getAndTouch returns the value and sets the TTL; no TTL removes it", async () => {
+    await withClient(async (client, node) => {
+      await client.set("k", "v");
+      assert.equal(await client.getAndTouch("k", 60), "v");
+      assert.equal(node.ttlOf("k"), 60);
+      assert.deepEqual(await client.getAndTouchBytes("k", null), Buffer.from("v"));
+      assert.equal(node.ttlOf("k"), undefined);
+      assert.equal(await client.getAndTouch("nope", 60), null);
+    });
+  });
+
+  it("getAndTouch with 0 returns the value, then the entry is gone", async () => {
+    await withClient(async (client) => {
+      await client.set("k", "v");
+      assert.equal(await client.getAndTouch("k", 0), "v");
+      assert.equal(await client.get("k"), null);
+    });
+  });
+
+  it("getAndTouch decompresses on a compress-enabled client", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+        compressionThreshold: 16,
+      });
+      try {
+        await client.set("k", "x".repeat(200));
+        assert.equal(await client.getAndTouch("k", 30), "x".repeat(200));
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("rejects a negative, fractional or missing TTL before any I/O", async () => {
+    await withClient(async (client, node) => {
+      for (const bad of [-1, 1.5, NaN, undefined as unknown as number]) {
+        await assert.rejects(() => client.touch("k", bad), RangeError, String(bad));
+        await assert.rejects(() => client.getAndTouch("k", bad), RangeError, String(bad));
+      }
+      assert.deepEqual(node.touches(), []);
+    });
+  });
+
+  it("round-trips over a tagged connection", async () => {
+    await withClient(
+      async (client) => {
+        await client.set("k", "v");
+        assert.equal(await client.touch("k", 30), true);
+        assert.equal(await client.getAndTouch("k", 60), "v");
+        assert.deepEqual(await client.getAndTouchBytes("k", null), Buffer.from("v"));
+        assert.equal(await client.touch("nope", 30), false);
+      },
+      { supportTags: true },
+    );
+  });
+
+  it("throws ServerTooOldError against a node that predates the command, and keeps working for everything else", async () => {
+    await withClient(
+      async (client) => {
+        await client.set("k", "v");
+        await assert.rejects(() => client.touch("k", 30), ServerTooOldError);
+        await assert.rejects(() => client.getAndTouch("k", 30), ServerTooOldError);
+        assert.equal(await client.get("k"), "v");
+      },
+      { withoutTouch: true },
+    );
+  });
+});
+
+describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster(nodeOptions: Parameters<typeof startMockNode>[0][] = [{}, {}]) {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(nodeOptions[0]), startMockNode(nodeOptions[1])]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary, replica] = ring.owners(Buffer.from(key), 2);
+        return {
+          primary: nodes.find(({ name }) => name === primary)!,
+          replica: nodes.find(({ name }) => name === replica)!,
+        };
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  async function withCluster(
+    run: (client: NanocachedClient, cluster: Awaited<ReturnType<typeof startReplicatedCluster>>) => Promise<void>,
+    nodeOptions?: Parameters<typeof startMockNode>[0][],
+  ): Promise<void> {
+    const cluster = await startReplicatedCluster(nodeOptions);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      await run(client, cluster);
+    } finally {
+      await client.close();
+      await cluster.close();
+    }
+  }
+
+  it("sends a touch to every owner", async () => {
+    await withCluster(async (client, cluster) => {
+      await client.set("k", "v", 10);
+      assert.equal(await client.touch("k", 77), true);
+      for (const node of cluster.nodes) {
+        assert.equal(node.mock.ttlOf("k"), 77);
+        assert.deepEqual(node.mock.touches(), [{ namespace: "", key: "k", ttl: 77, get: false }]);
+      }
+    });
+  });
+
+  it("asks only the primary for the value; the replica gets the plain touch", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary, replica } = cluster.ownerOf("k");
+      await client.set("k", "v");
+      assert.equal(await client.getAndTouch("k", 40), "v");
+      assert.deepEqual(primary.mock.touches(), [{ namespace: "", key: "k", ttl: 40, get: true }]);
+      assert.deepEqual(replica.mock.touches(), [{ namespace: "", key: "k", ttl: 40, get: false }]);
+      assert.equal(replica.mock.ttlOf("k"), 40);
+    });
+  });
+
+  it("getAndTouch does not fall back to a replica when the primary misses", async () => {
+    await withCluster(async (client, cluster) => {
+      const { replica } = cluster.ownerOf("k");
+      replica.mock.store.set("k", Buffer.from("v"));
+      assert.equal(await client.getAndTouch("k", 40), null);
+      assert.equal(replica.mock.ttlOf("k"), 40);
+    });
+  });
+
+  it("refreshes once after a wrong-node answer and succeeds", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary } = cluster.ownerOf("k");
+      await client.set("k", "v");
+      primary.mock.answerWrongNodeOnce();
+      assert.equal(await client.getAndTouch("k", 40), "v");
+    });
+  });
+
+  it("resends a touch whose reply was lost, unlike an incr", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary } = cluster.ownerOf("k");
+      await client.set("k", "10");
+      primary.mock.dropAfterTouchOnce();
+      // The primary applied the touch and the reply never arrived;
+      // resending it changes nothing, so the client does.
+      assert.equal(await client.touch("k", 30), true);
+      assert.equal(primary.mock.touches().filter((t) => t.ttl === 30).length, 2);
+
+      primary.mock.dropAfterIncrOnce();
+      await assert.rejects(() => client.incr("k", 1), ConnectionLostError);
+    });
+  });
+
+  it("a replica that predates the command does not fail the primary's answer", async () => {
+    const [, replicaName] = new HashRing(names).owners(Buffer.from("k"), 2);
+    const options = names.map((name) => (name === replicaName ? { withoutTouch: true } : {}));
+    await withCluster(async (client) => {
+      await client.set("k", "v");
+      assert.equal(await client.touch("k", 30), true);
+      assert.equal(client.stats().replicaWriteFailures, 1);
+    }, options);
   });
 });
 
