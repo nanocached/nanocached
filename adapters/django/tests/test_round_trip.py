@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import pickle
+import socket
 import time
 import unittest
 
-from support import ROUNDTRIP_NODE
+from support import PREFIX_NODE, ROUNDTRIP_NODE
 from django.core.cache import caches
 from nanocached_django import NanocachedCache
 
@@ -104,6 +106,98 @@ class RoundTripTests(unittest.TestCase):
         self.assertTrue(self.cache.touch("ttl-key", timeout=60))
         self.assertEqual(self.cache.get("ttl-key"), "value")
         self.assertFalse(self.cache.touch("missing-key", timeout=60))
+
+    def test_touch_is_one_wire_touch_not_a_read_and_a_re_set(self) -> None:
+        # issue #826: the TTL changes on the node in place — no value
+        # travels either way, so a get or a set would be the old
+        # read-then-re-write.
+        self.cache.set("one-touch", "value", timeout=300)
+        gets, sets = ROUNDTRIP_NODE.get_count, ROUNDTRIP_NODE.set_count
+        frames = len(ROUNDTRIP_NODE.touch_frames)
+
+        self.assertTrue(self.cache.touch("one-touch", timeout=60))
+
+        self.assertEqual(len(ROUNDTRIP_NODE.touch_frames), frames + 1)
+        self.assertEqual(ROUNDTRIP_NODE.get_count, gets)
+        self.assertEqual(ROUNDTRIP_NODE.set_count, sets)
+        self.assertEqual(self._wire_ttl("one-touch"), 60)
+
+    def test_touch_none_removes_the_ttl_and_leaves_the_value(self) -> None:
+        self.cache.set("was-timed", "value", timeout=300)
+        self.assertTrue(self.cache.touch("was-timed", timeout=None))
+        self.assertEqual(self._wire_ttl("was-timed"), 0)  # the mock's "no TTL"
+        self.assertEqual(self.cache.get("was-timed"), "value")
+
+    def test_touch_rounds_a_fractional_timeout_up(self) -> None:
+        self.cache.set("fractional-touch", "value", timeout=300)
+        self.assertTrue(self.cache.touch("fractional-touch", timeout=0.2))
+        self.assertEqual(self._wire_ttl("fractional-touch"), 1)
+
+    def test_touch_with_the_default_timeout_uses_the_caches_default(self) -> None:
+        self.cache.set("default-touch", "value", timeout=7)
+        self.assertTrue(self.cache.touch("default-touch"))
+        self.assertEqual(self._wire_ttl("default-touch"), 300)  # Django's own default
+
+    def test_touch_zero_timeout_deletes_like_set_does(self) -> None:
+        self.cache.set("touch-zero", "value", timeout=300)
+        gets = ROUNDTRIP_NODE.get_count
+        frames = len(ROUNDTRIP_NODE.touch_frames)
+        self.assertTrue(self.cache.touch("touch-zero", timeout=0))
+        self.assertIsNone(self.cache.get("touch-zero"))
+        # "Don't cache" is the existing delete handling, not a wire `t 0`.
+        self.assertEqual(len(ROUNDTRIP_NODE.touch_frames), frames)
+        # A missing key is still False.
+        self.assertFalse(self.cache.touch("touch-zero", timeout=0))
+        self.assertGreater(ROUNDTRIP_NODE.get_count, gets)
+
+    def test_a_write_landing_during_a_touch_is_not_overwritten(self) -> None:
+        # issue #826: the old get-then-set touch re-sent the value it had
+        # read, so a set that landed between the two was lost. The touch
+        # carries no value now. The concurrent write is injected where
+        # the old code's gap was: when the node has seen the request (the
+        # old code's read, the new touch) and not yet answered it. It
+        # goes over its own raw connection
+        # (backends with the same options share one client, and the node
+        # serves one connection's requests in order, so a write on the
+        # touch's own connection would just wait behind it), as a
+        # namespaced `s` frame carrying the cache's wire key.
+        self.cache.set("racy", "old", timeout=300)
+        wire_key = self.cache.make_key("racy", version=self.cache.version).encode()
+        namespace, value = b"django", pickle.dumps("new")
+        fired = []
+
+        def concurrent_set() -> None:
+            if fired:
+                return
+            fired.append(True)
+            with socket.create_connection(("127.0.0.1", ROUNDTRIP_NODE.port)) as sock:
+                reader = sock.makefile("rb")
+                sock.sendall(b"A 1\nx")
+                reader.readline()  # On
+                header = b"s %d %d %d 300\n" % (len(namespace), len(wire_key), len(value))
+                sock.sendall(header + namespace + wire_key + value)
+                reader.readline()  # S
+
+        ROUNDTRIP_NODE.before_access_applies = concurrent_set
+        self.addCleanup(setattr, ROUNDTRIP_NODE, "before_access_applies", None)
+
+        self.assertTrue(self.cache.touch("racy", timeout=60))
+
+        self.assertEqual(self.cache.get("racy"), "new")
+        self.assertEqual(self._wire_ttl("racy"), 60)
+
+    def test_touch_honors_key_prefix_and_version(self) -> None:
+        prefixed = caches["prefixed"]
+        prefixed.set("pv", "value", timeout=300)
+        self.assertTrue(prefixed.touch("pv", timeout=60))
+        self.assertFalse(prefixed.touch("pv", timeout=60, version=9))
+        self.assertEqual(
+            PREFIX_NODE.ttls[(b"prefixed", b"myprefix:3:pv")], 60
+        )
+
+    def _wire_ttl(self, key: str) -> int:
+        wire_key = self.cache.make_key(key, version=self.cache.version).encode()
+        return ROUNDTRIP_NODE.ttls[(b"django", wire_key)]
 
     def test_get_or_set(self) -> None:
         self.assertEqual(self.cache.get_or_set("computed", "default-value"), "default-value")

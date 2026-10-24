@@ -2,6 +2,7 @@
 enough of the wire protocol — ``A``, namespaced ``g``/``s``/``d`` (issue
 #105) with their legacy ``G``/``S``/``D`` counterparts, ``c``/``F``
 (issue #106), ``i`` (issue #129), ``m``/``o`` (issue #152), and the
+``t`` (issue #825), and the
 ``A``/``P``-conditioned forms of ``k`` (issue #141/#414 — the
 digest-conditioned form isn't exercised by these adapter tests and isn't
 implemented here) — for these adapter tests to exercise NanocachedCache
@@ -50,6 +51,15 @@ class MockNode:
         self.multi_get_count = 0
         self.multi_set_count = 0
         self.cas_set_count = 0
+        # Every `t` (touch, issue #825) header line received, verbatim
+        # (e.g. b"t 5 3 30"), in receipt order — lets a test assert the
+        # exact frame the adapter sent.
+        self.touch_frames: list[bytes] = []
+        # Runs when a `g`/`G`/`t` request has been read and not yet
+        # applied or answered, with the node's lock released — lets a
+        # test land a concurrent write in the gap between a read (or a
+        # touch) and whatever the client does next with it.
+        self.before_access_applies = None
 
         self._lock = threading.Lock()
         self._server: socketserver.ThreadingTCPServer | None = None
@@ -159,6 +169,10 @@ class MockNode:
                         key = rfile.read(int(parts[1]))
                     self.get_count += 1
                     value = self._get_entry(namespace, key)
+                    # Looked up, not yet answered: a write landing here
+                    # is exactly what a read-then-re-set client loses.
+                    if self.before_access_applies is not None:
+                        self.before_access_applies()
                     if value is not None:
                         wfile.write(b"V %d\n%b" % (len(value), value))
                     else:
@@ -279,6 +293,49 @@ class MockNode:
                             else:
                                 self.store[key] = value
                     wfile.write((b"S" if matches else b"N") + b"\n")
+                    wfile.flush()
+
+                elif cmd == b"t":
+                    # Touch (issue #825): `t <ns-len> <key-len> [<ttl>] [G]`,
+                    # always namespaced like `i`. A miss answers `N` and
+                    # never creates the key; ttl 0 expires the entry at
+                    # once; no ttl field removes the TTL (the mock stores
+                    # that as 0, like a set without one). Untagged only.
+                    namespace = rfile.read(int(parts[1]))
+                    key = rfile.read(int(parts[2]))
+                    self.touch_frames.append(header[:-1])
+                    ttl = None
+                    with_value = False
+                    for field in parts[3:]:
+                        if field == b"G":
+                            with_value = True
+                        else:
+                            ttl = int(field)
+                    if self.before_access_applies is not None:
+                        self.before_access_applies()
+                    with self._lock:
+                        current = (
+                            self.ns_store.get((namespace, key))
+                            if namespace
+                            else self.store.get(key)
+                        )
+                        if current is None:
+                            reply = b"N\n"
+                        else:
+                            if ttl == 0:
+                                self.ttls.pop((namespace, key), None)
+                                if namespace:
+                                    del self.ns_store[(namespace, key)]
+                                else:
+                                    del self.store[key]
+                            else:
+                                self.ttls[(namespace, key)] = ttl or 0
+                            if with_value:
+                                ttl_field = b" %d" % ttl if ttl else b""
+                                reply = b"V %d%b\n%b" % (len(current), ttl_field, current)
+                            else:
+                                reply = b"S\n"
+                    wfile.write(reply)
                     wfile.flush()
 
                 elif cmd == b"m":
