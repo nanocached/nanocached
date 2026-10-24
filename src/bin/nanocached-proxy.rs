@@ -1500,6 +1500,17 @@ enum Request {
         values: Vec<Bytes>,
         ttl: Option<u64>,
     },
+    /// Issue #871: `y` (batched touch, with an optional get). Always
+    /// namespaced. One `ttl` for the whole batch (`None` removes the TTL);
+    /// `get` makes it a read as well. Idempotent like `Touch`, so every
+    /// owner of a key is sent it; see `dispatch_request`'s arm for how the
+    /// primary's keys carry `G` and the replicas' do not.
+    MultiTouch {
+        namespace: Bytes,
+        keys: Vec<Bytes>,
+        ttl: Option<u64>,
+        get: bool,
+    },
 }
 
 /// Issue #141: `k`'s (and `x`'s) `<cond>` field, decoded. Independent
@@ -2158,6 +2169,68 @@ fn parse_request_body(
             ))
         }
 
+        // Issue #871: `y <ns-len> <n> <key-len-1>...<key-len-n> [ttl] [G]
+        // [tag]` — see `Request::MultiTouch`. As for `t`, the tag comes off
+        // the end first and what is left after the `n` key lengths is
+        // `[ttl] [G]`.
+        "y" => {
+            let (rest, tag) = if tagged {
+                let (tag_field, rest) =
+                    fields.split_last().ok_or_else(|| invalid("missing tag"))?;
+                let tag = u32::try_from(parse_length_field(tag_field)?)
+                    .map_err(|_| invalid("tag out of range"))?;
+                (rest, Some(tag))
+            } else {
+                (fields.as_slice(), None)
+            };
+            let [namespace_length, count, tail @ ..] = rest else {
+                return Err(invalid("bad multi-touch header"));
+            };
+            let namespace_length = parse_length_field(namespace_length)?;
+            let count = parse_length_field(count)?;
+            if count == 0 || tail.len() < count {
+                return Err(invalid("bad multi-touch header"));
+            }
+            let (key_length_fields, tail) = tail.split_at(count);
+            let (tail, get) = match tail {
+                [head @ .., "G"] => (head, true),
+                _ => (tail, false),
+            };
+            let ttl = match tail {
+                [] => None,
+                [ttl] => Some(parse_length_field(ttl)? as u64),
+                _ => return Err(invalid("bad multi-touch header")),
+            };
+            let key_lengths = key_length_fields
+                .iter()
+                .map(|field| parse_length_field(field))
+                .collect::<io::Result<Vec<_>>>()?;
+            if key_lengths.contains(&0) {
+                return Err(invalid("empty key in multi-touch"));
+            }
+            let body_length = key_lengths
+                .iter()
+                .try_fold(namespace_length, |sum, &length| sum.checked_add(length))
+                .ok_or_else(|| invalid("frame length overflow"))?;
+            let body = body!(body_length);
+            let namespace = body.slice(..namespace_length);
+            let mut cursor = namespace_length;
+            let mut keys = Vec::with_capacity(key_lengths.len());
+            for length in key_lengths {
+                keys.push(body.slice(cursor..cursor + length));
+                cursor += length;
+            }
+            Ok(ParseOutcome::Ready(
+                Request::MultiTouch {
+                    namespace,
+                    keys,
+                    ttl,
+                    get,
+                },
+                tag,
+            ))
+        }
+
         "c" => {
             let (lengths, tag) = split_tag(&fields)?;
             let [namespace_length] = lengths.as_slice() else {
@@ -2214,6 +2287,10 @@ enum Expect {
     /// Issue #150: `O <n> <r-1>...<r-n> <tag>`, no body, or `E`. Parsed
     /// specially in `read_reply` alongside `Expect::Multi`, same reason.
     MultiAck,
+    /// Issue #871: a plain `y`'s reply — `Y <n> <r-1>...<r-n> <tag>` with
+    /// `S`, `N` or `W` per key, no body, or `E`. A `y ... G` is answered
+    /// `M` and expects `Expect::Multi`.
+    MultiTouch,
 }
 
 /// One key's outcome inside a backend's `M` reply (issues #128/#150) —
@@ -2264,6 +2341,10 @@ enum NodeReply {
     /// Issue #150: `O`'s per-key roster, already decoded — see
     /// `Expect::MultiAck`.
     MultiAck(Vec<ProxyAckEntry>),
+    /// Issue #871: `Y`'s per-key roster, decoded into `M`'s entry type so a
+    /// batch can be reduced the same way whether its sub-frames asked for
+    /// values or not: `S` is a `Value` with no bytes, `N` a `Miss`.
+    MultiTouch(Vec<ProxyMultiEntry>),
     /// `E`, or a reply that doesn't fit `Expect` — the connection is
     /// dropped by the reader either way.
     Error,
@@ -2859,6 +2940,42 @@ async fn read_reply<S: AsyncRead + Unpin>(
         return Ok(reply);
     }
 
+    // Issue #871: `Y`'s roster is variable-length like `O`'s, with no body.
+    if marker == "Y" {
+        let (tag_field, rest) = fields
+            .split_last()
+            .ok_or_else(|| invalid("malformed Y reply"))?;
+        if *tag_field != tag.to_string() {
+            return Err(invalid(&format!(
+                "backend reply tag mismatch: expected {tag}, got {tag_field}"
+            )));
+        }
+
+        let (count_field, roster) = rest
+            .split_first()
+            .ok_or_else(|| invalid("malformed Y reply"))?;
+        let count = parse_length_field(count_field)?;
+        if roster.len() != count {
+            return Err(invalid("Y roster length does not match its own count"));
+        }
+
+        let entries = roster
+            .iter()
+            .map(|token| match *token {
+                "S" => Ok(ProxyMultiEntry::Value(Bytes::new())),
+                "N" => Ok(ProxyMultiEntry::Miss),
+                "W" => Ok(ProxyMultiEntry::WrongNode),
+                _ => Err(invalid("malformed Y roster token")),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        let reply = NodeReply::MultiTouch(entries);
+        if !matches!(expect, Expect::MultiTouch) {
+            return Err(invalid("backend reply does not fit the request"));
+        }
+        return Ok(reply);
+    }
+
     // Issue #129: `I`'s header carries an extra optional `<ttl>` field
     // ahead of the tag — same "present-but-unlabeled trailing field"
     // shape `S`'s own optional TTL has, but backend connections are
@@ -2955,6 +3072,7 @@ async fn read_reply<S: AsyncRead + Unpin>(
             )
             | (NodeReply::Error, Expect::Multi)
             | (NodeReply::Error, Expect::MultiAck)
+            | (NodeReply::Error, Expect::MultiTouch)
     );
     if !shape_ok {
         return Err(invalid("backend reply does not fit the request"));
@@ -3014,6 +3132,26 @@ fn frame_multi_set(namespace: &[u8], keys: &[Bytes], values: &[Bytes], ttl: Opti
     for (key, value) in keys.iter().zip(values) {
         frame.extend_from_slice(key);
         frame.extend_from_slice(value);
+    }
+    frame.into()
+}
+
+/// Issue #871: one `y` sub-frame per involved owner address and role — see
+/// `plan_multi_touch`. No `ttl` asks the node to remove the TTL; `get` adds
+/// the `G` token.
+fn frame_multi_touch(namespace: &[u8], keys: &[Bytes], ttl: Option<u64>, get: bool) -> Bytes {
+    let key_lengths: String = keys.iter().map(|key| format!(" {}", key.len())).collect();
+    let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
+    let get_field = if get { " G" } else { "" };
+    let mut frame = format!(
+        "y {} {}{key_lengths}{ttl_field}{get_field} {TAG_PLACEHOLDER}\n",
+        namespace.len(),
+        keys.len()
+    )
+    .into_bytes();
+    frame.extend_from_slice(namespace);
+    for key in keys {
+        frame.extend_from_slice(key);
     }
     frame.into()
 }
@@ -3511,6 +3649,22 @@ impl SharedBackends {
 
     /// `call` on every `(addr, frame)` in `requests` concurrently — the
     /// retry-path counterpart of `enqueue_each`, same ordering.
+    /// `call_each` for requests that do not all expect the same reply.
+    async fn call_mixed<'a>(
+        &'a self,
+        context: &'a ProxyContext,
+        requests: impl IntoIterator<Item = (&'a str, Bytes, Expect)>,
+    ) -> Vec<io::Result<NodeReply>> {
+        let futs = requests
+            .into_iter()
+            .map(|(addr, frame, expect)| {
+                Box::pin(self.call(context, addr, frame, expect))
+                    as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + 'a>>
+            })
+            .collect();
+        join_all(futs).await
+    }
+
     async fn call_each<'a>(
         &'a self,
         context: &'a ProxyContext,
@@ -3717,6 +3871,28 @@ fn respond_multi_ack(entries: &[ProxyAckEntry], tag: Option<u32>) -> Vec<u8> {
         match entry {
             ProxyAckEntry::Stored => header.push_str(" S"),
             ProxyAckEntry::WrongNode => header.push_str(" W"),
+        }
+    }
+    if let Some(tag) = tag {
+        header.push(' ');
+        header.push_str(&tag.to_string());
+    }
+    header.push('\n');
+
+    header.into_bytes()
+}
+
+/// Issue #871: `Y <n> <r-1>...<r-n> [tag]\n` — the client-facing answer to
+/// a plain `y`, mirroring `Response::MultiTouch` on the node side
+/// (`src/response.rs`). A hit (`Value`, whatever its bytes) is `S`.
+fn respond_multi_touch(entries: &[ProxyMultiEntry], tag: Option<u32>) -> Vec<u8> {
+    let mut header = format!("Y {}", entries.len());
+
+    for entry in entries {
+        match entry {
+            ProxyMultiEntry::Value(_) => header.push_str(" S"),
+            ProxyMultiEntry::Miss => header.push_str(" N"),
+            ProxyMultiEntry::WrongNode => header.push_str(" W"),
         }
     }
     if let Some(tag) = tag {
@@ -4097,6 +4273,50 @@ async fn dispatch_request(
                     },
                     missing,
                     groups_legs,
+                    pending,
+                    tag,
+                )
+                .await;
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
+            });
+        }
+        // Issue #871: like `Touch`, written to every owner. The keys are
+        // grouped by owner address, and a `G` batch splits each address's
+        // share by role: the keys it is primary for go in one `y ... G`
+        // sub-frame (the value the client asked for comes from the primary),
+        // the keys it is only a replica for in a plain `y` one. A plain
+        // batch is one sub-frame per address either way. Only a key's
+        // primary decides its client-facing status.
+        Request::MultiTouch {
+            namespace,
+            keys,
+            ttl,
+            get,
+        } => {
+            let (missing, groups) =
+                plan_multi_touch(&ring, &namespace, &keys, 0..keys.len(), ttl, get);
+
+            if groups.is_empty() {
+                let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+                return result_rx;
+            }
+
+            let requests = groups
+                .iter()
+                .map(|group| (group.addr.as_str(), group.frame.clone(), group.expect));
+            let pending = context.backends.enqueue_mixed(&context, requests).await;
+
+            tokio::spawn(async move {
+                let result = finish_multi_touch(
+                    &context,
+                    MultiTouchBatch {
+                        namespace: &namespace,
+                        keys: &keys,
+                        ttl,
+                        get,
+                    },
+                    missing,
+                    groups,
                     pending,
                     tag,
                 )
@@ -4575,6 +4795,216 @@ async fn retry_multi_set(
                 }
             }
         }
+    }
+}
+
+/// One backend sub-frame of a batched touch: where it goes, what it asks
+/// and expects back, and the batch positions it covers, each with whether
+/// that address is the key's primary.
+struct TouchGroup {
+    addr: String,
+    frame: Bytes,
+    expect: Expect,
+    legs: Vec<(usize, bool)>,
+}
+
+/// Issue #871: files `positions` of a `y` batch under the owners of each
+/// key, as the sub-frames to send. Returns the positions that have no owner
+/// at all (an empty ring) and the groups. With `get`, a key's primary gets
+/// it in a `G` group (expecting `M`) and the other owners in a plain one
+/// (expecting `Y`); without it every owner's share is one plain group.
+fn plan_multi_touch(
+    ring: &RingView,
+    namespace: &[u8],
+    keys: &[Bytes],
+    positions: impl IntoIterator<Item = usize>,
+    ttl: Option<u64>,
+    get: bool,
+) -> (Vec<usize>, Vec<TouchGroup>) {
+    let mut primaries: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(ring);
+    let mut plain: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(ring);
+    let mut missing = Vec::new();
+    let mut top = Vec::new();
+    let namespace_hash = NamespaceHash::of(namespace);
+
+    for position in positions {
+        ring.rank_owners(namespace_hash, &keys[position], ring.replication, &mut top);
+        if top.is_empty() {
+            missing.push(position);
+            continue;
+        }
+        for (rank, &(_, owner)) in top.iter().enumerate() {
+            if get && rank == 0 {
+                primaries.group_for(owner).push((position, true));
+            } else {
+                plain.group_for(owner).push((position, rank == 0));
+            }
+        }
+    }
+
+    let mut groups = Vec::new();
+    for (named, get, expect) in [
+        (primaries.into_named(), true, Expect::Multi),
+        (plain.into_named(), false, Expect::MultiTouch),
+    ] {
+        for (addr, legs) in named {
+            let group_keys: Vec<Bytes> = legs
+                .iter()
+                .map(|(position, _)| keys[*position].clone())
+                .collect();
+            groups.push(TouchGroup {
+                addr,
+                frame: frame_multi_touch(namespace, &group_keys, ttl, get),
+                expect,
+                legs,
+            });
+        }
+    }
+    (missing, groups)
+}
+
+/// The batch a `finish_multi_touch`/`retry_multi_touch` pass works against.
+struct MultiTouchBatch<'a> {
+    namespace: &'a [u8],
+    keys: &'a [Bytes],
+    ttl: Option<u64>,
+    get: bool,
+}
+
+/// Reduces one sub-reply to its keys' outcomes. Only a *primary* leg
+/// decides a key's client-facing entry: a `W` pushes it to
+/// `retry_positions`, and so does a group that failed or came back
+/// malformed. A replica leg's `W` or failure is logged and swallowed, like
+/// `finish_touch`'s stance on a replica.
+fn settle_multi_touch_group(
+    context: &ProxyContext,
+    legs: &[(usize, bool)],
+    reply: io::Result<NodeReply>,
+    entries: &mut [Option<ProxyMultiEntry>],
+    retry_positions: &mut Vec<usize>,
+) {
+    match reply {
+        Ok(NodeReply::Multi(results) | NodeReply::MultiTouch(results))
+            if results.len() == legs.len() =>
+        {
+            for (&(position, is_primary), result) in legs.iter().zip(results) {
+                if !is_primary {
+                    if matches!(result, ProxyMultiEntry::WrongNode) {
+                        note_refused_replica_leg(
+                            context,
+                            "multi-touch leg",
+                            None,
+                            &NodeReply::WrongNode,
+                        );
+                    }
+                } else if matches!(result, ProxyMultiEntry::WrongNode) {
+                    retry_positions.push(position);
+                } else {
+                    entries[position] = Some(result);
+                }
+            }
+        }
+        _ => {
+            for &(position, is_primary) in legs {
+                if is_primary {
+                    retry_positions.push(position);
+                } else {
+                    eprintln!("WARN replica multi-touch leg failed");
+                }
+            }
+        }
+    }
+}
+
+/// Issue #871: awaits every sub-reply of a `y` batch and splices the
+/// per-key outcomes back into the client's request order, then answers `M`
+/// (with `G`) or `Y`. Like `finish_multi_set`, a primary's `W` or a failed
+/// group gets one bounded refresh-and-retry, never a whole-frame failure: a
+/// key that is still wrong after it is answered `W` on its own.
+async fn finish_multi_touch(
+    context: &ProxyContext,
+    batch: MultiTouchBatch<'_>,
+    missing: Vec<usize>,
+    groups: Vec<TouchGroup>,
+    pending: Vec<PendingReply>,
+    tag: Option<u32>,
+) -> DriverResult {
+    let get = batch.get;
+    let mut entries: Vec<Option<ProxyMultiEntry>> = vec![None; batch.keys.len()];
+    let mut retry_positions = Vec::new();
+
+    for position in missing {
+        entries[position] = Some(ProxyMultiEntry::WrongNode);
+    }
+    for (group, reply) in groups.into_iter().zip(pending) {
+        settle_multi_touch_group(
+            context,
+            &group.legs,
+            reply.await,
+            &mut entries,
+            &mut retry_positions,
+        );
+    }
+
+    if !retry_positions.is_empty() {
+        retry_multi_touch(context, batch, &retry_positions, &mut entries).await;
+    }
+
+    let mut entries: Vec<ProxyMultiEntry> = entries
+        .into_iter()
+        .map(|entry| entry.unwrap_or(ProxyMultiEntry::WrongNode))
+        .collect();
+    if get {
+        cap_multi_reply_values(&mut entries);
+        Ok(respond_multi(&entries, tag))
+    } else {
+        Ok(respond_multi_touch(&entries, tag))
+    }
+}
+
+/// Issue #871: the one refresh-and-retry pass of a `y` batch, mirroring
+/// `retry_multi_set`: the retried keys are re-sent to every owner on the
+/// fresh ring, not just the primary, which is harmless because a touch is
+/// idempotent. A key whose primary is still `W` or unreachable is answered
+/// `W`.
+async fn retry_multi_touch(
+    context: &ProxyContext,
+    batch: MultiTouchBatch<'_>,
+    retry_positions: &[usize],
+    entries: &mut [Option<ProxyMultiEntry>],
+) {
+    force_refresh(context).await;
+
+    let Some(ring) = current_ring(context) else {
+        for &position in retry_positions {
+            entries[position] = Some(ProxyMultiEntry::WrongNode);
+        }
+        return;
+    };
+
+    let (missing, groups) = plan_multi_touch(
+        &ring,
+        batch.namespace,
+        batch.keys,
+        retry_positions.iter().copied(),
+        batch.ttl,
+        batch.get,
+    );
+    for position in missing {
+        entries[position] = Some(ProxyMultiEntry::WrongNode);
+    }
+
+    let requests = groups
+        .iter()
+        .map(|group| (group.addr.as_str(), group.frame.clone(), group.expect));
+    let replies = context.backends.call_mixed(context, requests).await;
+
+    let mut unresolved = Vec::new();
+    for (group, reply) in groups.iter().zip(replies) {
+        settle_multi_touch_group(context, &group.legs, reply, entries, &mut unresolved);
+    }
+    for position in unresolved {
+        entries[position] = Some(ProxyMultiEntry::WrongNode);
     }
 }
 
@@ -5289,6 +5719,22 @@ fn request_cost(request: &Request, frame_bytes: usize, replication: usize) -> us
         Request::MultiSet { keys, .. } => frame_bytes
             .saturating_mul(legs)
             .saturating_add(keys.len().saturating_mul(MULTI_KEY_OVERHEAD_BYTES)),
+        // Re-framed once per owner leg like a write; with `G` also answered
+        // with up to what an `m` is.
+        Request::MultiTouch { keys, get, .. } => {
+            let framed = frame_bytes
+                .saturating_mul(legs)
+                .saturating_add(keys.len().saturating_mul(MULTI_KEY_OVERHEAD_BYTES));
+            if *get {
+                framed.saturating_add(
+                    keys.len()
+                        .saturating_mul(MAX_REQUEST_SIZE)
+                        .min(MAX_MULTI_REPLY_VALUE_BYTES),
+                )
+            } else {
+                framed
+            }
+        }
     }
 }
 
@@ -7784,6 +8230,71 @@ mod tests {
                                         .write_all(format!("S {}\n", tag(&fields)).as_bytes())
                                         .await?;
                                 }
+                            }
+                        }
+                    }
+                    // Issue #871: mirrors the real node's `y`/`Y` (and `M` with
+                    // `G`) — no TTL fidelity, like the `t` arm above. Every key
+                    // that is not answered `W` is logged as one `(ttl, get)`
+                    // entry in `touches`.
+                    "y" => {
+                        let ns_length: usize = fields[0].parse().unwrap();
+                        let count: usize = fields[1].parse().unwrap();
+                        let key_lengths: Vec<usize> = fields[2..2 + count]
+                            .iter()
+                            .map(|field| field.parse().unwrap())
+                            .collect();
+                        let tail = &fields[2 + count..fields.len() - 1];
+                        let get = tail.last().is_some_and(|field| field == "G");
+                        let ttl_fields = if get { &tail[..tail.len() - 1] } else { tail };
+                        let ttl: Option<u64> =
+                            ttl_fields.first().map(|field| field.parse().unwrap());
+                        let total: usize = ns_length + key_lengths.iter().sum::<usize>();
+                        read_exact_into(&mut stream, &mut buf, total).await?;
+                        let body = buf.split_to(total);
+                        let namespace = body[..ns_length].to_vec();
+                        let mut cursor = ns_length;
+                        let keys: Vec<Vec<u8>> = key_lengths
+                            .iter()
+                            .map(|&length| {
+                                let key = body[cursor..cursor + length].to_vec();
+                                cursor += length;
+                                key
+                            })
+                            .collect();
+
+                        // The first key answered `W`, as the `m` arm does.
+                        let first_wrong = wrong_once.swap(false, Ordering::SeqCst);
+                        // `None`: wrong node, `Some(None)`: miss.
+                        let mut roster: Vec<Option<Option<Vec<u8>>>> = Vec::new();
+                        for (index, key) in keys.into_iter().enumerate() {
+                            if first_wrong && index == 0 {
+                                roster.push(None);
+                                continue;
+                            }
+                            touches.lock().unwrap().push((ttl, get));
+                            roster.push(Some(
+                                store.lock().unwrap().get(&(namespace.clone(), key)).cloned(),
+                            ));
+                        }
+
+                        let mut header = format!("{} {count}", if get { "M" } else { "Y" });
+                        for entry in &roster {
+                            match (entry, get) {
+                                (None, _) => header.push_str(" W"),
+                                (Some(None), true) => header.push_str(" -"),
+                                (Some(None), false) => header.push_str(" N"),
+                                (Some(Some(value)), true) => {
+                                    header.push_str(&format!(" {}", value.len()))
+                                }
+                                (Some(Some(_)), false) => header.push_str(" S"),
+                            }
+                        }
+                        header.push_str(&format!(" {}\n", tag(&fields)));
+                        stream.write_all(header.as_bytes()).await?;
+                        if get {
+                            for value in roster.into_iter().flatten().flatten() {
+                                stream.write_all(&value).await?;
                             }
                         }
                     }
@@ -10369,6 +10880,320 @@ mod tests {
                 (None, false)
             ]
         );
+    }
+
+    fn multi_touch_request(
+        namespace: &[u8],
+        keys: &[&[u8]],
+        ttl: Option<u64>,
+        get: bool,
+    ) -> Request {
+        Request::MultiTouch {
+            namespace: Bytes::copy_from_slice(namespace),
+            keys: keys.iter().map(|key| Bytes::copy_from_slice(key)).collect(),
+            ttl,
+            get,
+        }
+    }
+
+    #[test]
+    fn a_batch_touch_parses_with_every_combination_of_ttl_and_get() {
+        for (frame, expected) in [
+            (
+                &b"y 5 2 1 2\nusersabc"[..],
+                multi_touch_request(b"users", &[b"a", b"bc"], None, false),
+            ),
+            (
+                b"y 5 2 1 2 30\nusersabc",
+                multi_touch_request(b"users", &[b"a", b"bc"], Some(30), false),
+            ),
+            (
+                b"y 5 2 1 2 0\nusersabc",
+                multi_touch_request(b"users", &[b"a", b"bc"], Some(0), false),
+            ),
+            (
+                b"y 5 2 1 2 G\nusersabc",
+                multi_touch_request(b"users", &[b"a", b"bc"], None, true),
+            ),
+            (
+                b"y 5 2 1 2 30 G\nusersabc",
+                multi_touch_request(b"users", &[b"a", b"bc"], Some(30), true),
+            ),
+            (
+                b"y 0 1 1 30\na",
+                multi_touch_request(b"", &[b"a"], Some(30), false),
+            ),
+        ] {
+            assert_eq!(parsed_touch(frame, false), (expected, None));
+        }
+    }
+
+    #[test]
+    fn a_batch_touch_carries_its_tag_last_in_tagged_mode() {
+        // `y 0 1 1 7` is a TTL when untagged and a tag alone when tagged.
+        assert_eq!(
+            parsed_touch(b"y 0 1 1 7\na", false).0,
+            multi_touch_request(b"", &[b"a"], Some(7), false)
+        );
+        for (frame, expected) in [
+            (
+                &b"y 0 1 1 7\na"[..],
+                multi_touch_request(b"", &[b"a"], None, false),
+            ),
+            (
+                b"y 0 1 1 30 7\na",
+                multi_touch_request(b"", &[b"a"], Some(30), false),
+            ),
+            (
+                b"y 0 1 1 G 7\na",
+                multi_touch_request(b"", &[b"a"], None, true),
+            ),
+            (
+                b"y 0 1 1 30 G 7\na",
+                multi_touch_request(b"", &[b"a"], Some(30), true),
+            ),
+        ] {
+            assert_eq!(parsed_touch(frame, true), (expected, Some(7)));
+        }
+    }
+
+    #[test]
+    fn a_malformed_batch_touch_is_rejected() {
+        for (frame, tagged) in [
+            (&b"y 0 0\n"[..], false),
+            (b"y 0 2 1 0\na", false),
+            // The claimed count outruns the header.
+            (b"y 0 999999999 1\na", false),
+            (b"y 0 1 1 G 30\na", false),
+            (b"y 0 1 1 30 40\na", false),
+            (b"y 0 1 1 abc\na", false),
+            (b"y 0 1 1 g\na", false),
+            (b"y 0\n", false),
+            (b"y 0 1 1\na", true),
+        ] {
+            let mut input = BytesMut::from(frame);
+            assert!(
+                parse_request(&mut input, tagged, &mut RequestScanState::default()).is_err(),
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_touch_frame_to_the_node_names_its_keys_ttl_and_get() {
+        let keys = [Bytes::from_static(b"a"), Bytes::from_static(b"bc")];
+        assert_eq!(
+            &frame_multi_touch(b"", &keys, None, false)[..],
+            format!("y 0 2 1 2 {TAG_PLACEHOLDER}\nabc").as_bytes()
+        );
+        assert_eq!(
+            &frame_multi_touch(b"ns", &keys, Some(60), true)[..],
+            format!("y 2 2 1 2 60 G {TAG_PLACEHOLDER}\nnsabc").as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_batch_touch_with_get_is_charged_for_the_values_it_can_return() {
+        let plain = multi_touch_request(b"", &[b"a", b"b"], Some(1), false);
+        let get = multi_touch_request(b"", &[b"a", b"b"], Some(1), true);
+        assert!(request_cost(&get, 30, 2) > request_cost(&plain, 30, 2));
+    }
+
+    /// Two keys, one primaried by `nodes[0]` and one by `nodes[1]` at R = 2.
+    fn keys_with_each_primary(nodes: &[MockNode]) -> (String, String) {
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+        let mut primary_a = None;
+        let mut primary_b = None;
+        for index in 0..64u8 {
+            let key = format!("key-{index}");
+            let owner = ring.owners(b"", key.as_bytes())[0].clone();
+            if owner == nodes[0].addr && primary_a.is_none() {
+                primary_a = Some(key);
+            } else if owner == nodes[1].addr && primary_b.is_none() {
+                primary_b = Some(key);
+            }
+        }
+        (
+            primary_a.expect("no key primaried by node a"),
+            primary_b.expect("no key primaried by node b"),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_touch_reaches_every_owner_and_only_a_keys_primary_is_asked_for_its_value() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let (key_a, key_b) = keys_with_each_primary(&nodes);
+        for (key, value) in [(&key_a, "1"), (&key_b, "2")] {
+            stream
+                .write_all(format!("S {} 1\n{key}{value}", key.len()).as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        }
+        let missing = "nope";
+        let lengths = format!("{} {} {}", key_a.len(), key_b.len(), missing.len());
+
+        // Plain: every owner of every key gets the same plain touch; the
+        // answer is a roster of `S`/`N`.
+        stream
+            .write_all(format!("y 0 3 {lengths} 30\n{key_a}{key_b}{missing}").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "Y 3 S S N");
+        for node in &nodes {
+            assert_eq!(node.touches(), vec![(Some(30), false); 3], "{}", node.addr);
+        }
+
+        // With `G` the values come from the primaries and each node is sent
+        // `G` only for the key it is primary of, the plain touch for the
+        // other; no TTL field removes the TTL.
+        for node in &nodes {
+            node.touches.lock().unwrap().clear();
+        }
+        stream
+            .write_all(
+                format!("y 0 2 {} {} 60 G\n{key_a}{key_b}", key_a.len(), key_b.len()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"12");
+        for node in &nodes {
+            let mut touches = node.touches();
+            touches.sort();
+            assert_eq!(
+                touches,
+                vec![(Some(60), false), (Some(60), true)],
+                "{}",
+                node.addr
+            );
+        }
+        stream
+            .write_all(format!("y 0 1 {} G\n{key_a}", key_a.len()).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 1 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"1");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_touch_answers_a_miss_per_key_and_never_creates_one() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"s 2 1 1\nnsav").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        // The namespace is part of the key: `a` is not in the default one.
+        stream.write_all(b"y 0 2 1 1 30\nab").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "Y 2 N N");
+        stream.write_all(b"y 2 2 1 1 30\nnsab").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "Y 2 S N");
+        stream.write_all(b"y 2 2 1 1 30 G\nnsab").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 -");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+        assert!(nodes.iter().all(|node| node.entry(b"", b"a").is_none()));
+        assert!(nodes.iter().all(|node| node.entry(b"ns", b"b").is_none()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tagged_batch_touch_is_answered_with_its_tag() {
+        let (_nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+
+        stream.write_all(b"S 1 1 1\nav").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 1");
+        stream.write_all(b"y 0 2 1 1 30 2\nab").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "Y 2 S N 2");
+        stream.write_all(b"y 0 2 1 1 30 G 3\nab").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 - 3");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_touch_retries_a_per_key_wrong_node_after_a_refresh() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let (key_a, key_b) = keys_with_each_primary(&nodes);
+        for key in [&key_a, &key_b] {
+            stream
+                .write_all(format!("S {} 1\n{key}v", key.len()).as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        }
+
+        // Each node answers the first key of its next `y` sub-frame `W`: a
+        // stale view of one slice of the roster.
+        nodes[0].wrong_node_once.store(true, Ordering::SeqCst);
+        nodes[1].wrong_node_once.store(true, Ordering::SeqCst);
+        stream
+            .write_all(
+                format!("y 0 2 {} {} 30\n{key_a}{key_b}", key_a.len(), key_b.len()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "Y 2 S S");
+
+        nodes[0].wrong_node_once.store(true, Ordering::SeqCst);
+        nodes[1].wrong_node_once.store(true, Ordering::SeqCst);
+        stream
+            .write_all(
+                format!("y 0 2 {} {} 30 G\n{key_a}{key_b}", key_a.len(), key_b.len()).as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"vv");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_touch_whose_connection_drops_is_re_sent_not_failed() {
+        // A touch is idempotent, so a group whose reply never arrived is
+        // sent again over a fresh connection and the client gets its answer.
+        let (nodes, proxy) = cluster(1).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"S 1 1\nav").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        stream.write_all(b"S 1 1\nbw").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        for node in &nodes {
+            node.close_once.store(true, Ordering::SeqCst);
+        }
+        stream.write_all(b"y 0 2 1 1 30 G\nab").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"vw");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_touch_that_cannot_reach_its_nodes_degrades_each_key_to_w() {
+        // As for `m` and `o`, an unreachable owner is a per-key `W` (the
+        // client refreshes its routing and re-sends those keys), never a
+        // failure of the whole frame.
+        let proxy = dead_node_cluster().await;
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        stream.write_all(b"A 1 R\nx").await.unwrap();
+        let mut buf = BytesMut::new();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+
+        stream.write_all(b"y 0 1 4 30\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "Y 1 W");
+        stream.write_all(b"y 0 1 4 30 G\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 1 W");
     }
 
     #[tokio::test(flavor = "current_thread")]

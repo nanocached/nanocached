@@ -24,7 +24,7 @@ framework adapters at one version, whether or not a component changed.
   untouched. Like `t` it is idempotent and not primary-only, and each touched
   key is forwarded during a join or a decommission as the value with its new
   TTL, like a set. A node older than this release answers `En` and closes the
-  connection. The proxy does not forward it yet.
+  connection.
 - `nanocached-node`: `nanocached_node_touches_total` counts the touches a
   node handles, each `t` frame and each key of a `y` frame, plain and `G`,
   found or not, and `nanocached_node_touch_misses_total` counts the ones that
@@ -44,6 +44,15 @@ framework adapters at one version, whether or not a component changed.
   a set. A node older than this release answers `En` and closes the
   connection, so upgrade every node before a client sends it. No SDK,
   adapter or the proxy uses it yet.
+- `nanocached-proxy` routes the `y` command: a batch is split into one
+  sub-frame per owner address and the answers are put back in the client's
+  order, like `m` and `o`. Every owner of a key is sent it, as `t` is; a
+  batch with `G` sends each key's primary a `y ... G` for the keys it is
+  primary of (its answer is the client's) and every other owner the plain
+  form. A key whose primary answers `W`, or whose sub-frame fails, is sent
+  again once over a refreshed ring (a touch is idempotent), and a key still
+  wrong after that is answered `W` on its own, not the whole frame. The proxy
+  needs a node that knows `y`.
 - `nanocached-proxy` routes the `t` command: it goes to every owner of the key
   like a set, the answer comes from the primary, and a get-and-touch (`G`)
   asks only the primary for the value (replicas get the plain touch). A stale

@@ -381,7 +381,7 @@ here.</p>
   would need versioned writes in the server and every SDK. Revisit if a
   versioned write path is adopted for other reasons.</li>
   <li>During a join&rsquo;s or a decommission&rsquo;s forwarding window, a
-  touch (<code>t</code>) is forwarded as the value the old owner holds with
+  touch (<code>t</code>, or a key of a <code>y</code> batch) is forwarded as the value the old owner holds with
   the new TTL, written like a set, not as a touch: the joiner may not hold
   the key yet, and a touch it could not apply would be lost with the copy
   left on the handoff&rsquo;s old TTL. A touch that runs on the old owner
