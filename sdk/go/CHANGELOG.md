@@ -10,6 +10,19 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Added
+
+- `Touch(key, ttlSeconds)` replaces an entry's TTL in place and reports
+  whether the key existed; `GetAndTouch(key, ttlSeconds)` and
+  `GetAndTouchBytes` read the value and replace the TTL in one step. All
+  three are on `Namespace` too. `ttlSeconds` has no default: the new
+  constant `RemoveTTL` removes the TTL and `0` expires the entry at once
+  (the opposite of `Set`, where `0` means no expiry). They are idempotent,
+  so unlike `Incr` and the compare-and-set family a lost reply is retried;
+  they go to every owner (`GetAndTouch` asks only the primary for the
+  value). Against a node that predates the command they return the new
+  `ErrServerTooOld`. Needs a server release that includes the `t` command.
+
 ## [0.4.8] - 2026-10-21
 
 ### Fixed

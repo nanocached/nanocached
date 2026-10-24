@@ -83,6 +83,16 @@ var (
 	// it for counter keys.
 	ErrCompressIncompatible = errors.New("nanocached: incr/decr is incompatible with value compression (disable compress or use a separate client)")
 
+	// ErrServerTooOld is returned by Touch/GetAndTouch (issue #825) when
+	// the node answered `En` to the `t` command: a node that predates it
+	// does not know the command and closes the connection. Every node must
+	// be upgraded before a client sends it; nothing is retried to get past
+	// it, since the same node would answer the same way. `En` is also what
+	// a request that is too large or malformed gets, but the SDK validates
+	// size and builds a well-formed frame, so for `t` it means the command
+	// is unknown.
+	ErrServerTooOld = errors.New("nanocached: the server does not know the touch command (t) — upgrade every node to a release that includes it")
+
 	// ErrRetryable is returned when a single request was answered `R`
 	// (issue #125) on every attempt of the bounded retry budget — the
 	// server (today, only nanocached-proxy) reported the request itself
@@ -96,6 +106,13 @@ var (
 	// regardless of what the caller configured.
 	ErrRetryable = errors.New("nanocached: request failed transiently and retries were exhausted")
 )
+
+// errServerRejected marks the ErrProtocol failure a node's `En` produces
+// (issue #825): the node rejected the request and is closing the
+// connection. Joined onto the protocol error so everything that matches
+// ErrProtocol behaves as before; Touch/GetAndTouch look for it to report
+// ErrServerTooOld.
+var errServerRejected = errors.New("nanocached: the server rejected the request")
 
 // errRequestNotSent marks an ErrConnectionLost/ErrProtocol failure that
 // happened before this request's bytes were fully handed to the

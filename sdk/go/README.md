@@ -290,6 +290,40 @@ background, can only ever prove the first case.
 immediately, before any I/O, rather than produce a value the protocol
 can't safely round-trip — see "Value compression" below.
 
+## Touch and GetAndTouch
+
+`Touch` replaces an entry's TTL in place, without rewriting its value, and
+reports whether the key existed. `GetAndTouch` (and `GetAndTouchBytes`)
+reads the value and replaces the TTL in one step:
+
+```go
+err = client.Set("session", "abc", 60)
+existed, err := client.Touch("session", 300)                    // true — now expires in 300 s
+existed, err = client.Touch("session", nanocached.RemoveTTL)    // true — never expires
+value, ok, err := client.GetAndTouch("session", 300)            // "abc", true, nil
+existed, err = client.Touch("session", 0)                       // true — expires at once
+existed, err = client.Touch("missing", 30)                      // false, nil — a touch never creates a key
+```
+
+`ttlSeconds` has no default and is not `Set`'s: `RemoveTTL` removes the TTL
+and `0` expires the entry at once, which is the opposite of `Set`, where
+`0` means no expiry. Any other negative value is rejected before any
+network call (`ErrInvalidArgument`). A miss is `existed == false` for
+`Touch` and `ok == false` for `GetAndTouch`. `Namespace` has all three.
+
+A touch never changes the value, so it cannot overwrite a write that lands
+at the same time. Unlike `Incr` and the compare-and-set family it is
+idempotent: it goes to every owner of the key like a `Set`, and a request
+whose reply was lost is retried like `Get`/`Set`/`Delete`, never returned as
+`ErrConnectionLost`. `GetAndTouch` is a read that writes, so it goes to the
+primary like a write (one refresh and retry on a wrong-node answer or a
+connection failure; no hedging, and no fallback to a replica on a miss) and
+the other owners are sent the plain touch.
+
+Against a node older than the release that added the command, both return
+`ErrServerTooOld` (`errors.Is`-matchable): such a node answers `En` and
+closes the connection. Upgrade every node before using them.
+
 ## Batched get and set
 
 `GetMany`/`GetManyBytes` and `SetMany`/`SetManyBytes` (the `m`/`o`
