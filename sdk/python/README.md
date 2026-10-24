@@ -198,6 +198,39 @@ timeout closing it between calls) still redials and retries
 transparently, exactly like `get`/`set`/`delete` — only a request that
 may have already landed on the server is treated differently.
 
+## Touch (touch / get_and_touch)
+
+`touch` replaces an entry's TTL in place, without rewriting its value, and
+returns whether the key existed. `get_and_touch` reads the value and
+replaces the TTL in one step (`get_and_touch_bytes` is the raw companion):
+
+```python
+await client.set("session", "abc", ttl_seconds=60)
+await client.touch("session", 300)             # True — now expires in 300 s
+await client.touch("session", None)            # True — never expires
+await client.get_and_touch("session", 300)     # "abc", expires in 300 s again
+await client.touch("session", 0)               # True — expires at once
+print(await client.touch("missing", 30))       # False — a touch never creates a key
+```
+
+`ttl_seconds` has **no default**: `None` removes the TTL and `0` expires the
+entry at once, which is the opposite of `set()`, where `0` means no expiry.
+A miss is `False` for `touch` and `None` for `get_and_touch`. `Namespace`
+has both.
+
+A touch never changes the value, so it cannot overwrite a write that lands
+at the same time. Unlike `incr` and the compare-and-set family it is
+idempotent: it goes to every owner of the key like a `set`, and a request
+whose reply was lost is retried like `get`/`set`/`delete`, never raised as
+`ConnectionLostError`. `get_and_touch` is a read that writes, so it goes to
+the primary like a write (one refresh and retry on a wrong-node answer or a
+connection failure; no hedging, and no fallback to a replica on a miss) and
+the other owners are sent the plain touch.
+
+Against a node older than the release that added the command, both raise
+`ServerTooOldError`: such a node answers `En` and closes the connection.
+Upgrade every node before using them.
+
 ## Batched get and set
 
 `get_many`/`get_many_bytes` and `set_many` (the `m`/`o` frames) fetch or

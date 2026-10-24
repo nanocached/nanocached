@@ -9,6 +9,19 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Added
+
+- `touch(key, ttl_seconds)` replaces an entry's TTL in place and returns
+  whether the key existed; `get_and_touch(key, ttl_seconds)` and
+  `get_and_touch_bytes` read the value and replace the TTL in one step.
+  Both are on `Namespace` too. `ttl_seconds` has no default: `None` removes
+  the TTL and `0` expires the entry at once (the opposite of `set()`, where
+  `0` means no expiry). They are idempotent, so unlike `incr` and the
+  compare-and-set family a lost reply is retried; they go to every owner
+  (`get_and_touch` asks only the primary for the value). Against a node that
+  predates the command they raise the new `ServerTooOldError`. Needs a
+  server release that includes the `t` command.
+
 ## [0.4.8] - 2026-10-21
 
 ### Fixed

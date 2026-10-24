@@ -25,6 +25,7 @@ from nanocached import (
     PartialSetConnectionLostError,
     PartialWrongNodeError,
     RetryableError,
+    ServerTooOldError,
     WrongNodeError,
     content_digest,
 )
@@ -1976,6 +1977,288 @@ class IncrReplicationTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             for node in nodes.values():
                 await node.close()
+
+
+class TouchEncodingTests(unittest.TestCase):
+    # Touch (issue #825): docs/protocol.html "t" is the wire spec these
+    # pin. Always namespaced; an omitted TTL removes the TTL (so None sends
+    # no field) and 0 is sent — the opposite of set(), where 0 is omitted.
+
+    def test_encodes_every_combination_of_ttl_and_get(self):
+        from nanocached._connection import _encode_touch
+
+        self.assertEqual(_encode_touch(b"k", None, False), b"t 0 1\nk")
+        self.assertEqual(_encode_touch(b"k", 30, False), b"t 0 1 30\nk")
+        self.assertEqual(_encode_touch(b"k", 0, False), b"t 0 1 0\nk")
+        self.assertEqual(_encode_touch(b"k", None, True), b"t 0 1 G\nk")
+        self.assertEqual(_encode_touch(b"k", 30, True), b"t 0 1 30 G\nk")
+
+    def test_encodes_namespace_and_tag(self):
+        from nanocached._connection import _encode_touch
+
+        self.assertEqual(_encode_touch(b"k", 30, True, tag=7, namespace=b"users"), b"t 5 1 30 G 7\nusersk")
+        self.assertEqual(_encode_touch(b"k", None, False, tag=7), b"t 0 1 7\nk")
+
+
+class TouchTests(unittest.IsolatedAsyncioTestCase):
+    # Touch (issue #825), single node.
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+
+    async def asyncTearDown(self):
+        await self.node.close()
+
+    async def connect(self, **kwargs):
+        return await NanocachedClient.connect([("127.0.0.1", self.node.port)], **kwargs)
+
+    async def test_touch_extends_shortens_and_removes_a_ttl(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "v", ttl_seconds=10)
+            self.assertTrue(await client.touch("k", 100))
+            self.assertEqual(self.node.entry_ttl[(b"", b"k")], 100)
+            self.assertTrue(await client.touch("k", 5))
+            self.assertEqual(self.node.entry_ttl[(b"", b"k")], 5)
+            self.assertTrue(await client.touch("k", None))
+            self.assertEqual(self.node.entry_ttl[(b"", b"k")], 0)
+            self.assertEqual(await client.get("k"), "v")
+        finally:
+            await client.close()
+
+    async def test_touch_with_zero_expires_the_entry_at_once(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "v")
+            self.assertTrue(await client.touch("k", 0))
+            self.assertIsNone(await client.get("k"))
+        finally:
+            await client.close()
+
+    async def test_touch_of_a_missing_key_is_false_and_creates_nothing(self):
+        client = await self.connect()
+        try:
+            self.assertFalse(await client.touch("nope", 30))
+            self.assertIsNone(await client.get("nope"))
+            self.assertEqual(self.node.store, {})
+        finally:
+            await client.close()
+
+    async def test_touch_never_changes_the_value(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "v")
+            await client.touch("k", 30)
+            await client.set("k", "newer")
+            await client.touch("k", 60)
+            self.assertEqual(await client.get("k"), "newer")
+        finally:
+            await client.close()
+
+    async def test_touch_is_scoped_to_its_namespace(self):
+        client = await self.connect()
+        try:
+            users = client.namespace("users")
+            await users.set("k", "v")
+            self.assertFalse(await client.touch("k", 30))
+            self.assertTrue(await users.touch("k", 30))
+            self.assertEqual(self.node.entry_ttl[(b"users", b"k")], 30)
+        finally:
+            await client.close()
+
+    async def test_get_and_touch_returns_the_value_and_sets_the_ttl(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "v")
+            self.assertEqual(await client.get_and_touch("k", 60), "v")
+            self.assertEqual(self.node.entry_ttl[(b"", b"k")], 60)
+            # No TTL: the reply carries no TTL field, and the TTL is removed.
+            self.assertEqual(await client.get_and_touch_bytes("k", None), b"v")
+            self.assertEqual(self.node.entry_ttl[(b"", b"k")], 0)
+            self.assertIsNone(await client.get_and_touch("nope", 60))
+            self.assertEqual(await client.namespace("users").get_and_touch("k", 5), None)
+        finally:
+            await client.close()
+
+    async def test_get_and_touch_with_zero_returns_the_value_then_expires_it(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "v")
+            self.assertEqual(await client.get_and_touch("k", 0), "v")
+            self.assertIsNone(await client.get("k"))
+        finally:
+            await client.close()
+
+    async def test_get_and_touch_decompresses_on_a_compress_enabled_client(self):
+        client = await self.connect(compress=True, compression_threshold=16)
+        try:
+            await client.set("k", "x" * 200)
+            self.assertEqual(await client.get_and_touch("k", 30), "x" * 200)
+        finally:
+            await client.close()
+
+    async def test_a_negative_or_non_integer_ttl_is_rejected_before_any_io(self):
+        client = await self.connect()
+        try:
+            for bad in (-1, 1.5, True, "5"):
+                with self.assertRaises(ValueError):
+                    await client.touch("k", bad)
+                with self.assertRaises(ValueError):
+                    await client.get_and_touch("k", bad)
+            self.assertEqual(self.node.touches, [])
+        finally:
+            await client.close()
+
+    async def test_the_ttl_has_no_default(self):
+        client = await self.connect()
+        try:
+            with self.assertRaises(TypeError):
+                await client.touch("k")  # type: ignore[call-arg]
+        finally:
+            await client.close()
+
+    async def test_a_touch_round_trips_over_a_tagged_connection(self):
+        node = await MockNode(support_tags=True).start()
+        client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+        try:
+            await client.set("k", "v")
+            self.assertTrue(await client.touch("k", 30))
+            self.assertEqual(await client.get_and_touch("k", 60), "v")
+            self.assertEqual(await client.get_and_touch_bytes("k", None), b"v")
+            self.assertFalse(await client.touch("nope", 30))
+        finally:
+            await client.close()
+            await node.close()
+
+    async def test_a_node_that_predates_touch_raises_server_too_old(self):
+        self.node.legacy_without_touch = True
+        client = await self.connect()
+        try:
+            await client.set("k", "v")
+            with self.assertRaises(ServerTooOldError):
+                await client.touch("k", 30)
+            with self.assertRaises(ServerTooOldError):
+                await client.get_and_touch("k", 30)
+            # Other commands are untouched: the client redials and works.
+            self.assertEqual(await client.get("k"), "v")
+        finally:
+            await client.close()
+
+    async def test_a_value_reply_may_carry_the_ttl_now_in_effect(self):
+        # `V <len> <ttl>` is how a node answers a get-and-touch; the reader
+        # hands the TTL up beside the value (a plain get never gets one).
+        from nanocached._connection import Connection
+
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"V 1 30\nv")
+        connection = Connection.__new__(Connection)
+        connection._reader = reader
+        connection._tagged = False
+        marker, payload, tag = await Connection._read_one_response(connection)
+        self.assertEqual((marker, payload, tag), (b"V", (b"v", 30), None))
+
+
+class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
+    # Touch (issue #825) in a cluster: idempotent, so every owner is sent
+    # it (like a set) and a lost reply is retried (unlike incr).
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    async def stop(self, client, discovery, nodes):
+        await client.close()
+        await discovery.close()
+        for node in nodes.values():
+            await node.close()
+
+    async def test_a_touch_reaches_every_owner(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            await client.set("k", "v", ttl_seconds=10)
+            self.assertTrue(await client.touch("k", 77))
+            for node in nodes.values():
+                self.assertEqual(node.entry_ttl[(b"", b"k")], 77)
+                self.assertEqual(node.touches, [(b"", b"k", 77, False)])
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_only_the_primary_is_asked_for_the_value(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, replica_name = self.owners_of("k")
+            await client.set("k", "v")
+            self.assertEqual(await client.get_and_touch("k", 40), "v")
+            self.assertEqual(nodes[primary_name].touches, [(b"", b"k", 40, True)])
+            self.assertEqual(nodes[replica_name].touches, [(b"", b"k", 40, False)])
+            self.assertEqual(nodes[replica_name].entry_ttl[(b"", b"k")], 40)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_get_and_touch_does_not_fall_back_to_a_replica_on_a_miss(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, replica_name = self.owners_of("k")
+            # Only the replica holds the key: a read would find it, a
+            # write-ish read answers for the primary alone.
+            nodes[replica_name].store[b"k"] = b"v"
+            self.assertIsNone(await client.get_and_touch("k", 40))
+            self.assertEqual(nodes[replica_name].entry_ttl.get((b"", b"k")), 40)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_a_wrong_node_answer_refreshes_once_and_succeeds(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, _ = self.owners_of("k")
+            await client.set("k", "v")
+            nodes[primary_name].answer_wrong_node_once()
+            self.assertEqual(await client.get_and_touch("k", 40), "v")
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_a_touch_whose_reply_was_lost_is_resent_unlike_an_incr(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, _ = self.owners_of("k")
+            primary = nodes[primary_name]
+            await client.set("k", "10")
+            primary.apply_and_drop_next_touch()
+            # The primary applied the touch and the reply never arrived;
+            # resending it changes nothing, so the client does.
+            self.assertTrue(await client.touch("k", 30))
+            self.assertEqual(len([t for t in primary.touches if t[2] == 30]), 2)
+
+            primary.apply_and_drop_next_incr()
+            with self.assertRaises(ConnectionLostError):
+                await client.incr("k", 1)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_a_replica_that_predates_touch_does_not_fail_the_primarys_answer(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            _, replica_name = self.owners_of("k")
+            nodes[replica_name].legacy_without_touch = True
+            await client.set("k", "v")
+            self.assertTrue(await client.touch("k", 30))
+            self.assertEqual(client.stats().replica_write_failures, 1)
+        finally:
+            await self.stop(client, discovery, nodes)
 
 
 class ContentDigestTests(unittest.TestCase):

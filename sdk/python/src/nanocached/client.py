@@ -44,7 +44,7 @@ from ._compression import (
     compress_value,
     decompress_value,
 )
-from ._connection import CAS_ABSENT, CAS_PRESENT, WRONG_NODE, Connection
+from ._connection import CAS_ABSENT, CAS_PRESENT, WRONG_NODE, Connection, _ServerRejectedError
 from ._digest import content_digest
 from ._errors import (
     AlreadyClosedError,
@@ -54,6 +54,7 @@ from ._errors import (
     PartialConnectionLostError,
     PartialSetConnectionLostError,
     PartialWrongNodeError,
+    ServerTooOldError,
     WrongNodeError,
 )
 from ._hashring import HashRing
@@ -450,6 +451,26 @@ def _check_ttl_seconds(ttl_seconds: int) -> None:
             f"nanocached: ttl_seconds must fit in an unsigned 64-bit integer "
             f"(0..{_MAX_TTL_SECONDS}), got {ttl_seconds}"
         )
+
+
+def _check_touch_ttl(ttl_seconds: int | None) -> None:
+    """touch/get_and_touch (issue #825): ``None`` is a real value there (it
+    removes the TTL), so only a given TTL is validated, as set()'s is."""
+    if ttl_seconds is not None:
+        _check_ttl_seconds(ttl_seconds)
+
+
+def _rejected_by_server(error: BaseException) -> bool:
+    """Whether ``error`` is, or was caused by, the node's ``En`` (issue
+    #825): a sent request that fails because the connection was poisoned
+    arrives wrapped, with the original as ``__cause__``."""
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        if isinstance(error, _ServerRejectedError):
+            return True
+        seen.add(id(error))
+        error = error.__cause__  # type: ignore[assignment]
+    return False
 
 
 # Compare-and-set (issue #141): a token must be exactly the 32-character
@@ -1218,6 +1239,96 @@ class NanocachedClient:
                 namespace, key_bytes, lambda connection: connection.delete(key_bytes, namespace)
             )
         )
+
+    # ── Touch (issue #825) ─────────────────────────────────────────────
+
+    async def touch(self, key: str | bytes, ttl_seconds: int | None) -> bool:
+        """Replaces the TTL of an existing entry in place, without
+        rewriting its value (issue #825). Returns whether the key existed:
+        ``False`` for a missing or expired key, which a touch never
+        creates. ``ttl_seconds`` is counted from the moment the node
+        receives the request and has **no default**: ``None`` removes the
+        TTL (the entry never expires), and ``0`` expires the entry at once
+        — the opposite of set(), where 0 means no expiry. Negative values
+        are rejected before any I/O.
+
+        Unlike incr/CAS a touch is idempotent, so a request whose reply was
+        lost is retried like get/set/delete are, never raised as
+        ConnectionLostError. In a cluster it goes to every owner, like a
+        set, and the primary's answer is returned. Raises
+        ServerTooOldError against a node that predates the command."""
+        return await self._touch(b"", key, ttl_seconds)
+
+    async def _touch(self, namespace: bytes, key: str | bytes, ttl_seconds: int | None) -> bool:
+        """The namespace-carrying implementation behind touch() and
+        Namespace.touch() — see _get_bytes()."""
+        key_bytes = _to_bytes(key)
+        _check_key(key_bytes, namespace)
+        _check_touch_ttl(ttl_seconds)
+        await self._before_operation()
+        try:
+            return await self._with_wrong_node_retry(
+                lambda: self._write(
+                    namespace,
+                    key_bytes,
+                    lambda connection: connection.touch(key_bytes, ttl_seconds, namespace),
+                )
+            )
+        except (NanocachedError, ConnectionError, OSError) as error:
+            if _rejected_by_server(error):
+                raise ServerTooOldError() from error
+            raise
+
+    async def get_and_touch_bytes(self, key: str | bytes, ttl_seconds: int | None) -> bytes | None:
+        """The raw companion to get_and_touch(): no UTF-8 decoding.
+        Transparently decompresses when ``compress`` is enabled."""
+        return await self._get_and_touch_bytes(b"", key, ttl_seconds)
+
+    async def get_and_touch(self, key: str | bytes, ttl_seconds: int | None) -> str | None:
+        """Reads a value and replaces its TTL in one step (issue #825):
+        ``None`` on a miss, which creates nothing. See touch() for
+        ``ttl_seconds`` (no default; ``None`` removes the TTL, ``0``
+        expires the entry at once). Strict UTF-8 decode like get().
+
+        A write-ish read: it goes to the key's primary like a write (one
+        refresh and retry on a wrong-node answer or a connection failure,
+        no hedging, no fallback to a replica on a miss) and the other
+        owners are sent the plain touch, so a replica is never the only
+        owner touched. It counts as a read on the primary, which makes the
+        entry the most recently used."""
+        return await self._get_and_touch(b"", key, ttl_seconds)
+
+    async def _get_and_touch(
+        self, namespace: bytes, key: str | bytes, ttl_seconds: int | None
+    ) -> str | None:
+        value = await self._get_and_touch_bytes(namespace, key, ttl_seconds)
+        return value.decode() if value is not None else None
+
+    async def _get_and_touch_bytes(
+        self, namespace: bytes, key: str | bytes, ttl_seconds: int | None
+    ) -> bytes | None:
+        key_bytes = _to_bytes(key)
+        _check_key(key_bytes, namespace)
+        _check_touch_ttl(ttl_seconds)
+        await self._before_operation()
+        try:
+            value = await self._with_wrong_node_retry(
+                lambda: self._write(
+                    namespace,
+                    key_bytes,
+                    lambda connection: connection.get_and_touch(key_bytes, ttl_seconds, namespace),
+                    replica_op=lambda connection: connection.touch(
+                        key_bytes, ttl_seconds, namespace
+                    ),
+                )
+            )
+        except (NanocachedError, ConnectionError, OSError) as error:
+            if _rejected_by_server(error):
+                raise ServerTooOldError() from error
+            raise
+        if value is None or not self._compress:
+            return value
+        return decompress_value(value)
 
     # ── Batched get and set (issues #128/#150/#151) ────────────────────
     #
@@ -2694,7 +2805,10 @@ class NanocachedClient:
             replica_tasks.append(asyncio.ensure_future(replica_write(name)))
         return replica_tasks
 
-    async def _write(self, namespace: bytes, key: bytes, op):
+    async def _write(self, namespace: bytes, key: bytes, op, replica_op=None):
+        """``replica_op`` (issue #825) is what the non-primary owners are
+        sent when it differs from the primary's ``op`` — a get-and-touch
+        asks only the primary for the value."""
         if self._ring is None:
             return await op(await self._single_connection())
 
@@ -2703,7 +2817,7 @@ class NanocachedClient:
             raise ConnectionError("nanocached: no owner is reachable for this key")
         primary, replicas = names[0], names[1:]
 
-        replica_tasks = self._dispatch_replica_writes(replicas, op)
+        replica_tasks = self._dispatch_replica_writes(replicas, replica_op or op)
 
         primary_error: BaseException | None = None
         try:
@@ -3169,6 +3283,21 @@ class Namespace:
         """Same as NanocachedClient.delete_if_matches(), scoped to this
         namespace (issue #141)."""
         return await self._client._cas_delete(self._namespace, key, token)
+
+    async def touch(self, key: str | bytes, ttl_seconds: int | None) -> bool:
+        """Same as NanocachedClient.touch(), scoped to this namespace
+        (issue #825)."""
+        return await self._client._touch(self._namespace, key, ttl_seconds)
+
+    async def get_and_touch_bytes(self, key: str | bytes, ttl_seconds: int | None) -> bytes | None:
+        """Same as NanocachedClient.get_and_touch_bytes(), scoped to this
+        namespace (issue #825)."""
+        return await self._client._get_and_touch_bytes(self._namespace, key, ttl_seconds)
+
+    async def get_and_touch(self, key: str | bytes, ttl_seconds: int | None) -> str | None:
+        """Same as NanocachedClient.get_and_touch(), scoped to this
+        namespace (issue #825)."""
+        return await self._client._get_and_touch(self._namespace, key, ttl_seconds)
 
     async def clear(self) -> None:
         """Drops every entry in this namespace, on every node (issue
