@@ -148,11 +148,12 @@ impl InFlightBudget {
     }
 }
 
-/// The bytes a reply's encoded copy will hold: the values of a `V` or
-/// `M`; every other reply is a short header and is not charged.
+/// The bytes a reply's encoded copy will hold: the values of a `V` (a
+/// `G`'s or a get-and-touch's) or `M`; every other reply is a short header
+/// and is not charged.
 fn reply_bytes(response: &Response) -> usize {
     match response {
-        Response::Value(value) => value.len(),
+        Response::Value(value) | Response::Touched(value, _) => value.len(),
         Response::Multi(entries) => entries
             .iter()
             .map(|entry| match entry {
@@ -572,7 +573,11 @@ async fn spawn_forward(
 /// key from an earlier transfer would double-apply the increment, and one
 /// re-evaluating a condition against its own copy could reach a different
 /// outcome than the primary just did — so those forward as the `Set` or
-/// `Delete` they resulted in.
+/// `Delete` they resulted in. A `t` is idempotent and could be replayed,
+/// but a joiner may not hold the key yet and would drop it, and a frame of
+/// its own would need a handoff form, a membership token and a slot in
+/// the coalescing queue that must not replace a queued `Set`; it forwards
+/// as the `Set` it amounts to, the value it left with its new TTL.
 enum ForwardedResult {
     Set { value: Bytes, ttl: Option<Duration> },
     Delete,
@@ -591,7 +596,7 @@ enum ForwardedResult {
 ///   `U`/`u`, not a plain `S`/`D`: until the post-leave roster publishes
 ///   the entrant doesn't own the key yet and answers `S` with `W`.
 ///
-/// Every single-key client write (`S`, `D`, `i`, `k`, `x`) goes through
+/// Every single-key client write (`S`, `D`, `i`, `k`, `x`, `t`) goes through
 /// here, so one of them cannot forget either forward by omission (the
 /// bulk `o` once did, issue #176). Two things deliberately do not: the
 /// bulk `o` groups its keys per target and queues them with
@@ -3230,6 +3235,50 @@ async fn handle_connection(
                 }
 
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
+
+                continue;
+            }
+            Ok((Command::Touch { key, ttl, get }, tag)) => {
+                // Not primary-only like `i`/`k`/`x`: a touch is idempotent
+                // (see `Command::Touch`), so every owner accepts it, as
+                // for `S`, and the client sends it to all of them.
+                if let Some(node_context) = &config.node_context
+                    && wrong_node_refreshed(node_context, &key).await
+                {
+                    write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
+                        .await?;
+                    continue;
+                }
+
+                let response = execute_command(
+                    &request_tx,
+                    Command::Touch {
+                        key: key.clone(),
+                        ttl,
+                        get,
+                    },
+                )
+                .await?;
+                // A touch that found nothing changed nothing. One that did
+                // is forwarded as the literal result, the `Set` it amounts
+                // to, like `i`/`k`/`x` (see `ForwardedResult`): the
+                // remaining TTL is the one just set.
+                let Response::Touched(value, remaining_ttl) = response else {
+                    write_response(&mut stream, &encode_response(&response, tag)).await?;
+                    continue;
+                };
+                let result = ForwardedResult::Set {
+                    value: value.clone(),
+                    ttl: remaining_ttl,
+                };
+                forward_result(&config, &key, result).await;
+
+                if get {
+                    let reply = Response::Touched(value, remaining_ttl);
+                    write_reply(&mut stream, &config, &reply, tag).await?;
+                } else {
+                    write_response(&mut stream, &encode_response(&Response::Stored, tag)).await?;
+                }
 
                 continue;
             }
@@ -12300,6 +12349,260 @@ mod tests {
         connection_task.await.unwrap().unwrap();
     }
 
+    /// Runs `exchanges` (a request frame and the reply it must get)
+    /// through one connection to a node with no cluster and a real cache.
+    async fn replies_of_a_standalone_node(exchanges: &[(&[u8], &[u8])]) {
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let (mut client, server) = tcp_pair().await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        for (request, expected) in exchanges {
+            client.write_all(request).await.unwrap();
+            let mut reply = vec![0_u8; expected.len()];
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "no reply within 5 s to {}",
+                        String::from_utf8_lossy(request)
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                reply,
+                *expected,
+                "reply to {}",
+                String::from_utf8_lossy(request)
+            );
+        }
+
+        shutdown_tx.send_replace(true);
+        connection_task.await.unwrap().unwrap();
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_touch_answers_s_or_the_value_with_its_ttl_and_never_creates_a_key() {
+        replies_of_a_standalone_node(&[
+            (b"t 0 3 60\nkey", b"N\n"),
+            (b"t 0 3 60 G\nkey", b"N\n"),
+            (b"G 3\nkey", b"N\n"),
+            (b"S 3 2\nkeyv1", b"S\n"),
+            (b"t 0 3 60\nkey", b"S\n"),
+            (b"t 0 3 60 G\nkey", b"V 2 60\nv1"),
+            (b"t 0 3 G\nkey", b"V 2\nv1"),
+            // The value is never touched by a touch.
+            (b"G 3\nkey", b"V 2\nv1"),
+            (b"t 0 3 0\nkey", b"S\n"),
+            (b"G 3\nkey", b"N\n"),
+        ])
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_touch_is_scoped_to_its_namespace() {
+        replies_of_a_standalone_node(&[
+            (b"s 2 3 2\nnskeyv1", b"S\n"),
+            (b"t 0 3 60\nkey", b"N\n"),
+            (b"t 2 3 60\nnskey", b"S\n"),
+            (b"t 2 3 G\nnskey", b"V 2\nv1"),
+        ])
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_touch_is_answered_w_only_by_a_node_that_owns_no_copy_of_the_key() {
+        // Two nodes at R = 1: only the key's primary owns it. Unlike `i`,
+        // `k` and `x`, a touch needs no primary (every owner accepts it),
+        // so with R = 2 the same node would not answer `W`.
+        let ring = HashRing::new(vec!["a".to_string(), "b".to_string()]);
+        let theirs = (0..1000)
+            .map(|i| format!("key-{i}"))
+            .find(|name| ring.route(&key(name.as_bytes())) == "a")
+            .expect("some key routes to a");
+        let mine = (0..1000)
+            .map(|i| format!("key-{i}"))
+            .find(|name| ring.route(&key(name.as_bytes())) == "b")
+            .expect("some key routes to b");
+        let node_context = test_node_context(
+            "b",
+            "tok-b",
+            Arc::new(Mutex::new(Some(membership_of(&["a", "b"], 1)))),
+            Arc::new(Mutex::new(None)),
+        );
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        let n = theirs.len();
+        client
+            .write_all(format!("t 0 {n} 30\n{theirs}").as_bytes())
+            .await
+            .unwrap();
+        let mut response = vec![0_u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut response))
+            .await
+            .expect("a W reply within 5 s")
+            .unwrap();
+        assert_eq!(&response, b"W\n");
+
+        let n = mine.len();
+        client
+            .write_all(format!("t 0 {n} 30 G\n{mine}").as_bytes())
+            .await
+            .unwrap();
+        let request = request_rx.recv().await.unwrap();
+        assert_eq!(
+            request.command,
+            Command::Touch {
+                key: key(mine.as_bytes()),
+                ttl: Some(Duration::from_secs(30)),
+                get: true,
+            },
+        );
+        request
+            .response_tx
+            .send(Response::Touched(
+                Bytes::from_static(b"v"),
+                Some(Duration::from_secs(30)),
+            ))
+            .unwrap();
+        let mut value = vec![0_u8; b"V 1 30\nv".len()];
+        client.read_exact(&mut value).await.unwrap();
+        assert_eq!(&value, b"V 1 30\nv");
+
+        shutdown_tx.send_replace(true);
+        connection_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_touch_accepted_by_a_replica_that_is_not_the_primary() {
+        // R = 2 over two nodes: `b` owns every key but is primary of only
+        // some. `i` is answered `W` there (see
+        // `handle_connection_answers_w_to_incr_and_cas_on_an_owner_that_is_not_the_primary`);
+        // a touch is dispatched.
+        let ring = HashRing::new(vec!["a".to_string(), "b".to_string()]);
+        let theirs = (0..1000)
+            .map(|i| format!("key-{i}"))
+            .find(|name| ring.route(&key(name.as_bytes())) == "a")
+            .expect("some key routes to a");
+        let node_context = test_node_context(
+            "b",
+            "tok-b",
+            Arc::new(Mutex::new(Some(membership_of(&["a", "b"], 2)))),
+            Arc::new(Mutex::new(None)),
+        );
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        let n = theirs.len();
+        client
+            .write_all(format!("t 0 {n} 30\n{theirs}").as_bytes())
+            .await
+            .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(5), request_rx.recv())
+            .await
+            .expect("the touch reaches the cache within 5 s")
+            .unwrap();
+        assert!(
+            matches!(request.command, Command::Touch { .. }),
+            "{:?}",
+            request.command
+        );
+        request.response_tx.send(Response::NotFound).unwrap();
+        let mut response = vec![0_u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"N\n");
+
+        shutdown_tx.send_replace(true);
+        connection_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_rejects_a_touch_sent_before_authenticating() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: Some(Bytes::from_static(b"correct-secret")),
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(b"t 0 4 30 G\nname").await.unwrap();
+
+        let mut response = [0u8; 3];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"En\n");
+
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn handle_connection_dispatches_cas_set_and_replies_with_stored() {
         let (mut client, server) = tcp_pair().await;
@@ -16661,6 +16964,29 @@ mod tests {
         let (expected_joiner, expected_peer) = per_peer(vec![
             set_forward(b"key", b"v1"),
             delete_forward(b"key"),
+            set_forward(b"end", b"z"),
+        ]);
+        assert_eq!(joiner, expected_joiner, "joiner");
+        assert_eq!(peer, expected_peer, "promoted owner");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_touch_forwards_its_result_as_a_set_and_a_miss_forwards_nothing() {
+        // The new TTL goes out with the value the touch left, as a `Set`
+        // (never as `t` itself); `G` or not makes no difference to what
+        // is forwarded, and a touch that found no key changed nothing.
+        let (joiner, peer) = frames_forwarded_to_joiner_and_promoted_owner(&[
+            (b"S 3 2\nkeyv1", b"S\n", 1),
+            (b"t 0 3 60\nkey", b"S\n", 1),
+            (b"t 0 3 G\nkey", b"V 2\nv1", 1),
+            (b"t 0 4 30\nnope", b"N\n", 0),
+            (b"S 3 1\nendz", b"S\n", 1),
+        ])
+        .await;
+        let (expected_joiner, expected_peer) = per_peer(vec![
+            set_forward(b"key", b"v1"),
+            set_forward_with_ttl(b"key", b"v1", Duration::from_secs(60)),
+            set_forward(b"key", b"v1"),
             set_forward(b"end", b"z"),
         ]);
         assert_eq!(joiner, expected_joiner, "joiner");

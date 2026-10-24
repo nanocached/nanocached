@@ -185,6 +185,29 @@ pub enum Command {
         key: Key,
         expected_digest: [u8; 16],
     },
+    /// `t <ns-len> <key-len> [ttl] [G] [tag]\n<ns><key>` (issue #823):
+    /// replaces an entry's expiry in place — `ttl` seconds from receipt
+    /// (`0` expires it at once), or no expiry at all when the field is
+    /// omitted, since "never expire" has to be sayable — without touching
+    /// the value, and never creates a key. With `get` (the `G` token) it
+    /// is a read as well: the reply carries the value, and the entry
+    /// becomes the most recently used and counts as a hit or a miss like
+    /// `Get`; a plain touch does none of that. Always namespaced, same
+    /// reasoning as `Incr`.
+    ///
+    /// Unlike `Incr`, `CasSet` and `CasDelete` this is idempotent — the
+    /// expiry is absolute from receipt, not relative to what the entry
+    /// holds — so it is not primary-only: every owner accepts it like a
+    /// plain write, and the SDK sends it to all of them. `execute` always
+    /// answers with the value (`Response::Touched`) so the connection
+    /// handler can forward the result of a touch during a join or a leave
+    /// as the `Set` it amounts to; the handler answers a client that
+    /// did not ask for the value with a bare `S`.
+    Touch {
+        key: Key,
+        ttl: Option<Duration>,
+        get: bool,
+    },
     /// `c <namespace-length> [tag]\n<namespace>` (issue #106): drops one
     /// namespace's every entry. A zero-length namespace clears the
     /// default one. Not key-addressed, so no wrong-node check applies:
@@ -539,6 +562,11 @@ impl Command {
                     Response::NotFound
                 }
             }
+
+            Self::Touch { key, ttl, get } => match cache.touch(&key, ttl, get) {
+                Some((value, remaining_ttl)) => Response::Touched(value, remaining_ttl),
+                None => Response::NotFound,
+            },
 
             Self::Clear { namespace } => Response::Cleared(cache.clear(&namespace)),
             Self::ClearAll => Response::Cleared(cache.clear_all()),
@@ -1140,6 +1168,48 @@ fn parse_with_mode(
                 },
                 tag,
             ))
+        }
+
+        // Issue #823: `t <ns-len> <key-len> [ttl] [G] [tag]\n<ns><key>` —
+        // see `Command::Touch`'s doc comment. Always namespaced, same
+        // reasoning as `i`. The tail after the key length is read from the
+        // end: the connection's negotiated mode says whether the last field
+        // is the tag, and what is left is `[ttl] [G]`, which content alone
+        // tells apart (`G` is not a number), never a frame-by-frame guess.
+        b"t" => {
+            let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+            let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let mut tail: Vec<&[u8]> = parts.take(4).collect();
+            let tag = if tagged {
+                Some(parse_tag(tail.pop().ok_or(ParseError::InvalidLength)?)?)
+            } else {
+                None
+            };
+            let get = tail.last().is_some_and(|field| *field == b"G");
+            if get {
+                tail.pop();
+            }
+            let ttl = match tail[..] {
+                [] => None,
+                [ttl] => Some(parse_ttl(ttl)?),
+                _ => return Err(ParseError::InvalidLength),
+            };
+
+            let key_length = parse_length(key_length)?;
+
+            if key_length == 0 {
+                return Err(ParseError::EmptyKey);
+            }
+
+            let namespace_start = header_end + 1;
+            let [key_start, key_end] = field_ends(namespace_start, [namespace_length, key_length])?;
+            let frame = take_frame(input, key_end)?;
+            let key = Key::new(
+                frame.slice(namespace_start..key_start),
+                frame.slice(key_start..key_end),
+            );
+
+            Ok((Command::Touch { key, ttl, get }, tag))
         }
 
         b"c" => {
@@ -3016,6 +3086,165 @@ mod tests {
 
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
         assert_eq!(&input[..], &original[..]);
+    }
+
+    fn touch(namespace: &[u8], name: &[u8], ttl: Option<u64>, get: bool) -> Command {
+        Command::Touch {
+            key: namespaced(namespace, name),
+            ttl: ttl.map(Duration::from_secs),
+            get,
+        }
+    }
+
+    #[test]
+    fn parses_touch_in_every_combination_of_ttl_and_get() {
+        for (frame, expected) in [
+            (
+                &b"t 5 4\nusersname"[..],
+                touch(b"users", b"name", None, false),
+            ),
+            (
+                b"t 5 4 30\nusersname",
+                touch(b"users", b"name", Some(30), false),
+            ),
+            (
+                b"t 5 4 0\nusersname",
+                touch(b"users", b"name", Some(0), false),
+            ),
+            (b"t 5 4 G\nusersname", touch(b"users", b"name", None, true)),
+            (
+                b"t 5 4 30 G\nusersname",
+                touch(b"users", b"name", Some(30), true),
+            ),
+            (b"t 0 4 30\nname", touch(b"", b"name", Some(30), false)),
+        ] {
+            let mut input = buf(frame);
+            assert_eq!(
+                parse(&mut input),
+                Ok(expected),
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
+            assert!(input.is_empty());
+        }
+    }
+
+    #[test]
+    fn touch_carries_the_tag_last_in_tagged_mode() {
+        // `t 5 4 7` is a tag alone when tagged and a TTL when not: the
+        // connection's mode decides, as for `S`.
+        for (frame, expected, tag) in [
+            (
+                &b"t 5 4 7\nusersname"[..],
+                touch(b"users", b"name", None, false),
+                7,
+            ),
+            (
+                b"t 5 4 30 7\nusersname",
+                touch(b"users", b"name", Some(30), false),
+                7,
+            ),
+            (
+                b"t 5 4 G 7\nusersname",
+                touch(b"users", b"name", None, true),
+                7,
+            ),
+            (
+                b"t 5 4 30 G 7\nusersname",
+                touch(b"users", b"name", Some(30), true),
+                7,
+            ),
+        ] {
+            let mut input = buf(frame);
+            assert_eq!(
+                parse_tagged(&mut input),
+                Ok((expected, Some(tag))),
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+
+        let mut input = buf(b"t 5 4 7\nusersname");
+        assert_eq!(
+            parse(&mut input),
+            Ok(touch(b"users", b"name", Some(7), false))
+        );
+    }
+
+    #[test]
+    fn touch_rejects_a_malformed_tail_as_a_fatal_parse_error() {
+        for frame in [
+            // `G` ahead of the TTL, a repeated `G`, a lowercase `g`, a
+            // non-numeric or signed TTL, and a field too many.
+            &b"t 5 4 G 30\nusersname"[..],
+            b"t 5 4 G G\nusersname",
+            b"t 5 4 g\nusersname",
+            b"t 5 4 abc\nusersname",
+            b"t 5 4 -1\nusersname",
+            b"t 5 4 30 G 9\nusersname",
+            b"t 5 4 30 30\nusersname",
+        ] {
+            let mut input = buf(frame);
+            assert!(
+                parse(&mut input).is_err(),
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+
+        // Tagged: the tag is required.
+        let mut input = buf(b"t 5 4\nusersname");
+        assert_eq!(parse_tagged(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn touch_requires_the_namespace_length_field() {
+        let mut input = buf(b"t 4\nname");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn touch_rejects_an_empty_key() {
+        let mut input = buf(b"t 5 0 30\nusers");
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+    }
+
+    #[test]
+    fn parse_leaves_a_touch_command_untouched_when_incomplete() {
+        let original = b"t 5 4 30 G\nusersnam".to_vec();
+        let mut input = buf(&original);
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn touch_executes_against_the_cache_and_answers_the_value_with_its_new_ttl() {
+        let mut cache = Cache::new(usize::MAX);
+
+        // Missing key -> NotFound, and nothing is created.
+        assert_eq!(
+            touch(b"", b"name", Some(30), true).execute(&mut cache),
+            Response::NotFound
+        );
+        assert_eq!(cache.len(), 0);
+
+        Command::Set {
+            key: namespaced(b"", b"name"),
+            value: Bytes::from_static(b"Alice"),
+            ttl: None,
+        }
+        .execute(&mut cache);
+
+        assert_eq!(
+            touch(b"", b"name", Some(30), false).execute(&mut cache),
+            Response::Touched(Bytes::from_static(b"Alice"), Some(Duration::from_secs(30)))
+        );
+        // No TTL field removes the TTL.
+        assert_eq!(
+            touch(b"", b"name", None, true).execute(&mut cache),
+            Response::Touched(Bytes::from_static(b"Alice"), None)
+        );
     }
 
     #[test]

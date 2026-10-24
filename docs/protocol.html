@@ -276,6 +276,48 @@ SDK (or <code>nanocached-proxy</code> in proxy mode) writes the
 condition against its own possibly-different copy could reach a
 different outcome than the primary just did.</p>
 
+<h2 id="touch">t — refresh or remove an entry's TTL</h2>
+<pre><code>t &lt;namespace-length&gt; &lt;key-length&gt; [&lt;ttl-seconds&gt;] [G]\n&lt;namespace&gt;&lt;key&gt;</code></pre>
+<p>Replaces the TTL of an existing entry in place, without rewriting its
+value. <code>&lt;ttl-seconds&gt;</code> means what it means for
+<code>S</code>: counted from the moment the node receives the request,
+and <code>0</code> expires the entry at once (the next read misses).
+<strong>Omitting it removes the TTL</strong>, so the entry never expires.
+Without <code>G</code> the reply is <code>S\n</code>, or <code>N\n</code>
+if the key is missing or expired: <code>t</code> never creates a key, and
+since it never changes the value either, it cannot overwrite a write that
+lands at the same time. <code>&lt;namespace-length&gt;</code> is always
+present, like <code>i</code>: a <code>&lt;namespace-length&gt;</code> of 0
+addresses the default namespace. The node never interprets the value, so
+a touch works on a compressed value as well.</p>
+<p>With <code>G</code> (get and touch) the request is a read as well, and
+the reply is that of a read:</p>
+<pre><code>V &lt;value-length&gt; [&lt;ttl-seconds&gt;]\n&lt;value&gt;</code></pre>
+<p>or <code>N\n</code>. The optional <code>&lt;ttl-seconds&gt;</code> is
+the TTL now in effect, rounded down to whole seconds, present only when
+the entry has one. A get and touch counts as a hit or a miss and makes the
+entry the most recently used, as <code>G</code> does; a plain touch
+changes only the expiry, so it counts as neither and does not protect the
+entry from eviction.</p>
+<p>In a cluster, replication is client-side, and a touch is not primary-only
+like <code>i</code>, <code>k</code> and <code>x</code>: it is idempotent
+(the new expiry does not depend on what the entry holds), so every owner
+of the key accepts it, as it accepts an <code>S</code>, and a client sends
+it to each owner rather than writing a result to the others. A node that
+owns no copy of the key answers <code>W</code>. An owner that answers
+<code>N</code> has no live copy; the touch does not create one and
+nothing repairs it, while the owners that answered <code>S</code> keep the
+new expiry. During a join&rsquo;s or a decommission&rsquo;s forwarding
+window an old owner passes a touch on as the value it holds with the new
+TTL, written like an <code>S</code>, not as <code>t</code> itself: the
+joiner may not hold the key yet. As for every forwarded write, that
+unconditional copy can land after a later write to the key and bring
+back the earlier value &mdash; see
+<a href="architecture.html#accepted-behaviour">accepted behaviour</a>.</p>
+<p><code>t</code> needs a node that knows it: an older node answers
+<code>En\n</code> and closes the connection, so upgrade every node
+before clients start sending it.</p>
+
 <h2 id="multi">m / o — batched get and set</h2>
 <pre><code>m &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt;\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;</code></pre>
 <p>Gets <code>n</code> keys under one frame and, on the node that owns
@@ -349,7 +391,7 @@ frames above carry nothing to verify against. A connection whose
 <code>A</code> carried the <code>T</code> flag and was answered
 <code>OnT</code> runs in <em>tagged mode</em>: every
 <code>G</code>/<code>S</code>/<code>D</code> (and
-<code>g</code>/<code>s</code>/<code>d</code>/<code>c</code>/<code>F</code>/<code>i</code>/<code>k</code>/<code>x</code>/<code>m</code>/<code>o</code>)
+<code>g</code>/<code>s</code>/<code>d</code>/<code>c</code>/<code>F</code>/<code>i</code>/<code>t</code>/<code>k</code>/<code>x</code>/<code>m</code>/<code>o</code>)
 header must end with a
 client-chosen tag (a u32 in decimal), and the response echoes it as its
 own last field, so a client can verify the pairing before trusting the
@@ -364,6 +406,7 @@ d &lt;namespace-length&gt; &lt;key-length&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;
 c &lt;namespace-length&gt; &lt;tag&gt;\n&lt;namespace&gt;
 F &lt;tag&gt;\n
 i &lt;namespace-length&gt; &lt;key-length&gt; &lt;delta&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
+t &lt;namespace-length&gt; &lt;key-length&gt; [&lt;ttl-seconds&gt;] [G] &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
 k &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; &lt;cond&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;
 x &lt;namespace-length&gt; &lt;key-length&gt; &lt;cond&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
 m &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;
@@ -380,7 +423,10 @@ below). <code>i</code>'s reply becomes
 after the optional TTL. <code>k</code>'s reply is <code>S &lt;tag&gt;\n</code>
 or <code>N &lt;tag&gt;\n</code>; <code>x</code>'s is <code>D &lt;tag&gt;\n</code>
 or <code>N &lt;tag&gt;\n</code> — both reuse the markers above, so
-tagging them needs no new shape. <code>m</code>'s reply is
+tagging them needs no new shape. <code>t</code>'s reply is
+<code>S &lt;tag&gt;\n</code> or <code>N &lt;tag&gt;\n</code>, and with
+<code>G</code> <code>V &lt;value-length&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n</code>
+(the tag after the optional TTL, as for <code>i</code>). <code>m</code>'s reply is
 <code>M &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt; &lt;tag&gt;\n&lt;hit values&gt;</code>,
 <code>o</code>'s is <code>O &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt; &lt;tag&gt;\n</code> —
 same roster shape as the untagged form, with the tag appended as the

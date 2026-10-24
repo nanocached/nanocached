@@ -380,6 +380,22 @@ here.</p>
   changed content and a lagging forward to coincide, and removing it
   would need versioned writes in the server and every SDK. Revisit if a
   versioned write path is adopted for other reasons.</li>
+  <li>During a join&rsquo;s or a decommission&rsquo;s forwarding window, a
+  touch (<code>t</code>) is forwarded as the value the old owner holds with
+  the new TTL, written like a set, not as a touch: the joiner may not hold
+  the key yet, and a touch it could not apply would be lost with the copy
+  left on the handoff&rsquo;s old TTL. A touch that runs on the old owner
+  just before a client&rsquo;s write to the same key, through another
+  connection, can have its forward queued after that write&rsquo;s, and then
+  the joiner holds the earlier value. Measured with 20 keys written with a
+  1,000 s TTL, handed to a joiner, and shortened to 10 s on the old owner
+  alone while its window was open: the joiner expired all 20 together with the old
+  owner (with the forward disabled it still held all 20 once the TTL had
+  passed). Accepted 2026-10-24: the same lagging unconditional forward as
+  above, with the same bounds (a TTL, a membership change, and a concurrent
+  write to a key that is also being touched), and a touch that could not
+  create the key would make the shortened TTL depend on whether the
+  handoff had delivered it yet.</li>
   <li>During a join&rsquo;s, a decommission&rsquo;s or an eviction&rsquo;s
   forwarding window, writes a client makes right after
   <code>clear()</code> returned can be missing on one or more owners until

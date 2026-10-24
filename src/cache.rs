@@ -567,6 +567,75 @@ impl Cache {
         IncrResult::Value(new_value, remaining_ttl)
     }
 
+    /// Issue #823: `t` — replaces a live entry's expiry in place and returns its value
+    /// with the TTL now in effect (`None`: it never expires), or `None` for
+    /// a key that is missing or expired. Never creates a key and never
+    /// changes the value, so unlike `set_with_ttl` it cannot overwrite a
+    /// concurrent write, and it does not go through `insert`: the byte
+    /// accounting and the entry's place in the eviction order are left
+    /// alone.
+    ///
+    /// `promote` is the `G` form (get-and-touch): a read, so it counts a
+    /// hit or a miss and makes the entry the most recently used, exactly
+    /// as `get` does. A plain touch is a metadata update and does neither.
+    /// `ttl` follows `Set`'s own convention (`None` = no expiry, `0` =
+    /// expired at once, one too far out to represent = no expiry).
+    pub fn touch(
+        &mut self,
+        key: &Key,
+        ttl: Option<Duration>,
+        promote: bool,
+    ) -> Option<(Bytes, Option<Duration>)> {
+        self.touch_at(key, ttl, promote, Instant::now())
+    }
+
+    fn touch_at(
+        &mut self,
+        key: &Key,
+        ttl: Option<Duration>,
+        promote: bool,
+        now: Instant,
+    ) -> Option<(Bytes, Option<Duration>)> {
+        let id = self.find_namespace(&key.namespace);
+        let last_used = promote.then(|| self.tick());
+        let name = &key.name[..];
+        let entries = id
+            .and_then(|id| self.slots.get_mut(&id))
+            .map(|namespace| &mut namespace.entries);
+        let entry = match (entries, promote) {
+            (Some(entries), true) => entries.get_mut(name),
+            (Some(entries), false) => entries.peek_mut(name),
+            (None, _) => None,
+        };
+
+        let Some(entry) = entry else {
+            if promote {
+                self.misses += 1;
+            }
+            return None;
+        };
+
+        if entry.is_expired_at(now) {
+            self.remove_entry_in(id.expect("an entry was found in it"), name);
+            self.expirations += 1;
+            if promote {
+                self.misses += 1;
+            }
+            return None;
+        }
+
+        entry.expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
+        let remaining = entry
+            .expires_at
+            .map(|expires_at| expires_at.saturating_duration_since(now));
+        let value = entry.value.clone();
+        if let Some(last_used) = last_used {
+            entry.last_used = last_used;
+            self.hits += 1;
+        }
+        Some((value, remaining))
+    }
+
     /// Issue #141: `k` — compare-and-set. Evaluates `condition` against
     /// the key's current (lazily-expired-first) value and, only on a
     /// match, overwrites it through `insert` (the same accounting-safe
@@ -1984,6 +2053,166 @@ mod tests {
             IncrResult::Value(11, None)
         );
         assert_eq!(cache.incr(&key(b"counter"), 1), IncrResult::NotFound);
+    }
+
+    #[test]
+    fn touch_sets_shortens_and_removes_a_ttl_without_changing_the_value() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+        let now = Instant::now();
+
+        // Extends: a key without a TTL gets one.
+        assert_eq!(
+            cache.touch_at(&key(b"name"), Some(Duration::from_secs(100)), false, now),
+            Some((Bytes::from_static(b"Alice"), Some(Duration::from_secs(100))))
+        );
+        // Shortens.
+        assert_eq!(
+            cache.touch_at(&key(b"name"), Some(Duration::from_secs(10)), false, now),
+            Some((Bytes::from_static(b"Alice"), Some(Duration::from_secs(10))))
+        );
+        assert!(
+            cache
+                .get_at(&key(b"name"), now + Duration::from_secs(9))
+                .is_some()
+        );
+        assert_eq!(
+            cache.get_at(&key(b"name"), now + Duration::from_secs(10)),
+            None
+        );
+    }
+
+    #[test]
+    fn touch_without_a_ttl_removes_it() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set_with_ttl(
+            key(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
+        let now = Instant::now();
+
+        assert_eq!(
+            cache.touch_at(&key(b"name"), None, false, now),
+            Some((Bytes::from_static(b"Alice"), None))
+        );
+        assert_eq!(
+            cache.get_at(&key(b"name"), now + Duration::from_secs(1_000_000)),
+            Some(Bytes::from_static(b"Alice"))
+        );
+    }
+
+    #[test]
+    fn touch_with_a_zero_ttl_expires_the_entry_at_once() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+        let now = Instant::now();
+
+        // The reply still carries the value; the next access is a miss.
+        assert_eq!(
+            cache.touch_at(&key(b"name"), Some(Duration::ZERO), false, now),
+            Some((Bytes::from_static(b"Alice"), Some(Duration::ZERO)))
+        );
+        assert_eq!(cache.get_at(&key(b"name"), now), None);
+    }
+
+    #[test]
+    fn touch_of_a_ttl_too_far_out_to_represent_means_no_expiry() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+
+        assert_eq!(
+            cache.touch_at(&key(b"name"), Some(Duration::MAX), false, Instant::now()),
+            Some((Bytes::from_static(b"Alice"), None))
+        );
+    }
+
+    #[test]
+    fn touch_of_a_missing_or_expired_key_is_a_miss_and_never_creates_it() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let now = Instant::now();
+        assert_eq!(cache.touch_at(&key(b"name"), None, true, now), None);
+        assert_eq!(cache.len(), 0);
+
+        cache.set_with_ttl(
+            key(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
+        let later = now + Duration::from_secs(6);
+        assert_eq!(cache.touch_at(&key(b"name"), None, false, later), None);
+        // The expired entry is reclaimed, not revived.
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.get_at(&key(b"name"), later), None);
+    }
+
+    #[test]
+    fn touch_is_scoped_to_its_namespace() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(namespaced(b"ns", b"name"), Bytes::from_static(b"Alice"));
+
+        assert_eq!(cache.touch(&key(b"name"), None, false), None);
+        assert!(
+            cache
+                .touch(
+                    &namespaced(b"ns", b"name"),
+                    Some(Duration::from_secs(5)),
+                    false
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn touch_does_not_count_a_hit_or_a_miss_but_get_and_touch_does() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+
+        cache.touch(&key(b"name"), None, false);
+        cache.touch(&key(b"nope"), None, false);
+        let stats = cache.stats();
+        assert_eq!((stats.hits, stats.misses), (0, 0));
+
+        cache.touch(&key(b"name"), None, true);
+        cache.touch(&key(b"nope"), None, true);
+        let stats = cache.stats();
+        assert_eq!((stats.hits, stats.misses), (1, 1));
+    }
+
+    #[test]
+    fn touch_leaves_the_byte_accounting_alone() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+        let used = cache.used_bytes;
+
+        cache.touch(&key(b"name"), Some(Duration::from_secs(5)), true);
+
+        assert_eq!(cache.used_bytes, used);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn get_and_touch_protects_an_entry_from_eviction_but_a_plain_touch_does_not() {
+        let room = 2 * (2 + 4 + ENTRY_OVERHEAD_BYTES);
+        for (promote, k1_survives) in [(true, true), (false, false)] {
+            let mut cache = Cache::new(room);
+            cache.set(key(b"k1"), Bytes::from_static(b"vvvv"));
+            cache.set(key(b"k2"), Bytes::from_static(b"vvvv"));
+
+            cache.touch(&key(b"k1"), Some(Duration::from_secs(60)), promote);
+            cache.set(key(b"k3"), Bytes::from_static(b"vvvv"));
+
+            assert_eq!(
+                cache.peek(&key(b"k1")).is_some(),
+                k1_survives,
+                "promote = {promote}"
+            );
+            assert_eq!(
+                cache.peek(&key(b"k2")).is_some(),
+                !k1_survives,
+                "promote = {promote}"
+            );
+        }
     }
 
     #[test]

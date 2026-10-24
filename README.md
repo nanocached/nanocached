@@ -14,7 +14,8 @@ uses a small, binary-safe TCP protocol and supports optional time-to-live
 - In-memory storage for binary keys and values
 - `G`, `S`, and `D` commands, and their namespaced forms `g`, `s`, `d`
   with `c`/`F` to clear one namespace or all of them
-- `i` atomic counters, `k`/`x` compare-and-set and compare-and-delete,
+- `i` atomic counters, `t` to refresh or remove a TTL in place (with an
+  optional get), `k`/`x` compare-and-set and compare-and-delete,
   `m`/`o` batched get and set
 - Optional TTL for stored values
 - Optional shared-secret authentication (`A` command)

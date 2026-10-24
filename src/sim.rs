@@ -312,6 +312,84 @@ async fn sweep_564_write_offset() {
     eprintln!("{runs} runs in {:?}", started.elapsed());
 }
 
+/// What one run of the touch scenario saw.
+#[derive(Debug)]
+struct TouchOutcome {
+    keys: usize,
+    b_held_before: usize,
+    a_held_after: usize,
+    b_held_after: usize,
+}
+
+/// A touch that reaches only the old owner while its forwarding window for a
+/// confirmed joiner is open must reach the joiner too: its copy came from the
+/// handoff with the long TTL the key was written with, and nothing else
+/// tells it the TTL was shortened. A stale client (one that does not know
+/// B) shortens every key's TTL on A alone; after that TTL, no copy is left.
+async fn scenario_touch_during_a_join(touch_at: Duration) -> TouchOutcome {
+    let dport = free_port();
+    let (a, b) = (free_port(), free_port());
+    let d = start_discovery(dport, Duration::from_secs(15));
+    settle().await;
+    let na = start_node(a, dport, Some("node-a"));
+    run_for(Duration::from_secs(20)).await;
+    let keys: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
+    for key in &keys {
+        let req = format!("S {} 1 1000\n{key}v", key.len());
+        assert_eq!(raw_line(a, req.as_bytes()).await.0, "S");
+    }
+    let nb = start_node(b, dport, Some("node-b"));
+    run_for(Duration::from_secs(25)).await;
+    assert_eq!(roster(dport).await.len(), 2, "A and B are members");
+    run_for(touch_at).await;
+
+    let mut out = TouchOutcome {
+        keys: keys.len(),
+        b_held_before: 0,
+        a_held_after: 0,
+        b_held_after: 0,
+    };
+    for key in &keys {
+        if raw_get(b, key).await.0.starts_with('V') {
+            out.b_held_before += 1;
+        }
+        let req = format!("t 0 {} 10\n{key}", key.len());
+        assert_eq!(raw_line(a, req.as_bytes()).await.0, "S", "{key}");
+    }
+    run_for(Duration::from_secs(12)).await;
+    for key in &keys {
+        if raw_get(a, key).await.0.starts_with('V') {
+            out.a_held_after += 1;
+        }
+        if raw_get(b, key).await.0.starts_with('V') {
+            out.b_held_after += 1;
+        }
+    }
+    d.abort();
+    na.abort();
+    nb.abort();
+    out
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_touch_on_the_old_owner_reaches_the_joiner_inside_the_forwarding_window() {
+    let _spin = spin();
+    let out = scenario_touch_during_a_join(Duration::from_secs(1)).await;
+    eprintln!("{out:?}");
+    assert_eq!(
+        out.b_held_before, out.keys,
+        "nothing to check, B did not hold the keys: {out:?}"
+    );
+    assert_eq!(
+        out.a_held_after, 0,
+        "the touch did not shorten A's TTL: {out:?}"
+    );
+    assert_eq!(
+        out.b_held_after, 0,
+        "B kept the long TTL it was handed: {out:?}"
+    );
+}
+
 /// #571: a joiner that is promoted and then leaves before its senders'
 /// next heartbeat ack is never in a roster they see, so its handoff slot
 /// stays unconfirmed. The sender must still learn that it is gone and stop
