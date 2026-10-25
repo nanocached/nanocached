@@ -148,6 +148,28 @@ interface MultiSetTracker {
   lastCause: unknown;
 }
 
+/** One key's answer from a batched touch's primary (issue #871): a `hit`
+ * (the `G` form; carries the value), `touched` (the plain form), `missing`
+ * (no live entry) or `wrongNode`. */
+type TouchAnswer =
+  | { readonly kind: "hit"; readonly value: Buffer }
+  | { readonly kind: "touched" }
+  | { readonly kind: "missing" }
+  | { readonly kind: "wrongNode" };
+
+/** What one touchMany/getManyAndTouch call learns across its two
+ * multiTouchPass passes. `results` maps a key index to its primary's
+ * answer; `wrongNode` holds the indices whose primary leg's latest outcome
+ * was a `W` rather than a connection failure; `lastCause` is the most
+ * recent primary-leg connection failure and `rejected` whether any primary
+ * leg was answered `En` (a node that predates `y`). */
+interface MultiTouchState {
+  results: Map<number, TouchAnswer>;
+  wrongNode: Set<number>;
+  lastCause: unknown;
+  rejected: boolean;
+}
+
 /** Snapshot of counters for failures this client swallows by design
  * (client-side replication / fire-and-forget replica writes / read repair) instead of raising them to a caller — observability
  * for silently degrading replication or a stuck node-list refresh, which
@@ -634,6 +656,9 @@ interface NamespaceOps {
   touch(key: string | Uint8Array, ttlSeconds: number | null): Promise<boolean>;
   getAndTouch(key: string | Uint8Array, ttlSeconds: number | null): Promise<string | null>;
   getAndTouchBytes(key: string | Uint8Array, ttlSeconds: number | null): Promise<Buffer | null>;
+  touchMany(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, boolean>>;
+  getManyAndTouch(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, string>>;
+  getManyAndTouchBytes(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, Buffer>>;
 }
 
 /**
@@ -755,6 +780,21 @@ export class NanocachedNamespace {
   /** See `NanocachedClient.getAndTouchBytes`. */
   getAndTouchBytes(key: string | Uint8Array, ttlSeconds: number | null): Promise<Buffer | null> {
     return this.ops.getAndTouchBytes(key, ttlSeconds);
+  }
+
+  /** See `NanocachedClient.touchMany`. */
+  touchMany(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, boolean>> {
+    return this.ops.touchMany(keys, ttlSeconds);
+  }
+
+  /** See `NanocachedClient.getManyAndTouch`. */
+  getManyAndTouch(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, string>> {
+    return this.ops.getManyAndTouch(keys, ttlSeconds);
+  }
+
+  /** See `NanocachedClient.getManyAndTouchBytes`. */
+  getManyAndTouchBytes(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, Buffer>> {
+    return this.ops.getManyAndTouchBytes(keys, ttlSeconds);
   }
 }
 
@@ -1452,6 +1492,62 @@ export class NanocachedClient {
     return this.getAndTouchBytesInNamespace(EMPTY_NAMESPACE, key, ttlSeconds);
   }
 
+  /** Batched `touch` (issue #871): replaces the TTL of every existing key in
+   * `keys` in place, one round trip per involved node instead of one per
+   * key. `keys` must be non-empty. Resolves a `Map` from each key to
+   * whether it existed: `true`, or `false` for a missing or expired key,
+   * which a touch never creates. `ttlSeconds` is one TTL for the whole
+   * batch and means what it means for `touch`: no default, `null` removes
+   * the TTL, `0` expires the keys at once.
+   *
+   * Like `touch` it is idempotent, so a request whose reply was lost is
+   * retried, and in a cluster it goes to every owner of a key, the
+   * primary's answer being the key's. A replica's failure or `W` is
+   * counted in `stats().replicaWriteFailures` and never fails the batch.
+   * Larger batches are transparently split into more than one `y`
+   * sub-frame per node (see MAX_BATCH_KEYS). If some keys' primaries are
+   * still wrong-node after one bounded refresh-and-retry this throws a
+   * plain `WrongNodeError`, and a key whose primary could not be reached on
+   * both passes throws that connection error — every other key was still
+   * touched, and since a touch is idempotent the whole batch may simply be
+   * sent again, so nothing partial is attached. Throws `ServerTooOldError`
+   * against a node that predates the command. */
+  async touchMany(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, boolean>> {
+    return this.touchManyInNamespace(EMPTY_NAMESPACE, keys, ttlSeconds);
+  }
+
+  /** Batched `getAndTouch` (issue #871): reads the values of `keys` and
+   * replaces their TTL in one step, one round trip per involved node.
+   * `keys` must be non-empty. A miss is absent from the returned map,
+   * creates nothing and is not an error. See `touchMany` for `ttlSeconds`.
+   * Strictly UTF-8 decoded like `get`.
+   *
+   * A read that writes, as `getAndTouch` is: each key goes to its primary
+   * in the `G` form, with no hedging and no fallback to a replica on a
+   * miss, and its other owners are sent the plain touch, so a replica is
+   * never the only owner touched. It counts as a read on the primary,
+   * which makes the entries the most recently used. A value the node had
+   * no room for in its reply (16 MiB per frame) is left out and left
+   * untouched, so it reads as a miss here.
+   *
+   * Failures follow `getMany`: keys still wrong-node after one bounded
+   * refresh-and-retry throw `PartialWrongNodeError`, and keys whose primary
+   * was unreachable on both passes throw `PartialConnectionLostError` (the
+   * bare connection error when nothing resolved), each carrying
+   * `.partialValues`, the keys that did resolve. Unlike `getMany` a key is
+   * not tried on its next owner when its primary is down — a replica's
+   * answer would leave the primary untouched. Throws `ServerTooOldError`
+   * against a node that predates the command. */
+  async getManyAndTouch(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, string>> {
+    return this.decodeBatch(this.getManyAndTouchBytesInNamespace(EMPTY_NAMESPACE, keys, ttlSeconds));
+  }
+
+  /** The raw-bytes companion to `getManyAndTouch`: no decoding.
+   * Transparently decompresses when `compress` is enabled. */
+  async getManyAndTouchBytes(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, Buffer>> {
+    return this.getManyAndTouchBytesInNamespace(EMPTY_NAMESPACE, keys, ttlSeconds);
+  }
+
   /** Atomically adds `delta` (signed, default 1) to `key`'s stored
    * counter and returns the new value — `null` if the key is missing or
    * expired, matching `get`'s own miss convention. Throws
@@ -1643,6 +1739,268 @@ export class NanocachedClient {
     return decompressValue(value);
   }
 
+  // ── batched touch (issue #871) ─────────────────────────────────────
+  //
+  // touchMany/getManyAndTouch are touch/getAndTouch for N keys in one `y`
+  // sub-frame per involved node (docs/protocol.html "y — batched touch"),
+  // chunked like getMany/setMany. A touch is idempotent and not
+  // primary-only, so every owner of a key is sent it, as for setMany, and
+  // only the primary's answer decides the key's outcome. `G` belongs to the
+  // whole frame, so a node that is primary for some keys of a
+  // getManyAndTouch batch and a replica for others gets two frames: the G
+  // form for the first, the plain form for the second (setMany's "exactly
+  // one sub-frame per node" does not hold). Keys are deduplicated like
+  // getMany's.
+
+  private async touchManyInNamespace(namespace: Uint8Array, keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, boolean>> {
+    return (await this.multiTouch(namespace, keys, ttlSeconds, false, "touchMany")) as Map<string, boolean>;
+  }
+
+  private async getManyAndTouchBytesInNamespace(namespace: Uint8Array, keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, Buffer>> {
+    return (await this.multiTouch(namespace, keys, ttlSeconds, true, "getManyAndTouch/getManyAndTouchBytes")) as Map<string, Buffer>;
+  }
+
+  /** The shared body of touchMany (`get` false: a map of boolean per key)
+   * and getManyAndTouchBytes (`get` true: the hits). */
+  private async multiTouch(
+    namespace: Uint8Array,
+    keys: readonly string[],
+    ttlSeconds: number | null,
+    get: boolean,
+    method: string,
+  ): Promise<Map<string, boolean | Buffer>> {
+    if (this.closed) throw new AlreadyClosedError();
+    if (keys.length === 0) {
+      throw new RangeError(`nanocached: ${method} requires at least one key`);
+    }
+    checkTouchTtl(ttlSeconds);
+    // A repeated key is touched once, as getMany reads it once.
+    keys = [...new Set(keys)];
+    // Eager, up-front, before any network I/O — see
+    // getManyBytesInNamespace's own doc comment for why.
+    const keyBytes = keys.map((key) => {
+      const bytes = Buffer.from(key, "utf8");
+      checkKey(bytes, namespace);
+      return bytes;
+    });
+    await this.maybeRefreshNodeList();
+
+    // See getManyBytesInNamespace: one decompression budget for the response.
+    const budget = { decompressed: 0 };
+    const collect = (results: ReadonlyMap<number, TouchAnswer>): Map<string, boolean | Buffer> => {
+      const out = new Map<string, boolean | Buffer>();
+      for (const index of [...results.keys()].sort((a, b) => a - b)) {
+        const answer = results.get(index)!;
+        if (!get) out.set(keys[index], answer.kind === "touched");
+        else if (answer.kind === "hit") out.set(keys[index], this.decompressForBatch(answer.value, budget));
+      }
+      return out;
+    };
+
+    if (this.target.kind !== "cluster") {
+      // Single/proxy mode: no retry layer, as in getManyBytesInNamespace.
+      const { entries, resolved, error } = await this.multiTouchChunked(() => this.connectionForSingleTarget(), namespace, keyBytes, ttlSeconds, get);
+      if (error !== undefined) {
+        if (wasRejectedByServer(error)) throw new ServerTooOldError("y");
+        // issue #411, as for getMany: an earlier sub-frame already
+        // resolved before the connection died on a later one — a get
+        // hands back what it fetched; a plain touch has nothing partial
+        // worth attaching.
+        if (get && resolved > 0 && isConnectionError(error)) {
+          const answered = new Map<number, TouchAnswer>();
+          for (let i = 0; i < resolved; i++) if (entries[i].kind !== "wrongNode") answered.set(i, entries[i]);
+          throw new PartialConnectionLostError(collect(answered), (error as Error).message, {
+            requestWasSent: error instanceof ConnectionLostError ? error.requestWasSent : true,
+          });
+        }
+        throw error;
+      }
+      if (entries.some((entry) => entry.kind === "wrongNode")) {
+        if (get) throw new PartialWrongNodeError(collect(new Map(entries.flatMap((entry, i) => (entry.kind === "wrongNode" ? [] : [[i, entry] as const])))));
+        throw new WrongNodeError();
+      }
+      return collect(new Map(entries.map((entry, i) => [i, entry] as const)));
+    }
+
+    const state: MultiTouchState = { results: new Map(), wrongNode: new Set(), lastCause: undefined, rejected: false };
+    let retryIndices = await this.multiTouchPass(namespace, keyBytes, ttlSeconds, get, undefined, state);
+    if (retryIndices.length > 0) {
+      // One bounded refresh-and-retry over everything a primary left
+      // unresolved: a `W` is stale routing the refresh fixes, a primary
+      // that could not be reached gets a fresh view of who the owners
+      // are. A touch is idempotent, so the keys go to every owner of the
+      // fresh ring again.
+      await this.maybeRefreshNodeList({ force: true });
+      retryIndices = await this.multiTouchPass(namespace, keyBytes, ttlSeconds, get, retryIndices, state);
+    }
+    if (retryIndices.length === 0) return collect(state.results);
+    if (state.rejected) throw new ServerTooOldError("y");
+    if (retryIndices.some((index) => state.wrongNode.has(index))) {
+      if (get) throw new PartialWrongNodeError(collect(state.results));
+      throw new WrongNodeError();
+    }
+    // No primary answered `W` for these keys: each one's primary was
+    // unreachable on both passes. That is a connection loss and is
+    // reported as one, as getMany does.
+    const cause = state.lastCause;
+    const message =
+      `nanocached: ${method} could not reach the primary of ${retryIndices.length} of ${keys.length} keys: ` +
+      (cause instanceof Error ? cause.message : "no owner is reachable for these keys");
+    const requestWasSent = cause instanceof ConnectionLostError ? cause.requestWasSent : true;
+    if (get && state.results.size > 0) throw new PartialConnectionLostError(collect(state.results), message, { requestWasSent });
+    if (cause instanceof Error) throw cause;
+    throw new ConnectionLostError(message);
+  }
+
+  /** multiGetChunked's twin for `y`: one or more sub-frames against
+   * whatever `connectionFor` resolves to — already grouped to one owner (or
+   * the single/proxy target) by the caller — chunked like `m` (MAX_BATCH_KEYS,
+   * MAX_REQUEST_BYTES; `nextChunkEnd`). `get` selects the `G` form. Unlike
+   * multiGetChunked it does not throw on a failure: it returns the answers
+   * of the chunks that completed (`entries`, `resolved` of them — the index
+   * the failing chunk began at, or the key count when none failed) and the
+   * `error` that stopped it, since the callers need both. An error that is
+   * a programming bug (see isSwallowable) is still thrown. */
+  private async multiTouchChunked(
+    connectionFor: () => Promise<Connection>,
+    namespace: Uint8Array,
+    keyBytes: readonly Buffer[],
+    ttlSeconds: number | null,
+    get: boolean,
+  ): Promise<{ entries: TouchAnswer[]; resolved: number; error: unknown }> {
+    const entries: TouchAnswer[] = [];
+    for (let start = 0; start < keyBytes.length; ) {
+      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]));
+      try {
+        const connection = await connectionFor();
+        const chunk = keyBytes.slice(start, end);
+        if (get) {
+          for (const entry of await connection.multiGetAndTouch(chunk, ttlSeconds, namespace)) {
+            entries.push(entry.kind === "miss" ? { kind: "missing" } : entry);
+          }
+        } else {
+          entries.push(...(await connection.multiTouch(chunk, ttlSeconds, namespace)));
+        }
+      } catch (error) {
+        if (!isSwallowable(error)) throw error;
+        return { entries, resolved: start, error };
+      }
+      start = end;
+    }
+    return { entries, resolved: keyBytes.length, error: undefined };
+  }
+
+  /** One pass of the cluster routing of touchMany and getManyAndTouch:
+   * every key still needing resolution (every key when retryIndices is
+   * undefined, or just what the previous pass left unresolved) is sent to
+   * **every owner**, in one leg per (owner, form): with `get` a key's
+   * primary gets it in the `G` form and every other owner in the plain
+   * one, without it every owner gets the plain form, so a node holding
+   * some keys as primary and others as replica gets one frame in the
+   * second case and two in the first. Only the primary's answer is
+   * recorded in `state.results`; a replica's failure or `W` is swallowed
+   * into stats().replicaWriteFailures, as in multiSetPass. A leg that
+   * holds no key as primary is eligible for fireAndForgetReplicas, exactly
+   * like a single-key replica write.
+   *
+   * Returns the indices whose primary answered `W` or could not be reached
+   * (a key with no owners at all counts as `W`: a refresh may populate the
+   * ring). `state` learns which of the two it was, and whether a primary
+   * was a node that predates `y`. */
+  private async multiTouchPass(
+    namespace: Uint8Array,
+    keyBytes: readonly Buffer[],
+    ttlSeconds: number | null,
+    get: boolean,
+    retryIndices: readonly number[] | undefined,
+    state: MultiTouchState,
+  ): Promise<number[]> {
+    const indices = retryIndices ?? keyBytes.map((_, index) => index);
+
+    const legs = new Map<string, { name: string; get: boolean; indices: number[]; isPrimary: boolean[] }>();
+    const retry: number[] = [];
+    for (const index of indices) {
+      const names = this.ownerNames(keyBytes[index], namespace);
+      if (names.length === 0) {
+        state.wrongNode.add(index);
+        retry.push(index);
+        continue;
+      }
+      names.forEach((name, rank) => {
+        const form = get && rank === 0;
+        const id = `${form ? "G" : "P"}${name}`;
+        let leg = legs.get(id);
+        if (!leg) {
+          leg = { name, get: form, indices: [], isPrimary: [] };
+          legs.set(id, leg);
+        }
+        leg.indices.push(index);
+        leg.isPrimary.push(rank === 0);
+      });
+    }
+
+    const syncLegs: Promise<void>[] = [];
+    // The real fire-and-forget leg promises (issue #188), kept so a genuine
+    // programming bug on one of them can still surface, as in multiSetPass.
+    const backgroundLegs: Promise<void>[] = [];
+    for (const leg of legs.values()) {
+      const runLeg = async (): Promise<void> => {
+        const { entries, resolved, error } = await this.multiTouchChunked(
+          () => this.memberConnection(leg.name),
+          namespace,
+          leg.indices.map((index) => keyBytes[index]),
+          ttlSeconds,
+          leg.get,
+        );
+        if (error !== undefined && leg.isPrimary.some(Boolean)) {
+          state.lastCause = error;
+          if (wasRejectedByServer(error)) state.rejected = true;
+        }
+        for (let i = 0; i < leg.indices.length; i++) {
+          const index = leg.indices[i];
+          const answered = i < resolved && entries[i].kind !== "wrongNode";
+          if (!leg.isPrimary[i]) {
+            if (!answered) this.replicaWriteFailures++;
+          } else if (answered) {
+            state.results.set(index, entries[i]);
+          } else {
+            if (i < resolved) state.wrongNode.add(index);
+            else state.wrongNode.delete(index);
+            retry.push(index);
+          }
+        }
+      };
+
+      const pureReplica = leg.isPrimary.every((primary) => !primary);
+      if (this.fireAndForgetReplicas && pureReplica && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+        // Detached, as in multiSetPass: a pure-replica leg holds no
+        // primary key, so it has nothing to contribute to `retry`, and
+        // `!this.closed` is rechecked synchronously, with no `await`
+        // between it and `.add()` (issue #47 audit invariant).
+        const background = runLeg();
+        const settled = background.catch(() => {});
+        this.backgroundReplicaWrites.add(background);
+        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        backgroundLegs.push(background);
+        continue;
+      }
+
+      const promise = runLeg();
+      promise.catch(() => {});
+      syncLegs.push(promise);
+    }
+
+    try {
+      await Promise.all(syncLegs);
+    } catch (error) {
+      // See multiSetPass: a bug found in a detached leg takes priority.
+      const backgroundResults = await Promise.allSettled(backgroundLegs);
+      const backgroundBug = backgroundResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      throw backgroundBug ? backgroundBug.reason : error;
+    }
+    return retry;
+  }
+
   // ── batched get/set (issues #128/#150/#151) ────────────────────────
 
   /** Returns every requested key's value as a string, in one round trip
@@ -1654,8 +2012,15 @@ export class NanocachedClient {
   }
 
   private async getManyInNamespace(namespace: Uint8Array, keys: readonly string[]): Promise<Map<string, string>> {
+    return this.decodeBatch(this.getManyBytesInNamespace(namespace, keys));
+  }
+
+  /** Awaits a batched read's raw result and decodes its values, as
+   * `getMany` and `getManyAndTouch` both do — including the values a
+   * partial-result error carries. */
+  private async decodeBatch(fetch: Promise<Map<string, Buffer>>): Promise<Map<string, string>> {
     try {
-      return this.decodeMany(await this.getManyBytesInNamespace(namespace, keys));
+      return this.decodeMany(await fetch);
     } catch (error) {
       if (error instanceof PartialWrongNodeError) {
         throw new PartialWrongNodeError(this.decodeMany(error.partialValues as Map<string, Buffer>));
@@ -2479,6 +2844,9 @@ export class NanocachedClient {
       touch: (key, ttlSeconds) => this.touchInNamespace(namespaceBytes, key, ttlSeconds),
       getAndTouch: (key, ttlSeconds) => this.getAndTouchInNamespace(namespaceBytes, key, ttlSeconds),
       getAndTouchBytes: (key, ttlSeconds) => this.getAndTouchBytesInNamespace(namespaceBytes, key, ttlSeconds),
+      touchMany: (keys, ttlSeconds) => this.touchManyInNamespace(namespaceBytes, keys, ttlSeconds),
+      getManyAndTouch: (keys, ttlSeconds) => this.decodeBatch(this.getManyAndTouchBytesInNamespace(namespaceBytes, keys, ttlSeconds)),
+      getManyAndTouchBytes: (keys, ttlSeconds) => this.getManyAndTouchBytesInNamespace(namespaceBytes, keys, ttlSeconds),
     });
   }
 

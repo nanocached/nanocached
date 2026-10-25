@@ -13,6 +13,7 @@ import {
   encodeTouch,
   encodeMultiGet,
   encodeMultiSet,
+  encodeMultiTouch,
   encodeSet,
   MAX_RESPONSE_FRAME_LENGTH,
   parseCounterValue,
@@ -21,6 +22,7 @@ import {
   type CasCondition,
   type MultiAckEntry,
   type MultiEntry,
+  type MultiTouchEntry,
   type ParsedResponse,
 } from "./protocol.js";
 
@@ -175,13 +177,17 @@ export class RetryableError extends NanocachedError {
 }
 
 /** Thrown by touch/getAndTouch (issue #825) when the node answered `En` to
- * the `t` command: a node that predates it does not know the command and
- * closes the connection. Every node must be upgraded before a client sends
- * it; nothing is retried to get past it, since the same node would answer
- * the same way. */
+ * the `t` command, and by touchMany/getManyAndTouch (issue #871) when it
+ * answered `En` to `y`: a node that predates the command does not know it
+ * and closes the connection. Every node must be upgraded before a client
+ * sends it; nothing is retried to get past it, since the same node would
+ * answer the same way. `command` is the wire command the node did not
+ * know. */
 export class ServerTooOldError extends NanocachedError {
-  constructor() {
-    super("nanocached: the server does not know the touch command (t) — upgrade every node to a release that includes it");
+  constructor(public readonly command: "t" | "y" = "t") {
+    super(
+      `nanocached: the server does not know the ${command === "t" ? "touch" : "batched touch"} command (${command}) — upgrade every node to a release that includes it`,
+    );
     this.name = "ServerTooOldError";
   }
 }
@@ -507,6 +513,39 @@ export class Connection {
       );
     }
     return response.ackEntries;
+  }
+
+  /** `y` — batched touch (issue #871): `n` keys of one namespace touched
+   * under one TTL, on this node only (cluster fan-out to every owner is
+   * `NanocachedClient`'s job, as for `multiSet`). One entry per key, in
+   * request order: `touched`, `missing` (a touch never creates a key) or a
+   * per-key `wrongNode` — see `multiGet` for the per-key independence
+   * contract. */
+  async multiTouch(keys: readonly Uint8Array[], ttlSeconds: number | null, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<MultiTouchEntry[]> {
+    const response = await this.send((tag) => encodeMultiTouch(keys, ttlSeconds, false, tag, namespace));
+    if (response.kind !== "multiTouch" || response.touchEntries === undefined) throw this.mismatch(response);
+    if (response.touchEntries.length !== keys.length) {
+      throw this.desynced(
+        `multi-touch response roster length ${response.touchEntries.length} does not match request key count ${keys.length}`,
+      );
+    }
+    return response.touchEntries;
+  }
+
+  /** `y ... G` — batched get-and-touch (issue #871): the reply is
+   * `multiGet`'s roster for the keys the node touched, so a hit's value
+   * carries the frame's TTL, a miss is `miss`, and a value the node had no
+   * room for in its reply is also `miss` and left untouched. Unlike
+   * `getAndTouch` the reply carries no per-key TTL. */
+  async multiGetAndTouch(keys: readonly Uint8Array[], ttlSeconds: number | null, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<MultiEntry[]> {
+    const response = await this.send((tag) => encodeMultiTouch(keys, ttlSeconds, true, tag, namespace));
+    if (response.kind !== "multi" || response.entries === undefined) throw this.mismatch(response);
+    if (response.entries.length !== keys.length) {
+      throw this.desynced(
+        `multi-get response roster length ${response.entries.length} does not match request key count ${keys.length}`,
+      );
+    }
+    return response.entries;
   }
 
   /** A well-formed response of the wrong kind (a `stored` answering a G)

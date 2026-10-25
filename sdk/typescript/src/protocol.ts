@@ -472,6 +472,43 @@ export function encodeMultiSet(
   return Buffer.concat(pieces);
 }
 
+/** `y` — batched touch (issue #871): `touch` for `keys`, all of one
+ * namespace, under one TTL. Always namespaced, like `m`. `null` sends no
+ * TTL field (the node removes the TTL); `0` is sent and expires the keys at
+ * once — the opposite of encodeMultiSet, where 0 means no expiry. `get`
+ * appends the `G` token: the reply is then `m`'s, for the keys touched.
+ * Bounded like encodeMultiGet, with the TTL and `G` fields inside
+ * MULTI_FRAME_HEADER_SLACK. */
+export function encodeMultiTouch(
+  keys: readonly Uint8Array[],
+  ttlSeconds: number | null,
+  get: boolean,
+  tag?: number,
+  namespace: Uint8Array = EMPTY_NAMESPACE,
+): Buffer {
+  if (keys.length === 0) {
+    throw new RangeError("nanocached: encodeMultiTouch requires at least one key");
+  }
+  checkTouchTtl(ttlSeconds);
+  // The first key is exempt from the total check for the reason
+  // encodeMultiGet's is (issue #390).
+  let total = namespace.length + MULTI_FRAME_HEADER_SLACK;
+  for (let i = 0; i < keys.length; i++) {
+    checkKey(keys[i], namespace);
+    total += multiGetEntryCost(keys[i]);
+    if (i > 0 && total > MAX_REQUEST_BYTES) {
+      throw new RangeError(
+        `nanocached: namespace and keys together (including their header overhead) exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${total} bytes`,
+      );
+    }
+  }
+
+  const lengths = keys.map((key) => ` ${key.length}`).join("");
+  const ttlField = ttlSeconds === null ? "" : ` ${ttlSeconds}`;
+  const header = `y ${namespace.length} ${keys.length}${lengths}${ttlField}${get ? " G" : ""}${tagField(tag)}\n`;
+  return Buffer.concat([toAscii(header), namespace, ...keys]);
+}
+
 /** One key's outcome inside an `M` (multi-get) or `O` (multi-set)
  * response roster (issues #128/#150/#151, docs/protocol.html#multi) — a
  * batch never fails as a whole, so each key's result is independent of
@@ -480,6 +517,10 @@ export function encodeMultiSet(
  * shared by both. */
 export type MultiEntry = { readonly kind: "hit"; readonly value: Buffer } | { readonly kind: "miss" } | { readonly kind: "wrongNode" };
 export type MultiAckEntry = { readonly kind: "stored" } | { readonly kind: "wrongNode" };
+/** One key's answer in a batched touch's `Y` roster (issue #871): `touched`
+ * (`S`), `missing` (`N`, no live entry — a touch never creates one) or
+ * `wrongNode` (`W`). */
+export type MultiTouchEntry = { readonly kind: "touched" } | { readonly kind: "missing" } | { readonly kind: "wrongNode" };
 
 export interface ParsedResponse {
   kind:
@@ -494,7 +535,8 @@ export interface ParsedResponse {
     | "incremented"
     | "notNumeric"
     | "multi"
-    | "multiAck";
+    | "multiAck"
+    | "multiTouch";
   value?: Buffer;
   /** echoed response tags: the echoed request tag, present on every response parsed
    * in tagged mode except the unsolicited `busy`. */
@@ -519,6 +561,10 @@ export interface ParsedResponse {
    * response — see `entries`' own doc comment; the same per-key
    * independence, just without hit bytes to carry. */
   ackEntries?: MultiAckEntry[];
+  /** Batched touch's per-key roster (issue #871), present only on a
+   * `"multiTouch"` response — shaped like `ackEntries`, with a `missing`
+   * outcome as well. */
+  touchEntries?: MultiTouchEntry[];
 }
 
 // The server's own request cap is 1 MiB; this constant doubles that as
@@ -578,6 +624,9 @@ const MARKER_NOT_NUMERIC = 0x54; // 'T'
 // ever begins with 'O'.
 const MARKER_MULTI = 0x4d; // 'M'
 const MARKER_MULTI_ACK = 0x4f; // 'O'
+// Batched touch (issue #871): `Y` answers a plain `y`; a `y ... G` is
+// answered with `M`, as `m` is.
+const MARKER_MULTI_TOUCH = 0x59; // 'Y'
 const LF = 0x0a;
 
 // The longest a legal `M`/`O` response header can ever be before its
@@ -741,7 +790,7 @@ function parseMultiHeader(buf: Buffer, tagged: boolean): MultiHeader | null {
  * tryParseResponse itself to reject the next time it's actually
  * invoked. */
 export function peekMultiFrameLength(buf: Buffer, tagged: boolean): number | undefined {
-  if (buf.length === 0 || (buf[0] !== MARKER_MULTI && buf[0] !== MARKER_MULTI_ACK)) return undefined;
+  if (buf.length === 0 || (buf[0] !== MARKER_MULTI && buf[0] !== MARKER_MULTI_ACK && buf[0] !== MARKER_MULTI_TOUCH)) return undefined;
 
   let header: MultiHeader | null;
   try {
@@ -751,7 +800,7 @@ export function peekMultiFrameLength(buf: Buffer, tagged: boolean): number | und
   }
   if (header === null) return undefined;
 
-  if (buf[0] === MARKER_MULTI_ACK) return header.headerEnd + 1; // no body
+  if (buf[0] === MARKER_MULTI_ACK || buf[0] === MARKER_MULTI_TOUCH) return header.headerEnd + 1; // no body
 
   let total = header.headerEnd + 1;
   for (const token of header.tokens) {
@@ -1022,6 +1071,24 @@ export function tryParseResponse(
       });
 
       return { response: { kind: "multiAck", ackEntries, tag: header.tag }, consumed: header.headerEnd + 1 };
+    }
+
+    // `Y` — batched touch's reply (issue #871): `Y <n> <result-1>...
+    // <result-n>[ <tag>]\n`, shaped like `O` — "S" (touched), "N" (no
+    // live entry) or "W" (wrong node). No body, so no cumulative bound is
+    // needed, as for `O`.
+    case MARKER_MULTI_TOUCH: {
+      const header = parseMultiHeader(buf, tagged);
+      if (header === null) return null;
+
+      const touchEntries: MultiTouchEntry[] = header.tokens.map((token) => {
+        if (token === "S") return { kind: "touched" };
+        if (token === "N") return { kind: "missing" };
+        if (token === "W") return { kind: "wrongNode" };
+        throw new NanocachedError("nanocached: invalid multi-touch result token in response");
+      });
+
+      return { response: { kind: "multiTouch", touchEntries, tag: header.tag }, consumed: header.headerEnd + 1 };
     }
 
     // `En\n`: the node rejects the request and closes the connection.

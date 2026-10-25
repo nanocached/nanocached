@@ -22,6 +22,19 @@ tag: 0.4.3 was a server-only release.
   primary for the value). Against a node that predates the command they
   throw the new `ServerTooOldError`. Needs a server release that includes
   the `t` command.
+- `touchMany(keys, ttlSeconds)` and `getManyAndTouch(keys, ttlSeconds)`
+  (with `getManyAndTouchBytes`, and all three on `NanocachedNamespace`) are
+  `touch`/`getAndTouch` for a list of keys, in one round trip per involved
+  node. `touchMany` resolves a map of key to whether it existed;
+  `getManyAndTouch` resolves the hits, as `getMany` does. One TTL for the
+  whole batch, with the meaning and no default of `touch`. Every owner is
+  sent the batch; only a key's primary is asked for the value, so a node that
+  is primary for some keys and a replica for others receives two frames.
+  Failures follow `setMany`/`getMany`: `WrongNodeError` from `touchMany` and
+  `PartialWrongNodeError`/`PartialConnectionLostError` from
+  `getManyAndTouch`. Needs a server release that includes the `y` command;
+  against a node that has `t` but not `y` they throw `ServerTooOldError`,
+  which now has a `command` property (`"t"` or `"y"`).
 
 ### Changed
 

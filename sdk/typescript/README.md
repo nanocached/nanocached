@@ -468,6 +468,42 @@ Against a node older than the release that added the command, both throw
 `ServerTooOldError`: such a node answers `En` and closes the connection.
 Upgrade every node before using them.
 
+### Many keys at once (`touchMany` / `getManyAndTouch`)
+
+`touchMany` and `getManyAndTouch` (`getManyAndTouchBytes` is the raw
+companion) are the same two operations for a list of keys, in one round trip
+per involved node instead of one per key:
+
+```ts
+await client.setMany({ a: "1", b: "2" }, 60);
+await client.touchMany(["a", "b", "missing"], 300);
+// Map { a => true, b => true, missing => false } — a touch never creates a key
+await client.getManyAndTouch(["a", "b", "missing"], 300);
+// Map { a => "1", b => "2" } — a miss is absent, as in getMany()
+```
+
+The TTL is one value for the whole batch and means what it means for
+`touch`: no default, `null` removes it, `0` expires the keys at once. A key
+given twice is touched once, and a batch of more than 400 keys is split into
+several frames, as for `getMany`. `NanocachedNamespace` has all three.
+
+Like `touch` it goes to every owner of each key and the primary's answer
+decides. `getManyAndTouch` asks only a key's primary for the value, so a node
+that is the primary of some keys in the batch and a replica of others
+receives two frames, one with `G` and one without. A replica's failure is
+counted in `stats().replicaWriteFailures` (once per key) and never fails the
+batch. A value that did not fit in the node's reply (16 MiB per frame) is
+left untouched and reads as a miss.
+
+Keys whose primary still answers a wrong-node after one refresh and retry
+throw `WrongNodeError` from `touchMany` and `PartialWrongNodeError`, with
+the keys that did resolve in `.partialValues`, from `getManyAndTouch`. A
+primary that cannot be reached on both passes throws its connection error
+(`PartialConnectionLostError` with `.partialValues` for `getManyAndTouch`,
+when some keys did resolve). A touch is idempotent, so a failed `touchMany`
+can simply be sent again. Both throw `ServerTooOldError` (its `command` is
+`"y"`) against a node that has `t` but not `y`.
+
 ## Batched get and set
 
 `getMany`/`getManyBytes` and `setMany`/`setManyBytes` (the `m`/`o`
@@ -644,6 +680,12 @@ never replayed.
   `string | null`; `client.getAndTouchBytes(key, ttlSeconds)` — resolves
   `Buffer | null`; both throw `ServerTooOldError` against a node that
   predates the command; see [Touch](#touch-touch--getandtouch) above
+- `client.touchMany(keys, ttlSeconds)` — resolves `Map<string, boolean>`
+  (whether each key existed); `client.getManyAndTouch(keys, ttlSeconds)` —
+  resolves `Map<string, string>`, missing keys absent;
+  `client.getManyAndTouchBytes(keys, ttlSeconds)` — resolves `Map<string,
+  Buffer>`; `ttlSeconds` is required, as for `touch`; see [Many keys at
+  once](#many-keys-at-once-touchmany--getmanyandtouch) above
 - `client.getMany(keys)` — resolves `Map<string, string>`, missing keys
   simply absent; `client.getManyBytes(keys)` — resolves `Map<string,
   Buffer>`; see [Batched get and set](#batched-get-and-set) above
