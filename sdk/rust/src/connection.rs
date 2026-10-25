@@ -1837,8 +1837,12 @@ async fn read_one_response(
 }
 
 /// The `Protocol` message for a node's `En` — the same text the generic
-/// unknown-marker arm has always produced for that byte, so every command
-/// other than touch keeps surfacing exactly what it did before.
+/// unknown-marker arm has always produced for that byte, so a node's `En`
+/// to any command other than touch keeps surfacing exactly what it did
+/// before. Only the touch methods tell it apart from the proxy's `E` (see
+/// [`SERVER_ERROR_REPLY_MESSAGE`]); every other command reports a non-`En`
+/// `E` as a `Protocol` error carrying that message, which no retry path
+/// sends again.
 const SERVER_REJECTED_MESSAGE: &str = "nanocached: unexpected response from server: E";
 
 /// The `Protocol` message for an `E` line that is not a node's `En` (the
