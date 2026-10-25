@@ -79,6 +79,22 @@ export class PartialWrongNodeError<T = unknown> extends WrongNodeError {
   }
 }
 
+/** Thrown by getManyAndTouch/getManyAndTouchBytes (issue #924) in a
+ * cluster when one primary answered `En` to `y` while other primaries had
+ * already resolved their keys. A subclass of `ServerTooOldError`, so
+ * existing `catch (ServerTooOldError)` handling keeps working unchanged.
+ * `partialValues` holds every hit that DID resolve — a `Map<string,
+ * Buffer>` from getManyAndTouchBytes, `Map<string, string>` from
+ * getManyAndTouch — which with `ttlSeconds === 0` were consumed on the
+ * nodes that returned them and cannot be read again. touchMany has nothing
+ * partial worth attaching and throws a plain `ServerTooOldError`. */
+export class PartialServerTooOldError<T = unknown> extends ServerTooOldError {
+  constructor(public readonly partialValues: T) {
+    super("y");
+    this.name = "PartialServerTooOldError";
+  }
+}
+
 /** Thrown by getMany/getManyBytes/setMany/setManyBytes (issue #411) when a
  * batch spans more than one `m`/`o` sub-frame (batch chunking, see
  * MAX_BATCH_KEYS/MAX_REQUEST_BYTES/`nextChunkEnd`) and the connection dies
@@ -1560,7 +1576,9 @@ export class NanocachedClient {
    * resent (issue #901): it may have expired and consumed its values
    * already, so those keys throw `PartialConnectionLostError` at once
    * instead of reading as misses. Throws `ServerTooOldError` against a
-   * node that predates the command, at once, as `touchMany` does. */
+   * node that predates the command, at once, as `touchMany` does — in a
+   * cluster, when other primaries had already answered, its subclass
+   * `PartialServerTooOldError` carrying their hits in `.partialValues`. */
   async getManyAndTouch(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, string>> {
     return this.decodeBatch(this.getManyAndTouchBytesInNamespace(EMPTY_NAMESPACE, keys, ttlSeconds));
   }
@@ -1862,10 +1880,14 @@ export class NanocachedClient {
       lost: new Set(),
       lostCause: undefined,
     };
+    // With `get`, the hits other primaries already returned ride along
+    // (issue #924): a `ttlSeconds === 0` call consumed them.
+    const tooOld = (): ServerTooOldError =>
+      get && state.results.size > 0 ? new PartialServerTooOldError(collect(state.results)) : new ServerTooOldError("y");
     let retryIndices = await this.multiTouchPass(namespace, keyBytes, ttlSeconds, get, undefined, state);
     // `En` is final: the node would refuse the same frame again, so neither
     // the refresh nor the second pass (which would redial it) is worth it.
-    if (retryIndices.length > 0 && state.rejected) throw new ServerTooOldError("y");
+    if (retryIndices.length > 0 && state.rejected) throw tooOld();
     if (retryIndices.length > 0) {
       // One bounded refresh-and-retry over everything a primary left
       // unresolved: a `W` is stale routing the refresh fixes, a primary
@@ -1876,7 +1898,7 @@ export class NanocachedClient {
       retryIndices = await this.multiTouchPass(namespace, keyBytes, ttlSeconds, get, retryIndices, state);
     }
     if (retryIndices.length === 0 && state.lost.size === 0) return collect(state.results);
-    if (state.rejected) throw new ServerTooOldError("y");
+    if (state.rejected) throw tooOld();
     if (state.lost.size === 0 && retryIndices.some((index) => state.wrongNode.has(index))) {
       if (get) throw new PartialWrongNodeError(collect(state.results));
       throw new WrongNodeError();
@@ -2098,6 +2120,9 @@ export class NanocachedClient {
         throw new PartialConnectionLostError(this.decodeMany(error.partialValues as Map<string, Buffer>), error.message, {
           requestWasSent: error.requestWasSent,
         });
+      }
+      if (error instanceof PartialServerTooOldError) {
+        throw new PartialServerTooOldError(this.decodeMany(error.partialValues as Map<string, Buffer>));
       }
       throw error;
     }

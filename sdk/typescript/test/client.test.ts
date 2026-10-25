@@ -15,6 +15,7 @@ import {
   NanocachedError,
   NotNumericError,
   PartialConnectionLostError,
+  PartialServerTooOldError,
   PartialWrongNodeError,
   RetryableError,
   ServerTooOldError,
@@ -4624,6 +4625,44 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
       await assert.rejects(() => client.touchMany(keys, 30), ServerTooOldError);
       // The single-key touch is untouched: that node knows `t`.
       assert.equal(await client.touch(keys[0], 30), true);
+    }, [{ withoutMultiTouch: true }, {}]);
+  });
+
+  it("a primary that predates y hands back the hits other primaries returned (issue #924)", async () => {
+    // getManyAndTouch(ttl=0) consumes the values the other primaries
+    // return, so an `En` from one primary must not throw them away.
+    await withCluster(async (client, cluster) => {
+      const oldKeys = keysWithPrimary(cluster, names[0], 2, "old");
+      const newKeys = keysWithPrimary(cluster, names[1], 2, "new");
+      const values = Object.fromEntries([...oldKeys, ...newKeys].map((key) => [key, `v-${key}`]));
+      await client.setMany(values);
+      await assert.rejects(() => client.getManyAndTouch([...oldKeys, ...newKeys], 0), (error: unknown) => {
+        assert.ok(error instanceof PartialServerTooOldError);
+        assert.ok(error instanceof ServerTooOldError);
+        assert.equal(error.command, "y");
+        assert.deepEqual(error.partialValues, new Map(newKeys.map((key) => [key, `v-${key}`])));
+        return true;
+      });
+      // The ttl=0 call above consumed them: this is the loss.
+      assert.equal((await client.getMany(newKeys)).size, 0);
+      await client.setMany(values);
+      await assert.rejects(() => client.getManyAndTouchBytes([...oldKeys, ...newKeys], 30), (error: unknown) => {
+        assert.ok(error instanceof PartialServerTooOldError);
+        assert.deepEqual(error.partialValues, new Map(newKeys.map((key) => [key, Buffer.from(`v-${key}`)])));
+        return true;
+      });
+      // A plain touch has nothing partial worth attaching.
+      await assert.rejects(() => client.touchMany([...oldKeys, ...newKeys], 30), (error: unknown) => {
+        assert.ok(error instanceof ServerTooOldError);
+        assert.ok(!(error instanceof PartialServerTooOldError));
+        return true;
+      });
+      // Nothing resolved elsewhere: the bare error, as before.
+      await assert.rejects(() => client.getManyAndTouch(oldKeys, 30), (error: unknown) => {
+        assert.ok(error instanceof ServerTooOldError);
+        assert.ok(!(error instanceof PartialServerTooOldError));
+        return true;
+      });
     }, [{ withoutMultiTouch: true }, {}]);
   });
 
