@@ -677,6 +677,70 @@ final class Connection {
         return frame;
     }
 
+    /** Sends one plain {@code y} — batched touch (issue #871,
+     * docs/protocol.html "y — batched touch") — to this node only: cluster
+     * fan-out to every owner is the client's job, as for {@link
+     * #multiSet}. {@code ttlSeconds} null omits the TTL field (the node
+     * removes the TTL); 0 is sent and expires the keys at once — unlike
+     * {@code multiSet}, where 0 never reaches the wire. {@code entries[i]}
+     * answers {@code keys[i]}: {@code ok()} is {@code S} (touched), {@code
+     * wrongNode()} is {@code W}, neither is {@code N} (no live entry — a
+     * touch never creates one). As for {@link #multiGet}, only a desynced
+     * roster is an error. */
+    List<MultiEntry> multiTouch(byte[] namespace, byte[][] keys, Long ttlSeconds) {
+        Response response = request(tag -> buildMultiTouchFrame(namespace, keys, ttlSeconds, false, tag));
+        if (response.marker() != 'Y') throw mismatch(response.marker());
+        if (response.entries().size() != keys.length) {
+            throw desyncedEntryCount("multi-touch", response.entries().size(), keys.length);
+        }
+        return response.entries();
+    }
+
+    /** {@code y ... G}: the reply is {@link #multiGet}'s {@code M} roster
+     * for the keys the node touched — a hit's value carries the frame's
+     * TTL, a miss (or a value the node had no room for in its reply, which
+     * it also leaves untouched) is a clean miss, and a per-key {@code W}
+     * stays in the roster. Unlike {@link #getAndTouch} the reply carries no
+     * per-key TTL. */
+    List<MultiEntry> multiGetAndTouch(byte[] namespace, byte[][] keys, Long ttlSeconds) {
+        Response response = request(tag -> buildMultiTouchFrame(namespace, keys, ttlSeconds, true, tag));
+        if (response.marker() != 'M') throw mismatch(response.marker());
+        if (response.entries().size() != keys.length) {
+            throw desyncedEntryCount("multi-get", response.entries().size(), keys.length);
+        }
+        return response.entries();
+    }
+
+    /** Builds a {@code y} request frame: {@code y <ns-len> <n> <key-len-1>
+     * ... <key-len-n>[ <ttl>][ G][ <tag>]\n<ns><key-1>...<key-n>}. */
+    private static byte[] buildMultiTouchFrame(
+            byte[] namespace, byte[][] keys, Long ttlSeconds, boolean get, Integer tag) {
+        StringBuilder header = new StringBuilder("y ").append(namespace.length).append(' ').append(keys.length);
+        for (byte[] key : keys) {
+            header.append(' ').append(key.length);
+        }
+        if (ttlSeconds != null) header.append(' ').append(ttlSeconds);
+        if (get) header.append(" G");
+        header.append(tagSuffix(tag)).append('\n');
+        byte[] headerBytes = header.toString().getBytes(StandardCharsets.US_ASCII);
+
+        int bodyLength = namespace.length;
+        for (byte[] key : keys) {
+            bodyLength += key.length;
+        }
+        byte[] frame = new byte[headerBytes.length + bodyLength];
+        int offset = 0;
+        System.arraycopy(headerBytes, 0, frame, offset, headerBytes.length);
+        offset += headerBytes.length;
+        System.arraycopy(namespace, 0, frame, offset, namespace.length);
+        offset += namespace.length;
+        for (byte[] key : keys) {
+            System.arraycopy(key, 0, frame, offset, key.length);
+            offset += key.length;
+        }
+        return frame;
+    }
+
     /** Sends {@code o} — stores every key/value pair in one round trip,
      * one shared {@code ttlSeconds} (null means no expiry) for the whole
      * batch rather than per key (docs/protocol.html#multi).
@@ -1142,6 +1206,44 @@ final class Connection {
         }
     }
 
+    /** Reads the rest of a body-less roster reply ({@code O}, {@code Y})
+     * after its marker: {@code <n> <result-1> ... <result-n>[ <tag>]\n}.
+     * {@code entryOf} maps one result token to its entry, or {@code null}
+     * for a token the reply may not carry. No cumulative-bytes bound is
+     * needed here (issue #179): every token is a fixed one-character string
+     * with no length-prefixed body to read, so the loop's cost is already
+     * O(count), and count is already bounded by the header line's own
+     * length (capped like every other header, see readLine). */
+    private Response readAckRoster(
+            int marker, String what, java.util.function.Function<String, MultiEntry> entryOf) throws IOException {
+        String[] fields = readLine().split(" ");
+        if (fields.length < 1) {
+            throw new NanocachedException.ConnectionFailed(
+                    "nanocached: invalid " + what + " header in response", null);
+        }
+        int count = parseNonNegativeInt(fields[0]);
+        if (count < 0) {
+            throw new NanocachedException.ConnectionFailed(
+                    "nanocached: invalid " + what + " count in response", null);
+        }
+        int wantFields = 1 + count + (tagged ? 1 : 0);
+        if (fields.length != wantFields) {
+            throw new NanocachedException.ConnectionFailed(
+                    "nanocached: invalid " + what + " header in response", null);
+        }
+        List<MultiEntry> entries = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            MultiEntry entry = entryOf.apply(fields[1 + i]);
+            if (entry == null) {
+                throw new NanocachedException.ConnectionFailed(
+                        "nanocached: invalid " + what + " result token in response", null);
+            }
+            entries.add(entry);
+        }
+        int tag = tagged ? parseTag(fields[1 + count]) : -1;
+        return new Response(marker, null, tag, null, entries);
+    }
+
     private Response readResponse() throws IOException {
         int marker = readByte();
         switch (marker) {
@@ -1300,33 +1402,24 @@ final class Connection {
             // many single-character tokens can fit on it in the first
             // place.
             case 'O' -> {
-                String[] fields = readLine().split(" ");
-                if (fields.length < 1) {
-                    throw new NanocachedException.ConnectionFailed(
-                            "nanocached: invalid multi-set header in response", null);
-                }
-                int count = parseNonNegativeInt(fields[0]);
-                if (count < 0) {
-                    throw new NanocachedException.ConnectionFailed(
-                            "nanocached: invalid multi-set count in response", null);
-                }
-                int wantFields = 1 + count + (tagged ? 1 : 0);
-                if (fields.length != wantFields) {
-                    throw new NanocachedException.ConnectionFailed(
-                            "nanocached: invalid multi-set header in response", null);
-                }
-                List<MultiEntry> entries = new ArrayList<>(count);
-                for (int i = 0; i < count; i++) {
-                    String token = fields[1 + i];
-                    switch (token) {
-                        case "S" -> entries.add(MultiEntry.ofStored());
-                        case "W" -> entries.add(MultiEntry.ofWrongNode());
-                        default -> throw new NanocachedException.ConnectionFailed(
-                                "nanocached: invalid multi-set result token in response", null);
-                    }
-                }
-                int tag = tagged ? parseTag(fields[1 + count]) : -1;
-                return new Response(marker, null, tag, null, entries);
+                return readAckRoster(marker, "multi-set", token -> switch (token) {
+                    case "S" -> MultiEntry.ofStored();
+                    case "W" -> MultiEntry.ofWrongNode();
+                    default -> null;
+                });
+            }
+            // 'Y' is batched touch's (issue #871, docs/protocol.html "y —
+            // batched touch") reply: `Y <n> <result-1> ... <result-n>[
+            // <tag>]\n`, shaped like `O` — "S" (touched), "N" (no live
+            // entry, a clean miss) or "W" (wrong node). A `y ... G` is
+            // answered with `M` instead, as `m` is.
+            case 'Y' -> {
+                return readAckRoster(marker, "multi-touch", token -> switch (token) {
+                    case "S" -> MultiEntry.ofStored();
+                    case "N" -> MultiEntry.ofMiss();
+                    case "W" -> MultiEntry.ofWrongNode();
+                    default -> null;
+                });
             }
             // `En\n`: the node rejects the request and is closing the
             // connection. Told apart from other unexpected bytes so a touch

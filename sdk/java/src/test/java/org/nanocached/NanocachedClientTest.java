@@ -1083,6 +1083,560 @@ class NanocachedClientTest {
         }
     }
 
+    // ── Batched touch / get-and-touch (issue #871) ──────────────────
+
+    private static List<String> keysWhosePrimaryIs(String name, int count) {
+        HashRing ring = new HashRing(NAMES);
+        List<String> keys = new ArrayList<>();
+        for (int i = 0; keys.size() < count; i++) {
+            String key = "batch-" + i;
+            if (ring.owners(key.getBytes(StandardCharsets.UTF_8), 2).get(0).equals(name)) keys.add(key);
+        }
+        return keys;
+    }
+
+    private static List<String> concat(List<String> first, List<String> second) {
+        List<String> all = new ArrayList<>(first);
+        all.addAll(second);
+        return all;
+    }
+
+    private static List<MockNode.MultiTouchFrame> framesWithGet(MockNode node, boolean get) {
+        List<MockNode.MultiTouchFrame> frames = new ArrayList<>();
+        for (MockNode.MultiTouchFrame frame : node.multiTouchFrames) {
+            if (frame.get() == get) frames.add(frame);
+        }
+        return frames;
+    }
+
+    private static byte[][] utf8Keys(String... keys) {
+        byte[][] raw = new byte[keys.length][];
+        for (int i = 0; i < keys.length; i++) raw[i] = keys[i].getBytes(StandardCharsets.UTF_8);
+        return raw;
+    }
+
+    @Test
+    void batchTouchFramesCarryTheTtlAndTheGetFlag() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                List<String> keys = List.of("a", "bb");
+                client.touchMany(keys, 30);
+                client.touchMany(keys, NanocachedClient.REMOVE_TTL);
+                client.getManyAndTouch(keys, 45);
+                client.getManyAndTouchBytes(keys, NanocachedClient.REMOVE_TTL);
+                client.namespace("tenant").touchMany(keys, 7);
+                assertEquals(
+                        List.of(new MockNode.MultiTouchFrame("", keys, 30L, false),
+                                new MockNode.MultiTouchFrame("", keys, null, false),
+                                new MockNode.MultiTouchFrame("", keys, 45L, true),
+                                new MockNode.MultiTouchFrame("", keys, null, true),
+                                new MockNode.MultiTouchFrame("tenant", keys, 7L, false)),
+                        node.multiTouchFrames);
+            }
+        }
+    }
+
+    @Test
+    void touchManyReportsEachKeyAndNeverCreatesOne() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("a", "1", 100);
+                client.set("b", "2", 100);
+
+                Map<String, Boolean> touched = client.touchMany(List.of("a", "missing", "b"), 30);
+                assertEquals(Map.of("a", true, "missing", false, "b", true), touched);
+                assertEquals(Long.valueOf(30), node.ttls.get("a"));
+                assertEquals(Long.valueOf(30), node.ttls.get("b"));
+                assertFalse(node.store.containsKey("missing"));
+
+                client.touchMany(List.of("a"), NanocachedClient.REMOVE_TTL);
+                assertNull(node.ttls.get("a"));
+
+                // 0 expires at once — the opposite of set(), where 0 means no expiry.
+                assertEquals(Map.of("a", true, "b", true), client.touchMany(List.of("a", "b"), 0));
+                assertEquals(Optional.empty(), client.get("a"));
+                assertEquals(Optional.empty(), client.get("b"));
+            }
+        }
+    }
+
+    @Test
+    void getManyAndTouchReturnsTheHitsAndSetsTheTtl() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("a", "one", 100);
+                client.set("b", "two", 100);
+
+                assertEquals(Map.of("a", "one", "b", "two"),
+                        client.getManyAndTouch(List.of("a", "missing", "b"), 30));
+                assertEquals(Long.valueOf(30), node.ttls.get("a"));
+                assertFalse(node.store.containsKey("missing"));
+
+                Map<String, byte[]> raw = client.getManyAndTouchBytes(List.of("a", "missing"), 40);
+                assertEquals(Set.of("a"), raw.keySet());
+                assertArrayEquals("one".getBytes(StandardCharsets.UTF_8), raw.get("a"));
+                assertEquals(Long.valueOf(40), node.ttls.get("a"));
+
+                byte[][] positional = client.getManyAndTouchBytes(utf8Keys("b", "missing", "a"), 50);
+                assertArrayEquals("two".getBytes(StandardCharsets.UTF_8), positional[0]);
+                assertNull(positional[1]);
+                assertArrayEquals("one".getBytes(StandardCharsets.UTF_8), positional[2]);
+
+                boolean[] touched = client.touchMany(utf8Keys("b", "missing", "a"), 60);
+                assertArrayEquals(new boolean[] {true, false, true}, touched);
+            }
+        }
+    }
+
+    @Test
+    void batchTouchCollapsesDuplicateKeys() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("a", "one", 100);
+                client.set("b", "two", 100);
+
+                assertEquals(Map.of("a", true, "b", true), client.touchMany(List.of("a", "b", "a"), 30));
+                byte[][] values = client.getManyAndTouchBytes(utf8Keys("a", "b", "a", "missing", "missing"), 30);
+                assertArrayEquals("one".getBytes(StandardCharsets.UTF_8), values[0]);
+                assertArrayEquals("two".getBytes(StandardCharsets.UTF_8), values[1]);
+                assertArrayEquals("one".getBytes(StandardCharsets.UTF_8), values[2]);
+                assertNull(values[3]);
+                assertNull(values[4]);
+                assertArrayEquals(new boolean[] {true, true, true},
+                        client.touchMany(utf8Keys("a", "b", "a"), 30));
+
+                for (MockNode.MultiTouchFrame frame : node.multiTouchFrames) {
+                    assertEquals(frame.get() ? 3 : 2, frame.keys().size(), "duplicates are sent once: " + frame);
+                }
+            }
+        }
+    }
+
+    @Test
+    void batchTouchIsScopedToItsNamespace() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedClient.Namespace tenant = client.namespace("tenant");
+                tenant.set("k", "in-tenant", 100);
+                client.set("k", "in-default", 100);
+
+                assertEquals(Map.of("k", true, "only-default", false), tenant.touchMany(List.of("k", "only-default"), 5));
+                assertEquals(Map.of("k", "in-tenant"), tenant.getManyAndTouch(List.of("k", "only-default"), 6));
+                assertArrayEquals("in-tenant".getBytes(StandardCharsets.UTF_8),
+                        tenant.getManyAndTouchBytes(List.of("k"), 7).get("k"));
+                assertArrayEquals(new boolean[] {true}, tenant.touchMany(utf8Keys("k"), 8));
+                assertArrayEquals("in-tenant".getBytes(StandardCharsets.UTF_8),
+                        tenant.getManyAndTouchBytes(utf8Keys("k"), 9)[0]);
+
+                assertEquals(Long.valueOf(9), node.namespacedTtls.get("tenant").get("k"));
+                assertEquals(Long.valueOf(100), node.ttls.get("k"), "the default keyspace was not touched");
+            }
+        }
+    }
+
+    @Test
+    void getManyAndTouchDecompressesWhenCompressionIsEnabled() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", node.port()).compress(true))) {
+                String value = "compressible ".repeat(200);
+                client.set("k", value);
+                assertEquals(Map.of("k", value), client.getManyAndTouch(List.of("k"), 30));
+            }
+        }
+    }
+
+    @Test
+    void batchTouchRejectsBadArgumentsBeforeAnyIo() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                List<String> keys = List.of("k");
+                assertThrows(IllegalArgumentException.class, () -> client.touchMany(keys, -2));
+                assertThrows(IllegalArgumentException.class, () -> client.getManyAndTouch(keys, -2));
+                assertThrows(IllegalArgumentException.class, () -> client.getManyAndTouchBytes(utf8Keys("k"), -2));
+                assertThrows(IllegalArgumentException.class, () -> client.touchMany(List.of(), 30));
+                assertThrows(IllegalArgumentException.class, () -> client.getManyAndTouch(List.of(), 30));
+                assertThrows(IllegalArgumentException.class, () -> client.touchMany(new byte[0][], 30));
+                assertTrue(node.multiTouchFrames.isEmpty());
+            }
+        }
+    }
+
+    @Test
+    void batchTouchSplitsAtTheKeyLimit() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                List<String> keys = new ArrayList<>();
+                for (int i = 0; i < 401; i++) keys.add("k" + i);
+                client.set("k0", "first");
+                client.set("k400", "last");
+
+                Map<String, Boolean> touched = client.touchMany(keys, 30);
+                assertEquals(401, touched.size());
+                assertTrue(touched.get("k0"));
+                assertTrue(touched.get("k400"));
+                assertFalse(touched.get("k1"));
+                assertEquals(List.of(400, 1),
+                        node.multiTouchFrames.stream().map(frame -> frame.keys().size()).toList());
+
+                node.multiTouchFrames.clear();
+                assertEquals(Map.of("k0", "first", "k400", "last"), client.getManyAndTouch(keys, 30));
+                assertEquals(List.of(400, 1),
+                        node.multiTouchFrames.stream().map(frame -> frame.keys().size()).toList());
+            }
+        }
+    }
+
+    @Test
+    void batchTouchWorksOnATaggedConnection() throws Exception {
+        try (MockNode node = MockNode.withTagSupport()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v", 100);
+                assertEquals(Map.of("k", true, "missing", false), client.touchMany(List.of("k", "missing"), 30));
+                assertEquals(Map.of("k", "v"), client.getManyAndTouch(List.of("k", "missing"), 40));
+                assertEquals(Long.valueOf(40), node.ttls.get("k"));
+                assertEquals(2, node.multiTouchFrames.size());
+            }
+        }
+    }
+
+    @Test
+    void batchTouchAgainstAnOldServerIsServerTooOldAndTheClientStaysUsable() throws Exception {
+        for (boolean predatesTouchToo : new boolean[] {false, true}) {
+            try (MockNode node = new MockNode()) {
+                try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                    client.set("k", "v");
+                    if (predatesTouchToo) node.rejectTouchLikeAnOldServer();
+                    else node.rejectMultiTouchLikeAnOldServer();
+
+                    NanocachedException.ServerTooOld failure = assertThrows(
+                            NanocachedException.ServerTooOld.class, () -> client.touchMany(List.of("k"), 30));
+                    assertEquals("y", failure.command());
+                    assertEquals("y", assertThrows(NanocachedException.ServerTooOld.class,
+                            () -> client.getManyAndTouch(List.of("k"), 30)).command());
+                    assertEquals(Optional.of("v"), client.get("k"));
+                    // The single-key touch keeps the `t` wording it always had.
+                    if (!predatesTouchToo) {
+                        assertTrue(client.touch("k", 30));
+                    } else {
+                        assertEquals("t", assertThrows(NanocachedException.ServerTooOld.class,
+                                () -> client.touch("k", 30)).command());
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void batchTouchKeepsEarlierChunksWhenALaterChunkFails() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                byte[][] keys = new byte[401][];
+                for (int i = 0; i < keys.length; i++) keys[i] = ("k" + i).getBytes(StandardCharsets.UTF_8);
+                byte[] first = "first-chunk-value".getBytes(StandardCharsets.UTF_8);
+                client.set(keys[0], first);
+
+                node.failMultiTouchAfter(1);
+                NanocachedException.PartialConnectionFailedRaw failure = assertThrows(
+                        NanocachedException.PartialConnectionFailedRaw.class,
+                        () -> client.getManyAndTouchBytes(keys, 30));
+                assertEquals(keys.length, failure.partialValues.length);
+                assertArrayEquals(first, failure.partialValues[0]);
+                assertArrayEquals(new int[] {400}, failure.unresolvedIndices);
+
+                // touchMany carries no partial result: the whole batch is idempotent, send it again.
+                NanocachedException.ConnectionFailed bare = assertThrows(
+                        NanocachedException.ConnectionFailed.class, () -> client.touchMany(keys, 30));
+                assertFalse(bare instanceof NanocachedException.PartialConnectionFailedRaw);
+            }
+        }
+    }
+
+    @Test
+    void batchTouchEndsOnAWholeFrameWrongNodeOnASingleNode() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v", 100);
+                node.answerWrongNodeOnce();
+                assertThrows(NanocachedException.WrongNode.class, () -> client.touchMany(List.of("k"), 30));
+
+                node.answerWrongNodeOnce();
+                NanocachedException.PartialWrongNodeStrings failure = assertThrows(
+                        NanocachedException.PartialWrongNodeStrings.class,
+                        () -> client.getManyAndTouch(List.of("k"), 30));
+                assertTrue(failure.partialValues.isEmpty());
+                assertEquals(Long.valueOf(100), node.ttls.get("k"), "a wrong-node answer touches nothing");
+            }
+        }
+    }
+
+    @Test
+    void aBatchTouchReplyWithTheWrongEntryCountIsNeverTrusted() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("a", "1", 100);
+                client.set("b", "2", 100);
+                client.set("c", "3", 100);
+                List<String> keys = List.of("a", "b", "c");
+
+                // The connection is dropped as desynced and the idempotent
+                // request is sent again on a fresh one, so the caller sees
+                // the right answer rather than a shifted one.
+                node.answerMultiTouchWithEntryCountOnce(1);
+                assertEquals(Map.of("a", true, "b", true, "c", true), client.touchMany(keys, 30));
+                assertEquals(2, node.multiTouchFrames.size());
+
+                node.multiTouchFrames.clear();
+                node.answerMultiTouchWithEntryCountOnce(2);
+                assertEquals(Map.of("a", "1", "b", "2", "c", "3"), client.getManyAndTouch(keys, 31));
+                assertEquals(2, node.multiTouchFrames.size());
+            }
+        }
+    }
+
+    @Test
+    void batchTouchGoesToEveryOwnerAndGoesToThePrimaryInTheGetForm() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                MockNode nodeB = cluster.nodes().get(NAMES.get(1));
+                List<String> primaryA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                List<String> primaryB = keysWhosePrimaryIs(NAMES.get(1), 3);
+                List<String> all = concat(primaryA, primaryB);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : all) values.put(key, "value of " + key);
+                client.setMany(values);
+
+                assertEquals(Map.of(primaryA.get(0), true, primaryB.get(0), true),
+                        client.touchMany(List.of(primaryA.get(0), primaryB.get(0)), 30));
+                for (MockNode node : List.of(nodeA, nodeB)) {
+                    assertEquals(1, node.multiTouchFrames.size(), "one plain frame per node");
+                    assertFalse(node.multiTouchFrames.get(0).get());
+                    assertEquals(2, node.multiTouchFrames.get(0).keys().size());
+                }
+                nodeA.multiTouchFrames.clear();
+                nodeB.multiTouchFrames.clear();
+
+                assertEquals(values, client.getManyAndTouch(all, 40));
+                // A node is the primary of some keys and a replica of the
+                // others, so it gets the G frame for the first and a plain
+                // one for the second.
+                assertEquals(2, nodeA.multiTouchFrames.size());
+                assertEquals(2, nodeB.multiTouchFrames.size());
+                assertEquals(primaryA.stream().map(k -> MockNode.keyOf(k.getBytes(StandardCharsets.UTF_8))).toList(),
+                        framesWithGet(nodeA, true).get(0).keys());
+                assertEquals(primaryB.stream().map(k -> MockNode.keyOf(k.getBytes(StandardCharsets.UTF_8))).toList(),
+                        framesWithGet(nodeA, false).get(0).keys());
+                assertEquals(primaryB, framesWithGet(nodeB, true).get(0).keys());
+                assertEquals(primaryA, framesWithGet(nodeB, false).get(0).keys());
+                for (String key : all) {
+                    assertEquals(Long.valueOf(40), nodeA.ttls.get(key));
+                    assertEquals(Long.valueOf(40), nodeB.ttls.get(key));
+                }
+            }
+        }
+    }
+
+    @Test
+    void getManyAndTouchDoesNotFallBackToAReplicaOnAPrimaryMiss() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode primary = cluster.nodes().get(NAMES.get(0));
+                MockNode replica = cluster.nodes().get(NAMES.get(1));
+                String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                // Only the replica holds the value.
+                replica.store.put(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8)), new byte[] {'v'});
+
+                assertEquals(Map.of(), client.getManyAndTouch(List.of(key), 30));
+
+                assertEquals(1, framesWithGet(primary, true).size());
+                assertEquals(0, framesWithGet(replica, true).size(), "the replica is never asked for the value");
+                assertEquals(1, framesWithGet(replica, false).size());
+            }
+        }
+    }
+
+    @Test
+    void batchTouchRecoversFromAWrongNodeAnswer() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                List<String> all = concat(keysWhosePrimaryIs(NAMES.get(0), 3), keysWhosePrimaryIs(NAMES.get(1), 3));
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : all) values.put(key, "value of " + key);
+                client.setMany(values);
+
+                nodeA.answerWrongNodeOnce();
+                Map<String, Boolean> touched = client.touchMany(all, 30);
+                assertEquals(6, touched.size());
+                assertTrue(touched.values().stream().allMatch(t -> t));
+                assertEquals(2, nodeA.multiTouchFrames.size(), "the keys A answered W for were sent again");
+
+                nodeA.answerWrongNodeOnce();
+                assertEquals(values, client.getManyAndTouch(all, 31));
+            }
+        }
+    }
+
+    @Test
+    void batchTouchStillWrongNodeAfterTheRetryThrowsWhatDidResolve() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                List<String> primaryA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                List<String> primaryB = keysWhosePrimaryIs(NAMES.get(1), 3);
+                List<String> all = concat(primaryA, primaryB);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : all) values.put(key, "value of " + key);
+                client.setMany(values);
+
+                for (int i = 0; i < 8; i++) nodeA.answerWrongNodeOnce();
+                NanocachedException.WrongNode failure =
+                        assertThrows(NanocachedException.WrongNode.class, () -> client.touchMany(all, 30));
+                assertFalse(failure instanceof NanocachedException.PartialWrongNodeStrings);
+
+                NanocachedException.PartialWrongNodeStrings partial = assertThrows(
+                        NanocachedException.PartialWrongNodeStrings.class, () -> client.getManyAndTouch(all, 31));
+                Map<String, String> resolved = new java.util.LinkedHashMap<>();
+                for (String key : primaryB) resolved.put(key, values.get(key));
+                assertEquals(resolved, partial.partialValues);
+            }
+        }
+    }
+
+    @Test
+    void aBatchTouchWhoseReplyWasLostIsSentAgain() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 3);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : keys) values.put(key, "value of " + key);
+                client.setMany(values);
+
+                nodeA.dropReplyAfterNextTouch();
+                Map<String, Boolean> touched = client.touchMany(keys, 30);
+                assertTrue(touched.values().stream().allMatch(t -> t));
+                assertEquals(2, nodeA.multiTouchFrames.size());
+            }
+        }
+    }
+
+    @Test
+    void aReplicaThatPredatesBatchTouchIsCountedPerKeyAndDoesNotFailThePrimarysAnswer() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode primary = cluster.nodes().get(NAMES.get(0));
+                MockNode replica = cluster.nodes().get(NAMES.get(1));
+                List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 3);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : keys) values.put(key, "value of " + key);
+                client.setMany(values);
+                replica.rejectMultiTouchLikeAnOldServer();
+                long before = client.stats().replicaWriteFailures();
+
+                assertTrue(client.touchMany(keys, 30).values().stream().allMatch(t -> t));
+                assertEquals(before + 3, client.stats().replicaWriteFailures());
+                assertEquals(values, client.getManyAndTouch(keys, 40));
+                assertEquals(before + 6, client.stats().replicaWriteFailures());
+                for (String key : keys) {
+                    assertEquals(Long.valueOf(40), primary.ttls.get(key));
+                }
+            }
+        }
+    }
+
+    @Test
+    void aPrimaryThatPredatesBatchTouchIsServerTooOldNotAConnectionFailure() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 2);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : keys) values.put(key, "value of " + key);
+                client.setMany(values);
+                cluster.nodes().get(NAMES.get(0)).rejectMultiTouchLikeAnOldServer();
+
+                assertEquals("y", assertThrows(NanocachedException.ServerTooOld.class,
+                        () -> client.touchMany(keys, 30)).command());
+                assertEquals("y", assertThrows(NanocachedException.ServerTooOld.class,
+                        () -> client.getManyAndTouch(keys, 30)).command());
+            }
+        }
+    }
+
+    @Test
+    void batchTouchReportsAnUnreachablePrimaryAsAConnectionFailureNotWrongNode() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String dead = NAMES.get(0);
+                List<String> deadKeys = keysWhosePrimaryIs(dead, 3);
+                List<String> liveKeys = keysWhosePrimaryIs(NAMES.get(1), 3);
+                List<String> all = concat(deadKeys, liveKeys);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : all) values.put(key, "value of " + key);
+                client.setMany(values);
+                cluster.nodes().get(dead).close();
+                Thread.sleep(50); // let the FIN land
+
+                NanocachedException touchFailure = assertThrows(
+                        NanocachedException.ConnectionFailed.class, () -> client.touchMany(all, 30));
+                assertFalse(touchFailure instanceof NanocachedException.WrongNode);
+
+                NanocachedException.PartialConnectionFailedStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionFailedStrings.class,
+                        () -> client.getManyAndTouch(all, 30));
+                Map<String, String> live = new java.util.LinkedHashMap<>();
+                for (String key : liveKeys) live.put(key, values.get(key));
+                assertEquals(live, failure.partialValues);
+                assertTrue(failure.getCause() instanceof NanocachedException.ConnectionFailed,
+                        "cause = " + failure.getCause());
+            }
+        }
+    }
+
+    @Test
+    void batchTouchGoesToTheOwnersOfANamespacedKey() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                NanocachedClient.Namespace tenant = client.namespace("tenant");
+                List<String> keys = List.of("a", "b", "c", "d", "e", "f");
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : keys) values.put(key, "value of " + key);
+                tenant.setMany(values);
+
+                assertEquals(values, tenant.getManyAndTouch(keys, 30));
+                assertTrue(tenant.touchMany(keys, 31).values().stream().allMatch(t -> t));
+                for (MockNode node : cluster.nodes().values()) {
+                    for (MockNode.MultiTouchFrame frame : node.multiTouchFrames) {
+                        assertEquals("tenant", frame.namespace());
+                    }
+                    for (String key : keys) {
+                        assertEquals(Long.valueOf(31), node.namespacedTtls.get("tenant").get(key));
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void batchTouchReachesAFireAndForgetReplicaInTheBackground() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+                MockNode replica = cluster.nodes().get(NAMES.get(1));
+                List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 3);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : keys) values.put(key, "value of " + key);
+                client.setMany(values);
+
+                assertTrue(client.touchMany(keys, 30).values().stream().allMatch(t -> t));
+                waitFor(() -> !replica.multiTouchFrames.isEmpty(), "the background touch to reach the replica");
+                for (String key : keys) {
+                    waitFor(() -> Long.valueOf(30).equals(replica.ttls.get(key)), "the replica's TTL");
+                }
+            }
+        }
+    }
+
     // ── Compare-and-set (issue #141) ───────────────────────────────
 
     // The pinned cross-language digest vector (docs/protocol.html#cas):

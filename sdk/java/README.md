@@ -352,6 +352,47 @@ Against a node older than the release that added the command, both throw
 `NanocachedException.ServerTooOld`: such a node answers `En` and closes the
 connection. Upgrade every node before using them.
 
+### Many keys at once (touchMany / getManyAndTouch)
+
+`touchMany` and `getManyAndTouch` (`getManyAndTouchBytes` is the raw
+companion) are the same two operations for a list of keys, in one round trip
+per involved node instead of one per key:
+
+```java
+client.setMany(Map.of("a", "1", "b", "2"), 60);
+client.touchMany(List.of("a", "b", "missing"), 300);
+// {a=true, b=true, missing=false} — a touch never creates a key
+client.getManyAndTouch(List.of("a", "b", "missing"), 300);
+// {a=1, b=2} — a miss is absent, as in getMany
+```
+
+The TTL is one value for the whole batch and means what it means for `touch`:
+`REMOVE_TTL` removes it, `0` expires the keys at once. A key given twice is
+touched once, and a batch of more than 400 keys is split into several
+frames, as for `getMany`. The `byte[][]` forms (`touchMany(byte[][], long)`
+returns a `boolean[]`, `getManyAndTouchBytes(byte[][], long)` a `byte[][]`
+with `null` for a miss) are positional, like `getManyBytes(byte[][])`.
+`client.namespace(ns)` handles have all of them.
+
+Like `touch` it goes to every owner of each key and the primary's answer
+decides. `getManyAndTouch` asks only a key's primary for the value, so a node
+that is the primary of some keys in the batch and a replica of others
+receives two frames, one with `G` and one without. A replica's failure is
+counted in `stats().replicaWriteFailures()` (once per key) and never fails
+the batch. A value that did not fit in the node's reply (16 MiB per frame) is
+left untouched and reads as a miss.
+
+Failures follow `getMany`: `getManyAndTouch` throws
+`PartialWrongNodeStrings` (keys whose primary still answers a wrong-node
+after one refresh and retry) or `PartialConnectionFailedStrings` (a primary
+that cannot be reached on both passes), each carrying the keys that did
+resolve; the raw and positional forms throw the matching `PartialWrongNode`,
+`PartialConnectionFailed` and `...Raw` classes. A primary being down never
+reads as a wrong-node. `touchMany` carries no partial result: it throws a
+plain `WrongNode` or the connection failure, and since a touch is idempotent
+the whole batch can simply be sent again. Against a node that has `t` but not
+`y` both throw `ServerTooOld` (`command()` is `"y"`).
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to

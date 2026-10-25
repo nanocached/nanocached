@@ -24,6 +24,19 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
   the primary for the value). Against a node that predates the command
   they throw the new `NanocachedException.ServerTooOld`. Needs a server
   release that includes the `t` command.
+- `touchMany(keys, ttlSeconds)` and `getManyAndTouch(keys, ttlSeconds)`
+  (with `getManyAndTouchBytes`, positional `byte[][]` forms of all three,
+  and all of them on `Namespace`) are `touch`/`getAndTouch` for a list of
+  keys, in one round trip per involved node. `touchMany` returns a map of
+  key to whether it existed; `getManyAndTouch` returns the hits, as
+  `getMany` does. One TTL for the whole batch, with the meaning and no
+  default of `touch`. Every owner is sent the batch; only a key's primary is
+  asked for the value, so a node that is primary for some keys and a replica
+  for others receives two frames. `getManyAndTouch` fails like `getMany`
+  (partial results attached); `touchMany` throws a plain `WrongNode` or the
+  connection failure. Needs a server release that includes the `y` command;
+  against a node that has `t` but not `y` they throw `ServerTooOld` whose
+  new `command()` is `"y"`.
 
 ## [0.4.8] - 2026-10-21
 

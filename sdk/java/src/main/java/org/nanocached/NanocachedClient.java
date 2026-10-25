@@ -1383,6 +1383,36 @@ public final class NanocachedClient implements AutoCloseable {
             return NanocachedClient.this.getManyBytes(namespace, keys);
         }
 
+        /** As {@link NanocachedClient#touchMany(List, long)}, scoped to
+         * {@link #namespace()} (issue #871). */
+        public Map<String, Boolean> touchMany(List<String> keys, long ttlSeconds) {
+            return NanocachedClient.this.touchMany(namespace, keys, ttlSeconds);
+        }
+
+        /** As {@link NanocachedClient#touchMany(byte[][], long)}, scoped
+         * to {@link #namespace()} (issue #871). */
+        public boolean[] touchMany(byte[][] keys, long ttlSeconds) {
+            return NanocachedClient.this.touchMany(namespace, keys, ttlSeconds);
+        }
+
+        /** As {@link NanocachedClient#getManyAndTouch(List, long)}, scoped
+         * to {@link #namespace()} (issue #871). */
+        public Map<String, String> getManyAndTouch(List<String> keys, long ttlSeconds) {
+            return NanocachedClient.this.getManyAndTouchDecoded(namespace, keys, ttlSeconds);
+        }
+
+        /** As {@link NanocachedClient#getManyAndTouchBytes(List, long)},
+         * scoped to {@link #namespace()} (issue #871). */
+        public Map<String, byte[]> getManyAndTouchBytes(List<String> keys, long ttlSeconds) {
+            return NanocachedClient.this.getManyAndTouchBytes(namespace, keys, ttlSeconds);
+        }
+
+        /** As {@link NanocachedClient#getManyAndTouchBytes(byte[][], long)},
+         * scoped to {@link #namespace()} (issue #871). */
+        public byte[][] getManyAndTouchBytes(byte[][] keys, long ttlSeconds) {
+            return NanocachedClient.this.getManyAndTouchBytes(namespace, keys, ttlSeconds);
+        }
+
         public void set(String key, String value) {
             set(key, value, 0L);
         }
@@ -2643,6 +2673,567 @@ public final class NanocachedClient implements AutoCloseable {
                             + ttlSeconds);
         }
         return ttlSeconds;
+    }
+
+    // ── Batched touch (issue #871) ───────────────────────────────────
+    // touchMany/getManyAndTouch are touch/getAndTouch for N keys in one
+    // `y` sub-frame per involved node (docs/protocol.html "y — batched
+    // touch"), chunked like getMany/setMany. A touch is idempotent and not
+    // primary-only, so every owner of a key is sent it, as for setMany, and
+    // only the primary's answer decides the key's outcome. `G` belongs to
+    // the whole frame, so a node that is primary for some keys of a
+    // getManyAndTouch batch and a replica for others gets two frames: the G
+    // form for the first, the plain form for the second (setMany's "exactly
+    // one sub-frame per node" does not hold). A key that appears more than
+    // once is touched once.
+
+    /**
+     * Batched {@link #touch(String, long)} (issue #871): replaces the TTL of
+     * every existing key in {@code keys} in place, one round trip per
+     * involved node instead of one per key. {@code keys} must be non-empty.
+     * The result maps each key to whether it existed: {@code true}, or
+     * {@code false} for a missing or expired key, which a touch never
+     * creates. {@code ttlSeconds} is one TTL for the whole batch and means
+     * what it means for {@link #touch(String, long)}: {@link #REMOVE_TTL}
+     * removes it, {@code 0} expires the keys at once, any other negative
+     * value is rejected before any I/O with {@link
+     * IllegalArgumentException}.
+     *
+     * <p>Like {@code touch} it is idempotent, so a request whose reply was
+     * lost is retried, and in a cluster it goes to every owner of a key,
+     * the primary's answer being the key's. A replica's failure or {@code
+     * W} is counted in {@link ClientStats#replicaWriteFailures()} and never
+     * fails the batch. Larger batches are transparently split into more
+     * than one {@code y} sub-frame per node (see {@link #MAX_BATCH_KEYS}).
+     * If some keys' primaries are still wrong-node after one bounded
+     * refresh-and-retry this throws a plain {@link
+     * NanocachedException.WrongNode}, and a key whose primary could not be
+     * reached on both passes throws that connection failure — every other
+     * key was still touched, and since a touch is idempotent the whole
+     * batch may simply be sent again, so nothing partial is attached.
+     *
+     * @throws NanocachedException.ServerTooOld against a node that
+     *         predates the command
+     */
+    public Map<String, Boolean> touchMany(List<String> keys, long ttlSeconds) {
+        return touchMany(EMPTY_NAMESPACE, keys, ttlSeconds);
+    }
+
+    /** The namespaced counterpart of {@link #touchMany(List, long)} (issue
+     * #871) — see {@link #namespace}. */
+    Map<String, Boolean> touchMany(byte[] namespace, List<String> keys, long ttlSeconds) {
+        if (keys.isEmpty()) {
+            throw new IllegalArgumentException("nanocached: touchMany requires at least one key");
+        }
+        byte[][] keyBytes = new byte[keys.size()][];
+        for (int i = 0; i < keys.size(); i++) {
+            keyBytes[i] = utf8(keys.get(i), "key");
+        }
+        boolean[] touched = touchMany(namespace, keyBytes, ttlSeconds);
+        Map<String, Boolean> result = new LinkedHashMap<>(keys.size());
+        for (int i = 0; i < keys.size(); i++) {
+            result.put(keys.get(i), touched[i]);
+        }
+        return result;
+    }
+
+    /** The {@code byte[]}-keyed counterpart of {@link #touchMany(List,
+     * long)}, for callers whose keys are not UTF-8 text. The result is
+     * positional: {@code result[i]} is whether {@code keys[i]} existed.
+     * Same batch semantics as the {@code String}-keyed form. */
+    public boolean[] touchMany(byte[][] keys, long ttlSeconds) {
+        return touchMany(EMPTY_NAMESPACE, keys, ttlSeconds);
+    }
+
+    /** The namespaced, positional core every {@code touchMany} variant is
+     * built on — see {@link #touchMany(byte[][], long)}. */
+    boolean[] touchMany(byte[] namespace, byte[][] keys, long ttlSeconds) {
+        if (keys.length == 0) {
+            throw new IllegalArgumentException("nanocached: touchMany requires at least one key");
+        }
+        DistinctKeys distinct = DistinctKeys.of(keys);
+        MultiTouchOutcome outcome = multiTouch(namespace, distinct.keys, ttlSeconds, false);
+        if (!outcome.unresolved.isEmpty()) {
+            if (outcome.rejected) throw new NanocachedException.ServerTooOld("y", outcome.cause);
+            if (outcome.wrongNode) throw new NanocachedException.WrongNode();
+            throw outcome.cause != null
+                    ? outcome.cause
+                    : new NanocachedException.ConnectionFailed("nanocached: no owner is reachable for these keys", null);
+        }
+        boolean[] touched = new boolean[keys.length];
+        for (int i = 0; i < keys.length; i++) {
+            touched[i] = outcome.answers[distinct.positionOf[i]].ok();
+        }
+        return touched;
+    }
+
+    /**
+     * Batched {@link #getAndTouch(String, long)} (issue #871): reads the
+     * values of {@code keys} and replaces their TTL in one step, one round
+     * trip per involved node. {@code keys} must be non-empty. A miss is
+     * absent from the result, creates nothing and is not an error. See
+     * {@link #touchMany(List, long)} for {@code ttlSeconds}. Decoded as
+     * strict UTF-8, like {@link #get(String)}.
+     *
+     * <p>A read that writes, as {@code getAndTouch} is: each key goes to
+     * its primary in the {@code G} form, with no hedging and no fallback to
+     * a replica on a miss, and its other owners are sent the plain touch,
+     * so a replica is never the only owner touched. It counts as a read on
+     * the primary, which makes the entries the most recently used. A value
+     * the node had no room for in its reply (16 MiB per frame) is left out
+     * and left untouched, so it reads as a miss here.
+     *
+     * <p>Failures follow {@link #getMany(List)}: keys still wrong-node after
+     * one bounded refresh-and-retry throw {@link
+     * NanocachedException.PartialWrongNodeStrings}, and keys whose primary
+     * was unreachable on both passes throw {@link
+     * NanocachedException.PartialConnectionFailedStrings} (the bare
+     * connection failure when nothing resolved), each carrying the keys
+     * that did resolve. Unlike {@code getMany} a key is not tried on its
+     * next owner when its primary is down — a replica's answer would leave
+     * the primary untouched.
+     *
+     * @throws UncheckedIOException if a stored value is not valid UTF-8
+     * @throws NanocachedException.ServerTooOld against a node that
+     *         predates the command
+     */
+    public Map<String, String> getManyAndTouch(List<String> keys, long ttlSeconds) {
+        return getManyAndTouchDecoded(EMPTY_NAMESPACE, keys, ttlSeconds);
+    }
+
+    /** Shared by {@link #getManyAndTouch(List, long)} and {@link
+     * Namespace#getManyAndTouch}: as {@link #getManyDecoded}, for the
+     * touching read. */
+    private Map<String, String> getManyAndTouchDecoded(byte[] namespace, List<String> keys, long ttlSeconds) {
+        try {
+            return decodeMany(getManyAndTouchBytes(namespace, keys, ttlSeconds));
+        } catch (NanocachedException.PartialWrongNode partial) {
+            throw new NanocachedException.PartialWrongNodeStrings(decodeMany(partial.partialValues));
+        } catch (NanocachedException.PartialConnectionFailed partial) {
+            throw new NanocachedException.PartialConnectionFailedStrings(
+                    partial.getMessage(), partial.getCause(), decodeMany(partial.partialValues));
+        }
+    }
+
+    /** The raw-bytes companion to {@link #getManyAndTouch(List, long)}: no
+     * decoding. Transparently decompresses when {@code compress} is
+     * enabled. Failures are {@link NanocachedException.PartialWrongNode}
+     * and {@link NanocachedException.PartialConnectionFailed}, as for
+     * {@link #getManyBytes(List)}. */
+    public Map<String, byte[]> getManyAndTouchBytes(List<String> keys, long ttlSeconds) {
+        return getManyAndTouchBytes(EMPTY_NAMESPACE, keys, ttlSeconds);
+    }
+
+    /** The namespaced counterpart of {@link #getManyAndTouchBytes(List,
+     * long)} (issue #871) — see {@link #namespace}. */
+    Map<String, byte[]> getManyAndTouchBytes(byte[] namespace, List<String> keys, long ttlSeconds) {
+        if (keys.isEmpty()) {
+            throw new IllegalArgumentException("nanocached: getManyAndTouch/getManyAndTouchBytes requires at least one key");
+        }
+        byte[][] keyBytes = new byte[keys.size()][];
+        for (int i = 0; i < keys.size(); i++) {
+            keyBytes[i] = utf8(keys.get(i), "key");
+        }
+        try {
+            return spliceMany(keys, getManyAndTouchBytes(namespace, keyBytes, ttlSeconds));
+        } catch (NanocachedException.PartialWrongNodeRaw partial) {
+            throw new NanocachedException.PartialWrongNode(spliceMany(keys, partial.partialValues));
+        } catch (NanocachedException.PartialConnectionFailedRaw partial) {
+            throw new NanocachedException.PartialConnectionFailed(
+                    partial.getMessage(), partial.getCause(), spliceMany(keys, partial.partialValues));
+        }
+    }
+
+    /** The {@code byte[]}-keyed counterpart of {@link
+     * #getManyAndTouchBytes(List, long)}, for callers whose keys are not
+     * UTF-8 text. The result is positional: {@code result[i]} is {@code
+     * keys[i]}'s raw value, or {@code null} for a miss. The partial-failure
+     * exceptions are the positional {@link
+     * NanocachedException.PartialWrongNodeRaw} and {@link
+     * NanocachedException.PartialConnectionFailedRaw}, as for {@link
+     * #getManyBytes(byte[][])}, whose {@code unresolvedIndices} name the
+     * positions that did not resolve. */
+    public byte[][] getManyAndTouchBytes(byte[][] keys, long ttlSeconds) {
+        return getManyAndTouchBytes(EMPTY_NAMESPACE, keys, ttlSeconds);
+    }
+
+    /** The namespaced, positional core every {@code getManyAndTouch}
+     * variant is built on — see {@link #getManyAndTouchBytes(byte[][],
+     * long)}. A key that appears more than once is fetched and touched
+     * once, and every position of it gets the same result, as in {@link
+     * #getManyBytes(byte[], byte[][])}. */
+    byte[][] getManyAndTouchBytes(byte[] namespace, byte[][] keys, long ttlSeconds) {
+        if (keys.length == 0) {
+            throw new IllegalArgumentException("nanocached: getManyAndTouch/getManyAndTouchBytes requires at least one key");
+        }
+        DistinctKeys distinct = DistinctKeys.of(keys);
+        try {
+            byte[][] values = getManyAndTouchDistinct(namespace, distinct.keys, ttlSeconds);
+            return distinct.repeated ? expandPositions(values, distinct.positionOf) : values;
+        } catch (NanocachedException.PartialWrongNodeRaw partial) {
+            if (!distinct.repeated) throw partial;
+            throw new NanocachedException.PartialWrongNodeRaw(
+                    expandPositions(partial.partialValues, distinct.positionOf),
+                    expandIndices(partial.unresolvedIndices, distinct.positionOf));
+        } catch (NanocachedException.PartialConnectionFailedRaw partial) {
+            if (!distinct.repeated) throw partial;
+            throw new NanocachedException.PartialConnectionFailedRaw(
+                    partial.getMessage(), partial.getCause(),
+                    expandPositions(partial.partialValues, distinct.positionOf),
+                    expandIndices(partial.unresolvedIndices, distinct.positionOf));
+        }
+    }
+
+    /** {@link #getManyAndTouchBytes(byte[], byte[][], long)} over keys
+     * already known to be distinct. */
+    private byte[][] getManyAndTouchDistinct(byte[] namespace, byte[][] keys, long ttlSeconds) {
+        MultiTouchOutcome outcome = multiTouch(namespace, keys, ttlSeconds, true);
+        // One decompression budget for the whole response — see
+        // decompressForBatch.
+        long[] budget = {0};
+        byte[][] values = new byte[keys.length][];
+        boolean anyHit = false;
+        for (int i = 0; i < keys.length; i++) {
+            Connection.MultiEntry answer = outcome.answers[i];
+            if (answer != null && answer.ok()) {
+                values[i] = decompressForBatch(answer.value(), budget);
+                anyHit = true;
+            }
+        }
+        if (outcome.unresolved.isEmpty()) return values;
+        if (outcome.rejected) throw new NanocachedException.ServerTooOld("y", outcome.cause);
+        if (outcome.wrongNode) throw new NanocachedException.PartialWrongNodeRaw(values, outcome.unresolved);
+        // No primary answered `W` for these keys: each one's primary was
+        // unreachable on both passes. That is a connection loss, reported
+        // with whatever did resolve attached — or as the bare connection
+        // failure when nothing resolved, as getManyDistinct does.
+        NanocachedException cause = outcome.cause != null
+                ? outcome.cause
+                : new NanocachedException.ConnectionFailed("nanocached: no owner is reachable for these keys", null);
+        if (!anyHit) throw cause;
+        throw new NanocachedException.PartialConnectionFailedRaw(cause.getMessage(), cause, values, outcome.unresolved);
+    }
+
+    /** The distinct keys of a batch, and where each caller position's key
+     * sits among them. */
+    private static final class DistinctKeys {
+        final byte[][] keys;
+        final int[] positionOf;
+        final boolean repeated;
+
+        private DistinctKeys(byte[][] keys, int[] positionOf, boolean repeated) {
+            this.keys = keys;
+            this.positionOf = positionOf;
+            this.repeated = repeated;
+        }
+
+        static DistinctKeys of(byte[][] keys) {
+            Map<ByteBuffer, Integer> firstPosition = new LinkedHashMap<>(keys.length);
+            int[] positionOf = new int[keys.length];
+            for (int i = 0; i < keys.length; i++) {
+                Integer position = firstPosition.putIfAbsent(ByteBuffer.wrap(keys[i]), firstPosition.size());
+                positionOf[i] = position == null ? firstPosition.size() - 1 : position;
+            }
+            if (firstPosition.size() == keys.length) return new DistinctKeys(keys, positionOf, false);
+            byte[][] distinct = new byte[firstPosition.size()][];
+            for (int i = 0; i < keys.length; i++) {
+                distinct[positionOf[i]] = keys[i];
+            }
+            return new DistinctKeys(distinct, positionOf, true);
+        }
+    }
+
+    /** What one touchMany/getManyAndTouch call ended with, over its distinct
+     * keys: {@code answers[i]} is the primary's answer for key {@code i},
+     * {@code null} for an unresolved one; {@code unresolved} the positions
+     * (ascending) that never got one; {@code wrongNode} whether any of them
+     * last answered {@code W} rather than failing at the connection level;
+     * {@code cause} the last primary-leg connection failure; {@code
+     * rejected} whether a primary was a node that predates {@code y}. */
+    private static final class MultiTouchOutcome {
+        final Connection.MultiEntry[] answers;
+        final List<Integer> unresolved;
+        final boolean wrongNode;
+        final NanocachedException cause;
+        final boolean rejected;
+
+        MultiTouchOutcome(
+                Connection.MultiEntry[] answers, List<Integer> unresolved, boolean wrongNode,
+                NanocachedException cause, boolean rejected) {
+            this.answers = answers;
+            this.unresolved = unresolved;
+            this.wrongNode = wrongNode;
+            this.cause = cause;
+            this.rejected = rejected;
+        }
+    }
+
+    /** What the passes of one multiTouch call learn, shared by its legs
+     * (which run concurrently, so every member is thread-safe): {@code
+     * results} maps a position to its primary's answer; {@code wrongNode}
+     * holds the positions whose primary leg's latest outcome was a {@code
+     * W} rather than a connection failure. */
+    private static final class MultiTouchState {
+        final Map<Integer, Connection.MultiEntry> results = new ConcurrentHashMap<>();
+        final Set<Integer> wrongNode = ConcurrentHashMap.newKeySet();
+        final AtomicReference<NanocachedException> lastCause = new AtomicReference<>();
+        volatile boolean rejected;
+    }
+
+    /** One owner's keys, in one form, across one {@link #multiTouchPass}:
+     * with {@code get} a key's primary is in a {@code G} leg and every
+     * other owner in a plain one. */
+    private static final class TouchLeg {
+        final String owner;
+        final boolean get;
+        final List<Integer> indices = new ArrayList<>();
+        final List<Boolean> isPrimary = new ArrayList<>();
+
+        TouchLeg(String owner, boolean get) {
+            this.owner = owner;
+            this.get = get;
+        }
+    }
+
+    /** The shared body of touchMany ({@code get} false) and
+     * getManyAndTouch ({@code get} true) over distinct keys: validates,
+     * then sends the batch to every owner (see the section comment) and
+     * reports what resolved. Never throws a routing outcome — the callers
+     * turn {@link MultiTouchOutcome} into the exception their API
+     * promises. */
+    private MultiTouchOutcome multiTouch(byte[] namespace, byte[][] keys, long ttlSeconds, boolean get) {
+        Long wireTtl = touchWireTtl(ttlSeconds);
+        for (byte[] key : keys) {
+            validateKey(namespace, key);
+        }
+        beforeOperation();
+
+        boolean single;
+        synchronized (stateLock) {
+            single = ring == null;
+        }
+
+        Connection.MultiEntry[] answers = new Connection.MultiEntry[keys.length];
+        if (single) {
+            // Single/proxy mode: no ring to refresh against, so a `W` or a
+            // failure ends the batch as it is, as in getManyDistinct.
+            List<Connection.MultiEntry> entries;
+            NanocachedException failure = null;
+            try {
+                entries = multiTouchChunked(this::singleConnection, namespace, keys, wireTtl, get);
+            } catch (ChunkedConnectionFailure partial) {
+                entries = partial.partialEntries;
+                failure = partial.cause;
+            } catch (NanocachedException.ConnectionFailed bare) {
+                entries = Collections.nCopies(keys.length, null);
+                failure = bare;
+            }
+            List<Integer> unresolved = new ArrayList<>();
+            boolean wrongNode = false;
+            for (int i = 0; i < keys.length; i++) {
+                Connection.MultiEntry entry = entries.get(i);
+                if (entry == null) {
+                    unresolved.add(i);
+                } else if (entry.wrongNode()) {
+                    unresolved.add(i);
+                    wrongNode = true;
+                } else {
+                    answers[i] = entry;
+                }
+            }
+            return new MultiTouchOutcome(
+                    answers, unresolved, wrongNode && failure == null, failure,
+                    failure instanceof NanocachedException.ServerRejected);
+        }
+
+        MultiTouchState state = new MultiTouchState();
+        List<Integer> retry = multiTouchPass(namespace, keys, wireTtl, get, null, state);
+        if (!retry.isEmpty()) {
+            // One bounded refresh-and-retry over everything a primary left
+            // unresolved: a `W` is stale routing the refresh fixes, a
+            // primary that could not be reached gets a fresh view of who
+            // the owners are. A touch is idempotent, so the keys go to
+            // every owner of the fresh ring again.
+            maybeRefresh(true);
+            retry = multiTouchPass(namespace, keys, wireTtl, get, retry, state);
+        }
+        for (Map.Entry<Integer, Connection.MultiEntry> result : state.results.entrySet()) {
+            answers[result.getKey()] = result.getValue();
+        }
+        List<Integer> unresolved = new ArrayList<>(retry);
+        Collections.sort(unresolved);
+        boolean wrongNode = false;
+        for (int idx : unresolved) {
+            if (state.wrongNode.contains(idx)) {
+                wrongNode = true;
+                break;
+            }
+        }
+        return new MultiTouchOutcome(answers, unresolved, wrongNode, state.lastCause.get(), state.rejected);
+    }
+
+    /** {@link #multiGetChunked}'s twin for {@code y}: one or more
+     * sub-frames against whatever {@code connectionFor} resolves to,
+     * chunked like {@code m} (see {@link #multiGetChunkEnd}). {@code get}
+     * selects the {@code G} form. Throws {@link ChunkedConnectionFailure}
+     * when a chunk after the first fails (issue #411), and the plain
+     * connection failure when the first does — every caller must catch
+     * both. */
+    private List<Connection.MultiEntry> multiTouchChunked(
+            java.util.function.Supplier<Connection> connectionFor, byte[] namespace, byte[][] keys,
+            Long wireTtl, boolean get) {
+        List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
+        int start = 0;
+        while (start < keys.length) {
+            int end = multiGetChunkEnd(namespace.length, keys, start);
+            byte[][] chunk = Arrays.copyOfRange(keys, start, end);
+            List<Connection.MultiEntry> chunkEntries;
+            try {
+                chunkEntries = applyReconnecting(
+                        connectionFor,
+                        connection -> get
+                                ? connection.multiGetAndTouch(namespace, chunk, wireTtl)
+                                : connection.multiTouch(namespace, chunk, wireTtl));
+            } catch (NanocachedException.ConnectionFailed failure) {
+                if (start == 0) throw failure;
+                throw new ChunkedConnectionFailure(entries, failure);
+            }
+            for (int i = start; i < end; i++) {
+                entries.set(i, chunkEntries.get(i - start));
+            }
+            start = end;
+        }
+        return entries;
+    }
+
+    /** One pass of the cluster routing of {@link #multiTouch}: every key
+     * still needing resolution (every key when {@code retryIndices} is
+     * {@code null}, or just what the previous pass left unresolved) is
+     * sent to <b>every owner</b>, in one leg per (owner, form): with
+     * {@code get} a key's primary gets it in the {@code G} form and every
+     * other owner in the plain one, without it every owner gets the plain
+     * form, so a node holding some keys as primary and others as replica
+     * gets one frame in the second case and two in the first. Only the
+     * primary's answer is recorded in {@code state.results}; a replica's
+     * failure or {@code W} is counted in {@link #replicaWriteFailures}, as
+     * in {@link #runMultiSetLeg}. A leg that holds no key as primary is
+     * eligible for {@code fireAndForgetReplicas}, exactly like a
+     * single-key replica write.
+     *
+     * <p>Returns the positions whose primary answered {@code W} or could
+     * not be reached (a key with no owners at all counts as {@code W}: a
+     * refresh may populate the ring). {@code state} learns which of the
+     * two it was, and whether a primary was a node that predates {@code
+     * y}. */
+    private List<Integer> multiTouchPass(
+            byte[] namespace, byte[][] keyBytes, Long wireTtl, boolean get, List<Integer> retryIndices,
+            MultiTouchState state) {
+        List<Integer> indices = retryIndices;
+        if (indices == null) {
+            indices = new ArrayList<>(keyBytes.length);
+            for (int i = 0; i < keyBytes.length; i++) indices.add(i);
+        }
+
+        Map<String, TouchLeg> legs = new LinkedHashMap<>();
+        List<Integer> retry = Collections.synchronizedList(new ArrayList<>());
+        for (int idx : indices) {
+            List<String> names = ownerNames(namespace, keyBytes[idx]);
+            if (names.isEmpty()) {
+                state.wrongNode.add(idx);
+                retry.add(idx);
+                continue;
+            }
+            for (int rank = 0; rank < names.size(); rank++) {
+                boolean form = get && rank == 0;
+                String owner = names.get(rank);
+                TouchLeg leg = legs.computeIfAbsent((form ? "G" : "P") + owner, id -> new TouchLeg(owner, form));
+                leg.indices.add(idx);
+                leg.isPrimary.add(rank == 0);
+            }
+        }
+
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (TouchLeg leg : legs.values()) {
+            boolean pureReplica = !leg.isPrimary.contains(Boolean.TRUE);
+            // Fire-and-forget replica writes: mirrors multiSetPass's own
+            // branch, including its close()-race fallbacks. A pure-replica
+            // leg holds no primary key, so it has nothing to put in
+            // `retry`.
+            if (fireAndForgetReplicas && pureReplica && backgroundReplicaWritePermits.tryAcquire()) {
+                Runnable backgroundLeg = () -> runMultiTouchLeg(namespace, leg, keyBytes, wireTtl, retry, state);
+                try {
+                    CompletableFuture.runAsync(backgroundLeg, backgroundLegs)
+                            .whenComplete((ignoredResult, error) -> {
+                                backgroundReplicaWritePermits.release();
+                                reportBackgroundWriteBug(error);
+                            });
+                } catch (RejectedExecutionException rejected) {
+                    backgroundReplicaWritePermits.release();
+                    backgroundLeg.run();
+                }
+                continue;
+            }
+            futures.add(submitReplicaWrite(() -> runMultiTouchLeg(namespace, leg, keyBytes, wireTtl, retry, state)));
+        }
+
+        // Always drain every leg, even after one has already failed — see
+        // drainLegsKeepingFirstBug.
+        RuntimeException legBug = drainLegsKeepingFirstBug(futures);
+        if (legBug != null) throw legBug;
+        return retry;
+    }
+
+    /** Dispatches one {@link TouchLeg} (via {@link #multiTouchChunked}) and
+     * applies its result: only a primary-held position can end up in
+     * {@code retry}; every replica-held position's failure or {@code W} is
+     * counted in {@link #replicaWriteFailures} instead, mirroring {@link
+     * #applyLegOutcome}. A connection failure for the whole leg is treated
+     * the same way, position by position, since the same sub-frame can
+     * carry both primary- and replica-held keys; when a chunk after the
+     * first failed (issue #411) only the positions from it onward are
+     * unresolved. {@code retry} must already be a thread-safe list — this
+     * runs concurrently with every other leg. */
+    private void runMultiTouchLeg(
+            byte[] namespace, TouchLeg leg, byte[][] keyBytes, Long wireTtl, List<Integer> retry,
+            MultiTouchState state) {
+        byte[][] groupKeys = new byte[leg.indices.size()][];
+        for (int i = 0; i < leg.indices.size(); i++) {
+            groupKeys[i] = keyBytes[leg.indices.get(i)];
+        }
+
+        List<Connection.MultiEntry> entries;
+        NanocachedException failure = null;
+        try {
+            entries = multiTouchChunked(() -> memberConnection(leg.owner), namespace, groupKeys, wireTtl, leg.get);
+        } catch (ChunkedConnectionFailure partial) {
+            entries = partial.partialEntries;
+            failure = partial.cause;
+        } catch (NanocachedException connectionFailure) {
+            entries = Collections.nCopies(groupKeys.length, null);
+            failure = connectionFailure;
+        }
+        if (failure != null && leg.isPrimary.contains(Boolean.TRUE)) {
+            state.lastCause.set(failure);
+            if (failure instanceof NanocachedException.ServerRejected) state.rejected = true;
+        }
+
+        for (int i = 0; i < leg.indices.size(); i++) {
+            int idx = leg.indices.get(i);
+            Connection.MultiEntry entry = entries.get(i);
+            boolean answered = entry != null && !entry.wrongNode();
+            if (!leg.isPrimary.get(i)) {
+                if (!answered) replicaWriteFailures.incrementAndGet();
+            } else if (answered) {
+                state.results.put(idx, entry);
+            } else {
+                if (entry == null) {
+                    state.wrongNode.remove(idx);
+                } else {
+                    state.wrongNode.add(idx);
+                }
+                retry.add(idx);
+            }
+        }
     }
 
     /** The namespaced counterpart of {@link #delete(byte[])} (issue #105) —
