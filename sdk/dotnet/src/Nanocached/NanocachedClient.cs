@@ -1779,7 +1779,12 @@ public sealed class NanocachedClient : IDisposable
     /// a connection already known dead); a connection lost after it was
     /// sent throws <see cref="ConnectionLostException"/>, as Incr does, and
     /// the entry may or may not have expired. In a cluster it goes to every
-    /// owner, like a set, and the primary's answer is returned. Throws
+    /// owner, like a set, and the primary's answer is returned. With
+    /// <paramref name="ttlSeconds"/> 0 (issue #934) the other owners are sent
+    /// theirs only after the primary has answered, not alongside it, so a
+    /// primary that cannot be reached or answers <c>W</c> is rerouted while
+    /// the surviving owner still holds the entry; those legs therefore run
+    /// outside the pipelined-order guarantee, as the retry paths do. Throws
     /// <see cref="ServerTooOldException"/> against a node that predates the
     /// command.</para></summary>
     public Task<bool> TouchAsync(string key, long? ttlSeconds) => TouchAsync(EmptyNamespace, key, ttlSeconds);
@@ -1806,7 +1811,7 @@ public sealed class NanocachedClient : IDisposable
             return await WithClusterRetryAsync(
                 () => WriteAsync(
                     namespaceBytes, key, connection => connection.TouchAsync(namespaceBytes, key, ttlSeconds),
-                    replaySafe: replaySafe))
+                    replaySafe: replaySafe, primaryFirst: !replaySafe))
                 .ConfigureAwait(false);
         }
         catch (UnsafeToReplayException error)
@@ -1878,7 +1883,7 @@ public sealed class NanocachedClient : IDisposable
                 // A replica is sent the plain touch: it has no value to return,
                 // and `G` there would only move the value over the wire for nothing.
                 connection => connection.TouchAsync(namespaceBytes, key, ttlSeconds),
-                replaySafe))
+                replaySafe, primaryFirst: !replaySafe))
                 .ConfigureAwait(false);
         }
         catch (UnsafeToReplayException error)
@@ -1931,7 +1936,12 @@ public sealed class NanocachedClient : IDisposable
     /// other key was still touched, and since a touch is idempotent the
     /// whole batch may simply be sent again, so nothing partial is
     /// attached. Throws <see cref="ServerTooOldException"/> against a node
-    /// that predates the command.</para>
+    /// that predates the command. With <paramref name="ttlSeconds"/> 0
+    /// (issue #934) the sub-frames of the other owners are sent in one
+    /// fan-out after the primaries have answered, for the keys they
+    /// answered, so a primary that must be rerouted has expired nothing on
+    /// its replicas; that fan-out runs outside the pipelined-order
+    /// guarantee, as the retry paths do.</para>
     ///
     /// <para><b>With <paramref name="ttlSeconds"/> 0 the batch is not
     /// simply resendable (issue #938)</b>: the keys of the failure are the
@@ -2139,6 +2149,11 @@ public sealed class NanocachedClient : IDisposable
     private sealed class MultiTouchState
     {
         public readonly Dictionary<int, Connection.MultiEntry> Results = new();
+        /// <summary>issue #934: for a <c>ttl == 0</c> call, the owner whose
+        /// answer is in <see cref="Results"/> for each position — the node
+        /// the deferred replica fan-out must not send the touch to
+        /// again.</summary>
+        public readonly Dictionary<int, string> Answerer = new();
         public readonly HashSet<int> WrongNode = new();
         /// <summary>issue #901: positions a <c>ttl == 0</c> call must not
         /// resend — their primary leg failed after the frame may have been
@@ -2233,6 +2248,14 @@ public sealed class NanocachedClient : IDisposable
             retry = await MultiTouchPassAsync(namespaceBytes, keyBytes, ttlSeconds, get, retry, state)
                 .ConfigureAwait(false);
         }
+        // issue #934: with a TTL of 0 the two passes sent the primary's
+        // sub-frames only. Now that every primary has answered or been
+        // given up on, expire the copies on the other owners — once, on
+        // the ring in force now, for exactly the keys a primary answered.
+        if (ttlSeconds == 0)
+        {
+            await MultiTouchReplicaFanOutAsync(namespaceBytes, keyBytes, state).ConfigureAwait(false);
+        }
         lock (state)
         {
             foreach ((int idx, Connection.MultiEntry entry) in state.Results) answers[idx] = entry;
@@ -2244,6 +2267,48 @@ public sealed class NanocachedClient : IDisposable
                 answers, retry, state.Lost.Count == 0 && retry.Any(state.WrongNode.Contains), state.LastCause,
                 state.Rejected);
         }
+    }
+
+    /// <summary>issue #934 — the replica fan-out of a <c>ttl == 0</c>
+    /// batched touch, run after both primary-only passes: every key whose
+    /// primary answered (<c>S</c>/<c>V</c>, or <c>N</c> — an <c>N</c>
+    /// primary may still have a replica copy through fire-and-forget
+    /// replication, and the caller's intent is expire-everywhere) is sent
+    /// the plain touch on each of its other owners of the ring in force
+    /// now, grouped into one leg per owner. A key still <c>W</c>, lost or
+    /// rejected gets no replica leg: a reroute or the caller must still
+    /// find the value on the surviving owner. A replica's failure is
+    /// counted in <see cref="_replicaWriteFailures"/> and never fails the
+    /// batch.
+    ///
+    /// <para>These legs run after the primary answered, outside the
+    /// pipelined-order guarantee, the same class as the retry
+    /// paths.</para></summary>
+    private async Task MultiTouchReplicaFanOutAsync(
+        byte[] namespaceBytes, byte[][] keyBytes, MultiTouchState state)
+    {
+        var legs = new Dictionary<string, TouchLeg>();
+        int[] answered;
+        lock (state) answered = state.Results.Keys.OrderBy(idx => idx).ToArray();
+        foreach (int idx in answered)
+        {
+            string answerer;
+            lock (state) answerer = state.Answerer[idx];
+            foreach (string name in OwnerNames(namespaceBytes, keyBytes[idx]))
+            {
+                if (name == answerer) continue;
+                if (!legs.TryGetValue(name, out TouchLeg? leg))
+                {
+                    leg = new TouchLeg(name, get: false);
+                    legs[name] = leg;
+                }
+                leg.Indices.Add(idx);
+                leg.IsPrimary.Add(false);
+            }
+        }
+        if (legs.Count == 0) return;
+        await RunTouchLegsAsync(
+            namespaceBytes, legs.Values, keyBytes, 0, new List<int>(), state).ConfigureAwait(false);
     }
 
     /// <summary>One or more <c>y</c> sub-frames against <paramref name="slot"/>'s
@@ -2273,11 +2338,18 @@ public sealed class NanocachedClient : IDisposable
     ///
     /// <para>Returns the positions whose primary answered <c>W</c> or
     /// could not be reached (a key with no owners at all counts as
-    /// <c>W</c>: a refresh may populate the ring).</para></summary>
+    /// <c>W</c>: a refresh may populate the ring).</para>
+    ///
+    /// <para>With <paramref name="ttlSeconds"/> 0 (issue #934) only the
+    /// primary-role sub-frames are sent here; the other owners get theirs
+    /// afterwards, from <see cref="MultiTouchReplicaFanOutAsync"/>, once
+    /// the primaries have answered — a primary that is unreachable or
+    /// answers <c>W</c> is rerouted with no replica yet expired.</para></summary>
     private async Task<List<int>> MultiTouchPassAsync(
         byte[] namespaceBytes, byte[][] keyBytes, long? ttlSeconds, bool get, List<int>? retryIndices,
         MultiTouchState state)
     {
+        bool primaryOnly = ttlSeconds == 0;
         List<int> indices = retryIndices ?? Enumerable.Range(0, keyBytes.Length).ToList();
 
         var legs = new Dictionary<string, TouchLeg>();
@@ -2291,7 +2363,7 @@ public sealed class NanocachedClient : IDisposable
                 retry.Add(idx);
                 continue;
             }
-            for (int rank = 0; rank < names.Count; rank++)
+            for (int rank = 0; rank < (primaryOnly ? 1 : names.Count); rank++)
             {
                 bool form = get && rank == 0;
                 string id = (form ? "G" : "P") + names[rank];
@@ -2305,8 +2377,21 @@ public sealed class NanocachedClient : IDisposable
             }
         }
 
+        await RunTouchLegsAsync(namespaceBytes, legs.Values, keyBytes, ttlSeconds, retry, state)
+            .ConfigureAwait(false);
+        return retry;
+    }
+
+    /// <summary>Runs <paramref name="legs"/> concurrently and drains them
+    /// all; a pure-replica leg is eligible for <c>FireAndForgetReplicas</c>.
+    /// Shared by <see cref="MultiTouchPassAsync"/> and
+    /// <see cref="MultiTouchReplicaFanOutAsync"/>.</summary>
+    private async Task RunTouchLegsAsync(
+        byte[] namespaceBytes, IEnumerable<TouchLeg> legs, byte[][] keyBytes, long? ttlSeconds, List<int> retry,
+        MultiTouchState state)
+    {
         var running = new List<Task>();
-        foreach (TouchLeg leg in legs.Values)
+        foreach (TouchLeg leg in legs)
         {
             bool pureReplica = !leg.IsPrimary.Contains(true);
             bool background = _fireAndForgetReplicas && pureReplica && _backgroundReplicaPermits.Wait(0);
@@ -2348,7 +2433,6 @@ public sealed class NanocachedClient : IDisposable
             }
         }
         if (legBug is not null) ExceptionDispatchInfo.Capture(legBug).Throw();
-        return retry;
     }
 
     /// <summary>Dispatches one <see cref="TouchLeg"/> (via
@@ -2418,7 +2502,11 @@ public sealed class NanocachedClient : IDisposable
             }
             else if (answered)
             {
-                lock (state) state.Results[idx] = entry!.Value;
+                lock (state)
+                {
+                    state.Results[idx] = entry!.Value;
+                    state.Answerer[idx] = leg.Owner;
+                }
             }
             else
             {
@@ -4190,11 +4278,21 @@ public sealed class NanocachedClient : IDisposable
     /// and sends the others the plain touch.</summary>
     private async Task<T> WriteAsync<T>(
         byte[] namespaceBytes, byte[] key, Func<Connection, Task<T>> op, Func<Connection, Task>? replicaOp = null,
-        bool replaySafe = true)
+        bool replaySafe = true, bool primaryFirst = false)
     {
         // issue #901: with replaySafe false (a touch whose TTL expires the
         // entry) the primary leg is resent only when its request provably
         // never reached the wire; the replica legs keep the plain retry.
+        //
+        // issue #934: with primaryFirst (the same ttl == 0 touch) the
+        // replica legs are not sent alongside the primary but only after it
+        // has answered S/V/N, to the owners of the ring in force then. A
+        // primary that cannot be reached, or answers W, is rerouted by
+        // WithClusterRetryAsync with no replica touched — a concurrent
+        // replica leg would already have expired the copy the reroute needs
+        // (and, for get-and-touch, consumed the value). These replica legs
+        // run after the primary answered, outside the pipelined-order
+        // guarantee, the same class as the retry paths.
         if (_ring is null)
         {
             return replaySafe
@@ -4245,39 +4343,72 @@ public sealed class NanocachedClient : IDisposable
             }
         }
 
-        var replicaWrites = new List<Task>();
-        foreach (string name in names.Skip(1))
+        List<Task> StartReplicaWrites(IEnumerable<string> replicaNames)
         {
-            // Fire-and-forget replica writes: with FireAndForgetReplicas, up to
-            // MaxInFlightBackgroundReplicaWrites legs run in the
-            // background instead of being waited for below — past that
-            // cap, further legs fall back to the synchronous path exactly
-            // as with the option off.
-            if (_fireAndForgetReplicas && _backgroundReplicaPermits.Wait(0))
+            var started = new List<Task>();
+            foreach (string name in replicaNames)
             {
-                Task background = Task.Run(() => ReplicaWriteAsync(name));
-                _ = background.ContinueWith(
-                    completed =>
-                    {
-                        // D3: ReplicaWriteAsync's own try/catch already
-                        // swallows and counts every expected failure — this
-                        // observes whatever escaped it (a real bug, or the
-                        // deliberately uncaught OperationCanceledException
-                        // from Close()) instead of letting it vanish as an
-                        // unobserved task exception, and counts it in the
-                        // same ReplicaWriteFailures Stats() already exposes.
-                        if (completed.Exception is not null)
+                // Fire-and-forget replica writes: with FireAndForgetReplicas, up to
+                // MaxInFlightBackgroundReplicaWrites legs run in the
+                // background instead of being waited for below — past that
+                // cap, further legs fall back to the synchronous path exactly
+                // as with the option off.
+                if (_fireAndForgetReplicas && _backgroundReplicaPermits.Wait(0))
+                {
+                    Task background = Task.Run(() => ReplicaWriteAsync(name));
+                    _ = background.ContinueWith(
+                        completed =>
                         {
-                            Interlocked.Increment(ref _replicaWriteFailures);
-                        }
-                        _backgroundReplicaPermits.Release();
-                    },
-                    TaskScheduler.Default);
-                continue;
-            }
+                            // D3: ReplicaWriteAsync's own try/catch already
+                            // swallows and counts every expected failure — this
+                            // observes whatever escaped it (a real bug, or the
+                            // deliberately uncaught OperationCanceledException
+                            // from Close()) instead of letting it vanish as an
+                            // unobserved task exception, and counts it in the
+                            // same ReplicaWriteFailures Stats() already exposes.
+                            if (completed.Exception is not null)
+                            {
+                                Interlocked.Increment(ref _replicaWriteFailures);
+                            }
+                            _backgroundReplicaPermits.Release();
+                        },
+                        TaskScheduler.Default);
+                    continue;
+                }
 
-            replicaWrites.Add(ReplicaWriteAsync(name));
+                started.Add(ReplicaWriteAsync(name));
+            }
+            return started;
         }
+
+        if (primaryFirst)
+        {
+            // Throws (no replica touched) on W, a not-sent failure or a
+            // post-send loss: the caller's reroute / failure rules apply.
+            T answer = await ApplyReconnectingUnlessSentAsync(names[0], op).ConfigureAwait(false);
+
+            // The primary answered S/V/N: expire the other owners' copies,
+            // on the ring in force now. The node that answered is not sent
+            // the touch again.
+            IEnumerable<string> others = OwnerNames(namespaceBytes, key).Where(name => name != names[0]);
+            foreach (Task replicaWrite in StartReplicaWrites(others))
+            {
+                try
+                {
+                    await replicaWrite.ConfigureAwait(false);
+                }
+                catch (Exception outcome)
+                {
+                    // The primary already answered, so a replica-leg bug
+                    // is only logged, as for a successful primary below.
+                    Console.Error.WriteLine(
+                        $"nanocached: a replica write raised an unexpected error: {outcome}");
+                }
+            }
+            return answer;
+        }
+
+        List<Task> replicaWrites = StartReplicaWrites(names.Skip(1));
 
         // Run the primary and capture its outcome instead of just
         // `await`-ing it — a `finally { await Task.WhenAll(replicaWrites); }`

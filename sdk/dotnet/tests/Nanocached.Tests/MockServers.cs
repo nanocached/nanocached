@@ -338,6 +338,13 @@ public sealed class MockNode : IDisposable
     /// that predates it — <c>En</c>, then close the connection.</summary>
     public void RejectTouchLikeAnOldServer() => _rejectTouch = true;
     private volatile bool _rejectTouch;
+    private volatile int _touchDelayMillis;
+
+    /// <summary>issue #934: hold every <c>t</c>/<c>y</c> frame for
+    /// <paramref name="millis"/> after it was logged and before it is
+    /// applied and answered, so a test can look at what the other nodes
+    /// have seen while this one has not answered yet.</summary>
+    public void DelayTouches(int millis) => _touchDelayMillis = millis;
     private volatile string _rejectTouchReply = "En\n";
 
     /// <summary>issue #939: like <see cref="RejectTouchLikeAnOldServer"/>
@@ -1161,6 +1168,7 @@ public sealed class MockNode : IDisposable
                             if (parts[i] == "G") withValue = true;
                             else ttlSeconds = long.Parse(parts[i], CultureInfo.InvariantCulture);
                         }
+                        if (_touchDelayMillis > 0) await Task.Delay(_touchDelayMillis);
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
@@ -1238,6 +1246,7 @@ public sealed class MockNode : IDisposable
                             await Wire.WriteAsync(stream, _rejectTouchReply.Replace("{tag}", tag));
                             return;
                         }
+                        if (_touchDelayMillis > 0) await Task.Delay(_touchDelayMillis);
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
