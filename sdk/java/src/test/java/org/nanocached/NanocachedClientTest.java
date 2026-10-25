@@ -30,11 +30,13 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.nanocached.MockServers.MockDiscovery;
 import org.nanocached.MockServers.MockNode;
+import org.nanocached.MockServers.ScriptedNode;
 import org.nanocached.MockServers.Tls;
 import org.nanocached.NanocachedClient.Address;
 
@@ -1450,6 +1452,51 @@ class NanocachedClientTest {
                 NanocachedException.ConnectionFailed bare = assertThrows(
                         NanocachedException.ConnectionFailed.class, () -> client.touchMany(keys, 30));
                 assertFalse(bare instanceof NanocachedException.PartialConnectionFailedRaw);
+            }
+        }
+    }
+
+    @Test
+    void aRetryableErrorOnALaterChunkKeepsTheEarlierChunksHits() throws Exception {
+        // Issue #937: the proxy answers chunk 1 with hits and chunk 2 with
+        // `R` (three times: the connection's own bounded retry gives up).
+        // With ttl 0 chunk 1 expired its keys, so the 400 values it
+        // returned must reach the caller. `R` means chunk 2 was not
+        // applied, so its key is not reported as possibly applied either.
+        AtomicInteger frameCount = new AtomicInteger();
+        try (ScriptedNode proxy = new ScriptedNode(header -> {
+            int count = Integer.parseInt(header.split(" ")[2]);
+            if (frameCount.getAndIncrement() > 0) return "R\n";
+            StringBuilder reply = new StringBuilder("M " + count);
+            for (int i = 0; i < count; i++) reply.append(" 1");
+            reply.append('\n');
+            for (int i = 0; i < count; i++) reply.append('x');
+            return reply.toString();
+        })) {
+            try (NanocachedClient client = connect("127.0.0.1", proxy.port())) {
+                List<String> keys = new ArrayList<>();
+                for (int i = 0; i < 401; i++) keys.add("k" + i);
+
+                NanocachedException.PartialConnectionFailedStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionFailedStrings.class,
+                        () -> client.getManyAndTouch(keys, 0));
+                assertEquals(400, failure.partialValues.size());
+                assertEquals("x", failure.partialValues.get("k0"));
+                assertTrue(failure.getCause() instanceof NanocachedException.RetryableError);
+                // chunk 1, then chunk 2 on three attempts.
+                assertEquals(4, proxy.frames.get());
+            }
+        }
+    }
+
+    @Test
+    void aRetryableErrorOnTheFirstChunkIsThrownAsItAlwaysWas() throws Exception {
+        try (ScriptedNode proxy = new ScriptedNode(header -> "R\n")) {
+            try (NanocachedClient client = connect("127.0.0.1", proxy.port())) {
+                assertThrows(NanocachedException.RetryableError.class,
+                        () -> client.getManyAndTouch(List.of("a", "b"), 0));
+                assertThrows(NanocachedException.RetryableError.class,
+                        () -> client.touchMany(List.of("a", "b"), 0));
             }
         }
     }

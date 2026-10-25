@@ -2213,21 +2213,37 @@ public final class NanocachedClient implements AutoCloseable {
     private static final class ChunkedConnectionFailure extends RuntimeException {
         final List<Connection.MultiEntry> partialEntries;
         final NanocachedException.ConnectionFailed cause;
+
+        ChunkedConnectionFailure(
+                List<Connection.MultiEntry> partialEntries, NanocachedException.ConnectionFailed cause) {
+            super(cause);
+            this.partialEntries = partialEntries;
+            this.cause = cause;
+        }
+    }
+
+    /**
+     * {@link ChunkedConnectionFailure}'s twin for {@link #multiTouchChunked},
+     * whose {@code cause} may also be a {@link
+     * NanocachedException.RetryableError}: the proxy's {@code R} (issue
+     * #937), which is not a {@link NanocachedException.ConnectionFailed}.
+     * The entries of the chunks that did resolve ride along, as they do for
+     * a connection failure — with {@code ttl == 0} those chunks expired
+     * their keys and the values they returned are gone. Purely internal:
+     * every caller of {@code multiTouchChunked} must catch it.
+     */
+    private static final class ChunkedTouchFailure extends RuntimeException {
+        final List<Connection.MultiEntry> partialEntries;
+        final NanocachedException cause;
         /** Issue #901: how many leading keys of the call the failed
          * request may have reached the node with — {@code 0} unless it was
          * an expiring ({@code ttl == 0}) touch whose frame may have been
          * applied, in which case the unresolved keys below this index must
-         * not be resent. */
+         * not be resent. Always {@code 0} for an {@code R}, which means
+         * the chunk was not applied. */
         final int sentEnd;
 
-        ChunkedConnectionFailure(
-                List<Connection.MultiEntry> partialEntries, NanocachedException.ConnectionFailed cause) {
-            this(partialEntries, cause, 0);
-        }
-
-        ChunkedConnectionFailure(
-                List<Connection.MultiEntry> partialEntries, NanocachedException.ConnectionFailed cause,
-                int sentEnd) {
+        ChunkedTouchFailure(List<Connection.MultiEntry> partialEntries, NanocachedException cause, int sentEnd) {
             super(cause);
             this.partialEntries = partialEntries;
             this.cause = cause;
@@ -3083,7 +3099,7 @@ public final class NanocachedClient implements AutoCloseable {
             NanocachedException failure = null;
             try {
                 entries = multiTouchChunked(this::singleConnection, namespace, keys, wireTtl, get);
-            } catch (ChunkedConnectionFailure partial) {
+            } catch (ChunkedTouchFailure partial) {
                 entries = partial.partialEntries;
                 failure = partial.cause;
             } catch (NanocachedException.ConnectionFailed bare) {
@@ -3143,10 +3159,12 @@ public final class NanocachedClient implements AutoCloseable {
     /** {@link #multiGetChunked}'s twin for {@code y}: one or more
      * sub-frames against whatever {@code connectionFor} resolves to,
      * chunked like {@code m} (see {@link #multiGetChunkEnd}). {@code get}
-     * selects the {@code G} form. Throws {@link ChunkedConnectionFailure}
+     * selects the {@code G} form. Throws {@link ChunkedTouchFailure}
      * when a chunk fails (issue #411) — also the first, unlike {@code m}
      * — so that it can say how far a {@code ttl == 0} request may have
-     * been applied (issue #901); every caller must catch it. */
+     * been applied (issue #901); every caller must catch it. A chunk
+     * answered {@code R} (issue #937) fails the same way, with nothing
+     * counted as sent. */
     private List<Connection.MultiEntry> multiTouchChunked(
             java.util.function.Supplier<Connection> connectionFor, byte[] namespace, byte[][] keys,
             Long wireTtl, boolean get) {
@@ -3171,7 +3189,13 @@ public final class NanocachedClient implements AutoCloseable {
                 // never sent.
                 boolean mayHaveApplied = expiring && !failure.notSent()
                         && !(failure instanceof NanocachedException.ServerRejected);
-                throw new ChunkedConnectionFailure(entries, failure, mayHaveApplied ? end : 0);
+                throw new ChunkedTouchFailure(entries, failure, mayHaveApplied ? end : 0);
+            } catch (NanocachedException.RetryableError retryable) {
+                // Issue #937: the proxy's `R` means the request was NOT
+                // applied, so even with ttl 0 this chunk is not "sent" for
+                // the purposes of sentEnd, and the earlier chunks' entries
+                // are kept exactly as for a connection failure.
+                throw new ChunkedTouchFailure(entries, retryable, 0);
             }
             for (int i = start; i < end; i++) {
                 entries.set(i, chunkEntries.get(i - start));
@@ -3281,7 +3305,7 @@ public final class NanocachedClient implements AutoCloseable {
         int sentEnd = 0;
         try {
             entries = multiTouchChunked(() -> memberConnection(leg.owner), namespace, groupKeys, wireTtl, leg.get);
-        } catch (ChunkedConnectionFailure partial) {
+        } catch (ChunkedTouchFailure partial) {
             entries = partial.partialEntries;
             failure = partial.cause;
             sentEnd = partial.sentEnd;
