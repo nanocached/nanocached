@@ -1565,6 +1565,48 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aPrimaryThatAnswersEnToBatchTouchIsNotRedialledOrAskedAgain() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 3);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : keys) values.put(key, "value of " + key);
+                client.setMany(values);
+                MockNode old = cluster.nodes().get(NAMES.get(0));
+                old.rejectMultiTouchLikeAnOldServer();
+
+                // `En` is final: the same node would answer it again, so each
+                // call sends one frame, with no resend and no second pass.
+                assertEquals("y", assertThrows(NanocachedException.ServerTooOld.class,
+                        () -> client.touchMany(keys, 30)).command());
+                assertEquals(1, old.multiTouchFrames.size());
+                assertEquals("y", assertThrows(NanocachedException.ServerTooOld.class,
+                        () -> client.getManyAndTouch(keys, 30)).command());
+                assertEquals(2, old.multiTouchFrames.size());
+            }
+        }
+    }
+
+    @Test
+    void aReplicaThatAnswersEnToBatchTouchDoesNotFailTheCall() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 3);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : keys) values.put(key, "value of " + key);
+                client.setMany(values);
+                MockNode old = cluster.nodes().get(NAMES.get(1));
+                old.rejectMultiTouchLikeAnOldServer();
+                long before = client.stats().replicaWriteFailures();
+
+                assertTrue(client.touchMany(keys, 30).values().stream().allMatch(t -> t));
+                assertEquals(1, old.multiTouchFrames.size());
+                assertEquals(before + keys.size(), client.stats().replicaWriteFailures());
+            }
+        }
+    }
+
+    @Test
     void batchTouchReportsAnUnreachablePrimaryAsAConnectionFailureNotWrongNode() throws Exception {
         try (Cluster cluster = startCluster(1)) {
             try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
