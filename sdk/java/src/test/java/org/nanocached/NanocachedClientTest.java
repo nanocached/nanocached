@@ -984,6 +984,87 @@ class NanocachedClientTest {
         }
     }
 
+    // Issue #901: ttl 0 expires the entry, so a resend after the node applied
+    // it (reply lost) finds the key gone.
+
+    @Test
+    void anExpiringTouchWhoseReplyWasLostIsNotResent() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-key";
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+
+                client.set(key, "payload", 100);
+                primary.dropReplyAfterNextTouch();
+                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.touch(key, 0));
+                assertEquals(1, primary.touchFrames.size(), "the applied touch was not sent again");
+            }
+        }
+    }
+
+    @Test
+    void anExpiringGetAndTouchWhoseReplyWasLostIsNotResent() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-key";
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+
+                client.set(key, "payload", 100);
+                primary.dropReplyAfterNextTouch();
+                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.getAndTouch(key, 0));
+                assertEquals(1, primary.touchFrames.size(), "the applied get-and-touch was not sent again");
+            }
+        }
+    }
+
+    @Test
+    void anExpiringTouchOnASingleNodeIsNotResentAfterALostReply() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "payload", 100);
+                node.dropReplyAfterNextTouch();
+                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.getAndTouch("k", 0));
+                assertEquals(1, node.touchFrames.size());
+            }
+        }
+    }
+
+    @Test
+    void anExpiringTouchStillRetriesARequestThatWasNeverSent() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-key";
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+
+                client.set(key, "payload", 100);
+                primary.answerWrongNodeOnce();
+                assertEquals(Optional.of("payload"), client.getAndTouch(key, 0));
+                assertEquals(2, primary.touchFrames.size(), "the W answer was followed by one resend");
+
+                client.set(key, "payload", 100);
+                primary.answerWrongNodeOnce();
+                assertTrue(client.touch(key, 0));
+                assertEquals(4, primary.touchFrames.size());
+            }
+        }
+    }
+
+    @Test
+    void aTouchThatRemovesTheTtlIsStillResentAfterALostReply() throws Exception {
+        // Only ttl 0 changed: REMOVE_TTL is not "expire now" (issue #893).
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v", 100);
+                node.dropReplyAfterNextTouch();
+                assertTrue(client.touch("k", NanocachedClient.REMOVE_TTL));
+                assertEquals(2, node.touchFrames.size());
+            }
+        }
+    }
+
     // A touch fans out to every owner like a set; get-and-touch asks the
     // primary alone for the value.
 
@@ -1518,6 +1599,72 @@ class NanocachedClientTest {
                 Map<String, Boolean> touched = client.touchMany(keys, 30);
                 assertTrue(touched.values().stream().allMatch(t -> t));
                 assertEquals(2, nodeA.multiTouchFrames.size());
+            }
+        }
+    }
+
+    @Test
+    void anExpiringBatchTouchWhoseReplyWasLostIsNotResent() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                List<String> keysB = keysWhosePrimaryIs(NAMES.get(1), 3);
+                List<String> all = concat(keysA, keysB);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : all) values.put(key, "value of " + key);
+                client.setMany(values);
+
+                nodeA.dropReplyAfterNextTouch();
+                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.touchMany(all, 0));
+                assertEquals(1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
+            }
+        }
+    }
+
+    @Test
+    void anExpiringGetManyAndTouchWhoseReplyWasLostIsNotResent() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                List<String> keysB = keysWhosePrimaryIs(NAMES.get(1), 3);
+                List<String> all = concat(keysA, keysB);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : all) values.put(key, "value of " + key);
+                client.setMany(values);
+
+                nodeA.dropReplyAfterNextTouch();
+                NanocachedException.PartialConnectionFailedStrings partial = assertThrows(
+                        NanocachedException.PartialConnectionFailedStrings.class,
+                        () -> client.getManyAndTouch(all, 0));
+                Map<String, String> resolved = new java.util.LinkedHashMap<>();
+                for (String key : keysB) resolved.put(key, values.get(key));
+                assertEquals(resolved, partial.partialValues, "the other primary's hits are kept");
+                assertEquals(1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
+            }
+        }
+    }
+
+    @Test
+    void anExpiringBatchTouchStillRetriesKeysThatWereNeverSent() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                List<String> all = concat(keysWhosePrimaryIs(NAMES.get(0), 3), keysWhosePrimaryIs(NAMES.get(1), 3));
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : all) values.put(key, "value of " + key);
+                client.setMany(values);
+
+                nodeA.answerWrongNodeOnce();
+                Map<String, Boolean> touched = client.touchMany(all, 0);
+                assertEquals(6, touched.size());
+                assertTrue(touched.values().stream().allMatch(t -> t));
+                assertEquals(2, nodeA.multiTouchFrames.size(), "the keys A answered W for were sent again");
+
+                client.setMany(values);
+                nodeA.answerWrongNodeOnce();
+                assertEquals(values, client.getManyAndTouch(all, 0));
             }
         }
     }
