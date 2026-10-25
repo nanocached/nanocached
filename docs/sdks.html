@@ -285,7 +285,10 @@ existed, err := client.Delete("greeting")</code></pre>
   omitting it (<code>null</code>/<code>None</code>, or the
   <code>RemoveTTL</code>/<code>REMOVE_TTL</code> constant in Go and Java)
   removes the TTL and <code>0</code> expires the entry at once, where
-  <code>set</code> reads <code>0</code> as no expiry. A miss creates
+  <code>set</code> reads <code>0</code> as no expiry. In Go and Java the
+  constant is the number <code>-1</code>, so a TTL computed as a
+  difference that comes out as exactly <code>-1</code> removes the TTL
+  instead of being rejected like any other negative value. A miss creates
   nothing. Unlike counters and compare-and-set a touch is idempotent: it
   goes to every owner like a <code>set</code>, a request whose reply was
   lost is retried, and it cannot overwrite a write that lands at the same

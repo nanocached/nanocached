@@ -494,6 +494,23 @@ here.</p>
 </ul>
 <p><strong>Data model and operations</strong></p>
 <ul>
+  <li>A touch is not ordered against the fire-and-forget replica leg of
+  an earlier write to the same key. A client with fire-and-forget replica
+  writes sends the two legs independently, so under concurrency the touch
+  can reach a replica before the write does, find nothing to touch, and
+  leave the write to land with its own TTL (none, for a plain
+  <code>set</code>); that copy then outlives the primary&rsquo;s. Rare
+  (it needs a touch right after a write of the same key and concurrent
+  load) and the same class as a replica that answers <code>N</code> and is
+  never repaired; ordering the legs per key would put a lock on every
+  background write. Without fire-and-forget the write waits for its
+  replica legs and the race does not exist.</li>
+  <li>A batched touch with <code>G</code> leaves a value that does not fit
+  the 16&nbsp;MiB reply untouched on the primary, but the plain form its
+  other owners receive has no such bound, so their copies of that key get
+  the new TTL and the primary&rsquo;s keeps the old one. The client reads
+  the key as a miss either way; keep the batch under the reply bound, or
+  touch the key again.</li>
   <li><code>INCR</code> and compare-and-set are as volatile as a plain
   set: eviction and TTL reclaim counters, and CAS is not a distributed
   lock since eviction breaks mutual exclusion. Replicas receive the
@@ -524,6 +541,14 @@ here.</p>
 </ul>
 <p><strong>SDKs and adapters</strong></p>
 <ul>
+  <li>Go and Java spell &ldquo;remove the TTL&rdquo; of a touch as the
+  integer <code>-1</code> (<code>RemoveTTL</code>/<code>REMOVE_TTL</code>),
+  because the argument has no default and <code>0</code> is a real value
+  (expire at once). A computed TTL of exactly <code>-1</code> is therefore
+  accepted and removes the TTL, where every other negative value is
+  rejected. The other four SDKs use <code>None</code>/<code>null</code>/an
+  option and cannot collide; changing Go and Java would be an API break
+  for a mistake that needs arithmetic on the TTL to make.</li>
   <li>The <code>connect()</code> forgotten-close warning is kept per
   address within a process, not per client instance, so several clients
   to one single address trip it even when each is closed in turn.
