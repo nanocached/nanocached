@@ -17,12 +17,21 @@ changed. What 1.0.0 will promise is described on the
   value no longer travels back to the node, and a write landing between
   the two is no longer overwritten with the value the `get()` observed. An
   access duration of zero returns the value and expires the entry in the
-  same step. `getAll` keeps its one batched re-set of every hit (the
-  protocol has no batch touch, and one touch per hit would be slower), so
-  that race remains there. Needs a server release that includes the `t`
-  command and a Java SDK release that includes `getAndTouch`; against an
-  older server `get()` under an access policy fails with a
-  `CacheException` caused by the SDK's `ServerTooOld`.
+  same step. Needs a server release that includes the `t` command and a
+  Java SDK release that includes `getAndTouch`; against an older server
+  `get()` under an access policy fails with a `CacheException` caused by
+  the SDK's `ServerTooOld`.
+- With an access-based `ExpiryPolicy`, `getAll` reads and refreshes the
+  TTL of every key in one batched touch (`getManyAndTouch`) instead of a
+  batched read followed by a batched re-set of the values it read: one
+  round trip per owning node as before, but a write landing between the
+  read and the refresh is no longer overwritten with the value `getAll`
+  observed. A zero access duration expires the hits in the same step
+  instead of one `delete` per hit. Needs a server release that includes
+  the `y` command and a Java SDK release that includes `getManyAndTouch`;
+  against an older server `getAll` under an access policy fails with a
+  `CacheException` caused by the SDK's `ServerTooOld`. Without an access
+  policy `getAll` is unchanged.
 
 ## [0.4.8] - 2026-10-21
 

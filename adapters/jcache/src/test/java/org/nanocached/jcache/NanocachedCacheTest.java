@@ -347,11 +347,10 @@ class NanocachedCacheTest {
     }
 
     @Test
-    void getAllWithAnAccessExpiryPolicyRefreshesEveryHitInOneBulkWrite() {
-        // issue #192: getAll used to refresh an access-based ExpiryPolicy
-        // one key at a time (one wire round trip per hit); it must now
-        // batch every hit's refresh into a single setManyBytes call,
-        // exactly like putAll batches its writes.
+    void getAllWithAnAccessExpiryPolicyRefreshesEveryHitInOneBatchedTouch() {
+        // issue #192 batched the refresh of an access-based ExpiryPolicy
+        // into one setManyBytes; issue #871 replaces that re-set with one
+        // batched touch that reads and refreshes every key in the same step.
         MutableConfiguration<String, String> config = new MutableConfiguration<>();
         config.setTypes(String.class, String.class);
         config.setExpiryPolicyFactory(
@@ -370,15 +369,20 @@ class NanocachedCacheTest {
                         java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")),
                         new MockNode.Entry(node.entry("sliding-all", KeyCodec.toKeyBytes("b")).value(), 5L));
         node.multiSetCount.set(0);
+        node.multiGetCount.set(0);
 
         Map<String, String> all = slidingCache.getAll(Set.of("a", "b", "missing"));
 
         assertEquals(2, all.size());
         assertEquals("1", all.get("a"));
         assertEquals("2", all.get("b"));
-        assertEquals(1, node.multiSetCount.get(), "one bulk write refreshes every hit's TTL");
+        assertEquals(1, node.multiTouchFrames.size(), "one batched touch reads and refreshes every key");
+        assertTrue(node.multiTouchFrames.get(0).contains(" 30 G"), node.multiTouchFrames.get(0));
+        assertEquals(0, node.multiGetCount.get(), "no separate batched read");
+        assertEquals(0, node.multiSetCount.get(), "no re-set of the values");
         assertEquals(30L, storedTtlSeconds("sliding-all", "a"), "a getAll must refresh the TTL via getExpiryForAccess");
         assertEquals(30L, storedTtlSeconds("sliding-all", "b"), "a getAll must refresh the TTL via getExpiryForAccess");
+        assertNull(node.entry("sliding-all", KeyCodec.toKeyBytes("missing")), "a miss is not created");
     }
 
     @Test
@@ -1065,6 +1069,123 @@ class NanocachedCacheTest {
                 ValueCodec.deserialize(
                         node.entry("touch-race", KeyCodec.toKeyBytes("a")).value(),
                         getClass().getClassLoader()));
+    }
+
+    // ── getAll through the batched touch (issue #871) ───────────────
+
+    @Test
+    void getAllWithoutAnAccessPolicyStillReadsWithAPlainBatchedGet() {
+        cache.put("plain", "1");
+        node.multiGetCount.set(0);
+
+        assertEquals(Map.of("plain", "1"), cache.getAll(Set.of("plain", "absent")));
+
+        assertEquals(1, node.multiGetCount.get());
+        assertEquals(0, node.multiTouchFrames.size());
+    }
+
+    @Test
+    void anEternalAccessPolicyRemovesTheTtlOnGetAll() {
+        Cache<String, String> sliding = accessCache("touch-all-eternal", Duration.ETERNAL);
+        seedWithTtl("touch-all-eternal", "a", "1", 5L);
+        seedWithTtl("touch-all-eternal", "b", "2", 5L);
+
+        assertEquals(Map.of("a", "1", "b", "2"), sliding.getAll(Set.of("a", "b")));
+
+        assertEquals(0L, storedTtlSeconds("touch-all-eternal", "a"), "0 is the mock's no-TTL");
+        assertEquals(0L, storedTtlSeconds("touch-all-eternal", "b"), "0 is the mock's no-TTL");
+        assertFalse(node.multiTouchFrames.get(0).contains(" 0 G"), "no TTL field, not a 0 that would expire them");
+    }
+
+    @Test
+    void aZeroAccessPolicyReturnsTheValuesAndExpiresTheEntriesInOneStep() {
+        Cache<String, String> sliding = accessCache("touch-all-zero", Duration.ZERO);
+        seedWithTtl("touch-all-zero", "a", "1", 30L);
+        seedWithTtl("touch-all-zero", "b", "2", 30L);
+
+        assertEquals(Map.of("a", "1", "b", "2"), sliding.getAll(Set.of("a", "b")));
+
+        assertNull(node.entry("touch-all-zero", KeyCodec.toKeyBytes("a")));
+        assertNull(node.entry("touch-all-zero", KeyCodec.toKeyBytes("b")));
+        assertEquals(0, node.deleteCount.get(), "no per-key delete");
+        assertEquals(1, node.multiTouchFrames.size());
+        assertTrue(sliding.getAll(Set.of("a", "b")).isEmpty());
+    }
+
+    @Test
+    void getAllUnderAnAccessPolicyCountsHitsAndMisses() throws Exception {
+        Cache<String, String> sliding =
+                accessCache("touch-all-stats", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
+        manager.enableStatistics("touch-all-stats", true);
+        sliding.put("a", "1");
+
+        sliding.getAll(Set.of("a", "absent1", "absent2"));
+
+        assertEquals(1, statisticsMBean("touch-all-stats").getCacheHits());
+        assertEquals(2, statisticsMBean("touch-all-stats").getCacheMisses());
+    }
+
+    @Test
+    void aWriteLandingDuringAnAccessedGetAllIsNotOverwritten() throws Exception {
+        // The race issue #871 closes: getAll used to re-send the values it
+        // had read, so a write that landed between the read and the
+        // refresh was lost. The concurrent write is injected after the node
+        // has seen the batched touch and before it answers.
+        Cache<String, String> sliding =
+                accessCache("touch-all-race", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
+        sliding.put("a", "old");
+        sliding.put("b", "other");
+        java.util.concurrent.atomic.AtomicBoolean fired = new java.util.concurrent.atomic.AtomicBoolean();
+        node.beforeAccessApplies = () -> {
+            if (fired.compareAndSet(false, true)) {
+                rawSet("touch-all-race", KeyCodec.toKeyBytes("a"), ValueCodec.serialize("new"), 30L);
+            }
+        };
+
+        sliding.getAll(Set.of("a", "b"));
+        node.beforeAccessApplies = null;
+
+        assertEquals("new", sliding.get("a"));
+        assertEquals(
+                "new",
+                ValueCodec.deserialize(
+                        node.entry("touch-all-race", KeyCodec.toKeyBytes("a")).value(),
+                        getClass().getClassLoader()));
+    }
+
+    @Test
+    void getAllUnderAnAccessPolicyRetriesOnlyTheRemainderAfterAMidBatchWrongNode() {
+        Cache<String, String> sliding =
+                accessCache("touch-all-w", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
+        sliding.putAll(Map.of("a", "1", "b", "2", "c", "3"));
+        seedWithTtl("touch-all-w", "b", "2", 5L);
+        node.forceWrongNodeCountsForGet.put(
+                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")), new AtomicInteger(1));
+
+        Map<String, String> all = sliding.getAll(Set.of("a", "b", "c", "missing"));
+
+        assertEquals(Map.of("a", "1", "b", "2", "c", "3"), all);
+        assertEquals(2, node.multiTouchFrames.size(), "the forced W costs exactly one extra retry round");
+        assertTrue(node.multiTouchFrames.get(1).startsWith("y " + "touch-all-w".length() + " 1 "),
+                "the retry carries only the unresolved key: " + node.multiTouchFrames.get(1));
+        assertEquals(30L, storedTtlSeconds("touch-all-w", "b"));
+    }
+
+    @Test
+    void getAllAgainstAServerWithoutTheBatchedTouchFailsWithServerTooOld() {
+        Cache<String, String> sliding =
+                accessCache("touch-all-old", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
+        sliding.put("a", "1");
+        node.rejectMultiTouch = true;
+
+        javax.cache.CacheException error =
+                assertThrows(javax.cache.CacheException.class, () -> sliding.getAll(Set.of("a")));
+
+        assertTrue(error.getCause() instanceof NanocachedException.ServerTooOld, "cause: " + error.getCause());
+        assertEquals("y", ((NanocachedException.ServerTooOld) error.getCause()).command());
+        // A cache without an access policy never sends `y`, so it keeps working.
+        cache.put("plain", "1");
+        assertEquals(Map.of("plain", "1"), cache.getAll(Set.of("plain")));
     }
 
     private void rawSet(String namespace, byte[] key, byte[] value, long ttlSeconds) {
