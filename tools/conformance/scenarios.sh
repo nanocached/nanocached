@@ -94,13 +94,14 @@ hostile)
   [ $ready = 1 ] || { echo "the hostile fixture never came up" >&2; docker logs $P-fx >&2; exit 1; }
   python3 -c 'import json,sys; [print(c["id"], c["port"], *c["args"]) for c in json.load(open(sys.argv[1]))["cases"]]' "$HERE/fixtures/hostile_cases.json" > "$OUT/cases.txt"
   while read -r id port cargs; do
-    [ -n "${ONLY:-}" ] && [ "$id" != "$ONLY" ] && continue
+    # the baseline is the memory reference the other cases are judged against
+    [ -n "${ONLY:-}" ] && [ "$id" != "$ONLY" ] && [ "$id" != baseline ] && continue
     # the six SDKs at once, each in a container of its own: the case's memory is the container's cgroup peak
     for sdk in $SDKS; do sc "$sdk" "$OUT/$id.$sdk.jsonl" $P-fx:$port 0 "" "${LIMIT:-90}" host "$id" $cargs & done
     wait $(jobs -p | grep -v "^$WD$")
     echo "== $id"
   done < "$OUT/cases.txt"
-  python3 "$HERE/hostile_check.py" "$OUT"; VERDICT=$? ;;
+  python3 "$HERE/hostile_check.py" "$OUT" ${ONLY:+"$ONLY"}; VERDICT=$? ;;
 *) echo "unknown scenario set $WHAT"; exit 2 ;;
 esac
 kill $WD >/dev/null 2>&1
