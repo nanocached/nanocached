@@ -135,6 +135,9 @@ public class NanocachedException extends RuntimeException {
      * #825). A {@link ConnectionFailed}, so every command other than
      * touch, getAndTouch, touchMany or getManyAndTouch sees exactly the
      * failure it always did; those four turn it into {@link ServerTooOld}.
+     * Only the node's {@code En} is this (issue #939): the proxy's bare
+     * {@code E} (a request whose outcome it could not determine) stays a
+     * plain {@link ConnectionFailed}.
      */
     static final class ServerRejected extends ConnectionFailed {
         ServerRejected() {
@@ -419,6 +422,15 @@ public class NanocachedException extends RuntimeException {
      * even attempted, {@code unresolvedIndices} lists (ascending) the
      * positions that did NOT resolve — exactly {@link
      * PartialWrongNodeRaw}'s own convention.
+     *
+     * <p>When raised by {@link NanocachedClient#getManyAndTouchBytes(byte[][],
+     * long)} (or {@code getManyAndTouch}, whose partial results derive from
+     * this one) with {@code ttlSeconds == 0}, {@code unresolvedIndices}
+     * lists keys whose frame was never sent <em>and</em> keys whose frame
+     * was sent and whose outcome is unknown; the two cannot be told apart.
+     * The unknown ones may already have been expired by the node, so these
+     * positions must not be sent again with {@code 0}: a second attempt
+     * answers them as misses and the values they held are lost.
      */
     public static final class PartialConnectionFailedRaw extends ConnectionFailed {
         public final byte[][] partialValues;

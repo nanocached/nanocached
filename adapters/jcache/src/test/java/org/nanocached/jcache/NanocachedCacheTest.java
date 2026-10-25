@@ -385,6 +385,96 @@ class NanocachedCacheTest {
         assertNull(node.entry("sliding-all", KeyCodec.toKeyBytes("missing")), "a miss is not created");
     }
 
+    /** creation → eternal, access → zero: a value is read once and expires on
+     * that read. */
+    private static final class ExpireOnReadPolicy implements ExpiryPolicy, java.io.Serializable {
+        @Override
+        public Duration getExpiryForCreation() {
+            return Duration.ETERNAL;
+        }
+
+        @Override
+        public Duration getExpiryForAccess() {
+            return Duration.ZERO;
+        }
+
+        @Override
+        public Duration getExpiryForUpdate() {
+            return null;
+        }
+    }
+
+    private <P extends ExpiryPolicy & java.io.Serializable> Cache<String, String> cacheOf(
+            String name, P policy, Map<String, String> seed) {
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        config.setExpiryPolicyFactory(FactoryBuilder.factoryOf(policy));
+        Cache<String, String> created = manager.createCache(name, config);
+        created.putAll(seed);
+        return created;
+    }
+
+    private static Map<String, String> seedOf(int keyCount) {
+        Map<String, String> seed = new HashMap<>();
+        for (int i = 0; i < keyCount; i++) {
+            seed.put("k" + i, "v" + i);
+        }
+        return seed;
+    }
+
+    @Test
+    void getAllUnderAZeroAccessExpiryDoesNotRefetchKeysALostTouchMayHaveExpired() {
+        // Issue #938: under an access expiry of zero, getAll is a batched
+        // touch with a 0 TTL, which expires every key it finds. The SDK
+        // reports the keys of a frame that was sent and whose connection was
+        // then lost as unresolved, together with the keys it never sent, and
+        // the adapter's one follow-up for a connection failure used to fetch
+        // them again — asking for values the lost frame had already consumed
+        // and reporting them as misses. An expiring batch makes no follow-up:
+        // the failure propagates with the values resolved so far on it.
+        Map<String, String> seed = seedOf(401); // MAX_BATCH_KEYS(400) + 1: two `y` sub-frames
+        Cache<String, String> expiring = cacheOf("expire-on-read", new ExpireOnReadPolicy(), seed);
+        node.multiTouchFrames.clear();
+        // Chunk 1 is answered; chunk 2 is read in full, then the connection
+        // drops. A 0 TTL frame that was sent is never re-sent by the SDK.
+        node.armMultiTouchDrop(1, 1);
+
+        javax.cache.CacheException error =
+                assertThrows(javax.cache.CacheException.class, () -> expiring.getAll(seed.keySet()));
+
+        assertTrue(
+                error.getCause() instanceof NanocachedException.PartialConnectionFailedRaw,
+                "cause: " + error.getCause());
+        assertEquals(
+                2,
+                node.multiTouchFrames.size(),
+                "chunk 1 + chunk 2 only: no follow-up for keys the lost frame may have expired");
+        for (String frame : node.multiTouchFrames) {
+            assertTrue(frame.contains(" 0 G"), frame);
+        }
+    }
+
+    @Test
+    void getAllUnderAPositiveAccessExpiryStillRefetchesTheRemainderAfterAConnectionDrop() {
+        // The control for the test above: a positive access TTL is
+        // idempotent to re-send, so the adapter's one follow-up for the
+        // remainder stands and the whole map comes back.
+        Map<String, String> seed = seedOf(401);
+        Cache<String, String> sliding = cacheOf(
+                "sliding-drop",
+                new AccessedExpiryPolicy(new Duration(java.util.concurrent.TimeUnit.SECONDS, 30)),
+                seed);
+        node.multiTouchFrames.clear();
+        // Chunk 1 answered; chunk 2's two attempts (the SDK's own and its
+        // reconnect-and-retry) drop; the adapter's follow-up succeeds.
+        node.armMultiTouchDrop(1, 2);
+
+        Map<String, String> all = sliding.getAll(seed.keySet());
+
+        assertEquals(seed, all);
+        assertEquals(4, node.multiTouchFrames.size(), "chunk1 + chunk2-attempt1 + chunk2-attempt2 + adapter follow-up");
+    }
+
     @Test
     void putAllIssuesOneBulkWritePerResolvedTtl() {
         MutableConfiguration<String, String> config = new MutableConfiguration<>();

@@ -13,6 +13,33 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `touch`, `getAndTouch`, `touchMany` and `getManyAndTouch` with `ttlSeconds`
+  `0` no longer lose the value when the primary has to be rerouted. The
+  plain `t ... 0` legs went to the other owners at the same time as the
+  primary's; if the primary then could not be dialled or answered `W`, the
+  retry over the refreshed ring reached a replica that had already expired its
+  copy and answered `N`, so `getAndTouch` / `getManyAndTouch` returned a miss
+  for a key that existed and `touch` returned `false`. With `0` the primary is
+  now sent its leg alone (in a batch: the primary legs of both passes), and the
+  other owners are touched once it has answered `S`, `V` or `N` (in a batch: one
+  fan-out at the end, for the keys a primary answered); an attempt whose primary
+  failed or answered `W` touches no replica. These replica legs therefore run
+  after the primary's answer, outside the pipelined-order guarantee, the same
+  class as the existing retry paths; a positive TTL and `REMOVE_TTL` still go to
+  every owner at once.
+- `touch`, `getAndTouch`, `touchMany` and `getManyAndTouch` raise
+  `ServerTooOld` only for a node's `En`. A bare `E` (`E\n`, or `E <tag>\n`
+  from `nanocached-proxy`, which sends it when a `ttlSeconds` `0` touch's
+  outcome is unknown or a request failed transiently) used to be reported as
+  "server too old, upgrade every node"; it is now the `ConnectionFailed` every
+  other command raises for it, a failure after the frame was written, so a
+  `ttlSeconds` `0` touch is not resent.
+- The documentation of `touchMany`, `getManyAndTouch` and
+  `PartialConnectionFailed*` now says that with `ttlSeconds` `0` the keys a
+  connection failure leaves unresolved include keys whose frame was sent and
+  whose outcome is unknown, not only keys that were never sent. They must not
+  be sent again with `0`: the first attempt may have expired them, and a
+  second one reads them as misses. No behaviour change.
 - `getManyAndTouch` against a proxy no longer discards the hits the earlier
   chunks of a batch of more than 400 keys returned when a later chunk is
   answered `R` (the proxy's retryable error). It ends the batch with them

@@ -1425,13 +1425,30 @@ final class Connection {
             // connection. Told apart from other unexpected bytes so a touch
             // can report "server too old" (issue #825); a ConnectionFailed
             // either way, so every other command is unaffected.
+            //
+            // Only the node's `En` (the `n` server-type byte right after
+            // the `E`) is that (issue #939). The proxy answers a bare `E`
+            // (`E\n`, or `E <tag>\n` on a tagged connection) when it
+            // could not tell whether a request was applied -- a ttl=0 touch
+            // it had already forwarded, say -- and that is a connection
+            // failure after the frame was written, which is what every
+            // other command raises for it: not marked notSent, so a
+            // ttl=0 touch, an INCR or a CAS is not resent.
             case 'E' -> {
+                String rest;
                 try {
-                    readLine(); // the rest of `En\n`, if it arrives
-                } catch (IOException ignored) {
-                    // The connection is being poisoned anyway.
+                    rest = readLine();
+                } catch (IOException unreadable) {
+                    // Not even the end of the line arrived, so `En` is not
+                    // confirmed: treat it as the unspecific failure.
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: unexpected response from server: E", unreadable);
                 }
-                throw new NanocachedException.ServerRejected();
+                if (rest.equals("n") || rest.startsWith("n ")) {
+                    throw new NanocachedException.ServerRejected();
+                }
+                throw new NanocachedException.ConnectionFailed(
+                        "nanocached: unexpected response from server: E", null);
             }
             default -> throw new NanocachedException.ConnectionFailed(
                     "nanocached: unexpected response from server: " + (char) marker, null);

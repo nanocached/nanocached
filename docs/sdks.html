@@ -294,7 +294,12 @@ existed, err := client.Delete("greeting")</code></pre>
   lost is retried, and it cannot overwrite a write that lands at the same
   time. <code>getAndTouch</code> asks only the primary for the value (no
   hedging, no fallback to a replica on a miss) and sends the other owners
-  the plain touch. Against a node that predates the command the SDK
+  the plain touch. With a TTL of <code>0</code> the other owners are sent
+  theirs only once the primary has answered (sent together, a replica
+  would expire its copy while the primary leg was still failing, and the
+  reroute would then find nothing where the value was); those legs run
+  outside the request order a pipelined connection otherwise keeps. Against
+  a node that predates the command the SDK
   raises a "server too old" error; upgrade every node before using it.
   See <a href="protocol.html#touch">t</a>.
   <br>For many keys at once, <code>touchMany</code> and
@@ -303,7 +308,10 @@ existed, err := client.Delete("greeting")</code></pre>
   whole batch and cost one round trip per involved node. Every owner is
   sent the batch and the primary's answer is each key's; only a key's
   primary is asked for the value, so a node that is the primary of some
-  keys and a replica of others receives two frames. Failures follow
+  keys and a replica of others receives two frames. With a TTL of
+  <code>0</code> the primaries go first and the other owners are sent one
+  plain batch afterwards, for the keys a primary answered, as for the
+  single touch. Failures follow
   <code>getMany</code>: <code>getManyAndTouch</code> carries the keys that
   resolved, <code>touchMany</code> carries none (a touch is idempotent, so
   the whole batch can be sent again). See

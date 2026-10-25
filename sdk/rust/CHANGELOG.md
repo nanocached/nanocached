@@ -8,6 +8,24 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Fixed
 
+- A `Some(0)` touch (`touch`, `get_and_touch`, `touch_many`,
+  `get_many_and_touch`) no longer loses the value when its primary is
+  rerouted. The plain `t ... 0` to the other owners used to go out at the
+  same time as the primary's frame, so a primary that could not be reached
+  or answered `W` from a stale ring left a replica that had already expired
+  its copy; the reroute then reached that replica as the new primary and got
+  a miss (`touch` returned `false`, `get_and_touch` / `get_many_and_touch`
+  returned nothing for a key that existed, its value consumed and never
+  returned). With `Some(0)` the primary is now asked alone, and the other
+  owners of the ring in force at that moment are sent the plain touch only
+  after it answered `S`, `V` or `N`; a failed or `W` primary is rerouted with
+  no replica touched. In a batch both passes ask the primaries only, then one
+  plain fan-out goes to the replicas for the keys a primary answered (a miss
+  on the primary included: a replica may still hold a copy). A positive TTL
+  and `None` keep the concurrent fan-out. The replica legs of an expiring
+  touch therefore run after the primary answered, outside the order a
+  pipelined connection otherwise gives a key's operations, like the existing
+  retry paths.
 - With `Some(0)`, a chunk of `touch_many` / `get_many_and_touch` that fails
   after its frame was written no longer takes the chunks after it down with
   it. A batch of more than 400 keys on one primary is sent as several `y`
