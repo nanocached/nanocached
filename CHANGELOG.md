@@ -69,6 +69,15 @@ framework adapters at one version, whether or not a component changed.
   refused (a container has to listen on `0.0.0.0`); set a secret, bind
   loopback, or restrict the port at the network layer.
 
+### Fixed
+
+- `nanocached-proxy`: a `ttl=0` touch (`t`, `y`, plain or `G`) whose reply is
+  lost after the frame may have reached the node is no longer sent again. A
+  `ttl=0` touch expires the keys it finds, so the second frame answered them
+  as misses and a `G` lost the value the first one consumed. The client now
+  gets the fatal `E`, as for `i`, `k` and `x`, and reads the key to learn what
+  happened; a frame that provably never left the proxy is still retried.
+
 ### Security
 
 - Updated `rustls-webpki` to 0.103.16 in the node, proxy and discovery
