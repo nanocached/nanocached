@@ -2576,12 +2576,18 @@ impl NanocachedClient {
             Err((partial_entries, error)) => (partial_entries, Some(error)),
         };
         // The write may have been applied: `ConnectionLostAfterSend` (the
-        // frame was written) or `ConnectionLostTimedOut` (the node took it
-        // and never answered). `ServerTooOld` keeps its own handling.
+        // frame was written), `ConnectionLostTimedOut` (the node took it
+        // and never answered) or `Protocol` (a reply that could not be
+        // parsed, which only a sent frame gets). `ServerTooOld` keeps its
+        // own handling.
         let sent_failure = !replay_safe
             && matches!(
                 failure,
-                Some(Error::ConnectionLostAfterSend(_) | Error::ConnectionLostTimedOut(_))
+                Some(
+                    Error::ConnectionLostAfterSend(_)
+                        | Error::ConnectionLostTimedOut(_)
+                        | Error::Protocol(_)
+                )
             );
         let failure = failure.map(Self::downgrade_sent_error);
         if let Some(failure) = failure {
