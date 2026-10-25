@@ -236,11 +236,11 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 		c.maybeRefresh(true)
 		retry = c.multiTouchPass(namespace, keyBytes, ttlSeconds, get, retry, state)
 	}
-	if len(retry) == 0 {
-		return keys, state.results, nil
-	}
 	if state.rejected {
 		return keys, state.results, errors.Join(ErrServerTooOldBatch, state.lastErr)
+	}
+	if len(retry) == 0 {
+		return keys, state.results, nil
 	}
 	for _, idx := range retry {
 		if state.wrongNode[idx] {
@@ -400,6 +400,10 @@ func (c *Client) multiTouchPass(
 				}
 			case answered:
 				state.results[idx] = entries[i]
+			case i >= resolved && errors.Is(err, errServerRejected):
+				// A node that predates `y` refuses it every time: another
+				// pass would only dial it again.
+				delete(state.wrongNode, idx)
 			default:
 				if i < resolved {
 					state.wrongNode[idx] = true

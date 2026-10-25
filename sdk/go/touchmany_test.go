@@ -762,6 +762,35 @@ func TestClusterBatchTouchWithAnUnreachablePrimaryIsAConnectionLossWithTheOtherH
 	}
 }
 
+func TestClusterBatchTouchAgainstANodeThatPredatesYIsNotResentOrRetried(t *testing.T) {
+	// `En` is the node refusing `y` itself, so neither a redial-and-resend
+	// of the frame nor a refresh-and-second-pass can change the answer: the
+	// call must not dial the old node again.
+	var opts [2]mockNodeOpts
+	opts[0].withoutMultiTouch = true
+	nodes, discovery := startBatchTouchCluster(t, 2, opts)
+	client := connectCluster(t, discovery, Config{})
+	keys := keysWithPrimary(testNames[0], 3, "mt")
+	if _, err := client.SetMany(valuesFor(keys), 0); err != nil {
+		t.Fatal(err)
+	}
+	old := nodes[testNames[0]]
+	for name, call := range map[string]func() error{
+		"TouchMany":       func() error { _, err := client.TouchMany(keys, 30); return err },
+		"GetManyAndTouch": func() error { _, err := client.GetManyAndTouch(keys, 30); return err },
+	} {
+		before := old.connectionCount.Load()
+		if err := call(); !errors.Is(err, ErrServerTooOldBatch) {
+			t.Fatalf("%s err = %v, want ErrServerTooOldBatch", name, err)
+		}
+		// The `En` poisons the connection the call used, so the next call
+		// is the one that dials; this call itself dials at most that once.
+		if dialed := old.connectionCount.Load() - before; dialed > 1 {
+			t.Fatalf("%s dialed the old node %d times, want at most 1", name, dialed)
+		}
+	}
+}
+
 func TestClusterBatchTouchMovesOnlyAFailedChunksTailToTheRetry(t *testing.T) {
 	nodes, discovery := startBatchTouchCluster(t, 2, [2]mockNodeOpts{})
 	client := connectCluster(t, discovery, Config{})
