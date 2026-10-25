@@ -180,6 +180,35 @@ struct NodeState {
     /// Issue #825: behave like a node that predates `t` — answer `En` and
     /// close the connection.
     reject_touch: std::sync::atomic::AtomicBool,
+    /// Issue #871: every `y` (batched touch) frame this node has received,
+    /// in receipt order — lets a test assert how a batch was split and
+    /// which node got which form.
+    multi_touch_frames: Mutex<Vec<MultiTouchFrame>>,
+    /// Issue #871: behave like a node that knows `t` but predates `y` —
+    /// answer `En` and close the connection.
+    reject_multi_touch: std::sync::atomic::AtomicBool,
+    /// Issue #871: `0` (the default) never triggers. Once set to N, the
+    /// Nth `y` frame this node receives answers normally, but every `y`
+    /// frame after that (on ANY connection, including a redial) closes
+    /// without replying, permanently — a chunked batch's later chunk
+    /// failing even after the client's own reconnect-and-retry.
+    die_after_multi_touch_frames: AtomicUsize,
+    /// How many `y` frames this node has received, counting for
+    /// `die_after_multi_touch_frames`.
+    multi_touch_requests: AtomicUsize,
+    /// Issue #871: when set to `count + 1`, the next `y` reply reports
+    /// exactly `count` roster entries whatever the request's key count
+    /// (issue #181's desync, for `y`); `0` is disarmed.
+    multi_touch_bad_count_plus_one: AtomicUsize,
+}
+
+/// One `y` frame as the mock saw it (issue #871).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MultiTouchFrame {
+    namespace: String,
+    keys: Vec<String>,
+    ttl_seconds: Option<u64>,
+    get: bool,
 }
 
 struct MockNode {
@@ -662,6 +691,127 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     }
                 };
                 if stream.get_mut().write_all(&reply).await.is_err() {
+                    return;
+                }
+            }
+            "y" => {
+                // Batched touch (issue #871): `y <ns-len> <n> <key-len-1> ...
+                // <key-len-n>[ <ttl>][ G][ <tag>]`, always namespaced. One
+                // TTL for the whole batch; no ttl field removes the TTL, 0
+                // expires the keys at once. Plain: `Y <n> S|N|W ...`; with
+                // `G`: `m`'s `M` reply for the keys touched. Like `m`/`o`,
+                // take_wrong_node() answers the whole frame `W`.
+                let namespace = read_exact(&mut stream, parts[1].parse().unwrap()).await;
+                let n: usize = parts[2].parse().unwrap();
+                let mut keys = Vec::with_capacity(n);
+                for i in 0..n {
+                    let key_len: usize = parts[3 + i].parse().unwrap();
+                    keys.push(read_exact(&mut stream, key_len).await);
+                }
+                let mut ttl_seconds: Option<u64> = None;
+                let mut with_value = false;
+                let end = parts.len() - usize::from(tagged);
+                for field in &parts[3 + n..end] {
+                    if *field == "G" {
+                        with_value = true;
+                    } else {
+                        ttl_seconds = Some(field.parse().unwrap());
+                    }
+                }
+                let this_request = state.multi_touch_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                state
+                    .multi_touch_frames
+                    .lock()
+                    .unwrap()
+                    .push(MultiTouchFrame {
+                        namespace: String::from_utf8(namespace.clone()).unwrap(),
+                        keys: keys
+                            .iter()
+                            .map(|key| String::from_utf8(key.clone()).unwrap())
+                            .collect(),
+                        ttl_seconds,
+                        get: with_value,
+                    });
+                if state.reject_touch.load(Ordering::SeqCst)
+                    || state.reject_multi_touch.load(Ordering::SeqCst)
+                {
+                    let _ = stream.get_mut().write_all(b"En\n").await;
+                    return;
+                }
+                if state.silent.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let die_after = state.die_after_multi_touch_frames.load(Ordering::SeqCst);
+                if die_after != 0 && this_request > die_after {
+                    return;
+                }
+                if take_one(&state.retryable_replies) {
+                    let reply = format!("R{tag_suffix}\n");
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let wrong_node = take_wrong_node(&state);
+                let mut tokens: Vec<String> = Vec::with_capacity(n);
+                let mut hits: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+                for key in &keys {
+                    if wrong_node {
+                        tokens.push("W".to_string());
+                        hits.push(None);
+                        continue;
+                    }
+                    let composite = store_key(&namespace, key);
+                    let existing = state.store.lock().unwrap().get(&composite).cloned();
+                    let Some(value) = existing else {
+                        tokens.push(if with_value { "-" } else { "N" }.to_string());
+                        hits.push(None);
+                        continue;
+                    };
+                    if ttl_seconds == Some(0) {
+                        state.store.lock().unwrap().remove(&composite);
+                        state.ttls.lock().unwrap().remove(&composite);
+                    } else if let Some(ttl) = ttl_seconds {
+                        state.ttls.lock().unwrap().insert(composite, ttl);
+                    } else {
+                        state.ttls.lock().unwrap().remove(&composite);
+                    }
+                    if with_value {
+                        tokens.push(value.len().to_string());
+                        hits.push(Some(value));
+                    } else {
+                        tokens.push("S".to_string());
+                        hits.push(None);
+                    }
+                }
+                if take_one(&state.hang_after_touch) {
+                    // Applied above, but the reply never comes.
+                    return;
+                }
+                let bad = state
+                    .multi_touch_bad_count_plus_one
+                    .swap(0, Ordering::SeqCst);
+                if bad > 0 {
+                    let count = bad - 1;
+                    tokens.truncate(count);
+                    hits.truncate(count);
+                    while tokens.len() < count {
+                        tokens.push(if with_value { "-" } else { "N" }.to_string());
+                        hits.push(None);
+                    }
+                }
+                let mut reply = format!("{} {}", if with_value { 'M' } else { 'Y' }, tokens.len());
+                for token in &tokens {
+                    reply.push(' ');
+                    reply.push_str(token);
+                }
+                reply.push_str(&tag_suffix);
+                reply.push('\n');
+                let mut frame = reply.into_bytes();
+                for hit in hits.into_iter().flatten() {
+                    frame.extend_from_slice(&hit);
+                }
+                if stream.get_mut().write_all(&frame).await.is_err() {
                     return;
                 }
             }
@@ -3211,11 +3361,11 @@ async fn an_old_server_is_reported_as_server_too_old_and_the_client_stays_usable
     node.state.reject_touch.store(true, Ordering::SeqCst);
     assert!(matches!(
         client.touch("k", Some(30)).await,
-        Err(Error::ServerTooOld)
+        Err(Error::ServerTooOld { command: "t" })
     ));
     assert!(matches!(
         client.get_and_touch("k", Some(30)).await,
-        Err(Error::ServerTooOld)
+        Err(Error::ServerTooOld { command: "t" })
     ));
     assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
 
@@ -4035,6 +4185,826 @@ async fn set_many_bytes_cluster_leg_does_not_overcount_replica_write_failures_on
     for (_, node) in nodes {
         node.stop();
     }
+}
+
+// ── batched touch / get_many_and_touch (issue #871) ─────────────────
+
+fn multi_touch_frames(node: &MockNode) -> Vec<MultiTouchFrame> {
+    node.state.multi_touch_frames.lock().unwrap().clone()
+}
+
+/// A frame as `namespace|k1,k2|ttl|get` (`-` for no TTL), for compact assertions.
+fn describe_frame(frame: &MultiTouchFrame) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        frame.namespace,
+        frame.keys.join(","),
+        frame
+            .ttl_seconds
+            .map_or_else(|| "-".to_string(), |ttl| ttl.to_string()),
+        if frame.get { "G" } else { "P" }
+    )
+}
+
+fn frames_with_get(node: &MockNode, get: bool) -> Vec<MultiTouchFrame> {
+    multi_touch_frames(node)
+        .into_iter()
+        .filter(|frame| frame.get == get)
+        .collect()
+}
+
+fn keys_whose_primary_is(name: &str, count: usize) -> Vec<String> {
+    (0..)
+        .map(|i| format!("batch-{i}"))
+        .filter(|key| owners_of(key)[0] == name)
+        .take(count)
+        .collect()
+}
+
+fn values_for(keys: &[String]) -> HashMap<String, String> {
+    keys.iter()
+        .map(|key| (key.clone(), format!("value of {key}")))
+        .collect()
+}
+
+fn concat(first: &[String], second: &[String]) -> Vec<String> {
+    first.iter().chain(second).cloned().collect()
+}
+
+async fn stop_cluster(
+    client: NanocachedClient,
+    nodes: Vec<(String, MockNode)>,
+    discovery: MockDiscovery,
+) {
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn batch_touch_frames_carry_the_ttl_and_the_get_flag() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let keys = ["a", "bb"];
+
+    client.touch_many(&keys, Some(30)).await.unwrap();
+    client.touch_many(&keys, None).await.unwrap();
+    client.get_many_and_touch(&keys, Some(45)).await.unwrap();
+    client.get_many_and_touch_bytes(&keys, None).await.unwrap();
+    client
+        .namespace("tenant")
+        .touch_many(&keys, Some(7))
+        .await
+        .unwrap();
+
+    let frames: Vec<String> = multi_touch_frames(&node)
+        .iter()
+        .map(describe_frame)
+        .collect();
+    assert_eq!(
+        frames,
+        [
+            "|a,bb|30|P",
+            "|a,bb|-|P",
+            "|a,bb|45|G",
+            "|a,bb|-|G",
+            "tenant|a,bb|7|P"
+        ]
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn touch_many_reports_each_key_and_never_creates_one() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("a", "1", 100).await.unwrap();
+    client.set("b", "2", 100).await.unwrap();
+
+    let touched = client
+        .touch_many(&["a", "missing", "b"], Some(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        touched,
+        HashMap::from([
+            ("a".to_string(), true),
+            ("missing".to_string(), false),
+            ("b".to_string(), true)
+        ])
+    );
+    assert_eq!(touch_ttl(&node, b"", "a"), Some(30));
+    assert_eq!(touch_ttl(&node, b"", "b"), Some(30));
+    assert!(!node
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(&b"missing".to_vec()));
+
+    client.touch_many(&["a"], None).await.unwrap();
+    assert_eq!(touch_ttl(&node, b"", "a"), None);
+
+    // 0 expires at once — the opposite of set, where 0 means no expiry.
+    let expired = client.touch_many(&["a", "b"], Some(0)).await.unwrap();
+    assert_eq!(
+        expired,
+        HashMap::from([("a".to_string(), true), ("b".to_string(), true)])
+    );
+    assert_eq!(client.get("a").await.unwrap(), None);
+    assert_eq!(client.get("b").await.unwrap(), None);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn get_many_and_touch_returns_the_hits_and_sets_the_ttl() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("a", "one", 100).await.unwrap();
+    client.set("b", "two", 100).await.unwrap();
+
+    let hits = client
+        .get_many_and_touch(&["a", "missing", "b"], Some(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        hits,
+        HashMap::from([
+            ("a".to_string(), "one".to_string()),
+            ("b".to_string(), "two".to_string())
+        ])
+    );
+    assert_eq!(touch_ttl(&node, b"", "a"), Some(30));
+    assert!(!node
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(&b"missing".to_vec()));
+
+    let raw = client
+        .get_many_and_touch_bytes(&["a", "missing"], Some(40))
+        .await
+        .unwrap();
+    assert_eq!(raw, HashMap::from([("a".to_string(), b"one".to_vec())]));
+    assert_eq!(touch_ttl(&node, b"", "a"), Some(40));
+
+    client.get_many_and_touch_bytes(&["a"], None).await.unwrap();
+    assert_eq!(touch_ttl(&node, b"", "a"), None);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn batch_touch_collapses_duplicate_keys() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("a", "one", 100).await.unwrap();
+    client.set("b", "two", 100).await.unwrap();
+
+    let touched = client.touch_many(&["a", "b", "a"], Some(30)).await.unwrap();
+    assert_eq!(
+        touched,
+        HashMap::from([("a".to_string(), true), ("b".to_string(), true)])
+    );
+    let hits = client
+        .get_many_and_touch(&["a", "b", "a", "missing", "missing"], Some(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        hits,
+        HashMap::from([
+            ("a".to_string(), "one".to_string()),
+            ("b".to_string(), "two".to_string())
+        ])
+    );
+
+    let frames: Vec<String> = multi_touch_frames(&node)
+        .iter()
+        .map(describe_frame)
+        .collect();
+    assert_eq!(frames, ["|a,b|30|P", "|a,b,missing|30|G"]);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn batch_touch_is_scoped_to_its_namespace() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let tenant = client.namespace("tenant");
+    tenant.set("k", "in-tenant", 100).await.unwrap();
+    client.set("k", "in-default", 100).await.unwrap();
+
+    let touched = tenant
+        .touch_many(&["k", "only-default"], Some(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        touched,
+        HashMap::from([("k".to_string(), true), ("only-default".to_string(), false)])
+    );
+    let hits = tenant
+        .get_many_and_touch(&["k", "only-default"], Some(6))
+        .await
+        .unwrap();
+    assert_eq!(
+        hits,
+        HashMap::from([("k".to_string(), "in-tenant".to_string())])
+    );
+    let raw = tenant
+        .get_many_and_touch_bytes(&["k"], Some(7))
+        .await
+        .unwrap();
+    assert_eq!(
+        raw,
+        HashMap::from([("k".to_string(), b"in-tenant".to_vec())])
+    );
+
+    assert_eq!(touch_ttl(&node, b"tenant", "k"), Some(7));
+    assert_eq!(
+        touch_ttl(&node, b"", "k"),
+        Some(100),
+        "the default keyspace was not touched"
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn get_many_and_touch_decompresses_when_compression_is_enabled() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port).compress(true))
+        .await
+        .unwrap();
+
+    let value = "compressible ".repeat(200);
+    client.set("k", &value, 0).await.unwrap();
+    let hits = client.get_many_and_touch(&["k"], Some(30)).await.unwrap();
+    assert_eq!(hits, HashMap::from([("k".to_string(), value)]));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn batch_touch_rejects_bad_arguments_before_any_io() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let none: [&str; 0] = [];
+
+    assert!(matches!(
+        client.touch_many(&none, Some(30)).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        client.get_many_and_touch(&none, Some(30)).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        client.get_many_and_touch_bytes(&none, Some(30)).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        client.touch_many(&["ok", ""], Some(30)).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(multi_touch_frames(&node).is_empty());
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn batch_touch_splits_at_the_key_limit() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let keys: Vec<String> = (0..401).map(|i| format!("k{i}")).collect();
+    client.set("k0", "first", 0).await.unwrap();
+    client.set("k400", "last", 0).await.unwrap();
+
+    let touched = client.touch_many(&keys, Some(30)).await.unwrap();
+    assert_eq!(touched.len(), 401);
+    assert!(touched["k0"]);
+    assert!(touched["k400"]);
+    assert!(!touched["k1"]);
+    let sizes = |node: &MockNode| -> Vec<usize> {
+        multi_touch_frames(node)
+            .iter()
+            .map(|frame| frame.keys.len())
+            .collect()
+    };
+    assert_eq!(sizes(&node), [400, 1]);
+
+    let hits = client.get_many_and_touch(&keys, Some(30)).await.unwrap();
+    assert_eq!(
+        hits,
+        HashMap::from([
+            ("k0".to_string(), "first".to_string()),
+            ("k400".to_string(), "last".to_string())
+        ])
+    );
+    assert_eq!(sizes(&node), [400, 1, 400, 1]);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn batch_touch_works_on_a_tagged_connection() {
+    let node = MockNode::start_with(NodeState {
+        support_tags: true,
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("k", "v", 100).await.unwrap();
+    let touched = client
+        .touch_many(&["k", "missing"], Some(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        touched,
+        HashMap::from([("k".to_string(), true), ("missing".to_string(), false)])
+    );
+    let hits = client
+        .get_many_and_touch(&["k", "missing"], Some(40))
+        .await
+        .unwrap();
+    assert_eq!(hits, HashMap::from([("k".to_string(), "v".to_string())]));
+    assert_eq!(touch_ttl(&node, b"", "k"), Some(40));
+    assert_eq!(multi_touch_frames(&node).len(), 2);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn batch_touch_against_an_old_server_is_server_too_old_and_the_client_stays_usable() {
+    for predates_touch_too in [false, true] {
+        let node = MockNode::start().await;
+        let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+        client.set("k", "v", 0).await.unwrap();
+        if predates_touch_too {
+            node.state.reject_touch.store(true, Ordering::SeqCst);
+        } else {
+            node.state.reject_multi_touch.store(true, Ordering::SeqCst);
+        }
+
+        assert!(matches!(
+            client.touch_many(&["k"], Some(30)).await,
+            Err(Error::ServerTooOld { command: "y" })
+        ));
+        assert!(matches!(
+            client.get_many_and_touch(&["k"], Some(30)).await,
+            Err(Error::ServerTooOld { command: "y" })
+        ));
+        assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+        // The single-key touch keeps the `t` wording it always had.
+        if predates_touch_too {
+            assert!(matches!(
+                client.touch("k", Some(30)).await,
+                Err(Error::ServerTooOld { command: "t" })
+            ));
+        } else {
+            assert!(client.touch("k", Some(30)).await.unwrap());
+        }
+
+        client.close().await;
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn batch_touch_keeps_earlier_chunks_when_a_later_chunk_fails() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let keys: Vec<String> = (0..401).map(|i| format!("k{i}")).collect();
+    client.set("k0", "first-chunk-value", 0).await.unwrap();
+
+    node.state
+        .die_after_multi_touch_frames
+        .store(1, Ordering::SeqCst);
+    match client.get_many_and_touch_bytes(&keys, Some(30)).await {
+        Err(Error::PartialConnectionLost(partial, cause)) => {
+            assert_eq!(
+                partial,
+                HashMap::from([("k0".to_string(), b"first-chunk-value".to_vec())])
+            );
+            assert!(
+                matches!(*cause, Error::ConnectionLost(_)),
+                "cause = {cause:?}"
+            );
+        }
+        other => panic!("expected PartialConnectionLost, got {other:?}"),
+    }
+
+    // touch_many carries no partial result: the whole batch is idempotent, send it again.
+    assert!(matches!(
+        client.touch_many(&keys, Some(30)).await,
+        Err(Error::ConnectionLost(_))
+    ));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn batch_touch_ends_on_a_whole_frame_wrong_node_on_a_single_node() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("k", "v", 100).await.unwrap();
+
+    node.state.wrong_node_replies.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        client.touch_many(&["k"], Some(30)).await,
+        Err(Error::WrongNode)
+    ));
+
+    node.state.wrong_node_replies.store(1, Ordering::SeqCst);
+    match client.get_many_and_touch(&["k"], Some(30)).await {
+        Err(Error::PartialWrongNodeText(partial)) => assert!(partial.is_empty()),
+        other => panic!("expected PartialWrongNodeText, got {other:?}"),
+    }
+    assert_eq!(
+        touch_ttl(&node, b"", "k"),
+        Some(100),
+        "a wrong-node answer touches nothing"
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_batch_touch_reply_with_the_wrong_entry_count_is_never_trusted() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    for (key, value) in [("a", "1"), ("b", "2"), ("c", "3")] {
+        client.set(key, value, 100).await.unwrap();
+    }
+    let keys = ["a", "b", "c"];
+
+    // The connection is dropped as desynced and the idempotent request is
+    // sent again on a fresh one, so the caller sees the right answer
+    // rather than a shifted one.
+    node.state
+        .multi_touch_bad_count_plus_one
+        .store(2, Ordering::SeqCst);
+    let touched = client.touch_many(&keys, Some(30)).await.unwrap();
+    assert_eq!(touched.len(), 3);
+    assert!(touched.values().all(|touched| *touched));
+    assert_eq!(multi_touch_frames(&node).len(), 2);
+
+    node.state
+        .multi_touch_bad_count_plus_one
+        .store(3, Ordering::SeqCst);
+    let hits = client.get_many_and_touch(&keys, Some(31)).await.unwrap();
+    assert_eq!(
+        hits,
+        HashMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+            ("c".to_string(), "3".to_string())
+        ])
+    );
+    assert_eq!(multi_touch_frames(&node).len(), 4);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn batch_touch_goes_to_every_owner_and_goes_to_the_primary_in_the_get_form() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let node_a = node_named(&nodes, NAMES[0]);
+    let node_b = node_named(&nodes, NAMES[1]);
+    let primary_a = keys_whose_primary_is(NAMES[0], 3);
+    let primary_b = keys_whose_primary_is(NAMES[1], 3);
+    let all = concat(&primary_a, &primary_b);
+    let values = values_for(&all);
+    client.set_many(&values, 0).await.unwrap();
+
+    let two = [primary_a[0].clone(), primary_b[0].clone()];
+    let touched = client.touch_many(&two, Some(30)).await.unwrap();
+    assert!(touched.values().all(|touched| *touched));
+    for node in [node_a, node_b] {
+        // One plain frame per node.
+        let frames = multi_touch_frames(node);
+        assert_eq!(frames.len(), 1);
+        assert!(!frames[0].get);
+        assert_eq!(frames[0].keys.len(), 2);
+    }
+    let before_a = multi_touch_frames(node_a).len();
+    let before_b = multi_touch_frames(node_b).len();
+
+    assert_eq!(
+        client.get_many_and_touch(&all, Some(40)).await.unwrap(),
+        values
+    );
+    // A node is the primary of some keys and a replica of the others, so
+    // it gets the G frame for the first and a plain one for the second.
+    assert_eq!(multi_touch_frames(node_a).len() - before_a, 2);
+    assert_eq!(multi_touch_frames(node_b).len() - before_b, 2);
+    let sorted = |mut keys: Vec<String>| {
+        keys.sort();
+        keys
+    };
+    let get_keys =
+        |node: &MockNode| sorted(frames_with_get(node, true).last().unwrap().keys.clone());
+    let plain_keys =
+        |node: &MockNode| sorted(frames_with_get(node, false).last().unwrap().keys.clone());
+    assert_eq!(get_keys(node_a), sorted(primary_a.clone()));
+    assert_eq!(plain_keys(node_a), sorted(primary_b.clone()));
+    assert_eq!(get_keys(node_b), sorted(primary_b.clone()));
+    assert_eq!(plain_keys(node_b), sorted(primary_a.clone()));
+    for key in &all {
+        assert_eq!(touch_ttl(node_a, b"", key), Some(40));
+        assert_eq!(touch_ttl(node_b, b"", key), Some(40));
+    }
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn get_many_and_touch_does_not_fall_back_to_a_replica_on_a_primary_miss() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let primary = node_named(&nodes, NAMES[0]);
+    let replica = node_named(&nodes, NAMES[1]);
+    let key = keys_whose_primary_is(NAMES[0], 1).remove(0);
+    // Only the replica holds the value.
+    replica
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(key.as_bytes().to_vec(), b"v".to_vec());
+
+    assert!(client
+        .get_many_and_touch(&[key], Some(30))
+        .await
+        .unwrap()
+        .is_empty());
+
+    assert_eq!(frames_with_get(primary, true).len(), 1);
+    assert!(
+        frames_with_get(replica, true).is_empty(),
+        "the replica is never asked for the value"
+    );
+    assert_eq!(frames_with_get(replica, false).len(), 1);
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn batch_touch_recovers_from_a_wrong_node_answer() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let node_a = node_named(&nodes, NAMES[0]);
+    let all = concat(
+        &keys_whose_primary_is(NAMES[0], 3),
+        &keys_whose_primary_is(NAMES[1], 3),
+    );
+    let values = values_for(&all);
+    client.set_many(&values, 0).await.unwrap();
+
+    node_a.state.wrong_node_replies.store(1, Ordering::SeqCst);
+    let touched = client.touch_many(&all, Some(30)).await.unwrap();
+    assert_eq!(touched.len(), 6);
+    assert!(touched.values().all(|touched| *touched));
+    assert_eq!(
+        multi_touch_frames(node_a).len(),
+        2,
+        "the keys A answered W for were sent again"
+    );
+
+    node_a.state.wrong_node_replies.store(1, Ordering::SeqCst);
+    assert_eq!(
+        client.get_many_and_touch(&all, Some(31)).await.unwrap(),
+        values
+    );
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn batch_touch_still_wrong_node_after_the_retry_returns_what_did_resolve() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let node_a = node_named(&nodes, NAMES[0]);
+    let primary_a = keys_whose_primary_is(NAMES[0], 3);
+    let primary_b = keys_whose_primary_is(NAMES[1], 3);
+    let all = concat(&primary_a, &primary_b);
+    client.set_many(&values_for(&all), 0).await.unwrap();
+
+    node_a.state.wrong_node_replies.store(8, Ordering::SeqCst);
+    assert!(matches!(
+        client.touch_many(&all, Some(30)).await,
+        Err(Error::WrongNode)
+    ));
+
+    match client.get_many_and_touch(&all, Some(31)).await {
+        Err(Error::PartialWrongNodeText(partial)) => {
+            assert_eq!(partial, values_for(&primary_b));
+        }
+        other => panic!("expected PartialWrongNodeText, got {other:?}"),
+    }
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn a_batch_touch_whose_reply_was_lost_is_sent_again() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let node_a = node_named(&nodes, NAMES[0]);
+    let keys = keys_whose_primary_is(NAMES[0], 3);
+    client.set_many(&values_for(&keys), 0).await.unwrap();
+
+    node_a.state.hang_after_touch.store(1, Ordering::SeqCst);
+    let touched = client.touch_many(&keys, Some(30)).await.unwrap();
+    assert!(touched.values().all(|touched| *touched));
+    assert_eq!(multi_touch_frames(node_a).len(), 2);
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn a_replica_that_predates_batch_touch_is_counted_per_key_and_does_not_fail_the_primarys_answer(
+) {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let primary = node_named(&nodes, NAMES[0]);
+    let replica = node_named(&nodes, NAMES[1]);
+    let keys = keys_whose_primary_is(NAMES[0], 3);
+    let values = values_for(&keys);
+    client.set_many(&values, 0).await.unwrap();
+    replica
+        .state
+        .reject_multi_touch
+        .store(true, Ordering::SeqCst);
+    let before = client.stats().replica_write_failures;
+
+    let touched = client.touch_many(&keys, Some(30)).await.unwrap();
+    assert!(touched.values().all(|touched| *touched));
+    assert_eq!(client.stats().replica_write_failures, before + 3);
+    assert_eq!(
+        client.get_many_and_touch(&keys, Some(40)).await.unwrap(),
+        values
+    );
+    assert_eq!(client.stats().replica_write_failures, before + 6);
+    for key in &keys {
+        assert_eq!(touch_ttl(primary, b"", key), Some(40));
+    }
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn a_primary_that_predates_batch_touch_is_server_too_old_not_a_connection_failure() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    // Keys of the healthy node resolve, so a rejection that went
+    // unrecognised would surface as a partial connection failure.
+    let keys = concat(
+        &keys_whose_primary_is(NAMES[0], 2),
+        &keys_whose_primary_is(NAMES[1], 2),
+    );
+    client.set_many(&values_for(&keys), 0).await.unwrap();
+    node_named(&nodes, NAMES[0])
+        .state
+        .reject_multi_touch
+        .store(true, Ordering::SeqCst);
+
+    assert!(matches!(
+        client.touch_many(&keys, Some(30)).await,
+        Err(Error::ServerTooOld { command: "y" })
+    ));
+    assert!(matches!(
+        client.get_many_and_touch(&keys, Some(30)).await,
+        Err(Error::ServerTooOld { command: "y" })
+    ));
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn batch_touch_reports_an_unreachable_primary_as_a_connection_failure_not_wrong_node() {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let dead_keys = keys_whose_primary_is(NAMES[0], 3);
+    let live_keys = keys_whose_primary_is(NAMES[1], 3);
+    let all = concat(&dead_keys, &live_keys);
+    let values = values_for(&all);
+    client.set_many(&values, 0).await.unwrap();
+    node_named(&nodes, NAMES[0]).stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    match client.touch_many(&all, Some(30)).await {
+        Err(Error::ConnectionLost(_)) => {}
+        other => panic!("expected a bare ConnectionLost, got {other:?}"),
+    }
+
+    match client.get_many_and_touch(&all, Some(30)).await {
+        Err(Error::PartialConnectionLostText(partial, cause)) => {
+            assert_eq!(partial, values_for(&live_keys));
+            assert!(
+                matches!(*cause, Error::ConnectionLost(_)),
+                "cause = {cause:?}"
+            );
+        }
+        other => panic!("expected PartialConnectionLostText, got {other:?}"),
+    }
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn batch_touch_goes_to_the_owners_of_a_namespaced_key() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let tenant = client.namespace("tenant");
+    let keys: Vec<String> = ["a", "b", "c", "d", "e", "f"]
+        .iter()
+        .map(|key| key.to_string())
+        .collect();
+    let values = values_for(&keys);
+    tenant.set_many(&values, 0).await.unwrap();
+
+    assert_eq!(
+        tenant.get_many_and_touch(&keys, Some(30)).await.unwrap(),
+        values
+    );
+    let touched = tenant.touch_many(&keys, Some(31)).await.unwrap();
+    assert!(touched.values().all(|touched| *touched));
+    for (_, node) in &nodes {
+        for frame in multi_touch_frames(node) {
+            assert_eq!(frame.namespace, "tenant");
+        }
+        for key in &keys {
+            assert_eq!(touch_ttl(node, b"tenant", key), Some(31));
+        }
+    }
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn batch_touch_reaches_a_fire_and_forget_replica_in_the_background() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port).fire_and_forget_replicas(true))
+        .await
+        .unwrap();
+    let replica = node_named(&nodes, NAMES[1]);
+    let keys = keys_whose_primary_is(NAMES[0], 3);
+    client.set_many(&values_for(&keys), 0).await.unwrap();
+
+    let touched = client.touch_many(&keys, Some(30)).await.unwrap();
+    assert!(touched.values().all(|touched| *touched));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while keys
+        .iter()
+        .any(|key| touch_ttl(replica, b"", key) != Some(30))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the background touch never landed on the replica"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    stop_cluster(client, nodes, discovery).await;
 }
 
 // ── incr replication (issue #129) ───────────────────────────────────

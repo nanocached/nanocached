@@ -331,8 +331,47 @@ answer or a connection failure; no hedging, and no fallback to a replica
 on a miss) and the other owners are sent the plain touch.
 
 Against a node older than the release that added the command, both return
-`Error::ServerTooOld`: such a node answers `En` and closes the connection.
-Upgrade every node before using them.
+`Error::ServerTooOld { command: "t" }`: such a node answers `En` and closes
+the connection. Upgrade every node before using them.
+
+### Many keys at once (touch_many / get_many_and_touch)
+
+`touch_many` and `get_many_and_touch` (`get_many_and_touch_bytes` is the raw
+companion) are the same two operations for a list of keys, in one round trip
+per involved node instead of one per key:
+
+```rust
+client.set_many(&HashMap::from([("a".into(), "1".into()), ("b".into(), "2".into())]), 60).await?;
+client.touch_many(&["a", "b", "missing"], Some(300)).await?;
+// {"a": true, "b": true, "missing": false} — a touch never creates a key
+client.get_many_and_touch(&["a", "b", "missing"], Some(300)).await?;
+// {"a": "1", "b": "2"} — a miss is absent, as in get_many
+```
+
+The TTL is one value for the whole batch and means what it means for
+`touch`: `None` removes it, `Some(0)` expires the keys at once. A key given
+twice is touched once, and a batch of more than 400 keys is split into
+several frames, as for `get_many`. `client.namespace(ns)` handles have all
+three.
+
+Like `touch` it goes to every owner of each key and the primary's answer
+decides. `get_many_and_touch` asks only a key's primary for the value, so a
+node that is the primary of some keys in the batch and a replica of others
+receives two frames, one with `G` and one without. A replica's failure is
+counted in `stats().replica_write_failures` (once per key) and never fails
+the batch. A value that did not fit in the node's reply (16 MiB per frame)
+is left untouched and reads as a miss.
+
+Failures follow `get_many`: `get_many_and_touch` returns
+`Error::PartialWrongNodeText` (keys whose primary still answers a wrong-node
+after one refresh and retry) or `Error::PartialConnectionLostText` (a primary
+that cannot be reached on both passes), each carrying the keys that did
+resolve (`get_many_and_touch_bytes` returns `PartialWrongNode` /
+`PartialConnectionLost`). A primary being down never reads as a wrong-node.
+`touch_many` carries no partial result: it returns a plain `Error::WrongNode`
+or the connection error, and since a touch is idempotent the whole batch can
+simply be sent again. Against a node that has `t` but not `y` both return
+`Error::ServerTooOld { command: "y" }`.
 
 ## Namespaces
 

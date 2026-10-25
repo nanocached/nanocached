@@ -293,7 +293,18 @@ existed, err := client.Delete("greeting")</code></pre>
   hedging, no fallback to a replica on a miss) and sends the other owners
   the plain touch. Against a node that predates the command the SDK
   raises a "server too old" error; upgrade every node before using it.
-  See <a href="protocol.html#touch">t</a>.</li>
+  See <a href="protocol.html#touch">t</a>.
+  <br>For many keys at once, <code>touchMany</code> and
+  <code>getManyAndTouch</code> (<code>touch_many</code>/<code>get_many_and_touch</code>,
+  <code>TouchMany</code>, <code>TouchManyAsync</code>) take one TTL for the
+  whole batch and cost one round trip per involved node. Every owner is
+  sent the batch and the primary's answer is each key's; only a key's
+  primary is asked for the value, so a node that is the primary of some
+  keys and a replica of others receives two frames. Failures follow
+  <code>getMany</code>: <code>getManyAndTouch</code> carries the keys that
+  resolved, <code>touchMany</code> carries none (a touch is idempotent, so
+  the whole batch can be sent again). See
+  <a href="protocol.html#multi-touch">y</a>.</li>
   <li><b>Failure recovery</b> — a stale routing table (a node answers
   <code>W</code>) or a dead primary both trigger one node-list refresh
   and one retry; recovery is bounded by discovery's liveness timeout.</li>

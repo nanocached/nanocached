@@ -786,6 +786,54 @@ impl MultiSetTracker {
     }
 }
 
+/// One (owner, form) sub-batch of a batched touch (issue #871): the keys
+/// it carries and, per key, whether the owner is that key's primary. `get`
+/// is the `G` form, used only for primary-held keys.
+#[derive(Default)]
+struct MultiTouchLeg {
+    owner: String,
+    get: bool,
+    indices: Vec<usize>,
+    is_primary: Vec<bool>,
+    keys: Vec<Vec<u8>>,
+}
+
+/// What a batched touch's legs learn across its two passes; legs run
+/// concurrently, so everything sits behind one mutex (never held across an
+/// await).
+#[derive(Default)]
+struct MultiTouchState {
+    inner: std::sync::Mutex<MultiTouchStateInner>,
+}
+
+#[derive(Default)]
+struct MultiTouchStateInner {
+    results: HashMap<usize, MultiEntry>,
+    wrong_node: std::collections::HashSet<usize>,
+    last_cause: Option<Error>,
+    rejected: Option<Error>,
+}
+
+/// What one batched touch ended with, over its distinct keys: `answers[i]`
+/// is the primary's answer for key `i`, `None` for an unresolved one;
+/// `unresolved` the positions (ascending) that never got one; `wrong_node`
+/// whether any of them last answered `W` rather than failing at the
+/// connection level; `cause` the last primary-leg failure; `rejected` the
+/// [`Error::ServerTooOld`] of a primary that predates `y`, if there was
+/// one.
+struct MultiTouchOutcome {
+    answers: Vec<Option<MultiEntry>>,
+    unresolved: Vec<usize>,
+    wrong_node: bool,
+    cause: Option<Error>,
+    rejected: Option<Error>,
+}
+
+/// The error for a batch whose unresolved keys had no owner to ask at all.
+fn no_owner_reachable() -> Error {
+    Error::ConnectionLost("nanocached: no owner is reachable for these keys".to_string())
+}
+
 /// One hedged-read leg's outcome (hedged reads, issue #64): tagged with
 /// `index` — its position in the owners list, 0 being the primary — so
 /// `read_hedged` can tell a provisional replica miss (`index != 0`) apart
@@ -2018,6 +2066,490 @@ impl NanocachedClient {
             }
             other => Ok(other),
         }
+    }
+
+    // ── batched touch (issue #871) ───────────────────────────────────
+
+    /// Batched [`Self::touch`] (issue #871): replaces the TTL of every key
+    /// in `keys` in place, one round trip per involved node, and returns
+    /// each key's outcome — `true` if it existed, `false` for a missing or
+    /// expired key, which a touch never creates. `keys` must be non-empty;
+    /// a key given more than once is touched once. `ttl_seconds` is one
+    /// TTL for the whole batch and means what it means for
+    /// [`Self::touch`]: `None` removes it, `Some(0)` expires the keys at
+    /// once.
+    ///
+    /// Like `touch` it is idempotent, so a request whose reply was lost is
+    /// retried, and in a cluster it goes to every owner of a key, the
+    /// primary's answer being the key's. A replica's failure or `W` is
+    /// counted in `stats().replica_write_failures` and never fails the
+    /// batch. Larger batches are transparently split into more than one
+    /// `y` sub-frame per node (see [`MAX_BATCH_KEYS`]). If some keys'
+    /// primaries are still wrong-node after one bounded refresh-and-retry
+    /// this returns a plain [`Error::WrongNode`], and a key whose primary
+    /// could not be reached on both passes returns that connection error —
+    /// every other key was still touched, and since a touch is idempotent
+    /// the whole batch may simply be sent again, so nothing partial is
+    /// attached. [`Error::ServerTooOld`] against a node that predates the
+    /// command.
+    pub async fn touch_many<K: AsRef<str>>(
+        &self,
+        keys: &[K],
+        ttl_seconds: Option<u64>,
+    ) -> Result<HashMap<String, bool>> {
+        self.touch_many_in(DEFAULT_NAMESPACE, keys, ttl_seconds)
+            .await
+    }
+
+    /// The shared implementation behind [`Self::touch_many`] and
+    /// [`Namespace::touch_many`].
+    async fn touch_many_in<K: AsRef<str>>(
+        &self,
+        namespace: &[u8],
+        keys: &[K],
+        ttl_seconds: Option<u64>,
+    ) -> Result<HashMap<String, bool>> {
+        let (distinct, key_bytes) = Self::prepare_touch_batch(namespace, keys)?;
+        self.before_operation().await?;
+        let outcome = self
+            .multi_touch(namespace, &key_bytes, ttl_seconds, false)
+            .await;
+        if !outcome.unresolved.is_empty() {
+            if let Some(rejected) = outcome.rejected {
+                return Err(rejected);
+            }
+            if outcome.wrong_node {
+                return Err(Error::WrongNode);
+            }
+            return Err(outcome.cause.unwrap_or_else(no_owner_reachable));
+        }
+        Ok(distinct
+            .into_iter()
+            .zip(outcome.answers)
+            .map(|(key, answer)| (key, matches!(answer, Some(MultiEntry::Stored))))
+            .collect())
+    }
+
+    /// Batched [`Self::get_and_touch`] (issue #871): reads the values of
+    /// `keys` and replaces their TTL in one step, one round trip per
+    /// involved node. A miss is absent from the result, creates nothing
+    /// and is not an error. See [`Self::touch_many`] for `ttl_seconds`.
+    /// Decoded as strict UTF-8, like [`Self::get_many`].
+    ///
+    /// A read that writes, as `get_and_touch` is: each key goes to its
+    /// primary in the `G` form, with no hedging and no fallback to a
+    /// replica on a miss, and its other owners are sent the plain touch,
+    /// so a replica is never the only owner touched. It counts as a read
+    /// on the primary, which makes the entries the most recently used. A
+    /// value the node had no room for in its reply (16 MiB per frame) is
+    /// left out and left untouched, so it reads as a miss here.
+    ///
+    /// Failures follow [`Self::get_many`]: keys still wrong-node after one
+    /// bounded refresh-and-retry return [`Error::PartialWrongNodeText`],
+    /// and keys whose primary was unreachable on both passes return
+    /// [`Error::PartialConnectionLostText`] (the bare connection error
+    /// when nothing resolved), each carrying the keys that did resolve.
+    /// Unlike `get_many` a key is not tried on its next owner when its
+    /// primary is down — a replica's answer would leave the primary
+    /// untouched.
+    pub async fn get_many_and_touch<K: AsRef<str>>(
+        &self,
+        keys: &[K],
+        ttl_seconds: Option<u64>,
+    ) -> Result<HashMap<String, String>> {
+        self.get_many_and_touch_in(DEFAULT_NAMESPACE, keys, ttl_seconds)
+            .await
+    }
+
+    /// The shared implementation behind [`Self::get_many_and_touch`] and
+    /// [`Namespace::get_many_and_touch`].
+    async fn get_many_and_touch_in<K: AsRef<str>>(
+        &self,
+        namespace: &[u8],
+        keys: &[K],
+        ttl_seconds: Option<u64>,
+    ) -> Result<HashMap<String, String>> {
+        match self
+            .get_many_and_touch_bytes_in(namespace, keys, ttl_seconds)
+            .await
+        {
+            Ok(raw) => decode_many(raw),
+            Err(Error::PartialWrongNode(partial)) => {
+                Err(Error::PartialWrongNodeText(decode_many(partial)?))
+            }
+            Err(Error::PartialConnectionLost(partial, cause)) => Err(
+                Error::PartialConnectionLostText(decode_many(partial)?, cause),
+            ),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// The raw-bytes companion to [`Self::get_many_and_touch`]: no
+    /// decoding. Transparently decompresses when `compress` is enabled.
+    /// Failures are [`Error::PartialWrongNode`] and
+    /// [`Error::PartialConnectionLost`], as for [`Self::get_many_bytes`].
+    pub async fn get_many_and_touch_bytes<K: AsRef<str>>(
+        &self,
+        keys: &[K],
+        ttl_seconds: Option<u64>,
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        self.get_many_and_touch_bytes_in(DEFAULT_NAMESPACE, keys, ttl_seconds)
+            .await
+    }
+
+    /// The shared implementation behind [`Self::get_many_and_touch_bytes`]
+    /// and [`Namespace::get_many_and_touch_bytes`].
+    async fn get_many_and_touch_bytes_in<K: AsRef<str>>(
+        &self,
+        namespace: &[u8],
+        keys: &[K],
+        ttl_seconds: Option<u64>,
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        let (distinct, key_bytes) = Self::prepare_touch_batch(namespace, keys)?;
+        self.before_operation().await?;
+        let outcome = self
+            .multi_touch(namespace, &key_bytes, ttl_seconds, true)
+            .await;
+
+        // One decompression budget for the whole response — see
+        // `decompress_for_batch`.
+        let budget = AtomicU64::new(0);
+        let mut values: HashMap<String, Vec<u8>> = HashMap::with_capacity(distinct.len());
+        for (key, answer) in distinct.iter().zip(outcome.answers) {
+            if let Some(MultiEntry::Hit(value)) = answer {
+                values.insert(
+                    key.clone(),
+                    Self::decompress_for_batch(
+                        self.inner.compress,
+                        value,
+                        &budget,
+                        MAX_MULTIGET_DECOMPRESSED_BYTES,
+                    )?,
+                );
+            }
+        }
+        if outcome.unresolved.is_empty() {
+            return Ok(values);
+        }
+        if let Some(rejected) = outcome.rejected {
+            return Err(rejected);
+        }
+        if outcome.wrong_node {
+            return Err(Error::PartialWrongNode(values));
+        }
+        // No primary answered `W` for these keys: each one's primary was
+        // unreachable on both passes. That is a connection loss, reported
+        // with whatever did resolve attached — or as the bare connection
+        // error when nothing resolved, as `get_many_bytes` does.
+        let error = outcome.cause.unwrap_or_else(no_owner_reachable);
+        if values.is_empty() {
+            return Err(error);
+        }
+        Err(Error::PartialConnectionLost(values, Box::new(error)))
+    }
+
+    /// Validation shared by the batched touches: at least one key and
+    /// every key's size, all before any I/O; returns the batch's distinct
+    /// keys (first occurrence wins) with their bytes.
+    fn prepare_touch_batch<K: AsRef<str>>(
+        namespace: &[u8],
+        keys: &[K],
+    ) -> Result<(Vec<String>, Vec<Vec<u8>>)> {
+        if keys.is_empty() {
+            return Err(Error::InvalidArgument(
+                "nanocached: touch_many/get_many_and_touch/get_many_and_touch_bytes requires at least one key"
+                    .to_string(),
+            ));
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let distinct: Vec<String> = keys
+            .iter()
+            .map(|key| key.as_ref())
+            .filter(|key| seen.insert(key))
+            .map(str::to_string)
+            .collect();
+        let mut key_bytes: Vec<Vec<u8>> = Vec::with_capacity(distinct.len());
+        for key in &distinct {
+            let bytes = key.as_bytes().to_vec();
+            validate_key(namespace, &bytes)?;
+            key_bytes.push(bytes);
+        }
+        Ok((distinct, key_bytes))
+    }
+
+    /// Runs one batched touch over its distinct keys and reports how far
+    /// it got — never an `Err`: every failure is carried in the outcome
+    /// for the caller to turn into its own public error shape.
+    async fn multi_touch(
+        &self,
+        namespace: &[u8],
+        key_bytes: &[Vec<u8>],
+        ttl_seconds: Option<u64>,
+        get: bool,
+    ) -> MultiTouchOutcome {
+        let mut answers: Vec<Option<MultiEntry>> = vec![None; key_bytes.len()];
+
+        let single = matches!(self.inner.state.lock().await.target, Target::Single { .. });
+        if single {
+            // Single/proxy mode: no ring to refresh against, so a `W` or a
+            // failure ends the batch as it is, as in `get_many_bytes_in`.
+            let (entries, failure) = match self
+                .multi_touch_chunked(None, namespace, key_bytes, ttl_seconds, get)
+                .await
+            {
+                Ok(entries) => (entries, None),
+                Err((partial_entries, error)) => (partial_entries, Some(error)),
+            };
+            let mut unresolved = Vec::new();
+            let mut wrong_node = false;
+            for (i, answer) in answers.iter_mut().enumerate() {
+                match entries.get(i) {
+                    None => unresolved.push(i),
+                    Some(MultiEntry::WrongNode) => {
+                        wrong_node = true;
+                        unresolved.push(i);
+                    }
+                    Some(entry) => *answer = Some(entry.clone()),
+                }
+            }
+            let rejected = failure
+                .clone()
+                .filter(|error| matches!(error, Error::ServerTooOld { .. }));
+            return MultiTouchOutcome {
+                answers,
+                unresolved,
+                wrong_node: wrong_node && failure.is_none(),
+                cause: failure,
+                rejected,
+            };
+        }
+
+        let state = MultiTouchState::default();
+        let indices: Vec<usize> = (0..key_bytes.len()).collect();
+        let mut retry = self
+            .multi_touch_pass(namespace, key_bytes, ttl_seconds, get, indices, &state)
+            .await;
+        if !retry.is_empty() {
+            // One bounded refresh-and-retry over everything a primary left
+            // unresolved: a `W` is stale routing the refresh fixes, a
+            // primary that could not be reached gets a fresh view of who
+            // the owners are. A touch is idempotent, so the keys go to
+            // every owner of the fresh ring again.
+            self.maybe_refresh(true).await;
+            retry = self
+                .multi_touch_pass(namespace, key_bytes, ttl_seconds, get, retry, &state)
+                .await;
+        }
+        let inner = state.inner.lock().unwrap();
+        for (&idx, entry) in &inner.results {
+            answers[idx] = Some(entry.clone());
+        }
+        retry.sort_unstable();
+        let wrong_node = retry.iter().any(|idx| inner.wrong_node.contains(idx));
+        MultiTouchOutcome {
+            answers,
+            unresolved: retry,
+            wrong_node,
+            cause: inner.last_cause.clone(),
+            rejected: inner.rejected.clone(),
+        }
+    }
+
+    /// One or more `y` sub-frames against `slot`'s connection (`None` for
+    /// the single/proxy target), chunked like `m` — [`Self::multi_get_chunked`]'s
+    /// twin, with the same partial-on-error contract (issue #411).
+    async fn multi_touch_chunked(
+        &self,
+        slot: Option<&str>,
+        namespace: &[u8],
+        keys: &[Vec<u8>],
+        ttl_seconds: Option<u64>,
+        get: bool,
+    ) -> std::result::Result<Vec<MultiEntry>, (Vec<MultiEntry>, Error)> {
+        let mut entries = Vec::with_capacity(keys.len());
+        let lengths = chunk_lengths(namespace.len(), keys.len(), |i| get_entry_cost(&keys[i]));
+        let mut start = 0;
+        for len in lengths {
+            let chunk = &keys[start..start + len];
+            start += len;
+            let op = |connection: Arc<Connection>| async move {
+                connection
+                    .multi_touch(namespace, chunk, ttl_seconds, get)
+                    .await
+            };
+            match self.apply_reconnecting(slot, &op).await {
+                Ok(chunk_entries) => entries.extend(chunk_entries),
+                Err(error) => return Err((entries, error)),
+            }
+        }
+        Ok(entries)
+    }
+
+    /// One pass of [`Self::multi_touch`]'s cluster routing: every key still
+    /// needing resolution (every key on the initial pass, or just what the
+    /// previous pass left unresolved) is sent to **every owner**, in one
+    /// leg per (owner, form): with `get` a key's primary gets it in the
+    /// `G` form and every other owner in the plain one, without it every
+    /// owner gets the plain form — so a node holding some keys as primary
+    /// and others as replica gets one frame in the second case and two in
+    /// the first. Only the primary's answer is recorded in `state`; a
+    /// replica's failure or `W` is counted in
+    /// `stats().replica_write_failures`, as in [`Self::run_multi_set_leg`].
+    /// A leg that holds no key as primary is eligible for
+    /// `fire_and_forget_replicas`, exactly like a single-key replica
+    /// write.
+    ///
+    /// Returns the positions whose primary answered `W` or could not be
+    /// reached (a key with no owners at all counts as `W`: a refresh may
+    /// populate the ring).
+    async fn multi_touch_pass(
+        &self,
+        namespace: &[u8],
+        key_bytes: &[Vec<u8>],
+        ttl_seconds: Option<u64>,
+        get: bool,
+        indices: Vec<usize>,
+        state: &MultiTouchState,
+    ) -> Vec<usize> {
+        let mut legs: HashMap<String, MultiTouchLeg> = HashMap::new();
+        let mut retry = Vec::new();
+        {
+            let ring_state = self.inner.state.lock().await;
+            for idx in indices {
+                let names = Self::owner_names(&ring_state, namespace, &key_bytes[idx]);
+                if names.is_empty() {
+                    state.inner.lock().unwrap().wrong_node.insert(idx);
+                    retry.push(idx);
+                    continue;
+                }
+                for (rank, name) in names.into_iter().enumerate() {
+                    let form = get && rank == 0;
+                    let leg = legs
+                        .entry(format!("{}{name}", if form { 'G' } else { 'P' }))
+                        .or_insert_with(|| MultiTouchLeg {
+                            owner: name.clone(),
+                            get: form,
+                            ..Default::default()
+                        });
+                    leg.indices.push(idx);
+                    leg.is_primary.push(rank == 0);
+                    leg.keys.push(key_bytes[idx].clone());
+                }
+            }
+        }
+
+        let mut joined = Vec::with_capacity(legs.len());
+        for (_, leg) in legs {
+            let pure_replica = !leg.is_primary.iter().any(|&primary| primary);
+
+            // Fire-and-forget replica writes: mirrors `multi_set_pass`'s
+            // own branch, including its close()-race fallback. A
+            // pure-replica leg holds no primary key, so it records nothing
+            // in a state of its own.
+            if self.inner.fire_and_forget_replicas && pure_replica {
+                if let Ok(permit) =
+                    Arc::clone(&self.inner.background_replica_permits).try_acquire_owned()
+                {
+                    if self.inner.closed.load(Ordering::SeqCst) {
+                        drop(permit);
+                    } else {
+                        let client = self.clone();
+                        let owned_namespace: Arc<[u8]> = Arc::from(namespace.to_vec());
+                        tokio::spawn(async move {
+                            let _permit = permit; // held until this task finishes
+                            let _ = client
+                                .run_multi_touch_leg(
+                                    &owned_namespace,
+                                    &leg,
+                                    ttl_seconds,
+                                    &MultiTouchState::default(),
+                                )
+                                .await;
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            let client = self.clone();
+            let owned_namespace = namespace.to_vec();
+            joined.push(async move {
+                client
+                    .run_multi_touch_leg(&owned_namespace, &leg, ttl_seconds, state)
+                    .await
+            });
+        }
+
+        for mut leg_retry in futures_util::future::join_all(joined).await {
+            retry.append(&mut leg_retry);
+        }
+        retry
+    }
+
+    /// Dispatches one [`MultiTouchLeg`] (via [`Self::multi_touch_chunked`])
+    /// and applies its result: only a primary-held position can end up in
+    /// the returned retry list; every replica-held position's failure or
+    /// `W` is counted in `stats().replica_write_failures` instead,
+    /// mirroring [`Self::apply_multi_set_leg_entry`]. A connection failure
+    /// for the whole leg is treated the same way, position by position,
+    /// since the same sub-frame can carry both primary- and replica-held
+    /// keys; when a chunk after the first failed (issue #411) only the
+    /// positions from it onward are unresolved.
+    async fn run_multi_touch_leg(
+        &self,
+        namespace: &[u8],
+        leg: &MultiTouchLeg,
+        ttl_seconds: Option<u64>,
+        state: &MultiTouchState,
+    ) -> Vec<usize> {
+        let (entries, failure) = match self
+            .multi_touch_chunked(Some(&leg.owner), namespace, &leg.keys, ttl_seconds, leg.get)
+            .await
+        {
+            Ok(entries) => (entries, None),
+            Err((partial_entries, error)) => (partial_entries, Some(error)),
+        };
+        if let Some(failure) = failure {
+            if leg.is_primary.iter().any(|&primary| primary) {
+                let mut inner = state.inner.lock().unwrap();
+                if matches!(failure, Error::ServerTooOld { .. }) {
+                    inner.rejected = Some(failure.clone());
+                }
+                inner.last_cause = Some(failure);
+            }
+        }
+
+        let mut retry = Vec::new();
+        for (i, (&idx, &is_primary)) in leg.indices.iter().zip(&leg.is_primary).enumerate() {
+            let entry = entries.get(i);
+            let answered = entry.is_some_and(|entry| !matches!(entry, MultiEntry::WrongNode));
+            if !is_primary {
+                if !answered {
+                    self.inner
+                        .stats
+                        .replica_write_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            } else if answered {
+                state
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .results
+                    .insert(idx, entry.cloned().expect("answered implies an entry"));
+            } else {
+                {
+                    let mut inner = state.inner.lock().unwrap();
+                    if entry.is_none() {
+                        inner.wrong_node.remove(&idx);
+                    } else {
+                        inner.wrong_node.insert(idx);
+                    }
+                }
+                retry.push(idx);
+            }
+        }
+        retry
     }
 
     // ── batched get/set (issue #151) ─────────────────────────────────
@@ -4600,6 +5132,41 @@ impl Namespace {
     ) -> Result<Option<Vec<u8>>> {
         self.client
             .get_and_touch_bytes_in(&self.namespace, key, ttl_seconds)
+            .await
+    }
+
+    /// See [`NanocachedClient::touch_many`]; scoped to this namespace.
+    pub async fn touch_many<K: AsRef<str>>(
+        &self,
+        keys: &[K],
+        ttl_seconds: Option<u64>,
+    ) -> Result<HashMap<String, bool>> {
+        self.client
+            .touch_many_in(&self.namespace, keys, ttl_seconds)
+            .await
+    }
+
+    /// See [`NanocachedClient::get_many_and_touch`]; scoped to this
+    /// namespace.
+    pub async fn get_many_and_touch<K: AsRef<str>>(
+        &self,
+        keys: &[K],
+        ttl_seconds: Option<u64>,
+    ) -> Result<HashMap<String, String>> {
+        self.client
+            .get_many_and_touch_in(&self.namespace, keys, ttl_seconds)
+            .await
+    }
+
+    /// See [`NanocachedClient::get_many_and_touch_bytes`]; scoped to this
+    /// namespace.
+    pub async fn get_many_and_touch_bytes<K: AsRef<str>>(
+        &self,
+        keys: &[K],
+        ttl_seconds: Option<u64>,
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        self.client
+            .get_many_and_touch_bytes_in(&self.namespace, keys, ttl_seconds)
             .await
     }
 
