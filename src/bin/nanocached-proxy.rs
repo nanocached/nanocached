@@ -4837,6 +4837,10 @@ fn plan_multi_touch(
     let mut missing = Vec::new();
     let mut top = Vec::new();
     let namespace_hash = NamespaceHash::of(namespace);
+    // Issue #934: an expiring batch goes to the primaries alone; the other
+    // owners get theirs from `expire_batch_on_other_owners` once the
+    // primaries have answered (see `enqueue_touch` for why).
+    let expiring = expires_at_once(ttl);
 
     for position in positions {
         ring.rank_owners(namespace_hash, &keys[position], ring.replication, &mut top);
@@ -4845,6 +4849,9 @@ fn plan_multi_touch(
             continue;
         }
         for (rank, &(_, owner)) in top.iter().enumerate() {
+            if expiring && rank > 0 {
+                continue;
+            }
             if get && rank == 0 {
                 primaries.group_for(owner).push((position, true));
             } else {
@@ -4875,6 +4882,7 @@ fn plan_multi_touch(
 }
 
 /// The batch a `finish_multi_touch`/`retry_multi_touch` pass works against.
+#[derive(Clone, Copy)]
 struct MultiTouchBatch<'a> {
     namespace: &'a [u8],
     keys: &'a [Bytes],
@@ -4988,6 +4996,9 @@ async fn finish_multi_touch(
     {
         return Err(Fatal::OutcomeUnknown);
     }
+    if expiring {
+        expire_batch_on_other_owners(context, &batch, &entries).await;
+    }
 
     let mut entries: Vec<ProxyMultiEntry> = entries
         .into_iter()
@@ -5001,12 +5012,90 @@ async fn finish_multi_touch(
     }
 }
 
+/// Issue #934: the deferred replica legs of an expiring batch — one plain
+/// `y ... 0` per other owner on the current ring, covering every key whose
+/// primary answered (a value or a miss: a miss on the primary can still
+/// have a replica copy a fire-and-forget write left, and the client asked
+/// for the key to expire everywhere). Keys still `W` get none. Sent after
+/// the primaries answered, these run outside the pipelined-order guarantee
+/// like every retry path; a failure is logged and swallowed as for any
+/// replica leg.
+async fn expire_batch_on_other_owners(
+    context: &ProxyContext,
+    batch: &MultiTouchBatch<'_>,
+    entries: &[Option<ProxyMultiEntry>],
+) {
+    let Some(ring) = current_ring(context) else {
+        return;
+    };
+    let mut others: AddrGroups<Vec<Bytes>> = AddrGroups::new(&ring);
+    let namespace_hash = NamespaceHash::of(batch.namespace);
+    let mut top = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        if !matches!(
+            entry,
+            Some(ProxyMultiEntry::Value(_) | ProxyMultiEntry::Miss)
+        ) {
+            continue;
+        }
+        ring.rank_owners(
+            namespace_hash,
+            &batch.keys[position],
+            ring.replication,
+            &mut top,
+        );
+        for &(_, owner) in top.iter().skip(1) {
+            others.group_for(owner).push(batch.keys[position].clone());
+        }
+    }
+    if others.is_empty() {
+        return;
+    }
+    let frames: Vec<(String, Bytes)> = others
+        .into_named()
+        .into_iter()
+        .map(|(addr, keys)| {
+            (
+                addr,
+                frame_multi_touch(batch.namespace, &keys, Some(0), false),
+            )
+        })
+        .collect();
+    let requests = frames
+        .iter()
+        .map(|(addr, frame)| (addr.as_str(), frame.clone()));
+    let results = context
+        .backends
+        .call_each(context, requests, Expect::MultiTouch)
+        .await;
+    for ((addr, _), result) in frames.iter().zip(results) {
+        match result {
+            Err(error) => eprintln!("WARN replica multi-touch to {addr} failed: {error}"),
+            Ok(NodeReply::MultiTouch(results)) => {
+                for entry in results {
+                    if matches!(entry, ProxyMultiEntry::WrongNode) {
+                        note_refused_replica_leg(
+                            context,
+                            "multi-touch leg",
+                            Some(addr),
+                            &NodeReply::WrongNode,
+                        );
+                    }
+                }
+            }
+            Ok(reply) => note_refused_replica_leg(context, "multi-touch leg", Some(addr), &reply),
+        }
+    }
+}
+
 /// Issue #871: the one refresh-and-retry pass of a `y` batch, mirroring
 /// `retry_multi_set`: the retried keys are re-sent to every owner on the
 /// fresh ring, not just the primary, which is harmless because a touch is
-/// idempotent. A key whose primary is still `W` or unreachable is answered
-/// `W`. Returns `true` when an expiring (`ttl=0`) batch's primary leg may
-/// have been applied and its reply is lost (see `settle_multi_touch_group`).
+/// idempotent — except for an expiring batch, whose other owners wait for
+/// `expire_batch_on_other_owners` (issue #934). A key whose primary is still
+/// `W` or unreachable is answered `W`. Returns `true` when an expiring
+/// (`ttl=0`) batch's primary leg may have been applied and its reply is lost
+/// (see `settle_multi_touch_group`).
 async fn retry_multi_touch(
     context: &ProxyContext,
     batch: MultiTouchBatch<'_>,
@@ -5213,7 +5302,13 @@ fn touch_legs<'a>(
 }
 
 /// Issue #824: enqueues a touch on every owner concurrently, like
-/// `enqueue_write`.
+/// `enqueue_write` — except an expiring one (issue #934): a `ttl=0` touch
+/// goes to the primary alone here, and `finish_touch` sends the other
+/// owners theirs once the primary has answered. Sent together, a plain
+/// `t ... 0` would expire a replica's copy while the primary leg was
+/// still failing (unreachable, or `W` from a stale ring); the re-fan over
+/// the refreshed ring then asks that replica, now the primary, for a key
+/// it no longer holds, and a `G` loses the value for good.
 async fn enqueue_touch(
     context: &ProxyContext,
     ring: &RingView,
@@ -5223,9 +5318,48 @@ async fn enqueue_touch(
     get: bool,
 ) -> EnqueuedWrite {
     let owners = ring.owners(namespace, key);
-    let legs = touch_legs(&owners, namespace, key, ttl, get);
+    let legs = if expires_at_once(ttl) {
+        touch_legs(&owners[..owners.len().min(1)], namespace, key, ttl, get)
+    } else {
+        touch_legs(&owners, namespace, key, ttl, get)
+    };
     let pending = context.backends.enqueue_mixed(context, legs).await;
     EnqueuedWrite { owners, pending }
+}
+
+/// Whether a touch's TTL expires the keys it finds (`0`), which is what
+/// makes a frame that may have reached a node unsafe to send again
+/// (issue #919) and the replica legs unsafe to send ahead of the primary
+/// (issue #934).
+fn expires_at_once(ttl: Option<u64>) -> bool {
+    ttl == Some(0)
+}
+
+/// Issue #934: the deferred replica legs of an expiring touch — the plain
+/// `t ... 0` to every owner of `key` on the current ring other than
+/// `answered`, the node whose definitive reply the client is about to get.
+/// Sent only now, after that reply, these run outside the pipelined-order
+/// guarantee the initial dispatch gives, like every retry path; a replica
+/// failure is logged and swallowed as for any replica leg.
+async fn expire_on_other_owners(
+    context: &ProxyContext,
+    namespace: &[u8],
+    key: &[u8],
+    answered: &str,
+) {
+    let Some(ring) = current_ring(context) else {
+        return;
+    };
+    let others: Vec<String> = ring
+        .owners(namespace, key)
+        .into_iter()
+        .filter(|addr| addr != answered)
+        .collect();
+    if others.is_empty() {
+        return;
+    }
+    let plain = frame_touch(namespace, key, Some(0), false);
+    fan_out_to_replicas(context, &others, plain, Expect::Touch, "touch").await;
 }
 
 /// The client's answer to a touch, from the primary's reply.
@@ -5253,7 +5387,9 @@ fn touch_answer(reply: &NodeReply, tag: Option<u32>) -> Option<Vec<u8>> {
 /// with one exception: a `ttl=0` touch expires the key it finds, so a frame
 /// that may have reached the node is not sent again (the second would answer
 /// `N`, and a `G` would lose the value the first one consumed) and its
-/// failure is `OutcomeUnknown`.
+/// failure is `OutcomeUnknown`. For the same reason its replica legs were
+/// not enqueued with the primary's (see `enqueue_touch`): they are sent
+/// here, once the primary has answered, by `expire_on_other_owners`.
 async fn finish_touch(
     context: &ProxyContext,
     namespace: &[u8],
@@ -5287,13 +5423,23 @@ async fn finish_touch(
             force_refresh(context).await;
             refan_touch(context, namespace, key, ttl, get, tag, retry_capable).await
         }
-        Err(error) if ttl == Some(0) && !request_not_sent(error) => Err(Fatal::OutcomeUnknown),
+        Err(error) if expires_at_once(ttl) && !request_not_sent(error) => {
+            Err(Fatal::OutcomeUnknown)
+        }
         Err(_) => refan_touch(context, namespace, key, ttl, get, tag, retry_capable).await,
-        Ok(reply) => touch_answer(reply, tag).ok_or(if ttl == Some(0) {
-            Fatal::OutcomeUnknown
-        } else {
-            Fatal::Transient
-        }),
+        Ok(reply) => {
+            let answer = touch_answer(reply, tag);
+            if expires_at_once(ttl) {
+                let Some(answer) = answer else {
+                    return Err(Fatal::OutcomeUnknown);
+                };
+                if let Some(primary) = owners.first() {
+                    expire_on_other_owners(context, namespace, key, primary).await;
+                }
+                return Ok(answer);
+            }
+            answer.ok_or(Fatal::Transient)
+        }
     }
 }
 
@@ -5315,25 +5461,31 @@ async fn refan_touch(
     let Some((primary, replicas)) = owners.split_first() else {
         return Ok(transient_reply(retry_capable, tag));
     };
-    let plain = frame_touch(namespace, key, ttl, false);
-    fan_out_to_replicas(context, replicas, plain, Expect::Touch, "touch").await;
     let (frame, expect) = if get {
         (frame_touch(namespace, key, ttl, true), Expect::Touched)
     } else {
         (frame_touch(namespace, key, ttl, false), Expect::Touch)
     };
-    if ttl == Some(0) {
-        // A frame that may have reached the node is not sent again.
+    if expires_at_once(ttl) {
+        // A frame that may have reached the node is not sent again, and
+        // the other owners get theirs only once the primary has answered
+        // (issue #934; see `enqueue_touch`).
         return match context
             .backends
             .call_non_idempotent(context, primary, frame, expect)
             .await
         {
-            Ok(reply) => touch_answer(&reply, tag).ok_or(Fatal::OutcomeUnknown),
+            Ok(reply) => {
+                let answer = touch_answer(&reply, tag).ok_or(Fatal::OutcomeUnknown)?;
+                expire_on_other_owners(context, namespace, key, primary).await;
+                Ok(answer)
+            }
             Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
             Err(_) => Err(Fatal::OutcomeUnknown),
         };
     }
+    let plain = frame_touch(namespace, key, ttl, false);
+    fan_out_to_replicas(context, replicas, plain, Expect::Touch, "touch").await;
     match context.backends.call(context, primary, frame, expect).await {
         Ok(reply) => touch_answer(&reply, tag).ok_or(Fatal::Transient),
         Err(_) => Err(Fatal::Transient),
@@ -8274,7 +8426,15 @@ mod tests {
                             continue;
                         }
                         touches.lock().unwrap().push((ttl, get));
-                        let current = store.lock().unwrap().get(&(namespace, key)).cloned();
+                        let current = store
+                            .lock()
+                            .unwrap()
+                            .get(&(namespace.clone(), key.clone()))
+                            .cloned();
+                        // A zero TTL expires the entry at once, as the node does.
+                        if ttl == Some(0) && current.is_some() {
+                            store.lock().unwrap().remove(&(namespace, key));
+                        }
                         match current {
                             None => {
                                 stream
@@ -8347,9 +8507,16 @@ mod tests {
                                 continue;
                             }
                             touches.lock().unwrap().push((ttl, get));
-                            roster.push(Some(
-                                store.lock().unwrap().get(&(namespace.clone(), key)).cloned(),
-                            ));
+                            let current = store
+                                .lock()
+                                .unwrap()
+                                .get(&(namespace.clone(), key.clone()))
+                                .cloned();
+                            // A zero TTL expires the entry at once, as the node does.
+                            if ttl == Some(0) && current.is_some() {
+                                store.lock().unwrap().remove(&(namespace.clone(), key));
+                            }
+                            roster.push(Some(current));
                         }
 
                         let mut header = format!("{} {count}", if get { "M" } else { "Y" });
@@ -11459,6 +11626,172 @@ mod tests {
             let touches: usize = nodes.iter().map(|node| node.touches().len()).sum();
             assert_eq!(touches, 0, "no group was sent a second time");
         }
+    }
+
+    /// Issue #934: a live node and a dead address at replication 2, and a
+    /// key whose primary is the dead one (so the live node is its replica).
+    /// Returns (live node, proxy addr, that key).
+    async fn live_replica_dead_primary_cluster() -> (MockNode, String, String) {
+        let live = MockNode::start().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let roster = vec![
+            ("node-live".to_string(), live.addr.clone()),
+            ("node-dead".to_string(), dead_addr.clone()),
+        ];
+        let discovery = start_mock_discovery(roster.clone(), 2).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+        let ring = RingView::new(roster, 2);
+        let key = (0..64u8)
+            .map(|index| format!("k{index}"))
+            .find(|key| ring.owners(b"", key.as_bytes())[0] == dead_addr)
+            .expect("some key routes to the dead node first");
+        (live, proxy, key)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_touch_does_not_expire_a_replica_while_its_primary_is_unreachable() {
+        // Issue #934: the plain `t ... 0` used to go to the replica together
+        // with the primary leg, so a primary that could not be reached
+        // left the replica's copy expired before the re-fan asked it for
+        // the key. The replica gets nothing until a primary has answered.
+        for get in [false, true] {
+            let (live, proxy, key) = live_replica_dead_primary_cluster().await;
+            let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+            let request = if get {
+                format!("t 0 {} 0 G 1\n{key}", key.len())
+            } else {
+                format!("t 0 {} 0 1\n{key}", key.len())
+            };
+            stream.write_all(request.as_bytes()).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 1");
+            assert_eq!(
+                live.touches(),
+                Vec::<(Option<u64>, bool)>::new(),
+                "get={get}: the replica must not be touched while the primary leg fails"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_touch_reaches_the_replica_once_after_the_primary_answered() {
+        // Issue #934: the primary's stale `W` costs one refresh-and-re-fan;
+        // the replica is sent its plain touch exactly once, after the
+        // primary answered — not once per fan-out — and the `G` answer is
+        // the value, since no replica expired its copy ahead of time.
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+        let primary_addr = ring.owners(b"", b"key")[0].clone();
+        let (primary, replica) = if primary_addr == nodes[0].addr {
+            (&nodes[0], &nodes[1])
+        } else {
+            (&nodes[1], &nodes[0])
+        };
+        stream.write_all(b"S 3 1\nkeyv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        primary.wrong_node_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"t 0 3 0 G\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1 0");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+
+        // The `W` answer is not logged by the mock; the re-fan's apply is.
+        assert_eq!(primary.touches(), vec![(Some(0), true)]);
+        assert_eq!(
+            replica.touches(),
+            vec![(Some(0), false)],
+            "one plain touch, sent after the primary answered"
+        );
+        // Both copies are gone: the touch expired the key everywhere.
+        stream.write_all(b"G 3\nkey").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_batch_touch_does_not_expire_a_replica_while_its_primary_is_unreachable() {
+        // Issue #934: the batch counterpart — the key's primary is dead, so
+        // the key degrades to `W`; its replica must not have been sent the
+        // plain `y ... 0` in the meantime.
+        for get in [false, true] {
+            let (live, proxy, key) = live_replica_dead_primary_cluster().await;
+            let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+            let request = if get {
+                format!("y 0 1 {} 0 G 1\n{key}", key.len())
+            } else {
+                format!("y 0 1 {} 0 1\n{key}", key.len())
+            };
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let expected = if get { "M 1 W 1" } else { "Y 1 W 1" };
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), expected);
+            assert_eq!(
+                live.touches(),
+                Vec::<(Option<u64>, bool)>::new(),
+                "get={get}: the replica must not be touched while the primary leg fails"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_batch_touch_reaches_the_replicas_once_after_the_primaries_answered() {
+        // Issue #934: two keys with the same primary; the primary answers
+        // the first key `W` once, so that key takes the refresh-and-retry
+        // pass. The replica is then sent one plain `y` carrying both keys —
+        // not the two frames (first pass, retry) it used to get — and the
+        // `G` answers are the values.
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+        let keys: Vec<String> = (0..64u8)
+            .map(|index| format!("k{index}"))
+            .filter(|key| ring.owners(b"", key.as_bytes())[0] == nodes[0].addr)
+            .take(2)
+            .collect();
+        assert_eq!(keys.len(), 2, "two keys with node-a as their primary");
+        let (primary, replica) = (&nodes[0], &nodes[1]);
+        for key in &keys {
+            stream
+                .write_all(format!("S {} 1\n{key}v", key.len()).as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        }
+
+        primary.wrong_node_once.store(true, Ordering::SeqCst);
+        let request = format!(
+            "y 0 2 {} {} 0 G\n{}{}",
+            keys[0].len(),
+            keys[1].len(),
+            keys[0],
+            keys[1]
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"vv");
+
+        // First pass: the second key applied (the first answered `W`, not
+        // logged); retry pass: the first key applied.
+        assert_eq!(primary.touches(), vec![(Some(0), true), (Some(0), true)]);
+        assert_eq!(
+            replica.touches(),
+            vec![(Some(0), false), (Some(0), false)],
+            "one plain batch of both keys, sent after the primaries answered"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
