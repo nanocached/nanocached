@@ -29,6 +29,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported floor (22), the current LTS line the package is
+        # developed on (24), and whatever `lts/*` is today.
+        node-version: [22, 24, lts/*]
+
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -43,7 +50,11 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: lts/*
+          node-version: ${{ matrix.node-version }}
+          # Without this the action takes whatever patch release of that line the
+          # runner image has cached, which lags a security release by days: the
+          # root certificates Node bundles are part of the release.
+          check-latest: true
           cache: pnpm
           cache-dependency-path: sdk/typescript/pnpm-lock.yaml
 
@@ -205,6 +216,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported floor (22), the current LTS line the package is
+        # developed on (24), and whatever `lts/*` is today.
+        node-version: [22, 24, lts/*]
+
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -219,7 +237,11 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: lts/*
+          node-version: ${{ matrix.node-version }}
+          # Without this the action takes whatever patch release of that line the
+          # runner image has cached, which lags a security release by days: the
+          # root certificates Node bundles are part of the release.
+          check-latest: true
 
       - name: Install dependencies
         working-directory: adapters/cache-manager
@@ -237,6 +259,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported floor (22), the current LTS line the package is
+        # developed on (24), and whatever `lts/*` is today.
+        node-version: [22, 24, lts/*]
+
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -251,7 +280,11 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: lts/*
+          node-version: ${{ matrix.node-version }}
+          # Without this the action takes whatever patch release of that line the
+          # runner image has cached, which lags a security release by days: the
+          # root certificates Node bundles are part of the release.
+          check-latest: true
 
       - name: Install dependencies
         working-directory: adapters/keyv

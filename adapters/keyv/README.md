@@ -227,7 +227,7 @@ described above, so an oversize value is silently not cached unless
 
 ## Requirements
 
-Node.js 20+, `keyv` ^5 (the relative-millisecond-`ttl` adapter contract
+Node.js 22+, `keyv` ^5 (the relative-millisecond-`ttl` adapter contract
 this targets — `keyv@6`'s absolute-`expires` contract is a different shape
 and, as of writing, still only at a release candidate, not what published
 `cache-manager`/`@nestjs/cache-manager` depend on), nanocached server
