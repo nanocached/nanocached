@@ -2189,7 +2189,10 @@ public sealed class NanocachedClient : IDisposable
         var state = new MultiTouchState();
         List<int> retry = await MultiTouchPassAsync(namespaceBytes, keyBytes, ttlSeconds, get, null, state)
             .ConfigureAwait(false);
-        if (retry.Count > 0)
+        // An `En` is a final answer from that node (a server that predates
+        // `y`): a refresh and a second pass would only ask it again, so the
+        // outcome is returned as it stands (issue #902).
+        if (retry.Count > 0 && state.Rejected is null)
         {
             // One bounded refresh-and-retry over everything a primary left
             // unresolved: a `W` is stale routing the refresh fixes, a
