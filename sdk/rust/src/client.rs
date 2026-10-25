@@ -827,6 +827,10 @@ struct MultiTouchStateInner {
     /// primary leg failed after the frame was written, so the node may
     /// have expired them already. Never retried; reported as unresolved.
     lost: std::collections::HashSet<usize>,
+    /// The owner whose primary-held leg answered each resolved position
+    /// (issue #934): the one node the deferred replica fan-out of a
+    /// `Some(0)` batch must not touch a second time.
+    answered_by: HashMap<usize, String>,
 }
 
 /// What one batched touch ended with, over its distinct keys: `answers[i]`
@@ -1995,8 +1999,11 @@ impl NanocachedClient {
     /// answer, a failed dial, a connection that was already dead), and a
     /// reply lost after the send returns [`Error::ConnectionLost`], as
     /// `incr` does. In a cluster it goes to every owner, like a `set`, and
-    /// the primary's answer is returned. Returns [`Error::ServerTooOld`]
-    /// against a node that predates the command.
+    /// the primary's answer is returned; with `Some(0)` the other owners
+    /// are sent theirs only after the primary has answered (issue #934),
+    /// outside the order a pipelined connection otherwise gives a key's
+    /// operations. Returns [`Error::ServerTooOld`] against a node that
+    /// predates the command.
     pub async fn touch(&self, key: impl AsRef<[u8]>, ttl_seconds: Option<u64>) -> Result<bool> {
         self.touch_in(DEFAULT_NAMESPACE, key, ttl_seconds).await
     }
@@ -2037,7 +2044,10 @@ impl NanocachedClient {
     /// With `Some(0)` a reply lost after the request was sent returns
     /// [`Error::ConnectionLost`] instead of being resent (issue #901): the
     /// node may have expired the entry and consumed its value, and a
-    /// resend would report a miss.
+    /// resend would report a miss. The other owners are sent the plain
+    /// touch only after the primary has answered (issue #934), so a
+    /// primary that could not be reached or answered `W` is rerouted with
+    /// no replica touched yet.
     pub async fn get_and_touch(
         &self,
         key: impl AsRef<[u8]>,
@@ -2110,7 +2120,11 @@ impl NanocachedClient {
     /// fails after the frame was written is not resent (issue #901): the
     /// call returns that connection error, every other key having been
     /// touched. In a cluster it goes to every owner of a key, the
-    /// primary's answer being the key's. A replica's failure or `W` is
+    /// primary's answer being the key's; with `Some(0)` the primaries are
+    /// asked first, on both passes, and the other owners are sent one
+    /// plain fan-out afterwards for the keys a primary answered (issue
+    /// #934), outside the order a pipelined connection otherwise gives a
+    /// key's operations. A replica's failure or `W` is
     /// counted in `stats().replica_write_failures` and never fails the
     /// batch. Larger batches are transparently split into more than one
     /// `y` sub-frame per node (see [`MAX_BATCH_KEYS`]). If some keys'
@@ -2384,6 +2398,9 @@ impl NanocachedClient {
 
         let state = MultiTouchState::default();
         let indices: Vec<usize> = (0..key_bytes.len()).collect();
+        // An expiring touch asks the primaries alone, on both passes
+        // (issue #934); the other owners are sent theirs once, below,
+        // after the passes, for the keys a primary answered.
         let mut retry = self
             .multi_touch_pass(namespace, key_bytes, ttl_seconds, get, indices, &state)
             .await;
@@ -2400,6 +2417,10 @@ impl NanocachedClient {
             self.maybe_refresh(true).await;
             retry = self
                 .multi_touch_pass(namespace, key_bytes, ttl_seconds, get, retry, &state)
+                .await;
+        }
+        if ttl_seconds == Some(0) {
+            self.multi_touch_replica_fanout(namespace, key_bytes, &state)
                 .await;
         }
         let inner = state.inner.lock().unwrap();
@@ -2509,6 +2530,10 @@ impl NanocachedClient {
     /// `fire_and_forget_replicas`, exactly like a single-key replica
     /// write.
     ///
+    /// With `Some(0)` (an expiring touch, issue #934) only the
+    /// primary's leg is built here; the other owners are sent theirs by
+    /// [`Self::multi_touch_replica_fanout`] once the passes are over.
+    ///
     /// Returns the positions whose primary answered `W` or could not be
     /// reached (a key with no owners at all counts as `W`: a refresh may
     /// populate the ring).
@@ -2521,6 +2546,7 @@ impl NanocachedClient {
         indices: Vec<usize>,
         state: &MultiTouchState,
     ) -> Vec<usize> {
+        let primary_only = ttl_seconds == Some(0);
         let mut legs: HashMap<String, MultiTouchLeg> = HashMap::new();
         let mut retry = Vec::new();
         {
@@ -2533,6 +2559,9 @@ impl NanocachedClient {
                     continue;
                 }
                 for (rank, name) in names.into_iter().enumerate() {
+                    if primary_only && rank > 0 {
+                        break;
+                    }
                     let form = get && rank == 0;
                     let leg = legs
                         .entry(format!("{}{name}", if form { 'G' } else { 'P' }))
@@ -2548,6 +2577,24 @@ impl NanocachedClient {
             }
         }
 
+        retry.extend(
+            self.run_multi_touch_legs(namespace, legs, ttl_seconds, state)
+                .await,
+        );
+        retry
+    }
+
+    /// Runs `legs` concurrently and returns the positions their primary
+    /// keys left unresolved. A leg that holds no key as primary is
+    /// eligible for `fire_and_forget_replicas`, exactly like a single-key
+    /// replica write.
+    async fn run_multi_touch_legs(
+        &self,
+        namespace: &[u8],
+        legs: HashMap<String, MultiTouchLeg>,
+        ttl_seconds: Option<u64>,
+        state: &MultiTouchState,
+    ) -> Vec<usize> {
         let mut joined = Vec::with_capacity(legs.len());
         for (_, leg) in legs {
             let pure_replica = !leg.is_primary.iter().any(|&primary| primary);
@@ -2590,10 +2637,63 @@ impl NanocachedClient {
             });
         }
 
+        let mut retry = Vec::new();
         for mut leg_retry in futures_util::future::join_all(joined).await {
             retry.append(&mut leg_retry);
         }
         retry
+    }
+
+    /// The deferred replica fan-out of an expiring batched touch (issue
+    /// #934): one plain `y` leg per owner, for every key whose primary
+    /// answered (`S`, `V` or `N` — a missed primary may still have a copy
+    /// on a replica, written by its fire-and-forget replication, and the
+    /// caller meant expire-everywhere). The owners are those of the ring in
+    /// force now, minus the node that answered for the key. Keys left `W`,
+    /// lost or rejected get no replica leg. A replica's failure or `W` is
+    /// counted in `stats().replica_write_failures` and never fails the
+    /// batch; the legs run after the primaries answered, outside the order
+    /// the pipelined connections give a key's operations, the same class as
+    /// the retry paths.
+    async fn multi_touch_replica_fanout(
+        &self,
+        namespace: &[u8],
+        key_bytes: &[Vec<u8>],
+        state: &MultiTouchState,
+    ) {
+        let answered: Vec<(usize, String)> = {
+            let inner = state.inner.lock().unwrap();
+            inner
+                .results
+                .keys()
+                .filter_map(|&idx| Some((idx, inner.answered_by.get(&idx)?.clone())))
+                .collect()
+        };
+        if answered.is_empty() {
+            return;
+        }
+        let mut legs: HashMap<String, MultiTouchLeg> = HashMap::new();
+        {
+            let ring_state = self.inner.state.lock().await;
+            for (idx, answered_by) in answered {
+                for name in Self::owner_names(&ring_state, namespace, &key_bytes[idx]) {
+                    if name == answered_by {
+                        continue;
+                    }
+                    let leg = legs.entry(name.clone()).or_insert_with(|| MultiTouchLeg {
+                        owner: name,
+                        ..Default::default()
+                    });
+                    leg.indices.push(idx);
+                    leg.is_primary.push(false);
+                    leg.keys.push(key_bytes[idx].clone());
+                }
+            }
+        }
+        // Pure-replica legs record nothing in a state of their own, and a
+        // replica leg never reports a position to retry.
+        self.run_multi_touch_legs(namespace, legs, Some(0), &MultiTouchState::default())
+            .await;
     }
 
     /// Dispatches one [`MultiTouchLeg`] (via [`Self::multi_touch_chunked`])
@@ -2658,12 +2758,11 @@ impl NanocachedClient {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             } else if answered {
-                state
-                    .inner
-                    .lock()
-                    .unwrap()
+                let mut inner = state.inner.lock().unwrap();
+                inner
                     .results
                     .insert(idx, entry.cloned().expect("answered implies an entry"));
+                inner.answered_by.insert(idx, leg.owner.clone());
             } else {
                 {
                     let mut inner = state.inner.lock().unwrap();
@@ -4452,6 +4551,37 @@ impl NanocachedClient {
                 "nanocached: no owner is reachable for this key".to_string(),
             ));
         };
+
+        // A touch that expires its entry (`Some(0)`, issue #934) fans out
+        // to the other owners only once the primary has answered. The
+        // replicas used to be sent the plain touch concurrently with the
+        // primary, so a primary that could not be reached or answered `W`
+        // from a stale ring left a replica that had already expired its
+        // copy: the reroute then reached that replica as the new primary
+        // and found nothing (a miss, with the value consumed by the first
+        // frame and never returned). Primary first means a failed or
+        // misrouted primary leg is rerouted with no replica touched yet
+        // (`with_cluster_retry` runs this again over the refreshed ring),
+        // as `incr_once` does for its replicas. The deferred replica legs
+        // run outside the order the pipelined connections otherwise give a
+        // key's operations, the same class as the retry paths. A positive
+        // or removed TTL keeps the concurrent fan-out below.
+        if !replay_primary {
+            let result = self.apply_reconnecting_no_replay(Some(primary), &op).await;
+            if result.is_ok() {
+                // The ring in force now, not the one the primary was
+                // picked from: every owner but the one that answered.
+                let others: Vec<String> = {
+                    let state = self.inner.state.lock().await;
+                    Self::owner_names(&state, namespace, key)
+                        .into_iter()
+                        .filter(|name| name != primary)
+                        .collect()
+                };
+                self.replicate_writes(namespace, key, &others, body).await;
+            }
+            return result;
+        }
 
         // Fan out to the replicas concurrently with the primary write —
         // `set`/`delete` are idempotent, so replaying the same op on a
