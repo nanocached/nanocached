@@ -11,6 +11,12 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ### Fixed
 
+- A reply whose echoed tag does not answer the request it follows is now a
+  `ConnectionLostError` for that request, like every other failure after
+  the frame was written. It was a plain `ConnectionError`, so a `ttl=0`
+  touch, `incr` and the compare-and-set family were sent again: the second
+  `touch` reported a key that existed as missing and `incr` was applied
+  twice.
 - A `ttl=0` touch (`touch`, `get_and_touch`, `touch_many`,
   `get_many_and_touch`) is no longer sent again after a reply that cannot be
   matched to it, a reply of the wrong kind or a roster of the wrong length.

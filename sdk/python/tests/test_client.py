@@ -2292,6 +2292,52 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
+    async def start_tagged_cluster(self):
+        nodes = {
+            NAMES[0]: await MockNode(support_tags=True).start(),
+            NAMES[1]: await MockNode(support_tags=True).start(),
+        }
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    async def test_an_expiring_touch_is_not_resent_after_a_reply_with_the_wrong_tag(self):
+        # Issue #935: a reply whose echoed tag does not answer the request
+        # is a loss after the send, like any other desync.
+        nodes, discovery = await self.start_tagged_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, _ = self.owners_of("k")
+            primary = nodes[primary_name]
+            await client.set("k", "payload")
+            primary.answer_next_with_wrong_tag(b"t")
+            with self.assertRaises(ConnectionLostError):
+                await client.touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 1)
+
+            await client.set("k", "payload")
+            primary.answer_next_with_wrong_tag(b"t")
+            with self.assertRaises(ConnectionLostError):
+                await client.get_and_touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 2)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_incr_is_not_resent_after_a_reply_with_the_wrong_tag(self):
+        nodes, discovery = await self.start_tagged_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, _ = self.owners_of("k")
+            primary = nodes[primary_name]
+            await client.set("k", "10")
+            primary.answer_next_with_wrong_tag(b"i")
+            with self.assertRaises(ConnectionLostError):
+                await client.incr("k", 1)
+            self.assertEqual(primary.incr_count, 1)
+        finally:
+            await self.stop(client, discovery, nodes)
+
     async def test_an_expiring_touch_still_retries_a_request_that_was_never_sent(self):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
