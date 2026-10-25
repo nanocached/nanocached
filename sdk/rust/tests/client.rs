@@ -4989,6 +4989,24 @@ async fn batch_touch_reaches_a_fire_and_forget_replica_in_the_background() {
     let replica = node_named(&nodes, NAMES[1]);
     let keys = keys_whose_primary_is(NAMES[0], 3);
     client.set_many(&values_for(&keys), 0).await.unwrap();
+    // The replica's copy of the set is a background write too: a touch that
+    // reaches the replica first finds nothing to touch, and the set then
+    // lands without a TTL.
+    let set_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while keys.iter().any(|key| {
+        !replica
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .contains_key(key.as_bytes())
+    }) {
+        assert!(
+            tokio::time::Instant::now() < set_deadline,
+            "the background set never landed on the replica"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     let touched = client.touch_many(&keys, Some(30)).await.unwrap();
     assert!(touched.values().all(|touched| *touched));

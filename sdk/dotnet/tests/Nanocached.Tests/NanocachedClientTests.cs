@@ -4470,6 +4470,12 @@ public class NanocachedClientTests
         MockNode replica = cluster.Nodes[Names[1]];
         List<string> keys = KeysWhosePrimaryIs(Names[0], 3);
         await client.SetManyAsync(ValuesFor(keys));
+        // The replica's copy of the set is a background write too: a touch
+        // that reaches the replica first finds nothing to touch, and the
+        // set then lands without a TTL.
+        await WaitForAsync(
+            () => keys.All(key => replica.Store.ContainsKey(MockNode.KeyOf(Bytes(key)))),
+            "the background set to land on the replica");
 
         Assert.All((await client.TouchManyAsync(keys, 30)).Values, Assert.True);
         await WaitForAsync(() => replica.MultiTouchFrames.Count > 0, "the background touch to reach the replica");
