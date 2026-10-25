@@ -2925,7 +2925,7 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 // the operation's result — replica legs run on their own goroutines, so
 // an op that captures outer variables must only write them when primary.
 func (c *Client) write(namespace, key []byte, op func(conn *connection, primary bool) error) error {
-	return c.writeWith(namespace, key, op, c.applyReconnecting)
+	return c.writeWith(namespace, key, op, c.applyReconnecting, false)
 }
 
 // writeWith is write with the primary leg's send policy chosen by the
@@ -2934,10 +2934,22 @@ func (c *Client) write(namespace, key []byte, op func(conn *connection, primary 
 // sent, for a touch that expires the entry — issue #901). The replica legs
 // always keep applyReconnecting: a replica's outcome never decides the
 // result, and replaying a touch there is harmless.
+//
+// replicasAfterPrimary (a touch with ttlSeconds == 0, issue #934) sends the
+// replica legs only once the primary has answered, the way Incr's result
+// fan-out does, instead of concurrently with it. The plain `t ... 0` expires
+// the entry on whoever receives it, so a replica touched before the primary
+// failed or answered `W` would have consumed the value a reroute — which
+// makes that replica the primary and asks it for the `G` form — then reports
+// as a miss. A primary that could not be reached, or answered `W`, returns
+// its error with no replica touched; the retry layer reroutes the whole
+// operation, which runs this same shape again. The replicas are the key's
+// other owners on the ring in force when the primary answered.
 func (c *Client) writeWith(
 	namespace, key []byte,
 	op func(conn *connection, primary bool) error,
 	applyPrimary func(slot string, op func(*connection) error) error,
+	replicasAfterPrimary bool,
 ) error {
 	c.mu.Lock()
 	single := c.ring == nil
@@ -2952,6 +2964,15 @@ func (c *Client) writeWith(
 		return connectionLost("no owner is reachable for this key", nil)
 	}
 
+	if replicasAfterPrimary {
+		if err := applyPrimary(names[0], primaryOp); err != nil {
+			return err
+		}
+		wg := c.fanReplicas(c.ownersExcept(namespace, key, names[0]), func(conn *connection) error { return op(conn, false) })
+		wg.Wait()
+		return nil
+	}
+
 	// Fan out to the replicas concurrently with the primary write — see
 	// fanReplicas for the failure/fire-and-forget semantics both this and
 	// Incr's post-success result fan-out (issue #129) share.
@@ -2959,6 +2980,18 @@ func (c *Client) writeWith(
 	err := applyPrimary(names[0], primaryOp)
 	wg.Wait()
 	return err
+}
+
+// ownersExcept returns (namespace, key)'s owners on the ring in force now,
+// without the node that already answered as primary (issue #934).
+func (c *Client) ownersExcept(namespace, key []byte, answered string) []string {
+	var rest []string
+	for _, name := range c.ownerNames(namespace, key) {
+		if name != answered {
+			rest = append(rest, name)
+		}
+	}
+	return rest
 }
 
 // fanReplicas runs op against every name in replicas (a key's non-primary
