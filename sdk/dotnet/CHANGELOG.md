@@ -12,6 +12,12 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- The documentation of `TouchManyAsync`, `GetManyAndTouchAsync` and
+  `PartialConnectionLostException<T>` now says that with a TTL of 0 the keys
+  a connection failure leaves unresolved include ones whose frame was sent
+  and whose outcome is unknown: the node may already have expired them, so
+  they must not be sent again (a second touch finds them gone). No
+  behaviour change.
 - A failed redial of a dead node is now marked request-not-sent, as the
   first connect already did. `TouchAsync(key, 0)`, `GetAndTouchAsync(key, 0)`,
   `TouchManyAsync(keys, 0)`, `GetManyAndTouchAsync(keys, 0)`, `IncrAsync`
