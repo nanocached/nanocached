@@ -3650,15 +3650,26 @@ impl SharedBackends {
     /// `call` on every `(addr, frame)` in `requests` concurrently — the
     /// retry-path counterpart of `enqueue_each`, same ordering.
     /// `call_each` for requests that do not all expect the same reply.
+    /// `replay_sent` is `call`'s behaviour; without it a frame that may
+    /// have reached the backend is not sent again (`call_non_idempotent`),
+    /// for a batch whose effect a second application would undo (a
+    /// `ttl=0` touch, which expires the keys it answers).
     async fn call_mixed<'a>(
         &'a self,
         context: &'a ProxyContext,
         requests: impl IntoIterator<Item = (&'a str, Bytes, Expect)>,
+        replay_sent: bool,
     ) -> Vec<io::Result<NodeReply>> {
         let futs = requests
             .into_iter()
             .map(|(addr, frame, expect)| {
-                Box::pin(self.call(context, addr, frame, expect))
+                Box::pin(async move {
+                    if replay_sent {
+                        self.call(context, addr, frame, expect).await
+                    } else {
+                        self.call_non_idempotent(context, addr, frame, expect).await
+                    }
+                })
                     as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + 'a>>
             })
             .collect();
@@ -4876,13 +4887,32 @@ struct MultiTouchBatch<'a> {
 /// `retry_positions`, and so does a group that failed or came back
 /// malformed. A replica leg's `W` or failure is logged and swallowed, like
 /// `finish_touch`'s stance on a replica.
+///
+/// With `expiring` (`ttl=0`) a sent frame cannot be sent again: it expired
+/// the keys it found, so a second one would answer them as misses. A primary
+/// leg whose reply is lost or malformed after the frame may have reached the
+/// node is then not retried but reported to the caller (`true`), who fails
+/// the whole frame as an outcome unknown. A frame that provably never left
+/// (`request_not_sent`) or that the node refused is retried as before.
 fn settle_multi_touch_group(
     context: &ProxyContext,
     legs: &[(usize, bool)],
     reply: io::Result<NodeReply>,
     entries: &mut [Option<ProxyMultiEntry>],
     retry_positions: &mut Vec<usize>,
-) {
+    expiring: bool,
+) -> bool {
+    let may_have_applied = expiring
+        && match &reply {
+            Err(error) => !request_not_sent(error),
+            Ok(NodeReply::Multi(results) | NodeReply::MultiTouch(results)) => {
+                results.len() != legs.len()
+            }
+            Ok(_) => false,
+        };
+    if may_have_applied && legs.iter().any(|&(_, is_primary)| is_primary) {
+        return true;
+    }
     match reply {
         Ok(NodeReply::Multi(results) | NodeReply::MultiTouch(results))
             if results.len() == legs.len() =>
@@ -4914,6 +4944,7 @@ fn settle_multi_touch_group(
             }
         }
     }
+    false
 }
 
 /// Issue #871: awaits every sub-reply of a `y` batch and splices the
@@ -4936,18 +4967,26 @@ async fn finish_multi_touch(
     for position in missing {
         entries[position] = Some(ProxyMultiEntry::WrongNode);
     }
+    let expiring = batch.ttl == Some(0);
+    let mut unknown = false;
     for (group, reply) in groups.into_iter().zip(pending) {
-        settle_multi_touch_group(
+        unknown |= settle_multi_touch_group(
             context,
             &group.legs,
             reply.await,
             &mut entries,
             &mut retry_positions,
+            expiring,
         );
     }
+    if unknown {
+        return Err(Fatal::OutcomeUnknown);
+    }
 
-    if !retry_positions.is_empty() {
-        retry_multi_touch(context, batch, &retry_positions, &mut entries).await;
+    if !retry_positions.is_empty()
+        && retry_multi_touch(context, batch, &retry_positions, &mut entries).await
+    {
+        return Err(Fatal::OutcomeUnknown);
     }
 
     let mut entries: Vec<ProxyMultiEntry> = entries
@@ -4966,20 +5005,21 @@ async fn finish_multi_touch(
 /// `retry_multi_set`: the retried keys are re-sent to every owner on the
 /// fresh ring, not just the primary, which is harmless because a touch is
 /// idempotent. A key whose primary is still `W` or unreachable is answered
-/// `W`.
+/// `W`. Returns `true` when an expiring (`ttl=0`) batch's primary leg may
+/// have been applied and its reply is lost (see `settle_multi_touch_group`).
 async fn retry_multi_touch(
     context: &ProxyContext,
     batch: MultiTouchBatch<'_>,
     retry_positions: &[usize],
     entries: &mut [Option<ProxyMultiEntry>],
-) {
+) -> bool {
     force_refresh(context).await;
 
     let Some(ring) = current_ring(context) else {
         for &position in retry_positions {
             entries[position] = Some(ProxyMultiEntry::WrongNode);
         }
-        return;
+        return false;
     };
 
     let (missing, groups) = plan_multi_touch(
@@ -4997,15 +5037,28 @@ async fn retry_multi_touch(
     let requests = groups
         .iter()
         .map(|group| (group.addr.as_str(), group.frame.clone(), group.expect));
-    let replies = context.backends.call_mixed(context, requests).await;
+    let expiring = batch.ttl == Some(0);
+    let replies = context
+        .backends
+        .call_mixed(context, requests, !expiring)
+        .await;
 
     let mut unresolved = Vec::new();
+    let mut unknown = false;
     for (group, reply) in groups.iter().zip(replies) {
-        settle_multi_touch_group(context, &group.legs, reply, entries, &mut unresolved);
+        unknown |= settle_multi_touch_group(
+            context,
+            &group.legs,
+            reply,
+            entries,
+            &mut unresolved,
+            expiring,
+        );
     }
     for position in unresolved {
         entries[position] = Some(ProxyMultiEntry::WrongNode);
     }
+    unknown
 }
 
 /// Enqueues a write/delete on every owner concurrently (issue #177: one
@@ -5196,7 +5249,11 @@ fn touch_answer(reply: &NodeReply, tag: Option<u32>) -> Option<Vec<u8>> {
 /// receipt and it never changes the value), so a connection that failed
 /// after the frame may have reached the node is re-sent, and a second
 /// failure is `Fatal::Transient`, which a client that declared the
-/// retryable-error capability is answered `R` — never `OutcomeUnknown`.
+/// retryable-error capability is answered `R` — never `OutcomeUnknown`,
+/// with one exception: a `ttl=0` touch expires the key it finds, so a frame
+/// that may have reached the node is not sent again (the second would answer
+/// `N`, and a `G` would lose the value the first one consumed) and its
+/// failure is `OutcomeUnknown`.
 async fn finish_touch(
     context: &ProxyContext,
     namespace: &[u8],
@@ -5230,8 +5287,13 @@ async fn finish_touch(
             force_refresh(context).await;
             refan_touch(context, namespace, key, ttl, get, tag, retry_capable).await
         }
+        Err(error) if ttl == Some(0) && !request_not_sent(error) => Err(Fatal::OutcomeUnknown),
         Err(_) => refan_touch(context, namespace, key, ttl, get, tag, retry_capable).await,
-        Ok(reply) => touch_answer(reply, tag).ok_or(Fatal::Transient),
+        Ok(reply) => touch_answer(reply, tag).ok_or(if ttl == Some(0) {
+            Fatal::OutcomeUnknown
+        } else {
+            Fatal::Transient
+        }),
     }
 }
 
@@ -5260,6 +5322,18 @@ async fn refan_touch(
     } else {
         (frame_touch(namespace, key, ttl, false), Expect::Touch)
     };
+    if ttl == Some(0) {
+        // A frame that may have reached the node is not sent again.
+        return match context
+            .backends
+            .call_non_idempotent(context, primary, frame, expect)
+            .await
+        {
+            Ok(reply) => touch_answer(&reply, tag).ok_or(Fatal::OutcomeUnknown),
+            Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
+            Err(_) => Err(Fatal::OutcomeUnknown),
+        };
+    }
     match context.backends.call(context, primary, frame, expect).await {
         Ok(reply) => touch_answer(&reply, tag).ok_or(Fatal::Transient),
         Err(_) => Err(Fatal::Transient),
@@ -11302,6 +11376,89 @@ mod tests {
             vec![(Some(30), false), (Some(30), false)],
             "one attempt whose reply was lost, one re-send"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_touch_whose_reply_is_lost_is_not_re_sent() {
+        // Issue #919: a `ttl=0` touch expires the key it finds, so the
+        // re-send a lost reply gets for any other touch would answer `N`
+        // (and lose the value a `G` consumed). The frame goes once and the
+        // client is told the outcome is unknown.
+        for get in [false, true] {
+            let (nodes, proxy) = cluster(1).await;
+            let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+            let ring = RingView::new(
+                vec![
+                    ("node-a".to_string(), nodes[0].addr.clone()),
+                    ("node-b".to_string(), nodes[1].addr.clone()),
+                ],
+                1,
+            );
+            let primary_addr = ring.owners(b"", b"key")[0].clone();
+            let primary = if primary_addr == nodes[0].addr {
+                &nodes[0]
+            } else {
+                &nodes[1]
+            };
+            stream.write_all(b"S 3 1 1\nkeyv").await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 1");
+
+            primary
+                .close_after_touch_apply_once
+                .store(true, Ordering::SeqCst);
+            let request: &[u8] = if get {
+                b"t 0 3 0 G 2\nkey"
+            } else {
+                b"t 0 3 0 2\nkey"
+            };
+            stream.write_all(request).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+            assert_eq!(
+                primary.touches(),
+                vec![(Some(0), get)],
+                "get={get}: the lost-reply attempt must not be re-sent"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_touch_that_never_left_is_still_retried() {
+        // The control for the test above: a connection that is already dead
+        // when the touch is written never carried the frame, so the one
+        // re-send is safe and the answer is the same `R` as for any touch.
+        let proxy = dead_node_cluster().await;
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        stream.write_all(b"A 1 R\nx").await.unwrap();
+        let mut buf = BytesMut::new();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+
+        stream.write_all(b"t 0 4 0\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R");
+        stream.write_all(b"y 0 1 4 0\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "Y 1 W");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_batch_touch_whose_connection_drops_is_not_re_sent() {
+        // Issue #919: the batch counterpart. Every node drops the
+        // connection after reading the frame, so the keys may have been
+        // expired; sending the groups again would answer them as misses.
+        for request in [&b"y 0 2 1 1 0\nab"[..], &b"y 0 2 1 1 0 G\nab"[..]] {
+            let (nodes, proxy) = cluster(1).await;
+            let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+            stream.write_all(b"S 1 1\nav").await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+            stream.write_all(b"S 1 1\nbw").await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+            for node in &nodes {
+                node.close_once.store(true, Ordering::SeqCst);
+            }
+            stream.write_all(request).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+            let touches: usize = nodes.iter().map(|node| node.touches().len()).sum();
+            assert_eq!(touches, 0, "no group was sent a second time");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
