@@ -695,8 +695,31 @@ impl Cache {
         let bounded = max_value_bytes != usize::MAX;
         let mut value_bytes: usize = 0;
         let mut results = Vec::with_capacity(names.len());
+        // A zero TTL expires an entry at `now`, the instant the rest of the
+        // batch is judged by, so a name repeated in the frame would find
+        // its own first touch already expired and answer a miss. It is
+        // answered with what the first one returned instead, as `get_many`
+        // answers a repeated name twice.
+        let expires_at_once = ttl == Some(Duration::ZERO);
+        let mut touched_at_once: HashMap<&[u8], Bytes> = HashMap::new();
 
         for name in names {
+            if let Some(value) = touched_at_once.get(name.as_ref()) {
+                let over = bounded
+                    && (value_bytes >= max_value_bytes
+                        || value_bytes.saturating_add(value.len()) > max_value_bytes);
+                if over {
+                    results.push(None);
+                    continue;
+                }
+                self.touches += 1;
+                if promote {
+                    self.hits += 1;
+                }
+                value_bytes = value_bytes.saturating_add(value.len());
+                results.push(Some(value.clone()));
+                continue;
+            }
             if bounded {
                 let over = value_bytes >= max_value_bytes
                     || self
@@ -710,6 +733,9 @@ impl Cache {
             match self.touch_in(id, name, ttl, promote, now) {
                 Some((value, _)) => {
                     value_bytes = value_bytes.saturating_add(value.len());
+                    if expires_at_once {
+                        touched_at_once.insert(name.as_ref(), value.clone());
+                    }
                     results.push(Some(value));
                 }
                 None => results.push(None),
@@ -2329,6 +2355,41 @@ mod tests {
         let results = cache.touch_many(&namespace, &names, Some(Duration::ZERO), false, UNBOUNDED);
         assert_eq!(results.iter().filter(|value| value.is_some()).count(), 2);
         assert_eq!(cache.get_at(&namespaced(b"ns", b"a"), Instant::now()), None);
+    }
+
+    #[test]
+    fn touch_many_with_a_zero_ttl_answers_a_repeated_name_like_the_first() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let namespace = Bytes::from_static(b"ns");
+        cache.set_many(
+            &namespace,
+            [(Bytes::from_static(b"k"), Bytes::from_static(b"abc"))],
+            None,
+        );
+        let names = [Bytes::from_static(b"k"), Bytes::from_static(b"k")];
+
+        let results = cache.touch_many(&namespace, &names, Some(Duration::ZERO), true, UNBOUNDED);
+
+        assert_eq!(
+            results,
+            vec![
+                Some(Bytes::from_static(b"abc")),
+                Some(Bytes::from_static(b"abc")),
+            ]
+        );
+        let stats = cache.stats();
+        assert_eq!((stats.touches, stats.touch_misses), (2, 0));
+        assert_eq!((stats.hits, stats.misses), (2, 0));
+        assert_eq!(cache.get_at(&namespaced(b"ns", b"k"), Instant::now()), None);
+
+        // The reply bound still counts the repeat's bytes.
+        cache.set_many(
+            &namespace,
+            [(Bytes::from_static(b"k"), Bytes::from_static(b"abc"))],
+            None,
+        );
+        let results = cache.touch_many(&namespace, &names, Some(Duration::ZERO), true, 4);
+        assert_eq!(results, vec![Some(Bytes::from_static(b"abc")), None]);
     }
 
     #[test]
