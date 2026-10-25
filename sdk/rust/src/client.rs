@@ -2362,7 +2362,11 @@ impl NanocachedClient {
         let mut retry = self
             .multi_touch_pass(namespace, key_bytes, ttl_seconds, get, indices, &state)
             .await;
-        if !retry.is_empty() {
+        // An `En` is a final answer from that node (a server that predates
+        // `y`): a refresh and a second pass would only ask it again, so
+        // the outcome is returned as it stands (issue #902).
+        let rejected = state.inner.lock().unwrap().rejected.is_some();
+        if !retry.is_empty() && !rejected {
             // One bounded refresh-and-retry over everything a primary left
             // unresolved: a `W` is stale routing the refresh fixes, a
             // primary that could not be reached gets a fresh view of who
