@@ -767,7 +767,7 @@ impl Connection {
                 if entries.len() != keys.len() =>
             {
                 self.close();
-                Err(Error::ConnectionLost(format!(
+                Err(Error::ConnectionLostAfterSend(format!(
                     "nanocached: multi-touch response roster length {} does not match request key count {} (connection desynced)",
                     entries.len(),
                     keys.len()
@@ -1012,7 +1012,9 @@ impl Connection {
             ResponseKind::MultiTouch(_) => "multi-touch",
         };
         self.close();
-        Error::ConnectionLost(format!(
+        // The reply being parsed means the frame was written, so this is a
+        // loss after the send: an expiring touch must not be replayed on it.
+        Error::ConnectionLostAfterSend(format!(
             "nanocached: response \"{name}\" does not match the request (connection desynced)"
         ))
     }

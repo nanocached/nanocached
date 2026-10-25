@@ -203,6 +203,15 @@ struct NodeState {
     /// exactly `count` roster entries whatever the request's key count
     /// (issue #181's desync, for `y`); `0` is disarmed.
     multi_touch_bad_count_plus_one: AtomicUsize,
+    /// Issue #920: answer the next N `t` frames, once applied, with a `D`
+    /// (a reply of the wrong kind: the stream is desynced).
+    touch_wrong_kind_replies: AtomicUsize,
+    /// Issue #920: as `touch_wrong_kind_replies`, for `i`: applied, then
+    /// answered with a `D`.
+    incr_wrong_kind_replies: AtomicUsize,
+    /// Issue #920: answer the next `y` frame, once applied, with a header
+    /// that is not a reply at all.
+    multi_touch_garbage_replies: AtomicUsize,
 }
 
 /// One `y` frame as the mock saw it (issue #871).
@@ -601,15 +610,22 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                                         // replay this increment.
                                         return;
                                     }
-                                    let ttl = state.incr_ttl_seconds.load(Ordering::SeqCst);
-                                    let mut frame = if ttl > 0 {
-                                        format!("I {} {ttl}{tag_suffix}\n", new_bytes.len())
-                                            .into_bytes()
+                                    if take_one(&state.incr_wrong_kind_replies) {
+                                        // Issue #920: applied, then a reply of
+                                        // the wrong kind.
+                                        format!("D{tag_suffix}\n").into_bytes()
                                     } else {
-                                        format!("I {}{tag_suffix}\n", new_bytes.len()).into_bytes()
-                                    };
-                                    frame.extend_from_slice(&new_bytes);
-                                    frame
+                                        let ttl = state.incr_ttl_seconds.load(Ordering::SeqCst);
+                                        let mut frame = if ttl > 0 {
+                                            format!("I {} {ttl}{tag_suffix}\n", new_bytes.len())
+                                                .into_bytes()
+                                        } else {
+                                            format!("I {}{tag_suffix}\n", new_bytes.len())
+                                                .into_bytes()
+                                        };
+                                        frame.extend_from_slice(&new_bytes);
+                                        frame
+                                    }
                                 }
                             }
                         }
@@ -677,7 +693,9 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                                 // Applied above, but the reply never comes.
                                 return;
                             }
-                            if !with_value {
+                            if take_one(&state.touch_wrong_kind_replies) {
+                                format!("D{tag_suffix}\n").into_bytes()
+                            } else if !with_value {
                                 format!("S{tag_suffix}\n").into_bytes()
                             } else {
                                 let ttl_field = match ttl_seconds {
@@ -804,6 +822,10 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                         tokens.push(if with_value { "-" } else { "N" }.to_string());
                         hits.push(None);
                     }
+                }
+                if take_one(&state.multi_touch_garbage_replies) {
+                    let _ = stream.get_mut().write_all(b"~ not a reply\n").await;
+                    return;
                 }
                 let mut reply = format!("{} {}", if with_value { 'M' } else { 'Y' }, tokens.len());
                 for token in &tokens {
@@ -8446,4 +8468,137 @@ async fn connect_reports_a_node_at_its_connection_limit_as_busy_on_the_first_dia
         1,
         "a busy reply is not a legacy door-slam to retry"
     );
+}
+
+// Issue #920: a reply that cannot be matched to the frame (a reply of the
+// wrong kind, a roster of the wrong length, a header that is not a reply)
+// only ever follows a written frame, so for `Some(0)` it counts as sent: the
+// touch is not replayed onto a redialled connection, which would find the
+// key already expired.
+
+#[tokio::test]
+async fn a_zero_ttl_touch_is_not_resent_after_a_reply_of_the_wrong_kind() {
+    let node = MockNode::start_with(NodeState {
+        touch_wrong_kind_replies: AtomicUsize::new(1),
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("k", "v", 100).await.unwrap();
+    let result = client.touch("k", Some(0)).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "expected ConnectionLost, got {result:?}"
+    );
+    assert_eq!(touch_frames(&node).len(), 1, "the touch was sent once");
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_zero_ttl_get_and_touch_is_not_resent_after_a_reply_of_the_wrong_kind() {
+    let node = MockNode::start_with(NodeState {
+        touch_wrong_kind_replies: AtomicUsize::new(1),
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("k", "payload", 100).await.unwrap();
+    let result = client.get_and_touch("k", Some(0)).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "expected ConnectionLost, got {result:?}"
+    );
+    assert_eq!(touch_frames(&node).len(), 1, "the request was sent once");
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_zero_ttl_batch_touch_is_not_resent_after_a_roster_of_the_wrong_length() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let keys = ["a", "b", "c"].map(String::from).to_vec();
+    for key in &keys {
+        client.set(key, "v", 100).await.unwrap();
+    }
+
+    node.state
+        .multi_touch_bad_count_plus_one
+        .store(2, Ordering::SeqCst);
+    let result = client.touch_many(&keys, Some(0)).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "expected ConnectionLost, got {result:?}"
+    );
+    assert_eq!(
+        multi_touch_frames(&node).len(),
+        1,
+        "the batch was sent once"
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_zero_ttl_batch_touch_is_not_resent_after_a_reply_that_is_not_a_reply() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let node_a = node_named(&nodes, NAMES[0]);
+    let primary_a = keys_whose_primary_is(NAMES[0], 3);
+    let primary_b = keys_whose_primary_is(NAMES[1], 2);
+    let all = concat(&primary_a, &primary_b);
+    client.set_many(&values_for(&all), 0).await.unwrap();
+
+    node_a
+        .state
+        .multi_touch_garbage_replies
+        .store(1, Ordering::SeqCst);
+    let result = client.touch_many(&all, Some(0)).await;
+    // Resent, the keys would come back as `false`, expired by the first frame.
+    assert!(
+        matches!(result, Err(Error::Protocol(_))),
+        "expected Protocol, got {result:?}"
+    );
+    assert_eq!(
+        multi_touch_frames(node_a).len(),
+        1,
+        "the batch was sent to that primary once"
+    );
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn incr_is_not_replayed_after_a_reply_of_the_wrong_kind() {
+    // The same classification as for a zero-TTL touch: the reply being
+    // parsed means the delta was sent, and a replay would apply it twice.
+    let node = MockNode::start_with(NodeState {
+        incr_wrong_kind_replies: AtomicUsize::new(1),
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("counter", "10", 0).await.unwrap();
+    let result = client.incr("counter", 5).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "expected ConnectionLost, got {result:?}"
+    );
+    assert_eq!(
+        client.get("counter").await.unwrap().as_deref(),
+        Some("15"),
+        "the delta was applied once"
+    );
+
+    client.close().await;
+    node.stop();
 }

@@ -8,6 +8,16 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Fixed
 
+- A `Some(0)` touch (`touch`, `get_and_touch`, `touch_many`,
+  `get_many_and_touch`) is no longer sent again after a reply that cannot be
+  matched to it: a reply of the wrong kind, a roster of the wrong length, or
+  a reply that is not a reply at all. The frame was written, so the node had
+  already expired the keys, and the second one reported them as `false` or as
+  misses, and a `get_and_touch` lost the value. They now fail with the error
+  the bad reply raised. The same reply of the wrong kind used to make `incr`,
+  `decr` and the compare-and-set family redial and send the frame again, so
+  an `incr` could apply its delta twice; they now fail with
+  `ConnectionLost` instead.
 - The crate compiles with the `compression` feature off
   (`--no-default-features`, or `tls` alone). The cumulative size check for
   `get_many` named `Error::Decompression`, which exists only with
