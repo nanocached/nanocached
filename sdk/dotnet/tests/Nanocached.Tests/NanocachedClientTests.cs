@@ -4546,6 +4546,29 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task ABatchTouchAsksANodeThatPredatesYAtMostOnce()
+    {
+        // Issue #902: an `En` is final, so no refresh and second pass.
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        List<string> oldKeys = KeysWhosePrimaryIs(Names[0], 2);
+        List<string> keys = oldKeys.Concat(KeysWhosePrimaryIs(Names[1], 2)).ToList();
+        await client.SetManyAsync(ValuesFor(keys));
+        MockNode old = cluster.Nodes[Names[0]];
+        old.RejectMultiTouchLikeAnOldServer();
+        // The primary leg of the old node's own keys, in either form.
+        int Asks(bool get) => old.MultiTouchFrames.Count(f => f.Get == get && f.Keys.Contains(oldKeys[0]));
+
+        // At most one: a call that finds the connection the last `En` closed
+        // already dead answers without sending anything.
+        await Assert.ThrowsAsync<ServerTooOldException>(() => client.TouchManyAsync(keys, 30));
+        Assert.True(Asks(false) <= 1);
+        await Assert.ThrowsAsync<ServerTooOldException>(() => client.GetManyAndTouchAsync(keys, 30));
+        Assert.True(Asks(true) <= 1);
+    }
+
+    [Fact]
     public async Task BatchTouchReportsAnUnreachablePrimaryAsAConnectionFailureNotWrongNode()
     {
         using Cluster cluster = StartCluster(replication: 1);
