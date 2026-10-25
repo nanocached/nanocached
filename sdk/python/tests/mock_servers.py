@@ -119,6 +119,8 @@ class MockNode:
         self.legacy_without_touch = False
         self._drop_next_touch_reply = False
         self._touch_wrong_kind_reply = False
+        # See hold_touch_replies(): None means "answer at once".
+        self._touch_gate: asyncio.Event | None = None
         # See answer_next_touch_with_raw(): None means "answer normally".
         self._touch_raw_reply: bytes | None = None
         # See answer_next_with_wrong_tag(): command bytes whose next
@@ -327,6 +329,15 @@ class MockNode:
         well-formed reply of the wrong kind, the misaligned stream of
         issue #921."""
         self._touch_wrong_kind_reply = True
+
+    def hold_touch_replies(self) -> asyncio.Event:
+        """Holds every `t` and `y` reply (the request is recorded in
+        ``touches`` / ``multi_touch_frames`` on arrival, nothing is applied
+        or answered) until the returned event is set — for asserting what
+        other nodes have been sent while this one has not answered yet
+        (issue #934)."""
+        self._touch_gate = asyncio.Event()
+        return self._touch_gate
 
     def answer_next_touch_with_raw(self, raw: bytes) -> None:
         """Answers the next `t` or `y` request with exactly ``raw`` (say
@@ -824,6 +835,8 @@ class MockNode:
                         tail = tail[:-1]
                     ttl = int(tail[0]) if tail else None
                     self.touches.append((namespace, key, ttl, get))
+                    if self._touch_gate is not None:
+                        await self._touch_gate.wait()
                     if self.legacy_without_touch:
                         writer.write(b"En\n")
                         await writer.drain()
@@ -1029,6 +1042,8 @@ class MockNode:
                         tail = tail[:-1]
                     ttl = int(tail[0]) if tail else None
                     self.multi_touch_frames.append((namespace, keys, ttl, get))
+                    if self._touch_gate is not None:
+                        await self._touch_gate.wait()
                     if self.legacy_without_touch or self.legacy_without_multi_touch:
                         writer.write(b"En\n")
                         await writer.drain()
