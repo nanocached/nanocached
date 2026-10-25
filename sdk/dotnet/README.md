@@ -409,7 +409,12 @@ did resolve in `PartialValues`. A primary being down never reads as a
 wrong-node. `TouchManyAsync` carries no partial result: it throws a plain
 `WrongNodeException` or the connection failure, and since a touch is
 idempotent the whole batch can simply be sent again. Against a node that has
-`t` but not `y` both throw `ServerTooOldException` (`Command` is `"y"`).
+`t` but not `y` both throw `ServerTooOldException` (`Command` is `"y"`); in a
+cluster, when other primaries had already answered, `GetManyAndTouchAsync`
+throws its subclass `PartialServerTooOldException<T>` with their hits in
+`PartialValues`. With a TTL of 0 those values are consumed, so they are not
+read again. Catch `ServerTooOldException` as before; a test that asserts the
+exact type needs `ThrowsAnyAsync`.
 
 ## Replication
 

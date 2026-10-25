@@ -1988,7 +1988,12 @@ public sealed class NanocachedClient : IDisposable
     /// primary whose connection fails after the frame may have been applied
     /// is not resent (issue #901): it may have expired and consumed its
     /// values already, so those keys throw at once instead of reading as
-    /// misses.</para></summary>
+    /// misses. Against a node that predates <c>y</c> it throws
+    /// <see cref="ServerTooOldException"/> — in a cluster, when other
+    /// primaries had already answered, its subclass
+    /// <see cref="PartialServerTooOldException{T}"/> carrying their hits
+    /// (with a TTL of 0 those values are consumed and would otherwise be
+    /// lost).</para></summary>
     public Task<Dictionary<string, string>> GetManyAndTouchAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
         GetManyAndTouchAsync(EmptyNamespace, keys, ttlSeconds);
 
@@ -2004,6 +2009,11 @@ public sealed class NanocachedClient : IDisposable
         catch (PartialWrongNodeException<Dictionary<string, byte[]>> partial)
         {
             throw new PartialWrongNodeException<Dictionary<string, string>>(DecodeMany(partial.PartialValues));
+        }
+        catch (PartialServerTooOldException<Dictionary<string, byte[]>> partial)
+        {
+            throw new PartialServerTooOldException<Dictionary<string, string>>(
+                DecodeMany(partial.PartialValues), partial.InnerException!);
         }
         catch (PartialConnectionLostException<Dictionary<string, byte[]>> partial)
         {
@@ -2044,7 +2054,13 @@ public sealed class NanocachedClient : IDisposable
             }
         }
         if (outcome.Unresolved.Count == 0) return values;
-        if (outcome.Rejected is not null) ExceptionDispatchInfo.Capture(outcome.Rejected).Throw();
+        if (outcome.Rejected is not null)
+        {
+            // The hits other primaries returned ride along (issue #924): a
+            // TTL of 0 consumed them.
+            if (values.Count == 0) ExceptionDispatchInfo.Capture(outcome.Rejected).Throw();
+            throw new PartialServerTooOldException<Dictionary<string, byte[]>>(values, outcome.Rejected.InnerException!);
+        }
         if (outcome.WrongNode) throw new PartialWrongNodeException<Dictionary<string, byte[]>>(values);
         // No primary answered `W` for these keys: each one's primary was
         // unreachable on both passes. That is a connection loss, reported
