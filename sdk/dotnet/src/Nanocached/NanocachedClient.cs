@@ -1457,8 +1457,18 @@ public sealed class NanocachedClient : IDisposable
     /// discarding them — see that type's doc comment. A first-chunk
     /// failure has nothing to attach yet, so it propagates as the bare
     /// underlying exception, unchanged.</para></summary>
-    private async Task<List<Connection.MultiEntry>> MultiGetChunkedAsync(
-        string? slot, byte[] namespaceBytes, byte[][] keys)
+    private Task<List<Connection.MultiEntry>> MultiGetChunkedAsync(
+        string? slot, byte[] namespaceBytes, byte[][] keys) =>
+        MultiKeysChunkedAsync(
+            slot, namespaceBytes, keys, (connection, chunk) => connection.MultiGetAsync(namespaceBytes, chunk));
+
+    /// <summary><see cref="MultiGetChunkedAsync"/>'s chunking over any
+    /// key-list command: <paramref name="send"/> issues one sub-frame for
+    /// the chunk it is given (issue #871: <c>y</c> shares <c>m</c>'s
+    /// chunking, since both carry only keys).</summary>
+    private async Task<List<Connection.MultiEntry>> MultiKeysChunkedAsync(
+        string? slot, byte[] namespaceBytes, byte[][] keys,
+        Func<Connection, IReadOnlyList<byte[]>, Task<List<Connection.MultiEntry>>> send)
     {
         var entries = new List<Connection.MultiEntry>(new Connection.MultiEntry[keys.Length]);
         int start = 0;
@@ -1478,7 +1488,7 @@ public sealed class NanocachedClient : IDisposable
             try
             {
                 chunkEntries = await ApplyReconnectingAsync(
-                    slot, connection => connection.MultiGetAsync(namespaceBytes, chunk)).ConfigureAwait(false);
+                    slot, connection => send(connection, chunk)).ConfigureAwait(false);
             }
             catch (Exception error) when (start > 0 && (error is NanocachedException or IOException
                 or System.Net.Sockets.SocketException or ObjectDisposedException))
@@ -1831,6 +1841,485 @@ public sealed class NanocachedClient : IDisposable
             throw new ArgumentOutOfRangeException(
                 nameof(ttlSeconds),
                 $"nanocached: ttlSeconds must not be negative (pass null to remove the TTL), got {ttlSeconds}");
+        }
+    }
+
+    // ── Batched touch (issue #871) ───────────────────────────────────
+
+    /// <summary>Batched <see cref="TouchAsync(string, long?)"/> (issue
+    /// #871): replaces the TTL of every key in <paramref name="keys"/> in
+    /// place, one round trip per involved node, and returns each key's
+    /// outcome — <c>true</c> if it existed, <c>false</c> for a missing or
+    /// expired key, which a touch never creates. <paramref name="keys"/>
+    /// must be non-empty; a key given more than once is touched once.
+    /// <paramref name="ttlSeconds"/> is one TTL for the whole batch and
+    /// means what it means for <see cref="TouchAsync(string, long?)"/>:
+    /// <c>null</c> removes it, 0 expires the keys at once, and a negative
+    /// value throws <see cref="ArgumentOutOfRangeException"/> before any
+    /// I/O.
+    ///
+    /// <para>Like <c>TouchAsync</c> it is idempotent, so a request whose
+    /// reply was lost is retried, and in a cluster it goes to every owner
+    /// of a key, the primary's answer being the key's. A replica's failure
+    /// or <c>W</c> is counted in <c>Stats().ReplicaWriteFailures</c> and
+    /// never fails the batch. Larger batches are transparently split into
+    /// more than one <c>y</c> sub-frame per node (see
+    /// <see cref="MaxBatchKeys"/>). If some keys' primaries are still
+    /// wrong-node after one bounded refresh-and-retry this throws a plain
+    /// <see cref="WrongNodeException"/>, and a key whose primary could not
+    /// be reached on both passes throws that connection failure — every
+    /// other key was still touched, and since a touch is idempotent the
+    /// whole batch may simply be sent again, so nothing partial is
+    /// attached. Throws <see cref="ServerTooOldException"/> against a node
+    /// that predates the command.</para></summary>
+    public Task<Dictionary<string, bool>> TouchManyAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
+        TouchManyAsync(EmptyNamespace, keys, ttlSeconds);
+
+    /// <summary>issue #871: as <see cref="TouchManyAsync(IReadOnlyList{string}, long?)"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal async Task<Dictionary<string, bool>> TouchManyAsync(
+        byte[] namespaceBytes, IReadOnlyList<string> keys, long? ttlSeconds)
+    {
+        (List<string> distinct, byte[][] keyBytes) = PrepareTouchBatch(namespaceBytes, keys, ttlSeconds);
+        await BeforeOperationAsync().ConfigureAwait(false);
+        MultiTouchOutcome outcome = await MultiTouchAsync(namespaceBytes, keyBytes, ttlSeconds, get: false)
+            .ConfigureAwait(false);
+        if (outcome.Unresolved.Count > 0)
+        {
+            if (outcome.Rejected is not null) ExceptionDispatchInfo.Capture(outcome.Rejected).Throw();
+            if (outcome.WrongNode) throw new WrongNodeException();
+            ThrowUnreachable(outcome.Cause);
+        }
+        var touched = new Dictionary<string, bool>(distinct.Count);
+        for (int i = 0; i < distinct.Count; i++)
+        {
+            touched[distinct[i]] = outcome.Answers[i]!.Value.Ok;
+        }
+        return touched;
+    }
+
+    /// <summary>Batched <see cref="GetAndTouchAsync(string, long?)"/>
+    /// (issue #871): reads the values of <paramref name="keys"/> and
+    /// replaces their TTL in one step, one round trip per involved node.
+    /// A miss is absent from the result, creates nothing and is not an
+    /// error. See <see cref="TouchManyAsync(IReadOnlyList{string}, long?)"/>
+    /// for <paramref name="ttlSeconds"/>. Decoded as strict UTF-8, like
+    /// <see cref="GetManyAsync(IReadOnlyList{string})"/>.
+    ///
+    /// <para>A read that writes, as <c>GetAndTouchAsync</c> is: each key
+    /// goes to its primary in the <c>G</c> form, with no hedging and no
+    /// fallback to a replica on a miss, and its other owners are sent the
+    /// plain touch, so a replica is never the only owner touched. It
+    /// counts as a read on the primary, which makes the entries the most
+    /// recently used. A value the node had no room for in its reply (16
+    /// MiB per frame) is left out and left untouched, so it reads as a
+    /// miss here.</para>
+    ///
+    /// <para>Failures follow <see cref="GetManyAsync(IReadOnlyList{string})"/>:
+    /// keys still wrong-node after one bounded refresh-and-retry throw
+    /// <see cref="PartialWrongNodeException{T}"/>, and keys whose primary
+    /// was unreachable on both passes throw
+    /// <see cref="PartialConnectionLostException{T}"/> (the bare
+    /// connection error when nothing resolved), each carrying the keys
+    /// that did resolve. Unlike <c>GetManyAsync</c> a key is not tried on
+    /// its next owner when its primary is down — a replica's answer would
+    /// leave the primary untouched.</para></summary>
+    public Task<Dictionary<string, string>> GetManyAndTouchAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
+        GetManyAndTouchAsync(EmptyNamespace, keys, ttlSeconds);
+
+    /// <summary>issue #871: as <see cref="GetManyAndTouchAsync(IReadOnlyList{string}, long?)"/>,
+    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    internal async Task<Dictionary<string, string>> GetManyAndTouchAsync(
+        byte[] namespaceBytes, IReadOnlyList<string> keys, long? ttlSeconds)
+    {
+        try
+        {
+            return DecodeMany(await GetManyAndTouchBytesAsync(namespaceBytes, keys, ttlSeconds).ConfigureAwait(false));
+        }
+        catch (PartialWrongNodeException<Dictionary<string, byte[]>> partial)
+        {
+            throw new PartialWrongNodeException<Dictionary<string, string>>(DecodeMany(partial.PartialValues));
+        }
+        catch (PartialConnectionLostException<Dictionary<string, byte[]>> partial)
+        {
+            throw new PartialConnectionLostException<Dictionary<string, string>>(
+                DecodeMany(partial.PartialValues), partial.InnerException!, partial.Message);
+        }
+    }
+
+    /// <summary>The raw-bytes companion to
+    /// <see cref="GetManyAndTouchAsync(IReadOnlyList{string}, long?)"/>: no
+    /// decoding. Transparently decompresses when <c>Compress</c> is
+    /// enabled. Failures are <see cref="PartialWrongNodeException{T}"/> and
+    /// <see cref="PartialConnectionLostException{T}"/>, as for
+    /// <see cref="GetManyBytesAsync(IReadOnlyList{string})"/>.</summary>
+    public Task<Dictionary<string, byte[]>> GetManyAndTouchBytesAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
+        GetManyAndTouchBytesAsync(EmptyNamespace, keys, ttlSeconds);
+
+    /// <summary>issue #871: as <see cref="GetManyAndTouchBytesAsync(IReadOnlyList{string}, long?)"/>,
+    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    internal async Task<Dictionary<string, byte[]>> GetManyAndTouchBytesAsync(
+        byte[] namespaceBytes, IReadOnlyList<string> keys, long? ttlSeconds)
+    {
+        (List<string> distinct, byte[][] keyBytes) = PrepareTouchBatch(namespaceBytes, keys, ttlSeconds);
+        await BeforeOperationAsync().ConfigureAwait(false);
+        MultiTouchOutcome outcome = await MultiTouchAsync(namespaceBytes, keyBytes, ttlSeconds, get: true)
+            .ConfigureAwait(false);
+
+        // One decompression budget for the whole response — see
+        // DecompressForBatch.
+        long[] budget = { 0 };
+        var values = new Dictionary<string, byte[]>(distinct.Count);
+        for (int i = 0; i < distinct.Count; i++)
+        {
+            Connection.MultiEntry? answer = outcome.Answers[i];
+            if (answer is { Ok: true })
+            {
+                values[distinct[i]] = DecompressForBatch(answer.Value.Value!, budget);
+            }
+        }
+        if (outcome.Unresolved.Count == 0) return values;
+        if (outcome.Rejected is not null) ExceptionDispatchInfo.Capture(outcome.Rejected).Throw();
+        if (outcome.WrongNode) throw new PartialWrongNodeException<Dictionary<string, byte[]>>(values);
+        // No primary answered `W` for these keys: each one's primary was
+        // unreachable on both passes. That is a connection loss, reported
+        // with whatever did resolve attached — or as the bare connection
+        // failure when nothing resolved, as GetManyBytesAsync does.
+        Exception cause = outcome.Cause ?? new ConnectionLostException("nanocached: no owner is reachable for these keys");
+        if (values.Count == 0) ExceptionDispatchInfo.Capture(cause).Throw();
+        throw new PartialConnectionLostException<Dictionary<string, byte[]>>(
+            values, cause,
+            $"nanocached: could not reach the primary of {outcome.Unresolved.Count} of {distinct.Count} keys: {cause.Message}");
+    }
+
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowUnreachable(Exception? cause) =>
+        ExceptionDispatchInfo.Capture(
+            cause ?? new ConnectionLostException("nanocached: no owner is reachable for these keys")).Throw();
+
+    /// <summary>Validation shared by the batched touches: the TTL, at
+    /// least one key, every key's size — all before any I/O — and the
+    /// batch's distinct keys (first occurrence wins), with their bytes.</summary>
+    private (List<string> Distinct, byte[][] KeyBytes) PrepareTouchBatch(
+        byte[] namespaceBytes, IReadOnlyList<string> keys, long? ttlSeconds)
+    {
+        ValidateTouchTtl(ttlSeconds);
+        if (keys.Count == 0)
+        {
+            throw new ArgumentException(
+                "nanocached: TouchManyAsync/GetManyAndTouchAsync/GetManyAndTouchBytesAsync requires at least one key",
+                nameof(keys));
+        }
+        var distinct = new List<string>(keys.Count);
+        var seen = new HashSet<string>(keys.Count);
+        foreach (string key in keys)
+        {
+            if (seen.Add(key)) distinct.Add(key);
+        }
+        var keyBytes = new byte[distinct.Count][];
+        for (int i = 0; i < distinct.Count; i++)
+        {
+            byte[] bytes = Utf8(distinct[i], "key");
+            ValidateKey(namespaceBytes, bytes);
+            keyBytes[i] = bytes;
+        }
+        return (distinct, keyBytes);
+    }
+
+    /// <summary>What one batched touch ended with, over its distinct keys:
+    /// <c>Answers[i]</c> is the primary's answer for key <c>i</c>,
+    /// <c>null</c> for an unresolved one; <c>Unresolved</c> the positions
+    /// (ascending) that never got one; <c>WrongNode</c> whether any of
+    /// them last answered <c>W</c> rather than failing at the connection
+    /// level; <c>Cause</c> the last primary-leg failure; <c>Rejected</c>
+    /// the <see cref="ServerTooOldException"/> of a primary that predates
+    /// <c>y</c>, if there was one.</summary>
+    private readonly record struct MultiTouchOutcome(
+        Connection.MultiEntry?[] Answers, List<int> Unresolved, bool WrongNode, Exception? Cause,
+        ServerTooOldException? Rejected);
+
+    /// <summary>What a batched touch's legs learn across its two passes;
+    /// legs run concurrently, so every member is used under
+    /// <c>lock (this)</c>.</summary>
+    private sealed class MultiTouchState
+    {
+        public readonly Dictionary<int, Connection.MultiEntry> Results = new();
+        public readonly HashSet<int> WrongNode = new();
+        public Exception? LastCause;
+        public ServerTooOldException? Rejected;
+    }
+
+    /// <summary>One (owner, form) sub-batch of a batched touch: the keys it
+    /// carries and, per key, whether the owner is that key's primary.
+    /// <c>Get</c> is the <c>G</c> form, used only for primary-held keys.</summary>
+    private sealed class TouchLeg
+    {
+        public readonly string Owner;
+        public readonly bool Get;
+        public readonly List<int> Indices = new();
+        public readonly List<bool> IsPrimary = new();
+
+        public TouchLeg(string owner, bool get)
+        {
+            Owner = owner;
+            Get = get;
+        }
+    }
+
+    private async Task<MultiTouchOutcome> MultiTouchAsync(
+        byte[] namespaceBytes, byte[][] keyBytes, long? ttlSeconds, bool get)
+    {
+        var answers = new Connection.MultiEntry?[keyBytes.Length];
+
+        if (_ring is null)
+        {
+            // Single/proxy mode: no ring to refresh against, so a `W` or a
+            // failure ends the batch as it is, as in GetManyBytesAsync.
+            IReadOnlyList<Connection.MultiEntry?> entries;
+            Exception? failure = null;
+            try
+            {
+                entries = (await MultiTouchChunkedAsync(null, namespaceBytes, keyBytes, ttlSeconds, get)
+                    .ConfigureAwait(false)).Select(entry => (Connection.MultiEntry?)entry).ToList();
+            }
+            catch (ChunkedBatchInterruptedException partial)
+            {
+                entries = partial.CompletedEntries.Select(entry => (Connection.MultiEntry?)entry).ToList();
+                failure = partial.InnerException;
+            }
+            catch (Exception error) when (error is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or ObjectDisposedException)
+            {
+                entries = Array.Empty<Connection.MultiEntry?>();
+                failure = error;
+            }
+            var unresolved = new List<int>();
+            bool wrongNode = false;
+            for (int i = 0; i < keyBytes.Length; i++)
+            {
+                Connection.MultiEntry? entry = i < entries.Count ? entries[i] : null;
+                if (entry is null)
+                {
+                    unresolved.Add(i);
+                }
+                else if (entry.Value.WrongNode)
+                {
+                    wrongNode = true;
+                    unresolved.Add(i);
+                }
+                else
+                {
+                    answers[i] = entry;
+                }
+            }
+            return new MultiTouchOutcome(
+                answers, unresolved, wrongNode && failure is null, failure, failure as ServerTooOldException);
+        }
+
+        var state = new MultiTouchState();
+        List<int> retry = await MultiTouchPassAsync(namespaceBytes, keyBytes, ttlSeconds, get, null, state)
+            .ConfigureAwait(false);
+        if (retry.Count > 0)
+        {
+            // One bounded refresh-and-retry over everything a primary left
+            // unresolved: a `W` is stale routing the refresh fixes, a
+            // primary that could not be reached gets a fresh view of who
+            // the owners are. A touch is idempotent, so the keys go to
+            // every owner of the fresh ring again.
+            await MaybeRefreshAsync(force: true).ConfigureAwait(false);
+            retry = await MultiTouchPassAsync(namespaceBytes, keyBytes, ttlSeconds, get, retry, state)
+                .ConfigureAwait(false);
+        }
+        lock (state)
+        {
+            foreach ((int idx, Connection.MultiEntry entry) in state.Results) answers[idx] = entry;
+            retry.Sort();
+            return new MultiTouchOutcome(
+                answers, retry, retry.Any(state.WrongNode.Contains), state.LastCause, state.Rejected);
+        }
+    }
+
+    /// <summary>One or more <c>y</c> sub-frames against <paramref name="slot"/>'s
+    /// connection, chunked like <c>m</c> (see
+    /// <see cref="MultiKeysChunkedAsync"/>).</summary>
+    private Task<List<Connection.MultiEntry>> MultiTouchChunkedAsync(
+        string? slot, byte[] namespaceBytes, byte[][] keys, long? ttlSeconds, bool get) =>
+        MultiKeysChunkedAsync(
+            slot, namespaceBytes, keys,
+            (connection, chunk) => connection.MultiTouchAsync(namespaceBytes, chunk, ttlSeconds, get));
+
+    /// <summary>One pass of <see cref="MultiTouchAsync"/>'s cluster
+    /// routing: every key still needing resolution (every key when
+    /// <paramref name="retryIndices"/> is <c>null</c>, or just what the
+    /// previous pass left unresolved) is sent to <b>every owner</b>, in
+    /// one leg per (owner, form): with <paramref name="get"/> a key's
+    /// primary gets it in the <c>G</c> form and every other owner in the
+    /// plain one, without it every owner gets the plain form — so a node
+    /// holding some keys as primary and others as replica gets one frame
+    /// in the second case and two in the first. Only the primary's answer
+    /// is recorded in <paramref name="state"/>; a replica's failure or
+    /// <c>W</c> is counted in <see cref="_replicaWriteFailures"/>, as in
+    /// <see cref="RunMultiSetLegAsync"/>. A leg that holds no key as
+    /// primary is eligible for <c>FireAndForgetReplicas</c>, exactly like
+    /// a single-key replica write.
+    ///
+    /// <para>Returns the positions whose primary answered <c>W</c> or
+    /// could not be reached (a key with no owners at all counts as
+    /// <c>W</c>: a refresh may populate the ring).</para></summary>
+    private async Task<List<int>> MultiTouchPassAsync(
+        byte[] namespaceBytes, byte[][] keyBytes, long? ttlSeconds, bool get, List<int>? retryIndices,
+        MultiTouchState state)
+    {
+        List<int> indices = retryIndices ?? Enumerable.Range(0, keyBytes.Length).ToList();
+
+        var legs = new Dictionary<string, TouchLeg>();
+        var retry = new List<int>();
+        foreach (int idx in indices)
+        {
+            IReadOnlyList<string> names = OwnerNames(namespaceBytes, keyBytes[idx]);
+            if (names.Count == 0)
+            {
+                lock (state) state.WrongNode.Add(idx);
+                retry.Add(idx);
+                continue;
+            }
+            for (int rank = 0; rank < names.Count; rank++)
+            {
+                bool form = get && rank == 0;
+                string id = (form ? "G" : "P") + names[rank];
+                if (!legs.TryGetValue(id, out TouchLeg? leg))
+                {
+                    leg = new TouchLeg(names[rank], form);
+                    legs[id] = leg;
+                }
+                leg.Indices.Add(idx);
+                leg.IsPrimary.Add(rank == 0);
+            }
+        }
+
+        var running = new List<Task>();
+        foreach (TouchLeg leg in legs.Values)
+        {
+            bool pureReplica = !leg.IsPrimary.Contains(true);
+            bool background = _fireAndForgetReplicas && pureReplica && _backgroundReplicaPermits.Wait(0);
+            Task RunLegAsync() => RunMultiTouchLegAsync(namespaceBytes, leg, keyBytes, ttlSeconds, retry, state);
+
+            // Fire-and-forget replica writes: mirrors MultiSetPassAsync's
+            // own branch. A pure-replica leg holds no primary key, so it
+            // has nothing to put in `retry`.
+            if (background)
+            {
+                Task backgroundLeg = Task.Run(RunLegAsync);
+                _ = backgroundLeg.ContinueWith(
+                    completed =>
+                    {
+                        if (completed.Exception is not null)
+                        {
+                            Interlocked.Increment(ref _replicaWriteFailures);
+                        }
+                        _backgroundReplicaPermits.Release();
+                    },
+                    TaskScheduler.Default);
+                continue;
+            }
+
+            running.Add(RunLegAsync());
+        }
+
+        // Always drain every leg, even after one has already failed.
+        Exception? legBug = null;
+        foreach (Task leg in running)
+        {
+            try
+            {
+                await leg.ConfigureAwait(false);
+            }
+            catch (Exception error)
+            {
+                legBug = error;
+            }
+        }
+        if (legBug is not null) ExceptionDispatchInfo.Capture(legBug).Throw();
+        return retry;
+    }
+
+    /// <summary>Dispatches one <see cref="TouchLeg"/> (via
+    /// <see cref="MultiTouchChunkedAsync"/>) and applies its result: only a
+    /// primary-held position can end up in <paramref name="retry"/>; every
+    /// replica-held position's failure or <c>W</c> is counted in
+    /// <see cref="_replicaWriteFailures"/> instead, mirroring
+    /// <see cref="ApplyLegOutcome"/>. A connection failure for the whole
+    /// leg is treated the same way, position by position, since the same
+    /// sub-frame can carry both primary- and replica-held keys; when a
+    /// chunk after the first failed (issue #411) only the positions from
+    /// it onward are unresolved. <paramref name="retry"/> is shared by
+    /// every concurrently-running leg, so every access is under
+    /// <c>lock (retry)</c>.</summary>
+    private async Task RunMultiTouchLegAsync(
+        byte[] namespaceBytes, TouchLeg leg, byte[][] keyBytes, long? ttlSeconds, List<int> retry,
+        MultiTouchState state)
+    {
+        var groupKeys = new byte[leg.Indices.Count][];
+        for (int i = 0; i < leg.Indices.Count; i++)
+        {
+            groupKeys[i] = keyBytes[leg.Indices[i]];
+        }
+
+        IReadOnlyList<Connection.MultiEntry?> entries;
+        Exception? failure = null;
+        try
+        {
+            entries = (await MultiTouchChunkedAsync(leg.Owner, namespaceBytes, groupKeys, ttlSeconds, leg.Get)
+                .ConfigureAwait(false)).Select(entry => (Connection.MultiEntry?)entry).ToList();
+        }
+        catch (ChunkedBatchInterruptedException partial)
+        {
+            entries = partial.CompletedEntries.Select(entry => (Connection.MultiEntry?)entry).ToList();
+            failure = partial.InnerException;
+        }
+        catch (Exception error) when (error is NanocachedException or IOException
+            or System.Net.Sockets.SocketException or ObjectDisposedException)
+        {
+            // Swallowed by design (client-side replication) for
+            // replica-held keys; only a primary-held key's failure feeds
+            // the retry pass. Narrowed to the connection layer's own
+            // failure types, so a genuine programming bug propagates
+            // instead of being treated like a dead owner.
+            entries = Array.Empty<Connection.MultiEntry?>();
+            failure = error;
+        }
+        if (failure is not null && leg.IsPrimary.Contains(true))
+        {
+            lock (state)
+            {
+                state.LastCause = failure;
+                if (failure is ServerTooOldException tooOld) state.Rejected = tooOld;
+            }
+        }
+
+        for (int i = 0; i < leg.Indices.Count; i++)
+        {
+            int idx = leg.Indices[i];
+            Connection.MultiEntry? entry = i < entries.Count ? entries[i] : null;
+            bool answered = entry is not null && !entry.Value.WrongNode;
+            if (!leg.IsPrimary[i])
+            {
+                if (!answered) Interlocked.Increment(ref _replicaWriteFailures);
+            }
+            else if (answered)
+            {
+                lock (state) state.Results[idx] = entry!.Value;
+            }
+            else
+            {
+                lock (state)
+                {
+                    if (entry is null) state.WrongNode.Remove(idx);
+                    else state.WrongNode.Add(idx);
+                }
+                lock (retry) retry.Add(idx);
+            }
         }
     }
 

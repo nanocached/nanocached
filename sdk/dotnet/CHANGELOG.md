@@ -23,6 +23,20 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
   for the value). Against a node that predates the command they throw the
   new `ServerTooOldException`. Needs a server release that includes the
   `t` command.
+- `TouchManyAsync(keys, ttlSeconds)` and `GetManyAndTouchAsync(keys,
+  ttlSeconds)` (with `GetManyAndTouchBytesAsync`, and all three on
+  `NanocachedNamespace`) are `TouchAsync`/`GetAndTouchAsync` for a list of
+  keys, in one round trip per involved node. `TouchManyAsync` returns a
+  dictionary of key to whether it existed; `GetManyAndTouchAsync` returns
+  the hits, as `GetManyAsync` does. One TTL for the whole batch, with the
+  meaning and no default of `TouchAsync`. Every owner is sent the batch;
+  only a key's primary is asked for the value, so a node that is primary for
+  some keys and a replica for others receives two frames.
+  `GetManyAndTouchAsync` fails like `GetManyAsync` (partial results
+  attached); `TouchManyAsync` throws a plain `WrongNodeException` or the
+  connection failure. Needs a server release that includes the `y` command;
+  against a node that has `t` but not `y` they throw
+  `ServerTooOldException`, whose new `Command` is `"y"`.
 
 ## [0.4.8] - 2026-10-21
 
