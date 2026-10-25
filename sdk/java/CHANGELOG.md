@@ -17,6 +17,13 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
   replica that answers `En`. The primary leg already stopped at once; the
   replica leg took a second dial for the same answer on every call against a
   node that predates `t`.
+- In a cluster, `getManyAndTouch` no longer discards the hits other
+  primaries returned when one primary answers `En` to `y`. It throws
+  `PartialServerTooOldStrings` (`PartialServerTooOld` for the `byte[]` map,
+  `PartialServerTooOldRaw` for the positional form), subclasses of
+  `ServerTooOld`, with them in `partialValues`; with `ttlSeconds` `0` they
+  were consumed on the nodes and could not be read again. `ServerTooOld` is
+  no longer `final`. `touchMany` still throws the plain error.
 
 ### Added
 

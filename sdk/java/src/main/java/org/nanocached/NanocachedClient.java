@@ -2831,7 +2831,11 @@ public final class NanocachedClient implements AutoCloseable {
      *
      * @throws UncheckedIOException if a stored value is not valid UTF-8
      * @throws NanocachedException.ServerTooOld against a node that
-     *         predates the command
+     *         predates the command — in a cluster, when other primaries
+     *         had already answered, its subclass {@link
+     *         NanocachedException.PartialServerTooOldStrings} carrying
+     *         their hits (with {@code ttlSeconds == 0} those values are
+     *         consumed and would otherwise be lost)
      */
     public Map<String, String> getManyAndTouch(List<String> keys, long ttlSeconds) {
         return getManyAndTouchDecoded(EMPTY_NAMESPACE, keys, ttlSeconds);
@@ -2845,6 +2849,9 @@ public final class NanocachedClient implements AutoCloseable {
             return decodeMany(getManyAndTouchBytes(namespace, keys, ttlSeconds));
         } catch (NanocachedException.PartialWrongNode partial) {
             throw new NanocachedException.PartialWrongNodeStrings(decodeMany(partial.partialValues));
+        } catch (NanocachedException.PartialServerTooOld partial) {
+            throw new NanocachedException.PartialServerTooOldStrings(
+                    partial.getCause(), decodeMany(partial.partialValues));
         } catch (NanocachedException.PartialConnectionFailed partial) {
             throw new NanocachedException.PartialConnectionFailedStrings(
                     partial.getMessage(), partial.getCause(), decodeMany(partial.partialValues));
@@ -2874,6 +2881,9 @@ public final class NanocachedClient implements AutoCloseable {
             return spliceMany(keys, getManyAndTouchBytes(namespace, keyBytes, ttlSeconds));
         } catch (NanocachedException.PartialWrongNodeRaw partial) {
             throw new NanocachedException.PartialWrongNode(spliceMany(keys, partial.partialValues));
+        } catch (NanocachedException.PartialServerTooOldRaw partial) {
+            throw new NanocachedException.PartialServerTooOld(
+                    partial.getCause(), spliceMany(keys, partial.partialValues));
         } catch (NanocachedException.PartialConnectionFailedRaw partial) {
             throw new NanocachedException.PartialConnectionFailed(
                     partial.getMessage(), partial.getCause(), spliceMany(keys, partial.partialValues));
@@ -2911,6 +2921,12 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException.PartialWrongNodeRaw(
                     expandPositions(partial.partialValues, distinct.positionOf),
                     expandIndices(partial.unresolvedIndices, distinct.positionOf));
+        } catch (NanocachedException.PartialServerTooOldRaw partial) {
+            if (!distinct.repeated) throw partial;
+            throw new NanocachedException.PartialServerTooOldRaw(
+                    partial.getCause(),
+                    expandPositions(partial.partialValues, distinct.positionOf),
+                    expandIndices(partial.unresolvedIndices, distinct.positionOf));
         } catch (NanocachedException.PartialConnectionFailedRaw partial) {
             if (!distinct.repeated) throw partial;
             throw new NanocachedException.PartialConnectionFailedRaw(
@@ -2937,7 +2953,12 @@ public final class NanocachedClient implements AutoCloseable {
             }
         }
         if (outcome.unresolved.isEmpty()) return values;
-        if (outcome.rejected) throw new NanocachedException.ServerTooOld("y", outcome.cause);
+        if (outcome.rejected) {
+            // The hits other primaries returned ride along (issue #924):
+            // a ttlSeconds == 0 call consumed them.
+            if (!anyHit) throw new NanocachedException.ServerTooOld("y", outcome.cause);
+            throw new NanocachedException.PartialServerTooOldRaw(outcome.cause, values, outcome.unresolved);
+        }
         if (outcome.wrongNode) throw new NanocachedException.PartialWrongNodeRaw(values, outcome.unresolved);
         // No primary answered `W` for these keys: each one's primary was
         // unreachable on both passes. That is a connection loss, reported
