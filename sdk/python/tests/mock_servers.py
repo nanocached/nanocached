@@ -119,6 +119,9 @@ class MockNode:
         self.legacy_without_touch = False
         self._drop_next_touch_reply = False
         self._touch_wrong_kind_reply = False
+        # See answer_next_with_wrong_tag(): command bytes whose next
+        # applied request is answered with a mis-tagged success reply.
+        self._wrong_tag_after_apply: set[bytes] = set()
         # Batched touch (issue #871): every `y` received as (namespace,
         # keys, ttl, get), one entry per frame — what proves a frame's
         # grouping, which the per-key `touches` above cannot.
@@ -322,6 +325,13 @@ class MockNode:
         well-formed reply of the wrong kind, the misaligned stream of
         issue #921."""
         self._touch_wrong_kind_reply = True
+
+    def answer_next_with_wrong_tag(self, command: bytes) -> None:
+        """Applies the next ``command`` request (`t` or `i`) and answers it
+        with its normal success reply, but echoing the request's tag + 5 —
+        a reply that cannot be matched to the request it follows (issue
+        #935). Only on a tagged connection."""
+        self._wrong_tag_after_apply.add(command)
 
     def fail_multi_touch_after(self, successes: int) -> None:
         """Answers the next ``successes`` `y` requests normally, then closes
@@ -781,6 +791,9 @@ class MockNode:
                         writer.close()
                         return
                     ttl_field = b" %d" % ttl if ttl else b""
+                    if tagged and b"i" in self._wrong_tag_after_apply:
+                        self._wrong_tag_after_apply.discard(b"i")
+                        tag_suffix = b" %d" % (int(parts[-1]) + 5)
                     reply_bytes = new_bytes
                     if self._malformed_incr_value is not None:
                         reply_bytes = self._malformed_incr_value
@@ -837,6 +850,9 @@ class MockNode:
                         writer.write(b"D" + tag_suffix + b"\n")
                         await writer.drain()
                         continue
+                    if tagged and b"t" in self._wrong_tag_after_apply:
+                        self._wrong_tag_after_apply.discard(b"t")
+                        tag_suffix = b" %d" % (int(parts[-1]) + 5)
                     if get:
                         ttl_field = b" %d" % ttl if ttl is not None else b""
                         writer.write(b"V %d%b%b\n%b" % (len(current), ttl_field, tag_suffix, current))

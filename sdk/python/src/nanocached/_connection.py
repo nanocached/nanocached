@@ -1028,9 +1028,13 @@ class Connection:
                 self._poison(error)
                 # The popped future is no longer in _pending, so _poison()
                 # didn't reject it — do that here; the rest drain via
-                # _poison()'s own rejection of what's left.
+                # _poison()'s own rejection of what's left. Through
+                # _error_for like every other post-send failure (issue
+                # #935): the reply being read means the frame was written,
+                # so this request must surface as ConnectionLostError and
+                # never be replayed by incr/CAS or an expiring touch.
                 if not future.cancelled():
-                    future.set_exception(error)
+                    future.set_exception(self._error_for(slot, error))
                 return
 
             if not future.cancelled():
