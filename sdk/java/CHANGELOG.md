@@ -11,6 +11,13 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- `touch` and `getAndTouch` no longer redial and send the frame again to a
+  replica that answers `En`. The primary leg already stopped at once; the
+  replica leg took a second dial for the same answer on every call against a
+  node that predates `t`.
+
 ### Added
 
 - `touch(key, ttlSeconds)` replaces an entry's TTL in place and returns
