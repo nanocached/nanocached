@@ -4,8 +4,12 @@ MUTANTS_BASE ?= HEAD
 MUTANTS_JOBS ?= 4
 MUTANTS_FILE_ARG = $(if $(strip $(FILE)),--file "$(FILE)",)
 
+# src/sim.rs compiles the discovery binary into the node's test binary to
+# run discovery in process, and with it discovery's own unit tests, which its
+# binary already runs: skip that second copy (twice the time, twice the
+# exposure to port-binding flakes).
 test:
-	cargo nextest run
+	cargo nextest run -E 'not test(sim::discovery::)'
 
 mutants:
 	cargo mutants $(MUTANTS_FILE_ARG) --jobs $(MUTANTS_JOBS)
