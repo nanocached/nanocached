@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Touch / GetAndTouch (issue #825).
@@ -383,6 +384,135 @@ func TestClusterTouchWhoseReplyWasLostIsResentUnlikeAnIncr(t *testing.T) {
 	primary.applyThenCloseTimes(1)
 	if _, _, err := client.Incr("k", 1); !errors.Is(err, ErrConnectionLost) {
 		t.Fatalf("Incr after a lost reply err = %v, want ErrConnectionLost (never resent)", err)
+	}
+}
+
+func TestClusterExpiringTouchWhoseReplyWasLostIsNotResent(t *testing.T) {
+	// Issue #901: a resend of ttl 0 would find the key already expired.
+	for _, tc := range []struct {
+		name string
+		call func(t *testing.T, client *Client)
+	}{
+		{"Touch", func(t *testing.T, client *Client) {
+			existed, err := client.Touch("k", 0)
+			if !errors.Is(err, ErrConnectionLost) {
+				t.Errorf("Touch(0) after a lost reply = %v, %v, want ErrConnectionLost", existed, err)
+			}
+		}},
+		{"GetAndTouch", func(t *testing.T, client *Client) {
+			value, ok, err := client.GetAndTouch("k", 0)
+			if !errors.Is(err, ErrConnectionLost) {
+				t.Errorf("GetAndTouch(0) after a lost reply = %q, %v, %v, want ErrConnectionLost", value, ok, err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nodes, discovery := startTouchCluster(t, [2]mockNodeOpts{})
+			client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+
+			primary := nodes[ownersOf("k")[0]]
+			if err := client.Set("k", "payload", 0); err != nil {
+				t.Fatal(err)
+			}
+			primary.applyThenCloseTouchTimes(1)
+			tc.call(t, client)
+			expiring := 0
+			for _, seen := range primary.touchesSeen() {
+				if seen.ttl == 0 {
+					expiring++
+				}
+			}
+			if expiring != 1 {
+				t.Fatalf("primary saw %d ttl-0 touches, want 1 (never resent)", expiring)
+			}
+		})
+	}
+}
+
+func TestExpiringTouchWhoseReplyWasLostIsNotResentInSingleNodeMode(t *testing.T) {
+	node := startMockNode(t, nil)
+	client := connectTo(t, node, Config{})
+	if err := client.Set("k", "payload", 0); err != nil {
+		t.Fatal(err)
+	}
+	node.applyThenCloseTouchTimes(1)
+	if _, _, err := client.GetAndTouch("k", 0); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("GetAndTouch(0) after a lost reply err = %v, want ErrConnectionLost", err)
+	}
+	if got := len(node.touchesSeen()); got != 1 {
+		t.Fatalf("node saw %d touches, want 1 (never resent)", got)
+	}
+}
+
+func TestTouchWithRemoveTTLOrALiveTTLStillResendsAfterALostReply(t *testing.T) {
+	// Only ttl 0 changes: RemoveTTL (-1 in Go) is not "expire now".
+	nodes, discovery := startTouchCluster(t, [2]mockNodeOpts{})
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	primary := nodes[ownersOf("k")[0]]
+	if err := client.Set("k", "payload", 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, ttl := range []int64{RemoveTTL, 30} {
+		primary.applyThenCloseTouchTimes(1)
+		if value, ok, err := client.GetAndTouch("k", ttl); err != nil || !ok || value != "payload" {
+			t.Fatalf("GetAndTouch(%d) after a lost reply = %q, %v, %v, want payload, true, nil", ttl, value, ok, err)
+		}
+	}
+}
+
+func TestClusterExpiringTouchStillRetriesARequestThatWasNeverSent(t *testing.T) {
+	nodes, discovery := startTouchCluster(t, [2]mockNodeOpts{})
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	primary := nodes[ownersOf("k")[0]]
+	if err := client.Set("k", "payload", 0); err != nil {
+		t.Fatal(err)
+	}
+	primary.wrongNodeLeft.Add(1)
+	if value, ok, err := client.GetAndTouch("k", 0); err != nil || !ok || value != "payload" {
+		t.Fatalf("GetAndTouch(0) after a W = %q, %v, %v, want payload, true, nil", value, ok, err)
+	}
+	if err := client.Set("k", "payload", 0); err != nil {
+		t.Fatal(err)
+	}
+	primary.wrongNodeLeft.Add(1)
+	if existed, err := client.Touch("k", 0); err != nil || !existed {
+		t.Fatalf("Touch(0) after a W = %v, %v, want true, nil", existed, err)
+	}
+}
+
+func TestApplyExpiringTreatsAFailedDialAsNotSent(t *testing.T) {
+	// Nothing was written when the connection could not be had, so the
+	// cluster layer may refresh and try again (issue #901).
+	nodes, discovery := startTouchCluster(t, [2]mockNodeOpts{})
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	dead := testNames[0]
+	nodes[dead].close()
+	time.Sleep(50 * time.Millisecond)
+	err = client.applyExpiring(dead, func(conn *connection) error {
+		_, opErr := conn.touchNS(nil, []byte("k"), 0)
+		return opErr
+	})
+	if !errors.Is(err, ErrConnectionLost) || !errors.Is(err, errRequestNotSent) {
+		t.Fatalf("applyExpiring on a dead node = %v, want ErrConnectionLost marked not sent", err)
 	}
 }
 

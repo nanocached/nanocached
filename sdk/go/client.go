@@ -2662,6 +2662,46 @@ func (c *Client) applyNonIdempotent(slot string, op func(*connection) error) err
 	return nil
 }
 
+// applyExpiring is applyNonIdempotent's counterpart for a touch with
+// ttlSeconds == 0 (issue #901): that touch expires the entry, so a resend
+// after the node already applied it (reply lost) would find the key gone —
+// Touch would answer false for a key that existed and GetAndTouch would
+// report a miss and lose the value the first attempt consumed. It resends
+// exactly as applyNonIdempotent does (only a request marked
+// errRequestNotSent, once, after a redial), and additionally marks a
+// failure to obtain a connection at all — a dial that failed, a slot that
+// is gone — as not sent: no frame was written, so a retry after a node-list
+// refresh stays safe, which withClusterRetryNonIdempotent and
+// multiTouchPass key on. An `En` is not marked: the node refused the
+// request.
+func (c *Client) applyExpiring(slot string, op func(*connection) error) error {
+	conn, err := c.slotConnection(slot)
+	if err != nil {
+		return notSentIfLost(err)
+	}
+	if err := op(conn); err != nil {
+		if !errors.Is(err, errRequestNotSent) || errors.Is(err, errRequestTimedOut) {
+			return err
+		}
+		conn, redialErr := c.slotConnection(slot)
+		if redialErr != nil {
+			return notSentIfLost(redialErr)
+		}
+		return op(conn)
+	}
+	return nil
+}
+
+// notSentIfLost marks a connection-level failure that happened before any
+// frame was written (see applyExpiring) as errRequestNotSent, leaving every
+// other error as it was.
+func notSentIfLost(err error) error {
+	if errors.Is(err, ErrConnectionLost) && !errors.Is(err, errRequestNotSent) {
+		return notSent(err)
+	}
+	return err
+}
+
 // read drives the owner walk and error policy; op returns its outcome
 // directly (rather than writing into variables the caller captured) so
 // that readHedged below can run several legs concurrently without racing
@@ -2885,12 +2925,26 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 // the operation's result — replica legs run on their own goroutines, so
 // an op that captures outer variables must only write them when primary.
 func (c *Client) write(namespace, key []byte, op func(conn *connection, primary bool) error) error {
+	return c.writeWith(namespace, key, op, c.applyReconnecting)
+}
+
+// writeWith is write with the primary leg's send policy chosen by the
+// caller: applyReconnecting (resend after a connection loss, for an
+// idempotent op) or applyExpiring (resend only a request that was never
+// sent, for a touch that expires the entry — issue #901). The replica legs
+// always keep applyReconnecting: a replica's outcome never decides the
+// result, and replaying a touch there is harmless.
+func (c *Client) writeWith(
+	namespace, key []byte,
+	op func(conn *connection, primary bool) error,
+	applyPrimary func(slot string, op func(*connection) error) error,
+) error {
 	c.mu.Lock()
 	single := c.ring == nil
 	c.mu.Unlock()
 	primaryOp := func(conn *connection) error { return op(conn, true) }
 	if single {
-		return c.applyReconnecting("", primaryOp)
+		return applyPrimary("", primaryOp)
 	}
 
 	names := c.ownerNames(namespace, key)
@@ -2902,7 +2956,7 @@ func (c *Client) write(namespace, key []byte, op func(conn *connection, primary 
 	// fanReplicas for the failure/fire-and-forget semantics both this and
 	// Incr's post-success result fan-out (issue #129) share.
 	wg := c.fanReplicas(names[1:], func(conn *connection) error { return op(conn, false) })
-	err := c.applyReconnecting(names[0], primaryOp)
+	err := applyPrimary(names[0], primaryOp)
 	wg.Wait()
 	return err
 }

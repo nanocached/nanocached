@@ -671,6 +671,131 @@ func TestClusterBatchWhoseReplyWasLostIsResentWhole(t *testing.T) {
 	}
 }
 
+func TestClusterExpiringBatchWhoseReplyWasLostIsNotResent(t *testing.T) {
+	t.Run("TouchMany", func(t *testing.T) { expiringBatchWhoseReplyWasLost(t, false) })
+	t.Run("GetManyAndTouch", func(t *testing.T) { expiringBatchWhoseReplyWasLost(t, true) })
+}
+
+func expiringBatchWhoseReplyWasLost(t *testing.T, get bool) {
+	// Issue #901: R=1 and keys on both nodes, so the node that loses its
+	// reply is the primary of some keys only and the other node's hits are
+	// still returned. The old code resent the frame, found the keys gone
+	// and answered false (or a miss) for them without an error.
+	nodes, discovery := startBatchTouchCluster(t, 1, [2]mockNodeOpts{})
+	client := connectCluster(t, discovery, Config{})
+	lostKeys := keysWithPrimary(testNames[0], 4, "exp-a")
+	liveKeys := keysWithPrimary(testNames[1], 4, "exp-b")
+	keys := append(append([]string(nil), lostKeys...), liveKeys...)
+	primary := nodes[testNames[0]]
+	expiring := func() int {
+		n := 0
+		for _, frame := range primary.yFramesSeen() {
+			if frame.ttl == 0 {
+				n++
+			}
+		}
+		return n
+	}
+
+	if _, err := client.SetMany(valuesFor(keys), 0); err != nil {
+		t.Fatal(err)
+	}
+	primary.applyThenCloseTouchTimes(1)
+	var resolved []string
+	var err error
+	if get {
+		var values map[string]string
+		values, err = client.GetManyAndTouch(keys, 0)
+		for key := range values {
+			resolved = append(resolved, key)
+		}
+	} else {
+		var touched map[string]bool
+		touched, err = client.TouchMany(keys, 0)
+		for key, existed := range touched {
+			if !existed {
+				t.Errorf("TouchMany[%q] = false", key)
+			}
+			resolved = append(resolved, key)
+		}
+	}
+	if !errors.Is(err, ErrConnectionLost) || errors.Is(err, ErrWrongNode) {
+		t.Fatalf("ttl 0 after a lost reply err = %v, want ErrConnectionLost", err)
+	}
+	if !strings.Contains(err.Error(), "could not reach the primary of 4 of 8 keys") {
+		t.Fatalf("err = %q, want the 4 lost keys named", err)
+	}
+	if fmt.Sprint(sortedStrings(resolved)) != fmt.Sprint(sortedStrings(liveKeys)) {
+		t.Fatalf("resolved keys = %v, want only the live node's %v", sortedStrings(resolved), sortedStrings(liveKeys))
+	}
+	if got := expiring(); got != 1 {
+		t.Fatalf("primary saw %d ttl-0 frames, want 1 (never resent)", got)
+	}
+}
+
+func TestClusterExpiringBatchStillRetriesKeysThatWereNeverSent(t *testing.T) {
+	nodes, discovery := startBatchTouchCluster(t, 2, [2]mockNodeOpts{})
+	client := connectCluster(t, discovery, Config{})
+	keys := make([]string, 12)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k%d", i)
+	}
+	values := valuesFor(keys)
+	owner := nodes[ownersOf(keys[0])[0]]
+
+	if _, err := client.SetMany(values, 0); err != nil {
+		t.Fatal(err)
+	}
+	owner.multiWrongNodeKey.Store(keys[0])
+	owner.multiWrongNodeLeft.Store(1)
+	got, err := client.GetManyAndTouch(keys, 0)
+	if err != nil || len(got) != len(values) {
+		t.Fatalf("GetManyAndTouch(0) after a W = %d keys, %v, want all %d", len(got), err, len(values))
+	}
+
+	if _, err := client.SetMany(values, 0); err != nil {
+		t.Fatal(err)
+	}
+	owner.multiWrongNodeLeft.Store(1)
+	touched, err := client.TouchMany(keys, 0)
+	if err != nil || len(touched) != len(keys) {
+		t.Fatalf("TouchMany(0) after a W = %d keys, %v, want all %d", len(touched), err, len(keys))
+	}
+	for key, existed := range touched {
+		if !existed {
+			t.Fatalf("TouchMany(0)[%q] = false", key)
+		}
+	}
+}
+
+func TestClusterExpiringBatchWithAnUnreachablePrimaryStillGetsItsSecondPass(t *testing.T) {
+	// A dead primary was never sent anything, so the keys are retried after
+	// a refresh as before and then reported as a connection loss.
+	nodes, discovery := startBatchTouchCluster(t, 1, [2]mockNodeOpts{})
+	client := connectCluster(t, discovery, Config{})
+	deadKeys := keysWithPrimary(testNames[0], 3, "dead")
+	liveKeys := keysWithPrimary(testNames[1], 3, "live")
+	keys := append(append([]string(nil), deadKeys...), liveKeys...)
+	if _, err := client.SetMany(valuesFor(keys), 0); err != nil {
+		t.Fatal(err)
+	}
+	nodes[testNames[0]].close()
+	time.Sleep(50 * time.Millisecond)
+
+	before := len(nodes[testNames[1]].yFramesSeen())
+	values, err := client.GetManyAndTouch(keys, 0)
+	if !errors.Is(err, ErrConnectionLost) || errors.Is(err, ErrWrongNode) || len(values) != len(liveKeys) {
+		t.Fatalf("GetManyAndTouch(0) = %d keys, %v, want the live %d and ErrConnectionLost", len(values), err, len(liveKeys))
+	}
+	if !strings.Contains(err.Error(), "could not reach the primary of 3 of 6 keys") {
+		t.Fatalf("err = %q, want the 3 dead keys named", err)
+	}
+	// The second pass sent only the dead keys' retry, never the live ones.
+	if after := len(nodes[testNames[1]].yFramesSeen()); after != before+1 {
+		t.Fatalf("live node saw %d new frames, want 1", after-before)
+	}
+}
+
 func TestClusterReplicaThatFailsDoesNotFailThePrimarysAnswer(t *testing.T) {
 	var opts [2]mockNodeOpts
 	opts[1].withoutMultiTouch = true // testNames[1], the replica of every key below

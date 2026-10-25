@@ -28,8 +28,11 @@ import (
 // any I/O (ErrInvalidArgument).
 //
 // Like Touch it is idempotent, so a request whose reply was lost is
-// retried, and in a cluster it goes to every owner of a key, the primary's
-// answer being the key's. A replica's failure or `W` is counted in
+// retried — except with ttlSeconds == 0, where a primary whose connection
+// fails after the frame was written is not resent (issue #901): the call
+// returns that ErrConnectionLost, with every key that did resolve in the
+// map. In a cluster it goes to every owner of a key, the primary's answer
+// being the key's. A replica's failure or `W` is counted in
 // Stats().ReplicaWriteFailures and never fails the batch. Larger batches
 // are transparently split into more than one `y` sub-frame per node (see
 // maxBatchKeys).
@@ -65,8 +68,11 @@ func (c *Client) TouchMany(keys []string, ttlSeconds int64) (map[string]bool, er
 // refresh-and-retry, or with the last connection error for keys whose
 // primary was unreachable on both passes. Unlike GetMany a key is not tried
 // on its next owner when its primary is down — a replica's answer would
-// leave the primary untouched. Returns ErrServerTooOldBatch against a node
-// that predates the command.
+// leave the primary untouched. With ttlSeconds == 0 a primary whose
+// connection fails after the frame was written is not resent (issue #901):
+// it may have expired and consumed its values already, so those keys return
+// ErrConnectionLost at once instead of reading as misses. Returns
+// ErrServerTooOldBatch against a node that predates the command.
 func (c *Client) GetManyAndTouch(keys []string, ttlSeconds int64) (map[string]string, error) {
 	raw, err := c.GetManyAndTouchBytes(keys, ttlSeconds)
 	if raw == nil {
@@ -206,7 +212,7 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 	if single {
 		// Single/proxy mode: no ring to refresh against, so a `W` or a
 		// failure propagates immediately, as in getManyNS.
-		entries, resolved, err := c.multiTouchChunked("", namespace, keyBytes, ttlSeconds, get)
+		entries, resolved, err := c.multiTouchChunked("", namespace, keyBytes, ttlSeconds, get, false)
 		results := make(map[int]multiEntry, len(keys))
 		wrongNode := false
 		for i := 0; i < resolved; i++ {
@@ -225,7 +231,7 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 		return keys, results, nil
 	}
 
-	state := &multiTouchState{results: make(map[int]multiEntry, len(keys)), wrongNode: map[int]bool{}}
+	state := &multiTouchState{results: make(map[int]multiEntry, len(keys)), wrongNode: map[int]bool{}, lost: map[int]bool{}}
 	retry := c.multiTouchPass(namespace, keyBytes, ttlSeconds, get, nil, state)
 	if len(retry) > 0 {
 		// One bounded refresh-and-retry over everything a primary left
@@ -239,22 +245,25 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 	if state.rejected {
 		return keys, state.results, errors.Join(ErrServerTooOldBatch, state.lastErr)
 	}
-	if len(retry) == 0 {
+	if len(retry) == 0 && len(state.lost) == 0 {
 		return keys, state.results, nil
 	}
-	for _, idx := range retry {
-		if state.wrongNode[idx] {
-			return keys, state.results, ErrWrongNode
+	if len(state.lost) == 0 {
+		for _, idx := range retry {
+			if state.wrongNode[idx] {
+				return keys, state.results, ErrWrongNode
+			}
 		}
 	}
 	// No primary answered `W` for these keys: each one's primary was
-	// unreachable on both passes. That is a connection loss and is reported
-	// as one, as getManyNS does.
+	// unreachable on both passes, or (ttlSeconds == 0) lost its connection
+	// after the frame was written and was not resent. That is a connection
+	// loss and is reported as one, as getManyNS does.
 	cause := state.lastErr
 	if cause == nil {
 		cause = connectionLost("no owner is reachable for these keys", nil)
 	}
-	return keys, state.results, fmt.Errorf("nanocached: %s could not reach the primary of %d of %d keys: %w", method, len(retry), len(keys), cause)
+	return keys, state.results, fmt.Errorf("nanocached: %s could not reach the primary of %d of %d keys: %w", method, len(retry)+len(state.lost), len(keys), cause)
 }
 
 // multiTouchChunked is multiGetChunked's twin for `y`: one or more
@@ -265,8 +274,15 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 // chunk started at, or len(keys) on success) are real answers — the rest
 // were never reached, which no entry value can say, since a miss is a real
 // answer too.
-func (c *Client) multiTouchChunked(slot string, namespace []byte, keys [][]byte, ttlSeconds int64, get bool) (entries []multiEntry, resolved int, err error) {
+func (c *Client) multiTouchChunked(slot string, namespace []byte, keys [][]byte, ttlSeconds int64, get bool, replicaOnly bool) (entries []multiEntry, resolved int, err error) {
 	entries = make([]multiEntry, len(keys))
+	// A touch that expires the keys is resent only if never sent (issue
+	// #901). A frame none of whose keys has this slot as primary (replicaOnly)
+	// decides nothing and keeps the plain resend.
+	apply := c.applyReconnecting
+	if ttlSeconds == 0 && !replicaOnly {
+		apply = c.applyExpiring
+	}
 	budget := maxRequestBytes - len(namespace) - multiFrameHeaderSlack
 	for start := 0; start < len(keys); {
 		end := start
@@ -280,7 +296,7 @@ func (c *Client) multiTouchChunked(slot string, namespace []byte, keys [][]byte,
 			end++
 		}
 		var chunkEntries []multiEntry
-		err := c.applyReconnecting(slot, func(conn *connection) error {
+		err := apply(slot, func(conn *connection) error {
 			var opErr error
 			if get {
 				chunkEntries, opErr = conn.multiGetAndTouchNS(namespace, keys[start:end], ttlSeconds)
@@ -303,13 +319,17 @@ func (c *Client) multiTouchChunked(slot string, namespace []byte, keys [][]byte,
 // its primary's answer; wrongNode holds the indices whose primary leg's
 // latest outcome was a `W` rather than a connection failure; lastErr is the
 // most recent primary-leg connection failure and rejected whether any
-// primary leg was answered `En` (a node that predates `y`).
+// primary leg was answered `En` (a node that predates `y`); lost is below.
 type multiTouchState struct {
 	mu        sync.Mutex
 	results   map[int]multiEntry
 	wrongNode map[int]bool
 	lastErr   error
 	rejected  bool
+	// lost holds the indices a ttlSeconds == 0 call must not resend (issue
+	// #901): their primary leg failed after the frame was written, so the
+	// node may have expired them already.
+	lost map[int]bool
 }
 
 // multiTouchPass runs one pass of the cluster routing of TouchMany and
@@ -377,18 +397,29 @@ func (c *Client) multiTouchPass(
 		for i, idx := range leg.indices {
 			groupKeys[i] = keyBytes[idx]
 		}
-		entries, resolved, err := c.multiTouchChunked(leg.name, namespace, groupKeys, ttlSeconds, leg.get)
-
-		state.mu.Lock()
-		defer state.mu.Unlock()
 		anyPrimary := false
 		for _, isPrimary := range leg.isPrimary {
 			anyPrimary = anyPrimary || isPrimary
 		}
+		entries, resolved, err := c.multiTouchChunked(leg.name, namespace, groupKeys, ttlSeconds, leg.get, !anyPrimary)
+
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		// A touch that expires (ttlSeconds == 0) is not safe to resend once
+		// its frame was written (issue #901): the node may have applied it,
+		// and a resend would report the keys as missing — and, with `G`,
+		// lose the values it consumed. A failure marked errRequestNotSent
+		// (a dead connection, a dial that failed) stays retryable, and an
+		// `En` keeps its own handling.
+		lostIsFinal := false
 		if err != nil && anyPrimary {
 			state.lastErr = err
 			if errors.Is(err, errServerRejected) {
 				state.rejected = true
+			} else {
+				lostIsFinal = ttlSeconds == 0 &&
+					(errors.Is(err, ErrConnectionLost) || errors.Is(err, ErrProtocol)) &&
+					!errors.Is(err, errRequestNotSent)
 			}
 		}
 		for i, idx := range leg.indices {
@@ -409,6 +440,10 @@ func (c *Client) multiTouchPass(
 					state.wrongNode[idx] = true
 				} else {
 					delete(state.wrongNode, idx)
+					if lostIsFinal {
+						state.lost[idx] = true
+						continue
+					}
 				}
 				*retry = append(*retry, idx)
 			}
