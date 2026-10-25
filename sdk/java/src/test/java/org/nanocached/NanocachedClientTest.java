@@ -1733,6 +1733,60 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aPrimaryThatPredatesBatchTouchHandsBackTheHitsOtherPrimariesReturned() throws Exception {
+        // getManyAndTouch(ttl=0) consumes the values the other primaries
+        // return, so an `En` from one primary must not throw them away.
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                List<String> oldKeys = keysWhosePrimaryIs(NAMES.get(0), 2);
+                List<String> newKeys = keysWhosePrimaryIs(NAMES.get(1), 2);
+                List<String> all = new java.util.ArrayList<>(oldKeys);
+                all.addAll(newKeys);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : all) values.put(key, "value of " + key);
+                Map<String, String> expected = new java.util.LinkedHashMap<>();
+                for (String key : newKeys) expected.put(key, "value of " + key);
+                client.setMany(values);
+                cluster.nodes().get(NAMES.get(0)).rejectMultiTouchLikeAnOldServer();
+
+                NanocachedException.PartialServerTooOldStrings strings = assertThrows(
+                        NanocachedException.PartialServerTooOldStrings.class, () -> client.getManyAndTouch(all, 0));
+                assertEquals("y", strings.command());
+                assertEquals(expected, strings.partialValues);
+                // The ttl=0 call above consumed them: this is the loss.
+                assertTrue(client.getMany(newKeys).isEmpty());
+                client.setMany(values);
+
+                NanocachedException.PartialServerTooOld bytes = assertThrows(
+                        NanocachedException.PartialServerTooOld.class, () -> client.getManyAndTouchBytes(all, 30));
+                assertEquals(expected.keySet(), bytes.partialValues.keySet());
+                for (String key : newKeys) {
+                    assertArrayEquals(expected.get(key).getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                            bytes.partialValues.get(key));
+                }
+
+                // Positional, with a repeated key: every caller position is mapped.
+                byte[][] positional = new byte[all.size() + 1][];
+                for (int i = 0; i < all.size(); i++) positional[i] = all.get(i).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                positional[all.size()] = positional[0];
+                NanocachedException.PartialServerTooOldRaw raw = assertThrows(
+                        NanocachedException.PartialServerTooOldRaw.class,
+                        () -> client.getManyAndTouchBytes(positional, 30));
+                assertArrayEquals(new int[] {0, 1, all.size()}, raw.unresolvedIndices);
+                assertNull(raw.partialValues[0]);
+                assertTrue(raw.partialValues[2] != null);
+
+                // A plain touch has nothing partial worth attaching, and a call
+                // where nothing resolved elsewhere throws the bare error.
+                assertEquals(NanocachedException.ServerTooOld.class,
+                        assertThrows(NanocachedException.ServerTooOld.class, () -> client.touchMany(all, 30)).getClass());
+                assertEquals(NanocachedException.ServerTooOld.class,
+                        assertThrows(NanocachedException.ServerTooOld.class, () -> client.getManyAndTouch(oldKeys, 30)).getClass());
+            }
+        }
+    }
+
+    @Test
     void aPrimaryThatAnswersEnToBatchTouchIsNotRedialledOrAskedAgain() throws Exception {
         try (Cluster cluster = startCluster(2)) {
             try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {

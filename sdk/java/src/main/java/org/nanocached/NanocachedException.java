@@ -153,7 +153,7 @@ public class NanocachedException extends RuntimeException {
      * SDK validates size and builds a well-formed frame, so it means the
      * command is unknown.
      */
-    public static final class ServerTooOld extends NanocachedException {
+    public static class ServerTooOld extends NanocachedException {
         private final String command;
 
         public ServerTooOld(Throwable cause) {
@@ -241,6 +241,60 @@ public class NanocachedException extends RuntimeException {
         public CompressionIncompatible() {
             super("nanocached: incr/decr is incompatible with value compression "
                     + "(disable compress or use a separate client without it)");
+        }
+    }
+
+    /**
+     * Raised by {@link NanocachedClient#getManyAndTouchBytes(java.util.List,
+     * long)} (issue #924) in a cluster when one primary answered {@code En}
+     * to {@code y} while other primaries had already resolved their keys —
+     * a subclass of {@link ServerTooOld}, so existing {@code
+     * catch (ServerTooOld)} handling keeps working unchanged. {@code
+     * partialValues} holds every hit that DID resolve; with {@code
+     * ttlSeconds == 0} those values were consumed on the nodes that
+     * returned them and cannot be read again. {@code touchMany} has nothing
+     * partial worth attaching and throws a plain {@link ServerTooOld}.
+     *
+     * <p>Non-generic and split three ways, like {@link PartialWrongNode}:
+     * this is the {@code byte[]} map, {@link PartialServerTooOldStrings}
+     * the decoded one and {@link PartialServerTooOldRaw} the positional one.
+     */
+    public static final class PartialServerTooOld extends ServerTooOld {
+        public final java.util.Map<String, byte[]> partialValues;
+
+        public PartialServerTooOld(Throwable cause, java.util.Map<String, byte[]> partialValues) {
+            super("y", cause);
+            this.partialValues = partialValues;
+        }
+    }
+
+    /** As {@link PartialServerTooOld}, but raised by {@link
+     * NanocachedClient#getManyAndTouch} — the UTF-8-decoded counterpart. */
+    public static final class PartialServerTooOldStrings extends ServerTooOld {
+        public final java.util.Map<String, String> partialValues;
+
+        public PartialServerTooOldStrings(Throwable cause, java.util.Map<String, String> partialValues) {
+            super("y", cause);
+            this.partialValues = partialValues;
+        }
+    }
+
+    /** As {@link PartialServerTooOld}, but raised by the positional,
+     * {@code byte[]}-keyed {@link NanocachedClient#getManyAndTouchBytes(byte[][],
+     * long)}. {@code partialValues} is the array a successful call would
+     * have returned ({@code null} for a miss); since a {@code null} slot
+     * alone cannot tell a miss from a key the old node never answered,
+     * {@code unresolvedIndices} lists (ascending) the positions that did
+     * NOT resolve. */
+    public static final class PartialServerTooOldRaw extends ServerTooOld {
+        public final byte[][] partialValues;
+        public final int[] unresolvedIndices;
+
+        public PartialServerTooOldRaw(
+                Throwable cause, byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
+            super("y", cause);
+            this.partialValues = partialValues;
+            this.unresolvedIndices = unresolvedIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
         }
     }
 

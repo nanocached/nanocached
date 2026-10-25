@@ -391,7 +391,11 @@ resolve; the raw and positional forms throw the matching `PartialWrongNode`,
 reads as a wrong-node. `touchMany` carries no partial result: it throws a
 plain `WrongNode` or the connection failure, and since a touch is idempotent
 the whole batch can simply be sent again. Against a node that has `t` but not
-`y` both throw `ServerTooOld` (`command()` is `"y"`).
+`y` both throw `ServerTooOld` (`command()` is `"y"`); in a cluster, when other
+primaries had already answered, `getManyAndTouch` throws its subclass
+`PartialServerTooOldStrings` (or `PartialServerTooOld` / `PartialServerTooOldRaw`
+for the raw and positional forms) with their hits attached. With `ttlSeconds`
+`0` those values are consumed, so they are not read again.
 
 ## Fire-and-forget replica writes
 
