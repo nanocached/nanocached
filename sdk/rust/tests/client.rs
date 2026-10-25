@@ -196,6 +196,10 @@ struct NodeState {
     /// without replying, permanently — a chunked batch's later chunk
     /// failing even after the client's own reconnect-and-retry.
     die_after_multi_touch_frames: AtomicUsize,
+    /// Issue #941: `0` (the default) never triggers. Once set to N, only
+    /// the Nth `y` frame this node receives closes the connection without
+    /// replying; every other `y` frame is answered normally.
+    die_on_multi_touch_frame: AtomicUsize,
     /// How many `y` frames this node has received, counting for
     /// `die_after_multi_touch_frames`.
     multi_touch_requests: AtomicUsize,
@@ -766,6 +770,9 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 if die_after != 0 && this_request > die_after {
                     return;
                 }
+                if this_request == state.die_on_multi_touch_frame.load(Ordering::SeqCst) {
+                    return;
+                }
                 if take_one(&state.retryable_replies) {
                     let reply = format!("R{tag_suffix}\n");
                     if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
@@ -1224,6 +1231,17 @@ impl MockDiscovery {
         replication: usize,
         proxies: Vec<(String, String)>,
     ) -> Self {
+        Self::start_on_port(0, nodes, replication, proxies).await
+    }
+
+    /// Like `start_with_proxies`, pinned to `port` (`0` picks any free
+    /// one) — for a discovery server that answers where a node used to.
+    async fn start_on_port(
+        port: u16,
+        nodes: Vec<(String, String)>,
+        replication: usize,
+        proxies: Vec<(String, String)>,
+    ) -> Self {
         let handles = DiscoveryHandles {
             nodes: Arc::new(Mutex::new(nodes)),
             proxies: Arc::new(Mutex::new(proxies)),
@@ -1233,7 +1251,7 @@ impl MockDiscovery {
             q_requests: Arc::new(AtomicUsize::new(0)),
             l_delay_ms: Arc::new(AtomicUsize::new(0)),
         };
-        let listener = bind_listener(0).await;
+        let listener = bind_listener(port).await;
         let port = listener.local_addr().unwrap().port();
         let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -4830,6 +4848,112 @@ async fn batch_touch_keeps_earlier_chunks_when_a_later_chunk_fails() {
 
     client.close().await;
     node.stop();
+}
+
+// ── a failed chunk of an expiring touch_many (issue #941) ───────────
+
+#[tokio::test]
+async fn expiring_touch_many_loses_only_the_chunk_that_was_sent() {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    // 1000 keys on one primary: three `y` sub-frames of 400, 400 and 200.
+    let keys = keys_whose_primary_is(NAMES[0], 1000);
+    let node = node_named(&nodes, NAMES[0]);
+
+    // The node answers the first frame and never answers any later one.
+    node.state
+        .die_after_multi_touch_frames
+        .store(1, Ordering::SeqCst);
+    let result = client.touch_many(&keys, Some(0)).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "result = {result:?}"
+    );
+
+    // The second chunk was written and is not sent again; the third was
+    // never sent, so the second pass sends it.
+    let frames = multi_touch_frames(node);
+    assert_eq!(frames.len(), 3, "frames = {}", frames.len());
+    assert_eq!(frames[0].keys, keys[..400]);
+    assert_eq!(frames[1].keys, keys[400..800]);
+    assert_eq!(frames[2].keys, keys[800..]);
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn expiring_get_many_and_touch_returns_what_the_later_chunks_hit() {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let keys = keys_whose_primary_is(NAMES[0], 1000);
+    let node = node_named(&nodes, NAMES[0]);
+    for index in [0, 450, 900] {
+        client.set(&keys[index], "v", 0).await.unwrap();
+    }
+
+    // Only the second frame closes the connection, without a reply.
+    node.state
+        .die_on_multi_touch_frame
+        .store(2, Ordering::SeqCst);
+    match client.get_many_and_touch(&keys, Some(0)).await {
+        Err(Error::PartialConnectionLostText(partial, cause)) => {
+            // The second chunk was written (its key 450 may be consumed)
+            // and is reported lost; the third was sent in the second pass.
+            assert_eq!(
+                partial,
+                HashMap::from([
+                    (keys[0].clone(), "v".to_string()),
+                    (keys[900].clone(), "v".to_string())
+                ])
+            );
+            assert!(
+                matches!(*cause, Error::ConnectionLost(_)),
+                "cause = {cause:?}"
+            );
+        }
+        other => panic!("expected PartialConnectionLostText, got {other:?}"),
+    }
+    let frames = multi_touch_frames(node);
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames[1].keys, keys[400..800]);
+    assert_eq!(frames[2].keys, keys[800..]);
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn expiring_touch_many_counts_a_dial_that_found_no_node_as_not_sent() {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port).disable_reconnect_cooldown())
+        .await
+        .unwrap();
+    let keys = keys_whose_primary_is(NAMES[0], 3);
+    let node = node_named(&nodes, NAMES[0]);
+    let port = node.port;
+
+    // Node A goes away and a discovery server answers on its address: the
+    // redial no longer identifies a cache node (an `Error::Protocol`
+    // from the dial, before anything is written).
+    node.stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let impostor = MockDiscovery::start_on_port(port, Vec::new(), 1, Vec::new()).await;
+
+    let result = client.touch_many(&keys, Some(0)).await;
+    assert!(
+        matches!(result, Err(Error::Protocol(_))),
+        "result = {result:?}"
+    );
+    // Nothing was sent, so the keys went through the refresh-and-retry
+    // pass and dialed A again; had the dial's error counted as a lost
+    // frame the keys would have been given up on after the first.
+    assert_eq!(impostor.l_requests.load(Ordering::SeqCst), 2);
+
+    impostor.stop();
+    stop_cluster(client, nodes, discovery).await;
 }
 
 #[tokio::test]
