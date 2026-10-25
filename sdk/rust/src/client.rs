@@ -812,6 +812,10 @@ struct MultiTouchStateInner {
     wrong_node: std::collections::HashSet<usize>,
     last_cause: Option<Error>,
     rejected: Option<Error>,
+    /// Positions a `Some(0)` touch must not resend (issue #901): their
+    /// primary leg failed after the frame was written, so the node may
+    /// have expired them already. Never retried; reported as unresolved.
+    lost: std::collections::HashSet<usize>,
 }
 
 /// What one batched touch ended with, over its distinct keys: `answers[i]`
@@ -1973,9 +1977,15 @@ impl NanocachedClient {
     /// Unlike `incr` and the compare-and-set family a touch is idempotent,
     /// so a request whose reply was lost is retried like
     /// `get`/`set`/`delete` are, never returned as
-    /// [`Error::ConnectionLost`]. In a cluster it goes to every owner,
-    /// like a `set`, and the primary's answer is returned. Returns
-    /// [`Error::ServerTooOld`] against a node that predates the command.
+    /// [`Error::ConnectionLost`] — with one exception (issue #901):
+    /// `Some(0)` expires the entry, so a resend after the node already
+    /// applied it would answer `false` for a key that existed. That call
+    /// is retried only when its request was never sent (a wrong-node
+    /// answer, a failed dial, a connection that was already dead), and a
+    /// reply lost after the send returns [`Error::ConnectionLost`], as
+    /// `incr` does. In a cluster it goes to every owner, like a `set`, and
+    /// the primary's answer is returned. Returns [`Error::ServerTooOld`]
+    /// against a node that predates the command.
     pub async fn touch(&self, key: impl AsRef<[u8]>, ttl_seconds: Option<u64>) -> Result<bool> {
         self.touch_in(DEFAULT_NAMESPACE, key, ttl_seconds).await
     }
@@ -2012,6 +2022,11 @@ impl NanocachedClient {
     /// owners are sent the plain touch, so a replica is never the only
     /// owner touched. It counts as a read on the primary, which makes the
     /// entry the most recently used.
+    ///
+    /// With `Some(0)` a reply lost after the request was sent returns
+    /// [`Error::ConnectionLost`] instead of being resent (issue #901): the
+    /// node may have expired the entry and consumed its value, and a
+    /// resend would report a miss.
     pub async fn get_and_touch(
         &self,
         key: impl AsRef<[u8]>,
@@ -2080,7 +2095,10 @@ impl NanocachedClient {
     /// once.
     ///
     /// Like `touch` it is idempotent, so a request whose reply was lost is
-    /// retried, and in a cluster it goes to every owner of a key, the
+    /// retried — except with `Some(0)`, where a primary whose connection
+    /// fails after the frame was written is not resent (issue #901): the
+    /// call returns that connection error, every other key having been
+    /// touched. In a cluster it goes to every owner of a key, the
     /// primary's answer being the key's. A replica's failure or `W` is
     /// counted in `stats().replica_write_failures` and never fails the
     /// batch. Larger batches are transparently split into more than one
@@ -2151,7 +2169,11 @@ impl NanocachedClient {
     /// when nothing resolved), each carrying the keys that did resolve.
     /// Unlike `get_many` a key is not tried on its next owner when its
     /// primary is down — a replica's answer would leave the primary
-    /// untouched.
+    /// untouched. With `Some(0)` a primary whose connection fails after
+    /// the frame was written is not resent (issue #901): it may have
+    /// expired and consumed its values already, so those keys fail at
+    /// once with [`Error::PartialConnectionLostText`] instead of reading
+    /// as misses.
     pub async fn get_many_and_touch<K: AsRef<str>>(
         &self,
         keys: &[K],
@@ -2187,7 +2209,9 @@ impl NanocachedClient {
     /// The raw-bytes companion to [`Self::get_many_and_touch`]: no
     /// decoding. Transparently decompresses when `compress` is enabled.
     /// Failures are [`Error::PartialWrongNode`] and
-    /// [`Error::PartialConnectionLost`], as for [`Self::get_many_bytes`].
+    /// [`Error::PartialConnectionLost`], as for [`Self::get_many_bytes`];
+    /// with `Some(0)` a connection lost after the write is not resent (see
+    /// [`Self::get_many_and_touch`]).
     pub async fn get_many_and_touch_bytes<K: AsRef<str>>(
         &self,
         keys: &[K],
@@ -2294,11 +2318,20 @@ impl NanocachedClient {
             // Single/proxy mode: no ring to refresh against, so a `W` or a
             // failure ends the batch as it is, as in `get_many_bytes_in`.
             let (entries, failure) = match self
-                .multi_touch_chunked(None, namespace, key_bytes, ttl_seconds, get)
+                .multi_touch_chunked(
+                    None,
+                    namespace,
+                    key_bytes,
+                    ttl_seconds,
+                    get,
+                    ttl_seconds != Some(0),
+                )
                 .await
             {
                 Ok(entries) => (entries, None),
-                Err((partial_entries, error)) => (partial_entries, Some(error)),
+                Err((partial_entries, error)) => {
+                    (partial_entries, Some(Self::downgrade_sent_error(error)))
+                }
             };
             let mut unresolved = Vec::new();
             let mut wrong_node = false;
@@ -2344,8 +2377,14 @@ impl NanocachedClient {
         for (&idx, entry) in &inner.results {
             answers[idx] = Some(entry.clone());
         }
+        // A `Some(0)` key whose primary lost its connection after the
+        // write was never sent again (issue #901): it is unresolved, and
+        // reported as the connection failure it is, ahead of any
+        // wrong-node answer for other keys.
+        retry.extend(inner.lost.iter().copied());
         retry.sort_unstable();
-        let wrong_node = retry.iter().any(|idx| inner.wrong_node.contains(idx));
+        let wrong_node =
+            inner.lost.is_empty() && retry.iter().any(|idx| inner.wrong_node.contains(idx));
         MultiTouchOutcome {
             answers,
             unresolved: retry,
@@ -2358,6 +2397,11 @@ impl NanocachedClient {
     /// One or more `y` sub-frames against `slot`'s connection (`None` for
     /// the single/proxy target), chunked like `m` — [`Self::multi_get_chunked`]'s
     /// twin, with the same partial-on-error contract (issue #411).
+    ///
+    /// With `replay_safe` false (a `Some(0)` touch against a primary,
+    /// issue #901) a sub-frame is redialed and resent only when it was
+    /// never sent, as `incr` is, and the error is returned undowngraded
+    /// so the caller can tell a connection lost after the write.
     async fn multi_touch_chunked(
         &self,
         slot: Option<&str>,
@@ -2365,6 +2409,7 @@ impl NanocachedClient {
         keys: &[Vec<u8>],
         ttl_seconds: Option<u64>,
         get: bool,
+        replay_safe: bool,
     ) -> std::result::Result<Vec<MultiEntry>, (Vec<MultiEntry>, Error)> {
         let mut entries = Vec::with_capacity(keys.len());
         let lengths = chunk_lengths(namespace.len(), keys.len(), |i| get_entry_cost(&keys[i]));
@@ -2377,7 +2422,12 @@ impl NanocachedClient {
                     .multi_touch(namespace, chunk, ttl_seconds, get)
                     .await
             };
-            match self.apply_reconnecting(slot, &op).await {
+            let result = if replay_safe {
+                self.apply_reconnecting(slot, &op).await
+            } else {
+                self.apply_reconnecting_no_replay(slot, &op).await
+            };
+            match result {
                 Ok(chunk_entries) => entries.extend(chunk_entries),
                 Err(error) => return Err((entries, error)),
             }
@@ -2502,15 +2552,36 @@ impl NanocachedClient {
         ttl_seconds: Option<u64>,
         state: &MultiTouchState,
     ) -> Vec<usize> {
+        // A leg that holds a primary key must not resend an expiring touch
+        // (`Some(0)`, issue #901) once its frame was written; a pure
+        // replica leg is unaffected.
+        let holds_primary = leg.is_primary.iter().any(|&primary| primary);
+        let replay_safe = ttl_seconds != Some(0) || !holds_primary;
         let (entries, failure) = match self
-            .multi_touch_chunked(Some(&leg.owner), namespace, &leg.keys, ttl_seconds, leg.get)
+            .multi_touch_chunked(
+                Some(&leg.owner),
+                namespace,
+                &leg.keys,
+                ttl_seconds,
+                leg.get,
+                replay_safe,
+            )
             .await
         {
             Ok(entries) => (entries, None),
             Err((partial_entries, error)) => (partial_entries, Some(error)),
         };
+        // The write may have been applied: `ConnectionLostAfterSend` (the
+        // frame was written) or `ConnectionLostTimedOut` (the node took it
+        // and never answered). `ServerTooOld` keeps its own handling.
+        let sent_failure = !replay_safe
+            && matches!(
+                failure,
+                Some(Error::ConnectionLostAfterSend(_) | Error::ConnectionLostTimedOut(_))
+            );
+        let failure = failure.map(Self::downgrade_sent_error);
         if let Some(failure) = failure {
-            if leg.is_primary.iter().any(|&primary| primary) {
+            if holds_primary {
                 let mut inner = state.inner.lock().unwrap();
                 if matches!(failure, Error::ServerTooOld { .. }) {
                     inner.rejected = Some(failure.clone());
@@ -2542,6 +2613,10 @@ impl NanocachedClient {
                     let mut inner = state.inner.lock().unwrap();
                     if entry.is_none() {
                         inner.wrong_node.remove(&idx);
+                        if sent_failure {
+                            inner.lost.insert(idx);
+                            continue;
+                        }
                     } else {
                         inner.wrong_node.insert(idx);
                     }
@@ -4290,11 +4365,28 @@ impl NanocachedClient {
         F: Fn(Arc<Connection>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        // A touch that expires its entry (`Some(0)`, issue #901) is not
+        // safe to resend once its frame was written: the node may have
+        // applied it, and the resend would find the key gone (a `false`
+        // from `touch`, a miss and a lost value from `get_and_touch`). Its
+        // primary leg therefore uses the not-sent boundary of `incr`
+        // (issue #484); `with_cluster_retry` skips its own retry for the
+        // undowngraded error the same way. Replica legs stay replayable.
+        let replay_primary = !matches!(
+            body,
+            WriteBody::Touch {
+                ttl_seconds: Some(0)
+            }
+        );
         let owners = {
             let state = self.inner.state.lock().await;
             if let Target::Single { .. } = state.target {
                 drop(state);
-                return self.apply_reconnecting(None, &op).await;
+                return if replay_primary {
+                    self.apply_reconnecting(None, &op).await
+                } else {
+                    self.apply_reconnecting_no_replay(None, &op).await
+                };
             }
             Self::owner_names(&state, namespace, key)
         };
@@ -4312,7 +4404,13 @@ impl NanocachedClient {
         // which instead awaits it only *after* its own primary leg has
         // already succeeded — see that method's own doc comment for why
         // incr can't reuse this concurrent-with-primary shape.
-        let primary_write = self.apply_reconnecting(Some(primary), &op);
+        let primary_write = async {
+            if replay_primary {
+                self.apply_reconnecting(Some(primary), &op).await
+            } else {
+                self.apply_reconnecting_no_replay(Some(primary), &op).await
+            }
+        };
         let replica_writes = self.replicate_writes(namespace, key, replicas, body);
 
         let (primary_result, ()) = tokio::join!(primary_write, replica_writes);
