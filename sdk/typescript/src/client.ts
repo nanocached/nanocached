@@ -1511,7 +1511,8 @@ export class NanocachedClient {
    * both passes throws that connection error — every other key was still
    * touched, and since a touch is idempotent the whole batch may simply be
    * sent again, so nothing partial is attached. Throws `ServerTooOldError`
-   * against a node that predates the command. */
+   * against a node that predates the command, at once: its `En` is final
+   * and is neither redialed nor resent. */
   async touchMany(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, boolean>> {
     return this.touchManyInNamespace(EMPTY_NAMESPACE, keys, ttlSeconds);
   }
@@ -1537,7 +1538,7 @@ export class NanocachedClient {
    * `.partialValues`, the keys that did resolve. Unlike `getMany` a key is
    * not tried on its next owner when its primary is down — a replica's
    * answer would leave the primary untouched. Throws `ServerTooOldError`
-   * against a node that predates the command. */
+   * against a node that predates the command, at once, as `touchMany` does. */
   async getManyAndTouch(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, string>> {
     return this.decodeBatch(this.getManyAndTouchBytesInNamespace(EMPTY_NAMESPACE, keys, ttlSeconds));
   }
@@ -1824,6 +1825,9 @@ export class NanocachedClient {
 
     const state: MultiTouchState = { results: new Map(), wrongNode: new Set(), lastCause: undefined, rejected: false };
     let retryIndices = await this.multiTouchPass(namespace, keyBytes, ttlSeconds, get, undefined, state);
+    // `En` is final: the node would refuse the same frame again, so neither
+    // the refresh nor the second pass (which would redial it) is worth it.
+    if (retryIndices.length > 0 && state.rejected) throw new ServerTooOldError("y");
     if (retryIndices.length > 0) {
       // One bounded refresh-and-retry over everything a primary left
       // unresolved: a `W` is stale routing the refresh fixes, a primary
