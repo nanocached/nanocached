@@ -183,9 +183,51 @@ fn start_node(port: &mut Port, discovery_port: u16, name: Option<&str>) -> Node 
     Node { handle, leave }
 }
 
+/// How long a helper below may wait for its peer, in real time.
+const REAL_TIME_LIMIT: Duration = Duration::from_secs(60);
+
+/// Panics if `fut` has not finished within `limit` of real time. The test
+/// clock is paused and only moves through `run_for`, so a deadline on it
+/// never fires while a peer sits silent and `spin()` keeps the runtime
+/// busy: the test would hang at full CPU instead of failing. The watchdog
+/// is a plain thread, which the paused clock cannot hold back, and it ends
+/// as soon as `fut` does.
+async fn within_real_time<T>(
+    limit: Duration,
+    what: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> T {
+    use std::sync::atomic::AtomicBool;
+
+    let (expired, expiry) = tokio::sync::oneshot::channel::<()>();
+    let finished = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let finished = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            let end = std::time::Instant::now() + limit;
+            while !finished.load(Ordering::SeqCst) {
+                let left = end.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    let _ = expired.send(());
+                    return;
+                }
+                std::thread::park_timeout(left);
+            }
+        })
+    };
+    let out = tokio::select! {
+        out = fut => Some(out),
+        _ = expiry => None,
+    };
+    finished.store(true, Ordering::SeqCst);
+    watchdog.thread().unpark();
+    out.unwrap_or_else(|| panic!("{what}: no answer within {limit:?} of real time"))
+}
+
 /// One line, without its newline. Bounded like every other reader here
 /// (`clippy.toml` rejects `read_line`); the deadline is far away because
-/// the test clock only moves through `run_for`.
+/// the test clock only moves through `run_for` — see `within_real_time`
+/// for the bound that does hold.
 async fn line_of<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> String {
     let mut line = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
@@ -196,6 +238,10 @@ async fn line_of<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> String {
 }
 
 async fn roster(discovery_port: u16) -> Vec<(String, String)> {
+    within_real_time(REAL_TIME_LIMIT, "roster", roster_unbounded(discovery_port)).await
+}
+
+async fn roster_unbounded(discovery_port: u16) -> Vec<(String, String)> {
     let mut s = TcpStream::connect(("127.0.0.1", discovery_port))
         .await
         .unwrap();
@@ -219,6 +265,15 @@ async fn roster(discovery_port: u16) -> Vec<(String, String)> {
 }
 
 async fn raw_line(port: u16, request: &[u8]) -> (String, Vec<u8>) {
+    within_real_time(
+        REAL_TIME_LIMIT,
+        "raw_line",
+        raw_line_unbounded(port, request),
+    )
+    .await
+}
+
+async fn raw_line_unbounded(port: u16, request: &[u8]) -> (String, Vec<u8>) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     s.write_all(request).await.unwrap();
     let mut r = BufReader::new(s);
@@ -316,6 +371,27 @@ async fn scenario_564(write_at: Duration) -> Outcome {
         node.abort();
     }
     out
+}
+
+/// A peer that accepts and then says nothing used to hang the test at full
+/// CPU: the 3600 s deadline of `line_of` is on the paused clock, which only
+/// `run_for` moves.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[should_panic(expected = "no answer within")]
+async fn a_silent_peer_fails_a_helper_in_real_time_instead_of_hanging() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _silent_peer = tokio::spawn(async move {
+        let _held = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+    let _spin = spin();
+    within_real_time(
+        Duration::from_secs(1),
+        "raw_line",
+        raw_line_unbounded(port, b"G 1\nk"),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
