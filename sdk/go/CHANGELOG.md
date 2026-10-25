@@ -43,6 +43,13 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
   rejection, which `applyReconnecting` treats as final. A `Get` or `Set`
   that merely shared the connection with a touch sent to a node that
   predates `t` used to fail along with it (#940).
+- Only a node's `En` makes a touch return `ErrServerTooOld` /
+  `ErrServerTooOldBatch`. Any other `E` — the bare `E` (or `E <tag>`)
+  nanocached-proxy answers when a request's outcome is unknown — is now
+  `ErrConnectionLost` (not
+  `ErrProtocol`): a `ttl == 0` touch and `Incr`/the compare-and-set family
+  are not resent, and idempotent requests are replayed as for any lost
+  reply (#939).
 
 ## [0.4.8] - 2026-10-21
 
