@@ -110,6 +110,8 @@ final class MockNode implements AutoCloseable {
     private final AtomicInteger multiGetDropRemaining = new AtomicInteger(0);
     private final AtomicInteger multiSetOkCountdown = new AtomicInteger(0);
     private final AtomicInteger multiSetDropRemaining = new AtomicInteger(0);
+    private final AtomicInteger multiTouchOkCountdown = new AtomicInteger(0);
+    private final AtomicInteger multiTouchDropRemaining = new AtomicInteger(0);
     /** Milliseconds every single-key {@code d} (delete) sleeps before
      * answering — 0 (the default) is no delay. Used to prove {@code
      * removeAll(Set)} fans its deletes out concurrently rather than one
@@ -481,6 +483,10 @@ final class MockNode implements AutoCloseable {
             keys[i] = in.readNBytes(keyLengths[i]);
         }
         multiTouchFrames.add(String.join(" ", parts));
+        if (takeDrop(multiTouchOkCountdown, multiTouchDropRemaining)) {
+            // The frame was read in full, so the client counts it as sent.
+            throw new IOException("nanocached-test: forced connection drop after a y frame (issue #938)");
+        }
         if (rejectMultiTouch) {
             reply(out, "En\n");
             throw new IOException("nanocached-test: y rejected like an old server");
@@ -642,6 +648,13 @@ final class MockNode implements AutoCloseable {
     void armMultiGetDrop(int okCount, int dropCount) {
         multiGetOkCountdown.set(okCount);
         multiGetDropRemaining.set(dropCount);
+    }
+
+    /** As {@link #armMultiGetDrop}, for {@code y} (batched touch): the frame
+     * is read in full before the connection drops. */
+    void armMultiTouchDrop(int okCount, int dropCount) {
+        multiTouchOkCountdown.set(okCount);
+        multiTouchDropRemaining.set(dropCount);
     }
 
     /** As {@link #armMultiGetDrop}, for {@code o} (multi-set). */
