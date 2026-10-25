@@ -204,7 +204,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install Django
-        run: pip install "Django>=4.2"
+        # pip carries its own CA bundle (a vendored certifi), so the pip that
+        # ships with the runner's interpreter is only as current as that
+        # interpreter's last release: upgrade it before it downloads anything.
+        run: |
+          python -m pip install --upgrade "pip>=26.2.2"
+          python -m pip install "Django>=4.2"
 
       - name: Run tests
         working-directory: adapters/django
