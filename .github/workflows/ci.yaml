@@ -44,6 +44,10 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: lts/*
+          # Without this the action takes whatever LTS the runner image has
+          # cached, which lags a security release by days: the root store
+          # Node bundles is part of the release.
+          check-latest: true
           cache: pnpm
           cache-dependency-path: sdk/typescript/pnpm-lock.yaml
 
@@ -193,7 +197,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install Django
-        run: pip install "Django>=4.2"
+        # pip carries its own CA bundle (a vendored certifi), so the pip that
+        # ships with the runner's interpreter is only as current as that
+        # interpreter's last release: upgrade it before it downloads anything.
+        run: |
+          python -m pip install --upgrade "pip>=26.2.2"
+          python -m pip install "Django>=4.2"
 
       - name: Run tests
         working-directory: adapters/django
@@ -220,6 +229,10 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: lts/*
+          # Without this the action takes whatever LTS the runner image has
+          # cached, which lags a security release by days: the root store
+          # Node bundles is part of the release.
+          check-latest: true
 
       - name: Install dependencies
         working-directory: adapters/cache-manager
@@ -252,6 +265,10 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: lts/*
+          # Without this the action takes whatever LTS the runner image has
+          # cached, which lags a security release by days: the root store
+          # Node bundles is part of the release.
+          check-latest: true
 
       - name: Install dependencies
         working-directory: adapters/keyv

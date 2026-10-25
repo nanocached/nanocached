@@ -69,6 +69,16 @@ framework adapters at one version, whether or not a component changed.
   refused (a container has to listen on `0.0.0.0`); set a secret, bind
   loopback, or restrict the port at the network layer.
 
+### Security
+
+- Updated `rustls-webpki` to 0.103.16 in the node, proxy and discovery
+  binaries (RUSTSEC-2026-0382): earlier versions accept certificate paths
+  through the eight eMudhra intermediate CA certificates whose private keys
+  are now publicly recoverable, when the trust anchors in use allow such a
+  path. The binaries trust only the CA file given with `--tls-ca` and never
+  the system's roots, so a deployment whose CA file holds no emSign root was
+  not exposed; the update closes the path for one that does.
+
 ## [0.4.8] - 2026-10-21
 
 ### Fixed
