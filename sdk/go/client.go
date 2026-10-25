@@ -2614,6 +2614,12 @@ func (c *Client) applyReconnecting(slot string, op func(*connection) error) erro
 		if errors.Is(err, errRequestTimedOut) {
 			return err
 		}
+		// An `En` is the node refusing the request itself (a command it
+		// does not know, one too large or malformed): the same frame on a
+		// fresh connection is refused the same way.
+		if errors.Is(err, errServerRejected) {
+			return err
+		}
 		conn, redialErr := c.slotConnection(slot)
 		if redialErr != nil {
 			return redialErr
