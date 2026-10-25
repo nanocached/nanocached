@@ -11,6 +11,19 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A `ttlSeconds` `0` touch (`touch`, `getAndTouch`, `touchMany`,
+  `getManyAndTouch`) no longer sends the other owners the plain touch before
+  the primary has answered. A primary that could not be reached, or that
+  answered `W` from a stale ring, is rerouted to the surviving replica, which
+  had already expired its copy and answered `N`: `getAndTouch` and
+  `getManyAndTouch` returned a miss for a key that existed (the value was
+  consumed and never returned) and `touch` and `touchMany` reported `false`.
+  Now the primary legs go first (both passes of a batch), and the replicas
+  get one plain touch afterwards for every key whose primary answered, `N`
+  included; a key whose primary failed or answered `W` gets no replica leg.
+  These replica legs run after the primary's answer, outside the pipelined-
+  order guarantee, like the existing retry paths. A live or removed TTL
+  keeps the concurrent fan-out.
 - `touch`, `getAndTouch`, `touchMany` and `getManyAndTouch` throw
   `ServerTooOldError` only for the node's `En`. The proxy answers a bare
   `E` (or `E <tag>`) when a touch's outcome is unknown, for example a

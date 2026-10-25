@@ -189,6 +189,9 @@ interface MultiTouchState {
   rejected: boolean;
   lost: Set<number>;
   lostCause: unknown;
+  /** Which node answered each key in `results` as its primary (issue #934),
+   * so the deferred ttl-0 replica fan-out skips exactly that node. */
+  answeredBy: Map<number, string>;
 }
 
 /** Snapshot of counters for failures this client swallows by design
@@ -1744,7 +1747,7 @@ export class NanocachedClient {
       return await this.withWrongNodeRetry(
         () =>
           this.target.kind === "cluster"
-            ? this.writeToOwners(key, namespace, (connection) => connection.touch(key, ttlSeconds, namespace), undefined, expiring)
+            ? this.writeToOwners(key, namespace, (connection) => connection.touch(key, ttlSeconds, namespace), undefined, expiring, expiring)
             : this.connectionForSingleTarget().then((connection) => connection.touch(key, ttlSeconds, namespace)),
         { nonIdempotent: expiring, rejectionIsFinal: true },
       );
@@ -1776,6 +1779,7 @@ export class NanocachedClient {
                 namespace,
                 (connection) => connection.getAndTouch(key, ttlSeconds, namespace),
                 (connection) => connection.touch(key, ttlSeconds, namespace),
+                expiring,
                 expiring,
               )
             : this.connectionForSingleTarget().then((connection) => connection.getAndTouch(key, ttlSeconds, namespace)),
@@ -1879,6 +1883,7 @@ export class NanocachedClient {
       rejected: false,
       lost: new Set(),
       lostCause: undefined,
+      answeredBy: new Map(),
     };
     // With `get`, the hits other primaries already returned ride along
     // (issue #924): a `ttlSeconds === 0` call consumed them.
@@ -1887,8 +1892,8 @@ export class NanocachedClient {
     let retryIndices = await this.multiTouchPass(namespace, keyBytes, ttlSeconds, get, undefined, state);
     // `En` is final: the node would refuse the same frame again, so neither
     // the refresh nor the second pass (which would redial it) is worth it.
-    if (retryIndices.length > 0 && state.rejected) throw tooOld();
-    if (retryIndices.length > 0) {
+    const finalRejection = retryIndices.length > 0 && state.rejected;
+    if (retryIndices.length > 0 && !finalRejection) {
       // One bounded refresh-and-retry over everything a primary left
       // unresolved: a `W` is stale routing the refresh fixes, a primary
       // that could not be reached gets a fresh view of who the owners
@@ -1897,6 +1902,11 @@ export class NanocachedClient {
       await this.maybeRefreshNodeList({ force: true });
       retryIndices = await this.multiTouchPass(namespace, keyBytes, ttlSeconds, get, retryIndices, state);
     }
+    // An expiring touch (issue #934) sent only the primary legs; now that
+    // the primaries have answered, expire the other owners' copies too. Runs
+    // before any of the outcomes below, whichever way the call ends.
+    if (ttlSeconds === 0) await this.multiTouchReplicaFanOut(namespace, keyBytes, state);
+    if (finalRejection) throw tooOld();
     if (retryIndices.length === 0 && state.lost.size === 0) return collect(state.results);
     if (state.rejected) throw tooOld();
     if (state.lost.size === 0 && retryIndices.some((index) => state.wrongNode.has(index))) {
@@ -1973,7 +1983,15 @@ export class NanocachedClient {
    * Returns the indices whose primary answered `W` or could not be reached
    * (a key with no owners at all counts as `W`: a refresh may populate the
    * ring). `state` learns which of the two it was, and whether a primary
-   * was a node that predates `y`. */
+   * was a node that predates `y`.
+   *
+   * With `ttlSeconds === 0` only the primary legs are sent (issue #934):
+   * a plain `t ... 0` already sent to a replica expires its copy, and a
+   * primary that then answers `W` or cannot be reached is rerouted to
+   * exactly that replica, which would answer `N` for a key that existed.
+   * `multiTouchReplicaFanOut` sends the replica legs once the passes are
+   * over, outside the pipelined-order guarantee (same class as the retry
+   * paths). */
   private async multiTouchPass(
     namespace: Uint8Array,
     keyBytes: readonly Buffer[],
@@ -1993,7 +2011,7 @@ export class NanocachedClient {
         retry.push(index);
         continue;
       }
-      names.forEach((name, rank) => {
+      (ttlSeconds === 0 ? names.slice(0, 1) : names).forEach((name, rank) => {
         const form = get && rank === 0;
         const id = `${form ? "G" : "P"}${name}`;
         let leg = legs.get(id);
@@ -2048,6 +2066,7 @@ export class NanocachedClient {
             if (!answered) this.replicaWriteFailures++;
           } else if (answered) {
             state.results.set(index, entries[i]);
+            state.answeredBy.set(index, leg.name);
           } else {
             if (i < resolved) state.wrongNode.add(index);
             else {
@@ -2090,6 +2109,64 @@ export class NanocachedClient {
       throw backgroundBug ? backgroundBug.reason : error;
     }
     return retry;
+  }
+
+  /** The deferred replica legs of an expiring batch touch (issue #934): one
+   * plain `y ... 0` per replica owner, on the ring in force now, covering
+   * every key whose primary answered `S`/`V` or `N` (an `N` primary may
+   * still have a replica copy through fire-and-forget replication, and the
+   * caller meant "expire everywhere"). Keys still `W`, lost or rejected get
+   * no replica leg. Failures are swallowed into stats().replicaWriteFailures
+   * as in `multiTouchPass`, and a pure-replica leg is eligible for
+   * fireAndForgetReplicas. */
+  private async multiTouchReplicaFanOut(namespace: Uint8Array, keyBytes: readonly Buffer[], state: MultiTouchState): Promise<void> {
+    const legs = new Map<string, number[]>();
+    for (const [index, answeredBy] of state.answeredBy) {
+      for (const name of this.ownerNames(keyBytes[index], namespace)) {
+        if (name === answeredBy) continue;
+        const indices = legs.get(name);
+        if (indices) indices.push(index);
+        else legs.set(name, [index]);
+      }
+    }
+
+    const syncLegs: Promise<void>[] = [];
+    const backgroundLegs: Promise<void>[] = [];
+    for (const [name, indices] of legs) {
+      const runLeg = async (): Promise<void> => {
+        const { entries, resolved } = await this.multiTouchChunked(
+          () => this.memberConnection(name),
+          namespace,
+          indices.map((index) => keyBytes[index]),
+          0,
+          false,
+        );
+        for (let i = 0; i < indices.length; i++) {
+          if (!(i < resolved && entries[i].kind !== "wrongNode")) this.replicaWriteFailures++;
+        }
+      };
+
+      if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+        const background = runLeg();
+        const settled = background.catch(() => {});
+        this.backgroundReplicaWrites.add(background);
+        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        backgroundLegs.push(background);
+        continue;
+      }
+
+      const promise = runLeg();
+      promise.catch(() => {});
+      syncLegs.push(promise);
+    }
+
+    try {
+      await Promise.all(syncLegs);
+    } catch (error) {
+      const backgroundResults = await Promise.allSettled(backgroundLegs);
+      const backgroundBug = backgroundResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      throw backgroundBug ? backgroundBug.reason : error;
+    }
   }
 
   // ── batched get/set (issues #128/#150/#151) ────────────────────────
@@ -3163,6 +3240,15 @@ export class NanocachedClient {
      * goes through `dialForWrite`, so a failure to get a connection counts
      * as "never sent" for `withWrongNodeRetry`'s `nonIdempotent` option. */
     primaryNotResendable = false,
+    /** The replica legs go out only after the primary has answered (issue
+     * #934), to the owners of the ring in force at that moment. For a touch
+     * with ttl 0: a plain `t ... 0` already sent to a replica would expire
+     * its copy, and a primary that then fails or answers `W` is rerouted to
+     * exactly that replica, which would answer `N` for a key that existed.
+     * Those legs run after the primary's answer, outside the pipelined-order
+     * guarantee, the same class as the retry paths. A primary that fails
+     * gets no replica leg. */
+    replicasAfterPrimary = false,
   ): Promise<T> {
     const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
     if (primaryName === undefined) {
@@ -3202,43 +3288,46 @@ export class NanocachedClient {
     // protect from delay.
     const synchronousReplicaWrites: Promise<void>[] = [];
     const backgroundLegs: Promise<void>[] = [];
-    for (const name of replicaNames) {
-      // `!this.closed` is rechecked here, synchronously and immediately
-      // before this leg is ever registered in backgroundReplicaWrites —
-      // no await happens between this check and the `.add()` below, so
-      // close()'s own drain can't race a leg into existence after it
-      // already took its snapshot (issue #47 item 3 / audit finding). When
-      // closed, this falls through to the synchronous branch below instead,
-      // exactly as if fireAndForgetReplicas were off — that leg is awaited
-      // by this very call via Promise.allSettled below, so it can't outlive
-      // close()'s teardown either.
-      if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
-        const background = replicaWrite(name);
-        // Now that replicaWrite can legitimately reject (a programming bug
-        // — see isSwallowable), attach a rejection handler synchronously,
-        // in the same tick this promise is created: without it, Node
-        // would flag `background` as an unhandled rejection before
-        // anything else gets a chance to observe it, since nothing else
-        // awaits it until the `.finally` below, close()'s drain, or (on a
-        // failed primary) the Promise.allSettled below runs, possibly
-        // ticks later.
-        const settled = background.catch(() => {});
-        this.backgroundReplicaWrites.add(background);
-        settled.finally(() => this.backgroundReplicaWrites.delete(background));
-        backgroundLegs.push(background);
-        continue;
+    const launchReplicaLegs = (names: string[]): void => {
+      for (const name of names) {
+        // `!this.closed` is rechecked here, synchronously and immediately
+        // before this leg is ever registered in backgroundReplicaWrites —
+        // no await happens between this check and the `.add()` below, so
+        // close()'s own drain can't race a leg into existence after it
+        // already took its snapshot (issue #47 item 3 / audit finding). When
+        // closed, this falls through to the synchronous branch below instead,
+        // exactly as if fireAndForgetReplicas were off — that leg is awaited
+        // by this very call via Promise.allSettled below, so it can't outlive
+        // close()'s teardown either.
+        if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+          const background = replicaWrite(name);
+          // Now that replicaWrite can legitimately reject (a programming bug
+          // — see isSwallowable), attach a rejection handler synchronously,
+          // in the same tick this promise is created: without it, Node
+          // would flag `background` as an unhandled rejection before
+          // anything else gets a chance to observe it, since nothing else
+          // awaits it until the `.finally` below, close()'s drain, or (on a
+          // failed primary) the Promise.allSettled below runs, possibly
+          // ticks later.
+          const settled = background.catch(() => {});
+          this.backgroundReplicaWrites.add(background);
+          settled.finally(() => this.backgroundReplicaWrites.delete(background));
+          backgroundLegs.push(background);
+          continue;
+        }
+        const write = replicaWrite(name);
+        // Same reasoning as above: attach a no-op catch synchronously so a
+        // genuine programming bug surfacing here doesn't trip Node's
+        // unhandled-rejection detector before the `Promise.allSettled`
+        // below gets a chance to await this exact promise and propagate the
+        // real error to the caller of set()/delete() — unless the primary
+        // already succeeded, in which case that success wins instead (see
+        // below).
+        write.catch(() => {});
+        synchronousReplicaWrites.push(write);
       }
-      const write = replicaWrite(name);
-      // Same reasoning as above: attach a no-op catch synchronously so a
-      // genuine programming bug surfacing here doesn't trip Node's
-      // unhandled-rejection detector before the `Promise.allSettled`
-      // below gets a chance to await this exact promise and propagate the
-      // real error to the caller of set()/delete() — unless the primary
-      // already succeeded, in which case that success wins instead (see
-      // below).
-      write.catch(() => {});
-      synchronousReplicaWrites.push(write);
-    }
+    };
+    if (!replicasAfterPrimary) launchReplicaLegs(replicaNames);
 
     let primary: { ok: true; value: T } | { ok: false; error: unknown };
     try {
@@ -3248,6 +3337,12 @@ export class NanocachedClient {
       primary = { ok: true, value: await op(connection) };
     } catch (error) {
       primary = { ok: false, error };
+    }
+
+    // The deferred legs (issue #934): only a primary that answered gets
+    // them; a failure or a `W` is rerouted with no replica touched yet.
+    if (replicasAfterPrimary && primary.ok) {
+      launchReplicaLegs(this.ownerNames(key, namespace).filter((name) => name !== primaryName));
     }
 
     // Always drain the synchronous replica legs — for close()'s tracking,
