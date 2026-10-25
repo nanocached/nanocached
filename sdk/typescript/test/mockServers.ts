@@ -354,6 +354,10 @@ export async function startMockNode(
     /** Issue #871: behave like a node that knows `t` but predates `y`
      * (`withoutTouch` implies this). */
     withoutMultiTouch?: boolean;
+    /** Issue #939: answer `t` and `y` with the proxy's bare `E` (plus the
+     * echoed tag on a tagged connection) and close — the proxy's "request
+     * failed / outcome unknown", not the node's `En\n`. */
+    proxyStyleError?: boolean;
   } = {},
 ): Promise<MockNode> {
   const store = new Map<string, Buffer>();
@@ -956,6 +960,12 @@ export async function startMockNode(
               return;
             }
 
+            if (options.proxyStyleError) {
+              socket.write(`E${tag}\n`);
+              socket.end();
+              return;
+            }
+
             if (silent) break;
 
             if (retryableReplies > 0) {
@@ -1031,6 +1041,12 @@ export async function startMockNode(
 
             if (options.withoutTouch || options.withoutMultiTouch) {
               socket.write("En\n");
+              socket.end();
+              return;
+            }
+
+            if (options.proxyStyleError) {
+              socket.write(`E${tag}\n`);
               socket.end();
               return;
             }

@@ -11,6 +11,12 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `touch`, `getAndTouch`, `touchMany` and `getManyAndTouch` throw
+  `ServerTooOldError` only for the node's `En`. The proxy answers a bare
+  `E` (or `E <tag>`) when a touch's outcome is unknown, for example a
+  backend failure after the frame was written with `ttlSeconds` `0`; that is
+  now a `ConnectionLostError` with `requestWasSent` `true`, like a fatal `E`
+  to any other command, and an expiring touch is not sent again.
 - In a cluster, `getManyAndTouch` no longer discards the hits other
   primaries returned when one primary answers `En` to `y`. It throws
   `PartialServerTooOldError`, a `ServerTooOldError` subclass, with them in
