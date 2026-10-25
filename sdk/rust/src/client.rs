@@ -2173,7 +2173,11 @@ impl NanocachedClient {
     /// the frame was written is not resent (issue #901): it may have
     /// expired and consumed its values already, so those keys fail at
     /// once with [`Error::PartialConnectionLostText`] instead of reading
-    /// as misses.
+    /// as misses. Against a node that predates `y` it returns
+    /// [`Error::ServerTooOld`] — in a cluster, when other primaries had
+    /// already answered, [`Error::PartialServerTooOldText`] carrying their
+    /// hits (with `Some(0)` those values are consumed and would otherwise
+    /// be lost).
     pub async fn get_many_and_touch<K: AsRef<str>>(
         &self,
         keys: &[K],
@@ -2199,6 +2203,9 @@ impl NanocachedClient {
             Err(Error::PartialWrongNode(partial)) => {
                 Err(Error::PartialWrongNodeText(decode_many(partial)?))
             }
+            Err(Error::PartialServerTooOld(partial)) => {
+                Err(Error::PartialServerTooOldText(decode_many(partial)?))
+            }
             Err(Error::PartialConnectionLost(partial, cause)) => Err(
                 Error::PartialConnectionLostText(decode_many(partial)?, cause),
             ),
@@ -2209,9 +2216,10 @@ impl NanocachedClient {
     /// The raw-bytes companion to [`Self::get_many_and_touch`]: no
     /// decoding. Transparently decompresses when `compress` is enabled.
     /// Failures are [`Error::PartialWrongNode`] and
-    /// [`Error::PartialConnectionLost`], as for [`Self::get_many_bytes`];
-    /// with `Some(0)` a connection lost after the write is not resent (see
-    /// [`Self::get_many_and_touch`]).
+    /// [`Error::PartialConnectionLost`], as for [`Self::get_many_bytes`],
+    /// and [`Error::PartialServerTooOld`] for a primary that predates `y`
+    /// while others had already answered; with `Some(0)` a connection lost
+    /// after the write is not resent (see [`Self::get_many_and_touch`]).
     pub async fn get_many_and_touch_bytes<K: AsRef<str>>(
         &self,
         keys: &[K],
@@ -2256,7 +2264,12 @@ impl NanocachedClient {
             return Ok(values);
         }
         if let Some(rejected) = outcome.rejected {
-            return Err(rejected);
+            // The hits other primaries returned ride along (issue #924):
+            // a `Some(0)` call consumed them.
+            if values.is_empty() {
+                return Err(rejected);
+            }
+            return Err(Error::PartialServerTooOld(values));
         }
         if outcome.wrong_node {
             return Err(Error::PartialWrongNode(values));
