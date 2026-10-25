@@ -1501,6 +1501,77 @@ class NanocachedClientTest {
         }
     }
 
+    /** Runs each of the four touch calls with ttl 0 against a node that
+     * answers {@code reply} to every frame, and returns what each threw. */
+    private static List<Throwable> expiringTouchesAnsweredWith(String reply, boolean tagged) throws Exception {
+        List<Throwable> thrown = new ArrayList<>();
+        java.util.function.Consumer<Runnable> record = call -> {
+            try {
+                call.run();
+                thrown.add(null);
+            } catch (Throwable error) {
+                thrown.add(error);
+            }
+        };
+        // One node per call, so each call's frame count stands alone.
+        for (int which = 0; which < 4; which++) {
+            try (ScriptedNode node = new ScriptedNode(tagged, header -> reply)) {
+                try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                    int call = which;
+                    record.accept(() -> {
+                        switch (call) {
+                            case 0 -> client.touch("k", 0);
+                            case 1 -> client.getAndTouch("k", 0);
+                            case 2 -> client.touchMany(List.of("a", "b"), 0);
+                            default -> client.getManyAndTouch(List.of("a", "b"), 0);
+                        }
+                    });
+                }
+                assertEquals(1, node.frames.get(), "call " + which + " must send exactly one frame");
+            }
+        }
+        return thrown;
+    }
+
+    @Test
+    void aBareEToAnExpiringTouchIsAConnectionFailureAfterTheSendNotServerTooOld() throws Exception {
+        // Issue #939: nanocached-proxy answers a bare `E` when a ttl=0
+        // touch's outcome is unknown; only a node's `En` means the command
+        // is unknown to it.
+        for (boolean tagged : new boolean[] {false, true}) {
+            for (String reply : tagged ? new String[] {"E\n", "E 7\n"} : new String[] {"E\n"}) {
+                List<Throwable> thrown = expiringTouchesAnsweredWith(reply, tagged);
+                for (Throwable error : thrown) {
+                    String what = "tagged=" + tagged + " reply=" + reply.trim() + " threw " + error;
+                    assertTrue(error instanceof NanocachedException.ConnectionFailed, what);
+                    assertFalse(error instanceof NanocachedException.ServerTooOld, what);
+                    assertEquals(NanocachedException.ConnectionFailed.class, error.getClass(), what);
+                    // Written, then lost: never marked as unsent, so nothing resends it.
+                    assertFalse(((NanocachedException.ConnectionFailed) error).notSent(), what);
+                }
+            }
+        }
+    }
+
+    @Test
+    void anEnToAnExpiringTouchIsStillServerTooOld() throws Exception {
+        List<Throwable> thrown = expiringTouchesAnsweredWith("En\n", false);
+        for (Throwable error : thrown) {
+            assertTrue(error instanceof NanocachedException.ServerTooOld, String.valueOf(error));
+        }
+    }
+
+    @Test
+    void aBareEToANonExpiringTouchIsAConnectionFailureToo() throws Exception {
+        // Not "server too old" either; a touch that does not expire may be
+        // resent, so the connection failure is what surfaces after the retry.
+        try (ScriptedNode node = new ScriptedNode(header -> "E\n")) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.touch("k", 30));
+            }
+        }
+    }
+
     @Test
     void batchTouchEndsOnAWholeFrameWrongNodeOnASingleNode() throws Exception {
         try (MockNode node = new MockNode()) {
