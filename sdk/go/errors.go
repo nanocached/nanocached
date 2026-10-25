@@ -93,6 +93,14 @@ var (
 	// is unknown.
 	ErrServerTooOld = errors.New("nanocached: the server does not know the touch command (t) — upgrade every node to a release that includes it")
 
+	// ErrServerTooOldBatch is returned by TouchMany/GetManyAndTouch (issue
+	// #871) when the node answered `En` to the `y` command: a node that
+	// predates the batched touch does not know it and closes the
+	// connection, as for `t` above. errors.Is(err, ErrServerTooOld) holds
+	// for it too, so a caller that already handles ErrServerTooOld needs no
+	// change; the message names `y` instead of `t`.
+	ErrServerTooOldBatch error = serverTooOldBatchError{}
+
 	// ErrRetryable is returned when a single request was answered `R`
 	// (issue #125) on every attempt of the bounded retry budget — the
 	// server (today, only nanocached-proxy) reported the request itself
@@ -106,6 +114,16 @@ var (
 	// regardless of what the caller configured.
 	ErrRetryable = errors.New("nanocached: request failed transiently and retries were exhausted")
 )
+
+// serverTooOldBatchError is ErrServerTooOldBatch's type: an ErrServerTooOld
+// whose message names the batched touch command.
+type serverTooOldBatchError struct{}
+
+func (serverTooOldBatchError) Error() string {
+	return "nanocached: the server does not know the batched touch command (y) — upgrade every node to a release that includes it"
+}
+
+func (serverTooOldBatchError) Is(target error) bool { return target == ErrServerTooOld }
 
 // errServerRejected marks the ErrProtocol failure a node's `En` produces
 // (issue #825): the node rejected the request and is closing the

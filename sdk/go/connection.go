@@ -669,6 +669,87 @@ func appendMultiGetFrame(namespace []byte, keys [][]byte, tagged bool, tag uint3
 	return frame
 }
 
+// multiTouchNS sends the plain `y` frame — batched touch (issue #871) — to
+// this node only: cluster fan-out to every owner is the client's job, as
+// for multiSetNS. ttlSeconds -1 omits the TTL field (the node removes the
+// TTL); N >= 0 is sent, and 0 expires the keys at once — unlike
+// multiSetNS, where 0 means no expiry. entries[i] answers keys[i], in
+// request order: ok is `S` (touched), wrongNode is `W`, neither is `N` (no
+// live entry — a touch never creates one). As for multiGetNS, only a
+// desynced roster is an error.
+func (c *connection) multiTouchNS(namespace []byte, keys [][]byte, ttlSeconds int64) ([]multiEntry, error) {
+	marker, _, _, entries, err := c.request(func(tag uint32) []byte {
+		return appendMultiTouchFrame(namespace, keys, ttlSeconds, false, c.tagged, tag)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if marker != 'Y' {
+		return nil, c.mismatch(marker)
+	}
+	if len(entries) != len(keys) {
+		desyncErr := connectionLost(fmt.Sprintf(
+			"multi-touch response roster length %d does not match request key count %d (connection desynced)",
+			len(entries), len(keys)), nil)
+		c.poison(desyncErr)
+		return nil, desyncErr
+	}
+	return entries, nil
+}
+
+// multiGetAndTouchNS sends `y ... G` (issue #871): the reply is multiGetNS's
+// `M` roster for the keys the node touched — a hit's value carries the
+// frame's TTL, a miss (or a value the node had no room for in its reply,
+// which it also leaves untouched) is a clean miss, and a per-key `W` stays
+// in the roster. Unlike getAndTouchNS the reply carries no per-key TTL.
+func (c *connection) multiGetAndTouchNS(namespace []byte, keys [][]byte, ttlSeconds int64) ([]multiEntry, error) {
+	marker, _, _, entries, err := c.request(func(tag uint32) []byte {
+		return appendMultiTouchFrame(namespace, keys, ttlSeconds, true, c.tagged, tag)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if marker != 'M' {
+		return nil, c.mismatch(marker)
+	}
+	if len(entries) != len(keys) {
+		desyncErr := connectionLost(fmt.Sprintf(
+			"multi-get response roster length %d does not match request key count %d (connection desynced)",
+			len(entries), len(keys)), nil)
+		c.poison(desyncErr)
+		return nil, desyncErr
+	}
+	return entries, nil
+}
+
+// appendMultiTouchFrame builds a `y` request frame: `y <ns-len> <n>
+// <key-len-1> ... <key-len-n>[ <ttl>][ G][ <tag>]\n<ns><key-1>...<key-n>`
+// (docs/protocol.html "y — batched touch"). Always namespaced, like
+// appendMultiGetFrame. ttlSeconds < 0 omits the TTL field.
+func appendMultiTouchFrame(namespace []byte, keys [][]byte, ttlSeconds int64, get bool, tagged bool, tag uint32) []byte {
+	frame := append([]byte("y "), strconv.AppendInt(nil, int64(len(namespace)), 10)...)
+	frame = append(frame, ' ')
+	frame = strconv.AppendInt(frame, int64(len(keys)), 10)
+	for _, key := range keys {
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, int64(len(key)), 10)
+	}
+	if ttlSeconds >= 0 {
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, ttlSeconds, 10)
+	}
+	if get {
+		frame = append(frame, " G"...)
+	}
+	frame = appendTagField(frame, tagged, tag)
+	frame = append(frame, '\n')
+	frame = append(frame, namespace...)
+	for _, key := range keys {
+		frame = append(frame, key...)
+	}
+	return frame
+}
+
 // multiSetNS sends the `o` frame — batched set (issues #150/#151): n
 // keys stored under one round trip, one shared ttlSeconds for the whole
 // batch rather than per key (docs/protocol.html#multi). entries[i]
@@ -1190,42 +1271,25 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 	// line's own maxHeaderLineLength cap above, before this loop ever
 	// runs.
 	case 'O':
-		header, err := readLine(c.reader)
+		results, responseTag, err := c.readAckRoster("multi-set", map[string]multiEntry{
+			"S": {ok: true},
+			"W": {wrongNode: true},
+		})
 		if err != nil {
 			return 0, nil, 0, 0, nil, err
 		}
-		fields := strings.Fields(header)
-		if len(fields) < 1 {
-			return 0, nil, 0, 0, nil, protocolError("invalid multi-set header in response")
-		}
-		count, err := parseStrictInt(fields[0])
-		if err != nil || count < 0 {
-			return 0, nil, 0, 0, nil, protocolError("invalid multi-set count in response")
-		}
-		wantFields := 1 + count
-		if c.tagged {
-			wantFields++
-		}
-		if len(fields) != wantFields {
-			return 0, nil, 0, 0, nil, protocolError("invalid multi-set header in response")
-		}
-		var responseTag uint32
-		if c.tagged {
-			responseTag, err = parseTag(fields[1+count])
-			if err != nil {
-				return 0, nil, 0, 0, nil, err
-			}
-		}
-		results := make([]multiEntry, count)
-		for i, token := range fields[1 : 1+count] {
-			switch token {
-			case "S":
-				results[i] = multiEntry{ok: true}
-			case "W":
-				results[i] = multiEntry{wrongNode: true}
-			default:
-				return 0, nil, 0, 0, nil, protocolError("invalid multi-set result token in response")
-			}
+		return marker, nil, responseTag, 0, results, nil
+	// `Y` is batched touch's response (issue #871): `Y <n> <result-1> ...
+	// <result-n>[ <tag>]\n`, shaped like `O` — "S" (touched), "N" (no live
+	// entry, a clean miss) or "W" (wrong node).
+	case 'Y':
+		results, responseTag, err := c.readAckRoster("multi-touch", map[string]multiEntry{
+			"S": {ok: true},
+			"N": {},
+			"W": {wrongNode: true},
+		})
+		if err != nil {
+			return 0, nil, 0, 0, nil, err
 		}
 		return marker, nil, responseTag, 0, results, nil
 	case 'B':
@@ -1273,6 +1337,53 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 	default:
 		return 0, nil, 0, 0, nil, protocolError(fmt.Sprintf("unexpected response from server: %c", marker))
 	}
+}
+
+// readAckRoster reads the rest of a body-less roster reply (`O`, `Y`)
+// after its marker: `<n> <result-1> ... <result-n>[ <tag>]\n`. tokens maps
+// each result token the reply may carry to its entry. Unlike `M`, this
+// loop carries no cumulative-bytes bound (issue #207, following #179's
+// Java fix): every token is a fixed-width single character with no
+// length-prefixed body to allocate, so the loop is already O(count)
+// regardless of what count is — and count itself is already bounded, by
+// wantFields against the header line's own maxHeaderLineLength cap, before
+// this loop ever runs.
+func (c *connection) readAckRoster(what string, tokens map[string]multiEntry) ([]multiEntry, uint32, error) {
+	header, err := readLine(c.reader)
+	if err != nil {
+		return nil, 0, err
+	}
+	fields := strings.Fields(header)
+	if len(fields) < 1 {
+		return nil, 0, protocolError("invalid " + what + " header in response")
+	}
+	count, err := parseStrictInt(fields[0])
+	if err != nil || count < 0 {
+		return nil, 0, protocolError("invalid " + what + " count in response")
+	}
+	wantFields := 1 + count
+	if c.tagged {
+		wantFields++
+	}
+	if len(fields) != wantFields {
+		return nil, 0, protocolError("invalid " + what + " header in response")
+	}
+	var responseTag uint32
+	if c.tagged {
+		responseTag, err = parseTag(fields[1+count])
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	results := make([]multiEntry, count)
+	for i, token := range fields[1 : 1+count] {
+		entry, known := tokens[token]
+		if !known {
+			return nil, 0, protocolError("invalid " + what + " result token in response")
+		}
+		results[i] = entry
+	}
+	return results, responseTag, nil
 }
 
 // parseStrictUint parses s as an unsigned base-10 integer using the wire

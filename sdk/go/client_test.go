@@ -203,7 +203,60 @@ type mockNode struct {
 	// reply lost after the node executed it. A touch is idempotent, so the
 	// client resends it (unlike an `i`; see applyThenCloseLeft).
 	applyThenCloseTouchLeft atomic.Int32
+	// yFrames records every `y` (batched touch, issue #871) frame this
+	// node received, one entry per frame, in arrival order — what proves a
+	// frame's grouping, which the per-key touches above cannot.
+	yFramesMu sync.Mutex
+	yFrames   []yRecord
+	// yFailArmed/yFailAfter: once armed, the node answers yFailAfter more
+	// `y` frames normally and then closes the connection instead of
+	// replying to the one right after — a connection drop on chunk N>1 of
+	// a chunked batch touch, once (the node itself stays up, unlike
+	// closeAfterMFrames).
+	yFailArmed atomic.Bool
+	yFailAfter atomic.Int32
+	// yBadCount: the next `y` reply reports exactly yBadCount-1 roster
+	// entries whatever the request's key count (issue #181's desync, for
+	// `y`); 0 means none queued.
+	yBadCount atomic.Int32
+	// yCount counts the `y` frames answered; closeAfterYFrames, when
+	// non-zero, closes this node entirely (every connection and its
+	// listener, as closeAfterMFrames does) right after replying to its Nth.
+	yCount            atomic.Int32
+	closeAfterYFrames atomic.Int32
 }
+
+// yRecord is one `y` frame as a mock node saw it. ttl is -1 when the field
+// was omitted (remove the TTL).
+type yRecord struct {
+	ns   string
+	keys []string
+	ttl  int64
+	get  bool
+}
+
+func (m *mockNode) yFramesSeen() []yRecord {
+	m.yFramesMu.Lock()
+	defer m.yFramesMu.Unlock()
+	out := make([]yRecord, len(m.yFrames))
+	for i, frame := range m.yFrames {
+		frame.keys = append([]string(nil), frame.keys...)
+		out[i] = frame
+	}
+	return out
+}
+
+func (m *mockNode) closeAfterYFrame(n int32) { m.closeAfterYFrames.Store(n) }
+
+// failMultiTouchAfter arms the one-off drop described on yFailAfter.
+func (m *mockNode) failMultiTouchAfter(successes int32) {
+	m.yFailAfter.Store(successes)
+	m.yFailArmed.Store(true)
+}
+
+// answerMultiTouchBadCountOnce makes the next `y` reply report count
+// roster entries.
+func (m *mockNode) answerMultiTouchBadCountOnce(count int) { m.yBadCount.Store(int32(count) + 1) }
 
 // touchRecord is one `t` frame as a mock node saw it. ttl is -1 when the
 // field was omitted (remove the TTL).
@@ -248,6 +301,9 @@ type mockNodeOpts struct {
 	// answer it `En\n` and close, as the real node does for any command it
 	// does not know.
 	withoutTouch bool
+	// withoutMultiTouch (issue #871): behave like a node that knows `t` but
+	// predates `y` (withoutTouch implies this).
+	withoutMultiTouch bool
 }
 
 // delaySets makes every future S reply from this node wait d first — for
@@ -1172,6 +1228,127 @@ func (m *mockNode) serve(conn net.Conn) {
 				continue
 			}
 			if _, err := conn.Write([]byte("S" + tagSuffix + "\n")); err != nil {
+				return
+			}
+		// Batched touch (issue #871): `y <ns-len> <n> <key-len-1> ...
+		// <key-len-n> [<ttl>] [G] [<tag>]\n<ns><key-1>...<key-n>` — one TTL
+		// for the whole batch; no ttl field removes the TTL, 0 expires the
+		// keys at once. Plain: `Y <n> S|N|W ...`; with `G`: `m`'s `M` reply
+		// for the keys touched.
+		case "y":
+			nsLen := atoiOrPanic(parts[1])
+			count := atoiOrPanic(parts[2])
+			tail := parts[3+count:]
+			if tagged {
+				tail = tail[:len(tail)-1]
+			}
+			get := len(tail) > 0 && tail[len(tail)-1] == "G"
+			if get {
+				tail = tail[:len(tail)-1]
+			}
+			ttl := int64(-1)
+			if len(tail) > 0 {
+				ttl = int64(atoiOrPanic(tail[0]))
+			}
+			namespace := string(mustRead(reader, nsLen))
+			keys := make([]string, count)
+			for i := 0; i < count; i++ {
+				keys[i] = string(mustRead(reader, atoiOrPanic(parts[3+i])))
+			}
+			m.yFramesMu.Lock()
+			m.yFrames = append(m.yFrames, yRecord{namespace, keys, ttl, get})
+			m.yFramesMu.Unlock()
+			if m.opts.withoutTouch || m.opts.withoutMultiTouch {
+				_, _ = conn.Write([]byte("En\n"))
+				return
+			}
+			if m.silent.Load() {
+				continue
+			}
+			if m.yFailArmed.Load() {
+				if m.yFailAfter.Load() > 0 {
+					m.yFailAfter.Add(-1)
+				} else {
+					m.yFailArmed.Store(false)
+					_ = conn.Close()
+					return
+				}
+			}
+			m.dataRequestCount.Add(1)
+			if m.takeOne(&m.retryableLeft) {
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			type yResult struct {
+				token string
+				value []byte
+			}
+			results := make([]yResult, 0, count)
+			for _, key := range keys {
+				if m.takeMultiWrongNode(key) {
+					results = append(results, yResult{token: "W"})
+					continue
+				}
+				sk := storeKey{namespace, key}
+				existing, found := m.store.Load(sk)
+				if !found {
+					miss := "N"
+					if get {
+						miss = "-"
+					}
+					results = append(results, yResult{token: miss})
+					continue
+				}
+				switch {
+				case ttl == 0:
+					m.store.Delete(sk)
+					m.ttls.Delete(sk)
+				case ttl < 0:
+					m.ttls.Delete(sk)
+				default:
+					m.ttls.Store(sk, ttl)
+				}
+				if get {
+					value := existing.([]byte)
+					results = append(results, yResult{token: strconv.Itoa(len(value)), value: value})
+				} else {
+					results = append(results, yResult{token: "S"})
+				}
+			}
+			if m.takeOne(&m.applyThenCloseTouchLeft) {
+				return
+			}
+			if wanted := m.yBadCount.Swap(0); wanted > 0 {
+				pad := yResult{token: "N"}
+				if get {
+					pad = yResult{token: "-"}
+				}
+				n := int(wanted) - 1
+				if n <= len(results) {
+					results = results[:n]
+				} else {
+					for len(results) < n {
+						results = append(results, pad)
+					}
+				}
+			}
+			marker := "Y"
+			if get {
+				marker = "M"
+			}
+			reply := marker + " " + strconv.Itoa(len(results))
+			var body []byte
+			for _, result := range results {
+				reply += " " + result.token
+				body = append(body, result.value...)
+			}
+			if _, err := conn.Write(append([]byte(reply+tagSuffix+"\n"), body...)); err != nil {
+				return
+			}
+			if n := m.closeAfterYFrames.Load(); n != 0 && m.yCount.Add(1) == n {
+				m.close()
 				return
 			}
 		case "D":
