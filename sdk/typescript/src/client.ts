@@ -1728,7 +1728,7 @@ export class NanocachedClient {
           this.target.kind === "cluster"
             ? this.writeToOwners(key, namespace, (connection) => connection.touch(key, ttlSeconds, namespace), undefined, expiring)
             : this.connectionForSingleTarget().then((connection) => connection.touch(key, ttlSeconds, namespace)),
-        { nonIdempotent: expiring },
+        { nonIdempotent: expiring, rejectionIsFinal: true },
       );
     } catch (error) {
       if (wasRejectedByServer(error)) throw new ServerTooOldError();
@@ -1761,7 +1761,7 @@ export class NanocachedClient {
                 expiring,
               )
             : this.connectionForSingleTarget().then((connection) => connection.getAndTouch(key, ttlSeconds, namespace)),
-        { nonIdempotent: expiring },
+        { nonIdempotent: expiring, rejectionIsFinal: true },
       );
     } catch (error) {
       if (wasRejectedByServer(error)) throw new ServerTooOldError();
@@ -3603,10 +3603,16 @@ export class NanocachedClient {
    * connection error propagates as-is instead of being retried.
    * `WrongNodeError` stays retryable regardless: a `W` response means the
    * node explicitly declined to apply the op, so nothing was written. */
-  private async withWrongNodeRetry<T>(operation: () => Promise<T>, options?: { nonIdempotent?: boolean }): Promise<T> {
+  private async withWrongNodeRetry<T>(
+    operation: () => Promise<T>,
+    options?: { nonIdempotent?: boolean; rejectionIsFinal?: boolean },
+  ): Promise<T> {
     try {
       return await operation();
     } catch (error) {
+      // An `En` is a final answer from that node (issue #902): a refresh
+      // and a second attempt would only ask it again.
+      if (options?.rejectionIsFinal && wasRejectedByServer(error)) throw error;
       // Connection-level failures retry the same way `W` does: the usual
       // cause is a node death that discovery has since noticed, so a
       // forced refresh re-ranks the key onto survivors. The retry window

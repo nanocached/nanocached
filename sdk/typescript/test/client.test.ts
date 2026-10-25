@@ -4647,6 +4647,20 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
     }
   });
 
+  it("a primary that predates t is asked once by a single-key call", async () => {
+    // Issue #902: `En` is final, so no redial and resend.
+    for (const get of [false, true]) {
+      await withCluster(async (client, cluster) => {
+        const key = keysWithPrimary(cluster, names[0], 1)[0];
+        await client.set(key, "v");
+        const old = cluster.nodes[0].mock;
+        const before = old.touches().filter((touch) => touch.key === key).length;
+        await assert.rejects(() => (get ? client.getAndTouch(key, 30) : client.touch(key, 30)), ServerTooOldError);
+        assert.equal(old.touches().filter((touch) => touch.key === key).length - before, 1);
+      }, [{ withoutTouch: true }, {}]);
+    }
+  });
+
   it("an unreachable primary is a connection loss with the other hits attached", async () => {
     // R=1: the only owner of some keys is gone. Nothing answered `W`, so
     // the error is not the wrong-node one, and no replica stands in.
