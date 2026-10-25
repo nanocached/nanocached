@@ -3920,6 +3920,40 @@ describe("NanocachedClient touch/getAndTouch against a single node (issue #825)"
       { withoutTouch: true },
     );
   });
+
+  // Issue #939: only the node's `En` is "server too old". The proxy answers
+  // a bare `E` (+ tag) when a touch's outcome is unknown.
+  for (const tagged of [false, true]) {
+    it(`reads a bare E as a lost connection after the send, not as a too-old server (issue #939, ${tagged ? "tagged" : "untagged"})`, async () => {
+      await withClient(
+        async (client, node) => {
+          for (const call of [() => client.touch("k", 0), () => client.getAndTouch("k", 0)]) {
+            const before = node.touches().length;
+            await assert.rejects(call, (error: unknown) => {
+              assert.ok(error instanceof ConnectionLostError, `expected ConnectionLostError, got ${String(error)}`);
+              assert.equal(error.requestWasSent, true);
+              assert.ok(!(error instanceof ServerTooOldError));
+              return true;
+            });
+            // Not resent: exactly one frame reached the node.
+            assert.equal(node.touches().length - before, 1);
+          }
+        },
+        { proxyStyleError: true, supportTags: tagged },
+      );
+    });
+  }
+
+  it("still reports the node's En to a ttl=0 touch as ServerTooOldError (issue #939)", async () => {
+    await withClient(
+      async (client, node) => {
+        await assert.rejects(() => client.touch("k", 0), ServerTooOldError);
+        await assert.rejects(() => client.getAndTouch("k", 0), ServerTooOldError);
+        assert.equal(node.touches().length, 2);
+      },
+      { withoutTouch: true },
+    );
+  });
 });
 
 describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
@@ -4087,6 +4121,96 @@ describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
     });
   });
 
+  // Issue #934: a ttl=0 touch goes to the primary alone and to the other
+  // owners only once it has answered. A plain `t ... 0` sent to the replica
+  // up front would expire its copy, and a primary that then fails or answers
+  // `W` is rerouted to exactly that replica, which would answer `N`.
+  for (const reroute of ["dead", "wrong-node"] as const) {
+    for (const withValue of [false, true]) {
+      it(`a ttl=0 ${withValue ? "getAndTouch" : "touch"} to a ${reroute} primary leaves the replica alone until the reroute (issue #934)`, async () => {
+        await withCluster(async (client, cluster) => {
+          const { primary, replica } = cluster.ownerOf("k");
+          await client.set("k", "payload");
+          if (reroute === "dead") {
+            await primary.mock.close();
+            await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+          } else {
+            primary.mock.answerWrongNodeOnce();
+          }
+          // The replica is the only owner left once the client refreshes.
+          cluster.discovery.setNodes([{ name: replica.name, address: replica.mock.address }]);
+          if (withValue) assert.equal(await client.getAndTouch("k", 0), "payload");
+          else assert.equal(await client.touch("k", 0), true);
+          // One frame: the rerouted one. The first pass sent it nothing.
+          assert.deepEqual(replica.mock.touches(), [{ namespace: "", key: "k", ttl: 0, get: withValue }]);
+        });
+      });
+    }
+  }
+
+  it("a ttl=0 touch whose primary cannot be reached at all touches no replica (issue #934)", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary, replica } = cluster.ownerOf("k");
+      await client.set("k", "payload");
+      await primary.mock.close();
+      await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+      for (const call of [() => client.touch("k", 0), () => client.getAndTouch("k", 0)]) {
+        await assert.rejects(call, ConnectionLostError);
+      }
+      assert.deepEqual(replica.mock.touches(), []);
+      assert.equal(replica.mock.store.has("k"), true);
+    });
+  });
+
+  it("a ttl=0 touch whose reply was lost touches no replica (issue #934)", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary, replica } = cluster.ownerOf("k");
+      await client.set("k", "payload");
+      primary.mock.dropAfterTouchOnce();
+      await assert.rejects(() => client.touch("k", 0), ConnectionLostError);
+      assert.deepEqual(replica.mock.touches(), []);
+    });
+  });
+
+  it("a ttl=0 touch reaches the replica only after the primary answered (issue #934)", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary, replica } = cluster.ownerOf("k");
+      await client.set("k", "payload");
+      primary.mock.setTouchReplyDelay(300);
+      const call = client.getAndTouch("k", 0);
+      await waitFor(() => primary.mock.touches().length === 1, "the primary to see the touch");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.deepEqual(replica.mock.touches(), [], "the replica was touched before the primary answered");
+      assert.equal(await call, "payload");
+      assert.deepEqual(replica.mock.touches(), [{ namespace: "", key: "k", ttl: 0, get: false }]);
+      assert.equal(replica.mock.store.has("k"), false);
+    });
+  });
+
+  it("a ttl=0 touch still reaches the replica after a primary N (issue #934)", async () => {
+    await withCluster(async (client, cluster) => {
+      const { replica } = cluster.ownerOf("k");
+      replica.mock.store.set("k", Buffer.from("v"));
+      assert.equal(await client.touch("k", 0), false);
+      assert.equal(replica.mock.store.has("k"), false);
+    });
+  });
+
+  it("a touch with a live or removed TTL still fans out to every owner at once (issue #934)", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary, replica } = cluster.ownerOf("k");
+      await client.set("k", "payload", 10);
+      primary.mock.setTouchReplyDelay(300);
+      let seen = 0;
+      for (const ttl of [30, null]) {
+        const call = client.touch("k", ttl);
+        seen++;
+        await waitFor(() => replica.mock.touches().length === seen, "the replica to see the touch before the primary answers");
+        assert.equal(await call, true);
+      }
+    });
+  });
+
   it("a replica that predates the command does not fail the primary's answer", async () => {
     const [, replicaName] = new HashRing(names).owners(Buffer.from("k"), 2);
     const options = names.map((name) => (name === replicaName ? { withoutTouch: true } : {}));
@@ -4116,6 +4240,23 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
       await node.close();
     }
   }
+
+  it("reads a bare E to a ttl=0 batch touch as a lost connection after the send (issue #939)", async () => {
+    await withClient(
+      async (client, node) => {
+        for (const call of [() => client.touchMany(["a", "b"], 0), () => client.getManyAndTouch(["a", "b"], 0)]) {
+          const before = node.multiTouchFrames().length;
+          await assert.rejects(call, (error: unknown) => {
+            assert.ok(error instanceof ConnectionLostError, `expected ConnectionLostError, got ${String(error)}`);
+            assert.ok(!(error instanceof ServerTooOldError));
+            return true;
+          });
+          assert.equal(node.multiTouchFrames().length - before, 1);
+        }
+      },
+      { proxyStyleError: true },
+    );
+  });
 
   it("touchMany replaces every TTL and reports which keys existed", async () => {
     await withClient(async (client, node) => {
@@ -4505,6 +4646,83 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
       // resending it changes nothing, so the client does.
       assert.deepEqual(await client.getManyAndTouch(keys, 30), new Map(Object.entries(values)));
       assert.equal(primary.multiTouchFrames().filter((frame) => frame.get).length, 2);
+    });
+  });
+
+  // Issue #934: a ttl=0 batch sends primary legs only, then one plain
+  // fan-out to the replicas for the keys a primary answered.
+  for (const withValue of [false, true]) {
+    it(`an expiring ${withValue ? "getManyAndTouch" : "touchMany"} to a dead primary leaves the replica alone until the reroute (issue #934)`, async () => {
+      await withCluster(async (client, cluster) => {
+        const deadKeys = keysWithPrimary(cluster, names[0], 3, "dead");
+        const liveKeys = keysWithPrimary(cluster, names[1], 3, "live");
+        const keys = [...deadKeys, ...liveKeys];
+        const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
+        await client.setMany(values);
+        await cluster.nodes[0].mock.close();
+        await waitFor(() => memberConnectionClosed(client, names[0]), "the client to see the FIN");
+        cluster.discovery.setNodes([{ name: names[1], address: cluster.nodes[1].mock.address }]);
+        if (withValue) assert.deepEqual(await client.getManyAndTouch(keys, 0), new Map(Object.entries(values)));
+        else assert.deepEqual(await client.touchMany(keys, 0), new Map(keys.map((key) => [key, true])));
+        // Every frame the survivor saw asked it as the primary.
+        const frames = cluster.nodes[1].mock.multiTouchFrames();
+        assert.equal(frames.length, 2);
+        assert.ok(frames.every((frame) => frame.get === withValue));
+        assert.deepEqual(sorted(frames.flatMap((frame) => frame.keys)), sorted(keys));
+      });
+    });
+  }
+
+  it("an expiring batch whose primary cannot be reached touches no replica (issue #934)", async () => {
+    await withCluster(async (client, cluster) => {
+      const deadKeys = keysWithPrimary(cluster, names[0], 3, "dead");
+      await client.setMany(Object.fromEntries(deadKeys.map((key) => [key, "v"])));
+      await cluster.nodes[0].mock.close();
+      await waitFor(() => memberConnectionClosed(client, names[0]), "the client to see the FIN");
+      await assert.rejects(() => client.touchMany(deadKeys, 0), ConnectionLostError);
+      assert.deepEqual(cluster.nodes[1].mock.multiTouchFrames(), []);
+      for (const key of deadKeys) assert.equal(cluster.nodes[1].mock.store.has(key), true);
+    });
+  });
+
+  it("an expiring batch reaches the replicas only after the primaries answered (issue #934)", async () => {
+    await withCluster(async (client, cluster) => {
+      const keys = keysWithPrimary(cluster, names[0], 4, "order");
+      await client.setMany(Object.fromEntries(keys.map((key) => [key, `v-${key}`])));
+      const [primary, replica] = [cluster.nodes[0].mock, cluster.nodes[1].mock];
+      primary.setTouchReplyDelay(300);
+      const call = client.touchMany(keys, 0);
+      await waitFor(() => primary.multiTouchFrames().length === 1, "the primary to see the frame");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.deepEqual(replica.multiTouchFrames(), [], "the replica was touched before the primary answered");
+      assert.deepEqual(await call, new Map(keys.map((key) => [key, true])));
+      const frames = replica.multiTouchFrames();
+      assert.equal(frames.length, 1);
+      assert.equal(frames[0].get, false);
+      assert.equal(frames[0].ttl, 0);
+      assert.deepEqual(sorted(frames[0].keys), sorted(keys));
+      for (const key of keys) assert.equal(replica.store.has(key), false);
+    });
+  });
+
+  it("an expiring batch still reaches the replica for a key the primary answered N (issue #934)", async () => {
+    await withCluster(async (client, cluster) => {
+      const [, replicaName] = cluster.owners("k");
+      const replica = cluster.nodes.find((node) => node.name === replicaName)!;
+      replica.mock.store.set("k", Buffer.from("v"));
+      assert.deepEqual(await client.touchMany(["k"], 0), new Map([["k", false]]));
+      assert.equal(replica.mock.store.has("k"), false);
+    });
+  });
+
+  it("a batch touch with a live TTL still fans out to every owner at once (issue #934)", async () => {
+    await withCluster(async (client, cluster) => {
+      const keys = keysWithPrimary(cluster, names[0], 3, "live-ttl");
+      await client.setMany(Object.fromEntries(keys.map((key) => [key, "v"])));
+      cluster.nodes[0].mock.setTouchReplyDelay(300);
+      const call = client.touchMany(keys, 30);
+      await waitFor(() => cluster.nodes[1].mock.multiTouchFrames().length === 1, "the replica to see the frame before the primary answers");
+      assert.deepEqual(await call, new Map(keys.map((key) => [key, true])));
     });
   });
 

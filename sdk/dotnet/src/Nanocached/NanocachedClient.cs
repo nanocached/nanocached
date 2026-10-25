@@ -1931,7 +1931,15 @@ public sealed class NanocachedClient : IDisposable
     /// other key was still touched, and since a touch is idempotent the
     /// whole batch may simply be sent again, so nothing partial is
     /// attached. Throws <see cref="ServerTooOldException"/> against a node
-    /// that predates the command.</para></summary>
+    /// that predates the command.</para>
+    ///
+    /// <para><b>With <paramref name="ttlSeconds"/> 0 the batch is not
+    /// simply resendable (issue #938)</b>: the keys of the failure are the
+    /// ones not confirmed, and that list includes keys whose frame was
+    /// sent and whose outcome is unknown — the node may already have
+    /// expired them. Those keys must not be sent again (a second
+    /// touch would find them gone and report them missing); treat each as
+    /// "possibly expired".</para></summary>
     public Task<Dictionary<string, bool>> TouchManyAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
         TouchManyAsync(EmptyNamespace, keys, ttlSeconds);
 
@@ -1988,7 +1996,13 @@ public sealed class NanocachedClient : IDisposable
     /// primary whose connection fails after the frame may have been applied
     /// is not resent (issue #901): it may have expired and consumed its
     /// values already, so those keys throw at once instead of reading as
-    /// misses. Against a node that predates <c>y</c> it throws
+    /// misses. The keys the exception leaves out of
+    /// <c>PartialValues</c> then include ones whose frame was sent and
+    /// whose outcome is unknown (issue #938): they must not be fetched
+    /// again with a TTL of 0 — a second attempt would find them already
+    /// expired and read them as misses, their values gone — so keep the
+    /// hits already in <c>PartialValues</c> and treat the rest as
+    /// possibly expired. Against a node that predates <c>y</c> it throws
     /// <see cref="ServerTooOldException"/> — in a cluster, when other
     /// primaries had already answered, its subclass
     /// <see cref="PartialServerTooOldException{T}"/> carrying their hits
@@ -3890,6 +3904,15 @@ public sealed class NanocachedClient : IDisposable
             {
                 return await op(await SlotConnectionAsync(slot).ConfigureAwait(false)).ConfigureAwait(false);
             }
+            // Issue #936: a retry that provably sent nothing (the redial
+            // itself failed to dial, or the write failed) is thrown plain,
+            // like the first attempt's not-sent failure: nothing reached
+            // any node, so WithClusterRetryAsync may refresh and reroute
+            // it around a dead primary.
+            catch (ConnectionLostException retryError) when (retryError.RequestNotSent)
+            {
+                throw;
+            }
             catch (ConnectionLostException retryError)
             {
                 // The redial's own attempt failed too — whatever the
@@ -4551,8 +4574,14 @@ public sealed class NanocachedClient : IDisposable
         catch (Exception error) when (error is IOException or System.Net.Sockets.SocketException
             or AuthenticationException)
         {
+            // A dial that failed sent nothing, so it is marked not-sent as
+            // the first connect already does (issue #936): the not-sent
+            // retry paths (Incr/CAS, an expiring touch, the batch touch)
+            // may then refresh the roster and reroute instead of treating
+            // the dead node as one that might have applied the request.
+            // DialWithCooldownAsync replays this same object.
             throw new ConnectionLostException(
-                $"nanocached: could not connect to {address}: {error.Message}", error);
+                $"nanocached: could not connect to {address}: {error.Message}", error, requestNotSent: true);
         }
 
         if (identified is not Identify.NodeTarget node)

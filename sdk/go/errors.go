@@ -129,7 +129,9 @@ func (serverTooOldBatchError) Is(target error) bool { return target == ErrServer
 // (issue #825): the node rejected the request and is closing the
 // connection. Joined onto the protocol error so everything that matches
 // ErrProtocol behaves as before; Touch/GetAndTouch look for it to report
-// ErrServerTooOld.
+// ErrServerTooOld. Only the request the node answered carries it (issue
+// #940): the others pipelined on that connection get a plain
+// ErrConnectionLost and keep their redial.
 var errServerRejected = errors.New("nanocached: the server rejected the request")
 
 // errRequestNotSent marks an ErrConnectionLost/ErrProtocol failure that

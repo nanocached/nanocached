@@ -64,6 +64,10 @@ export interface MockNode extends MockServerBase {
    * node executed it. A touch is idempotent, so the client may resend it
    * (unlike an `i`; see `dropAfterIncrOnce`). */
   dropAfterTouchOnce(): void;
+  /** Issue #934: delay every `t`/`y` reply by `ms` (0 turns it off). The
+   * request is logged and applied at once; only the reply is late — what
+   * lets a test look at the other nodes while a primary has not answered. */
+  setTouchReplyDelay(ms: number): void;
   /** Every `t` (touch, issue #825) this server has received, in receipt
    * order; `ttl` is `null` when the field was omitted (remove the TTL). */
   touches(): Array<{ namespace: string; key: string; ttl: number | null; get: boolean }>;
@@ -354,6 +358,10 @@ export async function startMockNode(
     /** Issue #871: behave like a node that knows `t` but predates `y`
      * (`withoutTouch` implies this). */
     withoutMultiTouch?: boolean;
+    /** Issue #939: answer `t` and `y` with the proxy's bare `E` (plus the
+     * echoed tag on a tagged connection) and close — the proxy's "request
+     * failed / outcome unknown", not the node's `En\n`. */
+    proxyStyleError?: boolean;
   } = {},
 ): Promise<MockNode> {
   const store = new Map<string, Buffer>();
@@ -394,6 +402,7 @@ export async function startMockNode(
     return existing;
   }
   let wrongNodeReplies = 0;
+  let touchReplyDelayMs = 0;
   let wrongNodeOnSetReplies = 0;
   let wrongTagReplies = 0;
   let swallowedGets = 0;
@@ -937,6 +946,11 @@ export async function startMockNode(
             // like `i`. No ttl field removes the TTL; 0 expires the entry
             // at once.
             lastCommand = parts[0];
+            // Issue #934: replies can be held back by setTouchReplyDelay.
+            const reply = (data: string | Buffer): void => {
+              if (touchReplyDelayMs > 0) setTimeout(() => socket.write(data), touchReplyDelayMs);
+              else socket.write(data);
+            };
             const namespaceLength = Number(parts[1]);
             const keyLength = Number(parts[2]);
             let tail = parts.slice(3);
@@ -956,24 +970,30 @@ export async function startMockNode(
               return;
             }
 
+            if (options.proxyStyleError) {
+              socket.write(`E${tag}\n`);
+              socket.end();
+              return;
+            }
+
             if (silent) break;
 
             if (retryableReplies > 0) {
               retryableReplies--;
-              socket.write(`R${tag}\n`);
+              reply(`R${tag}\n`);
               break;
             }
 
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
-              socket.write(`W${tag}\n`);
+              reply(`W${tag}\n`);
               break;
             }
 
             const targetStore = storeFor(namespace);
             const existing = targetStore.get(key);
             if (existing === undefined) {
-              socket.write(`N${tag}\n`);
+              reply(`N${tag}\n`);
               break;
             }
 
@@ -994,9 +1014,9 @@ export async function startMockNode(
 
             if (get) {
               const ttlField = ttl === null ? "" : ` ${ttl}`;
-              socket.write(Buffer.concat([Buffer.from(`V ${existing.length}${ttlField}${tag}\n`), existing]));
+              reply(Buffer.concat([Buffer.from(`V ${existing.length}${ttlField}${tag}\n`), existing]));
             } else {
-              socket.write(`S${tag}\n`);
+              reply(`S${tag}\n`);
             }
             break;
           }
@@ -1008,6 +1028,11 @@ export async function startMockNode(
           // `m`'s `M` reply for the keys touched.
           case "y": {
             lastCommand = parts[0];
+            // Issue #934: replies can be held back by setTouchReplyDelay.
+            const reply = (data: string | Buffer): void => {
+              if (touchReplyDelayMs > 0) setTimeout(() => socket.write(data), touchReplyDelayMs);
+              else socket.write(data);
+            };
             const namespaceLength = Number(parts[1]);
             const count = Number(parts[2]);
             const keyLengths = parts.slice(3, 3 + count).map(Number);
@@ -1035,6 +1060,12 @@ export async function startMockNode(
               return;
             }
 
+            if (options.proxyStyleError) {
+              socket.write(`E${tag}\n`);
+              socket.end();
+              return;
+            }
+
             if (silent) break;
 
             if (multiTouchFailAfter !== undefined) {
@@ -1049,7 +1080,7 @@ export async function startMockNode(
 
             if (retryableReplies > 0) {
               retryableReplies--;
-              socket.write(`R${tag}\n`);
+              reply(`R${tag}\n`);
               break;
             }
 
@@ -1102,7 +1133,7 @@ export async function startMockNode(
                 tokens = tokens.concat(new Array(wanted - tokens.length).fill(get ? "-" : "N"));
               }
             }
-            socket.write(Buffer.concat([Buffer.from(`${get ? "M" : "Y"} ${tokens.length}${tokens.map((t) => ` ${t}`).join("")}${tag}\n`), ...hits]));
+            reply(Buffer.concat([Buffer.from(`${get ? "M" : "Y"} ${tokens.length}${tokens.map((t) => ` ${t}`).join("")}${tag}\n`), ...hits]));
             break;
           }
 
@@ -1325,6 +1356,9 @@ export async function startMockNode(
     },
     dropAfterTouchOnce: () => {
       dropAfterTouch++;
+    },
+    setTouchReplyDelay: (ms) => {
+      touchReplyDelayMs = ms;
     },
     touches: () => [...touchLog],
     multiTouchFrames: () => multiTouchLog.map((frame) => ({ ...frame, keys: [...frame.keys] })),

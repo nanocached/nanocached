@@ -2292,6 +2292,195 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
+    async def start_tagged_cluster(self):
+        nodes = {
+            NAMES[0]: await MockNode(support_tags=True).start(),
+            NAMES[1]: await MockNode(support_tags=True).start(),
+        }
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    async def test_an_expiring_touch_is_not_resent_after_a_reply_with_the_wrong_tag(self):
+        # Issue #935: a reply whose echoed tag does not answer the request
+        # is a loss after the send, like any other desync.
+        nodes, discovery = await self.start_tagged_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, _ = self.owners_of("k")
+            primary = nodes[primary_name]
+            await client.set("k", "payload")
+            primary.answer_next_with_wrong_tag(b"t")
+            with self.assertRaises(ConnectionLostError):
+                await client.touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 1)
+
+            await client.set("k", "payload")
+            primary.answer_next_with_wrong_tag(b"t")
+            with self.assertRaises(ConnectionLostError):
+                await client.get_and_touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 2)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_incr_is_not_resent_after_a_reply_with_the_wrong_tag(self):
+        nodes, discovery = await self.start_tagged_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, _ = self.owners_of("k")
+            primary = nodes[primary_name]
+            await client.set("k", "10")
+            primary.answer_next_with_wrong_tag(b"i")
+            with self.assertRaises(ConnectionLostError):
+                await client.incr("k", 1)
+            self.assertEqual(primary.incr_count, 1)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_touch_is_not_resent_after_an_e_that_is_not_en(self):
+        # Issue #939: only the node's `En` is "server too old". The proxy's
+        # bare (or tagged) `E` means the outcome is unknown, so it is a loss
+        # after the send: reported as such, and an expiring touch is not
+        # sent again.
+        for tagged, raw in ((False, b"E\n"), (True, b"E 7\n")):
+            with self.subTest(tagged=tagged):
+                nodes, discovery = (
+                    await self.start_tagged_cluster() if tagged else await self.start_cluster()
+                )
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    primary_name, _ = self.owners_of("k")
+                    primary = nodes[primary_name]
+                    await client.set("k", "payload")
+                    primary.answer_next_touch_with_raw(raw)
+                    with self.assertRaises(ConnectionLostError) as raised:
+                        await client.touch("k", 0)
+                    self.assertNotIsInstance(raised.exception, ServerTooOldError)
+                    self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 1)
+
+                    primary.answer_next_touch_with_raw(raw)
+                    with self.assertRaises(ConnectionLostError):
+                        await client.get_and_touch("k", 0)
+                    self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 2)
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_an_en_to_an_expiring_touch_is_still_server_too_old(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, _ = self.owners_of("k")
+            primary = nodes[primary_name]
+            await client.set("k", "payload")
+            primary.answer_next_touch_with_raw(b"En\n")
+            with self.assertRaises(ServerTooOldError):
+                await client.touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 1)
+            primary.answer_next_touch_with_raw(b"En\n")
+            with self.assertRaises(ServerTooOldError):
+                await client.get_and_touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 2)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_touch_reaches_the_replicas_only_after_the_primary_answered(self):
+        # Issue #934: the plain `t ... 0` expires the copy it reaches, so a
+        # replica is sent it only once the primary has answered. A positive
+        # TTL keeps the concurrent fan-out.
+        for ttl, held in ((0, False), (30, True)):
+            for get in (False, True):
+                with self.subTest(ttl=ttl, get=get):
+                    nodes, discovery = await self.start_cluster()
+                    client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                    try:
+                        primary_name, replica_name = self.owners_of("k")
+                        primary, replica = nodes[primary_name], nodes[replica_name]
+                        await client.set("k", "payload")
+                        gate = primary.hold_touch_replies()
+                        call = client.get_and_touch if get else client.touch
+                        task = asyncio.ensure_future(call("k", ttl))
+                        await wait_for(lambda: primary.touches, "the primary to receive the touch")
+                        if held:
+                            await wait_for(lambda: replica.touches, "the replica to be touched")
+                        else:
+                            await asyncio.sleep(0.1)
+                            self.assertEqual(replica.touches, [])
+                        gate.set()
+                        self.assertEqual(await task, "payload" if get else True)
+                        self.assertEqual(replica.touches, [(b"", b"k", ttl, False)])
+                    finally:
+                        await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_touch_rerouted_from_a_dead_primary_returns_the_value(self):
+        # Issue #934: the primary is gone and discovery has dropped it. The
+        # first attempt fails on the dead primary with no replica touched,
+        # so the reroute asks the surviving replica, now the primary, and
+        # still finds the value.
+        for get in (True, False):
+            with self.subTest(get=get):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    primary_name, replica_name = self.owners_of("k")
+                    replica = nodes[replica_name]
+                    await client.set("k", "precious")
+                    self.assertEqual(replica.store[b"k"], b"precious")
+                    await nodes[primary_name].close()
+                    discovery.nodes = [(replica_name, replica.address)]
+                    await wait_for(
+                        lambda: client._members[primary_name].connection.closed,
+                        "the client to see the FIN",
+                    )
+                    if get:
+                        self.assertEqual(await client.get_and_touch("k", 0), "precious")
+                    else:
+                        self.assertTrue(await client.touch("k", 0))
+                    self.assertEqual(replica.touches, [(b"", b"k", 0, get)])
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_touch_rerouted_after_a_wrong_node_answer_returns_the_value(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, replica_name = self.owners_of("k")
+            replica = nodes[replica_name]
+            await client.set("k", "precious")
+            nodes[primary_name].answer_wrong_node_once()
+            discovery.nodes = [(replica_name, replica.address)]
+            self.assertEqual(await client.get_and_touch("k", 0), "precious")
+            self.assertEqual(replica.touches, [(b"", b"k", 0, True)])
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_touch_touches_no_replica_when_the_primary_stays_unreachable(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, replica_name = self.owners_of("k")
+            await client.set("k", "precious")
+            await nodes[primary_name].close()
+            with self.assertRaises((ConnectionError, OSError)):
+                await client.touch("k", 0)
+            with self.assertRaises((ConnectionError, OSError)):
+                await client.get_and_touch("k", 0)
+            self.assertEqual(nodes[replica_name].touches, [])
+            self.assertEqual(nodes[replica_name].store[b"k"], b"precious")
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_touch_still_expires_the_replica_copy_when_the_primary_misses(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            _, replica_name = self.owners_of("k")
+            nodes[replica_name].store[b"k"] = b"v"
+            self.assertFalse(await client.touch("k", 0))
+            self.assertNotIn(b"k", nodes[replica_name].store)
+        finally:
+            await self.stop(client, discovery, nodes)
+
     async def test_an_expiring_touch_still_retries_a_request_that_was_never_sent(self):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
@@ -2806,6 +2995,98 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
+    async def test_an_expiring_batch_reaches_the_replicas_only_after_the_primary_answered(self):
+        # Issue #934, as for a single key: the replica frame is one plain
+        # frame after the primary's answer. A positive TTL keeps the
+        # concurrent fan-out.
+        for ttl, held in ((0, False), (30, True)):
+            for get in (False, True):
+                with self.subTest(ttl=ttl, get=get):
+                    nodes, discovery = await self.start_cluster()
+                    client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                    try:
+                        keys = self.keys_by_primary(NAMES[0], 4)
+                        primary, replica = nodes[NAMES[0]], nodes[NAMES[1]]
+                        values = {key: f"v-{key}" for key in keys}
+                        await client.set_many(values)
+                        gate = primary.hold_touch_replies()
+                        call = client.get_many_and_touch if get else client.touch_many
+                        task = asyncio.ensure_future(call(keys, ttl))
+                        await wait_for(
+                            lambda: primary.multi_touch_frames, "the primary to receive the batch"
+                        )
+                        if held:
+                            await wait_for(
+                                lambda: replica.multi_touch_frames, "the replica to be touched"
+                            )
+                        else:
+                            await asyncio.sleep(0.1)
+                            self.assertEqual(replica.multi_touch_frames, [])
+                        gate.set()
+                        self.assertEqual(await task, values if get else {key: True for key in keys})
+                        self.assertEqual(len(replica.multi_touch_frames), 1)
+                        namespace, sent, sent_ttl, sent_get = replica.multi_touch_frames[0]
+                        self.assertEqual((sorted(sent), sent_ttl, sent_get), (sorted(k.encode() for k in keys), ttl, False))
+                    finally:
+                        await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_batch_rerouted_from_a_dead_primary_returns_the_values(self):
+        for get in (True, False):
+            with self.subTest(get=get):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    keys = self.keys_by_primary(NAMES[0], 4)
+                    replica = nodes[NAMES[1]]
+                    values = {key: f"v-{key}" for key in keys}
+                    await client.set_many(values)
+                    await nodes[NAMES[0]].close()
+                    discovery.nodes = [(NAMES[1], replica.address)]
+                    await wait_for(
+                        lambda: client._members[NAMES[0]].connection.closed,
+                        "the client to see the FIN",
+                    )
+                    if get:
+                        self.assertEqual(await client.get_many_and_touch(keys, 0), values)
+                    else:
+                        self.assertEqual(await client.touch_many(keys, 0), {key: True for key in keys})
+                    # One frame, the reroute's: the value-carrying form for a
+                    # get, with no plain frame sent beforehand.
+                    self.assertEqual(
+                        [(sorted(f[1]), f[2], f[3]) for f in replica.multi_touch_frames],
+                        [(sorted(k.encode() for k in keys), 0, get)],
+                    )
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_batch_touches_no_replica_when_the_primary_stays_unreachable(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = self.keys_by_primary(NAMES[0], 4)
+            await client.set_many({key: f"v-{key}" for key in keys})
+            await nodes[NAMES[0]].close()
+            with self.assertRaises((ConnectionError, OSError)):
+                await client.touch_many(keys, 0)
+            with self.assertRaises((ConnectionError, OSError)):
+                await client.get_many_and_touch(keys, 0)
+            self.assertEqual(nodes[NAMES[1]].multi_touch_frames, [])
+            self.assertEqual(len(nodes[NAMES[1]].store), 4)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_batch_still_expires_replica_copies_the_primary_misses(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = self.keys_by_primary(NAMES[0], 3)
+            for key in keys:
+                nodes[NAMES[1]].store[key.encode()] = b"v"
+            self.assertEqual(await client.touch_many(keys, 0), {key: False for key in keys})
+            self.assertEqual(nodes[NAMES[1]].store, {})
+        finally:
+            await self.stop(client, discovery, nodes)
+
     async def test_an_expiring_batch_is_not_resent_after_a_roster_of_the_wrong_length(self):
         # Issue #921: as above for a short `y` roster.
         nodes, discovery = await self.start_cluster()
@@ -2820,6 +3101,30 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                     await call(keys, 0)
                 self.assertEqual(len(primary.multi_touch_frames), frames)
                 await client.set_many({key: f"v-{key}" for key in keys})
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_batch_is_not_resent_after_an_e_that_is_not_en(self):
+        # Issue #939: the proxy's bare `E` is an outcome-unknown loss after
+        # the send, not "server too old"; only `En` is.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = self.keys_by_primary(NAMES[0], 4)
+            primary = nodes[NAMES[0]]
+            await client.set_many({key: f"v-{key}" for key in keys})
+            for frames, call in ((1, client.touch_many), (2, client.get_many_and_touch)):
+                primary.answer_next_touch_with_raw(b"E\n")
+                with self.assertRaises(ConnectionLostError) as raised:
+                    await call(keys, 0)
+                self.assertNotIsInstance(raised.exception, ServerTooOldError)
+                self.assertEqual(len(primary.multi_touch_frames), frames)
+                await client.set_many({key: f"v-{key}" for key in keys})
+
+            primary.answer_next_touch_with_raw(b"En\n")
+            with self.assertRaises(ServerTooOldError):
+                await client.touch_many(keys, 0)
+            self.assertEqual(len(primary.multi_touch_frames), 3)
         finally:
             await self.stop(client, discovery, nodes)
 

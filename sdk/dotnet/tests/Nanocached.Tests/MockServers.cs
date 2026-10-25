@@ -338,6 +338,18 @@ public sealed class MockNode : IDisposable
     /// that predates it — <c>En</c>, then close the connection.</summary>
     public void RejectTouchLikeAnOldServer() => _rejectTouch = true;
     private volatile bool _rejectTouch;
+    private volatile string _rejectTouchReply = "En\n";
+
+    /// <summary>issue #939: like <see cref="RejectTouchLikeAnOldServer"/>
+    /// (answers, then closes the connection) but with an arbitrary reply
+    /// line instead of <c>En</c> — <c>{tag}</c> is replaced by the
+    /// request's tag field (<c> 7</c>, empty when untagged). The proxy's
+    /// outcome-unknown answer is <c>E{tag}\n</c>.</summary>
+    public void RejectTouchWith(string reply)
+    {
+        _rejectTouchReply = reply;
+        _rejectTouch = true;
+    }
 
     /// <summary>issue #871: one received <c>y</c> (batched touch) frame —
     /// the namespace, the keys in frame order, the TTL (<c>null</c> when
@@ -1139,7 +1151,7 @@ public sealed class MockNode : IDisposable
                         _touchFrames.Enqueue(string.Join(' ', parts));
                         if (_rejectTouch)
                         {
-                            await Wire.WriteAsync(stream, "En\n");
+                            await Wire.WriteAsync(stream, _rejectTouchReply.Replace("{tag}", tag));
                             return;
                         }
                         long? ttlSeconds = null;
@@ -1223,7 +1235,7 @@ public sealed class MockNode : IDisposable
                             keys.Select(k => Encoding.UTF8.GetString(k)).ToArray(), ttlSeconds, withValue));
                         if (_rejectTouch || _rejectMultiTouch)
                         {
-                            await Wire.WriteAsync(stream, "En\n");
+                            await Wire.WriteAsync(stream, _rejectTouchReply.Replace("{tag}", tag));
                             return;
                         }
                         if (_silent)

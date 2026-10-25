@@ -12,6 +12,25 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- Only a node's `En` to a touch is reported as `ServerTooOldException`.
+  Any other `E` answer to `TouchAsync`, `GetAndTouchAsync`, `TouchManyAsync`
+  or `GetManyAndTouchAsync` (a bare `E`, or the tagged `E <tag>`
+  nanocached-proxy answers when an expiring touch's outcome is unknown) is now
+  a `ConnectionLostException`, as for every other command: a TTL-0 touch is
+  not resent after it, and it no longer tells the caller to upgrade every node.
+- The documentation of `TouchManyAsync`, `GetManyAndTouchAsync` and
+  `PartialConnectionLostException<T>` now says that with a TTL of 0 the keys
+  a connection failure leaves unresolved include ones whose frame was sent
+  and whose outcome is unknown: the node may already have expired them, so
+  they must not be sent again (a second touch finds them gone). No
+  behaviour change.
+- A failed redial of a dead node is now marked request-not-sent, as the
+  first connect already did. `TouchAsync(key, 0)`, `GetAndTouchAsync(key, 0)`,
+  `TouchManyAsync(keys, 0)`, `GetManyAndTouchAsync(keys, 0)`, `IncrAsync`
+  and the compare-and-set family used to throw `ConnectionLostException`
+  ("could not connect") when the key's primary was dead and already dropped
+  from the roster, instead of refreshing the roster and rerouting to the
+  surviving owner as a TTL of 30 or a removed TTL already did.
 - In a cluster, `GetManyAndTouchAsync` no longer discards the hits other
   primaries returned when one primary answers `En` to `y`. It throws
   `PartialServerTooOldException<T>`, a `ServerTooOldException` subclass, with

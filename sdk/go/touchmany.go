@@ -16,7 +16,9 @@ import (
 // some keys of a GetManyAndTouch batch and a replica for others gets two
 // frames: the G form for the first, the plain form for the second
 // (SetMany's "exactly one sub-frame per node" does not hold). Keys are
-// deduplicated like GetMany's.
+// deduplicated like GetMany's. With ttlSeconds == 0 the passes send the
+// primary legs only and the other owners get one plain fan-out afterwards
+// (issue #934; touchReplicasAfterPrimary).
 
 // TouchMany replaces the TTL of every existing key in keys in place, one
 // round trip per involved node instead of one per key (issue #871). keys
@@ -32,7 +34,9 @@ import (
 // fails after the frame was written is not resent (issue #901): the call
 // returns that ErrConnectionLost, with every key that did resolve in the
 // map. In a cluster it goes to every owner of a key, the primary's answer
-// being the key's. A replica's failure or `W` is counted in
+// being the key's — with ttlSeconds == 0 the primaries are sent the batch
+// first, and the other owners only after they answered (issue #934, see
+// touchReplicasAfterPrimary). A replica's failure or `W` is counted in
 // Stats().ReplicaWriteFailures and never fails the batch. Larger batches
 // are transparently split into more than one `y` sub-frame per node (see
 // maxBatchKeys).
@@ -231,7 +235,10 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 		return keys, results, nil
 	}
 
-	state := &multiTouchState{results: make(map[int]multiEntry, len(keys)), wrongNode: map[int]bool{}, lost: map[int]bool{}}
+	state := &multiTouchState{
+		results: make(map[int]multiEntry, len(keys)), wrongNode: map[int]bool{}, lost: map[int]bool{},
+		answeredBy: map[int]string{},
+	}
 	retry := c.multiTouchPass(namespace, keyBytes, ttlSeconds, get, nil, state)
 	if len(retry) > 0 {
 		// One bounded refresh-and-retry over everything a primary left
@@ -241,6 +248,9 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 		// fresh ring again.
 		c.maybeRefresh(true)
 		retry = c.multiTouchPass(namespace, keyBytes, ttlSeconds, get, retry, state)
+	}
+	if ttlSeconds == 0 {
+		c.touchReplicasAfterPrimary(namespace, keyBytes, state)
 	}
 	if state.rejected {
 		return keys, state.results, errors.Join(ErrServerTooOldBatch, state.lastErr)
@@ -330,10 +340,16 @@ type multiTouchState struct {
 	// #901): their primary leg failed after the frame was written, so the
 	// node may have expired them already.
 	lost map[int]bool
+	// answeredBy names the node whose primary answer is in results[idx], so
+	// the deferred replica fan-out of a ttlSeconds == 0 call (issue #934)
+	// does not touch it a second time.
+	answeredBy map[int]string
 }
 
 // multiTouchPass runs one pass of the cluster routing of TouchMany and
-// GetManyAndTouch: every key still needing resolution (every key when
+// GetManyAndTouch (with ttlSeconds == 0, to the primary legs only — the rest
+// follows in touchReplicasAfterPrimary, issue #934): every key still needing
+// resolution (every key when
 // retryIndices is nil, or just what the previous pass left unresolved) is
 // sent to every owner, in one leg per (owner, form): with get a key's
 // primary gets it in the `G` form and every other owner in the plain one,
@@ -380,6 +396,12 @@ func (c *Client) multiTouchPass(
 			continue
 		}
 		for rank, name := range names {
+			if ttlSeconds == 0 && rank > 0 {
+				// An expiring touch goes to the primary alone first; the
+				// other owners are sent theirs after it answered (issue
+				// #934, see touchReplicasAfterPrimary).
+				break
+			}
 			form := get && rank == 0
 			id := legID{name, form}
 			leg := legs[id]
@@ -431,6 +453,7 @@ func (c *Client) multiTouchPass(
 				}
 			case answered:
 				state.results[idx] = entries[i]
+				state.answeredBy[idx] = leg.name
 			case i >= resolved && errors.Is(err, errServerRejected):
 				// A node that predates `y` refuses it every time: another
 				// pass would only dial it again.
@@ -461,30 +484,13 @@ func (c *Client) multiTouchPass(
 			}
 		}
 
-		if c.fireAndForgetReplicas && pureReplica {
-			select {
-			case c.backgroundReplicaSem <- struct{}{}:
-				// Same Add-under-c.mu-with-a-closed-recheck ordering
-				// multiSetPass itself uses, guaranteeing every Add
-				// happens-before Close()'s Wait.
-				c.mu.Lock()
-				if !c.closed {
-					c.backgroundReplicaWG.Add(1)
-					c.mu.Unlock()
-					go func(leg *touchLeg) {
-						defer c.backgroundReplicaWG.Done()
-						defer func() { <-c.backgroundReplicaSem }()
-						// A pure-replica leg holds no primary key, so it
-						// appends nothing to the retry list.
-						var none []int
-						runLeg(leg, &none)
-					}(leg)
-					continue
-				}
-				c.mu.Unlock()
-				<-c.backgroundReplicaSem
-			default:
-			}
+		if pureReplica && c.detachReplicaLeg(func() {
+			// A pure-replica leg holds no primary key, so it appends
+			// nothing to the retry list.
+			var none []int
+			runLeg(leg, &none)
+		}) {
+			continue
 		}
 
 		wg.Add(1)
@@ -495,4 +501,76 @@ func (c *Client) multiTouchPass(
 	}
 	wg.Wait()
 	return append(retry, legRetry...)
+}
+
+// detachReplicaLeg runs fn in the background when FireAndForgetReplicas is
+// on and a slot is free, reporting whether it did; the caller runs it itself
+// otherwise. Background legs are tracked on backgroundReplicaWG so Close()
+// still drains them (the same Add-under-c.mu-with-a-closed-recheck ordering
+// multiSetPass and fanReplicas use, which guarantees every Add
+// happens-before Close()'s Wait), and capped by backgroundReplicaSem.
+func (c *Client) detachReplicaLeg(fn func()) bool {
+	if !c.fireAndForgetReplicas {
+		return false
+	}
+	select {
+	case c.backgroundReplicaSem <- struct{}{}:
+		c.mu.Lock()
+		if !c.closed {
+			c.backgroundReplicaWG.Add(1)
+			c.mu.Unlock()
+			go func() {
+				defer c.backgroundReplicaWG.Done()
+				defer func() { <-c.backgroundReplicaSem }()
+				fn()
+			}()
+			return true
+		}
+		c.mu.Unlock()
+		<-c.backgroundReplicaSem
+	default:
+	}
+	return false
+}
+
+// touchReplicasAfterPrimary is the second half of an expiring batch touch
+// (ttlSeconds == 0, issue #934): both passes of multiTouchPass sent only the
+// PRIMARY legs, so no replica has expired a copy a reroute would still need
+// to return. Now, in one plain fan-out grouped by replica owner on the ring
+// in force, the other owners are sent the touch for every key whose primary
+// answered — `S`/`V` and also `N`, since a primary that missed may still
+// have a replica copy, and the caller's intent is to expire it everywhere.
+// A key whose primary answered `W`, was lost or was rejected gets no replica
+// leg. A replica's failure or `W` is counted in
+// Stats().ReplicaWriteFailures and never fails the batch, and a leg is
+// eligible for Config.FireAndForgetReplicas as an ordinary replica leg is.
+// These legs run after the primary answered, outside the pipelined-order
+// guarantee, the same class as the retry paths.
+func (c *Client) touchReplicasAfterPrimary(namespace []byte, keyBytes [][]byte, state *multiTouchState) {
+	groups := make(map[string][][]byte)
+	for idx := range state.results {
+		for _, name := range c.ownersExcept(namespace, keyBytes[idx], state.answeredBy[idx]) {
+			groups[name] = append(groups[name], keyBytes[idx])
+		}
+	}
+	var wg sync.WaitGroup
+	for name, groupKeys := range groups {
+		run := func() {
+			entries, resolved, _ := c.multiTouchChunked(name, namespace, groupKeys, 0, false, true)
+			for i := range groupKeys {
+				if i >= resolved || entries[i].wrongNode {
+					c.stats.replicaWriteFailures.Add(1)
+				}
+			}
+		}
+		if c.detachReplicaLeg(run) {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			run()
+		}()
+	}
+	wg.Wait()
 }

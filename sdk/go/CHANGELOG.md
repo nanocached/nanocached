@@ -35,6 +35,38 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
   against a node that has `t` but not `y` they return the new
   `ErrServerTooOldBatch`, which also matches `ErrServerTooOld`.
 
+### Fixed
+
+- A node's `En` rejects only the request it answered: the requests
+  pipelined behind it on the same connection get the plain
+  connection-lost error and keep their one redial, instead of the
+  rejection, which `applyReconnecting` treats as final. A `Get` or `Set`
+  that merely shared the connection with a touch sent to a node that
+  predates `t` used to fail along with it (#940).
+- Only a node's `En` makes a touch return `ErrServerTooOld` /
+  `ErrServerTooOldBatch`. Any other `E` — the bare `E` (or `E <tag>`)
+  nanocached-proxy answers when a request's outcome is unknown — is now
+  `ErrConnectionLost` (not
+  `ErrProtocol`): a `ttl == 0` touch and `Incr`/the compare-and-set family
+  are not resent, and idempotent requests are replayed as for any lost
+  reply (#939).
+- `Touch`/`GetAndTouch` and `TouchMany`/`GetManyAndTouch` with
+  `ttlSeconds == 0` no longer lose the value on a reroute. The plain
+  `t ... 0` leg to a key's replicas was sent concurrently with the primary
+  leg and expired the replica's copy; when the primary then failed before
+  the frame left (a dial failure) or answered `W` from a stale ring, the
+  retry made that replica the primary and its `G` form came back a miss —
+  `GetAndTouch` returned no value for a key that existed, `Touch` reported
+  `false`. The primary is now sent the touch alone and the other owners
+  (on the ring in force when it answered) only after it answered; a batch
+  sends both passes to the primaries only and then one plain fan-out for
+  every key whose primary answered, `N` included. A primary that could not
+  be reached, or answered `W`, is rerouted with no replica touched yet.
+  Because those replica legs now run after the primary answered, they are
+  outside the pipelined-order guarantee, the same class as the retry
+  paths. A positive TTL and `RemoveTTL` keep the concurrent fan-out
+  (#934).
+
 ## [0.4.8] - 2026-10-21
 
 ### Fixed

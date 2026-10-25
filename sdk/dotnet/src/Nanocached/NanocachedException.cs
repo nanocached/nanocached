@@ -163,6 +163,13 @@ public class ConnectionLostException : NanocachedException
 /// partial data yet, so a plain (bare) <see cref="ConnectionLostException"/>
 /// propagates instead — this type is only thrown once a second or later
 /// sub-frame fails.</para>
+///
+/// <para>From <c>GetManyAndTouchAsync</c>/<c>GetManyAndTouchBytesAsync</c>
+/// with a TTL of 0 (issue #938), the keys missing from
+/// <see cref="PartialValues"/> include ones whose frame was sent and whose
+/// outcome is unknown: the node may already have expired them and consumed
+/// their values. Do not send them again with a TTL of 0 — they would read
+/// as misses.</para>
 /// </summary>
 public sealed class PartialConnectionLostException<T> : ConnectionLostException
 {
@@ -242,7 +249,10 @@ public sealed class NotNumericException : NanocachedException
 /// <c>En</c> to a touch means it does not know the command — upgrade
 /// every node to a release that includes it. A bare disconnect with no
 /// <c>En</c> cannot be told apart from any other lost connection and
-/// stays a <see cref="ConnectionLostException"/>.
+/// stays a <see cref="ConnectionLostException"/>, and so does any other
+/// <c>E</c> (issue #939): nanocached-proxy answers a bare <c>E</c> (with the
+/// tag, if any) when a request's outcome is unknown, which is a lost
+/// connection after the frame was written, not an old server.
 /// </summary>
 public class ServerTooOldException : NanocachedException
 {
@@ -284,7 +294,9 @@ public sealed class PartialServerTooOldException<T> : ServerTooOldException
 }
 
 /// <summary>
-/// issue #825 — internal: the node answered <c>E</c> (<c>En</c>). Derives
+/// issue #825 — internal: the node answered <c>En</c> (issue #939: only
+/// that exact line; any other <c>E</c>, such as the proxy's, is a plain
+/// <see cref="ConnectionLostException"/>). Derives
 /// from <see cref="ConnectionLostException"/> so every command other than
 /// touch keeps surfacing exactly what it always did for an unexpected
 /// response; <c>Connection.TouchAsync</c> alone turns it into
