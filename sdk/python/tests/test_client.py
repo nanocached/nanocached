@@ -2844,6 +2844,24 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
+    async def test_a_primary_that_predates_touch_is_asked_once_by_a_single_key_call(self):
+        # Issue #902: `En` is final, so no redial and resend.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = self.keys_by_primary(NAMES[0], 1)[0]
+            await client.set(key, "v")
+            old = nodes[NAMES[0]]
+            old.legacy_without_touch = True
+            for call in (client.touch, client.get_and_touch):
+                with self.subTest(call.__name__):
+                    before = len(old.touches)
+                    with self.assertRaises(ServerTooOldError):
+                        await call(key, 30)
+                    self.assertEqual(len(old.touches) - before, 1)
+        finally:
+            await self.stop(client, discovery, nodes)
+
     async def test_an_unreachable_primary_is_a_connection_loss_with_the_other_hits_attached(self):
         # R=1: the only owner of some keys is gone. Nothing answered `W`,
         # so the error is not the wrong-node one, and no replica stands in
