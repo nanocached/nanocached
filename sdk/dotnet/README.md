@@ -373,6 +373,44 @@ Against a node older than the release that added the command, both throw
 `ServerTooOldException`: such a node answers `En` and closes the
 connection. Upgrade every node before using them.
 
+### Many keys at once (TouchManyAsync / GetManyAndTouchAsync)
+
+`TouchManyAsync` and `GetManyAndTouchAsync` (`GetManyAndTouchBytesAsync` is
+the raw companion) are the same two operations for a list of keys, in one
+round trip per involved node instead of one per key:
+
+```csharp
+await client.SetManyAsync(new Dictionary<string, string> { ["a"] = "1", ["b"] = "2" }, ttlSeconds: 60);
+await client.TouchManyAsync(new[] { "a", "b", "missing" }, 300);
+// { a: true, b: true, missing: false } — a touch never creates a key
+await client.GetManyAndTouchAsync(new[] { "a", "b", "missing" }, 300);
+// { a: "1", b: "2" } — a miss is absent, as in GetManyAsync
+```
+
+The TTL is one value for the whole batch and means what it means for
+`TouchAsync`: `null` removes it, `0` expires the keys at once. A key given
+twice is touched once, and a batch of more than 400 keys is split into
+several frames, as for `GetManyAsync`. `client.Namespace(ns)` handles have
+all three.
+
+Like `TouchAsync` it goes to every owner of each key and the primary's answer
+decides. `GetManyAndTouchAsync` asks only a key's primary for the value, so a
+node that is the primary of some keys in the batch and a replica of others
+receives two frames, one with `G` and one without. A replica's failure is
+counted in `Stats().ReplicaWriteFailures` (once per key) and never fails the
+batch. A value that did not fit in the node's reply (16 MiB per frame) is
+left untouched and reads as a miss.
+
+Failures follow `GetManyAsync`: `GetManyAndTouchAsync` throws
+`PartialWrongNodeException<T>` (keys whose primary still answers a wrong-node
+after one refresh and retry) or `PartialConnectionLostException<T>` (a
+primary that cannot be reached on both passes), each carrying the keys that
+did resolve in `PartialValues`. A primary being down never reads as a
+wrong-node. `TouchManyAsync` carries no partial result: it throws a plain
+`WrongNodeException` or the connection failure, and since a touch is
+idempotent the whole batch can simply be sent again. Against a node that has
+`t` but not `y` both throw `ServerTooOldException` (`Command` is `"y"`).
+
 ## Replication
 
 The cluster's replication factor R rides along with the node list, so

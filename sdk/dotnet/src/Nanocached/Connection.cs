@@ -666,14 +666,24 @@ internal sealed class Connection
     /// <summary>Builds an <c>m</c> request frame: <c>m &lt;ns-len&gt;
     /// &lt;n&gt; &lt;key-len-1&gt; ... &lt;key-len-n&gt;[ &lt;tag&gt;]\n&lt;ns&gt;&lt;key-1&gt;...&lt;key-n&gt;</c>
     /// (docs/protocol.html#multi).</summary>
-    private static byte[] MultiGetFrame(byte[] namespaceBytes, IReadOnlyList<byte[]> keys, uint? tag)
+    private static byte[] MultiGetFrame(byte[] namespaceBytes, IReadOnlyList<byte[]> keys, uint? tag) =>
+        KeysFrame('m', namespaceBytes, keys, "", tag);
+
+    /// <summary>Builds a key-list request frame — <c>m</c> and <c>y</c>
+    /// share the shape <c>&lt;cmd&gt; &lt;ns-len&gt; &lt;n&gt; &lt;key-len-1&gt;
+    /// ... &lt;key-len-n&gt;&lt;fields&gt;[ &lt;tag&gt;]\n&lt;ns&gt;&lt;key-1&gt;...&lt;key-n&gt;</c>
+    /// and differ only in the optional <paramref name="fields"/> (each
+    /// with its own leading space) between the key lengths and the
+    /// tag.</summary>
+    private static byte[] KeysFrame(
+        char command, byte[] namespaceBytes, IReadOnlyList<byte[]> keys, string fields, uint? tag)
     {
-        var header = new StringBuilder("m ").Append(namespaceBytes.Length).Append(' ').Append(keys.Count);
+        var header = new StringBuilder().Append(command).Append(' ').Append(namespaceBytes.Length).Append(' ').Append(keys.Count);
         foreach (byte[] key in keys)
         {
             header.Append(' ').Append(key.Length);
         }
-        header.Append(TagField(tag)).Append('\n');
+        header.Append(fields).Append(TagField(tag)).Append('\n');
         byte[] headerBytes = Encoding.ASCII.GetBytes(header.ToString());
 
         int bodyLength = namespaceBytes.Length;
@@ -690,6 +700,44 @@ internal sealed class Connection
             offset += key.Length;
         }
         return frame;
+    }
+
+    /// <summary>issue #871 — sends <c>y</c>: the batched touch. One round
+    /// trip replaces the TTL of every entry in <paramref name="keys"/>
+    /// (docs/protocol.html#multi-touch), one shared
+    /// <paramref name="ttlSeconds"/> for the whole batch: <c>null</c>
+    /// removes the TTL, 0 expires the entries at once. Without
+    /// <paramref name="withValue"/> the reply is <c>Y</c>, one <c>S</c>
+    /// (touched) / <c>N</c> (no live entry) / <c>W</c> per key — <c>Ok</c>
+    /// is <c>S</c>; with it (the <c>G</c> flag) the reply is <c>m</c>'s
+    /// <c>M</c> roster for the keys touched — <c>Ok</c> is a hit whose
+    /// value is returned, and a value that did not fit the node's reply
+    /// is <c>-</c> and left untouched. <c>entries[i]</c> answers
+    /// <c>keys[i]</c>; a roster of the wrong length is a desynced
+    /// connection, as for <see cref="MultiGetAsync"/>. A node that
+    /// predates the command answers <c>En</c> and closes the connection,
+    /// which surfaces as <see cref="ServerTooOldException"/>.</summary>
+    internal async Task<List<MultiEntry>> MultiTouchAsync(
+        byte[] namespaceBytes, IReadOnlyList<byte[]> keys, long? ttlSeconds, bool withValue)
+    {
+        string fields =
+            (ttlSeconds is long seconds ? $" {seconds.ToString(CultureInfo.InvariantCulture)}" : "")
+            + (withValue ? " G" : "");
+        try
+        {
+            var (marker, _, _, entries) = await RequestAsync(tag =>
+                KeysFrame('y', namespaceBytes, keys, fields, tag)).ConfigureAwait(false);
+            if (marker != (withValue ? (byte)'M' : (byte)'Y')) throw Mismatch(marker);
+            if (entries!.Count != keys.Count)
+            {
+                throw DesyncedEntryCount(withValue ? "multi-get-and-touch" : "multi-touch", entries.Count, keys.Count);
+            }
+            return entries;
+        }
+        catch (ServerRejectedException rejected)
+        {
+            throw new ServerTooOldException(rejected, "y");
+        }
     }
 
     /// <summary>Sends <c>o</c> — stores every key/value pair in one round
@@ -1336,37 +1384,23 @@ internal sealed class Connection
             // bounded by MaxHeaderLineLength capping the line this whole
             // roster lives on.
             case (byte)'O':
-            {
-                string[] fields = (await ReadLineAsync().ConfigureAwait(false)).Split(' ');
-                if (fields.Length < 1 || !int.TryParse(fields[0], NumberStyles.None, CultureInfo.InvariantCulture, out int count) || count < 0)
+                return await ReadAckRosterAsync(marker, "multi-set", token => token switch
                 {
-                    throw new ConnectionLostException("nanocached: invalid multi-set header in response");
-                }
-                int wantFields = 1 + count + (_tagged ? 1 : 0);
-                if (fields.Length != wantFields)
+                    "S" => MultiEntry.Stored(),
+                    "W" => MultiEntry.Wrong(),
+                    _ => null,
+                }).ConfigureAwait(false);
+            // issue #871: `Y <n> <result-1> ... <result-n>[ <tag>]\n` — the
+            // batched touch's reply, shaped like O. Each token is "S"
+            // (touched), "N" (no live entry) or "W" (wrong node).
+            case (byte)'Y':
+                return await ReadAckRosterAsync(marker, "multi-touch", token => token switch
                 {
-                    throw new ConnectionLostException("nanocached: invalid multi-set header in response");
-                }
-                var entries = new List<MultiEntry>(count);
-                for (int i = 0; i < count; i++)
-                {
-                    string token = fields[1 + i];
-                    if (token == "S")
-                    {
-                        entries.Add(MultiEntry.Stored());
-                    }
-                    else if (token == "W")
-                    {
-                        entries.Add(MultiEntry.Wrong());
-                    }
-                    else
-                    {
-                        throw new ConnectionLostException("nanocached: invalid multi-set result token in response");
-                    }
-                }
-                uint? tag = _tagged ? ParseTag(fields[1 + count]) : null;
-                return (marker, null, 0, tag, entries);
-            }
+                    "S" => MultiEntry.Stored(),
+                    "N" => MultiEntry.Miss(),
+                    "W" => MultiEntry.Wrong(),
+                    _ => null,
+                }).ConfigureAwait(false);
             default:
                 // A garbage marker means the stream is desynced; poison
                 // and classify as connection-level (issue #8) so the
@@ -1374,6 +1408,38 @@ internal sealed class Connection
                 throw new ConnectionLostException(
                     $"nanocached: unexpected response from server: {(char)marker}");
         }
+    }
+
+    /// <summary>Reads the rest of an <c>O</c> or <c>Y</c> reply: <c>&lt;n&gt;
+    /// &lt;result-1&gt; ... &lt;result-n&gt;[ &lt;tag&gt;]\n</c>, no body. The two share
+    /// everything but the result tokens, which <paramref name="entryOf"/>
+    /// maps (<c>null</c> for a token that is not one of the reply's
+    /// own). <paramref name="what"/> names the reply in error messages.</summary>
+    private async Task<(byte Marker, byte[]? Value, long TtlSeconds, uint? Tag, List<MultiEntry>? Entries)> ReadAckRosterAsync(
+        byte marker, string what, Func<string, MultiEntry?> entryOf)
+    {
+        string[] fields = (await ReadLineAsync().ConfigureAwait(false)).Split(' ');
+        if (fields.Length < 1 || !int.TryParse(fields[0], NumberStyles.None, CultureInfo.InvariantCulture, out int count) || count < 0)
+        {
+            throw new ConnectionLostException($"nanocached: invalid {what} header in response");
+        }
+        int wantFields = 1 + count + (_tagged ? 1 : 0);
+        if (fields.Length != wantFields)
+        {
+            throw new ConnectionLostException($"nanocached: invalid {what} header in response");
+        }
+        var entries = new List<MultiEntry>(count);
+        for (int i = 0; i < count; i++)
+        {
+            MultiEntry? entry = entryOf(fields[1 + i]);
+            if (entry is null)
+            {
+                throw new ConnectionLostException($"nanocached: invalid {what} result token in response");
+            }
+            entries.Add(entry.Value);
+        }
+        uint? tag = _tagged ? ParseTag(fields[1 + count]) : null;
+        return (marker, null, 0, tag, entries);
     }
 
     /// <summary>The node's counter body

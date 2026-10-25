@@ -3956,6 +3956,529 @@ public class NanocachedClientTests
         Assert.True(client.Stats().ReplicaWriteFailures > 0);
     }
 
+    // ── Batched touch / get-and-touch (issue #871) ───────────────────
+
+    private static List<string> KeysWhosePrimaryIs(string name, int count)
+    {
+        var keys = new List<string>();
+        for (int i = 0; keys.Count < count; i++)
+        {
+            string key = "batch-" + i;
+            if (OwnersOf(key)[0] == name) keys.Add(key);
+        }
+        return keys;
+    }
+
+    private static Dictionary<string, string> ValuesFor(IEnumerable<string> keys) =>
+        keys.ToDictionary(key => key, key => "value of " + key);
+
+    /// <summary>A frame as <c>namespace|k1,k2|ttl|get</c> (<c>-</c> for no TTL), comparable by value.</summary>
+    private static string Describe(MockNode.MultiTouchFrame frame) =>
+        $"{frame.Namespace}|{string.Join(',', frame.Keys)}|{(frame.Ttl?.ToString() ?? "-")}|{(frame.Get ? "G" : "P")}";
+
+    private static IEnumerable<MockNode.MultiTouchFrame> FramesWithGet(MockNode node, bool get) =>
+        node.MultiTouchFrames.Where(frame => frame.Get == get);
+
+    [Fact]
+    public async Task BatchTouchFramesCarryTheTtlAndTheGetFlag()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        var keys = new[] { "a", "bb" };
+
+        await client.TouchManyAsync(keys, 30);
+        await client.TouchManyAsync(keys, null);
+        await client.GetManyAndTouchAsync(keys, 45);
+        await client.GetManyAndTouchBytesAsync(keys, null);
+        await client.Namespace("tenant").TouchManyAsync(keys, 7);
+
+        Assert.Equal(
+            new[] { "|a,bb|30|P", "|a,bb|-|P", "|a,bb|45|G", "|a,bb|-|G", "tenant|a,bb|7|P" },
+            node.MultiTouchFrames.Select(Describe).ToArray());
+    }
+
+    [Fact]
+    public async Task TouchManyReportsEachKeyAndNeverCreatesOne()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        byte[] none = Array.Empty<byte>();
+        await client.SetAsync("a", "1", 100);
+        await client.SetAsync("b", "2", 100);
+
+        Dictionary<string, bool> touched = await client.TouchManyAsync(new[] { "a", "missing", "b" }, 30);
+        Assert.Equal(new Dictionary<string, bool> { ["a"] = true, ["missing"] = false, ["b"] = true }, touched);
+        Assert.Equal(30, node.TtlOf(none, Bytes("a")));
+        Assert.Equal(30, node.TtlOf(none, Bytes("b")));
+        Assert.False(node.Store.ContainsKey(MockNode.KeyOf(Bytes("missing"))));
+
+        await client.TouchManyAsync(new[] { "a" }, null);
+        Assert.Null(node.TtlOf(none, Bytes("a")));
+
+        // 0 expires at once — the opposite of SetAsync, where 0 means no expiry.
+        Assert.Equal(
+            new Dictionary<string, bool> { ["a"] = true, ["b"] = true },
+            await client.TouchManyAsync(new[] { "a", "b" }, 0));
+        Assert.Null(await client.GetAsync("a"));
+        Assert.Null(await client.GetAsync("b"));
+    }
+
+    [Fact]
+    public async Task GetManyAndTouchReturnsTheHitsAndSetsTheTtl()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        byte[] none = Array.Empty<byte>();
+        await client.SetAsync("a", "one", 100);
+        await client.SetAsync("b", "two", 100);
+
+        Assert.Equal(
+            new Dictionary<string, string> { ["a"] = "one", ["b"] = "two" },
+            await client.GetManyAndTouchAsync(new[] { "a", "missing", "b" }, 30));
+        Assert.Equal(30, node.TtlOf(none, Bytes("a")));
+        Assert.False(node.Store.ContainsKey(MockNode.KeyOf(Bytes("missing"))));
+
+        Dictionary<string, byte[]> raw = await client.GetManyAndTouchBytesAsync(new[] { "a", "missing" }, 40);
+        Assert.Equal(new[] { "a" }, raw.Keys.ToArray());
+        Assert.Equal(Bytes("one"), raw["a"]);
+        Assert.Equal(40, node.TtlOf(none, Bytes("a")));
+
+        await client.GetManyAndTouchBytesAsync(new[] { "a" }, null);
+        Assert.Null(node.TtlOf(none, Bytes("a")));
+    }
+
+    [Fact]
+    public async Task BatchTouchCollapsesDuplicateKeys()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        await client.SetAsync("a", "one", 100);
+        await client.SetAsync("b", "two", 100);
+
+        Assert.Equal(
+            new Dictionary<string, bool> { ["a"] = true, ["b"] = true },
+            await client.TouchManyAsync(new[] { "a", "b", "a" }, 30));
+        Assert.Equal(
+            new Dictionary<string, string> { ["a"] = "one", ["b"] = "two" },
+            await client.GetManyAndTouchAsync(new[] { "a", "b", "a", "missing", "missing" }, 30));
+
+        Assert.Equal(
+            new[] { "|a,b|30|P", "|a,b,missing|30|G" },
+            node.MultiTouchFrames.Select(Describe).ToArray());
+    }
+
+    [Fact]
+    public async Task BatchTouchIsScopedToItsNamespace()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        NanocachedNamespace tenant = client.Namespace("tenant");
+        await tenant.SetAsync("k", "in-tenant", 100);
+        await client.SetAsync("k", "in-default", 100);
+
+        Assert.Equal(
+            new Dictionary<string, bool> { ["k"] = true, ["only-default"] = false },
+            await tenant.TouchManyAsync(new[] { "k", "only-default" }, 5));
+        Assert.Equal(
+            new Dictionary<string, string> { ["k"] = "in-tenant" },
+            await tenant.GetManyAndTouchAsync(new[] { "k", "only-default" }, 6));
+        Assert.Equal(Bytes("in-tenant"), (await tenant.GetManyAndTouchBytesAsync(new[] { "k" }, 7))["k"]);
+
+        Assert.Equal(7, node.TtlOf(Bytes("tenant"), Bytes("k")));
+        Assert.Equal(100, node.TtlOf(Array.Empty<byte>(), Bytes("k"))); // the default keyspace was not touched
+    }
+
+    [Fact]
+    public async Task GetManyAndTouchDecompressesWhenCompressionIsEnabled()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port));
+
+        string value = new string('x', 2000);
+        await client.SetAsync("k", value);
+        Assert.Equal(
+            new Dictionary<string, string> { ["k"] = value },
+            await client.GetManyAndTouchAsync(new[] { "k" }, 30));
+    }
+
+    [Fact]
+    public async Task BatchTouchRejectsBadArgumentsBeforeAnyIo()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        var keys = new[] { "k" };
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => client.TouchManyAsync(keys, -1));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => client.GetManyAndTouchAsync(keys, -1));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => client.GetManyAndTouchBytesAsync(keys, long.MinValue));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.TouchManyAsync(Array.Empty<string>(), 30));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.GetManyAndTouchAsync(Array.Empty<string>(), 30));
+        Assert.Empty(node.MultiTouchFrames);
+    }
+
+    [Fact]
+    public async Task BatchTouchSplitsAtTheKeyLimit()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        List<string> keys = Enumerable.Range(0, 401).Select(i => "k" + i).ToList();
+        await client.SetAsync("k0", "first");
+        await client.SetAsync("k400", "last");
+
+        Dictionary<string, bool> touched = await client.TouchManyAsync(keys, 30);
+        Assert.Equal(401, touched.Count);
+        Assert.True(touched["k0"]);
+        Assert.True(touched["k400"]);
+        Assert.False(touched["k1"]);
+        Assert.Equal(new[] { 400, 1 }, node.MultiTouchFrames.Select(frame => frame.Keys.Count).ToArray());
+
+        Assert.Equal(
+            new Dictionary<string, string> { ["k0"] = "first", ["k400"] = "last" },
+            await client.GetManyAndTouchAsync(keys, 30));
+        Assert.Equal(new[] { 400, 1, 400, 1 }, node.MultiTouchFrames.Select(frame => frame.Keys.Count).ToArray());
+    }
+
+    [Fact]
+    public async Task BatchTouchWorksOnATaggedConnection()
+    {
+        using var node = new MockNode(supportTags: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v", 100);
+        Assert.Equal(
+            new Dictionary<string, bool> { ["k"] = true, ["missing"] = false },
+            await client.TouchManyAsync(new[] { "k", "missing" }, 30));
+        Assert.Equal(
+            new Dictionary<string, string> { ["k"] = "v" },
+            await client.GetManyAndTouchAsync(new[] { "k", "missing" }, 40));
+        Assert.Equal(40, node.TtlOf(Array.Empty<byte>(), Bytes("k")));
+        Assert.Equal(2, node.MultiTouchFrames.Count);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task BatchTouchAgainstAnOldServerIsServerTooOldAndTheClientStaysUsable(bool predatesTouchToo)
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        await client.SetAsync("k", "v");
+        if (predatesTouchToo) node.RejectTouchLikeAnOldServer();
+        else node.RejectMultiTouchLikeAnOldServer();
+
+        var keys = new[] { "k" };
+        Assert.Equal("y", (await Assert.ThrowsAsync<ServerTooOldException>(() => client.TouchManyAsync(keys, 30))).Command);
+        Assert.Equal("y", (await Assert.ThrowsAsync<ServerTooOldException>(() => client.GetManyAndTouchAsync(keys, 30))).Command);
+        Assert.Equal("v", await client.GetAsync("k"));
+        // The single-key touch keeps the `t` wording it always had.
+        if (predatesTouchToo)
+        {
+            Assert.Equal("t", (await Assert.ThrowsAsync<ServerTooOldException>(() => client.TouchAsync("k", 30))).Command);
+        }
+        else
+        {
+            Assert.True(await client.TouchAsync("k", 30));
+        }
+    }
+
+    [Fact]
+    public async Task BatchTouchKeepsEarlierChunksWhenALaterChunkFails()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        List<string> keys = Enumerable.Range(0, 401).Select(i => "k" + i).ToList();
+        await client.SetAsync("k0", "first-chunk-value");
+
+        node.FailMultiTouchFromRequestOnward(2);
+        PartialConnectionLostException<Dictionary<string, byte[]>> failure =
+            await Assert.ThrowsAsync<PartialConnectionLostException<Dictionary<string, byte[]>>>(
+                () => client.GetManyAndTouchBytesAsync(keys, 30));
+        Assert.Equal(new[] { "k0" }, failure.PartialValues.Keys.ToArray());
+        Assert.Equal(Bytes("first-chunk-value"), failure.PartialValues["k0"]);
+
+        // TouchMany carries no partial result: the whole batch is idempotent, send it again.
+        ConnectionLostException bare = await Assert.ThrowsAsync<ConnectionLostException>(
+            () => client.TouchManyAsync(keys, 30));
+        Assert.False(bare.GetType().IsGenericType);
+    }
+
+    [Fact]
+    public async Task BatchTouchEndsOnAWholeFrameWrongNodeOnASingleNode()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        await client.SetAsync("k", "v", 100);
+
+        node.AnswerWrongNodeOnce();
+        await Assert.ThrowsAsync<WrongNodeException>(() => client.TouchManyAsync(new[] { "k" }, 30));
+
+        node.AnswerWrongNodeOnce();
+        PartialWrongNodeException<Dictionary<string, string>> failure =
+            await Assert.ThrowsAsync<PartialWrongNodeException<Dictionary<string, string>>>(
+                () => client.GetManyAndTouchAsync(new[] { "k" }, 30));
+        Assert.Empty(failure.PartialValues);
+        Assert.Equal(100, node.TtlOf(Array.Empty<byte>(), Bytes("k"))); // a wrong-node answer touches nothing
+    }
+
+    [Fact]
+    public async Task ABatchTouchReplyWithTheWrongEntryCountIsNeverTrusted()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        await client.SetAsync("a", "1", 100);
+        await client.SetAsync("b", "2", 100);
+        await client.SetAsync("c", "3", 100);
+        var keys = new[] { "a", "b", "c" };
+
+        // The connection is dropped as desynced and the idempotent request
+        // is sent again on a fresh one, so the caller sees the right
+        // answer rather than a shifted one.
+        node.AnswerMultiTouchWithEntryCountOnce(1);
+        Assert.Equal(
+            new Dictionary<string, bool> { ["a"] = true, ["b"] = true, ["c"] = true },
+            await client.TouchManyAsync(keys, 30));
+        Assert.Equal(2, node.MultiTouchFrames.Count);
+
+        node.AnswerMultiTouchWithEntryCountOnce(2);
+        Assert.Equal(
+            new Dictionary<string, string> { ["a"] = "1", ["b"] = "2", ["c"] = "3" },
+            await client.GetManyAndTouchAsync(keys, 31));
+        Assert.Equal(4, node.MultiTouchFrames.Count);
+    }
+
+    [Fact]
+    public async Task BatchTouchGoesToEveryOwnerAndGoesToThePrimaryInTheGetForm()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        MockNode nodeA = cluster.Nodes[Names[0]];
+        MockNode nodeB = cluster.Nodes[Names[1]];
+        List<string> primaryA = KeysWhosePrimaryIs(Names[0], 3);
+        List<string> primaryB = KeysWhosePrimaryIs(Names[1], 3);
+        List<string> all = primaryA.Concat(primaryB).ToList();
+        Dictionary<string, string> values = ValuesFor(all);
+        await client.SetManyAsync(values);
+
+        var two = new[] { primaryA[0], primaryB[0] };
+        Assert.Equal(
+            new Dictionary<string, bool> { [two[0]] = true, [two[1]] = true },
+            await client.TouchManyAsync(two, 30));
+        foreach (MockNode node in new[] { nodeA, nodeB })
+        {
+            // One plain frame per node.
+            MockNode.MultiTouchFrame frame = Assert.Single(node.MultiTouchFrames);
+            Assert.False(frame.Get);
+            Assert.Equal(2, frame.Keys.Count);
+        }
+        int framesBeforeA = nodeA.MultiTouchFrames.Count;
+        int framesBeforeB = nodeB.MultiTouchFrames.Count;
+
+        Assert.Equal(values, await client.GetManyAndTouchAsync(all, 40));
+        // A node is the primary of some keys and a replica of the others,
+        // so it gets the G frame for the first and a plain one for the second.
+        Assert.Equal(2, nodeA.MultiTouchFrames.Count - framesBeforeA);
+        Assert.Equal(2, nodeB.MultiTouchFrames.Count - framesBeforeB);
+        Assert.Equal(primaryA, FramesWithGet(nodeA, true).Single().Keys);
+        Assert.Equal(primaryB, FramesWithGet(nodeA, false).Last().Keys);
+        Assert.Equal(primaryB, FramesWithGet(nodeB, true).Single().Keys);
+        Assert.Equal(primaryA, FramesWithGet(nodeB, false).Last().Keys);
+        foreach (string key in all)
+        {
+            Assert.Equal(40, nodeA.TtlOf(Array.Empty<byte>(), Bytes(key)));
+            Assert.Equal(40, nodeB.TtlOf(Array.Empty<byte>(), Bytes(key)));
+        }
+    }
+
+    [Fact]
+    public async Task GetManyAndTouchDoesNotFallBackToAReplicaOnAPrimaryMiss()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        MockNode primary = cluster.Nodes[Names[0]];
+        MockNode replica = cluster.Nodes[Names[1]];
+        string key = KeysWhosePrimaryIs(Names[0], 1)[0];
+        // Only the replica holds the value.
+        replica.Store[MockNode.KeyOf(Bytes(key))] = Bytes("v");
+
+        Assert.Empty(await client.GetManyAndTouchAsync(new[] { key }, 30));
+
+        Assert.Single(FramesWithGet(primary, true));
+        Assert.Empty(FramesWithGet(replica, true)); // the replica is never asked for the value
+        Assert.Single(FramesWithGet(replica, false));
+    }
+
+    [Fact]
+    public async Task BatchTouchRecoversFromAWrongNodeAnswer()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        MockNode nodeA = cluster.Nodes[Names[0]];
+        List<string> all = KeysWhosePrimaryIs(Names[0], 3).Concat(KeysWhosePrimaryIs(Names[1], 3)).ToList();
+        Dictionary<string, string> values = ValuesFor(all);
+        await client.SetManyAsync(values);
+
+        nodeA.AnswerWrongNodeOnce();
+        Dictionary<string, bool> touched = await client.TouchManyAsync(all, 30);
+        Assert.Equal(6, touched.Count);
+        Assert.All(touched.Values, Assert.True);
+        Assert.Equal(2, nodeA.MultiTouchFrames.Count); // the keys A answered W for were sent again
+
+        nodeA.AnswerWrongNodeOnce();
+        Assert.Equal(values, await client.GetManyAndTouchAsync(all, 31));
+    }
+
+    [Fact]
+    public async Task BatchTouchStillWrongNodeAfterTheRetryThrowsWhatDidResolve()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        MockNode nodeA = cluster.Nodes[Names[0]];
+        List<string> primaryA = KeysWhosePrimaryIs(Names[0], 3);
+        List<string> primaryB = KeysWhosePrimaryIs(Names[1], 3);
+        List<string> all = primaryA.Concat(primaryB).ToList();
+        Dictionary<string, string> values = ValuesFor(all);
+        await client.SetManyAsync(values);
+
+        for (int i = 0; i < 8; i++) nodeA.AnswerWrongNodeOnce();
+        WrongNodeException failure = await Assert.ThrowsAsync<WrongNodeException>(() => client.TouchManyAsync(all, 30));
+        Assert.IsNotType<PartialWrongNodeException<Dictionary<string, string>>>(failure);
+
+        PartialWrongNodeException<Dictionary<string, string>> partial =
+            await Assert.ThrowsAsync<PartialWrongNodeException<Dictionary<string, string>>>(
+                () => client.GetManyAndTouchAsync(all, 31));
+        Assert.Equal(ValuesFor(primaryB), partial.PartialValues);
+    }
+
+    [Fact]
+    public async Task ABatchTouchWhoseReplyWasLostIsSentAgain()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        MockNode nodeA = cluster.Nodes[Names[0]];
+        List<string> keys = KeysWhosePrimaryIs(Names[0], 3);
+        await client.SetManyAsync(ValuesFor(keys));
+
+        nodeA.FailTouchAfterApplyOnce();
+        Dictionary<string, bool> touched = await client.TouchManyAsync(keys, 30);
+        Assert.All(touched.Values, Assert.True);
+        Assert.Equal(2, nodeA.MultiTouchFrames.Count);
+    }
+
+    [Fact]
+    public async Task AReplicaThatPredatesBatchTouchIsCountedPerKeyAndDoesNotFailThePrimarysAnswer()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        MockNode primary = cluster.Nodes[Names[0]];
+        MockNode replica = cluster.Nodes[Names[1]];
+        List<string> keys = KeysWhosePrimaryIs(Names[0], 3);
+        Dictionary<string, string> values = ValuesFor(keys);
+        await client.SetManyAsync(values);
+        replica.RejectMultiTouchLikeAnOldServer();
+        long before = client.Stats().ReplicaWriteFailures;
+
+        Assert.All((await client.TouchManyAsync(keys, 30)).Values, Assert.True);
+        Assert.Equal(before + 3, client.Stats().ReplicaWriteFailures);
+        Assert.Equal(values, await client.GetManyAndTouchAsync(keys, 40));
+        Assert.Equal(before + 6, client.Stats().ReplicaWriteFailures);
+        foreach (string key in keys)
+        {
+            Assert.Equal(40, primary.TtlOf(Array.Empty<byte>(), Bytes(key)));
+        }
+    }
+
+    [Fact]
+    public async Task APrimaryThatPredatesBatchTouchIsServerTooOldNotAConnectionFailure()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        // Keys of the healthy node resolve, so a rejection that went
+        // unrecognised would surface as a partial connection failure.
+        List<string> keys = KeysWhosePrimaryIs(Names[0], 2).Concat(KeysWhosePrimaryIs(Names[1], 2)).ToList();
+        await client.SetManyAsync(ValuesFor(keys));
+        cluster.Nodes[Names[0]].RejectMultiTouchLikeAnOldServer();
+
+        Assert.Equal("y", (await Assert.ThrowsAsync<ServerTooOldException>(() => client.TouchManyAsync(keys, 30))).Command);
+        Assert.Equal("y", (await Assert.ThrowsAsync<ServerTooOldException>(() => client.GetManyAndTouchAsync(keys, 30))).Command);
+    }
+
+    [Fact]
+    public async Task BatchTouchReportsAnUnreachablePrimaryAsAConnectionFailureNotWrongNode()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        string dead = Names[0];
+        List<string> deadKeys = KeysWhosePrimaryIs(dead, 3);
+        List<string> liveKeys = KeysWhosePrimaryIs(Names[1], 3);
+        List<string> all = deadKeys.Concat(liveKeys).ToList();
+        Dictionary<string, string> values = ValuesFor(all);
+        await client.SetManyAsync(values);
+        cluster.Nodes[dead].Dispose();
+        await Task.Delay(50); // let the FIN land
+
+        NanocachedException touchFailure = await Assert.ThrowsAsync<ConnectionLostException>(
+            () => client.TouchManyAsync(all, 30));
+        Assert.IsNotType<WrongNodeException>(touchFailure);
+
+        PartialConnectionLostException<Dictionary<string, string>> failure =
+            await Assert.ThrowsAsync<PartialConnectionLostException<Dictionary<string, string>>>(
+                () => client.GetManyAndTouchAsync(all, 30));
+        Assert.Equal(ValuesFor(liveKeys), failure.PartialValues);
+        Assert.IsAssignableFrom<ConnectionLostException>(failure.InnerException);
+    }
+
+    [Fact]
+    public async Task BatchTouchGoesToTheOwnersOfANamespacedKey()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        NanocachedNamespace tenant = client.Namespace("tenant");
+        var keys = new[] { "a", "b", "c", "d", "e", "f" };
+        Dictionary<string, string> values = ValuesFor(keys);
+        await tenant.SetManyAsync(values);
+
+        Assert.Equal(values, await tenant.GetManyAndTouchAsync(keys, 30));
+        Assert.All((await tenant.TouchManyAsync(keys, 31)).Values, Assert.True);
+        foreach (MockNode node in cluster.Nodes.Values)
+        {
+            Assert.All(node.MultiTouchFrames, frame => Assert.Equal("tenant", frame.Namespace));
+            foreach (string key in keys)
+            {
+                Assert.Equal(31, node.TtlOf(Bytes("tenant"), Bytes(key)));
+            }
+        }
+    }
+
+    [Fact]
+    public async Task BatchTouchReachesAFireAndForgetReplicaInTheBackground()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            FireAndForgetReplicas = true,
+        });
+        MockNode replica = cluster.Nodes[Names[1]];
+        List<string> keys = KeysWhosePrimaryIs(Names[0], 3);
+        await client.SetManyAsync(ValuesFor(keys));
+
+        Assert.All((await client.TouchManyAsync(keys, 30)).Values, Assert.True);
+        await WaitForAsync(() => replica.MultiTouchFrames.Count > 0, "the background touch to reach the replica");
+        foreach (string key in keys)
+        {
+            await WaitForAsync(() => replica.TtlOf(Array.Empty<byte>(), Bytes(key)) == 30, "the replica's TTL");
+        }
+    }
+
     // ── 値の圧縮 (value compression) ──────────────────────────────
 
     private static NanocachedClient.Options CompressingOptions(int port, int threshold = 256) =>

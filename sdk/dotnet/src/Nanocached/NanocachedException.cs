@@ -235,17 +235,28 @@ public sealed class NotNumericException : NanocachedException
 
 /// <summary>
 /// issue #825 — raised by <c>TouchAsync</c>/<c>GetAndTouchAsync</c> against
-/// a node that predates the <c>t</c> command: such a node answers <c>En</c>
-/// and closes the connection. The SDK only sends frames it has validated,
-/// so a node's <c>En</c> to a touch means it does not know the command —
-/// upgrade every node to a release that includes it. A bare disconnect
-/// with no <c>En</c> cannot be told apart from any other lost connection
-/// and stays a <see cref="ConnectionLostException"/>.
+/// a node that predates the <c>t</c> command, and (issue #871) by
+/// <c>TouchManyAsync</c>/<c>GetManyAndTouchAsync</c> against one that
+/// predates <c>y</c>: such a node answers <c>En</c> and closes the
+/// connection. The SDK only sends frames it has validated, so a node's
+/// <c>En</c> to a touch means it does not know the command — upgrade
+/// every node to a release that includes it. A bare disconnect with no
+/// <c>En</c> cannot be told apart from any other lost connection and
+/// stays a <see cref="ConnectionLostException"/>.
 /// </summary>
 public sealed class ServerTooOldException : NanocachedException
 {
-    internal ServerTooOldException(Exception inner)
-        : base("nanocached: the server does not know the touch command (t) — upgrade every node to a release that includes it", inner) { }
+    /// <summary>The wire command the node did not know: <c>"t"</c> or
+    /// <c>"y"</c>.</summary>
+    public string Command { get; }
+
+    internal ServerTooOldException(Exception inner, string command = "t")
+        : base(
+            $"nanocached: the server does not know the {(command == "t" ? "touch" : "batched touch")} command ({command}) — upgrade every node to a release that includes it",
+            inner)
+    {
+        Command = command;
+    }
 }
 
 /// <summary>

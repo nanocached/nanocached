@@ -114,6 +114,21 @@ public sealed class NanocachedNamespace
     public Task<byte[]?> GetAndTouchBytesAsync(byte[] key, long? ttlSeconds) =>
         _client.GetAndTouchBytesAsync(_namespace, key, ttlSeconds);
 
+    /// <summary>issue #871: as <see cref="NanocachedClient.TouchManyAsync(IReadOnlyList{string}, long?)"/>,
+    /// scoped to this namespace.</summary>
+    public Task<Dictionary<string, bool>> TouchManyAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
+        _client.TouchManyAsync(_namespace, keys, ttlSeconds);
+
+    /// <summary>issue #871: as <see cref="NanocachedClient.GetManyAndTouchAsync(IReadOnlyList{string}, long?)"/>,
+    /// scoped to this namespace.</summary>
+    public Task<Dictionary<string, string>> GetManyAndTouchAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
+        _client.GetManyAndTouchAsync(_namespace, keys, ttlSeconds);
+
+    /// <summary>issue #871: as <see cref="NanocachedClient.GetManyAndTouchBytesAsync(IReadOnlyList{string}, long?)"/>,
+    /// scoped to this namespace.</summary>
+    public Task<Dictionary<string, byte[]>> GetManyAndTouchBytesAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
+        _client.GetManyAndTouchBytesAsync(_namespace, keys, ttlSeconds);
+
     /// <summary>issue #151: as <see cref="NanocachedClient.GetManyAsync(IReadOnlyList{string})"/>,
     /// scoped to this handle's namespace.</summary>
     public Task<Dictionary<string, string>> GetManyAsync(IReadOnlyList<string> keys) =>

@@ -339,6 +339,37 @@ public sealed class MockNode : IDisposable
     public void RejectTouchLikeAnOldServer() => _rejectTouch = true;
     private volatile bool _rejectTouch;
 
+    /// <summary>issue #871: one received <c>y</c> (batched touch) frame —
+    /// the namespace, the keys in frame order, the TTL (<c>null</c> when
+    /// the field was omitted) and whether the <c>G</c> flag was set.</summary>
+    public sealed record MultiTouchFrame(string Namespace, IReadOnlyList<string> Keys, long? Ttl, bool Get);
+
+    /// <summary>issue #871: every <c>y</c> frame received, in arrival
+    /// order — lets a test assert how a batch was split and which node got
+    /// which form.</summary>
+    public IReadOnlyList<MultiTouchFrame> MultiTouchFrames => _multiTouchFrames.ToArray();
+    private readonly ConcurrentQueue<MultiTouchFrame> _multiTouchFrames = new();
+
+    /// <summary>issue #871: from now on answer every <c>y</c> like a node
+    /// that knows <c>t</c> but predates <c>y</c> — <c>En</c>, then close the
+    /// connection.</summary>
+    public void RejectMultiTouchLikeAnOldServer() => _rejectMultiTouch = true;
+    private volatile bool _rejectMultiTouch;
+
+    /// <summary>issue #871: from the n-th <c>y</c> frame on (1-based), close
+    /// the connection instead of replying — for good, so the client's own
+    /// redial-and-resend fails too. <see cref="FailMultiGetFromRequestOnward"/>'s
+    /// twin.</summary>
+    public void FailMultiTouchFromRequestOnward(int n) => _failMultiTouchFromRequest = n;
+    private int _failMultiTouchFromRequest = int.MaxValue;
+    private int _multiTouchRequestCount;
+
+    /// <summary>issue #871: the next <c>y</c> reply reports exactly
+    /// <paramref name="count"/> roster entries whatever the request's key
+    /// count (issue #181's desync, for <c>y</c>).</summary>
+    public void AnswerMultiTouchWithEntryCountOnce(int count) => _multiTouchBadCount = count;
+    private int _multiTouchBadCount = -1;
+
     /// <summary>issue #225: the <see cref="FailIncrAfterApplyOnce"/>
     /// counterpart for <c>k</c> (CAS).</summary>
     public void FailCasAfterApplyOnce() => Interlocked.Increment(ref _failCasAfterApplyReplies);
@@ -1160,6 +1191,109 @@ public sealed class MockNode : IDisposable
                             string ttlField = ttlSeconds is > 0 ? $" {ttlSeconds}" : "";
                             await Wire.WriteAsync(stream, $"V {existing.Length}{ttlField}{tag}\n");
                             await stream.WriteAsync(existing);
+                        }
+                        break;
+                    }
+                    // issue #871 — batched touch: `y <ns-len> <n> <key-len-1>
+                    // ... <key-len-n> [<ttl>] [G] [<tag>]`, always
+                    // namespaced. One TTL for the whole batch; no ttl field
+                    // removes the TTL, 0 expires the keys at once. Plain:
+                    // `Y <n> S|N|W ...`; with `G`: `m`'s `M` reply for the
+                    // keys touched. Like `m`/`o`, TakeWrongNode() answers
+                    // the whole frame `W`.
+                    case "y":
+                    {
+                        byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        int n = int.Parse(parts[2], CultureInfo.InvariantCulture);
+                        var keys = new byte[n][];
+                        for (int i = 0; i < n; i++)
+                        {
+                            keys[i] = await Wire.ReadExactlyAsync(stream, int.Parse(parts[3 + i], CultureInfo.InvariantCulture));
+                        }
+                        long? ttlSeconds = null;
+                        bool withValue = false;
+                        for (int i = 3 + n; i < parts.Length - (tagged ? 1 : 0); i++)
+                        {
+                            if (parts[i] == "G") withValue = true;
+                            else ttlSeconds = long.Parse(parts[i], CultureInfo.InvariantCulture);
+                        }
+                        int multiTouchRequestNumber = Interlocked.Increment(ref _multiTouchRequestCount);
+                        _multiTouchFrames.Enqueue(new MultiTouchFrame(
+                            Encoding.UTF8.GetString(namespaceBytes),
+                            keys.Select(k => Encoding.UTF8.GetString(k)).ToArray(), ttlSeconds, withValue));
+                        if (_rejectTouch || _rejectMultiTouch)
+                        {
+                            await Wire.WriteAsync(stream, "En\n");
+                            return;
+                        }
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (multiTouchRequestNumber >= _failMultiTouchFromRequest)
+                        {
+                            return;
+                        }
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
+                        }
+                        bool wrongNode = TakeWrongNode();
+                        var tokens = new List<string>(n);
+                        var hits = new List<byte[]?>(n);
+                        for (int i = 0; i < n; i++)
+                        {
+                            if (wrongNode)
+                            {
+                                tokens.Add("W");
+                                hits.Add(null);
+                                continue;
+                            }
+                            string storeKey = KeyOf(namespaceBytes, keys[i]);
+                            if (!Store.TryGetValue(storeKey, out byte[]? existing))
+                            {
+                                tokens.Add(withValue ? "-" : "N");
+                                hits.Add(null);
+                                continue;
+                            }
+                            if (ttlSeconds == 0)
+                            {
+                                Store.TryRemove(storeKey, out _);
+                                _ttls.TryRemove(storeKey, out _);
+                            }
+                            else
+                            {
+                                _ttls[storeKey] = ttlSeconds ?? 0;
+                            }
+                            tokens.Add(withValue ? existing.Length.ToString(CultureInfo.InvariantCulture) : "S");
+                            hits.Add(withValue ? existing : null);
+                        }
+                        if (TakeOne(ref _failTouchAfterApplyReplies))
+                        {
+                            return; // applied, but the ack never arrives
+                        }
+                        int badCount = Interlocked.Exchange(ref _multiTouchBadCount, -1);
+                        if (badCount >= 0)
+                        {
+                            while (tokens.Count > badCount)
+                            {
+                                tokens.RemoveAt(tokens.Count - 1);
+                                hits.RemoveAt(hits.Count - 1);
+                            }
+                            while (tokens.Count < badCount)
+                            {
+                                tokens.Add(withValue ? "-" : "N");
+                                hits.Add(null);
+                            }
+                        }
+                        var reply = new StringBuilder(withValue ? "M " : "Y ").Append(tokens.Count);
+                        foreach (string token in tokens) reply.Append(' ').Append(token);
+                        reply.Append(tag).Append('\n');
+                        await Wire.WriteAsync(stream, reply.ToString());
+                        foreach (byte[]? hit in hits)
+                        {
+                            if (hit is not null) await stream.WriteAsync(hit);
                         }
                         break;
                     }
