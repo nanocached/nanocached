@@ -3962,7 +3962,8 @@ describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
       await run(client, cluster);
     } finally {
       await client.close();
-      await cluster.close();
+      // A test may have closed a node already (issue #901).
+      await cluster.close().catch(() => {});
     }
   }
 
@@ -4018,6 +4019,70 @@ describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
 
       primary.mock.dropAfterIncrOnce();
       await assert.rejects(() => client.incr("k", 1), ConnectionLostError);
+    });
+  });
+
+  it("does not resend an expiring touch whose reply was lost (issue #901)", async () => {
+    // A resend of ttl 0 would find the key already expired.
+    await withCluster(async (client, cluster) => {
+      const { primary } = cluster.ownerOf("k");
+      await client.set("k", "payload");
+      primary.mock.dropAfterTouchOnce();
+      await assert.rejects(() => client.touch("k", 0), ConnectionLostError);
+      assert.equal(primary.mock.touches().filter((t) => t.ttl === 0).length, 1);
+    });
+  });
+
+  it("does not resend an expiring getAndTouch whose reply was lost (issue #901)", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary } = cluster.ownerOf("k");
+      await client.set("k", "payload");
+      primary.mock.dropAfterTouchOnce();
+      await assert.rejects(() => client.getAndTouch("k", 0), ConnectionLostError);
+      assert.equal(primary.mock.touches().filter((t) => t.ttl === 0).length, 1);
+    });
+  });
+
+  it("still resends a touch with a null or live TTL whose reply was lost (issue #901)", async () => {
+    // Only 0 changes: null removes the TTL, it does not expire the entry.
+    await withCluster(async (client, cluster) => {
+      const { primary } = cluster.ownerOf("k");
+      await client.set("k", "payload");
+      for (const ttl of [null, 30]) {
+        primary.mock.dropAfterTouchOnce();
+        assert.equal(await client.getAndTouch("k", ttl), "payload");
+        primary.mock.dropAfterTouchOnce();
+        assert.equal(await client.touch("k", ttl), true);
+      }
+    });
+  });
+
+  it("still retries an expiring touch whose request was never sent (issue #901)", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary } = cluster.ownerOf("k");
+      await client.set("k", "payload");
+      primary.mock.answerWrongNodeOnce();
+      assert.equal(await client.getAndTouch("k", 0), "payload");
+      await client.set("k", "payload");
+      primary.mock.answerWrongNodeOnce();
+      assert.equal(await client.touch("k", 0), true);
+    });
+  });
+
+  it("treats a primary that cannot be dialed as never sent for an expiring touch (issue #901)", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary } = cluster.ownerOf("k");
+      await client.set("k", "payload");
+      await primary.mock.close();
+      await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+      await assert.rejects(
+        () => client.touch("k", 0),
+        (error: unknown) => {
+          assert.ok(error instanceof ConnectionLostError);
+          assert.equal(error.requestWasSent, false);
+          return true;
+        },
+      );
     });
   });
 
@@ -4440,6 +4505,98 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
       assert.deepEqual(await client.getManyAndTouch(keys, 30), new Map(Object.entries(values)));
       assert.equal(primary.multiTouchFrames().filter((frame) => frame.get).length, 2);
     });
+  });
+
+  it("an expiring batch touch whose reply was lost is not resent (issue #901)", async () => {
+    // R=1 and keys on both nodes: the node that loses its reply is the
+    // primary of some keys only. The old code resent the frame, found the
+    // keys gone and reported them missing without an error.
+    await withCluster(
+      async (client, cluster) => {
+        const lostKeys = keysWithPrimary(cluster, names[0], 4, "exp-a");
+        const liveKeys = keysWithPrimary(cluster, names[1], 4, "exp-b");
+        const keys = [...lostKeys, ...liveKeys];
+        await client.setMany(Object.fromEntries(keys.map((key) => [key, `v-${key}`])));
+        const primary = cluster.nodes[0].mock;
+        primary.dropAfterTouchOnce();
+        await assert.rejects(() => client.touchMany(keys, 0), (error: unknown) => {
+          assert.ok(error instanceof ConnectionLostError);
+          assert.ok(!(error instanceof WrongNodeError));
+          assert.equal(error.requestWasSent, true);
+          return true;
+        });
+        assert.equal(primary.multiTouchFrames().filter((frame) => frame.ttl === 0).length, 1);
+      },
+      undefined,
+      1,
+    );
+  });
+
+  it("an expiring batch getAndTouch whose reply was lost is not resent (issue #901)", async () => {
+    await withCluster(
+      async (client, cluster) => {
+        const lostKeys = keysWithPrimary(cluster, names[0], 4, "exp-a");
+        const liveKeys = keysWithPrimary(cluster, names[1], 4, "exp-b");
+        const keys = [...lostKeys, ...liveKeys];
+        await client.setMany(Object.fromEntries(keys.map((key) => [key, `v-${key}`])));
+        const primary = cluster.nodes[0].mock;
+        primary.dropAfterTouchOnce();
+        await assert.rejects(() => client.getManyAndTouch(keys, 0), (error: unknown) => {
+          assert.ok(error instanceof PartialConnectionLostError);
+          assert.ok(!(error instanceof WrongNodeError));
+          assert.equal(error.requestWasSent, true);
+          assert.match(error.message, /could not reach the primary of 4 of 8 keys/);
+          assert.deepEqual(sorted([...(error.partialValues as Map<string, string>).keys()]), sorted(liveKeys));
+          return true;
+        });
+        assert.equal(primary.multiTouchFrames().filter((frame) => frame.ttl === 0).length, 1);
+      },
+      undefined,
+      1,
+    );
+  });
+
+  it("an expiring batch still retries keys that were never sent (issue #901)", async () => {
+    await withCluster(async (client, cluster) => {
+      const keys = Array.from({ length: 12 }, (_, i) => `k${i}`);
+      const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
+      const owner = cluster.nodes.find((node) => node.name === cluster.owners(keys[0])[0])!;
+      await client.setMany(values);
+      owner.mock.answerMultiWrongNodeTimes(keys[0], 1);
+      assert.deepEqual(await client.getManyAndTouch(keys, 0), new Map(Object.entries(values)));
+      await client.setMany(values);
+      owner.mock.answerMultiWrongNodeTimes(keys[0], 1);
+      const touched = await client.touchMany(keys, 0);
+      assert.equal(touched.size, keys.length);
+      assert.equal([...touched.values()].every(Boolean), true);
+    });
+  });
+
+  it("an expiring batch with an unreachable primary still gets its second pass (issue #901)", async () => {
+    // A dead primary was never sent anything: the keys are retried after a
+    // refresh as before, then reported as a connection loss.
+    await withCluster(
+      async (client, cluster) => {
+        const deadKeys = keysWithPrimary(cluster, names[0], 3, "dead");
+        const liveKeys = keysWithPrimary(cluster, names[1], 3, "live");
+        const keys = [...deadKeys, ...liveKeys];
+        await client.setMany(Object.fromEntries(keys.map((key) => [key, `v-${key}`])));
+        await cluster.nodes[0].mock.close();
+        await waitFor(() => memberConnectionClosed(client, names[0]), "the client to see the FIN");
+        const liveFramesBefore = cluster.nodes[1].mock.multiTouchFrames().length;
+        await assert.rejects(() => client.getManyAndTouch(keys, 0), (error: unknown) => {
+          assert.ok(error instanceof PartialConnectionLostError);
+          assert.equal(error.requestWasSent, false);
+          assert.match(error.message, /could not reach the primary of 3 of 6 keys/);
+          assert.deepEqual(sorted([...(error.partialValues as Map<string, string>).keys()]), sorted(liveKeys));
+          return true;
+        });
+        // The second pass sent the dead keys only, never the live ones again.
+        assert.equal(cluster.nodes[1].mock.multiTouchFrames().length, liveFramesBefore + 1);
+      },
+      undefined,
+      1,
+    );
   });
 
   it("a replica that fails does not fail the primary's answer", async () => {

@@ -162,12 +162,17 @@ type TouchAnswer =
  * answer; `wrongNode` holds the indices whose primary leg's latest outcome
  * was a `W` rather than a connection failure; `lastCause` is the most
  * recent primary-leg connection failure and `rejected` whether any primary
- * leg was answered `En` (a node that predates `y`). */
+ * leg was answered `En` (a node that predates `y`). `lost` holds the
+ * indices a `ttlSeconds === 0` call must not resend (issue #901): their
+ * primary leg failed after the frame was written, so the node may have
+ * expired them already; `lostCause` is that failure. */
 interface MultiTouchState {
   results: Map<number, TouchAnswer>;
   wrongNode: Set<number>;
   lastCause: unknown;
   rejected: boolean;
+  lost: Set<number>;
+  lostCause: unknown;
 }
 
 /** Snapshot of counters for failures this client swallows by design
@@ -1464,9 +1469,14 @@ export class NanocachedClient {
    *
    * Unlike `incr` and the compare-and-set family a touch is idempotent, so
    * a request whose reply was lost is retried like `get`/`set`/`delete`
-   * are, never thrown as `ConnectionLostError`. In a cluster it goes to
-   * every owner, like a `set`, and the primary's answer is returned.
-   * Throws `ServerTooOldError` against a node that predates the command. */
+   * are, never thrown as `ConnectionLostError` — with one exception (issue
+   * #901): a `0` TTL expires the entry, so a resend after the node already
+   * applied it would resolve `false` for a key that existed. That call is
+   * retried only when its request was never sent, and a reply lost after
+   * the send throws `ConnectionLostError`, as `incr` does. In a cluster it
+   * goes to every owner, like a `set`, and the primary's answer is
+   * returned. Throws `ServerTooOldError` against a node that predates the
+   * command. */
   async touch(key: string | Uint8Array, ttlSeconds: number | null): Promise<boolean> {
     return this.touchInNamespace(EMPTY_NAMESPACE, key, ttlSeconds);
   }
@@ -1481,7 +1491,12 @@ export class NanocachedClient {
    * hedging, and no fallback to a replica on a miss) and the other owners
    * are sent the plain touch, so a replica is never the only owner touched.
    * It counts as a read on the primary, which makes the entry the most
-   * recently used. */
+   * recently used.
+   *
+   * With `ttlSeconds === 0` a reply lost after the request was sent throws
+   * `ConnectionLostError` instead of being resent (issue #901): the node
+   * may have expired the entry and consumed its value, and a resend would
+   * report a miss. */
   async getAndTouch(key: string | Uint8Array, ttlSeconds: number | null): Promise<string | null> {
     return this.getAndTouchInNamespace(EMPTY_NAMESPACE, key, ttlSeconds);
   }
@@ -1501,7 +1516,10 @@ export class NanocachedClient {
    * the TTL, `0` expires the keys at once.
    *
    * Like `touch` it is idempotent, so a request whose reply was lost is
-   * retried, and in a cluster it goes to every owner of a key, the
+   * retried — except with `ttlSeconds === 0`, where a primary whose
+   * connection fails after the frame was written is not resent (issue
+   * #901) and the call throws that connection error, every other key
+   * having been touched. In a cluster it goes to every owner of a key, the
    * primary's answer being the key's. A replica's failure or `W` is
    * counted in `stats().replicaWriteFailures` and never fails the batch.
    * Larger batches are transparently split into more than one `y`
@@ -1537,8 +1555,12 @@ export class NanocachedClient {
    * bare connection error when nothing resolved), each carrying
    * `.partialValues`, the keys that did resolve. Unlike `getMany` a key is
    * not tried on its next owner when its primary is down — a replica's
-   * answer would leave the primary untouched. Throws `ServerTooOldError`
-   * against a node that predates the command, at once, as `touchMany` does. */
+   * answer would leave the primary untouched. With `ttlSeconds === 0` a
+   * primary whose connection fails after the frame was written is not
+   * resent (issue #901): it may have expired and consumed its values
+   * already, so those keys throw `PartialConnectionLostError` at once
+   * instead of reading as misses. Throws `ServerTooOldError` against a
+   * node that predates the command, at once, as `touchMany` does. */
   async getManyAndTouch(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, string>> {
     return this.decodeBatch(this.getManyAndTouchBytesInNamespace(EMPTY_NAMESPACE, keys, ttlSeconds));
   }
@@ -1698,11 +1720,15 @@ export class NanocachedClient {
     checkTouchTtl(ttlSeconds);
     checkKey(typeof key === "string" ? Buffer.from(key, "utf8") : key, namespace);
     await this.maybeRefreshNodeList();
+    // A touch that expires the entry is resent only if never sent (issue #901).
+    const expiring = ttlSeconds === 0;
     try {
-      return await this.withWrongNodeRetry(() =>
-        this.target.kind === "cluster"
-          ? this.writeToOwners(key, namespace, (connection) => connection.touch(key, ttlSeconds, namespace))
-          : this.connectionForSingleTarget().then((connection) => connection.touch(key, ttlSeconds, namespace)),
+      return await this.withWrongNodeRetry(
+        () =>
+          this.target.kind === "cluster"
+            ? this.writeToOwners(key, namespace, (connection) => connection.touch(key, ttlSeconds, namespace), undefined, expiring)
+            : this.connectionForSingleTarget().then((connection) => connection.touch(key, ttlSeconds, namespace)),
+        { nonIdempotent: expiring },
       );
     } catch (error) {
       if (wasRejectedByServer(error)) throw new ServerTooOldError();
@@ -1721,16 +1747,21 @@ export class NanocachedClient {
     checkKey(typeof key === "string" ? Buffer.from(key, "utf8") : key, namespace);
     await this.maybeRefreshNodeList();
     let value: Buffer | null;
+    // See touchInNamespace: ttl 0 is resent only if never sent (issue #901).
+    const expiring = ttlSeconds === 0;
     try {
-      value = await this.withWrongNodeRetry(() =>
-        this.target.kind === "cluster"
-          ? this.writeToOwners(
-              key,
-              namespace,
-              (connection) => connection.getAndTouch(key, ttlSeconds, namespace),
-              (connection) => connection.touch(key, ttlSeconds, namespace),
-            )
-          : this.connectionForSingleTarget().then((connection) => connection.getAndTouch(key, ttlSeconds, namespace)),
+      value = await this.withWrongNodeRetry(
+        () =>
+          this.target.kind === "cluster"
+            ? this.writeToOwners(
+                key,
+                namespace,
+                (connection) => connection.getAndTouch(key, ttlSeconds, namespace),
+                (connection) => connection.touch(key, ttlSeconds, namespace),
+                expiring,
+              )
+            : this.connectionForSingleTarget().then((connection) => connection.getAndTouch(key, ttlSeconds, namespace)),
+        { nonIdempotent: expiring },
       );
     } catch (error) {
       if (wasRejectedByServer(error)) throw new ServerTooOldError();
@@ -1823,7 +1854,14 @@ export class NanocachedClient {
       return collect(new Map(entries.map((entry, i) => [i, entry] as const)));
     }
 
-    const state: MultiTouchState = { results: new Map(), wrongNode: new Set(), lastCause: undefined, rejected: false };
+    const state: MultiTouchState = {
+      results: new Map(),
+      wrongNode: new Set(),
+      lastCause: undefined,
+      rejected: false,
+      lost: new Set(),
+      lostCause: undefined,
+    };
     let retryIndices = await this.multiTouchPass(namespace, keyBytes, ttlSeconds, get, undefined, state);
     // `En` is final: the node would refuse the same frame again, so neither
     // the refresh nor the second pass (which would redial it) is worth it.
@@ -1837,18 +1875,21 @@ export class NanocachedClient {
       await this.maybeRefreshNodeList({ force: true });
       retryIndices = await this.multiTouchPass(namespace, keyBytes, ttlSeconds, get, retryIndices, state);
     }
-    if (retryIndices.length === 0) return collect(state.results);
+    if (retryIndices.length === 0 && state.lost.size === 0) return collect(state.results);
     if (state.rejected) throw new ServerTooOldError("y");
-    if (retryIndices.some((index) => state.wrongNode.has(index))) {
+    if (state.lost.size === 0 && retryIndices.some((index) => state.wrongNode.has(index))) {
       if (get) throw new PartialWrongNodeError(collect(state.results));
       throw new WrongNodeError();
     }
     // No primary answered `W` for these keys: each one's primary was
-    // unreachable on both passes. That is a connection loss and is
-    // reported as one, as getMany does.
-    const cause = state.lastCause;
+    // unreachable on both passes, or (`ttlSeconds === 0`) lost its
+    // connection after the frame was written and was not resent. That is a
+    // connection loss and is reported as one, as getMany does. A lost
+    // key's own failure is reported, never a later not-sent one: only it
+    // says the request may have been applied (`requestWasSent`).
+    const cause = state.lost.size > 0 ? state.lostCause : state.lastCause;
     const message =
-      `nanocached: ${method} could not reach the primary of ${retryIndices.length} of ${keys.length} keys: ` +
+      `nanocached: ${method} could not reach the primary of ${retryIndices.length + state.lost.size} of ${keys.length} keys: ` +
       (cause instanceof Error ? cause.message : "no owner is reachable for these keys");
     const requestWasSent = cause instanceof ConnectionLostError ? cause.requestWasSent : true;
     if (get && state.results.size > 0) throw new PartialConnectionLostError(collect(state.results), message, { requestWasSent });
@@ -1949,16 +1990,34 @@ export class NanocachedClient {
     const backgroundLegs: Promise<void>[] = [];
     for (const leg of legs.values()) {
       const runLeg = async (): Promise<void> => {
+        const holdsPrimary = leg.isPrimary.some(Boolean);
+        // A touch that expires the keys is resent only if never sent (issue
+        // #901): a frame none of whose keys has this node as primary decides
+        // nothing and keeps the plain path.
+        const connectionFor =
+          ttlSeconds === 0 && holdsPrimary
+            ? () => this.dialForWrite(() => this.memberConnection(leg.name))
+            : () => this.memberConnection(leg.name);
         const { entries, resolved, error } = await this.multiTouchChunked(
-          () => this.memberConnection(leg.name),
+          connectionFor,
           namespace,
           leg.indices.map((index) => keyBytes[index]),
           ttlSeconds,
           leg.get,
         );
-        if (error !== undefined && leg.isPrimary.some(Boolean)) {
+        // A failure after the frame was written (requestWasSent) of a touch
+        // that expires: the node may have applied it, and a resend would
+        // report the keys as missing — and, with `G`, lose the values it
+        // consumed. A failure that never sent stays retryable, and an `En`
+        // keeps its own handling.
+        let lostIsFinal = false;
+        if (error !== undefined && holdsPrimary) {
           state.lastCause = error;
           if (wasRejectedByServer(error)) state.rejected = true;
+          else if (ttlSeconds === 0 && isConnectionError(error) && !(error instanceof ConnectionLostError && error.requestWasSent === false)) {
+            lostIsFinal = true;
+            state.lostCause = error;
+          }
         }
         for (let i = 0; i < leg.indices.length; i++) {
           const index = leg.indices[i];
@@ -1969,7 +2028,13 @@ export class NanocachedClient {
             state.results.set(index, entries[i]);
           } else {
             if (i < resolved) state.wrongNode.add(index);
-            else state.wrongNode.delete(index);
+            else {
+              state.wrongNode.delete(index);
+              if (lostIsFinal) {
+                state.lost.add(index);
+                continue;
+              }
+            }
             retry.push(index);
           }
         }
@@ -3068,10 +3133,15 @@ export class NanocachedClient {
      * primary's `op` (issue #825): a get-and-touch asks only the primary
      * for the value. */
     replicaOp: (connection: Connection) => Promise<unknown> = op,
+    /** The primary leg is not safe to resend once its frame may have been
+     * written (a touch with ttl 0, issue #901): reaching the primary then
+     * goes through `dialForWrite`, so a failure to get a connection counts
+     * as "never sent" for `withWrongNodeRetry`'s `nonIdempotent` option. */
+    primaryNotResendable = false,
   ): Promise<T> {
     const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
     if (primaryName === undefined) {
-      throw new ConnectionLostError("nanocached: no owner is reachable for this key");
+      throw new ConnectionLostError("nanocached: no owner is reachable for this key", primaryNotResendable ? { requestWasSent: false } : undefined);
     }
 
     const replicaWrite = async (name: string): Promise<void> => {
@@ -3147,7 +3217,9 @@ export class NanocachedClient {
 
     let primary: { ok: true; value: T } | { ok: false; error: unknown };
     try {
-      const connection = await this.memberConnection(primaryName);
+      const connection = primaryNotResendable
+        ? await this.dialForWrite(() => this.memberConnection(primaryName))
+        : await this.memberConnection(primaryName);
       primary = { ok: true, value: await op(connection) };
     } catch (error) {
       primary = { ok: false, error };
