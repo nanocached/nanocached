@@ -8,6 +8,17 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Fixed
 
+- With `Some(0)`, a chunk of `touch_many` / `get_many_and_touch` that fails
+  after its frame was written no longer takes the chunks after it down with
+  it. A batch of more than 400 keys on one primary is sent as several `y`
+  frames; only the keys of the chunk that was written are reported as lost
+  (that frame is not sent again), and the chunks never sent now go out in the
+  refresh-and-retry pass, so `touch_many`'s "every other key was touched"
+  holds and `get_many_and_touch` returns their hits. An address that stopped
+  identifying as a node when it was redialed (`Error::Protocol` from the
+  dial, before anything was written) is no longer counted as a lost frame
+  either: its keys are retried on the second pass instead of being given up
+  on.
 - In a cluster, `get_many_and_touch` no longer discards the hits other
   primaries returned when one primary answers `En` to `y`. It returns the new
   `Error::PartialServerTooOldText` (`get_many_and_touch_bytes`:

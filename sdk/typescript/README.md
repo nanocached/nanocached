@@ -464,6 +464,14 @@ the primary like a write (one refresh and retry on a wrong-node answer or a
 connection failure; no hedging, and no fallback to a replica on a miss) and
 the other owners are sent the plain touch.
 
+With `ttlSeconds` `0` the other owners are sent theirs only after the primary
+has answered, not alongside it: a plain touch that expired a replica's copy
+before a rerouted primary read it would turn a hit into a miss. A primary that
+fails or answers wrong-node gets the call rerouted with no replica touched,
+and these replica legs run outside the pipelined-order guarantee, like the
+retry paths. `touchMany` and `getManyAndTouch` do the same: primary frames
+first, then one plain frame per replica for the keys a primary answered.
+
 Against a node older than the release that added the command, both throw
 `ServerTooOldError`: such a node answers `En` and closes the connection.
 Upgrade every node before using them.

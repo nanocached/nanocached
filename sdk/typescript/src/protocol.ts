@@ -1094,8 +1094,16 @@ export function tryParseResponse(
     // `En\n`: the node rejects the request and closes the connection.
     // Told apart from other unexpected bytes so a touch can report "server
     // too old" (issue #825); every other command still fails the same way.
+    // Only the node's `En` (the server-type byte `n` right after the `E`)
+    // is that: the proxy's bare `E\n` / `E <tag>\n` means the request failed
+    // or its outcome is unknown (issue #939), which is not a protocol
+    // mismatch. It poisons the connection like any other unexpected reply,
+    // so the waiters see a `ConnectionLostError` with `requestWasSent` true
+    // — never resent where the command is not idempotent.
     case 0x45 /* 'E' */:
-      throw new ServerRejectedError();
+      if (buf.length < 2) return null;
+      if (buf[1] === 0x6e /* 'n' */) throw new ServerRejectedError();
+      throw new NanocachedError("nanocached: server answered E (request failed, outcome unknown)");
 
     default:
       throw new NanocachedError(`nanocached: unexpected response from server: ${String.fromCharCode(buf[0])}`);

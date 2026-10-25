@@ -1626,6 +1626,91 @@ final class MockServers {
         }
     }
 
+    /**
+     * A node that answers each {@code t} / {@code y} frame with whatever
+     * bytes a script returns for its header line, so a test can put an
+     * exact wire reply (the proxy's {@code R}, a bare {@code E}, ...) in
+     * front of the client. {@code null} from the script closes the
+     * connection. Only the touch frames are understood after the
+     * handshake; each one is counted in {@link #frames} and recorded in
+     * {@link #headers}.
+     */
+    static final class ScriptedNode implements AutoCloseable {
+        final ServerSocket server;
+        final AtomicInteger frames = new AtomicInteger();
+        final List<String> headers = new CopyOnWriteArrayList<>();
+        private final boolean acceptTags;
+        private final java.util.function.Function<String, String> script;
+
+        ScriptedNode(java.util.function.Function<String, String> script) throws IOException {
+            this(false, script);
+        }
+
+        ScriptedNode(boolean acceptTags, java.util.function.Function<String, String> script) throws IOException {
+            this.acceptTags = acceptTags;
+            this.script = script;
+            this.server = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
+            Thread acceptor = new Thread(this::acceptLoop, "scripted-node-accept");
+            acceptor.setDaemon(true);
+            acceptor.start();
+        }
+
+        int port() {
+            return server.getLocalPort();
+        }
+
+        private void acceptLoop() {
+            try {
+                while (true) {
+                    Socket socket = server.accept();
+                    Thread worker = new Thread(() -> serve(socket), "scripted-node-conn");
+                    worker.setDaemon(true);
+                    worker.start();
+                }
+            } catch (IOException closed) {
+                // close()
+            }
+        }
+
+        private void serve(Socket socket) {
+            try (socket) {
+                InputStream in = new java.io.BufferedInputStream(socket.getInputStream());
+                OutputStream out = socket.getOutputStream();
+                String[] hello = readLine(in).split(" ");
+                in.readNBytes(Integer.parseInt(hello[1]));
+                boolean tagged = acceptTags && hello.length > 2 && hello[2].equals("T");
+                out.write((tagged ? "OnT\n" : "On\n").getBytes(StandardCharsets.US_ASCII));
+                out.flush();
+                while (true) {
+                    String header = readLine(in);
+                    String[] p = header.split(" ");
+                    int body = 0;
+                    if (p[0].equals("t")) {
+                        body = Integer.parseInt(p[1]) + Integer.parseInt(p[2]);
+                    } else if (p[0].equals("y")) {
+                        body = Integer.parseInt(p[1]);
+                        int count = Integer.parseInt(p[2]);
+                        for (int i = 0; i < count; i++) body += Integer.parseInt(p[3 + i]);
+                    }
+                    in.readNBytes(body);
+                    frames.incrementAndGet();
+                    headers.add(header);
+                    String reply = script.apply(header);
+                    if (reply == null) return;
+                    out.write(reply.getBytes(StandardCharsets.UTF_8));
+                    out.flush();
+                }
+            } catch (IOException closed) {
+                // the client went away
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            server.close();
+        }
+    }
+
     static int unusedPort() throws IOException {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();

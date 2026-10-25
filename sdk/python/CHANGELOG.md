@@ -11,6 +11,33 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ### Fixed
 
+- A `ttl=0` `touch`, `get_and_touch`, `touch_many` or `get_many_and_touch`
+  in a cluster no longer sends the replicas their `t`/`y` before the
+  primary has answered. The frame expires the copy it reaches, so when the
+  primary could not be reached or answered `W` from a stale ring, the
+  retry over the refreshed ring asked the surviving replica, now the
+  primary, for a value its copy no longer held: `get_and_touch` and
+  `get_many_and_touch` returned a miss for a key that existed (the value
+  was consumed and never returned) and `touch` returned `False`. The
+  primaries are now sent alone, and one plain frame per replica follows for
+  the keys a primary answered (a miss included, since the replica may still
+  hold a copy); a key whose primary failed or answered `W` has no replica
+  touched before it is rerouted. These replica touches therefore run after
+  the primary's answer, outside the pipelined-order guarantee, the same
+  class as the retry paths. Positive and removed TTLs keep the concurrent
+  fan-out.
+- `touch`, `get_and_touch`, `touch_many` and `get_many_and_touch` report
+  `ServerTooOldError` only for the node's `En` answer. Any other `E`
+  (nanocached-proxy answers a bare `E` when a `ttl=0` touch's outcome is
+  unknown, or when a request failed transiently) raised "server too old,
+  upgrade every node"; it is now the `ConnectionLostError` a sent request
+  fails with, so a `ttl=0` touch is not sent again.
+- A reply whose echoed tag does not answer the request it follows is now a
+  `ConnectionLostError` for that request, like every other failure after
+  the frame was written. It was a plain `ConnectionError`, so a `ttl=0`
+  touch, `incr` and the compare-and-set family were sent again: the second
+  `touch` reported a key that existed as missing and `incr` was applied
+  twice.
 - A `ttl=0` touch (`touch`, `get_and_touch`, `touch_many`,
   `get_many_and_touch`) is no longer sent again after a reply that cannot be
   matched to it, a reply of the wrong kind or a roster of the wrong length.

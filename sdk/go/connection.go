@@ -827,6 +827,16 @@ func (c *connection) mismatch(marker byte) error {
 // from a writer noticing a failed Write, the read loop noticing a failed
 // Read, or an explicit close() — only the first call has any effect.
 func (c *connection) poison(err error) {
+	c.poisonRejecting(err, nil)
+}
+
+// poisonRejecting is poison for a connection the node closed after
+// rejecting ONE request (issue #940: its `En`). The oldest pending
+// request is the one the node refused — responses are FIFO — so it alone
+// receives rejected; every other waiter poisoned alongside it merely
+// shares the dead connection and receives err, the plain connection-lost
+// error, which keeps their redial. rejected == nil is poison.
+func (c *connection) poisonRejecting(err, rejected error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -842,7 +852,11 @@ func (c *connection) poison(err error) {
 	if c.conn != nil {
 		_ = c.conn.Close()
 	}
-	for _, req := range pending {
+	for i, req := range pending {
+		if i == 0 && rejected != nil {
+			req.ch <- roundTripResult{err: rejected}
+			continue
+		}
 		req.ch <- roundTripResult{err: err}
 	}
 	if onClose != nil {
@@ -990,7 +1004,14 @@ func (c *connection) readLoop() {
 			// I/O failure (issue #47 audit item G4). Everything else here
 			// is a real I/O error (EOF, reset, timeout, ...) and keeps the
 			// existing ErrConnectionLost classification.
-			if errors.Is(err, ErrProtocol) {
+			if errors.Is(err, errServerRejected) {
+				// A node's `En` refuses one request (issue #940): only
+				// that one carries the rejection; the others pipelined
+				// behind it merely lose the connection and keep their
+				// redial.
+				c.poisonRejecting(connectionLost(
+					"the server closed the connection after rejecting a request", nil), err)
+			} else if errors.Is(err, ErrProtocol) || errors.Is(err, ErrConnectionLost) {
 				c.poison(err)
 			} else if isTimeout(err) {
 				// The request deadline expired with a request still
@@ -1330,10 +1351,21 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 	// (a command it does not know, one too large or malformed). Marked so a
 	// touch can report ErrServerTooOld (issue #825); an ErrProtocol like
 	// any other unexpected marker for everything else.
+	//
+	// Any other `E` — a bare `E\n`, or the `E <tag>\n` nanocached-proxy
+	// answers when a request's outcome is unknown (issue #939) — is not a
+	// node refusing the command, so it must neither read as "server too
+	// old" nor as an ErrProtocol a redial would resend: it is a connection
+	// lost after the frame was written, which idempotent requests replay as
+	// they replay any lost reply and a ttl=0 touch or an incr/CAS does not.
 	case 'E':
-		_, _ = readLine(c.reader) // the rest of `En\n`, if it arrives
-		return 0, nil, 0, 0, nil, errors.Join(
-			protocolError(fmt.Sprintf("unexpected response from server: %c", marker)), errServerRejected)
+		rest, _ := readLine(c.reader) // the rest of `En\n`, if it arrives
+		if strings.HasPrefix(rest, "n") {
+			return 0, nil, 0, 0, nil, errors.Join(
+				protocolError(fmt.Sprintf("unexpected response from server: %c", marker)), errServerRejected)
+		}
+		return 0, nil, 0, 0, nil, connectionLost(
+			"the server answered E: the outcome of the request is unknown", nil)
 	default:
 		return 0, nil, 0, 0, nil, protocolError(fmt.Sprintf("unexpected response from server: %c", marker))
 	}

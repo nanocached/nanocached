@@ -71,6 +71,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a `ttl=0` touch (`t`, `y`, plain or `G`) sends the
+  plain legs to a key's other owners only once the primary has answered. They
+  used to go out together with the primary leg, so while the primary leg was
+  failing (unreachable, or `W` from a stale ring) a replica had already
+  expired its copy; the re-fan over the refreshed ring then asked that
+  replica, now the primary, for a key it no longer held, answered `N` for a
+  key that existed, and a `G` lost the value for good. Those deferred legs
+  run after the primary's answer, outside the pipelined-order guarantee the
+  initial dispatch gives, like the retry paths. A positive or removed TTL
+  keeps the concurrent fan-out.
 - `nanocached-proxy`: a `ttl=0` touch (`t`, `y`, plain or `G`) whose reply is
   lost after the frame may have reached the node is no longer sent again. A
   `ttl=0` touch expires the keys it finds, so the second frame answered them

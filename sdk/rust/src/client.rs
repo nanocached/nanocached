@@ -798,6 +798,17 @@ struct MultiTouchLeg {
     keys: Vec<Vec<u8>>,
 }
 
+/// How [`NanocachedClient::multi_touch_chunked`] failed (issue #941): the entries
+/// of the chunks answered before it, the error, and `sent_end`, the
+/// position (in the leg's key order) after the last chunk whose frame was
+/// written. The positions from `entries.len()` to `sent_end` are the
+/// failed chunk's; the ones from `sent_end` on were never sent.
+struct MultiTouchChunkFailure {
+    entries: Vec<MultiEntry>,
+    error: Error,
+    sent_end: usize,
+}
+
 /// What a batched touch's legs learn across its two passes; legs run
 /// concurrently, so everything sits behind one mutex (never held across an
 /// await).
@@ -2342,9 +2353,10 @@ impl NanocachedClient {
                 .await
             {
                 Ok(entries) => (entries, None),
-                Err((partial_entries, error)) => {
-                    (partial_entries, Some(Self::downgrade_sent_error(error)))
-                }
+                Err(failure) => (
+                    failure.entries,
+                    Some(Self::downgrade_sent_error(failure.error)),
+                ),
             };
             let mut unresolved = Vec::new();
             let mut wrong_node = false;
@@ -2419,6 +2431,14 @@ impl NanocachedClient {
     /// issue #901) a sub-frame is redialed and resent only when it was
     /// never sent, as `incr` is, and the error is returned undowngraded
     /// so the caller can tell a connection lost after the write.
+    ///
+    /// A failure reports where the written frames end (issue #941): the
+    /// chunk that failed was written when the error says so (a connection
+    /// lost after the write, a reply deadline, a reply that could not be
+    /// parsed), and then its positions are `sent_end` past the entries
+    /// already answered; a chunk that never left (a failed dial, an
+    /// address that stopped identifying as a node) and every chunk after
+    /// it were not written, so `sent_end` is just the answered count.
     async fn multi_touch_chunked(
         &self,
         slot: Option<&str>,
@@ -2427,17 +2447,28 @@ impl NanocachedClient {
         ttl_seconds: Option<u64>,
         get: bool,
         replay_safe: bool,
-    ) -> std::result::Result<Vec<MultiEntry>, (Vec<MultiEntry>, Error)> {
+    ) -> std::result::Result<Vec<MultiEntry>, MultiTouchChunkFailure> {
         let mut entries = Vec::with_capacity(keys.len());
         let lengths = chunk_lengths(namespace.len(), keys.len(), |i| get_entry_cost(&keys[i]));
         let mut start = 0;
         for len in lengths {
             let chunk = &keys[start..start + len];
             start += len;
-            let op = |connection: Arc<Connection>| async move {
-                connection
-                    .multi_touch(namespace, chunk, ttl_seconds, get)
-                    .await
+            // Set when `op` itself failed with `Error::Protocol`: a reply
+            // that could not be parsed, which only a written frame gets. A
+            // `Protocol` that did not come from `op` is the dial's (an
+            // address that no longer identifies as a node): nothing was
+            // sent.
+            let bad_reply = AtomicBool::new(false);
+            let op = |connection: Arc<Connection>| {
+                let bad_reply = &bad_reply;
+                async move {
+                    let result = connection
+                        .multi_touch(namespace, chunk, ttl_seconds, get)
+                        .await;
+                    bad_reply.store(matches!(result, Err(Error::Protocol(_))), Ordering::SeqCst);
+                    result
+                }
             };
             let result = if replay_safe {
                 self.apply_reconnecting(slot, &op).await
@@ -2446,7 +2477,19 @@ impl NanocachedClient {
             };
             match result {
                 Ok(chunk_entries) => entries.extend(chunk_entries),
-                Err(error) => return Err((entries, error)),
+                Err(error) => {
+                    let written = matches!(
+                        error,
+                        Error::ConnectionLostAfterSend(_) | Error::ConnectionLostTimedOut(_)
+                    ) || (matches!(error, Error::Protocol(_))
+                        && bad_reply.load(Ordering::SeqCst));
+                    let sent_end = if written { start } else { entries.len() };
+                    return Err(MultiTouchChunkFailure {
+                        entries,
+                        error,
+                        sent_end,
+                    });
+                }
             }
         }
         Ok(entries)
@@ -2574,7 +2617,7 @@ impl NanocachedClient {
         // replica leg is unaffected.
         let holds_primary = leg.is_primary.iter().any(|&primary| primary);
         let replay_safe = ttl_seconds != Some(0) || !holds_primary;
-        let (entries, failure) = match self
+        let (entries, failure, sent_end) = match self
             .multi_touch_chunked(
                 Some(&leg.owner),
                 namespace,
@@ -2585,23 +2628,13 @@ impl NanocachedClient {
             )
             .await
         {
-            Ok(entries) => (entries, None),
-            Err((partial_entries, error)) => (partial_entries, Some(error)),
+            Ok(entries) => (entries, None, 0),
+            Err(failure) => (failure.entries, Some(failure.error), failure.sent_end),
         };
-        // The write may have been applied: `ConnectionLostAfterSend` (the
-        // frame was written), `ConnectionLostTimedOut` (the node took it
-        // and never answered) or `Protocol` (a reply that could not be
-        // parsed, which only a sent frame gets). `ServerTooOld` keeps its
-        // own handling.
-        let sent_failure = !replay_safe
-            && matches!(
-                failure,
-                Some(
-                    Error::ConnectionLostAfterSend(_)
-                        | Error::ConnectionLostTimedOut(_)
-                        | Error::Protocol(_)
-                )
-            );
+        // Only the chunk whose frame was written may have been applied
+        // (issue #941): the positions from the answered ones up to
+        // `sent_end` are lost. The chunks after it were never sent and go
+        // to the next pass like any other unresolved position.
         let failure = failure.map(Self::downgrade_sent_error);
         if let Some(failure) = failure {
             if holds_primary {
@@ -2636,7 +2669,7 @@ impl NanocachedClient {
                     let mut inner = state.inner.lock().unwrap();
                     if entry.is_none() {
                         inner.wrong_node.remove(&idx);
-                        if sent_failure {
+                        if !replay_safe && i < sent_end {
                             inner.lost.insert(idx);
                             continue;
                         }

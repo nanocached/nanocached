@@ -25,7 +25,13 @@ const RemoveTTL int64 = -1
 // the node already applied it would answer false for a key that existed.
 // That call is retried only when its request was never sent, and a reply
 // lost after the send returns ErrConnectionLost, as Incr does. In a cluster
-// it goes to every owner, like a Set, and the primary's answer is returned.
+// it goes to every owner, like a Set, and the primary's answer is returned —
+// except that a 0 TTL goes to the primary alone first and to the other
+// owners only after the primary answered (issue #934): a replica that had
+// expired its copy before the primary failed or answered `W` would leave the
+// reroute, which makes it the primary, nothing to find. Those replica legs
+// therefore run after the primary answered, outside the pipelined-order
+// guarantee, the same class as the retry paths.
 // Returns ErrServerTooOld against a node that predates the command.
 func (c *Client) Touch(key string, ttlSeconds int64) (existed bool, err error) {
 	return c.touchNS(nil, key, ttlSeconds)
@@ -45,7 +51,9 @@ func (c *Client) Touch(key string, ttlSeconds int64) (existed bool, err error) {
 // With ttlSeconds == 0 a reply lost after the request was sent returns
 // ErrConnectionLost instead of being resent (issue #901): the node may have
 // expired the entry and consumed its value, and a resend would report a
-// miss.
+// miss. The plain touch to the other owners then follows the primary's
+// answer instead of racing it (issue #934), so a reroute after a failed or
+// stale-ring primary still reads the value from the replica.
 func (c *Client) GetAndTouch(key string, ttlSeconds int64) (value string, ok bool, err error) {
 	raw, ok, err := c.GetAndTouchBytes(key, ttlSeconds)
 	if err != nil || !ok {
@@ -119,7 +127,7 @@ func (c *Client) touchNS(namespace []byte, key string, ttlSeconds int64) (existe
 				existed = e
 			}
 			return opErr
-		}, applyPrimary)
+		}, applyPrimary, ttlSeconds == 0)
 	})
 	return existed, touchRejected(err)
 }
@@ -150,7 +158,7 @@ func (c *Client) getAndTouchBytesNS(namespace []byte, key string, ttlSeconds int
 			v, found, opErr := conn.getAndTouchNS(namespace, keyBytes, ttlSeconds)
 			value, ok = v, found
 			return opErr
-		}, applyPrimary)
+		}, applyPrimary, ttlSeconds == 0)
 	})
 	if err != nil {
 		return nil, false, touchRejected(err)

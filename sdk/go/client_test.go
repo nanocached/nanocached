@@ -203,6 +203,11 @@ type mockNode struct {
 	// reply lost after the node executed it. A touch is idempotent, so the
 	// client resends it (unlike an `i`; see applyThenCloseLeft).
 	applyThenCloseTouchLeft atomic.Int32
+	// touchDelay (issue #934): every `t`/`y` request sleeps this many
+	// nanoseconds after it is logged and before it is applied and answered,
+	// so a test can look at what the OTHER owners have seen while this node
+	// has not answered yet.
+	touchDelay atomic.Int64
 	// yFrames records every `y` (batched touch, issue #871) frame this
 	// node received, one entry per frame, in arrival order — what proves a
 	// frame's grouping, which the per-key touches above cannot.
@@ -1175,6 +1180,9 @@ func (m *mockNode) serve(conn net.Conn) {
 			m.touchesMu.Lock()
 			m.touches = append(m.touches, touchRecord{namespace, key, ttl, get})
 			m.touchesMu.Unlock()
+			if delay := time.Duration(m.touchDelay.Load()); delay > 0 {
+				time.Sleep(delay)
+			}
 			if m.opts.withoutTouch {
 				_, _ = conn.Write([]byte("En\n"))
 				return
@@ -1258,6 +1266,9 @@ func (m *mockNode) serve(conn net.Conn) {
 			m.yFramesMu.Lock()
 			m.yFrames = append(m.yFrames, yRecord{namespace, keys, ttl, get})
 			m.yFramesMu.Unlock()
+			if delay := time.Duration(m.touchDelay.Load()); delay > 0 {
+				time.Sleep(delay)
+			}
 			if m.opts.withoutTouch || m.opts.withoutMultiTouch {
 				_, _ = conn.Write([]byte("En\n"))
 				return
