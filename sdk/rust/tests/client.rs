@@ -183,6 +183,12 @@ struct NodeState {
     /// Issue #825: behave like a node that predates `t` — answer `En` and
     /// close the connection.
     reject_touch: std::sync::atomic::AtomicBool,
+    /// Issue #939: the raw bytes (`E\n`, `E 7\n`, `En\n`...) to answer
+    /// every `t` and `y` frame with, then close the connection. Unlike
+    /// `reject_touch` this need not be a node's `En`: the proxy answers a
+    /// bare `E` (tagged `E <tag>`) for a touch whose outcome it could not
+    /// tell.
+    touch_error_reply: Mutex<Option<Vec<u8>>>,
     /// Issue #934: holds every `t` and `y` frame this long before it is
     /// applied and answered — a slow primary, so a test can look at the
     /// replicas while the primary has not answered yet. Persistent.
@@ -656,6 +662,11 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     let _ = stream.get_mut().write_all(b"En\n").await;
                     return;
                 }
+                let error_reply = state.touch_error_reply.lock().unwrap().clone();
+                if let Some(reply) = error_reply {
+                    let _ = stream.get_mut().write_all(&reply).await;
+                    return;
+                }
                 let delay = state.touch_delay_ms.load(Ordering::SeqCst);
                 if delay > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
@@ -769,6 +780,11 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     || state.reject_multi_touch.load(Ordering::SeqCst)
                 {
                     let _ = stream.get_mut().write_all(b"En\n").await;
+                    return;
+                }
+                let error_reply = state.touch_error_reply.lock().unwrap().clone();
+                if let Some(reply) = error_reply {
+                    let _ = stream.get_mut().write_all(&reply).await;
                     return;
                 }
                 let delay = state.touch_delay_ms.load(Ordering::SeqCst);
@@ -4860,6 +4876,91 @@ async fn batch_touch_keeps_earlier_chunks_when_a_later_chunk_fails() {
 
     client.close().await;
     node.stop();
+}
+
+// ── only `En` is "server too old" (issue #939) ──────────────────────
+
+#[tokio::test]
+async fn an_e_that_is_not_en_to_an_expiring_touch_is_a_loss_after_the_send() {
+    // The proxy answers a bare `E` (tagged: `E <tag>`) to a touch whose
+    // outcome it could not tell; it is not a node that predates the
+    // command, and an expiring touch must not be sent again.
+    for reply in [&b"E\n"[..], &b"E 7\n"[..]] {
+        let node = MockNode::start().await;
+        let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+        *node.state.touch_error_reply.lock().unwrap() = Some(reply.to_vec());
+
+        let result = client.touch("k", Some(0)).await;
+        assert!(
+            matches!(result, Err(Error::ConnectionLost(_))),
+            "{reply:?}: {result:?}"
+        );
+        let result = client.get_and_touch("k", Some(0)).await;
+        assert!(
+            matches!(result, Err(Error::ConnectionLost(_))),
+            "{reply:?}: {result:?}"
+        );
+        assert_eq!(touch_frames(&node).len(), 2, "one frame per call");
+
+        let result = client.touch_many(&["a", "b"], Some(0)).await;
+        assert!(
+            matches!(result, Err(Error::ConnectionLost(_))),
+            "{reply:?}: {result:?}"
+        );
+        let result = client.get_many_and_touch(&["a", "b"], Some(0)).await;
+        assert!(
+            matches!(result, Err(Error::ConnectionLost(_))),
+            "{reply:?}: {result:?}"
+        );
+        assert_eq!(multi_touch_frames(&node).len(), 2, "one frame per call");
+
+        client.close().await;
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn an_e_that_is_not_en_to_a_replayable_touch_is_resent_once_like_any_lost_reply() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    *node.state.touch_error_reply.lock().unwrap() = Some(b"E 7\n".to_vec());
+
+    let result = client.touch("k", Some(30)).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        touch_frames(&node).len(),
+        2,
+        "sent again on a fresh connection"
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn en_to_a_touch_is_still_server_too_old() {
+    for reply in [&b"En\n"[..], &b"En 7\n"[..]] {
+        let node = MockNode::start().await;
+        let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+        *node.state.touch_error_reply.lock().unwrap() = Some(reply.to_vec());
+
+        for ttl in [Some(0), Some(30)] {
+            assert!(matches!(
+                client.touch("k", ttl).await,
+                Err(Error::ServerTooOld { command: "t" })
+            ));
+            assert!(matches!(
+                client.touch_many(&["a", "b"], ttl).await,
+                Err(Error::ServerTooOld { command: "y" })
+            ));
+        }
+
+        client.close().await;
+        node.stop();
+    }
 }
 
 // ── a failed chunk of an expiring touch_many (issue #941) ───────────
