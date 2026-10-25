@@ -324,6 +324,41 @@ Against a node older than the release that added the command, both return
 `ErrServerTooOld` (`errors.Is`-matchable): such a node answers `En` and
 closes the connection. Upgrade every node before using them.
 
+### Many keys at once (TouchMany / GetManyAndTouch)
+
+`TouchMany` and `GetManyAndTouch` (`GetManyAndTouchBytes` is the raw
+companion) are the same two operations for a list of keys, in one round trip
+per involved node instead of one per key:
+
+```go
+_, err = client.SetMany(map[string]string{"a": "1", "b": "2"}, 60)
+existed, err := client.TouchMany([]string{"a", "b", "missing"}, 300)
+// map[a:true b:true missing:false] — a touch never creates a key
+values, err := client.GetManyAndTouch([]string{"a", "b", "missing"}, 300)
+// map[a:1 b:2] — a miss is absent, as in GetMany
+```
+
+The TTL is one value for the whole batch and means what it means for `Touch`:
+`RemoveTTL` removes it, `0` expires the keys at once. A key given twice is
+touched once, and a batch of more than 400 keys is split into several frames,
+as for `GetMany`. `Namespace` has all three.
+
+Like `Touch` it goes to every owner of each key and the primary's answer
+decides. `GetManyAndTouch` asks only a key's primary for the value, so a node
+that is the primary of some keys in the batch and a replica of others
+receives two frames, one with `G` and one without. A replica's failure is
+counted in `Stats().ReplicaWriteFailures` (once per key) and never fails the
+batch. A value that did not fit in the node's reply (16 MiB per frame) is
+left untouched and reads as a miss.
+
+As with `GetMany`, the returned map always holds the keys that resolved,
+whether or not `err` is nil. Keys whose primary still answers a wrong-node
+after one refresh and retry return `ErrWrongNode`; a primary that cannot be
+reached on both passes returns its connection error (`ErrConnectionLost`),
+never `ErrWrongNode`. A touch is idempotent, so a failed `TouchMany` can
+simply be sent again. Against a node that has `t` but not `y` both return
+`ErrServerTooOldBatch`, which also matches `ErrServerTooOld`.
+
 ## Batched get and set
 
 `GetMany`/`GetManyBytes` and `SetMany`/`SetManyBytes` (the `m`/`o`
