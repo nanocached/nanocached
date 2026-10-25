@@ -1303,8 +1303,18 @@ internal sealed class Connection
                 // issue #825: `En` — a node that does not know the command
                 // just sent. It closes the connection right after; consume
                 // the rest of the line so the failure carries its own type.
-                await ReadLineAsync().ConfigureAwait(false);
-                throw new ServerRejectedException();
+                //
+                // Issue #939: only that exact line is a server that is too
+                // old. Any other E — a bare `E\n`, or the tagged `E <tag>\n`
+                // nanocached-proxy answers when an expiring touch's outcome
+                // is unknown or a request failed transiently — is a fatal
+                // error after the frame was written: the connection-lost
+                // error every other command gets, which a ttl=0 touch and
+                // Incr/CAS never resend.
+                string rest = await ReadLineAsync(stripLeadingSpace: false).ConfigureAwait(false);
+                if (rest == "n") throw new ServerRejectedException();
+                throw new ConnectionLostException(
+                    $"nanocached: unexpected response from server: E{rest}");
             case (byte)'B':
                 // Busy is unsolicited and always bare (echoed response tags) — never
                 // tagged, even on a tagged connection.

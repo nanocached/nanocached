@@ -249,7 +249,10 @@ public sealed class NotNumericException : NanocachedException
 /// <c>En</c> to a touch means it does not know the command — upgrade
 /// every node to a release that includes it. A bare disconnect with no
 /// <c>En</c> cannot be told apart from any other lost connection and
-/// stays a <see cref="ConnectionLostException"/>.
+/// stays a <see cref="ConnectionLostException"/>, and so does any other
+/// <c>E</c> (issue #939): nanocached-proxy answers a bare <c>E</c> (with the
+/// tag, if any) when a request's outcome is unknown, which is a lost
+/// connection after the frame was written, not an old server.
 /// </summary>
 public class ServerTooOldException : NanocachedException
 {
@@ -291,7 +294,9 @@ public sealed class PartialServerTooOldException<T> : ServerTooOldException
 }
 
 /// <summary>
-/// issue #825 — internal: the node answered <c>E</c> (<c>En</c>). Derives
+/// issue #825 — internal: the node answered <c>En</c> (issue #939: only
+/// that exact line; any other <c>E</c>, such as the proxy's, is a plain
+/// <see cref="ConnectionLostException"/>). Derives
 /// from <see cref="ConnectionLostException"/> so every command other than
 /// touch keeps surfacing exactly what it always did for an unexpected
 /// response; <c>Connection.TouchAsync</c> alone turns it into

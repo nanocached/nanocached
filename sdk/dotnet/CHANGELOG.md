@@ -12,6 +12,12 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- Only a node's `En` to a touch is reported as `ServerTooOldException`.
+  Any other `E` answer to `TouchAsync`, `GetAndTouchAsync`, `TouchManyAsync`
+  or `GetManyAndTouchAsync` (a bare `E`, or the tagged `E <tag>`
+  nanocached-proxy answers when an expiring touch's outcome is unknown) is now
+  a `ConnectionLostException`, as for every other command: a TTL-0 touch is
+  not resent after it, and it no longer tells the caller to upgrade every node.
 - The documentation of `TouchManyAsync`, `GetManyAndTouchAsync` and
   `PartialConnectionLostException<T>` now says that with a TTL of 0 the keys
   a connection failure leaves unresolved include ones whose frame was sent
