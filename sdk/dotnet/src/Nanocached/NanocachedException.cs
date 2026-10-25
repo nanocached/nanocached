@@ -244,7 +244,7 @@ public sealed class NotNumericException : NanocachedException
 /// <c>En</c> cannot be told apart from any other lost connection and
 /// stays a <see cref="ConnectionLostException"/>.
 /// </summary>
-public sealed class ServerTooOldException : NanocachedException
+public class ServerTooOldException : NanocachedException
 {
     /// <summary>The wire command the node did not know: <c>"t"</c> or
     /// <c>"y"</c>.</summary>
@@ -256,6 +256,30 @@ public sealed class ServerTooOldException : NanocachedException
             inner)
     {
         Command = command;
+    }
+}
+
+/// <summary>
+/// Thrown by <c>GetManyAndTouchAsync</c>/<c>GetManyAndTouchBytesAsync</c>
+/// (issue #924) in a cluster when one primary answered <c>En</c> to
+/// <c>y</c> while other primaries had already resolved their keys. A
+/// subclass of <see cref="ServerTooOldException"/>, so existing
+/// <c>catch (ServerTooOldException)</c> handling keeps working unchanged.
+/// <see cref="PartialValues"/> holds every hit that DID resolve — a
+/// <c>Dictionary&lt;string, byte[]&gt;</c> from the bytes form,
+/// <c>Dictionary&lt;string, string&gt;</c> from the string form — which,
+/// with a TTL of 0, were consumed on the nodes that returned them and
+/// cannot be read again. <c>TouchManyAsync</c> has nothing partial worth
+/// attaching and throws a plain <see cref="ServerTooOldException"/>.
+/// </summary>
+public sealed class PartialServerTooOldException<T> : ServerTooOldException
+{
+    public T PartialValues { get; }
+
+    internal PartialServerTooOldException(T partialValues, Exception inner)
+        : base(inner, "y")
+    {
+        PartialValues = partialValues;
     }
 }
 

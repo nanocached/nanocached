@@ -4542,7 +4542,43 @@ public class NanocachedClientTests
         cluster.Nodes[Names[0]].RejectMultiTouchLikeAnOldServer();
 
         Assert.Equal("y", (await Assert.ThrowsAsync<ServerTooOldException>(() => client.TouchManyAsync(keys, 30))).Command);
-        Assert.Equal("y", (await Assert.ThrowsAsync<ServerTooOldException>(() => client.GetManyAndTouchAsync(keys, 30))).Command);
+        // The healthy node's hits ride along (issue #924), so this is the subclass.
+        Assert.Equal("y", (await Assert.ThrowsAnyAsync<ServerTooOldException>(() => client.GetManyAndTouchAsync(keys, 30))).Command);
+    }
+
+    [Fact]
+    public async Task APrimaryThatPredatesBatchTouchHandsBackTheHitsOtherPrimariesReturned()
+    {
+        // GetManyAndTouch(ttl 0) consumes the values the other primaries
+        // return, so an `En` from one primary must not throw them away.
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        List<string> oldKeys = KeysWhosePrimaryIs(Names[0], 2);
+        List<string> newKeys = KeysWhosePrimaryIs(Names[1], 2);
+        List<string> keys = oldKeys.Concat(newKeys).ToList();
+        await client.SetManyAsync(ValuesFor(keys));
+        cluster.Nodes[Names[0]].RejectMultiTouchLikeAnOldServer();
+        Dictionary<string, string> expected = ValuesFor(newKeys);
+
+        var strings = await Assert.ThrowsAsync<PartialServerTooOldException<Dictionary<string, string>>>(
+            () => client.GetManyAndTouchAsync(keys, 0));
+        Assert.Equal("y", strings.Command);
+        Assert.Equal(expected, strings.PartialValues);
+        Assert.NotNull(strings.InnerException);
+        // The TTL-0 call above consumed them: this is the loss.
+        Assert.Empty(await client.GetManyAsync(newKeys));
+        await client.SetManyAsync(ValuesFor(keys));
+
+        var bytes = await Assert.ThrowsAsync<PartialServerTooOldException<Dictionary<string, byte[]>>>(
+            () => client.GetManyAndTouchBytesAsync(keys, 30));
+        Assert.Equal(expected.Keys.OrderBy(k => k), bytes.PartialValues.Keys.OrderBy(k => k));
+        foreach (string key in newKeys) Assert.Equal(Bytes(expected[key]), bytes.PartialValues[key]);
+
+        // A plain touch has nothing partial worth attaching, and a call where
+        // nothing resolved elsewhere throws the bare error.
+        await Assert.ThrowsAsync<ServerTooOldException>(() => client.TouchManyAsync(keys, 30));
+        await Assert.ThrowsAsync<ServerTooOldException>(() => client.GetManyAndTouchAsync(oldKeys, 30));
     }
 
     [Fact]
@@ -4564,7 +4600,7 @@ public class NanocachedClientTests
         // already dead answers without sending anything.
         await Assert.ThrowsAsync<ServerTooOldException>(() => client.TouchManyAsync(keys, 30));
         Assert.True(Asks(false) <= 1);
-        await Assert.ThrowsAsync<ServerTooOldException>(() => client.GetManyAndTouchAsync(keys, 30));
+        await Assert.ThrowsAnyAsync<ServerTooOldException>(() => client.GetManyAndTouchAsync(keys, 30));
         Assert.True(Asks(true) <= 1);
     }
 

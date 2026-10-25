@@ -10,6 +10,15 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- In a cluster, `GetManyAndTouchAsync` no longer discards the hits other
+  primaries returned when one primary answers `En` to `y`. It throws
+  `PartialServerTooOldException<T>`, a `ServerTooOldException` subclass, with
+  them in `PartialValues`; with a TTL of 0 they were consumed on the nodes
+  and could not be read again. `ServerTooOldException` is no longer
+  `sealed`. `TouchManyAsync` still throws the plain exception.
+
 ### Added
 
 - `TouchAsync(key, ttlSeconds)` replaces an entry's TTL in place and
