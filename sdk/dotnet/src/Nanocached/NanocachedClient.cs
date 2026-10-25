@@ -3890,6 +3890,15 @@ public sealed class NanocachedClient : IDisposable
             {
                 return await op(await SlotConnectionAsync(slot).ConfigureAwait(false)).ConfigureAwait(false);
             }
+            // Issue #936: a retry that provably sent nothing (the redial
+            // itself failed to dial, or the write failed) is thrown plain,
+            // like the first attempt's not-sent failure: nothing reached
+            // any node, so WithClusterRetryAsync may refresh and reroute
+            // it around a dead primary.
+            catch (ConnectionLostException retryError) when (retryError.RequestNotSent)
+            {
+                throw;
+            }
             catch (ConnectionLostException retryError)
             {
                 // The redial's own attempt failed too — whatever the
@@ -4551,8 +4560,14 @@ public sealed class NanocachedClient : IDisposable
         catch (Exception error) when (error is IOException or System.Net.Sockets.SocketException
             or AuthenticationException)
         {
+            // A dial that failed sent nothing, so it is marked not-sent as
+            // the first connect already does (issue #936): the not-sent
+            // retry paths (Incr/CAS, an expiring touch, the batch touch)
+            // may then refresh the roster and reroute instead of treating
+            // the dead node as one that might have applied the request.
+            // DialWithCooldownAsync replays this same object.
             throw new ConnectionLostException(
-                $"nanocached: could not connect to {address}: {error.Message}", error);
+                $"nanocached: could not connect to {address}: {error.Message}", error, requestNotSent: true);
         }
 
         if (identified is not Identify.NodeTarget node)

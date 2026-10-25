@@ -12,6 +12,13 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- A failed redial of a dead node is now marked request-not-sent, as the
+  first connect already did. `TouchAsync(key, 0)`, `GetAndTouchAsync(key, 0)`,
+  `TouchManyAsync(keys, 0)`, `GetManyAndTouchAsync(keys, 0)`, `IncrAsync`
+  and the compare-and-set family used to throw `ConnectionLostException`
+  ("could not connect") when the key's primary was dead and already dropped
+  from the roster, instead of refreshing the roster and rerouting to the
+  surviving owner as a TTL of 30 or a removed TTL already did.
 - In a cluster, `GetManyAndTouchAsync` no longer discards the hits other
   primaries returned when one primary answers `En` to `y`. It throws
   `PartialServerTooOldException<T>`, a `ServerTooOldException` subclass, with
