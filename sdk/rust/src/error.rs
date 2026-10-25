@@ -123,6 +123,22 @@ pub enum Error {
     /// [`Self::PartialWrongNode`]'s own map has been decoded the same
     /// way a successful `get_many` decodes `get_many_bytes`' own result.
     PartialWrongNodeText(HashMap<String, String>),
+    /// `get_many_and_touch_bytes` (issue #924) in a cluster when one
+    /// primary answered `En` to `y` while other primaries had already
+    /// resolved their keys: [`Self::ServerTooOld`] with the hits that DID
+    /// resolve attached. With `Some(0)` those values were consumed on the
+    /// nodes that returned them and cannot be read again, so they are not
+    /// dropped. Code that matches [`Self::ServerTooOld`] to detect a node
+    /// that predates `y` must match this and
+    /// [`Self::PartialServerTooOldText`] too. `touch_many` has nothing
+    /// partial worth attaching and returns the plain
+    /// [`Self::ServerTooOld`], as does a call where nothing resolved
+    /// elsewhere.
+    PartialServerTooOld(HashMap<String, Vec<u8>>),
+    /// As [`Self::PartialServerTooOld`], but returned by
+    /// `get_many_and_touch` — the UTF-8-decoded counterpart (see
+    /// [`Self::PartialWrongNodeText`]).
+    PartialServerTooOldText(HashMap<String, String>),
     /// `get_many`/`get_many_bytes` when a connection loss left part of
     /// the batch unresolved while another part did resolve. In
     /// single-node/proxy mode (issue #411): a chunked batch (issue #222)
@@ -196,6 +212,11 @@ impl fmt::Display for Error {
             }
             #[cfg(feature = "compression")]
             Error::Decompression(message) => write!(f, "{message}"),
+            Error::PartialServerTooOld(_) | Error::PartialServerTooOldText(_) => write!(
+                f,
+                "nanocached: the server does not know the batched touch command (y) — \
+                 upgrade every node to a release that includes it (the keys that did resolve are attached)"
+            ),
             Error::PartialWrongNode(_) | Error::PartialWrongNodeText(_) => write!(
                 f,
                 "nanocached: some keys in this batch are still wrong-node after a refresh-and-retry"

@@ -5251,8 +5251,60 @@ async fn a_primary_that_predates_batch_touch_is_server_too_old_not_a_connection_
         client.touch_many(&keys, Some(30)).await,
         Err(Error::ServerTooOld { command: "y" })
     ));
+    // The healthy node's hits ride along (issue #924), so this is the
+    // partial form.
     assert!(matches!(
         client.get_many_and_touch(&keys, Some(30)).await,
+        Err(Error::PartialServerTooOldText(_))
+    ));
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn a_primary_that_predates_batch_touch_hands_back_the_hits_other_primaries_returned() {
+    // `get_many_and_touch(Some(0))` consumes the values the other primaries
+    // return, so an `En` from one primary must not throw them away.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let old_keys = keys_whose_primary_is(NAMES[0], 2);
+    let new_keys = keys_whose_primary_is(NAMES[1], 2);
+    let keys = concat(&old_keys, &new_keys);
+    client.set_many(&values_for(&keys), 0).await.unwrap();
+    node_named(&nodes, NAMES[0])
+        .state
+        .reject_multi_touch
+        .store(true, Ordering::SeqCst);
+    let expected = values_for(&new_keys);
+
+    match client.get_many_and_touch(&keys, Some(0)).await {
+        Err(Error::PartialServerTooOldText(partial)) => assert_eq!(partial, expected),
+        other => panic!("want PartialServerTooOldText, got {other:?}"),
+    }
+    // The `Some(0)` call above consumed them: this is the loss.
+    assert!(client.get_many(&new_keys).await.unwrap().is_empty());
+    client.set_many(&values_for(&keys), 0).await.unwrap();
+
+    match client.get_many_and_touch_bytes(&keys, Some(30)).await {
+        Err(Error::PartialServerTooOld(partial)) => {
+            assert_eq!(partial.len(), new_keys.len());
+            for key in &new_keys {
+                assert_eq!(partial[key], expected[key].as_bytes());
+            }
+        }
+        other => panic!("want PartialServerTooOld, got {other:?}"),
+    }
+
+    // A plain touch has nothing partial worth attaching, and a call where
+    // nothing resolved elsewhere returns the bare error.
+    assert!(matches!(
+        client.touch_many(&keys, Some(30)).await,
+        Err(Error::ServerTooOld { command: "y" })
+    ));
+    assert!(matches!(
+        client.get_many_and_touch(&old_keys, Some(30)).await,
         Err(Error::ServerTooOld { command: "y" })
     ));
 
@@ -5288,7 +5340,7 @@ async fn a_batch_touch_asks_a_node_that_predates_y_at_most_once() {
     assert!(asks(false) <= 1);
     assert!(matches!(
         client.get_many_and_touch(&keys, Some(30)).await,
-        Err(Error::ServerTooOld { command: "y" })
+        Err(Error::PartialServerTooOldText(_))
     ));
     assert!(asks(true) <= 1);
 

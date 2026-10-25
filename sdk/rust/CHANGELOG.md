@@ -8,6 +8,14 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Fixed
 
+- In a cluster, `get_many_and_touch` no longer discards the hits other
+  primaries returned when one primary answers `En` to `y`. It returns the new
+  `Error::PartialServerTooOldText` (`get_many_and_touch_bytes`:
+  `PartialServerTooOld`) with them attached; with `Some(0)` they were
+  consumed on the nodes and could not be read again. Code that matches
+  `Error::ServerTooOld` to detect an old node must match these as well, and
+  an exhaustive `match` on `Error` needs the two new arms. `touch_many` still
+  returns the plain error.
 - A `Some(0)` touch (`touch`, `get_and_touch`, `touch_many`,
   `get_many_and_touch`) is no longer sent again after a reply that cannot be
   matched to it: a reply of the wrong kind, a roster of the wrong length, or

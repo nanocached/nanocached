@@ -371,7 +371,12 @@ resolve (`get_many_and_touch_bytes` returns `PartialWrongNode` /
 `touch_many` carries no partial result: it returns a plain `Error::WrongNode`
 or the connection error, and since a touch is idempotent the whole batch can
 simply be sent again. Against a node that has `t` but not `y` both return
-`Error::ServerTooOld { command: "y" }`.
+`Error::ServerTooOld { command: "y" }`; in a cluster, when other primaries
+had already answered, `get_many_and_touch` returns
+`Error::PartialServerTooOldText` instead (`get_many_and_touch_bytes`:
+`PartialServerTooOld`) with their hits attached. With `Some(0)` those values
+are consumed, so they are not read again. Code that matches `ServerTooOld` to
+spot an old node must match these too.
 
 ## Namespaces
 
