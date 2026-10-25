@@ -3857,6 +3857,84 @@ public class NanocachedClientTests
         await Assert.ThrowsAsync<ConnectionLostException>(() => client.IncrAsync("counter", 5));
     }
 
+    // Issue #901: ttl 0 expires the entry, so a resend after the node applied
+    // it (reply lost) finds the key gone.
+
+    [Fact]
+    public async Task AnExpiringTouchWhoseReplyWasLostIsNotResent()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        const string key = "shared-key";
+        MockNode primary = cluster.Nodes[new HashRing(Names).Owners(Encoding.UTF8.GetBytes(key), 2)[0]];
+
+        await client.SetAsync(key, "payload", 100);
+        primary.FailTouchAfterApplyOnce();
+        await Assert.ThrowsAsync<ConnectionLostException>(() => client.TouchAsync(key, 0));
+        Assert.Single(primary.TouchFrames); // the applied touch was not sent again
+    }
+
+    [Fact]
+    public async Task AnExpiringGetAndTouchWhoseReplyWasLostIsNotResent()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        const string key = "shared-key";
+        MockNode primary = cluster.Nodes[new HashRing(Names).Owners(Encoding.UTF8.GetBytes(key), 2)[0]];
+
+        await client.SetAsync(key, "payload", 100);
+        primary.FailTouchAfterApplyOnce();
+        await Assert.ThrowsAsync<ConnectionLostException>(() => client.GetAndTouchAsync(key, 0));
+        Assert.Single(primary.TouchFrames);
+    }
+
+    [Fact]
+    public async Task AnExpiringTouchOnASingleNodeIsNotResentAfterALostReply()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "payload", 100);
+        node.FailTouchAfterApplyOnce();
+        await Assert.ThrowsAsync<ConnectionLostException>(() => client.GetAndTouchAsync("k", 0));
+        Assert.Single(node.TouchFrames);
+    }
+
+    [Fact]
+    public async Task AnExpiringTouchStillRetriesARequestThatWasNeverSent()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        const string key = "shared-key";
+        MockNode primary = cluster.Nodes[new HashRing(Names).Owners(Encoding.UTF8.GetBytes(key), 2)[0]];
+
+        await client.SetAsync(key, "payload", 100);
+        primary.AnswerWrongNodeOnce();
+        Assert.Equal("payload", await client.GetAndTouchAsync(key, 0));
+        Assert.Equal(2, primary.TouchFrames.Count); // the W answer was followed by one resend
+
+        await client.SetAsync(key, "payload", 100);
+        primary.AnswerWrongNodeOnce();
+        Assert.True(await client.TouchAsync(key, 0));
+        Assert.Equal(4, primary.TouchFrames.Count);
+    }
+
+    [Fact]
+    public async Task ATouchThatRemovesTheTtlIsStillResentAfterALostReply()
+    {
+        // Only ttl 0 changed: null (remove the TTL) is not "expire now".
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v", 100);
+        node.FailTouchAfterApplyOnce();
+        Assert.True(await client.TouchAsync("k", null));
+        Assert.Equal(2, node.TouchFrames.Count);
+    }
+
     // A touch fans out to every owner like a set; get-and-touch asks the
     // primary alone for the value.
 
@@ -4367,6 +4445,64 @@ public class NanocachedClientTests
         Dictionary<string, bool> touched = await client.TouchManyAsync(keys, 30);
         Assert.All(touched.Values, Assert.True);
         Assert.Equal(2, nodeA.MultiTouchFrames.Count);
+    }
+
+    [Fact]
+    public async Task AnExpiringBatchTouchWhoseReplyWasLostIsNotResent()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        MockNode nodeA = cluster.Nodes[Names[0]];
+        List<string> all = KeysWhosePrimaryIs(Names[0], 3).Concat(KeysWhosePrimaryIs(Names[1], 3)).ToList();
+        await client.SetManyAsync(ValuesFor(all));
+
+        nodeA.FailTouchAfterApplyOnce();
+        NanocachedException failure = await Assert.ThrowsAsync<ConnectionLostException>(
+            () => client.TouchManyAsync(all, 0));
+        Assert.IsNotType<WrongNodeException>(failure);
+        Assert.Single(nodeA.MultiTouchFrames); // the applied frame was not sent again
+    }
+
+    [Fact]
+    public async Task AnExpiringGetManyAndTouchWhoseReplyWasLostIsNotResent()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        MockNode nodeA = cluster.Nodes[Names[0]];
+        List<string> keysB = KeysWhosePrimaryIs(Names[1], 3);
+        List<string> all = KeysWhosePrimaryIs(Names[0], 3).Concat(keysB).ToList();
+        await client.SetManyAsync(ValuesFor(all));
+
+        nodeA.FailTouchAfterApplyOnce();
+        PartialConnectionLostException<Dictionary<string, string>> failure =
+            await Assert.ThrowsAsync<PartialConnectionLostException<Dictionary<string, string>>>(
+                () => client.GetManyAndTouchAsync(all, 0));
+        Assert.Equal(ValuesFor(keysB), failure.PartialValues); // the other primary's hits are kept
+        Assert.Single(nodeA.MultiTouchFrames);
+    }
+
+    [Fact]
+    public async Task AnExpiringBatchTouchStillRetriesKeysThatWereNeverSent()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        MockNode nodeA = cluster.Nodes[Names[0]];
+        List<string> all = KeysWhosePrimaryIs(Names[0], 3).Concat(KeysWhosePrimaryIs(Names[1], 3)).ToList();
+        Dictionary<string, string> values = ValuesFor(all);
+        await client.SetManyAsync(values);
+
+        nodeA.AnswerWrongNodeOnce();
+        Dictionary<string, bool> touched = await client.TouchManyAsync(all, 0);
+        Assert.Equal(6, touched.Count);
+        Assert.All(touched.Values, Assert.True);
+        Assert.Equal(2, nodeA.MultiTouchFrames.Count); // the keys A answered W for were sent again
+
+        await client.SetManyAsync(values);
+        nodeA.AnswerWrongNodeOnce();
+        Assert.Equal(values, await client.GetManyAndTouchAsync(all, 0));
     }
 
     [Fact]

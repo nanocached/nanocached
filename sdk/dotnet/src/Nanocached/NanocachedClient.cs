@@ -1433,10 +1433,19 @@ public sealed class NanocachedClient : IDisposable
     {
         public IReadOnlyList<Connection.MultiEntry> CompletedEntries { get; }
 
-        public ChunkedBatchInterruptedException(IReadOnlyList<Connection.MultiEntry> completedEntries, Exception inner)
+        /// <summary>issue #901: how many leading keys of the call the
+        /// failed request may have reached the node with — 0 unless it was
+        /// an expiring (<c>ttl == 0</c>) touch whose frame may have been
+        /// applied, in which case the unresolved keys below this index
+        /// must not be resent.</summary>
+        public int SentEnd { get; }
+
+        public ChunkedBatchInterruptedException(
+            IReadOnlyList<Connection.MultiEntry> completedEntries, Exception inner, int sentEnd = 0)
             : base(inner.Message, inner)
         {
             CompletedEntries = completedEntries;
+            SentEnd = sentEnd;
         }
     }
 
@@ -1468,7 +1477,8 @@ public sealed class NanocachedClient : IDisposable
     /// chunking, since both carry only keys).</summary>
     private async Task<List<Connection.MultiEntry>> MultiKeysChunkedAsync(
         string? slot, byte[] namespaceBytes, byte[][] keys,
-        Func<Connection, IReadOnlyList<byte[]>, Task<List<Connection.MultiEntry>>> send)
+        Func<Connection, IReadOnlyList<byte[]>, Task<List<Connection.MultiEntry>>> send,
+        bool expiring = false)
     {
         var entries = new List<Connection.MultiEntry>(new Connection.MultiEntry[keys.Length]);
         int start = 0;
@@ -1487,8 +1497,18 @@ public sealed class NanocachedClient : IDisposable
             List<Connection.MultiEntry> chunkEntries;
             try
             {
-                chunkEntries = await ApplyReconnectingAsync(
-                    slot, connection => send(connection, chunk)).ConfigureAwait(false);
+                chunkEntries = expiring
+                    ? await ApplyReconnectingUnlessSentAsync(
+                        slot, connection => send(connection, chunk)).ConfigureAwait(false)
+                    : await ApplyReconnectingAsync(
+                        slot, connection => send(connection, chunk)).ConfigureAwait(false);
+            }
+            catch (UnsafeToReplayException sent)
+            {
+                // issue #901: an expiring touch whose frame may have been
+                // applied. The failed chunk's keys must not be resent;
+                // later chunks were never sent.
+                throw new ChunkedBatchInterruptedException(entries.GetRange(0, start), sent.Unwrap(), end);
             }
             catch (Exception error) when (start > 0 && (error is NanocachedException or IOException
                 or System.Net.Sockets.SocketException or ObjectDisposedException))
@@ -1751,7 +1771,14 @@ public sealed class NanocachedClient : IDisposable
     /// <para>Unlike INCR and the compare-and-set family a touch is
     /// idempotent, so a request whose reply was lost is retried like
     /// get/set/delete are, never thrown as
-    /// <see cref="ConnectionLostException"/>. In a cluster it goes to every
+    /// <see cref="ConnectionLostException"/> — with one exception (issue
+    /// #901): 0 expires the entry, so a resend after the node already
+    /// applied it would answer <c>false</c> for a key that existed. With
+    /// <paramref name="ttlSeconds"/> 0 the request is retried only when it
+    /// provably never reached the wire (a wrong-node answer, a failed dial,
+    /// a connection already known dead); a connection lost after it was
+    /// sent throws <see cref="ConnectionLostException"/>, as Incr does, and
+    /// the entry may or may not have expired. In a cluster it goes to every
     /// owner, like a set, and the primary's answer is returned. Throws
     /// <see cref="ServerTooOldException"/> against a node that predates the
     /// command.</para></summary>
@@ -1773,9 +1800,21 @@ public sealed class NanocachedClient : IDisposable
         ValidateTouchTtl(ttlSeconds);
         ValidateKey(namespaceBytes, key);
         await BeforeOperationAsync().ConfigureAwait(false);
-        return await WithClusterRetryAsync(
-            () => WriteAsync(namespaceBytes, key, connection => connection.TouchAsync(namespaceBytes, key, ttlSeconds)))
-            .ConfigureAwait(false);
+        bool replaySafe = ttlSeconds != 0;
+        try
+        {
+            return await WithClusterRetryAsync(
+                () => WriteAsync(
+                    namespaceBytes, key, connection => connection.TouchAsync(namespaceBytes, key, ttlSeconds),
+                    replaySafe: replaySafe))
+                .ConfigureAwait(false);
+        }
+        catch (UnsafeToReplayException error)
+        {
+            // issue #901: the touch may already have been applied and
+            // expired the key — surface the connection loss, never resend.
+            throw error.Unwrap();
+        }
     }
 
     /// <summary>Reads a value and replaces its TTL in one step (issue
@@ -1789,7 +1828,12 @@ public sealed class NanocachedClient : IDisposable
     /// failure; no hedging, and no fallback to a replica on a miss) and the
     /// other owners are sent the plain touch, so a replica is never the
     /// only owner touched. It counts as a read on the primary, which makes
-    /// the entry the most recently used.</para></summary>
+    /// the entry the most recently used.</para>
+    ///
+    /// <para>With <paramref name="ttlSeconds"/> 0 a connection lost after
+    /// the request was sent throws <see cref="ConnectionLostException"/>
+    /// instead of being resent (issue #901): the node may have expired the
+    /// entry and consumed its value, and a resend would report a miss.</para></summary>
     public Task<string?> GetAndTouchAsync(string key, long? ttlSeconds) =>
         GetAndTouchAsync(EmptyNamespace, key, ttlSeconds);
 
@@ -1824,13 +1868,25 @@ public sealed class NanocachedClient : IDisposable
         ValidateTouchTtl(ttlSeconds);
         ValidateKey(namespaceBytes, key);
         await BeforeOperationAsync().ConfigureAwait(false);
-        byte[]? raw = await WithClusterRetryAsync(() => WriteAsync(
-            namespaceBytes, key,
-            connection => connection.GetAndTouchAsync(namespaceBytes, key, ttlSeconds),
-            // A replica is sent the plain touch: it has no value to return,
-            // and `G` there would only move the value over the wire for nothing.
-            connection => connection.TouchAsync(namespaceBytes, key, ttlSeconds)))
-            .ConfigureAwait(false);
+        bool replaySafe = ttlSeconds != 0;
+        byte[]? raw;
+        try
+        {
+            raw = await WithClusterRetryAsync(() => WriteAsync(
+                namespaceBytes, key,
+                connection => connection.GetAndTouchAsync(namespaceBytes, key, ttlSeconds),
+                // A replica is sent the plain touch: it has no value to return,
+                // and `G` there would only move the value over the wire for nothing.
+                connection => connection.TouchAsync(namespaceBytes, key, ttlSeconds),
+                replaySafe))
+                .ConfigureAwait(false);
+        }
+        catch (UnsafeToReplayException error)
+        {
+            // issue #901: the value may already have been consumed by the
+            // node — surface the connection loss, never resend.
+            throw error.Unwrap();
+        }
         return raw is null || !_compress ? raw : Compression.DecompressValue(raw, _inflateBudget);
     }
 
@@ -1859,7 +1915,11 @@ public sealed class NanocachedClient : IDisposable
     /// I/O.
     ///
     /// <para>Like <c>TouchAsync</c> it is idempotent, so a request whose
-    /// reply was lost is retried, and in a cluster it goes to every owner
+    /// reply was lost is retried — except with <paramref name="ttlSeconds"/>
+    /// 0 (issue #901), where a primary whose connection fails after the
+    /// frame may have been applied is not resent: its keys are reported as
+    /// that connection failure instead of being read as missing, every
+    /// other key having been touched. In a cluster it goes to every owner
     /// of a key, the primary's answer being the key's. A replica's failure
     /// or <c>W</c> is counted in <c>Stats().ReplicaWriteFailures</c> and
     /// never fails the batch. Larger batches are transparently split into
@@ -1924,7 +1984,11 @@ public sealed class NanocachedClient : IDisposable
     /// connection error when nothing resolved), each carrying the keys
     /// that did resolve. Unlike <c>GetManyAsync</c> a key is not tried on
     /// its next owner when its primary is down — a replica's answer would
-    /// leave the primary untouched.</para></summary>
+    /// leave the primary untouched. With <paramref name="ttlSeconds"/> 0 a
+    /// primary whose connection fails after the frame may have been applied
+    /// is not resent (issue #901): it may have expired and consumed its
+    /// values already, so those keys throw at once instead of reading as
+    /// misses.</para></summary>
     public Task<Dictionary<string, string>> GetManyAndTouchAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
         GetManyAndTouchAsync(EmptyNamespace, keys, ttlSeconds);
 
@@ -2046,6 +2110,11 @@ public sealed class NanocachedClient : IDisposable
     {
         public readonly Dictionary<int, Connection.MultiEntry> Results = new();
         public readonly HashSet<int> WrongNode = new();
+        /// <summary>issue #901: positions a <c>ttl == 0</c> call must not
+        /// resend — their primary leg failed after the frame may have been
+        /// applied, so a resend would report them missing (and, with
+        /// <c>get</c>, lose the values it consumed).</summary>
+        public readonly HashSet<int> Lost = new();
         public Exception? LastCause;
         public ServerTooOldException? Rejected;
     }
@@ -2134,9 +2203,13 @@ public sealed class NanocachedClient : IDisposable
         lock (state)
         {
             foreach ((int idx, Connection.MultiEntry entry) in state.Results) answers[idx] = entry;
+            // A key that was sent and lost its connection is a connection
+            // failure, whatever the others did (issue #901).
+            retry.AddRange(state.Lost);
             retry.Sort();
             return new MultiTouchOutcome(
-                answers, retry, retry.Any(state.WrongNode.Contains), state.LastCause, state.Rejected);
+                answers, retry, state.Lost.Count == 0 && retry.Any(state.WrongNode.Contains), state.LastCause,
+                state.Rejected);
         }
     }
 
@@ -2147,7 +2220,8 @@ public sealed class NanocachedClient : IDisposable
         string? slot, byte[] namespaceBytes, byte[][] keys, long? ttlSeconds, bool get) =>
         MultiKeysChunkedAsync(
             slot, namespaceBytes, keys,
-            (connection, chunk) => connection.MultiTouchAsync(namespaceBytes, chunk, ttlSeconds, get));
+            (connection, chunk) => connection.MultiTouchAsync(namespaceBytes, chunk, ttlSeconds, get),
+            expiring: ttlSeconds == 0);
 
     /// <summary>One pass of <see cref="MultiTouchAsync"/>'s cluster
     /// routing: every key still needing resolution (every key when
@@ -2268,6 +2342,7 @@ public sealed class NanocachedClient : IDisposable
 
         IReadOnlyList<Connection.MultiEntry?> entries;
         Exception? failure = null;
+        int sentEnd = 0;
         try
         {
             entries = (await MultiTouchChunkedAsync(leg.Owner, namespaceBytes, groupKeys, ttlSeconds, leg.Get)
@@ -2277,6 +2352,7 @@ public sealed class NanocachedClient : IDisposable
         {
             entries = partial.CompletedEntries.Select(entry => (Connection.MultiEntry?)entry).ToList();
             failure = partial.InnerException;
+            sentEnd = partial.SentEnd;
         }
         catch (Exception error) when (error is NanocachedException or IOException
             or System.Net.Sockets.SocketException or ObjectDisposedException)
@@ -2317,6 +2393,12 @@ public sealed class NanocachedClient : IDisposable
                 {
                     if (entry is null) state.WrongNode.Remove(idx);
                     else state.WrongNode.Add(idx);
+                    if (entry is null && i < sentEnd)
+                    {
+                        // issue #901: sent, then the connection was lost.
+                        state.Lost.Add(idx);
+                        continue;
+                    }
                 }
                 lock (retry) retry.Add(idx);
             }
@@ -3804,6 +3886,30 @@ public sealed class NanocachedClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// issue #901 — <see cref="ApplyReconnectingNotIdempotentAsync{T}"/>
+    /// for a touch whose TTL expires the entry: a resend after the node
+    /// applied it would find the key gone. The same
+    /// <see cref="ConnectionLostException.RequestNotSent"/> boundary as
+    /// Incr/CAS; the one difference is that a failure which is itself
+    /// proof that nothing was sent (a redial that failed too) is thrown
+    /// plain, so <see cref="WithClusterRetryAsync{T}"/> may still refresh
+    /// and route around the dead node, as it always could. Anything that
+    /// may have reached the node stays an <see cref="UnsafeToReplayException"/>,
+    /// which the caller unwraps.
+    /// </summary>
+    private async Task<T> ApplyReconnectingUnlessSentAsync<T>(string? slot, Func<Connection, Task<T>> op)
+    {
+        try
+        {
+            return await ApplyReconnectingNotIdempotentAsync(slot, op).ConfigureAwait(false);
+        }
+        catch (UnsafeToReplayException error) when (error.Unwrap().RequestNotSent)
+        {
+            throw error.Unwrap();
+        }
+    }
+
     private async Task<T> ReadAsync<T>(byte[] namespaceBytes, byte[] key, Func<Connection, Task<T>> op)
     {
         if (_ring is null)
@@ -4041,11 +4147,17 @@ public sealed class NanocachedClient : IDisposable
     /// the result, so a get-and-touch asks just the primary for the value
     /// and sends the others the plain touch.</summary>
     private async Task<T> WriteAsync<T>(
-        byte[] namespaceBytes, byte[] key, Func<Connection, Task<T>> op, Func<Connection, Task>? replicaOp = null)
+        byte[] namespaceBytes, byte[] key, Func<Connection, Task<T>> op, Func<Connection, Task>? replicaOp = null,
+        bool replaySafe = true)
     {
+        // issue #901: with replaySafe false (a touch whose TTL expires the
+        // entry) the primary leg is resent only when its request provably
+        // never reached the wire; the replica legs keep the plain retry.
         if (_ring is null)
         {
-            return await ApplyReconnectingAsync(null, op).ConfigureAwait(false);
+            return replaySafe
+                ? await ApplyReconnectingAsync(null, op).ConfigureAwait(false)
+                : await ApplyReconnectingUnlessSentAsync(null, op).ConfigureAwait(false);
         }
 
         IReadOnlyList<string> names = OwnerNames(namespaceBytes, key);
@@ -4138,7 +4250,9 @@ public sealed class NanocachedClient : IDisposable
         Exception? primaryError = null;
         try
         {
-            result = await ApplyReconnectingAsync(names[0], op).ConfigureAwait(false);
+            result = replaySafe
+                ? await ApplyReconnectingAsync(names[0], op).ConfigureAwait(false)
+                : await ApplyReconnectingUnlessSentAsync(names[0], op).ConfigureAwait(false);
         }
         catch (Exception error)
         {
