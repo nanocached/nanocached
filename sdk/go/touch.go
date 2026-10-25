@@ -20,10 +20,13 @@ const RemoveTTL int64 = -1
 // value is rejected before any I/O (ErrInvalidArgument).
 //
 // Unlike Incr and the compare-and-set family a touch is idempotent, so a
-// request whose reply was lost is retried like Get/Set/Delete are. In a
-// cluster it goes to every owner, like a Set, and the primary's answer is
-// returned. Returns ErrServerTooOld against a node that predates the
-// command.
+// request whose reply was lost is retried like Get/Set/Delete are — with
+// one exception (issue #901): a 0 TTL expires the entry, so a resend after
+// the node already applied it would answer false for a key that existed.
+// That call is retried only when its request was never sent, and a reply
+// lost after the send returns ErrConnectionLost, as Incr does. In a cluster
+// it goes to every owner, like a Set, and the primary's answer is returned.
+// Returns ErrServerTooOld against a node that predates the command.
 func (c *Client) Touch(key string, ttlSeconds int64) (existed bool, err error) {
 	return c.touchNS(nil, key, ttlSeconds)
 }
@@ -38,6 +41,11 @@ func (c *Client) Touch(key string, ttlSeconds int64) (existed bool, err error) {
 // sent the plain touch, so a replica is never the only owner touched. It
 // counts as a read on the primary, which makes the entry the most recently
 // used.
+//
+// With ttlSeconds == 0 a reply lost after the request was sent returns
+// ErrConnectionLost instead of being resent (issue #901): the node may have
+// expired the entry and consumed its value, and a resend would report a
+// miss.
 func (c *Client) GetAndTouch(key string, ttlSeconds int64) (value string, ok bool, err error) {
 	raw, ok, err := c.GetAndTouchBytes(key, ttlSeconds)
 	if err != nil || !ok {
@@ -71,6 +79,22 @@ func touchRejected(err error) error {
 	return err
 }
 
+// touchRetryPolicy picks how Touch/GetAndTouch resend (issue #901). A touch
+// is idempotent, so the default is withClusterRetry/applyReconnecting like
+// Get/Set/Delete — except ttlSeconds == 0 (not RemoveTTL, which is -1),
+// which expires the entry: a resend after the node applied it would find
+// the key gone, so that call uses the Incr family's not-sent boundary
+// instead (withClusterRetryNonIdempotent, applyExpiring).
+func (c *Client) touchRetryPolicy(ttlSeconds int64) (
+	retry func(func() error) error,
+	applyPrimary func(slot string, op func(*connection) error) error,
+) {
+	if ttlSeconds == 0 {
+		return c.withClusterRetryNonIdempotent, c.applyExpiring
+	}
+	return c.withClusterRetry, c.applyReconnecting
+}
+
 // touchNS is Touch scoped to namespace — see getBytesNS's doc comment; the
 // same internal (namespace, key) entry point a *Namespace handle's Touch
 // forwards to.
@@ -85,8 +109,9 @@ func (c *Client) touchNS(namespace []byte, key string, ttlSeconds int64) (existe
 		return false, err
 	}
 	keyBytes := []byte(key)
-	err = c.withClusterRetry(func() error {
-		return c.write(namespace, keyBytes, func(conn *connection, primary bool) error {
+	retry, applyPrimary := c.touchRetryPolicy(ttlSeconds)
+	err = retry(func() error {
+		return c.writeWith(namespace, keyBytes, func(conn *connection, primary bool) error {
 			e, opErr := conn.touchNS(namespace, keyBytes, ttlSeconds)
 			// Only the primary's answer decides, and only the primary leg
 			// may write `existed` — see deleteNS.
@@ -94,7 +119,7 @@ func (c *Client) touchNS(namespace []byte, key string, ttlSeconds int64) (existe
 				existed = e
 			}
 			return opErr
-		})
+		}, applyPrimary)
 	})
 	return existed, touchRejected(err)
 }
@@ -111,9 +136,10 @@ func (c *Client) getAndTouchBytesNS(namespace []byte, key string, ttlSeconds int
 		return nil, false, err
 	}
 	keyBytes := []byte(key)
-	err = c.withClusterRetry(func() error {
+	retry, applyPrimary := c.touchRetryPolicy(ttlSeconds)
+	err = retry(func() error {
 		value, ok = nil, false
-		return c.write(namespace, keyBytes, func(conn *connection, primary bool) error {
+		return c.writeWith(namespace, keyBytes, func(conn *connection, primary bool) error {
 			if !primary {
 				// A replica is sent the plain touch: it has no value to
 				// return, and `G` there would only move the value over the
@@ -124,7 +150,7 @@ func (c *Client) getAndTouchBytesNS(namespace []byte, key string, ttlSeconds int
 			v, found, opErr := conn.getAndTouchNS(namespace, keyBytes, ttlSeconds)
 			value, ok = v, found
 			return opErr
-		})
+		}, applyPrimary)
 	})
 	if err != nil {
 		return nil, false, touchRejected(err)
