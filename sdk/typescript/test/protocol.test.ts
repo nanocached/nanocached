@@ -11,6 +11,7 @@ import {
   encodeIncr,
   encodeMultiGet,
   encodeMultiSet,
+  encodeMultiTouch,
   encodeSet,
   encodeTouch,
   MAX_REQUEST_BYTES,
@@ -20,6 +21,7 @@ import {
   peekMultiFrameLength,
   tryParseResponse,
 } from "../src/protocol.js";
+import { NanocachedError } from "../src/errors.js";
 
 const NS = Buffer.from("users");
 
@@ -489,6 +491,72 @@ describe("encodeTouch (issue #825)", () => {
     for (const bad of [-1, 1.5, NaN, Infinity, 1e21, undefined as unknown as number, "5" as unknown as number]) {
       assert.throws(() => encodeTouch(key, bad, false), RangeError, String(bad));
     }
+  });
+});
+
+describe("encodeMultiTouch (issue #871)", () => {
+  const keys = [Buffer.from("a"), Buffer.from("bb")];
+
+  it("frames every combination of ttl and get; null sends no TTL field and 0 is sent", () => {
+    assert.deepEqual(encodeMultiTouch(keys, null, false), Buffer.from("y 0 2 1 2\nabb"));
+    assert.deepEqual(encodeMultiTouch(keys, 30, false), Buffer.from("y 0 2 1 2 30\nabb"));
+    assert.deepEqual(encodeMultiTouch(keys, 0, false), Buffer.from("y 0 2 1 2 0\nabb"));
+    assert.deepEqual(encodeMultiTouch(keys, null, true), Buffer.from("y 0 2 1 2 G\nabb"));
+    assert.deepEqual(encodeMultiTouch(keys, 30, true), Buffer.from("y 0 2 1 2 30 G\nabb"));
+  });
+
+  it("carries the namespace and the tag last", () => {
+    assert.deepEqual(encodeMultiTouch([Buffer.from("k")], 30, true, 7, NS), Buffer.from("y 5 1 1 30 G 7\nusersk"));
+    assert.deepEqual(encodeMultiTouch([Buffer.from("k")], null, false, 7), Buffer.from("y 0 1 1 7\nk"));
+  });
+
+  it("rejects no keys, an empty key, and a bad TTL before anything is written", () => {
+    assert.throws(() => encodeMultiTouch([], 30, false), RangeError);
+    assert.throws(() => encodeMultiTouch([Buffer.alloc(0)], 30, false), RangeError);
+    for (const bad of [-1, 1.5, NaN, Infinity, undefined as unknown as number, "5" as unknown as number]) {
+      assert.throws(() => encodeMultiTouch(keys, bad, false), RangeError, String(bad));
+    }
+  });
+
+  it("rejects keys whose frame cannot fit the request cap", () => {
+    const big = [Buffer.alloc(MAX_REQUEST_BYTES / 2), Buffer.alloc(MAX_REQUEST_BYTES / 2)];
+    assert.throws(() => encodeMultiTouch(big, 30, false), RangeError);
+  });
+});
+
+describe("tryParseResponse for a batched touch's Y reply (issue #871)", () => {
+  it("parses touched, missing and wrong-node tokens", () => {
+    assert.deepEqual(tryParseResponse(Buffer.from("Y 3 S N W\n")), {
+      response: {
+        kind: "multiTouch",
+        touchEntries: [{ kind: "touched" }, { kind: "missing" }, { kind: "wrongNode" }],
+        tag: undefined,
+      },
+      consumed: 10,
+    });
+  });
+
+  it("parses a tagged reply", () => {
+    const parsed = tryParseResponse(Buffer.from("Y 2 N S 9\n"), true);
+    assert.equal(parsed?.response.tag, 9);
+    assert.deepEqual(parsed?.response.touchEntries, [{ kind: "missing" }, { kind: "touched" }]);
+  });
+
+  it("waits for the rest of an incomplete header", () => {
+    assert.equal(tryParseResponse(Buffer.from("Y 3 S N")), null);
+  });
+
+  it("rejects a token a touch never answers, and a roster whose count does not match", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("Y 1 -\n")), NanocachedError);
+    assert.throws(() => tryParseResponse(Buffer.from("Y 3 S S\n")), NanocachedError);
+  });
+
+  it("leaves the multi-set reply's tokens as S and W only", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("O 1 N\n")), NanocachedError);
+  });
+
+  it("has no body, so its frame length is its header's", () => {
+    assert.equal(peekMultiFrameLength(Buffer.from("Y 3 S N W\nextra"), false), 10);
   });
 });
 

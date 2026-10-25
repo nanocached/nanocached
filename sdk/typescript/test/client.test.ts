@@ -4032,6 +4032,519 @@ describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
   });
 });
 
+describe("NanocachedClient touchMany/getManyAndTouch against a single node (issue #871)", () => {
+  async function withClient(
+    run: (client: NanocachedClient, node: MockNode) => Promise<void>,
+    nodeOptions: Parameters<typeof startMockNode>[0] = {},
+    clientOptions: { compress?: boolean; compressionThreshold?: number } = {},
+  ): Promise<void> {
+    const node = await startMockNode(nodeOptions);
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }], ...clientOptions });
+      try {
+        await run(client, node);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  }
+
+  it("touchMany replaces every TTL and reports which keys existed", async () => {
+    await withClient(async (client, node) => {
+      await client.setMany({ a: "1", b: "2" }, 10);
+      assert.deepEqual(
+        await client.touchMany(["a", "missing", "b"], 100),
+        new Map([
+          ["a", true],
+          ["missing", false],
+          ["b", true],
+        ]),
+      );
+      assert.equal(node.ttlOf("a"), 100);
+      assert.equal(node.ttlOf("b"), 100);
+      // A touch never creates a key.
+      assert.equal(node.store.has("missing"), false);
+      // One plain frame for the whole batch.
+      assert.deepEqual(node.multiTouchFrames(), [{ namespace: "", keys: ["a", "missing", "b"], ttl: 100, get: false }]);
+      assert.deepEqual(node.touches(), []);
+    });
+  });
+
+  it("touchMany with null removes the TTL and 0 expires the keys at once", async () => {
+    await withClient(async (client, node) => {
+      await client.setMany({ a: "1", b: "2" }, 10);
+      await client.touchMany(["a", "b"], null);
+      assert.equal(node.ttlOf("a"), undefined);
+      assert.equal(node.multiTouchFrames()[0].ttl, null);
+      assert.deepEqual(await client.touchMany(["a", "b"], 0), new Map([["a", true], ["b", true]]));
+      assert.deepEqual(await client.getMany(["a", "b"]), new Map());
+    });
+  });
+
+  it("touchMany never changes the values", async () => {
+    await withClient(async (client) => {
+      await client.setMany({ a: "1", b: "2" });
+      await client.touchMany(["a", "b"], 30);
+      assert.deepEqual(await client.getMany(["a", "b"]), new Map([["a", "1"], ["b", "2"]]));
+    });
+  });
+
+  it("getManyAndTouch returns the hits and sets the TTL", async () => {
+    await withClient(async (client, node) => {
+      await client.setMany({ a: "1", b: "2" }, 10);
+      assert.deepEqual(await client.getManyAndTouch(["a", "missing", "b"], 60), new Map([["a", "1"], ["b", "2"]]));
+      assert.equal(node.ttlOf("a"), 60);
+      assert.equal(node.ttlOf("b"), 60);
+      assert.deepEqual(node.multiTouchFrames(), [{ namespace: "", keys: ["a", "missing", "b"], ttl: 60, get: true }]);
+      assert.deepEqual(await client.getManyAndTouchBytes(["a", "b"], null), new Map([["a", Buffer.from("1")], ["b", Buffer.from("2")]]));
+      assert.equal(node.ttlOf("a"), undefined);
+      assert.deepEqual(await client.getManyAndTouch(["missing"], 5), new Map());
+    });
+  });
+
+  it("getManyAndTouch with 0 returns the values then expires them", async () => {
+    await withClient(async (client) => {
+      await client.setMany({ a: "1", b: "2" });
+      assert.deepEqual(await client.getManyAndTouch(["a", "b"], 0), new Map([["a", "1"], ["b", "2"]]));
+      assert.deepEqual(await client.getMany(["a", "b"]), new Map());
+    });
+  });
+
+  it("a key given twice is touched once", async () => {
+    await withClient(async (client, node) => {
+      await client.set("a", "1");
+      assert.deepEqual(await client.touchMany(["a", "a", "a"], 30), new Map([["a", true]]));
+      assert.deepEqual(await client.getManyAndTouch(["a", "a"], 30), new Map([["a", "1"]]));
+      assert.deepEqual(node.multiTouchFrames().map((frame) => frame.keys), [["a"], ["a"]]);
+    });
+  });
+
+  it("is scoped to its namespace", async () => {
+    await withClient(async (client, node) => {
+      const users = client.namespace("users");
+      await users.setMany({ a: "1", b: "2" });
+      assert.deepEqual(await client.touchMany(["a"], 30), new Map([["a", false]]));
+      assert.deepEqual(await users.touchMany(["a", "b"], 30), new Map([["a", true], ["b", true]]));
+      assert.deepEqual(await users.getManyAndTouch(["a", "b"], 40), new Map([["a", "1"], ["b", "2"]]));
+      assert.deepEqual(await users.getManyAndTouchBytes(["a"], 40), new Map([["a", Buffer.from("1")]]));
+      assert.equal(node.ttlOf("a", "users"), 40);
+      assert.deepEqual(new Set(node.multiTouchFrames().map((frame) => frame.namespace)), new Set(["", "users"]));
+    });
+  });
+
+  it("getManyAndTouch decompresses on a compress-enabled client", async () => {
+    await withClient(
+      async (client) => {
+        await client.setMany({ a: "x".repeat(200), b: "short" });
+        assert.deepEqual(await client.getManyAndTouch(["a", "b"], 30), new Map([["a", "x".repeat(200)], ["b", "short"]]));
+        // A plain touch never reads a value, so compression is moot.
+        assert.deepEqual(await client.touchMany(["a", "b"], 30), new Map([["a", true], ["b", true]]));
+      },
+      {},
+      { compress: true, compressionThreshold: 16 },
+    );
+  });
+
+  it("splits a large batch into sub-frames and reassembles it", async () => {
+    await withClient(async (client, node) => {
+      const values: Record<string, string> = {};
+      for (let i = 0; i < MAX_BATCH_KEYS * 2 + 5; i++) values[`k${i}`] = `v${i}`;
+      await client.setMany(values);
+      assert.deepEqual(await client.getManyAndTouch(Object.keys(values), 30), new Map(Object.entries(values)));
+      assert.deepEqual(node.multiTouchFrames().map((frame) => frame.keys.length), [MAX_BATCH_KEYS, MAX_BATCH_KEYS, 5]);
+      const result = await client.touchMany([...Object.keys(values), "missing"], 30);
+      assert.equal(result.size, Object.keys(values).length + 1);
+      assert.equal(result.get("missing"), false);
+      assert.equal(node.multiTouchFrames().length, 6);
+    });
+  });
+
+  it("rejects empty keys and a bad TTL before any I/O", async () => {
+    await withClient(async (client, node) => {
+      const calls: Array<(keys: string[], ttl: number) => Promise<unknown>> = [
+        (keys, ttl) => client.touchMany(keys, ttl),
+        (keys, ttl) => client.getManyAndTouch(keys, ttl),
+        (keys, ttl) => client.getManyAndTouchBytes(keys, ttl),
+      ];
+      for (const call of calls) {
+        await assert.rejects(() => call([], 30), RangeError);
+        for (const bad of [-1, 1.5, undefined as unknown as number, "5" as unknown as number]) {
+          await assert.rejects(() => call(["k"], bad), RangeError, String(bad));
+        }
+      }
+      await assert.rejects(() => client.namespace("users").touchMany([], 30), RangeError);
+      await assert.rejects(() => client.touchMany([""], 30), RangeError);
+      assert.deepEqual(node.multiTouchFrames(), []);
+    });
+  });
+
+  it("round-trips over a tagged connection", async () => {
+    await withClient(
+      async (client, node) => {
+        await client.setMany({ a: "1", b: "2" });
+        assert.deepEqual(await client.touchMany(["a", "nope"], 30), new Map([["a", true], ["nope", false]]));
+        assert.deepEqual(await client.getManyAndTouch(["a", "b", "nope"], 60), new Map([["a", "1"], ["b", "2"]]));
+        assert.deepEqual(node.multiTouchFrames().at(-1), { namespace: "", keys: ["a", "b", "nope"], ttl: 60, get: true });
+      },
+      { supportTags: true },
+    );
+  });
+
+  it("a node that predates y throws ServerTooOldError naming it", async () => {
+    for (const options of [{ withoutMultiTouch: true }, { withoutTouch: true }]) {
+      await withClient(async (client) => {
+        await client.setMany({ a: "1" });
+        await assert.rejects(() => client.touchMany(["a"], 30), (error: unknown) => {
+          assert.ok(error instanceof ServerTooOldError);
+          assert.equal(error.command, "y");
+          assert.match(error.message, /\(y\)/);
+          return true;
+        });
+        await assert.rejects(() => client.getManyAndTouch(["a"], 30), ServerTooOldError);
+        // Other commands are untouched: the client redials and works.
+        assert.equal(await client.get("a"), "1");
+      }, options);
+    }
+  });
+
+  it("a single touch still names its own command when too old", async () => {
+    await withClient(
+      async (client) => {
+        await assert.rejects(() => client.touch("k", 30), (error: unknown) => {
+          assert.ok(error instanceof ServerTooOldError);
+          assert.equal(error.command, "t");
+          assert.match(error.message, /\(t\)/);
+          return true;
+        });
+      },
+      { withoutTouch: true },
+    );
+  });
+
+  it("a connection lost on a later chunk keeps the earlier chunks' hits for a get only", async () => {
+    await withClient(async (client, node) => {
+      const values: Record<string, string> = {};
+      for (let i = 0; i < MAX_BATCH_KEYS + 1; i++) values[`k${i}`] = `v${i}`;
+      await client.setMany(values);
+      const keys = Object.keys(values);
+
+      node.failMultiTouchAfter(1);
+      await assert.rejects(() => client.getManyAndTouch(keys, 30), (error: unknown) => {
+        assert.ok(error instanceof PartialConnectionLostError);
+        const partial = error.partialValues as Map<string, string>;
+        assert.deepEqual([...partial.keys()], keys.slice(0, MAX_BATCH_KEYS));
+        return true;
+      });
+
+      node.failMultiTouchAfter(1);
+      await assert.rejects(() => client.touchMany(keys, 30), (error: unknown) => {
+        assert.ok(error instanceof ConnectionLostError);
+        assert.ok(!(error instanceof PartialConnectionLostError));
+        return true;
+      });
+      // The connection was poisoned, not left desynced.
+      assert.equal((await client.getManyAndTouch(keys, 30)).size, keys.length);
+    });
+  });
+
+  it("a per-key wrong-node in single-node mode throws", async () => {
+    await withClient(async (client, node) => {
+      await client.setMany({ a: "1", b: "2" });
+      node.answerMultiWrongNodeTimes("a", 2);
+      await assert.rejects(() => client.touchMany(["a", "b"], 30), (error: unknown) => {
+        assert.ok(error instanceof WrongNodeError);
+        assert.ok(!(error instanceof PartialWrongNodeError));
+        return true;
+      });
+      await assert.rejects(() => client.getManyAndTouch(["a", "b"], 30), (error: unknown) => {
+        assert.ok(error instanceof PartialWrongNodeError);
+        assert.deepEqual(error.partialValues, new Map([["b", "2"]]));
+        return true;
+      });
+    });
+  });
+
+  it("a reply with the wrong number of entries is a desync", async () => {
+    // The same count check multiGet/multiSet make (issue #181): a short
+    // roster would otherwise shift every later key's answer onto another key.
+    await withClient(async (client, node) => {
+      await client.setMany({ a: "1", b: "2" });
+      const calls: Array<(keys: string[], ttl: number) => Promise<unknown>> = [
+        (keys, ttl) => client.touchMany(keys, ttl),
+        (keys, ttl) => client.getManyAndTouch(keys, ttl),
+      ];
+      for (const call of calls) {
+        node.answerMultiTouchBadCountOnce(1);
+        await assert.rejects(() => call(["a", "b"], 30), (error: unknown) => {
+          assert.ok(error instanceof ConnectionLostError);
+          assert.match((error as Error).message, /roster length 1 does not match request key count 2/);
+          return true;
+        });
+      }
+      // The connection was poisoned, not left desynced.
+      assert.deepEqual(await client.touchMany(["a", "b"], 30), new Map([["a", true], ["b", true]]));
+    });
+  });
+});
+
+describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startCluster(nodeOptions: Parameters<typeof startMockNode>[0][] = [{}, {}], replication = 2) {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(nodeOptions[0]), startMockNode(nodeOptions[1])]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication },
+    );
+    return {
+      nodes,
+      discovery,
+      owners(key: string) {
+        return new HashRing(names).owners(Buffer.from(key), replication);
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  async function withCluster(
+    run: (client: NanocachedClient, cluster: Awaited<ReturnType<typeof startCluster>>) => Promise<void>,
+    nodeOptions?: Parameters<typeof startMockNode>[0][],
+    replication = 2,
+    clientOptions: { fireAndForgetReplicas?: boolean } = {},
+  ): Promise<void> {
+    const cluster = await startCluster(nodeOptions, replication);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }], ...clientOptions });
+    try {
+      await run(client, cluster);
+    } finally {
+      await client.close();
+      await cluster.close().catch(() => {});
+    }
+  }
+
+  function keysWithPrimary(cluster: Awaited<ReturnType<typeof startCluster>>, name: string, count: number, prefix = "mt"): string[] {
+    const keys: string[] = [];
+    for (let i = 0; keys.length < count; i++) {
+      const key = `${prefix}-${i}`;
+      if (cluster.owners(key)[0] === name) keys.push(key);
+    }
+    return keys;
+  }
+
+  const sorted = (items: string[]) => [...items].sort();
+
+  it("a batch touch reaches every owner with one frame per node", async () => {
+    await withCluster(async (client, cluster) => {
+      const keys = Array.from({ length: 20 }, (_, i) => `k${i}`);
+      await client.setMany(Object.fromEntries(keys.map((key) => [key, "v"])), 10);
+      const result = await client.touchMany([...keys, "nope"], 77);
+      assert.equal(result.get("nope"), false);
+      assert.equal([...result.values()].filter(Boolean).length, 20);
+      for (const node of cluster.nodes) {
+        // R=2 over two nodes: both hold every key, and each got a single
+        // plain frame for all of them.
+        const frames = node.mock.multiTouchFrames();
+        assert.equal(frames.length, 1);
+        assert.equal(frames[0].get, false);
+        assert.equal(frames[0].keys.length, 21);
+        for (const key of keys) assert.equal(node.mock.ttlOf(key), 77);
+      }
+    });
+  });
+
+  it("only a key's primary is asked for the value, in two frames per node", async () => {
+    await withCluster(async (client, cluster) => {
+      const keys = Array.from({ length: 24 }, (_, i) => `k${i}`);
+      const primaryOf = new Map(keys.map((key) => [key, cluster.owners(key)[0]]));
+      assert.equal(new Set(primaryOf.values()).size, 2, "the keys must give both nodes primaries");
+      const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
+      await client.setMany(values);
+      assert.deepEqual(await client.getManyAndTouch(keys, 40), new Map(Object.entries(values)));
+      for (const node of cluster.nodes) {
+        // Each node is primary for some keys and replica for the others, so
+        // it gets the G frame for the first and the plain frame for the second.
+        const frames = node.mock.multiTouchFrames();
+        assert.equal(frames.length, 2);
+        const withG = frames.find((frame) => frame.get)!;
+        const plain = frames.find((frame) => !frame.get)!;
+        assert.deepEqual(sorted(withG.keys), sorted(keys.filter((key) => primaryOf.get(key) === node.name)));
+        assert.deepEqual(sorted(plain.keys), sorted(keys.filter((key) => primaryOf.get(key) !== node.name)));
+        for (const key of keys) assert.equal(node.mock.ttlOf(key), 40);
+      }
+    });
+  });
+
+  it("getManyAndTouch does not fall back to a replica on a miss", async () => {
+    await withCluster(async (client, cluster) => {
+      const [primaryName, replicaName] = cluster.owners("k");
+      const replica = cluster.nodes.find((node) => node.name === replicaName)!;
+      void primaryName;
+      replica.mock.store.set("k", Buffer.from("v"));
+      assert.deepEqual(await client.getManyAndTouch(["k"], 40), new Map());
+      assert.deepEqual(await client.touchMany(["k"], 40), new Map([["k", false]]));
+      assert.equal(replica.mock.ttlOf("k"), 40);
+    });
+  });
+
+  it("a wrong-node answer for a key refreshes once and succeeds", async () => {
+    await withCluster(async (client, cluster) => {
+      const keys = Array.from({ length: 12 }, (_, i) => `k${i}`);
+      const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
+      await client.setMany(values);
+      const owner = cluster.nodes.find((node) => node.name === cluster.owners(keys[0])[0])!;
+      owner.mock.answerMultiWrongNodeTimes(keys[0], 1);
+      assert.deepEqual(await client.getManyAndTouch(keys, 40), new Map(Object.entries(values)));
+      owner.mock.answerMultiWrongNodeTimes(keys[0], 1);
+      const touched = await client.touchMany(keys, 41);
+      assert.equal([...touched.values()].every(Boolean), true);
+    });
+  });
+
+  it("a persisting wrong-node throws", async () => {
+    await withCluster(async (client, cluster) => {
+      const key = "some-key";
+      await client.setMany({ [key]: "v", "other-key": "v2" });
+      const owner = cluster.nodes.find((node) => node.name === cluster.owners(key)[0])!;
+      owner.mock.answerMultiWrongNodeTimes(key, 10);
+      await assert.rejects(() => client.getManyAndTouch([key, "other-key"], 30), (error: unknown) => {
+        assert.ok(error instanceof PartialWrongNodeError);
+        assert.deepEqual(error.partialValues, new Map([["other-key", "v2"]]));
+        return true;
+      });
+      owner.mock.answerMultiWrongNodeTimes(key, 10);
+      await assert.rejects(() => client.touchMany([key, "other-key"], 30), (error: unknown) => {
+        assert.ok(error instanceof WrongNodeError);
+        assert.ok(!(error instanceof PartialWrongNodeError));
+        return true;
+      });
+    });
+  });
+
+  it("a batch whose reply was lost is resent whole", async () => {
+    await withCluster(async (client, cluster) => {
+      const keys = keysWithPrimary(cluster, names[0], 4);
+      const primary = cluster.nodes[0].mock;
+      const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
+      await client.setMany(values);
+      primary.dropAfterTouchOnce();
+      // The primary applied the touch and the reply never arrived;
+      // resending it changes nothing, so the client does.
+      assert.deepEqual(await client.getManyAndTouch(keys, 30), new Map(Object.entries(values)));
+      assert.equal(primary.multiTouchFrames().filter((frame) => frame.get).length, 2);
+    });
+  });
+
+  it("a replica that fails does not fail the primary's answer", async () => {
+    await withCluster(async (client, cluster) => {
+      const keys = keysWithPrimary(cluster, names[0], 3);
+      const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
+      await client.setMany(values);
+      // names[1] is the replica of all three, and only a replica.
+      // Counted per key, as setMany counts a failed replica leg.
+      assert.deepEqual(await client.getManyAndTouch(keys, 30), new Map(Object.entries(values)));
+      assert.equal(client.stats().replicaWriteFailures, 3);
+      assert.equal([...(await client.touchMany(keys, 30)).values()].every(Boolean), true);
+      assert.equal(client.stats().replicaWriteFailures, 6);
+    }, [{}, { withoutMultiTouch: true }]);
+  });
+
+  it("a primary that predates y throws ServerTooOldError, not a connection loss", async () => {
+    // A release that knows `t` but not `y`: its `En` closes the connection,
+    // and the batch code sees it as a failed leg, not as a thrown error — it
+    // must still come out as ServerTooOldError.
+    await withCluster(async (client, cluster) => {
+      const keys = keysWithPrimary(cluster, names[0], 3);
+      await client.setMany(Object.fromEntries(keys.map((key) => [key, "v"])));
+      await assert.rejects(() => client.getManyAndTouch(keys, 30), ServerTooOldError);
+      await assert.rejects(() => client.touchMany(keys, 30), ServerTooOldError);
+      // The single-key touch is untouched: that node knows `t`.
+      assert.equal(await client.touch(keys[0], 30), true);
+    }, [{ withoutMultiTouch: true }, {}]);
+  });
+
+  it("an unreachable primary is a connection loss with the other hits attached", async () => {
+    // R=1: the only owner of some keys is gone. Nothing answered `W`, so
+    // the error is not the wrong-node one, and no replica stands in.
+    await withCluster(
+      async (client, cluster) => {
+        const keys = Array.from({ length: 24 }, (_, i) => `k${i}`);
+        await client.setMany(Object.fromEntries(keys.map((key) => [key, `v${key}`])));
+        const liveKeys = keys.filter((key) => cluster.owners(key)[0] === names[1]);
+        assert.ok(liveKeys.length > 0 && liveKeys.length < keys.length);
+        await cluster.nodes[0].mock.close();
+        await waitFor(() => memberConnectionClosed(client, names[0]), "the client to see the FIN");
+        await assert.rejects(() => client.getManyAndTouch(keys, 30), (error: unknown) => {
+          assert.ok(error instanceof PartialConnectionLostError);
+          assert.ok(!(error instanceof WrongNodeError));
+          assert.deepEqual(sorted([...(error.partialValues as Map<string, string>).keys()]), sorted(liveKeys));
+          return true;
+        });
+        await assert.rejects(() => client.touchMany(keys, 30), (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok(!(error instanceof WrongNodeError) && !(error instanceof PartialConnectionLostError));
+          return true;
+        });
+      },
+      undefined,
+      1,
+    );
+  });
+
+  it("a chunk that fails in the cluster moves only the tail to the retry", async () => {
+    await withCluster(async (client, cluster) => {
+      const keys = keysWithPrimary(cluster, names[0], MAX_BATCH_KEYS + 50, "chunk");
+      const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
+      await client.setMany(values);
+      const primary = cluster.nodes[0].mock;
+      const before = primary.multiTouchFrames().length;
+      primary.failMultiTouchAfter(1);
+      assert.deepEqual(await client.getManyAndTouch(keys, 30), new Map(Object.entries(values)));
+      // Chunk 1 answered; chunk 2 (the last 50) died once and was sent
+      // again alone — chunk 1's keys were not resent.
+      assert.deepEqual(
+        primary.multiTouchFrames().slice(before).map((frame) => [frame.keys.length, frame.get]),
+        [[MAX_BATCH_KEYS, true], [50, true], [50, true]],
+      );
+    });
+  });
+
+  it("is scoped to its namespace in a cluster", async () => {
+    await withCluster(async (client, cluster) => {
+      const users = client.namespace("users");
+      await users.setMany({ a: "1", b: "2" });
+      assert.deepEqual(await client.touchMany(["a", "b"], 30), new Map([["a", false], ["b", false]]));
+      assert.deepEqual(await users.getManyAndTouch(["a", "b"], 30), new Map([["a", "1"], ["b", "2"]]));
+      for (const node of cluster.nodes) {
+        assert.deepEqual(new Set(node.mock.multiTouchFrames().map((frame) => frame.namespace)), new Set(["", "users"]));
+      }
+    });
+  });
+
+  it("pure-replica legs may run in the background", async () => {
+    await withCluster(
+      async (client, cluster) => {
+        const keys = keysWithPrimary(cluster, names[0], 3);
+        const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
+        await client.setMany(values);
+        assert.deepEqual(await client.getManyAndTouch(keys, 55), new Map(Object.entries(values)));
+        // The replica's plain frame is not awaited, but it does land.
+        await waitFor(() => keys.every((key) => cluster.nodes[1].mock.ttlOf(key) === 55), "the background replica touch");
+      },
+      undefined,
+      2,
+      { fireAndForgetReplicas: true },
+    );
+  });
+});
+
 describe("NanocachedClient non-idempotent retry on connection loss (issue #225)", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 

@@ -67,6 +67,18 @@ export interface MockNode extends MockServerBase {
   /** Every `t` (touch, issue #825) this server has received, in receipt
    * order; `ttl` is `null` when the field was omitted (remove the TTL). */
   touches(): Array<{ namespace: string; key: string; ttl: number | null; get: boolean }>;
+  /** Every `y` (batched touch, issue #871) this server has received, one
+   * entry per frame, in receipt order — what proves a frame's grouping,
+   * which the per-key `touches` above cannot. `ttl` is `null` when the
+   * field was omitted (remove the TTL). */
+  multiTouchFrames(): Array<{ namespace: string; keys: string[]; ttl: number | null; get: boolean }>;
+  /** Answers the next `successes` `y` frames normally, then destroys the
+   * connection instead of replying to the one right after — a connection
+   * drop on chunk N>1 of a chunked batch touch. */
+  failMultiTouchAfter(successes: number): void;
+  /** The next `y` reply reports exactly `count` roster entries whatever
+   * the request's key count (issue #181's desync, for `y`). */
+  answerMultiTouchBadCountOnce(count: number): void;
   /** The TTL (whole seconds) the entry currently has in `namespace`, or
    * `undefined` when it has none. */
   ttlOf(key: string, namespace?: string): number | undefined;
@@ -339,6 +351,9 @@ export async function startMockNode(
     /** Issue #825: behave like a node that predates `t` — answer it `En\n`
      * and close, as the real node does for any command it does not know. */
     withoutTouch?: boolean;
+    /** Issue #871: behave like a node that knows `t` but predates `y`
+     * (`withoutTouch` implies this). */
+    withoutMultiTouch?: boolean;
   } = {},
 ): Promise<MockNode> {
   const store = new Map<string, Buffer>();
@@ -401,6 +416,9 @@ export async function startMockNode(
   let incrTtlOverride: string | undefined; // issue #501, see answerIncrTtlOnce
   let dropAfterCas = 0;
   let dropAfterTouch = 0;
+  const multiTouchLog: Array<{ namespace: string; keys: string[]; ttl: number | null; get: boolean }> = [];
+  let multiTouchFailAfter: number | undefined;
+  let multiTouchBadCount: number | undefined;
   const touchLog: Array<{ namespace: string; key: string; ttl: number | null; get: boolean }> = [];
   let clears = 0;
   let failClearReplies = 0;
@@ -983,6 +1001,111 @@ export async function startMockNode(
             break;
           }
 
+          // Batched touch (issue #871): `y <ns-len> <n> <key-len-1>...
+          // <key-len-n> [<ttl>] [G] [<tag>]\n<ns><key-1>...<key-n>` — one
+          // TTL for the whole batch; no ttl field removes the TTL, 0
+          // expires the keys at once. Plain: `Y <n> S|N|W...`; with `G`:
+          // `m`'s `M` reply for the keys touched.
+          case "y": {
+            lastCommand = parts[0];
+            const namespaceLength = Number(parts[1]);
+            const count = Number(parts[2]);
+            const keyLengths = parts.slice(3, 3 + count).map(Number);
+            const totalKeyLength = keyLengths.reduce((sum, length) => sum + length, 0);
+            if (buffer.length < bodyStart + namespaceLength + totalKeyLength) return;
+            let tail = parts.slice(3 + count);
+            if (tagged) tail = tail.slice(0, -1);
+            const get = tail[tail.length - 1] === "G";
+            if (get) tail = tail.slice(0, -1);
+            const ttl = tail.length > 0 ? Number(tail[0]) : null;
+
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            const keys: string[] = new Array(count);
+            let cursor = bodyStart + namespaceLength;
+            for (let i = 0; i < count; i++) {
+              keys[i] = buffer.subarray(cursor, cursor + keyLengths[i]).toString("utf8");
+              cursor += keyLengths[i];
+            }
+            buffer = buffer.subarray(cursor);
+            multiTouchLog.push({ namespace: namespace.toString("utf8"), keys, ttl, get });
+
+            if (options.withoutTouch || options.withoutMultiTouch) {
+              socket.write("En\n");
+              socket.end();
+              return;
+            }
+
+            if (silent) break;
+
+            if (multiTouchFailAfter !== undefined) {
+              if (multiTouchFailAfter > 0) {
+                multiTouchFailAfter--;
+              } else {
+                multiTouchFailAfter = undefined;
+                socket.destroy();
+                return;
+              }
+            }
+
+            if (retryableReplies > 0) {
+              retryableReplies--;
+              socket.write(`R${tag}\n`);
+              break;
+            }
+
+            const targetStore = storeFor(namespace);
+            const targetTtls = ttlsFor(namespace);
+            let tokens: string[] = [];
+            let hits: Buffer[] = [];
+            for (const key of keys) {
+              if (multiWrongNodeKey === key && multiWrongNodeLeft > 0) {
+                multiWrongNodeLeft--;
+                tokens.push("W");
+                continue;
+              }
+              const existing = targetStore.get(key);
+              if (existing === undefined) {
+                tokens.push(get ? "-" : "N");
+                continue;
+              }
+              if (ttl === 0) {
+                targetStore.delete(key);
+                targetTtls.delete(key);
+              } else if (ttl === null) {
+                targetTtls.delete(key);
+              } else {
+                targetTtls.set(key, ttl);
+              }
+              if (get) {
+                tokens.push(String(existing.length));
+                hits.push(existing);
+              } else {
+                tokens.push("S");
+              }
+            }
+
+            if (dropAfterTouch > 0) {
+              dropAfterTouch--;
+              socket.destroy();
+              break;
+            }
+
+            if (multiTouchBadCount !== undefined) {
+              const wanted = multiTouchBadCount;
+              multiTouchBadCount = undefined;
+              if (wanted <= tokens.length) {
+                tokens = tokens.slice(0, wanted);
+                // Keep the body consistent with the roster that is left: a
+                // hit token promises that many bytes of body.
+                hits = hits.slice(0, tokens.filter((t) => t !== "-" && t !== "W" && t !== "S" && t !== "N").length);
+              } else {
+                tokens = tokens.concat(new Array(wanted - tokens.length).fill(get ? "-" : "N"));
+              }
+            }
+            socket.write(Buffer.concat([Buffer.from(`${get ? "M" : "Y"} ${tokens.length}${tokens.map((t) => ` ${t}`).join("")}${tag}\n`), ...hits]));
+            break;
+          }
+
           case "k": {
             // Compare-and-set (issue #141): `k <namespace-length>
             // <key-length> <value-length> <cond> [<ttl-seconds>]
@@ -1204,6 +1327,13 @@ export async function startMockNode(
       dropAfterTouch++;
     },
     touches: () => [...touchLog],
+    multiTouchFrames: () => multiTouchLog.map((frame) => ({ ...frame, keys: [...frame.keys] })),
+    failMultiTouchAfter: (successes) => {
+      multiTouchFailAfter = successes;
+    },
+    answerMultiTouchBadCountOnce: (count) => {
+      multiTouchBadCount = count;
+    },
     ttlOf: (key, namespace = "") => ttlsFor(Buffer.from(namespace, "utf8")).get(key),
     answerMalformedValueOnce: () => {
       malformedValueReplies++;
