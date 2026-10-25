@@ -419,6 +419,15 @@ public class NanocachedException extends RuntimeException {
      * even attempted, {@code unresolvedIndices} lists (ascending) the
      * positions that did NOT resolve — exactly {@link
      * PartialWrongNodeRaw}'s own convention.
+     *
+     * <p>When raised by {@link NanocachedClient#getManyAndTouchBytes(byte[][],
+     * long)} (or {@code getManyAndTouch}, whose partial results derive from
+     * this one) with {@code ttlSeconds == 0}, {@code unresolvedIndices}
+     * lists keys whose frame was never sent <em>and</em> keys whose frame
+     * was sent and whose outcome is unknown; the two cannot be told apart.
+     * The unknown ones may already have been expired by the node, so these
+     * positions must not be sent again with {@code 0}: a second attempt
+     * answers them as misses and the values they held are lost.
      */
     public static final class PartialConnectionFailedRaw extends ConnectionFailed {
         public final byte[][] partialValues;

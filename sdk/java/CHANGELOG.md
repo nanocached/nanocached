@@ -13,6 +13,12 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- The documentation of `touchMany`, `getManyAndTouch` and
+  `PartialConnectionFailed*` now says that with `ttlSeconds` `0` the keys a
+  connection failure leaves unresolved include keys whose frame was sent and
+  whose outcome is unknown, not only keys that were never sent. They must not
+  be sent again with `0`: the first attempt may have expired them, and a
+  second one reads them as misses. No behaviour change.
 - `getManyAndTouch` against a proxy no longer discards the hits the earlier
   chunks of a batch of more than 400 keys returned when a later chunk is
   answered `R` (the proxy's retryable error). It ends the batch with them
