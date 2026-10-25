@@ -2762,6 +2762,31 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
+    async def test_a_primary_that_predates_y_is_asked_once_and_not_redialed(self):
+        # `En` is a final answer: neither a redial and resend nor a
+        # refresh and second pass can change it, so the old node sees one
+        # `y` and no new connection per call.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = self.keys_by_primary(NAMES[0], 3)
+            await client.set_many({key: "v" for key in keys})
+            old = nodes[NAMES[0]]
+            old.legacy_without_multi_touch = True
+            for call in (client.touch_many, client.get_many_and_touch):
+                with self.subTest(call.__name__):
+                    frames, connections = len(old.multi_touch_frames), old.connection_count
+                    with self.assertRaises(ServerTooOldError) as raised:
+                        await call(keys, 30)
+                    self.assertEqual(raised.exception.command, "y")
+                    self.assertIsNotNone(raised.exception.__cause__)
+                    self.assertEqual(len(old.multi_touch_frames) - frames, 1)
+                    # At most the one redial after the first call's poisoned
+                    # connection; never one per attempt.
+                    self.assertLessEqual(old.connection_count - connections, 1)
+        finally:
+            await self.stop(client, discovery, nodes)
+
     async def test_an_unreachable_primary_is_a_connection_loss_with_the_other_hits_attached(self):
         # R=1: the only owner of some keys is gone. Nothing answered `W`,
         # so the error is not the wrong-node one, and no replica stands in
