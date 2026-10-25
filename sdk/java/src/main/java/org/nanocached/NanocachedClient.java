@@ -2761,6 +2761,13 @@ public final class NanocachedClient implements AutoCloseable {
      * key was still touched, and since a touch is idempotent the whole
      * batch may simply be sent again, so nothing partial is attached.
      *
+     * <p>With {@code ttlSeconds == 0} that last step does not hold: the
+     * connection failure covers keys that were never sent and keys whose
+     * frame was sent and whose outcome is unknown (the node may have
+     * expired them already), and the exception cannot tell the two apart.
+     * Do not send the batch again, or the keys that failed, with {@code
+     * 0}: a resend reports a key the first attempt expired as missing.
+     *
      * @throws NanocachedException.ServerTooOld against a node that
      *         predates the command
      */
@@ -2845,6 +2852,17 @@ public final class NanocachedClient implements AutoCloseable {
      * (issue #901): it may have expired and consumed its values already, so
      * those keys throw at once instead of reading as misses.
      *
+     * <p>For that reason, with {@code ttlSeconds == 0} the keys a {@link
+     * NanocachedException.PartialConnectionFailedStrings} (or {@link
+     * NanocachedException.PartialConnectionFailed}, {@link
+     * NanocachedException.PartialConnectionFailedRaw}) leaves out of its
+     * result are not all "never asked": they include keys whose frame was
+     * sent and whose outcome is unknown, and the exception cannot tell
+     * them apart from keys that were never sent. They must not be fetched
+     * again with {@code 0} -- the first attempt may have expired them, and
+     * a second one reads them as misses, losing the values for good. The
+     * hits it carries are the only values this call will ever return.
+     *
      * @throws UncheckedIOException if a stored value is not valid UTF-8
      * @throws NanocachedException.ServerTooOld against a node that
      *         predates the command — in a cluster, when other primaries
@@ -2914,7 +2932,11 @@ public final class NanocachedClient implements AutoCloseable {
      * NanocachedException.PartialWrongNodeRaw} and {@link
      * NanocachedException.PartialConnectionFailedRaw}, as for {@link
      * #getManyBytes(byte[][])}, whose {@code unresolvedIndices} name the
-     * positions that did not resolve. */
+     * positions that did not resolve. With {@code ttlSeconds == 0} the
+     * {@code unresolvedIndices} of a {@code PartialConnectionFailedRaw}
+     * include positions whose frame was sent and whose outcome is unknown,
+     * not only positions that were never sent; do not fetch them again with
+     * {@code 0} (see {@link #getManyAndTouch(List, long)}). */
     public byte[][] getManyAndTouchBytes(byte[][] keys, long ttlSeconds) {
         return getManyAndTouchBytes(EMPTY_NAMESPACE, keys, ttlSeconds);
     }
