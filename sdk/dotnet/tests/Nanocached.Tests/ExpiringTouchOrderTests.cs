@@ -180,7 +180,11 @@ public class ExpiringTouchOrderTests
 
         Task call = cluster.Client.TouchAsync(key, 30);
         await WaitForAsync(() => replica.TouchFrames.Count == 1, "the replica's touch frame");
-        Assert.Single(primary.TouchFrames);
+        // The replica got its frame while the delayed primary had not answered:
+        // the legs went out together. The primary's own frame is read by its
+        // mock on another task, so it is waited for rather than asserted.
+        Assert.False(call.IsCompleted, "the primary had not answered yet");
+        await WaitForAsync(() => primary.TouchFrames.Count == 1, "the primary's touch frame");
         await call;
     }
 
@@ -295,7 +299,10 @@ public class ExpiringTouchOrderTests
 
         Task call = cluster.Client.TouchManyAsync(keysOfA, 30);
         await WaitForAsync(() => b.MultiTouchFrames.Count == 1, "the replica's batch frame");
-        Assert.Single(a.MultiTouchFrames);
+        // As for the single touch: the replica's frame arrived while the
+        // delayed primary had not answered; the primary's frame is waited for.
+        Assert.False(call.IsCompleted, "the primary had not answered yet");
+        await WaitForAsync(() => a.MultiTouchFrames.Count == 1, "the primary's batch frame");
         await call;
     }
 }
