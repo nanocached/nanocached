@@ -1572,6 +1572,294 @@ class NanocachedClientTest {
         }
     }
 
+    // ── ttl 0: the replicas are touched after the primary answered (issue #934) ──
+
+    /** Drops {@code node} from the discovery server's list, so the client's
+     * next refresh no longer has it, and waits for its sockets to be gone. */
+    private static void removeFromDiscovery(Cluster cluster, String name, MockNode node) throws Exception {
+        node.close();
+        Thread.sleep(100);
+        cluster.discovery().nodes = cluster.discovery().nodes.stream()
+                .filter(discovered -> !discovered.name().equals(name))
+                .toList();
+    }
+
+    private static String touchFrame(String key, String tail) {
+        return "t 0 " + key.getBytes(StandardCharsets.UTF_8).length + " " + tail;
+    }
+
+    @Test
+    void anExpiringTouchRerouteFromADeadPrimaryFindsTheValueBecauseNoReplicaWasTouchedFirst() throws Exception {
+        for (boolean get : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                    client.set(key, "v", 100);
+                    MockNode survivor = cluster.nodes().get(NAMES.get(1));
+                    removeFromDiscovery(cluster, NAMES.get(0), cluster.nodes().get(NAMES.get(0)));
+
+                    // The primary cannot be dialled, the refresh drops it, and the
+                    // survivor, now the primary, still holds the value: it must not
+                    // have been expired by a replica leg of the first attempt.
+                    if (get) {
+                        assertEquals(Optional.of("v"), client.getAndTouch(key, 0));
+                        assertEquals(List.of(touchFrame(key, "0 G")), survivor.touchFrames);
+                    } else {
+                        assertTrue(client.touch(key, 0));
+                        assertEquals(List.of(touchFrame(key, "0")), survivor.touchFrames);
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void anExpiringTouchOfAPrimaryThatStaysUnreachableTouchesNoReplica() throws Exception {
+        for (boolean get : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                    client.set(key, "v", 100);
+                    MockNode replica = cluster.nodes().get(NAMES.get(1));
+                    cluster.nodes().get(NAMES.get(0)).close();
+                    Thread.sleep(100);
+
+                    assertThrows(NanocachedException.ConnectionFailed.class,
+                            () -> { if (get) client.getAndTouch(key, 0); else client.touch(key, 0); });
+                    assertEquals(List.of(), replica.touchFrames, "the replica was not touched");
+                    assertEquals("v", new String(replica.store.get(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))),
+                            StandardCharsets.UTF_8));
+                }
+            }
+        }
+    }
+
+    @Test
+    void anExpiringTouchAnsweredWrongNodeTouchesTheReplicaOnlyWithTheFinalAnswer() throws Exception {
+        for (boolean get : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                    client.set(key, "v", 100);
+                    MockNode primary = cluster.nodes().get(NAMES.get(0));
+                    MockNode replica = cluster.nodes().get(NAMES.get(1));
+                    primary.answerWrongNodeOnce();
+
+                    if (get) {
+                        assertEquals(Optional.of("v"), client.getAndTouch(key, 0));
+                    } else {
+                        assertTrue(client.touch(key, 0));
+                    }
+                    assertEquals(2, primary.touchFrames.size(), "W, then the retried touch");
+                    assertEquals(List.of(touchFrame(key, "0")), replica.touchFrames,
+                            "one plain touch, sent after the primary's definitive answer");
+                }
+            }
+        }
+    }
+
+    @Test
+    void anExpiringTouchWhoseReplyWasLostTouchedNoReplica() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                client.set(key, "v", 100);
+                MockNode primary = cluster.nodes().get(NAMES.get(0));
+                MockNode replica = cluster.nodes().get(NAMES.get(1));
+                primary.dropReplyAfterNextTouch();
+
+                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.touch(key, 0));
+                assertEquals(1, primary.touchFrames.size());
+                assertEquals(List.of(), replica.touchFrames, "the primary never answered");
+            }
+        }
+    }
+
+    @Test
+    void anExpiringTouchIsSentToTheReplicaOnlyAfterThePrimaryAnswered() throws Exception {
+        for (boolean get : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                    client.set(key, "v", 100);
+                    MockNode primary = cluster.nodes().get(NAMES.get(0));
+                    MockNode replica = cluster.nodes().get(NAMES.get(1));
+                    primary.delayTouchRepliesBy(400);
+
+                    if (get) {
+                        assertEquals(Optional.of("v"), client.getAndTouch(key, 0));
+                    } else {
+                        assertTrue(client.touch(key, 0));
+                    }
+                    long gapMillis = (replica.touchReceiptNanos.get(0) - primary.touchReceiptNanos.get(0)) / 1_000_000;
+                    assertTrue(gapMillis >= 350, "the replica's frame came " + gapMillis + " ms after the primary's");
+                    assertEquals(List.of(touchFrame(key, "0")), replica.touchFrames);
+                    assertEquals(null, replica.store.get(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
+                }
+            }
+        }
+    }
+
+    @Test
+    void aTouchThatDoesNotExpireStillGoesToEveryOwnerAtOnce() throws Exception {
+        for (long ttl : new long[] {30, NanocachedClient.REMOVE_TTL}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                    client.set(key, "v", 100);
+                    MockNode primary = cluster.nodes().get(NAMES.get(0));
+                    MockNode replica = cluster.nodes().get(NAMES.get(1));
+                    primary.delayTouchRepliesBy(400);
+
+                    assertTrue(client.touch(key, ttl));
+                    long gapMillis = (replica.touchReceiptNanos.get(0) - primary.touchReceiptNanos.get(0)) / 1_000_000;
+                    assertTrue(Math.abs(gapMillis) < 300, "concurrent legs, " + gapMillis + " ms apart");
+                }
+            }
+        }
+    }
+
+    @Test
+    void anExpiringBatchTouchSendsThePrimariesFirstAndOneFanOutAfterThem() throws Exception {
+        for (boolean get : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                    MockNode nodeB = cluster.nodes().get(NAMES.get(1));
+                    List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                    List<String> keysB = keysWhosePrimaryIs(NAMES.get(1), 3);
+                    List<String> all = concat(keysA, keysB);
+                    Map<String, String> values = new java.util.LinkedHashMap<>();
+                    for (String key : all) values.put(key, "value of " + key);
+                    client.setMany(values);
+                    nodeA.delayTouchRepliesBy(300);
+                    nodeB.delayTouchRepliesBy(300);
+
+                    if (get) {
+                        assertEquals(values, client.getManyAndTouch(all, 0));
+                    } else {
+                        Map<String, Boolean> touched = client.touchMany(all, 0);
+                        assertTrue(touched.values().stream().allMatch(Boolean::booleanValue));
+                    }
+
+                    // Primary legs first (the G form for a getManyAndTouch), then the
+                    // plain fan-out of what the primaries answered.
+                    assertEquals(2, nodeA.multiTouchFrames.size());
+                    assertEquals(2, nodeB.multiTouchFrames.size());
+                    assertEquals(keysA, nodeA.multiTouchFrames.get(0).keys());
+                    assertEquals(get, nodeA.multiTouchFrames.get(0).get());
+                    assertEquals(keysB, nodeA.multiTouchFrames.get(1).keys());
+                    assertFalse(nodeA.multiTouchFrames.get(1).get());
+                    assertEquals(keysB, nodeB.multiTouchFrames.get(0).keys());
+                    assertEquals(get, nodeB.multiTouchFrames.get(0).get());
+                    assertEquals(keysA, nodeB.multiTouchFrames.get(1).keys());
+                    assertFalse(nodeB.multiTouchFrames.get(1).get());
+                    // Nothing went to a replica until the primaries had answered (300 ms).
+                    long firstReplicaFrame = Math.min(nodeA.touchReceiptNanos.get(1), nodeB.touchReceiptNanos.get(1));
+                    long lastPrimaryFrame = Math.max(nodeA.touchReceiptNanos.get(0), nodeB.touchReceiptNanos.get(0));
+                    assertTrue((firstReplicaFrame - lastPrimaryFrame) / 1_000_000 >= 250,
+                            "replica legs followed the primaries by "
+                                    + (firstReplicaFrame - lastPrimaryFrame) / 1_000_000 + " ms");
+                }
+            }
+        }
+    }
+
+    @Test
+    void anExpiringBatchTouchRerouteFromADeadPrimaryFindsTheValuesBecauseNoReplicaWasTouchedFirst() throws Exception {
+        for (boolean get : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    MockNode survivor = cluster.nodes().get(NAMES.get(1));
+                    List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 2);
+                    List<String> keysB = keysWhosePrimaryIs(NAMES.get(1), 2);
+                    List<String> all = concat(keysA, keysB);
+                    Map<String, String> values = new java.util.LinkedHashMap<>();
+                    for (String key : all) values.put(key, "value of " + key);
+                    client.setMany(values);
+                    removeFromDiscovery(cluster, NAMES.get(0), cluster.nodes().get(NAMES.get(0)));
+
+                    if (get) {
+                        assertEquals(values, client.getManyAndTouch(all, 0));
+                    } else {
+                        Map<String, Boolean> touched = client.touchMany(all, 0);
+                        assertTrue(touched.values().stream().allMatch(Boolean::booleanValue), touched.toString());
+                    }
+                    // The first pass sent the survivor only the keys it is primary
+                    // for; the dead primary's keys came in the second pass.
+                    assertEquals(2, survivor.multiTouchFrames.size());
+                    assertEquals(keysB, survivor.multiTouchFrames.get(0).keys());
+                    assertEquals(keysA, survivor.multiTouchFrames.get(1).keys());
+                }
+            }
+        }
+    }
+
+    @Test
+    void anExpiringBatchTouchOfPrimariesThatStayUnreachableTouchesNoReplica() throws Exception {
+        for (boolean get : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    MockNode replica = cluster.nodes().get(NAMES.get(1));
+                    List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                    Map<String, String> values = new java.util.LinkedHashMap<>();
+                    for (String key : keysA) values.put(key, "value of " + key);
+                    client.setMany(values);
+                    cluster.nodes().get(NAMES.get(0)).close();
+                    Thread.sleep(100);
+
+                    assertThrows(NanocachedException.ConnectionFailed.class,
+                            () -> { if (get) client.getManyAndTouch(keysA, 0); else client.touchMany(keysA, 0); });
+                    assertEquals(List.of(), replica.multiTouchFrames, "no primary answered, so no replica leg");
+                    assertEquals(keysA.size(), replica.store.size());
+                }
+            }
+        }
+    }
+
+    @Test
+    void anExpiringBatchTouchWhosePrimaryReplyWasLostTouchedNoReplica() throws Exception {
+        for (boolean get : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                    MockNode replica = cluster.nodes().get(NAMES.get(1));
+                    List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                    Map<String, String> values = new java.util.LinkedHashMap<>();
+                    for (String key : keysA) values.put(key, "value of " + key);
+                    client.setMany(values);
+                    nodeA.dropReplyAfterNextTouch();
+
+                    assertThrows(NanocachedException.ConnectionFailed.class,
+                            () -> { if (get) client.getManyAndTouch(keysA, 0); else client.touchMany(keysA, 0); });
+                    assertEquals(1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
+                    assertEquals(List.of(), replica.multiTouchFrames, "the primary never answered");
+                }
+            }
+        }
+    }
+
+    @Test
+    void anExpiringBatchTouchAnsweredWrongNodeTouchesTheReplicaOnlyWithTheFinalAnswer() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                MockNode replica = cluster.nodes().get(NAMES.get(1));
+                List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : keysA) values.put(key, "value of " + key);
+                client.setMany(values);
+                nodeA.answerWrongNodeOnce();
+
+                assertEquals(values, client.getManyAndTouch(keysA, 0));
+                assertEquals(2, nodeA.multiTouchFrames.size(), "W, then the retried frame");
+                assertEquals(1, replica.multiTouchFrames.size());
+                assertEquals(keysA, replica.multiTouchFrames.get(0).keys());
+                assertFalse(replica.multiTouchFrames.get(0).get());
+            }
+        }
+    }
+
     @Test
     void batchTouchEndsOnAWholeFrameWrongNodeOnASingleNode() throws Exception {
         try (MockNode node = new MockNode()) {
