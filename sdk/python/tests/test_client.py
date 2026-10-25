@@ -2248,6 +2248,41 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
+    async def test_an_expiring_touch_whose_reply_was_lost_is_not_resent(self):
+        # Issue #901: a resend of ttl=0 would find the key already expired.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, _ = self.owners_of("k")
+            primary = nodes[primary_name]
+            await client.set("k", "payload")
+            primary.apply_and_drop_next_touch()
+            with self.assertRaises(ConnectionLostError):
+                await client.touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 1)
+
+            await client.set("k", "payload")
+            primary.apply_and_drop_next_touch()
+            with self.assertRaises(ConnectionLostError):
+                await client.get_and_touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 2)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_touch_still_retries_a_request_that_was_never_sent(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, _ = self.owners_of("k")
+            await client.set("k", "payload")
+            nodes[primary_name].answer_wrong_node_once()
+            self.assertEqual(await client.get_and_touch("k", 0), "payload")
+            await client.set("k", "payload")
+            nodes[primary_name].answer_wrong_node_once()
+            self.assertTrue(await client.touch("k", 0))
+        finally:
+            await self.stop(client, discovery, nodes)
+
     async def test_a_replica_that_predates_touch_does_not_fail_the_primarys_answer(self):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
@@ -2723,6 +2758,28 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
             # resending it changes nothing, so the client does.
             self.assertEqual(await client.get_many_and_touch(keys, 30), values)
             self.assertEqual(len([f for f in primary.multi_touch_frames if f[3]]), 2)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_batch_whose_reply_was_lost_is_not_resent(self):
+        # Issue #901: the primary may already have expired (and, with a
+        # get, consumed) the keys, so a resend would report them missing.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = self.keys_by_primary(NAMES[0], 4)
+            primary = nodes[NAMES[0]]
+            await client.set_many({key: f"v-{key}" for key in keys})
+            primary.apply_and_drop_next_touch()
+            with self.assertRaises(ConnectionLostError):
+                await client.touch_many(keys, 0)
+            self.assertEqual(len(primary.multi_touch_frames), 1)
+
+            await client.set_many({key: f"v-{key}" for key in keys})
+            primary.apply_and_drop_next_touch()
+            with self.assertRaises(ConnectionLostError):
+                await client.get_many_and_touch(keys, 0)
+            self.assertEqual(len(primary.multi_touch_frames), 2)
         finally:
             await self.stop(client, discovery, nodes)
 

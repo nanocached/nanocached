@@ -106,15 +106,19 @@ class _MultiTouchState:
     latest outcome was a `W` rather than a connection failure;
     ``last_cause`` the most recent primary-leg connection failure and
     ``rejected`` whether any primary leg was answered ``En`` (a node that
-    predates ``y``). Single-threaded (asyncio), so no locking."""
+    predates ``y``). ``lost`` holds the indices a ``ttl_seconds == 0``
+    call must not resend (issue #901): their primary leg failed after the
+    frame was written, so the node may have expired them already.
+    Single-threaded (asyncio), so no locking."""
 
-    __slots__ = ("results", "wrong_node", "last_cause", "rejected")
+    __slots__ = ("results", "wrong_node", "last_cause", "rejected", "lost")
 
     def __init__(self) -> None:
         self.results: dict[int, object] = {}
         self.wrong_node: set[int] = set()
         self.last_cause: BaseException | None = None
         self.rejected = False
+        self.lost: set[int] = set()
 
 
 @dataclass(frozen=True)
@@ -1273,9 +1277,14 @@ class NanocachedClient:
 
         Unlike incr/CAS a touch is idempotent, so a request whose reply was
         lost is retried like get/set/delete are, never raised as
-        ConnectionLostError. In a cluster it goes to every owner, like a
-        set, and the primary's answer is returned. Raises
-        ServerTooOldError against a node that predates the command."""
+        ConnectionLostError — with one exception (issue #901): a ``0`` TTL
+        expires the entry, so a resend after the node already applied it
+        would answer ``False`` for a key that existed. That call is
+        retried only when its request was never sent, and a reply lost
+        after the send raises ConnectionLostError, as incr does. In a
+        cluster it goes to every owner, like a set, and the primary's
+        answer is returned. Raises ServerTooOldError against a node that
+        predates the command."""
         return await self._touch(b"", key, ttl_seconds)
 
     async def _touch(self, namespace: bytes, key: str | bytes, ttl_seconds: int | None) -> bool:
@@ -1291,7 +1300,8 @@ class NanocachedClient:
                     namespace,
                     key_bytes,
                     lambda connection: connection.touch(key_bytes, ttl_seconds, namespace),
-                )
+                ),
+                replay_safe=ttl_seconds != 0,
             )
         except (NanocachedError, ConnectionError, OSError) as error:
             if _rejected_by_server(error):
@@ -1314,7 +1324,12 @@ class NanocachedClient:
         no hedging, no fallback to a replica on a miss) and the other
         owners are sent the plain touch, so a replica is never the only
         owner touched. It counts as a read on the primary, which makes the
-        entry the most recently used."""
+        entry the most recently used.
+
+        With ``ttl_seconds == 0`` a reply lost after the request was sent
+        raises ConnectionLostError instead of being resent (issue #901):
+        the node may have expired the entry and consumed its value, and a
+        resend would report a miss."""
         return await self._get_and_touch(b"", key, ttl_seconds)
 
     async def _get_and_touch(
@@ -1339,7 +1354,8 @@ class NanocachedClient:
                     replica_op=lambda connection: connection.touch(
                         key_bytes, ttl_seconds, namespace
                     ),
-                )
+                ),
+                replay_safe=ttl_seconds != 0,
             )
         except (NanocachedError, ConnectionError, OSError) as error:
             if _rejected_by_server(error):
@@ -2025,7 +2041,10 @@ class NanocachedClient:
         ``0`` expires the keys at once.
 
         Like touch() it is idempotent, so a request whose reply was lost
-        is retried, and in a cluster it goes to every owner of a key, the
+        is retried — except with ``ttl_seconds == 0``, where a primary
+        whose connection fails after the frame was written is not resent
+        (issue #901) and the call raises that connection error, every
+        other key having been touched. In a cluster it goes to every owner of a key, the
         primary's answer being the key's. A replica's failure or ``W`` is
         counted in stats().replica_write_failures and never fails the
         batch. Larger batches are transparently split into more than one
@@ -2079,8 +2098,12 @@ class NanocachedClient:
         nothing resolved), each carrying ``partial_values``, the keys that
         did resolve. Unlike get_many() a key is not tried on its next
         owner when its primary is down — a replica's answer would leave
-        the primary untouched. Raises ServerTooOldError against a node
-        that predates the command."""
+        the primary untouched. With ``ttl_seconds == 0`` a primary whose
+        connection fails after the frame was written is not resent (issue
+        #901): it may have expired and consumed its values already, so
+        those keys raise PartialConnectionLostError at once instead of
+        reading as misses. Raises ServerTooOldError against a node that
+        predates the command."""
         return await self._decode_batch(self._get_many_and_touch_bytes(b"", keys, ttl_seconds))
 
     async def _get_many_and_touch_bytes(
@@ -2168,17 +2191,18 @@ class NanocachedClient:
             retry = await self._multi_touch_pass(
                 namespace, key_bytes_list, ttl_seconds, get, retry, state
             )
-        if not retry:
+        if not retry and not state.lost:
             return collect(state.results)
         if state.rejected:
             raise ServerTooOldError("y") from state.last_cause
-        if any(idx in state.wrong_node for idx in retry):
+        if not state.lost and any(idx in state.wrong_node for idx in retry):
             if get:
                 raise PartialWrongNodeError(collect(state.results))
             raise WrongNodeError()
         # No primary answered `W` for these keys: each one's primary was
-        # unreachable on both passes. That is a connection loss and is
-        # reported as one, as get_many() does.
+        # unreachable on both passes, or (``ttl_seconds == 0``) lost its
+        # connection after the frame was written and was not resent. That
+        # is a connection loss and is reported as one, as get_many() does.
         cause = state.last_cause
         if cause is None:
             cause = ConnectionError("nanocached: no owner is reachable for these keys")
@@ -2186,7 +2210,7 @@ class NanocachedClient:
             raise PartialConnectionLostError(
                 collect(state.results),
                 f"nanocached: get_many_and_touch could not reach the primary of "
-                f"{len(retry)} of {len(key_bytes_list)} keys: {cause}",
+                f"{len(retry) + len(state.lost)} of {len(key_bytes_list)} keys: {cause}",
             ) from cause
         raise cause
 
@@ -2272,10 +2296,17 @@ class NanocachedClient:
                 lambda: self._member_connection(name), namespace, group_keys, ttl_seconds, get_form
             )
             resolved = len(leg_indices) if error is None else failed_at
+            # A touch that expires (``ttl_seconds == 0``) is not safe to
+            # resend once its frame was written (issue #901): the node may
+            # have applied it, and a resend would report the keys as
+            # missing — and, with ``get``, lose the values it consumed.
+            lost_is_final = False
             if error is not None and any(is_primary):
                 state.last_cause = error
                 if _rejected_by_server(error):
                     state.rejected = True
+                else:
+                    lost_is_final = ttl_seconds == 0 and isinstance(error, ConnectionLostError)
             leg_retry: list[int] = []
             for pos, (idx, primary) in enumerate(zip(leg_indices, is_primary)):
                 answered = pos < resolved and entries[pos] is not WRONG_NODE
@@ -2289,6 +2320,9 @@ class NanocachedClient:
                         state.wrong_node.add(idx)
                     else:
                         state.wrong_node.discard(idx)
+                        if lost_is_final:
+                            state.lost.add(idx)
+                            continue
                     leg_retry.append(idx)
             return leg_retry
 
