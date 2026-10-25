@@ -4470,6 +4470,26 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
     }, [{ withoutMultiTouch: true }, {}]);
   });
 
+  it("a primary that predates y is not redialed or resent: one frame, then ServerTooOldError", async () => {
+    // `En` is the node's final answer: a second pass would dial the same
+    // node again and be refused the same way.
+    for (const get of [false, true]) {
+      await withCluster(async (client, cluster) => {
+        const keys = keysWithPrimary(cluster, names[0], 3);
+        await client.setMany(Object.fromEntries(keys.map((key) => [key, "v"])));
+        const old = cluster.nodes[0].mock;
+        const connectionsBefore = old.connectionCount();
+        await assert.rejects(() => (get ? client.getManyAndTouch(keys, 30) : client.touchMany(keys, 30)), (error: unknown) => {
+          assert.ok(error instanceof ServerTooOldError);
+          assert.equal(error.command, "y");
+          return true;
+        });
+        assert.equal(old.multiTouchFrames().length, 1);
+        assert.equal(old.connectionCount(), connectionsBefore);
+      }, [{ withoutMultiTouch: true }, {}]);
+    }
+  });
+
   it("an unreachable primary is a connection loss with the other hits attached", async () => {
     // R=1: the only owner of some keys is gone. Nothing answered `W`, so
     // the error is not the wrong-node one, and no replica stands in.
