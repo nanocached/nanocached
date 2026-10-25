@@ -1,3 +1,3 @@
-export { NanocachedClient, NanocachedNamespace, NanocachedError, AlreadyClosedError, CompressionIncompatibleError, ConnectionLostError, CounterOutOfRangeError, NotNumericError, RetryableError, ServerTooOldError, WrongNodeError, PartialWrongNodeError, PartialConnectionLostError, DecompressionError, contentDigest, MAX_BATCH_KEYS } from "./client.js";
+export { NanocachedClient, NanocachedNamespace, NanocachedError, AlreadyClosedError, CompressionIncompatibleError, ConnectionLostError, CounterOutOfRangeError, NotNumericError, RetryableError, ServerTooOldError, WrongNodeError, PartialWrongNodeError, PartialServerTooOldError, PartialConnectionLostError, DecompressionError, contentDigest, MAX_BATCH_KEYS } from "./client.js";
 export { AuthenticationError, DiscoveryBusyError } from "./identify.js";
 export type { NanocachedClientOptions, NanocachedAddress, ClientStats } from "./client.js";

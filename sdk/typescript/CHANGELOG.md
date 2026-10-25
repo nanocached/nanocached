@@ -9,6 +9,14 @@ tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- In a cluster, `getManyAndTouch` no longer discards the hits other
+  primaries returned when one primary answers `En` to `y`. It throws
+  `PartialServerTooOldError`, a `ServerTooOldError` subclass, with them in
+  `.partialValues`; with `ttlSeconds` `0` they were consumed on the nodes
+  and could not be read again. `touchMany` still throws the plain error.
+
 ### Added
 
 - `touch(key, ttlSeconds)` replaces an entry's TTL in place and resolves

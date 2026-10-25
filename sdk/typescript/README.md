@@ -502,7 +502,10 @@ primary that cannot be reached on both passes throws its connection error
 (`PartialConnectionLostError` with `.partialValues` for `getManyAndTouch`,
 when some keys did resolve). A touch is idempotent, so a failed `touchMany`
 can simply be sent again. Both throw `ServerTooOldError` (its `command` is
-`"y"`) against a node that has `t` but not `y`.
+`"y"`) against a node that has `t` but not `y`; in a cluster, when other
+primaries had already answered, `getManyAndTouch` throws its subclass
+`PartialServerTooOldError` with their hits in `.partialValues` (with
+`ttlSeconds` `0` those values are consumed, so they are not read again).
 
 ## Batched get and set
 
