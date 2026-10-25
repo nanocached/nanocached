@@ -2213,12 +2213,25 @@ public final class NanocachedClient implements AutoCloseable {
     private static final class ChunkedConnectionFailure extends RuntimeException {
         final List<Connection.MultiEntry> partialEntries;
         final NanocachedException.ConnectionFailed cause;
+        /** Issue #901: how many leading keys of the call the failed
+         * request may have reached the node with — {@code 0} unless it was
+         * an expiring ({@code ttl == 0}) touch whose frame may have been
+         * applied, in which case the unresolved keys below this index must
+         * not be resent. */
+        final int sentEnd;
 
         ChunkedConnectionFailure(
                 List<Connection.MultiEntry> partialEntries, NanocachedException.ConnectionFailed cause) {
+            this(partialEntries, cause, 0);
+        }
+
+        ChunkedConnectionFailure(
+                List<Connection.MultiEntry> partialEntries, NanocachedException.ConnectionFailed cause,
+                int sentEnd) {
             super(cause);
             this.partialEntries = partialEntries;
             this.cause = cause;
+            this.sentEnd = sentEnd;
         }
     }
 
@@ -2572,9 +2585,16 @@ public final class NanocachedClient implements AutoCloseable {
      *
      * <p>Unlike INCR and the compare-and-set family a touch is idempotent,
      * so a request whose reply was lost is retried like get/set/delete are,
-     * never thrown as {@link NanocachedException.ConnectionFailed}. In a
-     * cluster it goes to every owner, like a set, and the primary's answer
-     * is returned.
+     * never thrown as {@link NanocachedException.ConnectionFailed} -- with
+     * one exception (issue #901): {@code 0} expires the entry, so a resend
+     * after the node already applied it would answer {@code false} for a
+     * key that existed. With {@code ttlSeconds == 0} the request is
+     * retried only when it provably never reached the wire (a wrong-node
+     * answer, a failed dial, a connection already known dead); a
+     * connection lost after it was sent is thrown as {@link
+     * NanocachedException.ConnectionFailed}, as INCR's is, and the entry
+     * may or may not have expired. In a cluster it goes to every owner,
+     * like a set, and the primary's answer is returned.
      *
      * @throws NanocachedException.ServerTooOld against a node that predates
      *         the command
@@ -2595,8 +2615,10 @@ public final class NanocachedClient implements AutoCloseable {
         Long wireTtl = touchWireTtl(ttlSeconds);
         beforeOperation();
         try {
-            return withWrongNodeRetry(() -> write(
-                    namespace, key, connection -> connection.touch(namespace, key, wireTtl)));
+            boolean expiring = expiresAtOnce(wireTtl);
+            return withTouchRetry(expiring, () -> write(
+                    namespace, key, connection -> connection.touch(namespace, key, wireTtl),
+                    null, null, !expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         }
@@ -2614,6 +2636,11 @@ public final class NanocachedClient implements AutoCloseable {
      * are sent the plain touch, so a replica is never the only owner
      * touched. It counts as a read on the primary, which makes the entry
      * the most recently used.
+     *
+     * <p>With {@code ttlSeconds == 0} a connection lost after the request
+     * was sent is thrown as {@link NanocachedException.ConnectionFailed}
+     * instead of being resent (issue #901): the node may have expired the
+     * entry and consumed its value, and a resend would report a miss.
      *
      * @throws UncheckedIOException if the stored value is not valid UTF-8
      * @throws NanocachedException.ServerTooOld against a node that predates
@@ -2648,14 +2675,16 @@ public final class NanocachedClient implements AutoCloseable {
         beforeOperation();
         byte[] raw;
         try {
-            raw = withWrongNodeRetry(() -> write(
+            boolean expiring = expiresAtOnce(wireTtl);
+            raw = withTouchRetry(expiring, () -> write(
                     namespace, key,
                     connection -> connection.getAndTouch(namespace, key, wireTtl),
                     null,
                     // A replica is sent the plain touch: it has no value to
                     // return, and `G` there would only move the value over
                     // the wire for nothing.
-                    connection -> connection.touch(namespace, key, wireTtl)));
+                    connection -> connection.touch(namespace, key, wireTtl),
+                    !expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         }
@@ -2700,7 +2729,11 @@ public final class NanocachedClient implements AutoCloseable {
      * IllegalArgumentException}.
      *
      * <p>Like {@code touch} it is idempotent, so a request whose reply was
-     * lost is retried, and in a cluster it goes to every owner of a key,
+     * lost is retried -- except with {@code ttlSeconds == 0} (issue #901),
+     * where a primary whose connection fails after the frame may have been
+     * applied is not resent: its keys are reported as that connection
+     * failure instead of being read as missing, every other key having
+     * been touched. In a cluster it goes to every owner of a key,
      * the primary's answer being the key's. A replica's failure or {@code
      * W} is counted in {@link ClientStats#replicaWriteFailures()} and never
      * fails the batch. Larger batches are transparently split into more
@@ -2791,7 +2824,10 @@ public final class NanocachedClient implements AutoCloseable {
      * connection failure when nothing resolved), each carrying the keys
      * that did resolve. Unlike {@code getMany} a key is not tried on its
      * next owner when its primary is down — a replica's answer would leave
-     * the primary untouched.
+     * the primary untouched. With {@code ttlSeconds == 0} a primary whose
+     * connection fails after the frame may have been applied is not resent
+     * (issue #901): it may have expired and consumed its values already, so
+     * those keys throw at once instead of reading as misses.
      *
      * @throws UncheckedIOException if a stored value is not valid UTF-8
      * @throws NanocachedException.ServerTooOld against a node that
@@ -2977,6 +3013,11 @@ public final class NanocachedClient implements AutoCloseable {
         final Map<Integer, Connection.MultiEntry> results = new ConcurrentHashMap<>();
         final Set<Integer> wrongNode = ConcurrentHashMap.newKeySet();
         final AtomicReference<NanocachedException> lastCause = new AtomicReference<>();
+        /** Issue #901: positions a {@code ttl == 0} call must not resend —
+         * their primary leg failed after the frame may have been applied,
+         * so a resend would report them missing (and, with {@code get},
+         * lose the values it consumed). */
+        final Set<Integer> lost = ConcurrentHashMap.newKeySet();
         volatile boolean rejected;
     }
 
@@ -3064,9 +3105,12 @@ public final class NanocachedClient implements AutoCloseable {
             answers[result.getKey()] = result.getValue();
         }
         List<Integer> unresolved = new ArrayList<>(retry);
+        unresolved.addAll(state.lost);
         Collections.sort(unresolved);
+        // A key that was sent and lost its connection is a connection
+        // failure, whatever the others did (issue #901).
         boolean wrongNode = false;
-        for (int idx : unresolved) {
+        for (int idx : state.lost.isEmpty() ? unresolved : List.<Integer>of()) {
             if (state.wrongNode.contains(idx)) {
                 wrongNode = true;
                 break;
@@ -3079,28 +3123,34 @@ public final class NanocachedClient implements AutoCloseable {
      * sub-frames against whatever {@code connectionFor} resolves to,
      * chunked like {@code m} (see {@link #multiGetChunkEnd}). {@code get}
      * selects the {@code G} form. Throws {@link ChunkedConnectionFailure}
-     * when a chunk after the first fails (issue #411), and the plain
-     * connection failure when the first does — every caller must catch
-     * both. */
+     * when a chunk fails (issue #411) — also the first, unlike {@code m}
+     * — so that it can say how far a {@code ttl == 0} request may have
+     * been applied (issue #901); every caller must catch it. */
     private List<Connection.MultiEntry> multiTouchChunked(
             java.util.function.Supplier<Connection> connectionFor, byte[] namespace, byte[][] keys,
             Long wireTtl, boolean get) {
         List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
+        boolean expiring = expiresAtOnce(wireTtl);
         int start = 0;
         while (start < keys.length) {
             int end = multiGetChunkEnd(namespace.length, keys, start);
             byte[][] chunk = Arrays.copyOfRange(keys, start, end);
             List<Connection.MultiEntry> chunkEntries;
+            ConnectionOp<List<Connection.MultiEntry>> chunkOp = connection -> get
+                    ? connection.multiGetAndTouch(namespace, chunk, wireTtl)
+                    : connection.multiTouch(namespace, chunk, wireTtl);
             try {
-                chunkEntries = applyReconnecting(
-                        connectionFor,
-                        connection -> get
-                                ? connection.multiGetAndTouch(namespace, chunk, wireTtl)
-                                : connection.multiTouch(namespace, chunk, wireTtl),
-                        true);
+                chunkEntries = expiring
+                        ? applyReconnectingUnlessSent(connectionFor, chunkOp)
+                        : applyReconnecting(connectionFor, chunkOp, true);
             } catch (NanocachedException.ConnectionFailed failure) {
-                if (start == 0) throw failure;
-                throw new ChunkedConnectionFailure(entries, failure);
+                // Issue #901: with ttl 0 a chunk whose frame may have been
+                // applied (not provably unsent, and not an `En`, which
+                // applied nothing) must not be resent; later chunks were
+                // never sent.
+                boolean mayHaveApplied = expiring && !failure.notSent()
+                        && !(failure instanceof NanocachedException.ServerRejected);
+                throw new ChunkedConnectionFailure(entries, failure, mayHaveApplied ? end : 0);
             }
             for (int i = start; i < end; i++) {
                 entries.set(i, chunkEntries.get(i - start));
@@ -3207,11 +3257,13 @@ public final class NanocachedClient implements AutoCloseable {
 
         List<Connection.MultiEntry> entries;
         NanocachedException failure = null;
+        int sentEnd = 0;
         try {
             entries = multiTouchChunked(() -> memberConnection(leg.owner), namespace, groupKeys, wireTtl, leg.get);
         } catch (ChunkedConnectionFailure partial) {
             entries = partial.partialEntries;
             failure = partial.cause;
+            sentEnd = partial.sentEnd;
         } catch (NanocachedException connectionFailure) {
             entries = Collections.nCopies(groupKeys.length, null);
             failure = connectionFailure;
@@ -3232,6 +3284,11 @@ public final class NanocachedClient implements AutoCloseable {
             } else {
                 if (entry == null) {
                     state.wrongNode.remove(idx);
+                    if (i < sentEnd) {
+                        // Issue #901: sent, then the connection was lost.
+                        state.lost.add(idx);
+                        continue;
+                    }
                 } else {
                     state.wrongNode.add(idx);
                 }
@@ -4431,6 +4488,35 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
+    /**
+     * {@link #withWrongNodeRetry} for a touch: with {@code expiring} (issue
+     * #901, {@code ttl == 0}) a connection failure is retried after a
+     * refresh only if the request provably never reached the wire; the
+     * node may already have applied anything else and expired the entry.
+     * {@code W} is always retried, as for every command.
+     */
+    private <T> T withTouchRetry(boolean expiring, java.util.function.Supplier<T> operation) {
+        if (!expiring) return withWrongNodeRetry(operation);
+        try {
+            return operation.get();
+        } catch (NanocachedException.WrongNode error) {
+            if (ring == null) throw error;
+            maybeRefresh(true);
+            return operation.get();
+        } catch (NanocachedException.ConnectionFailed error) {
+            if (ring == null || !error.notSent()) throw error;
+            maybeRefresh(true);
+            return operation.get();
+        }
+    }
+
+    /** {@code true} for a touch TTL that expires the entry at once — not
+     * {@link #REMOVE_TTL} (a {@code null} wire TTL) and not a positive
+     * TTL. */
+    private static boolean expiresAtOnce(Long wireTtl) {
+        return wireTtl != null && wireTtl == 0L;
+    }
+
     /** {@code namespace} empty is exactly the un-namespaced form — {@link
      * HashRing#owners(byte[], byte[], int)} treats it identically to
      * {@link HashRing#owners(byte[], int)} (namespaces, issue #105). */
@@ -4514,6 +4600,38 @@ public final class NanocachedClient implements AutoCloseable {
         } catch (NanocachedException.ConnectionFailed retryable) {
             if (!retryable.notSent()) throw retryable;
             return op.apply(source.get());
+        }
+    }
+
+    /**
+     * As {@link #applyReconnectingNonIdempotent}, for a touch whose TTL
+     * expires the entry (issue #901): a resend after the node applied it
+     * would find the key gone. Same boundary as INCR/CAS -- {@link
+     * NanocachedException.ConnectionFailed#notSent()} -- with one addition:
+     * a failure to obtain the connection at all (a dial that failed, a
+     * member with no connection) is itself proof that nothing was sent, so
+     * it is flagged {@code notSent} too and the caller may route around the
+     * dead node after a refresh, as it always could.
+     */
+    private <T> T applyReconnectingUnlessSent(
+            java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
+        try {
+            return op.apply(connectionNotSent(source));
+        } catch (NanocachedException.ConnectionFailed retryable) {
+            if (!retryable.notSent()) throw retryable;
+            return op.apply(connectionNotSent(source));
+        }
+    }
+
+    private static Connection connectionNotSent(java.util.function.Supplier<Connection> source) {
+        try {
+            return source.get();
+        } catch (NanocachedException.ConnectionFailed dialFailure) {
+            if (dialFailure.getClass() != NanocachedException.ConnectionFailed.class || dialFailure.notSent()) {
+                throw dialFailure;
+            }
+            throw new NanocachedException.ConnectionFailed(
+                    dialFailure.getMessage(), dialFailure.getCause(), true, dialFailure.timedOut());
         }
     }
 
@@ -4845,8 +4963,26 @@ public final class NanocachedClient implements AutoCloseable {
             byte[] namespace, byte[] key, ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
             ConnectionOp<?> replicaOp) {
+        return write(namespace, key, op, backgroundSafeOp, replicaOp, true);
+    }
+
+    /**
+     * As the five-argument {@code write}; with {@code primaryReplaySafe}
+     * false (issue #901: a touch whose TTL expires the entry) the primary
+     * leg is redialled and resent only when the request provably never
+     * reached the wire (see {@link #applyReconnectingUnlessSent}). A
+     * replica leg keeps its plain retry: only the primary's answer is
+     * reported, so a replica that already expired the entry changes
+     * nothing.
+     */
+    private <T> T write(
+            byte[] namespace, byte[] key, ConnectionOp<T> op,
+            java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
+            ConnectionOp<?> replicaOp, boolean primaryReplaySafe) {
         if (ring == null) {
-            return applyReconnecting(this::singleConnection, op);
+            return primaryReplaySafe
+                    ? applyReconnecting(this::singleConnection, op)
+                    : applyReconnectingUnlessSent(this::singleConnection, op);
         }
 
         List<String> names = ownerNames(namespace, key);
@@ -4927,7 +5063,9 @@ public final class NanocachedClient implements AutoCloseable {
         T value = null;
         RuntimeException primaryError = null;
         try {
-            value = applyReconnecting(() -> memberConnection(names.get(0)), op);
+            value = primaryReplaySafe
+                    ? applyReconnecting(() -> memberConnection(names.get(0)), op)
+                    : applyReconnectingUnlessSent(() -> memberConnection(names.get(0)), op);
         } catch (RuntimeException error) {
             primaryError = error;
         }
