@@ -183,6 +183,10 @@ struct NodeState {
     /// Issue #825: behave like a node that predates `t` — answer `En` and
     /// close the connection.
     reject_touch: std::sync::atomic::AtomicBool,
+    /// Issue #934: holds every `t` and `y` frame this long before it is
+    /// applied and answered — a slow primary, so a test can look at the
+    /// replicas while the primary has not answered yet. Persistent.
+    touch_delay_ms: AtomicUsize,
     /// Issue #871: every `y` (batched touch) frame this node has received,
     /// in receipt order — lets a test assert how a batch was split and
     /// which node got which form.
@@ -652,6 +656,10 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     let _ = stream.get_mut().write_all(b"En\n").await;
                     return;
                 }
+                let delay = state.touch_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+                }
                 let mut ttl_seconds: Option<u64> = None;
                 let mut with_value = false;
                 let end = parts.len() - usize::from(tagged);
@@ -762,6 +770,10 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 {
                     let _ = stream.get_mut().write_all(b"En\n").await;
                     return;
+                }
+                let delay = state.touch_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
                 }
                 if state.silent.load(Ordering::SeqCst) {
                     continue;
@@ -5170,6 +5182,330 @@ async fn batch_touch_still_wrong_node_after_the_retry_returns_what_did_resolve()
     stop_cluster(client, nodes, discovery).await;
 }
 
+// ── an expiring touch asks the primary first (issue #934) ───────────
+//
+// With `Some(0)` the plain touch to the other owners goes out only after
+// the primary has answered `S`/`V`/`N`: a primary that could not be reached
+// or answered `W` is rerouted with no replica touched yet, where the
+// replica would have expired its copy and answered a miss as the new primary.
+
+/// Drops every node but `keep` from the roster discovery answers with.
+fn shrink_roster_to(discovery: &MockDiscovery, nodes: &[(String, MockNode)], keep: &str) {
+    let address = node_named(nodes, keep).address();
+    *discovery.nodes.lock().unwrap() = vec![(keep.to_string(), address)];
+}
+
+fn stored(node: &MockNode, key: &str) -> bool {
+    node.state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(&store_key(b"", key.as_bytes()))
+}
+
+fn frames_carrying(node: &MockNode, keys: &[String]) -> usize {
+    multi_touch_frames(node)
+        .iter()
+        .filter(|frame| keys.iter().any(|key| frame.keys.contains(key)))
+        .count()
+}
+
+#[tokio::test]
+async fn an_expiring_touch_reroutes_a_dead_primary_with_no_replica_touched() {
+    let key = "shared-key";
+    for get in [false, true] {
+        let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
+        let client = NanocachedClient::connect(options(discovery.port))
+            .await
+            .unwrap();
+        let owners = owners_of(key);
+        let primary = node_named(&nodes, &owners[0]);
+        let replica = node_named(&nodes, &owners[1]);
+
+        // The primary goes away and the roster still lists it: the call
+        // fails, and the replica was never touched.
+        primary.stop();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let result = if get {
+            client.get_and_touch(key, Some(0)).await.map(|_| ())
+        } else {
+            client.touch(key, Some(0)).await.map(|_| ())
+        };
+        assert!(
+            matches!(result, Err(Error::ConnectionLost(_))),
+            "get={get}: {result:?}"
+        );
+        assert!(touch_frames(replica).is_empty(), "get={get}");
+        assert!(stored(replica, key), "get={get}: the copy is still there");
+
+        // Once the roster drops the primary the reroute reaches the replica
+        // as the new primary, and finds the value.
+        shrink_roster_to(&discovery, &nodes, &owners[1]);
+        if get {
+            assert_eq!(
+                client.get_and_touch(key, Some(0)).await.unwrap(),
+                Some("v".to_string())
+            );
+            assert_eq!(touch_frames(replica), ["t 0 10 0 G"]);
+        } else {
+            assert!(client.touch(key, Some(0)).await.unwrap());
+            assert_eq!(touch_frames(replica), ["t 0 10 0"]);
+        }
+
+        client.close().await;
+        discovery.stop();
+        for (_, node) in nodes {
+            node.stop();
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_expiring_touch_answered_wrong_node_touches_no_replica_and_reroutes_with_the_value() {
+    let key = "shared-key";
+    let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let owners = owners_of(key);
+    let primary = node_named(&nodes, &owners[0]);
+    let replica = node_named(&nodes, &owners[1]);
+
+    // `W` on both attempts: the error reaches the caller with nothing
+    // touched anywhere.
+    primary.state.wrong_node_replies.store(2, Ordering::SeqCst);
+    assert!(matches!(
+        client.get_and_touch(key, Some(0)).await,
+        Err(Error::WrongNode)
+    ));
+    assert!(touch_frames(replica).is_empty());
+    assert!(stored(replica, key));
+    assert!(stored(primary, key));
+
+    // `W` once: the reroute returns the value, and only then does the
+    // replica get the plain touch.
+    primary.state.wrong_node_replies.store(1, Ordering::SeqCst);
+    assert_eq!(
+        client.get_and_touch(key, Some(0)).await.unwrap(),
+        Some("v".to_string())
+    );
+    assert_eq!(touch_frames(replica), ["t 0 10 0"]);
+    assert!(!stored(replica, key));
+    assert!(!stored(primary, key));
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn an_expiring_touch_reaches_the_replicas_only_after_the_primary_answered() {
+    let key = "shared-key";
+    for (ttl, replica_at_once) in [(Some(0), false), (Some(30), true), (None, true)] {
+        let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
+        let client = NanocachedClient::connect(options(discovery.port))
+            .await
+            .unwrap();
+        let owners = owners_of(key);
+        let primary = node_named(&nodes, &owners[0]);
+        let replica = node_named(&nodes, &owners[1]);
+        primary.state.touch_delay_ms.store(400, Ordering::SeqCst);
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.touch(key, ttl).await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(touch_frames(primary).len(), 1, "ttl={ttl:?}");
+        assert_eq!(
+            touch_frames(replica).len(),
+            usize::from(replica_at_once),
+            "ttl={ttl:?}: the replica's frame while the primary has not answered"
+        );
+        assert!(call.await.unwrap().unwrap());
+        assert_eq!(touch_frames(replica).len(), 1, "ttl={ttl:?}");
+
+        client.close().await;
+        discovery.stop();
+        for (_, node) in nodes {
+            node.stop();
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_expiring_touch_still_reaches_the_replica_when_the_primary_misses() {
+    // A miss on the primary is a definitive answer: the replica may still
+    // hold a copy (written by fire-and-forget replication), and the caller
+    // meant expire-everywhere.
+    let key = "shared-key";
+    let (nodes, discovery) = start_cluster_with_seed(key, [false, true]).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let owners = owners_of(key);
+    let replica = node_named(&nodes, &owners[1]);
+
+    assert!(!client.touch(key, Some(0)).await.unwrap());
+    assert_eq!(touch_frames(replica), ["t 0 10 0"]);
+    assert!(!stored(replica, key));
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn an_expiring_batch_touch_reroutes_a_dead_primary_with_no_replica_touched() {
+    for get in [false, true] {
+        let (nodes, discovery) = start_cluster(2).await;
+        let client = NanocachedClient::connect(options(discovery.port))
+            .await
+            .unwrap();
+        let keys = keys_whose_primary_is(NAMES[0], 3);
+        let replica = node_named(&nodes, NAMES[1]);
+        client.set_many(&values_for(&keys), 0).await.unwrap();
+
+        node_named(&nodes, NAMES[0]).stop();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let result = if get {
+            client
+                .get_many_and_touch(&keys, Some(0))
+                .await
+                .map(|_| ())
+                .err()
+        } else {
+            client.touch_many(&keys, Some(0)).await.map(|_| ()).err()
+        };
+        assert!(
+            matches!(
+                result,
+                Some(Error::ConnectionLost(_) | Error::PartialConnectionLostText(..))
+            ),
+            "get={get}: {result:?}"
+        );
+        assert!(multi_touch_frames(replica).is_empty(), "get={get}");
+        assert!(keys.iter().all(|key| stored(replica, key)), "get={get}");
+
+        shrink_roster_to(&discovery, &nodes, NAMES[1]);
+        if get {
+            assert_eq!(
+                client.get_many_and_touch(&keys, Some(0)).await.unwrap(),
+                values_for(&keys)
+            );
+        } else {
+            let touched = client.touch_many(&keys, Some(0)).await.unwrap();
+            assert_eq!(touched.len(), keys.len());
+            assert!(touched.values().all(|touched| *touched));
+        }
+        assert_eq!(multi_touch_frames(replica).len(), 1, "get={get}");
+        assert_eq!(multi_touch_frames(replica)[0].get, get);
+
+        client.close().await;
+        discovery.stop();
+        for (_, node) in nodes {
+            node.stop();
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_expiring_batch_touch_gives_no_replica_leg_to_keys_still_wrong_node() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let node_a = node_named(&nodes, NAMES[0]);
+    let node_b = node_named(&nodes, NAMES[1]);
+    let primary_a = keys_whose_primary_is(NAMES[0], 3);
+    let primary_b = keys_whose_primary_is(NAMES[1], 2);
+    let all = concat(&primary_a, &primary_b);
+    client.set_many(&values_for(&all), 0).await.unwrap();
+
+    // A answers `W` to both passes: its keys stay unresolved, B's resolve.
+    node_a.state.wrong_node_replies.store(2, Ordering::SeqCst);
+    assert!(matches!(
+        client.touch_many(&all, Some(0)).await,
+        Err(Error::WrongNode)
+    ));
+    // The keys A kept get no leg on B, as primary or replica; the ones B
+    // answered are then sent to A in the plain form, once.
+    assert_eq!(frames_carrying(node_b, &primary_a), 0);
+    assert_eq!(frames_carrying(node_b, &primary_b), 1);
+    assert_eq!(multi_touch_frames(node_a).len(), 3);
+    assert_eq!(frames_carrying(node_a, &primary_b), 1);
+    assert!(primary_a.iter().all(|key| stored(node_b, key)));
+    assert!(primary_b.iter().all(|key| !stored(node_a, key)));
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn an_expiring_batch_touch_reaches_the_replicas_only_after_the_primaries_answered() {
+    for (ttl, replica_at_once) in [(Some(0), false), (Some(30), true)] {
+        let (nodes, discovery) = start_cluster(2).await;
+        let client = NanocachedClient::connect(options(discovery.port))
+            .await
+            .unwrap();
+        let node_a = node_named(&nodes, NAMES[0]);
+        let node_b = node_named(&nodes, NAMES[1]);
+        let keys = keys_whose_primary_is(NAMES[0], 3);
+        client.set_many(&values_for(&keys), 0).await.unwrap();
+        node_a.state.touch_delay_ms.store(400, Ordering::SeqCst);
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            let keys = keys.clone();
+            async move { client.touch_many(&keys, ttl).await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(multi_touch_frames(node_a).len(), 1, "ttl={ttl:?}");
+        assert_eq!(
+            multi_touch_frames(node_b).len(),
+            usize::from(replica_at_once),
+            "ttl={ttl:?}: the replica's frame while the primary has not answered"
+        );
+        assert!(call
+            .await
+            .unwrap()
+            .unwrap()
+            .values()
+            .all(|touched| *touched));
+        assert_eq!(multi_touch_frames(node_b).len(), 1, "ttl={ttl:?}");
+
+        stop_cluster(client, nodes, discovery).await;
+    }
+}
+
+#[tokio::test]
+async fn an_expiring_batch_touch_still_reaches_the_replica_for_a_key_the_primary_missed() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let node_b = node_named(&nodes, NAMES[1]);
+    let keys = keys_whose_primary_is(NAMES[0], 2);
+    for key in &keys {
+        node_b
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .insert(key.as_bytes().to_vec(), b"v".to_vec());
+    }
+
+    let touched = client.touch_many(&keys, Some(0)).await.unwrap();
+    assert!(touched.values().all(|touched| !*touched));
+    assert_eq!(multi_touch_frames(node_b).len(), 1);
+    assert!(keys.iter().all(|key| !stored(node_b, key)));
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
 #[tokio::test]
 async fn a_batch_touch_whose_reply_was_lost_is_sent_again() {
     let (nodes, discovery) = start_cluster(2).await;
@@ -5210,8 +5546,13 @@ async fn a_zero_ttl_batch_touch_does_not_resend_a_primary_that_lost_its_reply() 
         matches!(result, Err(Error::ConnectionLost(_))),
         "expected ConnectionLost, got {result:?}"
     );
+    // (A also gets the plain touch for B's keys, which B answered, after
+    // the primaries: that frame does not carry `primary_a`.)
     assert_eq!(
-        multi_touch_frames(node_a).len(),
+        multi_touch_frames(node_a)
+            .iter()
+            .filter(|frame| frame.keys.contains(&primary_a[0]))
+            .count(),
         1,
         "the batch was sent to the lost primary once"
     );
@@ -8744,7 +9085,10 @@ async fn a_zero_ttl_batch_touch_is_not_resent_after_a_reply_that_is_not_a_reply(
         "expected Protocol, got {result:?}"
     );
     assert_eq!(
-        multi_touch_frames(node_a).len(),
+        multi_touch_frames(node_a)
+            .iter()
+            .filter(|frame| frame.keys.contains(&primary_a[0]))
+            .count(),
         1,
         "the batch was sent to that primary once"
     );
