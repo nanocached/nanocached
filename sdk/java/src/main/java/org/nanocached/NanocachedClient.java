@@ -3048,7 +3048,10 @@ public final class NanocachedClient implements AutoCloseable {
 
         MultiTouchState state = new MultiTouchState();
         List<Integer> retry = multiTouchPass(namespace, keys, wireTtl, get, null, state);
-        if (!retry.isEmpty()) {
+        // A primary that answered `En` predates `y` and always will, so a
+        // refresh and a second pass could only dial it again; the caller
+        // raises ServerTooOld whatever the other keys do.
+        if (!retry.isEmpty() && !state.rejected) {
             // One bounded refresh-and-retry over everything a primary left
             // unresolved: a `W` is stale routing the refresh fixes, a
             // primary that could not be reached gets a fresh view of who
@@ -3093,7 +3096,8 @@ public final class NanocachedClient implements AutoCloseable {
                         connectionFor,
                         connection -> get
                                 ? connection.multiGetAndTouch(namespace, chunk, wireTtl)
-                                : connection.multiTouch(namespace, chunk, wireTtl));
+                                : connection.multiTouch(namespace, chunk, wireTtl),
+                        true);
             } catch (NanocachedException.ConnectionFailed failure) {
                 if (start == 0) throw failure;
                 throw new ChunkedConnectionFailure(entries, failure);
@@ -4457,9 +4461,23 @@ public final class NanocachedClient implements AutoCloseable {
      */
     private <T> T applyReconnecting(
             java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
+        return applyReconnecting(source, op, false);
+    }
+
+    /**
+     * As {@link #applyReconnecting(java.util.function.Supplier,
+     * ConnectionOp)}; with {@code rejectionIsFinal} an {@code En} (a node
+     * that predates the command) is surfaced as it is instead of being
+     * redialled and resent. The same node would answer {@code En} again, so
+     * the resend only costs a dial and a round trip. Only batched touch asks
+     * for it: every other command keeps the retry it always had.
+     */
+    private <T> T applyReconnecting(
+            java.util.function.Supplier<Connection> source, ConnectionOp<T> op, boolean rejectionIsFinal) {
         try {
             return op.apply(source.get());
         } catch (NanocachedException.ConnectionFailed retryable) {
+            if (rejectionIsFinal && retryable instanceof NanocachedException.ServerRejected) throw retryable;
             // A request timeout is not the idle-FIN case this retry exists
             // for: the peer accepted the frame and simply never answered
             // within the request deadline, so a redial-and-resend would
