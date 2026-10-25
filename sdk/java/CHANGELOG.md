@@ -13,6 +13,14 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `getManyAndTouch` against a proxy no longer discards the hits the earlier
+  chunks of a batch of more than 400 keys returned when a later chunk is
+  answered `R` (the proxy's retryable error). It ends the batch with them
+  attached, as a lost connection does: it throws `PartialConnectionFailed*`
+  whose cause is the `RetryableError`; with `ttlSeconds` `0` those values
+  were consumed and could not be read again. An `R` means the chunk was not
+  applied, so it is never counted as possibly applied. A first chunk
+  answered `R` still throws the bare `RetryableError`, as does `touchMany`.
 - `touch` and `getAndTouch` no longer redial and send the frame again to a
   replica that answers `En`. The primary leg already stopped at once; the
   replica leg took a second dial for the same answer on every call against a
