@@ -133,8 +133,8 @@ public class NanocachedException extends RuntimeException {
     /**
      * The node answered {@code En} and is closing the connection (issue
      * #825). A {@link ConnectionFailed}, so every command other than
-     * touch/getAndTouch sees exactly the failure it always did;
-     * those two turn it into {@link ServerTooOld}.
+     * touch, getAndTouch, touchMany or getManyAndTouch sees exactly the
+     * failure it always did; those four turn it into {@link ServerTooOld}.
      */
     static final class ServerRejected extends ConnectionFailed {
         ServerRejected() {
@@ -144,18 +144,33 @@ public class NanocachedException extends RuntimeException {
 
     /**
      * Raised by touch/getAndTouch (issue #825) when the node answered {@code
-     * En} to the {@code t} command: a node that predates it does not know
-     * the command and closes the connection. Every node must be upgraded
-     * before a client sends it; nothing is retried to get past it, since
-     * the same node would answer the same way. {@code En} is also what a
-     * request that is too large or malformed gets, but the SDK validates
-     * size and builds a well-formed frame, so for {@code t} it means the
+     * En} to the {@code t} command, and by touchMany/getManyAndTouch (issue
+     * #871) when it answered {@code En} to {@code y}: a node that predates
+     * the command does not know it and closes the connection. Every node
+     * must be upgraded before a client sends it; nothing is retried to get
+     * past it, since the same node would answer the same way. {@code En}
+     * is also what a request that is too large or malformed gets, but the
+     * SDK validates size and builds a well-formed frame, so it means the
      * command is unknown.
      */
     public static final class ServerTooOld extends NanocachedException {
+        private final String command;
+
         public ServerTooOld(Throwable cause) {
-            super("nanocached: the server does not know the touch command (t) — upgrade every node to a release "
-                    + "that includes it", cause);
+            this("t", cause);
+        }
+
+        /** {@code command} is the wire command the node did not know:
+         * {@code "t"} or {@code "y"}. */
+        public ServerTooOld(String command, Throwable cause) {
+            super("nanocached: the server does not know the " + ("t".equals(command) ? "touch" : "batched touch")
+                    + " command (" + command + ") — upgrade every node to a release that includes it", cause);
+            this.command = command;
+        }
+
+        /** The wire command the node did not know: {@code "t"} or {@code "y"}. */
+        public String command() {
+            return command;
         }
     }
 

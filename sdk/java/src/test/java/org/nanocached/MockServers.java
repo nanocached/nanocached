@@ -158,6 +158,26 @@ final class MockServers {
         /** issue #825: behave like a node that predates `t` — an unknown
          * command is answered `En` and the connection closed. */
         private volatile boolean rejectTouch = false;
+        /** One `y` (batched touch, issue #871) frame as this node saw it:
+         * {@code ttl} is {@code null} when the field was omitted (remove the
+         * TTL). One entry per frame, in receipt order — what proves a
+         * frame's grouping, which the per-key {@link #touchFrames} cannot. */
+        record MultiTouchFrame(String namespace, List<String> keys, Long ttl, boolean get) {}
+
+        final List<MultiTouchFrame> multiTouchFrames = new CopyOnWriteArrayList<>();
+        /** Behave like a node that knows `t` but predates `y` — `En`, then
+         * close ({@link #rejectTouch} implies it). */
+        private volatile boolean rejectMultiTouch = false;
+        /** Answers this many more `y` frames normally, then closes the
+         * connection instead of replying to every one after that, so the
+         * client's own redial-and-resend fails too; -1 is disarmed — a
+         * connection loss on chunk N>1 of a chunked batch touch (the node
+         * itself stays up, unlike {@link #closeAfterMultiGet}). */
+        private final AtomicInteger multiTouchFailAfter = new AtomicInteger(-1);
+        /** The next `y` reply reports exactly this many roster entries
+         * whatever the request's key count (issue #181's desync, for `y`);
+         * -1 is disarmed. */
+        private final AtomicInteger multiTouchBadCount = new AtomicInteger(-1);
         /** One-off connection resets queued for the next `c`/`F` frame(s)
          * (issue #106), mirroring {@link #wrongNodeReplies}/{@link
          * #takeWrongNode()} rather than {@link #failSets}'s permanent
@@ -469,6 +489,22 @@ final class MockServers {
                 if (pending == 0) return false;
                 if (dropReplyAfterTouch.compareAndSet(pending, pending - 1)) return true;
             }
+        }
+
+        /** issue #871: from now on answer every `y` like a node that knows
+         * `t` but predates `y` — `En`, then close. */
+        void rejectMultiTouchLikeAnOldServer() {
+            rejectMultiTouch = true;
+        }
+
+        /** See {@link #multiTouchFailAfter}. */
+        void failMultiTouchAfter(int successes) {
+            multiTouchFailAfter.set(successes);
+        }
+
+        /** See {@link #multiTouchBadCount}. */
+        void answerMultiTouchWithEntryCountOnce(int count) {
+            multiTouchBadCount.set(count);
         }
 
         /** issue #825: from now on answer every `t` like a node that
@@ -1155,6 +1191,92 @@ final class MockServers {
                                         .getBytes(StandardCharsets.US_ASCII));
                                 out.write(existing);
                             }
+                            out.flush();
+                        }
+                        // Batched touch (issue #871): `y <ns-len> <n>
+                        // <key-len-1> ... <key-len-n> [<ttl>] [G] [<tag>]`,
+                        // always namespaced. One TTL for the whole batch; no
+                        // ttl field removes the TTL, 0 expires the keys at
+                        // once. Plain: `Y <n> S|N|W ...`; with `G`: `m`'s `M`
+                        // reply for the keys touched. Like `m`/`o`, a
+                        // takeWrongNode() answers the whole frame `W`.
+                        case "y" -> {
+                            int nsLen = Integer.parseInt(parts[1]);
+                            String ns = keyOf(in.readNBytes(nsLen));
+                            int n = Integer.parseInt(parts[2]);
+                            String[] keys = new String[n];
+                            for (int i = 0; i < n; i++) {
+                                keys[i] = keyOf(in.readNBytes(Integer.parseInt(parts[3 + i])));
+                            }
+                            Long ttlSeconds = null;
+                            boolean withValue = false;
+                            for (int i = 3 + n; i < parts.length - (tagged ? 1 : 0); i++) {
+                                if (parts[i].equals("G")) withValue = true;
+                                else ttlSeconds = Long.parseLong(parts[i]);
+                            }
+                            multiTouchFrames.add(new MultiTouchFrame(ns, List.of(keys), ttlSeconds, withValue));
+                            if (rejectTouch || rejectMultiTouch) {
+                                out.write("En\n".getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                return;
+                            }
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            int failAfter = multiTouchFailAfter.get();
+                            if (failAfter == 0) {
+                                return; // close without replying, for good
+                            }
+                            if (failAfter > 0) multiTouchFailAfter.decrementAndGet();
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            boolean wrongNode = takeWrongNode();
+                            List<String> tokens = new java.util.ArrayList<>(n);
+                            List<byte[]> hits = new java.util.ArrayList<>();
+                            for (String key : keys) {
+                                if (wrongNode) {
+                                    tokens.add("W");
+                                    continue;
+                                }
+                                byte[] existing = namespacedGet(ns, key);
+                                if (existing == null) {
+                                    tokens.add(withValue ? "-" : "N");
+                                    continue;
+                                }
+                                if (ttlSeconds != null && ttlSeconds == 0) {
+                                    namespacedRemove(ns, key);
+                                } else {
+                                    namespacedPutTtl(ns, key, ttlSeconds == null ? 0 : ttlSeconds);
+                                }
+                                if (withValue) {
+                                    tokens.add(String.valueOf(existing.length));
+                                    hits.add(existing);
+                                } else {
+                                    tokens.add("S");
+                                }
+                            }
+                            if (takeDropReplyAfterTouch()) {
+                                return; // applied, but the ack never arrives
+                            }
+                            int badCount = multiTouchBadCount.getAndSet(-1);
+                            if (badCount >= 0) {
+                                while (tokens.size() > badCount) {
+                                    String dropped = tokens.remove(tokens.size() - 1);
+                                    if (!dropped.equals("-") && !dropped.equals("W") && !dropped.equals("S")
+                                            && !dropped.equals("N")) {
+                                        hits.remove(hits.size() - 1);
+                                    }
+                                }
+                                while (tokens.size() < badCount) tokens.add(withValue ? "-" : "N");
+                            }
+                            StringBuilder header = new StringBuilder(withValue ? "M " : "Y ").append(tokens.size());
+                            for (String token : tokens) header.append(' ').append(token);
+                            header.append(tagSuffix).append('\n');
+                            out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
+                            for (byte[] hit : hits) out.write(hit);
                             out.flush();
                         }
                         case "F" -> {
