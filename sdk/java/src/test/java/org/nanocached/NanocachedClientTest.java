@@ -1735,6 +1735,27 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aPrimaryThatAnswersEnToTouchIsNotRedialledOrAskedAgain() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                client.set(key, "v", 100);
+                MockNode old = cluster.nodes().get(NAMES.get(0));
+                old.rejectTouchLikeAnOldServer();
+
+                // `En` is final (issue #902): one frame per call, no resend
+                // after a redial and none after a refresh.
+                assertThrows(NanocachedException.ServerTooOld.class, () -> client.touch(key, 30));
+                assertEquals(1, old.touchFrames.size());
+                assertThrows(NanocachedException.ServerTooOld.class, () -> client.getAndTouch(key, 30));
+                assertEquals(2, old.touchFrames.size());
+                assertThrows(NanocachedException.ServerTooOld.class, () -> client.touch(key, 0));
+                assertEquals(3, old.touchFrames.size());
+            }
+        }
+    }
+
+    @Test
     void aReplicaThatAnswersEnToBatchTouchDoesNotFailTheCall() throws Exception {
         try (Cluster cluster = startCluster(2)) {
             try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
