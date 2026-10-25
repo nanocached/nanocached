@@ -2610,7 +2610,10 @@ public final class NanocachedClient implements AutoCloseable {
      * connection lost after it was sent is thrown as {@link
      * NanocachedException.ConnectionFailed}, as INCR's is, and the entry
      * may or may not have expired. In a cluster it goes to every owner,
-     * like a set, and the primary's answer is returned.
+     * like a set, and the primary's answer is returned; with {@code
+     * ttlSeconds == 0} the other owners are sent it only after the primary
+     * has answered (issue #934), so a primary that has to be rerouted never
+     * finds its replicas have already expired the entry.
      *
      * @throws NanocachedException.ServerTooOld against a node that predates
      *         the command
@@ -2634,7 +2637,7 @@ public final class NanocachedClient implements AutoCloseable {
             boolean expiring = expiresAtOnce(wireTtl);
             return withTouchRetry(expiring, () -> write(
                     namespace, key, connection -> connection.touch(namespace, key, wireTtl),
-                    null, null, !expiring, true));
+                    null, null, !expiring, true, expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         }
@@ -2700,7 +2703,7 @@ public final class NanocachedClient implements AutoCloseable {
                     // return, and `G` there would only move the value over
                     // the wire for nothing.
                     connection -> connection.touch(namespace, key, wireTtl),
-                    !expiring, true));
+                    !expiring, true, expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         }
@@ -2725,7 +2728,12 @@ public final class NanocachedClient implements AutoCloseable {
     // `y` sub-frame per involved node (docs/protocol.html "y — batched
     // touch"), chunked like getMany/setMany. A touch is idempotent and not
     // primary-only, so every owner of a key is sent it, as for setMany, and
-    // only the primary's answer decides the key's outcome. `G` belongs to
+    // only the primary's answer decides the key's outcome. A TTL that
+    // expires the keys at once (ttl 0, issue #934) is the exception: its
+    // primaries are sent theirs first, in both passes, and the other owners
+    // get one plain fan-out at the end, for the keys a primary answered
+    // only. Those replica legs run after the primary's answer, outside the
+    // pipelined-order guarantee, the same class as the retry paths. `G` belongs to
     // the whole frame, so a node that is primary for some keys of a
     // getManyAndTouch batch and a replica for others gets two frames: the G
     // form for the first, the plain form for the second (setMany's "exactly
@@ -2750,7 +2758,9 @@ public final class NanocachedClient implements AutoCloseable {
      * applied is not resent: its keys are reported as that connection
      * failure instead of being read as missing, every other key having
      * been touched. In a cluster it goes to every owner of a key,
-     * the primary's answer being the key's. A replica's failure or {@code
+     * the primary's answer being the key's; with {@code ttlSeconds == 0}
+     * the primaries are sent theirs first and the other owners afterwards,
+     * for the keys a primary answered (issue #934). A replica's failure or {@code
      * W} is counted in {@link ClientStats#replicaWriteFailures()} and never
      * fails the batch. Larger batches are transparently split into more
      * than one {@code y} sub-frame per node (see {@link #MAX_BATCH_KEYS}).
@@ -3070,6 +3080,10 @@ public final class NanocachedClient implements AutoCloseable {
      * W} rather than a connection failure. */
     private static final class MultiTouchState {
         final Map<Integer, Connection.MultiEntry> results = new ConcurrentHashMap<>();
+        /** Issue #934: the node whose primary leg answered each position
+         * in {@link #results}, for the ttl 0 replica fan-out that follows
+         * the passes. */
+        final Map<Integer, String> answeredBy = new ConcurrentHashMap<>();
         final Set<Integer> wrongNode = ConcurrentHashMap.newKeySet();
         final AtomicReference<NanocachedException> lastCause = new AtomicReference<>();
         /** Issue #901: positions a {@code ttl == 0} call must not resend —
@@ -3147,7 +3161,14 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         MultiTouchState state = new MultiTouchState();
-        List<Integer> retry = multiTouchPass(namespace, keys, wireTtl, get, null, state);
+        // Issue #934: a TTL that expires the keys at once is sent to the
+        // primaries alone, in both passes; the other owners get one fan-out
+        // after them (below). Sent together with the primaries', a replica
+        // would expire its copy while a primary that failed or answered `W`
+        // is retried over the refreshed ring, where that replica becomes
+        // the primary, finds the key gone and answers `N`.
+        boolean expiring = expiresAtOnce(wireTtl);
+        List<Integer> retry = multiTouchPass(namespace, keys, wireTtl, get, null, state, expiring);
         // A primary that answered `En` predates `y` and always will, so a
         // refresh and a second pass could only dial it again; the caller
         // raises ServerTooOld whatever the other keys do.
@@ -3156,10 +3177,12 @@ public final class NanocachedClient implements AutoCloseable {
             // unresolved: a `W` is stale routing the refresh fixes, a
             // primary that could not be reached gets a fresh view of who
             // the owners are. A touch is idempotent, so the keys go to
-            // every owner of the fresh ring again.
+            // every owner of the fresh ring again (the primary alone when
+            // the TTL expires them, see above).
             maybeRefresh(true);
-            retry = multiTouchPass(namespace, keys, wireTtl, get, retry, state);
+            retry = multiTouchPass(namespace, keys, wireTtl, get, retry, state, expiring);
         }
+        if (expiring) multiTouchReplicas(namespace, keys, wireTtl, state);
         for (Map.Entry<Integer, Connection.MultiEntry> result : state.results.entrySet()) {
             answers[result.getKey()] = result.getValue();
         }
@@ -3241,6 +3264,10 @@ public final class NanocachedClient implements AutoCloseable {
      * eligible for {@code fireAndForgetReplicas}, exactly like a
      * single-key replica write.
      *
+     * <p>With {@code primaryOnly} (issue #934, a TTL that expires the
+     * keys) only the primary's leg is built; the other owners are sent
+     * theirs by {@link #multiTouchReplicas} once the passes are over.
+     *
      * <p>Returns the positions whose primary answered {@code W} or could
      * not be reached (a key with no owners at all counts as {@code W}: a
      * refresh may populate the ring). {@code state} learns which of the
@@ -3248,7 +3275,7 @@ public final class NanocachedClient implements AutoCloseable {
      * y}. */
     private List<Integer> multiTouchPass(
             byte[] namespace, byte[][] keyBytes, Long wireTtl, boolean get, List<Integer> retryIndices,
-            MultiTouchState state) {
+            MultiTouchState state, boolean primaryOnly) {
         List<Integer> indices = retryIndices;
         if (indices == null) {
             indices = new ArrayList<>(keyBytes.length);
@@ -3264,7 +3291,7 @@ public final class NanocachedClient implements AutoCloseable {
                 retry.add(idx);
                 continue;
             }
-            for (int rank = 0; rank < names.size(); rank++) {
+            for (int rank = 0; rank < (primaryOnly ? 1 : names.size()); rank++) {
                 boolean form = get && rank == 0;
                 String owner = names.get(rank);
                 TouchLeg leg = legs.computeIfAbsent((form ? "G" : "P") + owner, id -> new TouchLeg(owner, form));
@@ -3273,6 +3300,43 @@ public final class NanocachedClient implements AutoCloseable {
             }
         }
 
+        dispatchTouchLegs(namespace, legs, keyBytes, wireTtl, retry, state);
+        return retry;
+    }
+
+    /**
+     * The fan-out of a ttl 0 batch touch that follows its primary-only
+     * passes (issue #934): every position whose primary answered (a hit, a
+     * touch or a miss: a miss may still have a replica copy, and the
+     * caller's intent is to expire it everywhere) is sent as the plain
+     * touch to its other owners on the ring in force now, grouped by owner
+     * into one leg each. A position whose primary answered {@code W},
+     * failed or was lost is not among them, so no replica is touched for
+     * it. A replica's failure is counted in {@link #replicaWriteFailures}
+     * and never fails the batch, exactly as for the concurrent fan-out.
+     */
+    private void multiTouchReplicas(
+            byte[] namespace, byte[][] keyBytes, Long wireTtl, MultiTouchState state) {
+        Map<String, TouchLeg> legs = new LinkedHashMap<>();
+        for (Map.Entry<Integer, String> answered : new java.util.TreeMap<>(state.answeredBy).entrySet()) {
+            int idx = answered.getKey();
+            for (String owner : ownerNames(namespace, keyBytes[idx])) {
+                if (owner.equals(answered.getValue())) continue;
+                TouchLeg leg = legs.computeIfAbsent("P" + owner, id -> new TouchLeg(owner, false));
+                leg.indices.add(idx);
+                leg.isPrimary.add(false);
+            }
+        }
+        if (legs.isEmpty()) return;
+        // Nothing can end up in `retry`: no leg holds a primary position.
+        dispatchTouchLegs(namespace, legs, keyBytes, wireTtl, Collections.synchronizedList(new ArrayList<>()), state);
+    }
+
+    /** Runs the legs of one {@link #multiTouchPass} (or of {@link
+     * #multiTouchReplicas}) concurrently and waits for all of them. */
+    private void dispatchTouchLegs(
+            byte[] namespace, Map<String, TouchLeg> legs, byte[][] keyBytes, Long wireTtl, List<Integer> retry,
+            MultiTouchState state) {
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         for (TouchLeg leg : legs.values()) {
             boolean pureReplica = !leg.isPrimary.contains(Boolean.TRUE);
@@ -3301,7 +3365,6 @@ public final class NanocachedClient implements AutoCloseable {
         // drainLegsKeepingFirstBug.
         RuntimeException legBug = drainLegsKeepingFirstBug(futures);
         if (legBug != null) throw legBug;
-        return retry;
     }
 
     /** Dispatches one {@link TouchLeg} (via {@link #multiTouchChunked}) and
@@ -3348,6 +3411,7 @@ public final class NanocachedClient implements AutoCloseable {
                 if (!answered) replicaWriteFailures.incrementAndGet();
             } else if (answered) {
                 state.results.put(idx, entry);
+                state.answeredBy.put(idx, leg.owner);
             } else {
                 if (entry == null) {
                     state.wrongNode.remove(idx);
@@ -5045,6 +5109,16 @@ public final class NanocachedClient implements AutoCloseable {
         return write(namespace, key, op, backgroundSafeOp, replicaOp, primaryReplaySafe, false);
     }
 
+    /** As the eight-argument {@code write}, with {@code replicasAfterPrimary}
+     * false. */
+    private <T> T write(
+            byte[] namespace, byte[] key, ConnectionOp<T> op,
+            java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
+            ConnectionOp<?> replicaOp, boolean primaryReplaySafe, boolean rejectionIsFinal) {
+        return write(
+                namespace, key, op, backgroundSafeOp, replicaOp, primaryReplaySafe, rejectionIsFinal, false);
+    }
+
     /**
      * As the five-argument {@code write}; with {@code primaryReplaySafe}
      * false (issue #901: a touch whose TTL expires the entry) the primary
@@ -5055,11 +5129,24 @@ public final class NanocachedClient implements AutoCloseable {
      * nothing. With {@code rejectionIsFinal} (issue #902, touch) an
      * {@code En} from a node, a replica leg included (issue #924), is
      * surfaced as it is instead of being redialled and resent.
+     *
+     * <p>With {@code replicasAfterPrimary} (issue #934, a touch whose TTL
+     * expires the entry) the other owners are sent their leg only after the
+     * primary has answered, as the result fan-out of INCR/CAS is. Sent
+     * together with the primary's, a replica would expire its copy at once;
+     * if the primary then turned out to be unreachable or answered {@code
+     * W}, the retry over the refreshed ring would reach that replica as the
+     * new primary, find the key gone and report a miss, and the value
+     * would be lost. A primary that fails sends no replica leg at all. The
+     * replica legs therefore run after the primary's answer, outside the
+     * pipelined-order guarantee, the same class as the existing retry
+     * paths.
      */
     private <T> T write(
             byte[] namespace, byte[] key, ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
-            ConnectionOp<?> replicaOp, boolean primaryReplaySafe, boolean rejectionIsFinal) {
+            ConnectionOp<?> replicaOp, boolean primaryReplaySafe, boolean rejectionIsFinal,
+            boolean replicasAfterPrimary) {
         if (ring == null) {
             return primaryReplaySafe
                     ? applyReconnecting(this::singleConnection, op, rejectionIsFinal)
@@ -5071,10 +5158,87 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException("nanocached: no owner is reachable for this key");
         }
 
-        ConnectionOp<T> backgroundOp = null; // lazily built at most once; see javadoc above (issue #326)
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
-        for (int i = 1; i < names.size(); i++) {
-            String replica = names.get(i);
+        if (!replicasAfterPrimary) {
+            replicaWrites.addAll(startReplicaWrites(
+                    names.subList(1, names.size()), op, backgroundSafeOp, replicaOp, rejectionIsFinal));
+        }
+
+        T value = null;
+        RuntimeException primaryError = null;
+        try {
+            value = primaryReplaySafe
+                    ? applyReconnecting(() -> memberConnection(names.get(0)), op, rejectionIsFinal)
+                    : applyReconnectingUnlessSent(() -> memberConnection(names.get(0)), op);
+        } catch (RuntimeException error) {
+            primaryError = error;
+        }
+
+        if (replicasAfterPrimary && primaryError == null) {
+            // Issue #934: the primary has answered (a hit, a miss or a
+            // plain success; a `W` or a failure would have thrown), so the
+            // key's value is accounted for and the other owners may now be
+            // sent the plain touch. The owners are those of the ring in
+            // force now, minus the node that answered.
+            List<String> others = new ArrayList<>(ownerNames(namespace, key));
+            others.remove(names.get(0));
+            replicaWrites.addAll(startReplicaWrites(others, op, backgroundSafeOp, replicaOp, rejectionIsFinal));
+        }
+
+        // Always drain the synchronous replica legs — for close()'s
+        // tracking, and so a genuine replica-leg bug (a RuntimeException
+        // that escaped replicaWrite's own NanocachedException-only catch
+        // above) doesn't linger as an unobserved CompletableFuture
+        // failure — but never let one override an already-successful
+        // primary write: the write happened, so throwing here despite
+        // that would misreport a completed write as failed. This used to
+        // be a plain `finally { pending.join(); }`, whose
+        // CompletionException — thrown even when the primary's try block
+        // had already returned normally — silently replaced a successful
+        // result, or masked the primary's own exception, with a raw,
+        // un-narrowed CompletionException that (unlike everything else
+        // this SDK throws) didn't even extend NanocachedException (issue:
+        // audit finding). Mirrors the TypeScript SDK's writeToOwners
+        // (client.ts) / the Python SDK's _write() (client.py): a genuine
+        // replica bug is only ever surfaced by throwing when the primary
+        // itself also failed — any other one is still counted/logged via
+        // reportBackgroundWriteBug, the same as a fireAndForgetReplicas
+        // leg's bug above.
+        RuntimeException replicaBug = null;
+        for (CompletableFuture<Void> pending : replicaWrites) {
+            try {
+                pending.join();
+            } catch (CompletionException wrapped) {
+                RuntimeException bug = unwrapReplicaBug(wrapped);
+                if (primaryError != null && replicaBug == null) {
+                    replicaBug = bug;
+                } else {
+                    reportBackgroundWriteBug(bug);
+                }
+            }
+        }
+
+        if (primaryError != null) {
+            throw replicaBug != null ? replicaBug : primaryError;
+        }
+        return value;
+    }
+
+    /**
+     * Sends the replica leg of a write to each of {@code replicas} and
+     * returns the synchronous legs' futures for the caller to drain (a
+     * {@code fireAndForgetReplicas} leg is not among them). A replica's
+     * failure is swallowed and counted in {@link #replicaWriteFailures}; see
+     * the matching comments in the body for the rest of the contract the
+     * single-key {@link #write} documents.
+     */
+    private <T> List<CompletableFuture<Void>> startReplicaWrites(
+            List<String> replicas, ConnectionOp<T> op,
+            java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
+            ConnectionOp<?> replicaOp, boolean rejectionIsFinal) {
+        ConnectionOp<T> backgroundOp = null; // lazily built at most once; see write()'s javadoc (issue #326)
+        List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
+        for (String replica : replicas) {
 
             // Fire-and-forget replica writes: with fireAndForgetReplicas, up to
             // maxInFlightBackgroundReplicaWrites legs run in the
@@ -5140,54 +5304,7 @@ public final class NanocachedClient implements AutoCloseable {
             };
             replicaWrites.add(submitReplicaWrite(replicaWrite));
         }
-
-        T value = null;
-        RuntimeException primaryError = null;
-        try {
-            value = primaryReplaySafe
-                    ? applyReconnecting(() -> memberConnection(names.get(0)), op, rejectionIsFinal)
-                    : applyReconnectingUnlessSent(() -> memberConnection(names.get(0)), op);
-        } catch (RuntimeException error) {
-            primaryError = error;
-        }
-
-        // Always drain the synchronous replica legs — for close()'s
-        // tracking, and so a genuine replica-leg bug (a RuntimeException
-        // that escaped replicaWrite's own NanocachedException-only catch
-        // above) doesn't linger as an unobserved CompletableFuture
-        // failure — but never let one override an already-successful
-        // primary write: the write happened, so throwing here despite
-        // that would misreport a completed write as failed. This used to
-        // be a plain `finally { pending.join(); }`, whose
-        // CompletionException — thrown even when the primary's try block
-        // had already returned normally — silently replaced a successful
-        // result, or masked the primary's own exception, with a raw,
-        // un-narrowed CompletionException that (unlike everything else
-        // this SDK throws) didn't even extend NanocachedException (issue:
-        // audit finding). Mirrors the TypeScript SDK's writeToOwners
-        // (client.ts) / the Python SDK's _write() (client.py): a genuine
-        // replica bug is only ever surfaced by throwing when the primary
-        // itself also failed — any other one is still counted/logged via
-        // reportBackgroundWriteBug, the same as a fireAndForgetReplicas
-        // leg's bug above.
-        RuntimeException replicaBug = null;
-        for (CompletableFuture<Void> pending : replicaWrites) {
-            try {
-                pending.join();
-            } catch (CompletionException wrapped) {
-                RuntimeException bug = unwrapReplicaBug(wrapped);
-                if (primaryError != null && replicaBug == null) {
-                    replicaBug = bug;
-                } else {
-                    reportBackgroundWriteBug(bug);
-                }
-            }
-        }
-
-        if (primaryError != null) {
-            throw replicaBug != null ? replicaBug : primaryError;
-        }
-        return value;
+        return replicaWrites;
     }
 
     // ── INCR/DECR (issue #129) ───────────────────────────────────────

@@ -152,6 +152,14 @@ final class MockServers {
          * the exact frame (ttl field, `G`, tag) and which node got which
          * form. */
         final List<String> touchFrames = new CopyOnWriteArrayList<>();
+        /** Issue #934: {@link System#nanoTime()} at which each `t` / `y`
+         * frame (either kind, in receipt order) arrived — lets a test prove
+         * that a replica was sent its touch only after the primary had
+         * answered, together with {@link #touchReplyDelayMillis}. */
+        final List<Long> touchReceiptNanos = new CopyOnWriteArrayList<>();
+        /** Issue #934: how long a `t` / `y` reply is held back after the
+         * frame has been applied; 0 is no delay. */
+        private volatile long touchReplyDelayMillis = 0;
         /** As {@link #dropReplyAfterIncr}, for `t`: a touch is idempotent, so
          * the client resends it where it must not resend an INCR. */
         private final AtomicInteger dropReplyAfterTouch = new AtomicInteger();
@@ -479,6 +487,21 @@ final class MockServers {
 
         /** issue #825: apply (and log) the next `t` request as usual, but
          * close the connection instead of replying. */
+        /** See {@link #touchReplyDelayMillis}. */
+        void delayTouchRepliesBy(long millis) {
+            touchReplyDelayMillis = millis;
+        }
+
+        private void holdTouchReply() {
+            long delay = touchReplyDelayMillis;
+            if (delay <= 0) return;
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
         void dropReplyAfterNextTouch() {
             dropReplyAfterTouch.incrementAndGet();
         }
@@ -1145,6 +1168,7 @@ final class MockServers {
                             String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[2])));
                             touchFrames.add(String.join(" ", parts));
+                            touchReceiptNanos.add(System.nanoTime());
                             if (rejectTouch) {
                                 out.write("En\n".getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
@@ -1180,6 +1204,7 @@ final class MockServers {
                             } else {
                                 namespacedPutTtl(ns, key, ttlSeconds == null ? 0 : ttlSeconds);
                             }
+                            holdTouchReply();
                             if (takeDropReplyAfterTouch()) {
                                 return; // applied, but the ack never arrives
                             }
@@ -1215,6 +1240,7 @@ final class MockServers {
                                 else ttlSeconds = Long.parseLong(parts[i]);
                             }
                             multiTouchFrames.add(new MultiTouchFrame(ns, List.of(keys), ttlSeconds, withValue));
+                            touchReceiptNanos.add(System.nanoTime());
                             if (rejectTouch || rejectMultiTouch) {
                                 out.write("En\n".getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
@@ -1258,6 +1284,7 @@ final class MockServers {
                                     tokens.add("S");
                                 }
                             }
+                            holdTouchReply();
                             if (takeDropReplyAfterTouch()) {
                                 return; // applied, but the ack never arrives
                             }
