@@ -2154,6 +2154,10 @@ class NanocachedClient:
         retry = await self._multi_touch_pass(
             namespace, key_bytes_list, ttl_seconds, get, None, state
         )
+        if retry and state.rejected:
+            # An `En` is a final answer from that node: a refresh and a
+            # second pass would only ask it again, so fail now.
+            raise ServerTooOldError("y") from state.last_cause
         if retry:
             # One bounded refresh-and-retry over everything a primary left
             # unresolved: a `W` is stale routing the refresh fixes, a
