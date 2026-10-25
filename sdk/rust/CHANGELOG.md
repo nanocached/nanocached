@@ -27,6 +27,22 @@ follow the `sdk/rust/vX.Y.Z` tags.
   primary for the value). Against a node that predates the command they
   return the new `Error::ServerTooOld`. Needs a server release that
   includes the `t` command.
+- `touch_many(keys, ttl_seconds)` and `get_many_and_touch(keys,
+  ttl_seconds)` (with `get_many_and_touch_bytes`, and all three on
+  `Namespace`) are `touch`/`get_and_touch` for a list of keys, in one round
+  trip per involved node. `touch_many` returns a map of key to whether it
+  existed; `get_many_and_touch` returns the hits, as `get_many` does. One
+  TTL for the whole batch, with the meaning and no default of `touch`. Every
+  owner is sent the batch; only a key's primary is asked for the value, so a
+  node that is primary for some keys and a replica for others receives two
+  frames. `get_many_and_touch` fails like `get_many` (partial results
+  attached); `touch_many` returns a plain `Error::WrongNode` or the
+  connection error. Needs a server release that includes the `y` command;
+  against a node that has `t` but not `y` they return `Error::ServerTooOld`.
+- `Error::ServerTooOld` now carries the wire command the node did not know
+  (`Error::ServerTooOld { command: "t" }` or `"y"`), so one variant covers
+  both. It is still unreleased, so nothing that matched the unit variant
+  has shipped.
 
 ## [0.4.8] - 2026-10-21
 

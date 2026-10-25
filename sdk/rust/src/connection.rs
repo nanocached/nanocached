@@ -224,6 +224,12 @@ pub(crate) enum ResponseKind {
     /// docs/protocol.html#multi. One entry per requested key, in request
     /// order; see [`MultiEntry`].
     Multi(Vec<MultiEntry>),
+    /// `Y` — issue #871's batched touch reply (without `G`): one entry per
+    /// requested key, in request order — [`MultiEntry::Stored`] (`S`,
+    /// touched), [`MultiEntry::Miss`] (`N`, no live entry) or
+    /// [`MultiEntry::WrongNode`]. With `G` the reply is an ordinary
+    /// [`ResponseKind::Multi`] (`M`).
+    MultiTouch(Vec<MultiEntry>),
 }
 
 /// One key's outcome inside an `M` (multi-get) or `O` (multi-set)
@@ -235,6 +241,8 @@ pub(crate) enum ResponseKind {
 ///   (`-`); [`Self::WrongNode`] is a per-key `W`.
 /// - `O`: [`Self::Stored`] (`S`) or [`Self::WrongNode`] (`W`); there is
 ///   no miss shape (`O` never uses [`Self::Hit`]/[`Self::Miss`]).
+/// - `Y` (issue #871): [`Self::Stored`] (`S`, touched), [`Self::Miss`]
+///   (`N`) or [`Self::WrongNode`]. With `G` the reply is an `M`.
 #[derive(Debug, Clone)]
 pub(crate) enum MultiEntry {
     Hit(Vec<u8>),
@@ -479,7 +487,7 @@ impl Connection {
         match self
             .request(|tag| encode_touch(namespace, key, ttl_seconds, false, tag))
             .await
-            .map_err(Self::server_too_old)?
+            .map_err(|error| Self::server_too_old(error, "t"))?
         {
             ResponseKind::Stored => Ok(true),
             ResponseKind::NotFound => Ok(false),
@@ -498,7 +506,7 @@ impl Connection {
         match self
             .request(|tag| encode_touch(namespace, key, ttl_seconds, true, tag))
             .await
-            .map_err(Self::server_too_old)?
+            .map_err(|error| Self::server_too_old(error, "t"))?
         {
             ResponseKind::TouchedValue(value) | ResponseKind::Value(value) => Ok(Some(value)),
             ResponseKind::NotFound => Ok(None),
@@ -507,12 +515,15 @@ impl Connection {
     }
 
     /// Turns the node's `E` (an unknown command) into
-    /// [`Error::ServerTooOld`], leaving every other error as it was. Only
-    /// the touch methods call this, so every other command keeps
-    /// surfacing the `Protocol` error it always did for an `E`.
-    fn server_too_old(error: Error) -> Error {
+    /// [`Error::ServerTooOld`] naming `command`, leaving every other error
+    /// as it was. Only the touch methods call this, so every other
+    /// command keeps surfacing the `Protocol` error it always did for an
+    /// `E`.
+    fn server_too_old(error: Error, command: &'static str) -> Error {
         match error {
-            Error::Protocol(message) if message == SERVER_REJECTED_MESSAGE => Error::ServerTooOld,
+            Error::Protocol(message) if message == SERVER_REJECTED_MESSAGE => {
+                Error::ServerTooOld { command }
+            }
             other => other,
         }
     }
@@ -714,6 +725,50 @@ impl Connection {
                 self.close();
                 Err(Error::ConnectionLost(format!(
                     "nanocached: multi-set response roster length {} does not match request key count {} (connection desynced)",
+                    entries.len(),
+                    keys.len()
+                )))
+            }
+            other => Err(self.mismatch(&other)),
+        }
+    }
+
+    /// Sends `y` (issue #871) — the batched touch: one round trip replaces
+    /// the TTL of every entry in `keys`, one shared `ttl_seconds` for the
+    /// whole batch (`None` removes the TTL, `Some(0)` expires the entries
+    /// at once). Without `with_value` the reply is `Y`, one entry per key —
+    /// [`MultiEntry::Stored`] (touched), [`MultiEntry::Miss`] or
+    /// [`MultiEntry::WrongNode`]; with it (the `G` flag) the reply is
+    /// `m`'s `M` roster for the keys touched — [`MultiEntry::Hit`] with
+    /// the value, and a value that did not fit the node's reply is a
+    /// [`MultiEntry::Miss`], left untouched. `entries[i]` answers
+    /// `keys[i]`; a roster of the wrong length is a desynced connection,
+    /// as for [`Self::multi_get`]. A node that predates the command
+    /// answers `En`, which surfaces as [`Error::ServerTooOld`].
+    pub(crate) async fn multi_touch(
+        &self,
+        namespace: &[u8],
+        keys: &[Vec<u8>],
+        ttl_seconds: Option<u64>,
+        with_value: bool,
+    ) -> Result<Vec<MultiEntry>> {
+        let response = self
+            .request(|tag| encode_multi_touch(namespace, keys, ttl_seconds, with_value, tag))
+            .await
+            .map_err(|error| Self::server_too_old(error, "y"))?;
+        match response {
+            ResponseKind::Multi(entries) if with_value && entries.len() == keys.len() => {
+                Ok(entries)
+            }
+            ResponseKind::MultiTouch(entries) if !with_value && entries.len() == keys.len() => {
+                Ok(entries)
+            }
+            ResponseKind::Multi(entries) | ResponseKind::MultiTouch(entries)
+                if entries.len() != keys.len() =>
+            {
+                self.close();
+                Err(Error::ConnectionLost(format!(
+                    "nanocached: multi-touch response roster length {} does not match request key count {} (connection desynced)",
                     entries.len(),
                     keys.len()
                 )))
@@ -954,6 +1009,7 @@ impl Connection {
             ResponseKind::Incr(_, _) => "incr",
             ResponseKind::TouchedValue(_) => "touched-value",
             ResponseKind::Multi(_) => "multi",
+            ResponseKind::MultiTouch(_) => "multi-touch",
         };
         self.close();
         Error::ConnectionLost(format!(
@@ -1223,6 +1279,41 @@ fn encode_multi_get(namespace: &[u8], keys: &[Vec<u8>], tag: Option<u32>) -> Vec
     frame
 }
 
+/// Builds a `y` frame (issue #871, the batched touch): `y <namespace-length>
+/// <n> <key-length-1> ... <key-length-n>[ <ttl-seconds>][ G][ <tag>]\n<namespace>
+/// <key-1>...<key-n>` — always namespaced, like `encode_multi_get`. `None`
+/// omits the TTL field (removes the TTL); `Some(0)` is sent, and expires
+/// the entries at once — the opposite of `encode_multi_set`, where 0 means
+/// no expiry.
+fn encode_multi_touch(
+    namespace: &[u8],
+    keys: &[Vec<u8>],
+    ttl_seconds: Option<u64>,
+    with_value: bool,
+    tag: Option<u32>,
+) -> Vec<u8> {
+    let mut header = format!("y {} {}", namespace.len(), keys.len());
+    for key in keys {
+        let _ = write!(header, " {}", key.len());
+    }
+    if let Some(ttl_seconds) = ttl_seconds {
+        let _ = write!(header, " {ttl_seconds}");
+    }
+    if with_value {
+        header.push_str(" G");
+    }
+    if let Some(tag) = tag {
+        let _ = write!(header, " {tag}");
+    }
+    header.push('\n');
+    let mut frame = header.into_bytes();
+    frame.extend_from_slice(namespace);
+    for key in keys {
+        frame.extend_from_slice(key);
+    }
+    frame
+}
+
 /// Builds an `o` frame (issue #151): `o <namespace-length> <n>
 /// <key-length-1> <value-length-1> ... <key-length-n> <value-length-n>
 /// [<ttl-seconds>][ <tag>]\n<namespace><key-1><value-1>...<key-n><value-n>`.
@@ -1363,7 +1454,7 @@ async fn read_loop(
         // as a tag mismatch (mirrors Go's `default: mismatch`).
         if !matches!(
             marker,
-            b'V' | b'N' | b'S' | b'D' | b'W' | b'C' | b'R' | b'I' | b'T' | b'M' | b'O'
+            b'V' | b'N' | b'S' | b'D' | b'W' | b'C' | b'R' | b'I' | b'T' | b'M' | b'O' | b'Y'
         ) {
             let message = format!(
                 "nanocached: unexpected response from server: {} (connection desynced)",
@@ -1610,15 +1701,22 @@ async fn read_one_response(
         // body bytes belong to this key, read here, inline, in token
         // order, since only hit tokens consume body bytes). `O`'s
         // reply has the same header shape but no body (a set has
-        // nothing to echo back) and only "S"/"W" tokens.
-        b'M' | b'O' => {
+        // nothing to echo back) and only "S"/"W" tokens. issue #871: `Y`
+        // answers `y` (the batched touch, without `G`) in the same shape as
+        // `O`, with "N" (no live entry) as a third token; with `G` the
+        // reply is an ordinary `M`.
+        b'M' | b'O' | b'Y' => {
+            let what = match marker {
+                b'M' => "get",
+                b'O' => "set",
+                _ => "touch",
+            };
             let header = read_line(read_half).await?;
             let header = header.trim();
             let mut fields = header.split(' ').filter(|field| !field.is_empty());
             let count: usize = fields.next().and_then(parse_strict).ok_or_else(|| {
                 Error::Protocol(format!(
-                    "nanocached: invalid multi-{} header in response",
-                    if marker == b'M' { "get" } else { "set" }
+                    "nanocached: invalid multi-{what} header in response"
                 ))
             })?;
             let rest: Vec<&str> = fields.collect();
@@ -1632,16 +1730,14 @@ async fn read_one_response(
             let (result_tokens, tag): (&[&str], Option<u32>) = if tagged {
                 if rest.len().checked_sub(1) != Some(count) {
                     return Err(Error::Protocol(format!(
-                        "nanocached: invalid multi-{} header in response",
-                        if marker == b'M' { "get" } else { "set" }
+                        "nanocached: invalid multi-{what} header in response"
                     )));
                 }
                 (&rest[..count], Some(parse_tag(rest[count])?))
             } else {
                 if rest.len() != count {
                     return Err(Error::Protocol(format!(
-                        "nanocached: invalid multi-{} header in response",
-                        if marker == b'M' { "get" } else { "set" }
+                        "nanocached: invalid multi-{what} header in response"
                     )));
                 }
                 (&rest[..], None)
@@ -1684,7 +1780,8 @@ async fn read_one_response(
                     }
                 }
             } else {
-                // `O` (multi-set) acks carry no bodies — just "S"/"W"
+                // `O` (multi-set) and `Y` (batched touch, issue #871) acks
+                // carry no bodies — just "S"/"W" (and, for `Y`, "N")
                 // tokens on this one already-length-bounded header line
                 // (MAX_HEADER_LINE_LENGTH), so `count` itself is already
                 // bounded and there's nothing analogous to `M`'s
@@ -1692,12 +1789,12 @@ async fn read_one_response(
                 for token in result_tokens {
                     match *token {
                         "S" => entries.push(MultiEntry::Stored),
+                        "N" if marker == b'Y' => entries.push(MultiEntry::Miss),
                         "W" => entries.push(MultiEntry::WrongNode),
                         _ => {
-                            return Err(Error::Protocol(
-                                "nanocached: invalid multi-set result token in response"
-                                    .to_string(),
-                            ));
+                            return Err(Error::Protocol(format!(
+                                "nanocached: invalid multi-{what} result token in response"
+                            )));
                         }
                     }
                 }
@@ -1747,6 +1844,8 @@ impl TryFrom<RawResponse> for ResponseKind {
             // own doc comment) — `unwrap_or_default` only ever matters
             // for tests that construct a bare `RawResponse` by hand.
             b'M' | b'O' => Ok(ResponseKind::Multi(entries.unwrap_or_default())),
+            // issue #871: `Y` answers the batched touch's plain form.
+            b'Y' => Ok(ResponseKind::MultiTouch(entries.unwrap_or_default())),
             b'I' => {
                 let text = value.unwrap_or_default();
                 // The counter body is the one field allowed a leading `-`
@@ -2169,6 +2268,64 @@ mod tests {
             encode_touch(b"ns", b"hits", Some(30), true, Some(7)),
             [b"t 2 4 30 G 7\n".as_slice(), b"ns", b"hits"].concat()
         );
+    }
+
+    // ── batched touch (issue #871) ───────────────────────────────────
+
+    #[test]
+    fn encode_multi_touch_emits_every_ttl_and_get_flag_combination() {
+        let keys = vec![b"a".to_vec(), b"bcd".to_vec()];
+        for (ttl, with_value, header) in [
+            (Some(30), false, "y 0 2 1 3 30\n"),
+            (None, false, "y 0 2 1 3\n"),
+            (Some(0), false, "y 0 2 1 3 0\n"),
+            (Some(45), true, "y 0 2 1 3 45 G\n"),
+            (None, true, "y 0 2 1 3 G\n"),
+        ] {
+            assert_eq!(
+                encode_multi_touch(b"", &keys, ttl, with_value, None),
+                [header.as_bytes(), b"abcd"].concat(),
+                "ttl {ttl:?}, G {with_value}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_multi_touch_emits_the_namespace_and_the_tag_last() {
+        let keys = vec![b"a".to_vec()];
+        assert_eq!(
+            encode_multi_touch(b"ns", &keys, Some(30), true, Some(7)),
+            [b"y 2 1 1 30 G 7\n".as_slice(), b"ns", b"a"].concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_y_reply_maps_s_n_and_w_to_entries() {
+        let (marker, _, _, tag, entries) =
+            read_one_from_bytes(b"Y 3 S N W 9\n", true, UNBOUNDED_MULTI_GET)
+                .await
+                .expect("a well-formed Y reply parses");
+        assert_eq!(marker, b'Y');
+        assert_eq!(tag, Some(9));
+        assert!(matches!(
+            entries.unwrap().as_slice(),
+            [MultiEntry::Stored, MultiEntry::Miss, MultiEntry::WrongNode]
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_y_reply_rejects_a_token_it_does_not_define() {
+        for reply in [&b"Y 1 -\n"[..], b"Y 1 5\n", b"Y 2 S\n"] {
+            let result = read_one_from_bytes(reply, false, UNBOUNDED_MULTI_GET).await;
+            assert!(
+                matches!(result, Err(Error::Protocol(_))),
+                "{:?} must be a protocol error, got {result:?}",
+                String::from_utf8_lossy(reply)
+            );
+        }
+        // `N` belongs to Y alone: an `O` (multi-set) reply never carries it.
+        let result = read_one_from_bytes(b"O 1 N\n", false, UNBOUNDED_MULTI_GET).await;
+        assert!(matches!(result, Err(Error::Protocol(_))), "got {result:?}");
     }
 
     // ── incr (issue #129) ────────────────────────────────────────────
