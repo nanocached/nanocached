@@ -1011,7 +1011,7 @@ func (c *connection) readLoop() {
 				// redial.
 				c.poisonRejecting(connectionLost(
 					"the server closed the connection after rejecting a request", nil), err)
-			} else if errors.Is(err, ErrProtocol) {
+			} else if errors.Is(err, ErrProtocol) || errors.Is(err, ErrConnectionLost) {
 				c.poison(err)
 			} else if isTimeout(err) {
 				// The request deadline expired with a request still
@@ -1351,10 +1351,21 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 	// (a command it does not know, one too large or malformed). Marked so a
 	// touch can report ErrServerTooOld (issue #825); an ErrProtocol like
 	// any other unexpected marker for everything else.
+	//
+	// Any other `E` — a bare `E\n`, or the `E <tag>\n` nanocached-proxy
+	// answers when a request's outcome is unknown (issue #939) — is not a
+	// node refusing the command, so it must neither read as "server too
+	// old" nor as an ErrProtocol a redial would resend: it is a connection
+	// lost after the frame was written, which idempotent requests replay as
+	// they replay any lost reply and a ttl=0 touch or an incr/CAS does not.
 	case 'E':
-		_, _ = readLine(c.reader) // the rest of `En\n`, if it arrives
-		return 0, nil, 0, 0, nil, errors.Join(
-			protocolError(fmt.Sprintf("unexpected response from server: %c", marker)), errServerRejected)
+		rest, _ := readLine(c.reader) // the rest of `En\n`, if it arrives
+		if strings.HasPrefix(rest, "n") {
+			return 0, nil, 0, 0, nil, errors.Join(
+				protocolError(fmt.Sprintf("unexpected response from server: %c", marker)), errServerRejected)
+		}
+		return 0, nil, 0, 0, nil, connectionLost(
+			"the server answered E: the outcome of the request is unknown", nil)
 	default:
 		return 0, nil, 0, 0, nil, protocolError(fmt.Sprintf("unexpected response from server: %c", marker))
 	}

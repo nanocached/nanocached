@@ -67,6 +67,13 @@ func startScriptedNode(t *testing.T, script func(connIndex int, conn net.Conn, n
 						mustRead(reader, atoiOrPanic(fields[1]))
 					case "t":
 						mustRead(reader, atoiOrPanic(fields[1])+atoiOrPanic(fields[2]))
+					case "y":
+						// y <ns-len> <n> <key-len-1> ... <key-len-n> [<ttl>] [G] [<tag>]
+						size := atoiOrPanic(fields[1])
+						for _, keyLen := range fields[3 : 3+atoiOrPanic(fields[2])] {
+							size += atoiOrPanic(keyLen)
+						}
+						mustRead(reader, size)
 					default:
 						panic("scriptedNode: unsupported frame " + line)
 					}
