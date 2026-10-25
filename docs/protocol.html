@@ -307,7 +307,12 @@ it to each owner rather than writing a result to the others. A node that
 owns no copy of the key answers <code>W</code>. An owner that answers
 <code>N</code> has no live copy; the touch does not create one and
 nothing repairs it, while the owners that answered <code>S</code> keep the
-new expiry. During a join&rsquo;s or a decommission&rsquo;s forwarding
+new expiry. That includes a replica whose copy of the key is still on its
+way: with fire-and-forget replica writes a client sends the replica legs of
+a <code>set</code> and of a following <code>touch</code> of the same key
+independently, so the touch can arrive first, find nothing, and the
+<code>set</code> then land with its own TTL &mdash; none, for a plain
+<code>set</code> &mdash; so that copy never expires. During a join&rsquo;s or a decommission&rsquo;s forwarding
 window an old owner passes a touch on as the value it holds with the new
 TTL, written like an <code>S</code>, not as <code>t</code> itself: the
 joiner may not hold the key yet. As for every forwarded write, that
@@ -342,7 +347,11 @@ or <code>W</code>. Unlike a single <code>t</code> with <code>G</code>, there
 is no per-key TTL in the reply: every key has the TTL the frame carried. The
 values in one reply total at most 16 MiB, as for <code>m</code>, and a key
 whose value does not fit is answered <code>-</code> <em>and left
-untouched</em>, so a reply that leaves a value out never refreshed it. Each
+untouched</em>, so a reply that leaves a value out never refreshed it on
+that node. Only the node that was asked for values has this bound: the
+plain form a client sends to a key&rsquo;s other owners has none, so those
+owners do refresh the key and its TTL can then differ between the
+primary and a replica. Each
 touched key counts as a hit and becomes the most recently used, as for
 <code>G</code>; a miss counts as a miss. Without <code>G</code> a key counts
 as neither and is not protected from eviction.</p>
