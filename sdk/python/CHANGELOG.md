@@ -11,6 +11,12 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ### Fixed
 
+- `touch`, `get_and_touch`, `touch_many` and `get_many_and_touch` report
+  `ServerTooOldError` only for the node's `En` answer. Any other `E`
+  (nanocached-proxy answers a bare `E` when a `ttl=0` touch's outcome is
+  unknown, or when a request failed transiently) raised "server too old,
+  upgrade every node"; it is now the `ConnectionLostError` a sent request
+  fails with, so a `ttl=0` touch is not sent again.
 - A reply whose echoed tag does not answer the request it follows is now a
   `ConnectionLostError` for that request, like every other failure after
   the frame was written. It was a plain `ConnectionError`, so a `ttl=0`

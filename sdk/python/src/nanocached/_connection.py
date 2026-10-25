@@ -334,7 +334,8 @@ WRONG_NODE = _MultiWrongNode()
 
 
 class _ServerRejectedError(NanocachedError):
-    """The node answered ``E`` and is closing the connection (issue #825).
+    """The node answered ``En`` and is closing the connection (issue #825).
+    Only that exact form: any other ``E`` is an ordinary unexpected response.
     Private: it travels as the ``__cause__`` of the ConnectionLostError a
     sent request fails with, and touch()/get_and_touch() turn it into
     ServerTooOldError."""
@@ -1245,13 +1246,17 @@ class Connection:
             # `En\n`: the node rejected the request and is closing the
             # connection (a command it does not know, one too large or
             # malformed). Told apart from other unexpected bytes so a
-            # touch can report "server too old" (issue #825); every other
-            # command still sees the same NanocachedError as before.
+            # touch can report "server too old" (issue #825). Only that
+            # exact form is: any other `E` (a bare `E\n` or `E <tag>\n`,
+            # which nanocached-proxy answers when a request's outcome is
+            # unknown) is an unexpected response like any other, which a
+            # sent request fails with as ConnectionLostError (issue #939).
             try:
-                await self._reader.readuntil(b"\n")
-            except asyncio.IncompleteReadError:
-                pass
-            raise _ServerRejectedError(f"nanocached: unexpected response from server: {marker!r}")
+                rest = await self._reader.readuntil(b"\n")
+            except asyncio.IncompleteReadError as error:
+                rest = error.partial
+            if rest.startswith(b"n"):
+                raise _ServerRejectedError(f"nanocached: unexpected response from server: {marker!r}")
 
         raise NanocachedError(f"nanocached: unexpected response from server: {marker!r}")
 
