@@ -18,6 +18,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.UnaryOperator;
 import javax.cache.Cache;
 import javax.cache.CacheException;
 import javax.cache.CacheManager;
@@ -266,17 +267,14 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * so {@code byte[]} keys and JDK-serialized fallback keys batch exactly like {@code String} ones —
      * there is no longer a "bulk-safe" subset that has to fall back to per-key {@link #get}.
      *
-     * <p>An access-based {@link ExpiryPolicy} (issue #192) is likewise refreshed in one batched {@code
-     * setManyBytes} covering every hit, not one wire round trip per key: unlike {@link #putAll}, where
-     * each entry can resolve to a different TTL, {@code getExpiryForAccess()} is a single fixed,
-     * cache-wide policy — every hit resolves to the exact same outcome, so there is only ever one group
-     * to write, never several.
-     *
-     * <p>Unlike a single {@link #get}, which refreshes through {@code getAndTouch} (issue #826), this
-     * keeps that batched re-set: the protocol has no batch touch, and replacing it with one touch per
-     * hit would cost a wire round trip per key where today there is one per owner. The trade-off is that
-     * a write landing between {@code getAll}'s read and its refresh can still be overwritten with the
-     * value {@code getAll} observed, as documented in the README.
+     * <p>An access-based {@link ExpiryPolicy} makes the read refresh the TTL in the same wire step
+     * (issue #871): {@code getManyAndTouchBytes} reads every key and replaces its TTL on the node, one
+     * batched round trip per owner. Like a single {@link #get} (issue #826), the values do not travel
+     * back to the node, and a write landing at the same time is never overwritten. {@code
+     * getExpiryForAccess()} is a single fixed, cache-wide policy — every hit resolves to the exact same
+     * outcome — so one TTL covers the whole batch: a positive duration sets it, an eternal one removes
+     * it, and {@link Duration#ZERO} expires the hits as they are read. A key that is missing is a miss
+     * and is not created.
      */
     @Override
     public Map<K, V> getAll(Set<? extends K> keys) {
@@ -291,13 +289,11 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         for (int i = 0; i < ordered.size(); i++) {
             wireKeys[i] = KeyCodec.toKeyBytes(Objects.requireNonNull(ordered.get(i), "key"));
         }
-        byte[][] raw = getManyBytesResolvingWrongNode(wireKeys);
-
         Duration accessExpiry = expiryPolicy.getExpiryForAccess();
-        OptionalLong accessTtl = accessExpiry == null ? OptionalLong.empty() : wireTtlSeconds(accessExpiry);
-        boolean refreshesToPositiveTtl = accessExpiry != null && accessTtl.isPresent();
-        List<byte[]> refreshKeys = refreshesToPositiveTtl ? new ArrayList<>() : null;
-        List<byte[]> refreshValues = refreshesToPositiveTtl ? new ArrayList<>() : null;
+        byte[][] raw = accessExpiry == null
+                ? getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys)
+                : getManyBytesResolvingWrongNode(
+                        pending -> namespace.getManyAndTouchBytes(pending, touchTtlSeconds(accessExpiry)), wireKeys);
 
         for (int i = 0; i < ordered.size(); i++) {
             byte[] value = raw[i];
@@ -306,27 +302,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 continue;
             }
             statistics.recordHit();
-            if (accessExpiry != null) {
-                if (refreshesToPositiveTtl) {
-                    refreshKeys.add(wireKeys[i]);
-                    refreshValues.add(value);
-                } else {
-                    // Duration.ZERO: access expires the entry immediately.
-                    // No bulk-delete on the wire, so this stays per key —
-                    // the same as a single get() would do, and rare in
-                    // practice (an access policy of zero means "expire on
-                    // every read").
-                    namespace.delete(wireKeys[i]);
-                }
-            }
             result.put(ordered.get(i), decode(value));
-        }
-
-        if (refreshesToPositiveTtl && !refreshKeys.isEmpty()) {
-            namespace.setManyBytes(
-                    refreshKeys.toArray(new byte[0][]),
-                    refreshValues.toArray(new byte[0][]),
-                    accessTtl.getAsLong());
         }
         return result;
     }
@@ -372,15 +348,21 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * <p>A whole-batch {@link NanocachedException.WrongNode} (no
      * per-key outcome attached) is retried like {@link #putAll}'s, under
      * the same budget.
+     *
+     * <p>{@code fetch} is the batched read itself — a plain {@code
+     * getManyBytes}, or (issue #871) {@code getManyAndTouchBytes} under an
+     * access-based policy; both throw the same partial outcomes, and a
+     * touch is idempotent, so retrying the remainder is as safe as for a
+     * plain read.
      */
-    private byte[][] getManyBytesResolvingWrongNode(byte[][] wireKeys) {
+    private byte[][] getManyBytesResolvingWrongNode(UnaryOperator<byte[][]> fetch, byte[][] wireKeys) {
         byte[][] result = new byte[wireKeys.length][];
         int[] positions = identityPositions(wireKeys.length);
         byte[][] pending = wireKeys;
         boolean connectionRetried = false;
         for (int attempt = 0; ; attempt++) {
             try {
-                byte[][] values = namespace.getManyBytes(pending);
+                byte[][] values = fetch.apply(pending);
                 for (int i = 0; i < positions.length; i++) {
                     result[positions[i]] = values[i];
                 }
@@ -695,7 +677,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             n++;
         }
 
-        byte[][] existing = getManyBytesResolvingWrongNode(wireKeys);
+        byte[][] existing = getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys);
 
         // Resolved TTL → the positions that share it. Insertion order is
         // kept so the groups' writes (and their listener events) follow
@@ -1319,6 +1301,14 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         byte[][] getManyBytes(byte[][] keys) {
             try {
                 return namespace.getManyBytes(keys);
+            } catch (RuntimeException error) {
+                throw wrappedUnlessBulkOutcome(error);
+            }
+        }
+
+        byte[][] getManyAndTouchBytes(byte[][] keys, long ttlSeconds) {
+            try {
+                return namespace.getManyAndTouchBytes(keys, ttlSeconds);
             } catch (RuntimeException error) {
                 throw wrappedUnlessBulkOutcome(error);
             }

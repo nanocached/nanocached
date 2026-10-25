@@ -26,7 +26,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * {@code x} (issue #141) this adapter's {@code putIfAbsent}/{@code
  * replace}/{@code deleteIfMatches}/{@code getWithToken} rely on, and the
  * batched {@code m} (issue #152) this adapter's {@code getAll} uses for
- * its bulk-safe keys. A
+ * its bulk-safe keys, and the batched touch {@code y} (issue #871) it uses
+ * instead when the cache has an access-based expiry policy. A
  * trimmed, independent reimplementation — see the adapters' shared
  * "duplicate per module rather than share a test double" convention
  * (e.g. {@code nanocached-spring}'s own {@code MockNode}).
@@ -52,6 +53,12 @@ final class MockNode implements AutoCloseable {
      * verbatim, e.g. {@code "t 7 1 30 G 0"} — lets a test assert the exact
      * frame the adapter sent. */
     final java.util.List<String> touchFrames = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** Every {@code y} (batched touch, issue #871) header line received
+     * verbatim, e.g. {@code "y 7 2 1 1 30 G 0"}. */
+    final java.util.List<String> multiTouchFrames = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** When set, every {@code y} is answered like a node that knows {@code
+     * t} but predates {@code y}: {@code En}, then the connection closes. */
+    volatile boolean rejectMultiTouch = false;
     /** Plain {@code g} (get) frames received. */
     final AtomicInteger getCount = new AtomicInteger();
     /** Runs when a {@code g} has looked its value up (not yet answered) or
@@ -221,6 +228,10 @@ final class MockNode implements AutoCloseable {
                     case "m" -> {
                         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
                         multiGet(in, out, ns(namespace), parts, tagSuffix);
+                    }
+                    case "y" -> {
+                        byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
+                        multiTouch(in, out, ns(namespace), parts, tagged, tagSuffix);
                     }
                     case "o" -> {
                         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
@@ -436,6 +447,79 @@ final class MockNode implements AutoCloseable {
             for (int i = 0; i < n; i++) {
                 if (!wrongNode[i] && values[i] != null) {
                     out.write(values[i]);
+                }
+            }
+            out.flush();
+        }
+    }
+
+    /** {@code y <ns-len> <n> <key-len-1> ... <key-len-n> [<ttl>] [G] [<tag>]}
+     * (issue #871): one TTL for the whole batch — no ttl field removes the TTL
+     * (stored as 0, like a set without one), 0 expires the keys at once, a miss
+     * is never created. Without {@code G} the reply is {@code Y <n> S|N ...};
+     * with it {@code M}'s roster for the keys touched. A key in {@link
+     * #forceWrongNodeCountsForGet} answers {@code W}, like {@link #multiGet}. */
+    private void multiTouch(
+            InputStream in, OutputStream out, String namespace, String[] parts, boolean tagged, String tagSuffix)
+            throws IOException {
+        int n = Integer.parseInt(parts[2]);
+        int[] keyLengths = new int[n];
+        for (int i = 0; i < n; i++) {
+            keyLengths[i] = Integer.parseInt(parts[3 + i]);
+        }
+        Long ttl = null;
+        boolean withValue = false;
+        for (int i = 3 + n; i < parts.length - (tagged ? 1 : 0); i++) {
+            if (parts[i].equals("G")) {
+                withValue = true;
+            } else {
+                ttl = Long.parseLong(parts[i]);
+            }
+        }
+        byte[][] keys = new byte[n][];
+        for (int i = 0; i < n; i++) {
+            keys[i] = in.readNBytes(keyLengths[i]);
+        }
+        multiTouchFrames.add(String.join(" ", parts));
+        if (rejectMultiTouch) {
+            reply(out, "En\n");
+            throw new IOException("nanocached-test: y rejected like an old server");
+        }
+        Runnable hook = beforeAccessApplies;
+        if (hook != null) {
+            hook.run();
+        }
+        String[] tokens = new String[n];
+        byte[][] hits = new byte[n][];
+        for (int i = 0; i < n; i++) {
+            if (forceWrongNode(forceWrongNodeCountsForGet, keys[i])) {
+                tokens[i] = "W";
+                continue;
+            }
+            ByteBuffer wrapped = ByteBuffer.wrap(keys[i]);
+            Entry existing = store(namespace).get(wrapped);
+            if (existing == null) {
+                tokens[i] = withValue ? "-" : "N";
+                continue;
+            }
+            if (ttl != null && ttl == 0) {
+                store(namespace).remove(wrapped);
+            } else {
+                store(namespace).put(wrapped, new Entry(existing.value(), ttl == null ? 0 : ttl));
+            }
+            tokens[i] = withValue ? String.valueOf(existing.value().length) : "S";
+            hits[i] = withValue ? existing.value() : null;
+        }
+        StringBuilder header = new StringBuilder(withValue ? "M " : "Y ").append(n);
+        for (String token : tokens) {
+            header.append(' ').append(token);
+        }
+        header.append(tagSuffix).append('\n');
+        synchronized (out) {
+            out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
+            for (byte[] hit : hits) {
+                if (hit != null) {
+                    out.write(hit);
                 }
             }
             out.flush();
