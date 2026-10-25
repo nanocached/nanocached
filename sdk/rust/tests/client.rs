@@ -5238,6 +5238,42 @@ async fn a_primary_that_predates_batch_touch_is_server_too_old_not_a_connection_
 }
 
 #[tokio::test]
+async fn a_batch_touch_asks_a_node_that_predates_y_at_most_once() {
+    // Issue #902: an `En` is final, so no refresh and second pass.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let old_keys = keys_whose_primary_is(NAMES[0], 2);
+    let keys = concat(&old_keys, &keys_whose_primary_is(NAMES[1], 2));
+    client.set_many(&values_for(&keys), 0).await.unwrap();
+    let old = node_named(&nodes, NAMES[0]);
+    old.state.reject_multi_touch.store(true, Ordering::SeqCst);
+    // The primary leg of the old node's own keys, in either form.
+    let asks = |get: bool| {
+        multi_touch_frames(old)
+            .iter()
+            .filter(|frame| frame.get == get && frame.keys.contains(&old_keys[0]))
+            .count()
+    };
+
+    assert!(matches!(
+        client.touch_many(&keys, Some(30)).await,
+        Err(Error::ServerTooOld { command: "y" })
+    ));
+    // At most one: a call that finds the connection the last `En` closed
+    // already dead answers without sending anything.
+    assert!(asks(false) <= 1);
+    assert!(matches!(
+        client.get_many_and_touch(&keys, Some(30)).await,
+        Err(Error::ServerTooOld { command: "y" })
+    ));
+    assert!(asks(true) <= 1);
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
 async fn batch_touch_reports_an_unreachable_primary_as_a_connection_failure_not_wrong_node() {
     let (nodes, discovery) = start_cluster(1).await;
     let client = NanocachedClient::connect(options(discovery.port))
