@@ -477,7 +477,8 @@ impl Connection {
     /// touch is idempotent and not primary-only — this talks to the ONE
     /// node this connection is dialed to, and [`crate::client::NanocachedClient`]
     /// sends it to every owner. A node that predates the command answers
-    /// `En`, which surfaces as [`Error::ServerTooOld`].
+    /// `En`, which surfaces as [`Error::ServerTooOld`]; any other `E` (the
+    /// proxy's outcome-unknown, issue #939) as [`Error::ConnectionLostAfterSend`].
     pub(crate) async fn touch(
         &self,
         namespace: &[u8],
@@ -523,6 +524,14 @@ impl Connection {
         match error {
             Error::Protocol(message) if message == SERVER_REJECTED_MESSAGE => {
                 Error::ServerTooOld { command }
+            }
+            // Any other `E` (issue #939): the proxy's "outcome unknown"
+            // (`E`, tagged `E <tag>`), not a node that predates the
+            // command. The frame was written and the connection is gone, so
+            // it is a loss after the send, which an expiring touch is not
+            // resent on.
+            Error::Protocol(message) if message.starts_with(SERVER_ERROR_REPLY_MESSAGE) => {
+                Error::ConnectionLostAfterSend(message)
             }
             other => other,
         }
@@ -744,7 +753,9 @@ impl Connection {
     /// [`MultiEntry::Miss`], left untouched. `entries[i]` answers
     /// `keys[i]`; a roster of the wrong length is a desynced connection,
     /// as for [`Self::multi_get`]. A node that predates the command
-    /// answers `En`, which surfaces as [`Error::ServerTooOld`].
+    /// answers `En`, which surfaces as [`Error::ServerTooOld`]; any other `E`
+    /// (the proxy's outcome-unknown, issue #939) as
+    /// [`Error::ConnectionLostAfterSend`].
     pub(crate) async fn multi_touch(
         &self,
         namespace: &[u8],
@@ -1806,7 +1817,18 @@ async fn read_one_response(
         // issue #825: `En` — a node that does not know the command just
         // sent. It closes the connection right after; only the touch
         // methods tell this apart from other garbage (see `server_too_old`).
-        b'E' => Err(Error::Protocol(SERVER_REJECTED_MESSAGE.to_string())),
+        // Any other `E` is not a node's `En`: the proxy answers a bare `E`
+        // (tagged: `E <tag>`) when it could not tell whether a request was
+        // applied (issue #939). The rest of the line is read either way, so
+        // the two are told apart by the byte that follows the `E`.
+        b'E' => {
+            let line = read_line(read_half).await?;
+            Err(Error::Protocol(if line.starts_with('n') {
+                SERVER_REJECTED_MESSAGE.to_string()
+            } else {
+                format!("{SERVER_ERROR_REPLY_MESSAGE}: {line:?}")
+            }))
+        }
         other => Err(Error::Protocol(format!(
             "nanocached: unexpected response from server: {}",
             other as char
@@ -1814,10 +1836,17 @@ async fn read_one_response(
     }
 }
 
-/// The `Protocol` message for a node's `E` — the same text the generic
+/// The `Protocol` message for a node's `En` — the same text the generic
 /// unknown-marker arm has always produced for that byte, so every command
 /// other than touch keeps surfacing exactly what it did before.
 const SERVER_REJECTED_MESSAGE: &str = "nanocached: unexpected response from server: E";
+
+/// The `Protocol` message for an `E` line that is not a node's `En` (the
+/// proxy's `E`, tagged `E <tag>`, for a request whose outcome it could not
+/// tell, issue #939); the line itself follows. It must not equal
+/// [`SERVER_REJECTED_MESSAGE`], which is how `En` is told apart.
+const SERVER_ERROR_REPLY_MESSAGE: &str =
+    "nanocached: unexpected response from server: E reply that is not En";
 
 /// Parses a response's echoed tag (echoed response tags): a `u32` in decimal,
 /// matching the wire width the client itself claims tags from.

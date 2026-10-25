@@ -73,9 +73,11 @@ pub enum Error {
     /// the connection. The SDK only sends frames it has validated, so a
     /// node's `En` to a touch means it does not know the command —
     /// upgrade every node to a release that includes it. `command` is the
-    /// wire command the node did not know: `"t"` or `"y"`. A bare
-    /// disconnect with no `En` cannot be told apart from any other lost
-    /// connection and stays [`Self::ConnectionLost`].
+    /// wire command the node did not know: `"t"` or `"y"`. Only an `En`
+    /// is this: a bare disconnect, or an `E` that is not an `En` (the
+    /// proxy answers a bare `E` when a touch's outcome is unknown), cannot
+    /// be told apart from any other lost connection and stays
+    /// [`Self::ConnectionLost`].
     ServerTooOld { command: &'static str },
     /// The server rejected the `A` handshake's secret — either the server
     /// requires one and none was configured, or the configured one is

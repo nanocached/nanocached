@@ -31,6 +31,14 @@ follow the `sdk/rust/vX.Y.Z` tags.
   `get_many` named `Error::Decompression`, which exists only with
   `compression`, outside its cfg, so a consumer who turned the feature off
   got a compile error. CI now builds and tests every feature combination.
+- Only a node's `En` is reported as `Error::ServerTooOld` by the touch
+  methods. Any other `E` to a `t` or `y` frame (the proxy answers a bare `E`,
+  tagged `E <tag>`, when it could not tell whether an expiring touch was
+  applied) was reported as "server too old, upgrade every node"; it is now
+  the connection lost after the frame was written, which an expiring touch is
+  not sent again on, and which `touch` / `touch_many` with a TTL still send
+  once more on a fresh connection like any lost reply. The caller gets
+  `Error::ConnectionLost` either way.
 
 ### Added
 
