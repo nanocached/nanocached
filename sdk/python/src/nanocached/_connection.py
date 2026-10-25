@@ -709,7 +709,10 @@ class Connection:
         # means the request/response streams are misaligned — every later
         # response would answer the wrong request, silently returning
         # other keys' data. Poison the connection, and classify as a
-        # connection error so the retry layer redials and retries once.
+        # connection error so the retry layer redials and retries once
+        # (a ConnectionLostError: the reply is in hand, so the frame was
+        # sent, and incr, the CAS family and an expiring touch must not
+        # be replayed — issue #921).
         # Requests still pending behind this one may already have been
         # resolved with misaligned data by the time this runs — an
         # inherent limitation of matching-by-order pipelining (documented once, for every SDK, at docs/protocol.html#untagged-desync) shared with
@@ -724,8 +727,12 @@ class Connection:
         # entry-count check (issue #181): either way the response stream
         # can no longer be trusted to line up with requests, so poison the
         # connection exactly like _mismatch does and return a
-        # ConnectionError for the caller to raise.
-        error = ConnectionError(message)
+        # ConnectionError for the caller to raise. Both only run once a
+        # reply has been read, so the request's frame had been written:
+        # the error is a ConnectionLostError (issue #921), which
+        # `_with_wrong_node_retry` does not replay for incr/CAS or for a
+        # touch with ttl 0 (`replay_safe=False`).
+        error = ConnectionLostError(message)
         self._poison(error)
         return error
 

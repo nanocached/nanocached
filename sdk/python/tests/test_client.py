@@ -2269,6 +2269,28 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
+    async def test_an_expiring_touch_is_not_resent_after_a_reply_of_the_wrong_kind(self):
+        # Issue #921: the reply being read means the frame was sent, so a
+        # misaligned stream is a loss after the send like any other.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, _ = self.owners_of("k")
+            primary = nodes[primary_name]
+            await client.set("k", "payload")
+            primary.answer_next_touch_with_wrong_kind()
+            with self.assertRaises(ConnectionLostError):
+                await client.touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 1)
+
+            await client.set("k", "payload")
+            primary.answer_next_touch_with_wrong_kind()
+            with self.assertRaises(ConnectionLostError):
+                await client.get_and_touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 2)
+        finally:
+            await self.stop(client, discovery, nodes)
+
     async def test_an_expiring_touch_still_retries_a_request_that_was_never_sent(self):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
@@ -2780,6 +2802,23 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ConnectionLostError):
                 await client.get_many_and_touch(keys, 0)
             self.assertEqual(len(primary.multi_touch_frames), 2)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_batch_is_not_resent_after_a_roster_of_the_wrong_length(self):
+        # Issue #921: as above for a short `y` roster.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = self.keys_by_primary(NAMES[0], 4)
+            primary = nodes[NAMES[0]]
+            await client.set_many({key: f"v-{key}" for key in keys})
+            for frames, call in ((1, client.touch_many), (2, client.get_many_and_touch)):
+                primary.answer_multi_touch_bad_count_once(1)
+                with self.assertRaises(ConnectionLostError):
+                    await call(keys, 0)
+                self.assertEqual(len(primary.multi_touch_frames), frames)
+                await client.set_many({key: f"v-{key}" for key in keys})
         finally:
             await self.stop(client, discovery, nodes)
 
