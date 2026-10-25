@@ -23,6 +23,12 @@ for i in 1 2 3 4; do
   py_bg "blocker$i" q_blockers.py "$P-disc:8357" 256 25
 done
 sleep 20
-for i in 1 2 3 4; do docker logs "$P-blocker$i" 2>&1 | head -1; done
+held=0
+for i in 1 2 3 4; do
+  line=$(docker logs "$P-blocker$i" 2>&1 | head -1)
+  T "blocker$i: $line"
+  held=$(( held + $(json_int "$line" held) ))
+done
+require_at_least "connections held asking Q" "$held" 1000
 verdict "$P-disc" $LIMIT 50 "1,024 clients asking Q with a 1 KiB receive buffer"
 hl_result

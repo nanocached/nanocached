@@ -95,6 +95,25 @@ peak_rss_mb() {
   docker exec "$1" sh -c 'grep VmHWM /proc/1/status' 2>/dev/null | awk '{printf "%d", $2 / 1024}'
 }
 
+# json_int <json> <field>: the first integer value of "field" in a JSON text
+# (the client images have no jq).
+json_int() {
+  printf '%s' "$1" | sed -n "s/.*\"$2\": *\([0-9][0-9]*\).*/\1/p" | head -1
+}
+
+# require_at_least <label> <value> <floor>: a low peak only proves something
+# if the client really applied the load, so a client that failed to connect or
+# sent far less than it should fails the scenario instead of passing it.
+require_at_least() {
+  local label=$1 value=$2 floor=$3
+  if [ -z "$value" ] || [ "$value" -lt "$floor" ]; then
+    T "FAIL $label: ${value:-none}, want at least $floor (the load was not applied)"
+    FAIL=1
+  else
+    T "ok   $label: $value (at least $floor)"
+  fi
+}
+
 # verdict <container> <limit_mb> <max_percent> <label>
 # Passes when the container was never OOM-killed, is still running, and
 # its peak RSS stayed under max_percent of its memory limit.

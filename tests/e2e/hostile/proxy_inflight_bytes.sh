@@ -22,6 +22,9 @@ docker pause "$P-node" >/dev/null
 # 300 x 1 MB is what OOM-killed the unbounded proxy after ~213 frames.
 result=$(py proxy_pipeline.py "$P-proxy:8358" 300 1000000 60)
 T "client: $result"
+# A bounded proxy stops reading once its in-flight bytes are full, so the
+# client is expected to end "blocked" (37 MB were sent when this was written).
+require_at_least "client frames sent" "$(json_int "$result" frames_sent)" 10
 sleep 2
 verdict "$P-proxy" $LIMIT 50 "pipelined 1 MB S with the node stalled"
 hl_result

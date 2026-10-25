@@ -27,6 +27,10 @@ docker pause "$P-c" >/dev/null
 # 8 connections, ~1 MB unique namespaces: the shape that pinned 425 MB.
 result=$(py node_flood.py "$P-a:8356" 8 40)
 T "client: $result"
+# 111 MB went over the wire when this was written; a client that never
+# connected or was refused at once sends none.
+require_at_least "client wire MB" "$(json_int "$result" wire_mb)" 20
+require_at_least "client acked writes" "$(json_int "$result" acked)" 1
 sleep 2
 verdict "$P-a" $LIMIT 85 "1 MB-namespace writes with the joiner stalled"
 hl_result

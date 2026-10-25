@@ -17,6 +17,9 @@ Cell:  PASS   within every bound
        FAIL   outside one (the reasons are listed below the matrix)
        --     no record of the case for that SDK
 Writes <run-dir>/hostile_report.md, prints the matrix, and exits 1 when any cell is not PASS.
+
+hostile_check.py <run-dir> <case> judges that one case only (`ONLY=<case> scenarios.sh hostile`, which also runs
+`baseline` for the memory reference); the others have no record in such a run and are not listed.
 """
 import collections
 import json
@@ -35,7 +38,12 @@ def events(run_dir, case, sdk):
     for line in open(path):
         line = line.strip()
         if line.startswith("{"):
-            r = json.loads(line)
+            try:
+                r = json.loads(line)
+            except ValueError:
+                # a driver killed mid-write leaves a truncated last line: it is no event, and must not
+                # take the report of the other five SDKs down with it
+                continue
             out[r.get("event")] = r
     return out
 
@@ -79,8 +87,12 @@ def judge(case, ev, baseline_peak):
     return why
 
 
-def main(run_dir):
+def main(run_dir, only=None):
     cases = json.load(open(BOUNDS))["cases"]
+    if only is not None:
+        cases = [case for case in cases if case["id"] == only]
+        if not cases:
+            sys.exit(f"hostile_check.py: no case {only!r} in {BOUNDS}")
     rows, details = [], []
     for case in cases:
         row = {}
@@ -109,4 +121,4 @@ def main(run_dir):
     sys.exit(1 if details else 0)
 
 
-main(sys.argv[1])
+main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
