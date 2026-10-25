@@ -52,6 +52,7 @@ from ._errors import (
     ConnectionLostError,
     NanocachedError,
     PartialConnectionLostError,
+    PartialServerTooOldError,
     PartialSetConnectionLostError,
     PartialWrongNodeError,
     ServerTooOldError,
@@ -1575,7 +1576,11 @@ class NanocachedClient:
         way get_many() and get_many_and_touch() both do."""
         try:
             raw = await fetch
-        except (PartialWrongNodeError, PartialConnectionLostError) as error:
+        except (
+            PartialWrongNodeError,
+            PartialConnectionLostError,
+            PartialServerTooOldError,
+        ) as error:
             # Defensive decode (issue #412, revised by issue #488): a
             # stored value need not be valid UTF-8 even when this is
             # get_many() rather than get_many_bytes() (nothing on the
@@ -2105,7 +2110,10 @@ class NanocachedClient:
         #901): it may have expired and consumed its values already, so
         those keys raise PartialConnectionLostError at once instead of
         reading as misses. Raises ServerTooOldError against a node that
-        predates the command."""
+        predates the command — in a cluster, when other primaries had
+        already answered, the PartialServerTooOldError subclass carrying
+        their hits in ``partial_values`` (with ``ttl_seconds == 0`` those
+        values are consumed and would otherwise be lost)."""
         return await self._decode_batch(self._get_many_and_touch_bytes(b"", keys, ttl_seconds))
 
     async def _get_many_and_touch_bytes(
@@ -2182,7 +2190,7 @@ class NanocachedClient:
         if retry and state.rejected:
             # An `En` is a final answer from that node: a refresh and a
             # second pass would only ask it again, so fail now.
-            raise ServerTooOldError("y") from state.last_cause
+            raise self._too_old("y", get, collect, state)
         if retry:
             # One bounded refresh-and-retry over everything a primary left
             # unresolved: a `W` is stale routing the refresh fixes, a
@@ -2196,7 +2204,7 @@ class NanocachedClient:
         if not retry and not state.lost:
             return collect(state.results)
         if state.rejected:
-            raise ServerTooOldError("y") from state.last_cause
+            raise self._too_old("y", get, collect, state)
         if not state.lost and any(idx in state.wrong_node for idx in retry):
             if get:
                 raise PartialWrongNodeError(collect(state.results))
@@ -2215,6 +2223,20 @@ class NanocachedClient:
                 f"{len(retry) + len(state.lost)} of {len(key_bytes_list)} keys: {cause}",
             ) from cause
         raise cause
+
+    @staticmethod
+    def _too_old(command: str, get: bool, collect, state: _MultiTouchState) -> ServerTooOldError:
+        """The error for a primary that answered ``En`` to ``y``: with
+        ``get``, the hits other primaries already returned ride along (they
+        may have been consumed by a ``ttl_seconds == 0`` call), as
+        _multi_touch() does for a wrong-node or unreachable primary."""
+        error: ServerTooOldError = (
+            PartialServerTooOldError(collect(state.results))
+            if get and state.results
+            else ServerTooOldError(command)
+        )
+        error.__cause__ = state.last_cause
+        return error
 
     async def _multi_touch_chunked(
         self,
