@@ -9,6 +9,13 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Changed
+
+- The minimum supported Node.js is 22 (`engines.node` is `>=22`, was
+  `>=20`), as for the TypeScript SDK this adapter is built on: Node 20 reached
+  end of life on 2026-04-30. The test suite now runs on Node 22, 24 and the
+  current LTS.
+
 ## [0.4.8] - 2026-10-21
 
 ### Changed

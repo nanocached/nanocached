@@ -182,7 +182,7 @@ are measured after JSON serialization, and after compression when
 
 ## Requirements
 
-Node.js 20+, `cache-manager` ^5 (the `get`/`set`/`del`/`reset`/`mget`/`mset`
+Node.js 22+, `cache-manager` ^5 (the `get`/`set`/`del`/`reset`/`mget`/`mset`
 shape this targets — its `Keyv`-based v6+/NestJS 11 successor is
 [`nanocached-keyv`](../keyv), a separate package), nanocached server
 0.4.0 or later — the release that added namespaces, `CLEAR` and the

@@ -6,7 +6,7 @@ a tiny distributed cache. Talks to either a single `nanocached-node` or a
 the server's own handshake response, so the calling code is identical
 either way.
 
-Requires Node.js 20+. No runtime dependencies.
+Requires Node.js 22+. No runtime dependencies.
 
 ## Install
 

@@ -38,6 +38,11 @@ tag: 0.4.3 was a server-only release.
 
 ### Changed
 
+- The minimum supported Node.js is 22 (`engines.node` is `>=22`, was
+  `>=20`). Node 20 reached end of life on 2026-04-30 and the 20 line has no
+  release carrying the root-certificate update made after the eMudhra
+  intermediate CA key compromise. The test suite now runs on Node 22, 24
+  and the current LTS.
 - `set` and the compare-and-set writes no longer copy a `Uint8Array` or
   `Buffer` value when they are called: a write that waits behind a slow or
   stalled peer holds a reference to the caller's buffer instead of a second
