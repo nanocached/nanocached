@@ -163,6 +163,13 @@ public class ConnectionLostException : NanocachedException
 /// partial data yet, so a plain (bare) <see cref="ConnectionLostException"/>
 /// propagates instead — this type is only thrown once a second or later
 /// sub-frame fails.</para>
+///
+/// <para>From <c>GetManyAndTouchAsync</c>/<c>GetManyAndTouchBytesAsync</c>
+/// with a TTL of 0 (issue #938), the keys missing from
+/// <see cref="PartialValues"/> include ones whose frame was sent and whose
+/// outcome is unknown: the node may already have expired them and consumed
+/// their values. Do not send them again with a TTL of 0 — they would read
+/// as misses.</para>
 /// </summary>
 public sealed class PartialConnectionLostException<T> : ConnectionLostException
 {
