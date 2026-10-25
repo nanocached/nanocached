@@ -183,7 +183,13 @@ whose access duration is zero expires the entries on read, in the same
 step. A server older than the touch commands makes `get()` (without the
 batched form, `t`) or `getAll` (`y`) fail with the SDK's `ServerTooOld`
 (wrapped in a `CacheException`) under such a policy; the default policies
-never touch.
+never touch. Upgrade every server before the adapters that use such a
+policy: `getAll` sends the batch to all owning nodes before it reports the
+old ones, so in a mixed cluster the nodes that were upgraded have already
+refreshed their hits when the exception is raised — and with a zero access
+duration, already expired them — while the caller gets the exception and none
+of the values. There is no fallback to a plain read plus a touch, because it
+could not give those expired values back.
 
 ## Trust boundary / deserialization
 
