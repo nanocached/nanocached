@@ -9,6 +9,16 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- A `ttl=0` touch (`touch`, `get_and_touch`, `touch_many`,
+  `get_many_and_touch`) is no longer sent again after a reply that cannot be
+  matched to it, a reply of the wrong kind or a roster of the wrong length.
+  The frame was written, so the node had already expired the keys, and the
+  second one reported them as missing and a `get_and_touch` lost the value.
+  They now raise `ConnectionLostError`, as the docstring of that class
+  already said a misaligned reply does.
+
 ### Added
 
 - `touch(key, ttl_seconds)` replaces an entry's TTL in place and returns

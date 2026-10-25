@@ -118,6 +118,7 @@ class MockNode:
         # exactly as the real node does for any command it does not know.
         self.legacy_without_touch = False
         self._drop_next_touch_reply = False
+        self._touch_wrong_kind_reply = False
         # Batched touch (issue #871): every `y` received as (namespace,
         # keys, ttl, get), one entry per frame — what proves a frame's
         # grouping, which the per-key `touches` above cannot.
@@ -315,6 +316,12 @@ class MockNode:
         A touch is idempotent, so the client may resend it, unlike an
         incr (see apply_and_drop_next_incr)."""
         self._drop_next_touch_reply = True
+
+    def answer_next_touch_with_wrong_kind(self) -> None:
+        """Applies the next `t` request, then answers it with a `D` — a
+        well-formed reply of the wrong kind, the misaligned stream of
+        issue #921."""
+        self._touch_wrong_kind_reply = True
 
     def fail_multi_touch_after(self, successes: int) -> None:
         """Answers the next ``successes`` `y` requests normally, then closes
@@ -825,6 +832,11 @@ class MockNode:
                         self._drop_next_touch_reply = False
                         writer.close()
                         return
+                    if self._touch_wrong_kind_reply:
+                        self._touch_wrong_kind_reply = False
+                        writer.write(b"D" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
                     if get:
                         ttl_field = b" %d" % ttl if ttl is not None else b""
                         writer.write(b"V %d%b%b\n%b" % (len(current), ttl_field, tag_suffix, current))
