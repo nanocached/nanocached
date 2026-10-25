@@ -98,6 +98,25 @@ class _MultiSetTracker:
         self.last_cause: BaseException | None = None
 
 
+class _MultiTouchState:
+    """What one touch_many/get_many_and_touch call learns across its two
+    _multi_touch_pass passes. ``results`` maps a key index to its
+    primary's answer (a bool for a plain touch; the value, or None for a
+    miss, for a get). ``wrong_node`` holds the indices whose primary leg's
+    latest outcome was a `W` rather than a connection failure;
+    ``last_cause`` the most recent primary-leg connection failure and
+    ``rejected`` whether any primary leg was answered ``En`` (a node that
+    predates ``y``). Single-threaded (asyncio), so no locking."""
+
+    __slots__ = ("results", "wrong_node", "last_cause", "rejected")
+
+    def __init__(self) -> None:
+        self.results: dict[int, object] = {}
+        self.wrong_node: set[int] = set()
+        self.last_cause: BaseException | None = None
+        self.rejected = False
+
+
 @dataclass(frozen=True)
 class ClientStats:
     """Snapshot of counters for failures this client swallows by design
@@ -1531,8 +1550,13 @@ class NanocachedClient:
     async def _get_many(self, namespace: bytes, keys: Sequence[str | bytes]) -> dict[str | bytes, str]:
         """The namespace-carrying implementation behind get_many() and
         Namespace.get_many() — see _get()."""
+        return await self._decode_batch(self._get_many_bytes(namespace, keys))
+
+    async def _decode_batch(self, fetch) -> dict[str | bytes, str]:
+        """Awaits a batched read's raw result and decodes its values, the
+        way get_many() and get_many_and_touch() both do."""
         try:
-            raw = await self._get_many_bytes(namespace, keys)
+            raw = await fetch
         except (PartialWrongNodeError, PartialConnectionLostError) as error:
             # Defensive decode (issue #412, revised by issue #488): a
             # stored value need not be valid UTF-8 even when this is
@@ -1970,6 +1994,313 @@ class NanocachedClient:
                 task.add_done_callback(self._background_replica_writes.discard)
                 continue
             synchronous_legs.append(run_leg(name, leg_indices, is_primary))
+
+        for leg_retry in await asyncio.gather(*synchronous_legs):
+            retry.extend(leg_retry)
+        return retry
+
+    # ── Batched touch (issue #871) ─────────────────────────────────────
+    #
+    # touch_many/get_many_and_touch are touch()/get_and_touch() for N keys
+    # in one ``y`` sub-frame per involved node (docs/protocol.html "y —
+    # batched touch"), chunked like get_many/set_many. A touch is
+    # idempotent and not primary-only, so every owner of a key is sent it,
+    # as for set_many, and only the primary's answer decides the key's
+    # outcome. ``G`` belongs to the whole frame, so a node that is primary
+    # for some keys of a get_many_and_touch batch and a replica for others
+    # gets two frames: the G form for the first, the plain form for the
+    # second (set_many's "exactly one sub-frame per node" does not hold).
+    # Keys are deduplicated like get_many's.
+
+    async def touch_many(
+        self, keys: Sequence[str | bytes], ttl_seconds: int | None
+    ) -> dict[str | bytes, bool]:
+        """Batched touch (issue #871): replaces the TTL of every existing
+        key in ``keys`` in place, one round trip per involved node instead
+        of one per key. ``keys`` must be non-empty. Returns a dict keyed by
+        the original key objects: ``True`` for a key that existed,
+        ``False`` for a missing or expired one, which a touch never
+        creates. ``ttl_seconds`` is one TTL for the whole batch and means
+        what it means for touch(): no default, ``None`` removes the TTL,
+        ``0`` expires the keys at once.
+
+        Like touch() it is idempotent, so a request whose reply was lost
+        is retried, and in a cluster it goes to every owner of a key, the
+        primary's answer being the key's. A replica's failure or ``W`` is
+        counted in stats().replica_write_failures and never fails the
+        batch. Larger batches are transparently split into more than one
+        ``y`` sub-frame per node (issue #222). If some keys' primaries
+        are still wrong-node after one bounded refresh-and-retry this
+        raises a plain WrongNodeError, and a key whose primary could not
+        be reached on both passes raises that connection error — every
+        other key was still touched, and since a touch is idempotent the
+        whole batch may simply be sent again, so nothing partial is
+        attached. Raises ServerTooOldError against a node that predates
+        the command."""
+        return await self._touch_many(b"", keys, ttl_seconds)
+
+    async def _touch_many(
+        self, namespace: bytes, keys: Sequence[str | bytes], ttl_seconds: int | None
+    ) -> dict[str | bytes, bool]:
+        """The namespace-carrying implementation behind touch_many() and
+        Namespace.touch_many() — see _get_bytes()."""
+        return await self._multi_touch(namespace, keys, ttl_seconds, False, "touch_many")  # type: ignore[return-value]
+
+    async def get_many_and_touch_bytes(
+        self, keys: Sequence[str | bytes], ttl_seconds: int | None
+    ) -> dict[str | bytes, bytes]:
+        """The raw companion to get_many_and_touch(): no UTF-8 decoding.
+        Transparently decompresses when ``compress`` is enabled."""
+        return await self._get_many_and_touch_bytes(b"", keys, ttl_seconds)
+
+    async def get_many_and_touch(
+        self, keys: Sequence[str | bytes], ttl_seconds: int | None
+    ) -> dict[str | bytes, str]:
+        """Batched get_and_touch() (issue #871): reads the values of
+        ``keys`` and replaces their TTL in one step, one round trip per
+        involved node. ``keys`` must be non-empty. A miss is absent from
+        the returned dict, creates nothing and is not an error. See
+        touch_many() for ``ttl_seconds`` (one TTL for the whole batch; no
+        default; ``None`` removes it, ``0`` expires the keys at once).
+        Strict UTF-8 decode like get().
+
+        A write-ish read, as get_and_touch() is: each key goes to its
+        primary in the ``G`` form, with no hedging and no fallback to a
+        replica on a miss, and its other owners are sent the plain touch,
+        so a replica is never the only owner touched. It counts as a read
+        on the primary, which makes the entries the most recently used. A
+        value the node had no room for in its reply (16 MiB per frame) is
+        left out and left untouched, so it reads as a miss here.
+
+        Failures follow get_many(): keys still wrong-node after one
+        bounded refresh-and-retry raise PartialWrongNodeError, and keys
+        whose primary was unreachable on both passes raise
+        PartialConnectionLostError (the bare connection error when
+        nothing resolved), each carrying ``partial_values``, the keys that
+        did resolve. Unlike get_many() a key is not tried on its next
+        owner when its primary is down — a replica's answer would leave
+        the primary untouched. Raises ServerTooOldError against a node
+        that predates the command."""
+        return await self._decode_batch(self._get_many_and_touch_bytes(b"", keys, ttl_seconds))
+
+    async def _get_many_and_touch_bytes(
+        self, namespace: bytes, keys: Sequence[str | bytes], ttl_seconds: int | None
+    ) -> dict[str | bytes, bytes]:
+        """The namespace-carrying implementation behind
+        get_many_and_touch_bytes() and Namespace.get_many_and_touch_bytes()
+        — see _get_bytes()."""
+        return await self._multi_touch(  # type: ignore[return-value]
+            namespace, keys, ttl_seconds, True, "get_many_and_touch/get_many_and_touch_bytes"
+        )
+
+    async def _multi_touch(
+        self,
+        namespace: bytes,
+        keys: Sequence[str | bytes],
+        ttl_seconds: int | None,
+        get: bool,
+        method: str,
+    ) -> dict[str | bytes, object]:
+        """The shared body of touch_many() (``get`` False: a dict of bool
+        per key) and get_many_and_touch_bytes() (``get`` True: the hits)."""
+        if not keys:
+            raise ValueError(f"nanocached: {method} requires at least one key")
+        _check_touch_ttl(ttl_seconds)
+        originals, key_bytes_list = self._dedupe_batch_keys(keys, namespace)
+        await self._before_operation()
+
+        # See get_many_bytes(): one decompression budget for the response.
+        budget = [0]
+
+        def collect(results: dict[int, object]) -> dict[str | bytes, object]:
+            out: dict[str | bytes, object] = {}
+            for idx in sorted(results):
+                entry = results[idx]
+                if not get:
+                    out[originals[idx]] = entry
+                elif entry is not None:
+                    out[originals[idx]] = self._decompress_for_batch(entry, budget)  # type: ignore[arg-type]
+            return out
+
+        if self._ring is None:
+            entries, error, failed_at = await self._multi_touch_chunked(
+                self._single_connection, namespace, key_bytes_list, ttl_seconds, get
+            )
+            resolved = len(key_bytes_list) if error is None else failed_at
+            if error is not None:
+                if _rejected_by_server(error):
+                    raise ServerTooOldError("y") from error
+                if get and failed_at > 0:
+                    # As for get_many() (issue #411): single-node/proxy
+                    # mode never retries a chunk failure, so the hits an
+                    # earlier chunk already returned are attached.
+                    raise PartialConnectionLostError(
+                        collect(
+                            {
+                                idx: entry
+                                for idx, entry in enumerate(entries[:failed_at])
+                                if entry is not WRONG_NODE
+                            }
+                        ),
+                        f"nanocached: get_many_and_touch lost its connection after "
+                        f"{failed_at} of {len(key_bytes_list)} keys had already resolved: {error}",
+                    ) from error
+                raise error
+            if any(entry is WRONG_NODE for entry in entries[:resolved]):
+                raise WrongNodeError()
+            return collect(dict(enumerate(entries)))
+
+        state = _MultiTouchState()
+        retry = await self._multi_touch_pass(
+            namespace, key_bytes_list, ttl_seconds, get, None, state
+        )
+        if retry:
+            # One bounded refresh-and-retry over everything a primary left
+            # unresolved: a `W` is stale routing the refresh fixes, a
+            # primary that could not be reached gets a fresh view of who
+            # the owners are. A touch is idempotent, so the keys go to
+            # every owner of the fresh ring again.
+            await self._maybe_refresh(force=True)
+            retry = await self._multi_touch_pass(
+                namespace, key_bytes_list, ttl_seconds, get, retry, state
+            )
+        if not retry:
+            return collect(state.results)
+        if state.rejected:
+            raise ServerTooOldError("y") from state.last_cause
+        if any(idx in state.wrong_node for idx in retry):
+            if get:
+                raise PartialWrongNodeError(collect(state.results))
+            raise WrongNodeError()
+        # No primary answered `W` for these keys: each one's primary was
+        # unreachable on both passes. That is a connection loss and is
+        # reported as one, as get_many() does.
+        cause = state.last_cause
+        if cause is None:
+            cause = ConnectionError("nanocached: no owner is reachable for these keys")
+        if get and state.results:
+            raise PartialConnectionLostError(
+                collect(state.results),
+                f"nanocached: get_many_and_touch could not reach the primary of "
+                f"{len(retry)} of {len(key_bytes_list)} keys: {cause}",
+            ) from cause
+        raise cause
+
+    async def _multi_touch_chunked(
+        self,
+        connection_getter,
+        namespace: bytes,
+        keys: list[bytes],
+        ttl_seconds: int | None,
+        get: bool,
+    ) -> tuple[list[object], BaseException | None, int]:
+        """_multi_get_chunked's twin for ``y``: one or more sub-frames
+        against ``connection_getter`` for ``keys`` (already grouped to one
+        owner, or the single/proxy target), split by _batch_chunk_bounds.
+        ``get`` selects the ``G`` form. Always returns len(keys) entries —
+        a bool per key for a plain touch, bytes/None for a get — where only
+        those below ``failed_at`` (the index the failing chunk began at;
+        len(keys) when none failed) are real answers: the rest were never
+        reached, which no entry value can say, since a miss is a real
+        answer too."""
+        entries: list[object] = [None] * len(keys)
+        bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], None)
+        for start, end in bounds:
+            chunk = keys[start:end]
+            try:
+                connection = await connection_getter()
+                if get:
+                    chunk_entries = await connection.multi_get_and_touch(chunk, ttl_seconds, namespace)
+                else:
+                    chunk_entries = await connection.multi_touch(chunk, ttl_seconds, namespace)
+            except _SWALLOWABLE_ERRORS as error:
+                return entries, error, start
+            entries[start:end] = chunk_entries
+        return entries, None, len(keys)
+
+    async def _multi_touch_pass(
+        self,
+        namespace: bytes,
+        key_bytes_list: list[bytes],
+        ttl_seconds: int | None,
+        get: bool,
+        retry_indices: list[int] | None,
+        state: _MultiTouchState,
+    ) -> list[int]:
+        """Runs one pass of the cluster routing of touch_many and
+        get_many_and_touch: every key still needing resolution (every key
+        when retry_indices is None, or just what the previous pass left
+        unresolved) is sent to **every owner**, in one leg per (owner,
+        form): with ``get`` a key's primary gets it in the ``G`` form and
+        every other owner in the plain one, without it every owner gets
+        the plain form, so a node holding some keys as primary and others
+        as replica gets one frame in the second case and two in the first.
+        Only the primary's answer is recorded in ``state.results``; a
+        replica's failure or ``W`` is swallowed into
+        stats().replica_write_failures, as in _multi_set_pass(). A leg
+        that holds no key as primary is eligible for
+        fire_and_forget_replicas, exactly like a single-key replica write.
+
+        Returns the indices whose primary answered `W` or could not be
+        reached (a key with no owners at all counts as `W`: a refresh may
+        populate the ring). ``state`` learns which of the two it was, and
+        whether a primary was a node that predates ``y``."""
+        indices = retry_indices if retry_indices is not None else list(range(len(key_bytes_list)))
+
+        legs: dict[tuple[str, bool], tuple[list[int], list[bool]]] = {}
+        retry: list[int] = []
+        for idx in indices:
+            names = self._owner_names(namespace, key_bytes_list[idx])
+            if not names:
+                state.wrong_node.add(idx)
+                retry.append(idx)
+                continue
+            for rank, name in enumerate(names):
+                leg_indices, leg_primary = legs.setdefault((name, get and rank == 0), ([], []))
+                leg_indices.append(idx)
+                leg_primary.append(rank == 0)
+
+        async def run_leg(
+            name: str, get_form: bool, leg_indices: list[int], is_primary: list[bool]
+        ) -> list[int]:
+            group_keys = [key_bytes_list[idx] for idx in leg_indices]
+            entries, error, failed_at = await self._multi_touch_chunked(
+                lambda: self._member_connection(name), namespace, group_keys, ttl_seconds, get_form
+            )
+            resolved = len(leg_indices) if error is None else failed_at
+            if error is not None and any(is_primary):
+                state.last_cause = error
+                if _rejected_by_server(error):
+                    state.rejected = True
+            leg_retry: list[int] = []
+            for pos, (idx, primary) in enumerate(zip(leg_indices, is_primary)):
+                answered = pos < resolved and entries[pos] is not WRONG_NODE
+                if not primary:
+                    if not answered:
+                        self._replica_write_failures += 1
+                elif answered:
+                    state.results[idx] = entries[pos]
+                else:
+                    if pos < resolved:
+                        state.wrong_node.add(idx)
+                    else:
+                        state.wrong_node.discard(idx)
+                    leg_retry.append(idx)
+            return leg_retry
+
+        synchronous_legs = []
+        for (name, get_form), (leg_indices, is_primary) in legs.items():
+            if (
+                not any(is_primary)
+                and self._fire_and_forget_replicas
+                and not self._closed
+                and len(self._background_replica_writes) < _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
+            ):
+                task = asyncio.ensure_future(run_leg(name, get_form, leg_indices, is_primary))
+                self._background_replica_writes.add(task)
+                task.add_done_callback(self._background_replica_writes.discard)
+                continue
+            synchronous_legs.append(run_leg(name, get_form, leg_indices, is_primary))
 
         for leg_retry in await asyncio.gather(*synchronous_legs):
             retry.extend(leg_retry)
@@ -3243,6 +3574,29 @@ class Namespace:
         """Same as NanocachedClient.set_many(), scoped to this namespace
         (issues #128/#150/#151)."""
         await self._client._set_many(self._namespace, values, ttl_seconds=ttl_seconds)
+
+    async def touch_many(
+        self, keys: Sequence[str | bytes], ttl_seconds: int | None
+    ) -> dict[str | bytes, bool]:
+        """Same as NanocachedClient.touch_many(), scoped to this namespace
+        (issue #871)."""
+        return await self._client._touch_many(self._namespace, keys, ttl_seconds)
+
+    async def get_many_and_touch_bytes(
+        self, keys: Sequence[str | bytes], ttl_seconds: int | None
+    ) -> dict[str | bytes, bytes]:
+        """Same as NanocachedClient.get_many_and_touch_bytes(), scoped to
+        this namespace (issue #871)."""
+        return await self._client._get_many_and_touch_bytes(self._namespace, keys, ttl_seconds)
+
+    async def get_many_and_touch(
+        self, keys: Sequence[str | bytes], ttl_seconds: int | None
+    ) -> dict[str | bytes, str]:
+        """Same as NanocachedClient.get_many_and_touch(), scoped to this
+        namespace (issue #871)."""
+        return await self._client._decode_batch(
+            self._client._get_many_and_touch_bytes(self._namespace, keys, ttl_seconds)
+        )
 
     async def incr(self, key: str | bytes, delta: int = 1) -> int | None:
         """Same as NanocachedClient.incr(), scoped to this namespace

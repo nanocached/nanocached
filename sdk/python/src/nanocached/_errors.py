@@ -75,14 +75,18 @@ class NotNumericError(NanocachedError):
 
 class ServerTooOldError(NanocachedError):
     """Raised by touch/get_and_touch (issue #825) when the node answered
-    ``En`` to the ``t`` command: a node that predates ``t`` does not know
-    the command and closes the connection. Every node must be upgraded
-    before a client sends it; nothing is retried, since the same node would
-    answer the same way."""
+    ``En`` to the ``t`` command, and by touch_many/get_many_and_touch
+    (issue #871) when it answered ``En`` to ``y``: a node that predates the
+    command does not know it and closes the connection. Every node must be
+    upgraded before a client sends it; nothing is retried, since the same
+    node would answer the same way. ``command`` is the wire command the node
+    did not know."""
 
-    def __init__(self) -> None:
+    def __init__(self, command: str = "t") -> None:
+        self.command = command
+        what = "touch" if command == "t" else "batched touch"
         super().__init__(
-            "nanocached: the server does not know the touch command (t) — "
+            f"nanocached: the server does not know the {what} command ({command}) — "
             "upgrade every node to a release that includes it"
         )
 

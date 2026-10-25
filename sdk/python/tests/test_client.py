@@ -2261,6 +2261,588 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
             await self.stop(client, discovery, nodes)
 
 
+class MultiTouchEncodingTests(unittest.TestCase):
+    # Batched touch (issue #871): docs/protocol.html "y — batched touch" is
+    # the wire spec these pin. Always namespaced; an omitted TTL removes the
+    # TTL (so None sends no field) and 0 is sent — the opposite of
+    # _encode_multi_set, where 0 is omitted. `G` follows the TTL.
+
+    def test_encodes_every_combination_of_ttl_and_get(self):
+        from nanocached._connection import _encode_multi_touch
+
+        keys = [b"a", b"bb"]
+        self.assertEqual(_encode_multi_touch(keys, None, False), b"y 0 2 1 2\nabb")
+        self.assertEqual(_encode_multi_touch(keys, 30, False), b"y 0 2 1 2 30\nabb")
+        self.assertEqual(_encode_multi_touch(keys, 0, False), b"y 0 2 1 2 0\nabb")
+        self.assertEqual(_encode_multi_touch(keys, None, True), b"y 0 2 1 2 G\nabb")
+        self.assertEqual(_encode_multi_touch(keys, 30, True), b"y 0 2 1 2 30 G\nabb")
+
+    def test_encodes_namespace_and_tag(self):
+        from nanocached._connection import _encode_multi_touch
+
+        self.assertEqual(
+            _encode_multi_touch([b"k"], 30, True, tag=7, namespace=b"users"),
+            b"y 5 1 1 30 G 7\nusersk",
+        )
+        self.assertEqual(_encode_multi_touch([b"k"], None, False, tag=7), b"y 0 1 1 7\nk")
+
+
+class MultiTouchReplyTests(unittest.IsolatedAsyncioTestCase):
+    # The `Y` roster: S (touched), N (no live entry), W (wrong node).
+
+    async def read(self, data: bytes, tagged: bool = False):
+        from nanocached._connection import Connection
+
+        reader = asyncio.StreamReader()
+        reader.feed_data(data)
+        connection = Connection.__new__(Connection)
+        connection._reader = reader
+        connection._tagged = tagged
+        return await Connection._read_one_response(connection)
+
+    async def test_parses_each_result_token(self):
+        from nanocached._connection import WRONG_NODE
+
+        marker, entries, tag = await self.read(b"Y 3 S N W\n")
+        self.assertEqual((marker, entries, tag), (b"Y", [True, False, WRONG_NODE], None))
+
+    async def test_parses_a_tagged_reply(self):
+        marker, entries, tag = await self.read(b"Y 2 N S 9\n", tagged=True)
+        self.assertEqual((marker, entries, tag), (b"Y", [False, True], 9))
+
+    async def test_rejects_a_token_a_touch_never_answers(self):
+        # `-` is `M`'s miss; a `Y` roster has no such token.
+        with self.assertRaises(NanocachedError):
+            await self.read(b"Y 1 -\n")
+
+    async def test_rejects_a_roster_whose_count_does_not_match_its_tokens(self):
+        with self.assertRaises(NanocachedError):
+            await self.read(b"Y 3 S S\n")
+
+    async def test_the_multi_set_roster_still_rejects_n(self):
+        # `O` shares the reader: its tokens stay S and W only.
+        with self.assertRaises(NanocachedError):
+            await self.read(b"O 1 N\n")
+
+
+class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
+    # Batched touch (issue #871), single node.
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+
+    async def asyncTearDown(self):
+        await self.node.close()
+
+    async def connect(self, **kwargs):
+        return await NanocachedClient.connect([("127.0.0.1", self.node.port)], **kwargs)
+
+    async def test_touch_many_replaces_every_ttl_and_reports_which_keys_existed(self):
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"}, ttl_seconds=10)
+            self.assertEqual(
+                await client.touch_many(["a", "missing", b"b"], 100),
+                {"a": True, "missing": False, b"b": True},
+            )
+            self.assertEqual(self.node.entry_ttl[(b"", b"a")], 100)
+            self.assertEqual(self.node.entry_ttl[(b"", b"b")], 100)
+            # A touch never creates a key.
+            self.assertNotIn(b"missing", self.node.store)
+            # One frame for the whole batch, plain.
+            self.assertEqual(self.node.multi_touch_frames, [(b"", [b"a", b"missing", b"b"], 100, False)])
+            self.assertEqual(self.node.touches, [])
+        finally:
+            await client.close()
+
+    async def test_touch_many_with_none_removes_the_ttl_and_zero_expires_at_once(self):
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"}, ttl_seconds=10)
+            await client.touch_many(["a", "b"], None)
+            self.assertEqual(self.node.entry_ttl[(b"", b"a")], 0)
+            self.assertEqual(self.node.multi_touch_frames[-1][2], None)
+            self.assertEqual(await client.touch_many(["a", "b"], 0), {"a": True, "b": True})
+            self.assertEqual(await client.get_many(["a", "b"]), {})
+        finally:
+            await client.close()
+
+    async def test_touch_many_never_changes_the_values(self):
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"})
+            await client.touch_many(["a", "b"], 30)
+            self.assertEqual(await client.get_many(["a", "b"]), {"a": "1", "b": "2"})
+        finally:
+            await client.close()
+
+    async def test_get_many_and_touch_returns_the_hits_and_sets_the_ttl(self):
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"}, ttl_seconds=10)
+            self.assertEqual(
+                await client.get_many_and_touch(["a", "missing", "b"], 60), {"a": "1", "b": "2"}
+            )
+            self.assertEqual(self.node.entry_ttl[(b"", b"a")], 60)
+            self.assertEqual(self.node.entry_ttl[(b"", b"b")], 60)
+            self.assertEqual(self.node.multi_touch_frames, [(b"", [b"a", b"missing", b"b"], 60, True)])
+            self.assertEqual(await client.get_many_and_touch_bytes([b"a", "b"], None), {b"a": b"1", "b": b"2"})
+            self.assertEqual(self.node.entry_ttl[(b"", b"a")], 0)
+            self.assertEqual(await client.get_many_and_touch(["missing"], 5), {})
+        finally:
+            await client.close()
+
+    async def test_get_many_and_touch_with_zero_returns_the_values_then_expires_them(self):
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"})
+            self.assertEqual(await client.get_many_and_touch(["a", "b"], 0), {"a": "1", "b": "2"})
+            self.assertEqual(await client.get_many(["a", "b"]), {})
+        finally:
+            await client.close()
+
+    async def test_a_key_given_twice_is_touched_once_and_keyed_by_its_first_occurrence(self):
+        client = await self.connect()
+        try:
+            await client.set("a", "1")
+            self.assertEqual(await client.touch_many(["a", b"a", "a"], 30), {"a": True})
+            self.assertEqual(await client.get_many_and_touch(["a", b"a"], 30), {"a": "1"})
+            self.assertEqual([frame[1] for frame in self.node.multi_touch_frames], [[b"a"], [b"a"]])
+        finally:
+            await client.close()
+
+    async def test_both_are_scoped_to_their_namespace(self):
+        client = await self.connect()
+        try:
+            users = client.namespace("users")
+            await users.set_many({"a": "1", "b": "2"})
+            self.assertEqual(await client.touch_many(["a"], 30), {"a": False})
+            self.assertEqual(await users.touch_many(["a", "b"], 30), {"a": True, "b": True})
+            self.assertEqual(await users.get_many_and_touch(["a", "b"], 40), {"a": "1", "b": "2"})
+            self.assertEqual(await users.get_many_and_touch_bytes(["a"], 40), {"a": b"1"})
+            self.assertEqual(self.node.entry_ttl[(b"users", b"a")], 40)
+            self.assertEqual({frame[0] for frame in self.node.multi_touch_frames}, {b"", b"users"})
+        finally:
+            await client.close()
+
+    async def test_get_many_and_touch_decompresses_on_a_compress_enabled_client(self):
+        client = await self.connect(compress=True, compression_threshold=16)
+        try:
+            await client.set_many({"a": "x" * 200, "b": "short"})
+            self.assertEqual(
+                await client.get_many_and_touch(["a", "b"], 30), {"a": "x" * 200, "b": "short"}
+            )
+            # A plain touch never reads a value, so compression is moot.
+            self.assertEqual(await client.touch_many(["a", "b"], 30), {"a": True, "b": True})
+        finally:
+            await client.close()
+
+    async def test_a_large_batch_is_split_into_sub_frames_and_reassembled(self):
+        from nanocached.client import _MAX_BATCH_KEYS
+
+        client = await self.connect()
+        try:
+            values = {f"k{i}": f"v{i}" for i in range(_MAX_BATCH_KEYS * 2 + 5)}
+            await client.set_many(values)
+            self.assertEqual(await client.get_many_and_touch(list(values), 30), values)
+            self.assertEqual([len(f[1]) for f in self.node.multi_touch_frames], [_MAX_BATCH_KEYS, _MAX_BATCH_KEYS, 5])
+            self.node.multi_touch_frames.clear()
+            result = await client.touch_many(list(values) + ["missing"], 30)
+            self.assertEqual(result, {**{key: True for key in values}, "missing": False})
+            self.assertEqual(len(self.node.multi_touch_frames), 3)
+        finally:
+            await client.close()
+
+    async def test_empty_keys_and_bad_ttls_are_rejected_before_any_io(self):
+        client = await self.connect()
+        try:
+            for call in (client.touch_many, client.get_many_and_touch, client.get_many_and_touch_bytes):
+                with self.assertRaises(ValueError):
+                    await call([], 30)
+                for bad in (-1, 1.5, True, "5"):
+                    with self.assertRaises(ValueError):
+                        await call(["k"], bad)
+            with self.assertRaises(ValueError):
+                await client.namespace("users").touch_many([], 30)
+            with self.assertRaises(ValueError):
+                await client.touch_many([""], 30)
+            self.assertEqual(self.node.multi_touch_frames, [])
+        finally:
+            await client.close()
+
+    async def test_the_ttl_has_no_default(self):
+        client = await self.connect()
+        try:
+            with self.assertRaises(TypeError):
+                await client.touch_many(["k"])  # type: ignore[call-arg]
+            with self.assertRaises(TypeError):
+                await client.get_many_and_touch(["k"])  # type: ignore[call-arg]
+        finally:
+            await client.close()
+
+    async def test_a_batch_touch_round_trips_over_a_tagged_connection(self):
+        node = await MockNode(support_tags=True).start()
+        client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+        try:
+            await client.set_many({"a": "1", "b": "2"})
+            self.assertEqual(await client.touch_many(["a", "nope"], 30), {"a": True, "nope": False})
+            self.assertEqual(await client.get_many_and_touch(["a", "b", "nope"], 60), {"a": "1", "b": "2"})
+            self.assertEqual(node.multi_touch_frames[-1], (b"", [b"a", b"b", b"nope"], 60, True))
+        finally:
+            await client.close()
+            await node.close()
+
+    async def test_a_node_that_predates_y_raises_server_too_old(self):
+        for attribute in ("legacy_without_multi_touch", "legacy_without_touch"):
+            with self.subTest(attribute):
+                node = await MockNode().start()
+                setattr(node, attribute, True)
+                client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+                try:
+                    await client.set_many({"a": "1"})
+                    with self.assertRaises(ServerTooOldError) as raised:
+                        await client.touch_many(["a"], 30)
+                    self.assertEqual(raised.exception.command, "y")
+                    self.assertIn("(y)", str(raised.exception))
+                    with self.assertRaises(ServerTooOldError):
+                        await client.get_many_and_touch(["a"], 30)
+                    # Other commands are untouched: the client redials and works.
+                    self.assertEqual(await client.get("a"), "1")
+                finally:
+                    await client.close()
+                    await node.close()
+
+    async def test_a_single_touch_still_names_its_own_command_when_too_old(self):
+        self.node.legacy_without_touch = True
+        client = await self.connect()
+        try:
+            with self.assertRaises(ServerTooOldError) as raised:
+                await client.touch("k", 30)
+            self.assertEqual(raised.exception.command, "t")
+            self.assertIn("(t)", str(raised.exception))
+        finally:
+            await client.close()
+
+    async def test_a_connection_lost_on_a_later_chunk_keeps_the_earlier_chunks_hits(self):
+        # Single-node/proxy mode never retries a chunk failure, so a get
+        # attaches what the chunks that completed returned, as get_many
+        # does; a plain touch has nothing partial worth attaching.
+        from nanocached.client import _MAX_BATCH_KEYS
+
+        client = await self.connect()
+        try:
+            values = {f"k{i}": f"v{i}" for i in range(_MAX_BATCH_KEYS + 1)}
+            await client.set_many(values)
+            self.node.fail_multi_touch_after(1)
+            with self.assertRaises(PartialConnectionLostError) as raised:
+                await client.get_many_and_touch(list(values), 30)
+            first_chunk = list(values)[:_MAX_BATCH_KEYS]
+            self.assertEqual(raised.exception.partial_values, {k: values[k] for k in first_chunk})
+            self.assertIsInstance(raised.exception.__cause__, ConnectionError)
+
+            self.node.fail_multi_touch_after(1)
+            with self.assertRaises(ConnectionError) as raised_plain:
+                await client.touch_many(list(values), 30)
+            self.assertNotIsInstance(raised_plain.exception, PartialConnectionLostError)
+            # The connection was poisoned, not left desynced.
+            self.assertEqual(await client.get_many_and_touch(list(values), 30), values)
+        finally:
+            await client.close()
+
+    async def test_a_per_key_wrong_node_in_single_node_mode_raises_wrong_node_error(self):
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"})
+            self.node.answer_wrong_node_for_keys({b"a"}, times=2)
+            with self.assertRaises(WrongNodeError):
+                await client.touch_many(["a", "b"], 30)
+            with self.assertRaises(WrongNodeError):
+                await client.get_many_and_touch(["a", "b"], 30)
+        finally:
+            await client.close()
+
+    async def test_a_reply_with_the_wrong_number_of_entries_is_a_desync(self):
+        # The same count check multi_get/multi_set make (issue #181): a
+        # short roster would otherwise shift every later key's answer onto
+        # another key.
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"})
+            for call in (client.touch_many, client.get_many_and_touch):
+                self.node.answer_multi_touch_bad_count_once(1)
+                with self.assertRaises(ConnectionError) as raised:
+                    await call(["a", "b"], 30)
+                self.assertIn("1 entries for 2 keys", str(raised.exception))
+            # The connection was poisoned, not left desynced.
+            self.assertEqual(await client.touch_many(["a", "b"], 30), {"a": True, "b": True})
+        finally:
+            await client.close()
+
+
+class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
+    # Batched touch (issue #871) in a cluster: idempotent, so every owner of
+    # a key is sent it (like set_many), the primary's answer is the key's,
+    # and `G` — a property of the frame — goes only to a key's primary.
+
+    async def start_cluster(self, replication: int = 2):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=replication
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str, replication: int = 2):
+        return HashRing(NAMES).owners(key.encode(), replication)
+
+    def keys_by_primary(self, primary: str, count: int, prefix: str = "mt") -> list[str]:
+        keys, i = [], 0
+        while len(keys) < count:
+            candidate = f"{prefix}-{i}"
+            if self.owners_of(candidate)[0] == primary:
+                keys.append(candidate)
+            i += 1
+        return keys
+
+    async def stop(self, client, discovery, nodes):
+        await client.close()
+        await discovery.close()
+        for node in nodes.values():
+            try:
+                await node.close()
+            except Exception:
+                pass
+
+    async def test_a_batch_touch_reaches_every_owner_with_one_frame_per_node(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = [f"k{i}" for i in range(20)]
+            await client.set_many({key: "v" for key in keys}, ttl_seconds=10)
+            self.assertEqual(await client.touch_many(keys + ["nope"], 77), {**{k: True for k in keys}, "nope": False})
+            for node in nodes.values():
+                # R=2 over two nodes: both hold every key, and each got a
+                # single plain frame for all of them.
+                self.assertEqual(len(node.multi_touch_frames), 1)
+                self.assertFalse(node.multi_touch_frames[0][3])
+                self.assertEqual(len(node.multi_touch_frames[0][1]), 21)
+                for key in keys:
+                    self.assertEqual(node.entry_ttl[(b"", key.encode())], 77)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_only_a_keys_primary_is_asked_for_the_value_in_two_frames_per_node(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = [f"k{i}" for i in range(24)]
+            primary_of = {key: self.owners_of(key)[0] for key in keys}
+            self.assertEqual(set(primary_of.values()), set(NAMES), "the keys must give both nodes primaries")
+            values = {key: f"v-{key}" for key in keys}
+            await client.set_many(values)
+            self.assertEqual(await client.get_many_and_touch(keys, 40), values)
+            for name, node in nodes.items():
+                # R=2 over two nodes: each node is primary for some keys and
+                # replica for the others, so it gets the G frame for the
+                # first and the plain frame for the second.
+                by_form = {frame[3]: frame for frame in node.multi_touch_frames}
+                self.assertEqual(len(node.multi_touch_frames), 2)
+                self.assertEqual(
+                    sorted(by_form[True][1]), sorted(k.encode() for k in keys if primary_of[k] == name)
+                )
+                self.assertEqual(
+                    sorted(by_form[False][1]), sorted(k.encode() for k in keys if primary_of[k] != name)
+                )
+                for key in keys:
+                    self.assertEqual(node.entry_ttl[(b"", key.encode())], 40)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_get_many_and_touch_does_not_fall_back_to_a_replica_on_a_miss(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            _, replica_name = self.owners_of("k")
+            # Only the replica holds the key: a read would find it, a
+            # write-ish read answers for the primary alone.
+            nodes[replica_name].store[b"k"] = b"v"
+            self.assertEqual(await client.get_many_and_touch(["k"], 40), {})
+            self.assertEqual(await client.touch_many(["k"], 40), {"k": False})
+            self.assertEqual(nodes[replica_name].entry_ttl.get((b"", b"k")), 40)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_a_wrong_node_answer_for_some_keys_refreshes_once_and_succeeds(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = [f"k{i}" for i in range(12)]
+            values = {key: f"v-{key}" for key in keys}
+            await client.set_many(values)
+            stale = {keys[0].encode(), keys[1].encode()}
+            for key in stale:
+                nodes[self.owners_of(key.decode())[0]].answer_wrong_node_for_keys(stale, times=1)
+            self.assertEqual(await client.get_many_and_touch(keys, 40), values)
+            for node in nodes.values():
+                node.answer_wrong_node_for_keys(stale, times=0)
+            for name in NAMES:
+                nodes[name].answer_wrong_node_for_keys(stale, times=1)
+            self.assertEqual(await client.touch_many(keys, 41), {key: True for key in keys})
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_a_persisting_wrong_node_raises(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key, other = "some-key", "other-key"
+            await client.set_many({key: "v", other: "v2"})
+            owner = nodes[self.owners_of(key)[0]]
+            owner.answer_wrong_node_for_keys({key.encode()}, times=10)
+            with self.assertRaises(PartialWrongNodeError) as raised:
+                await client.get_many_and_touch([key, other], 30)
+            self.assertEqual(raised.exception.partial_values, {other: "v2"})
+            owner.answer_wrong_node_for_keys({key.encode()}, times=10)
+            with self.assertRaises(WrongNodeError) as raised_plain:
+                await client.touch_many([key, other], 30)
+            self.assertNotIsInstance(raised_plain.exception, PartialWrongNodeError)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_a_batch_whose_reply_was_lost_is_resent_whole(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = self.keys_by_primary(NAMES[0], 4)
+            primary = nodes[NAMES[0]]
+            values = {key: f"v-{key}" for key in keys}
+            await client.set_many(values)
+            primary.apply_and_drop_next_touch()
+            # The primary applied the touch and the reply never arrived;
+            # resending it changes nothing, so the client does.
+            self.assertEqual(await client.get_many_and_touch(keys, 30), values)
+            self.assertEqual(len([f for f in primary.multi_touch_frames if f[3]]), 2)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_a_replica_that_fails_does_not_fail_the_primarys_answer(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = self.keys_by_primary(NAMES[0], 3)
+            values = {key: f"v-{key}" for key in keys}
+            await client.set_many(values)
+            # NAMES[1] is the replica of all three, and only a replica.
+            nodes[NAMES[1]].legacy_without_multi_touch = True
+            # Counted per key, as set_many counts a failed replica leg.
+            self.assertEqual(await client.get_many_and_touch(keys, 30), values)
+            self.assertEqual(client.stats().replica_write_failures, 3)
+            self.assertEqual(await client.touch_many(keys, 30), {key: True for key in keys})
+            self.assertEqual(client.stats().replica_write_failures, 6)
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_a_primary_that_predates_y_raises_server_too_old_not_a_connection_loss(self):
+        # A release that knows `t` but not `y`: its `En` closes the
+        # connection, and the batch code sees it as a failed leg, not as
+        # a raised exception — it must still come out as ServerTooOldError.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = self.keys_by_primary(NAMES[0], 3)
+            await client.set_many({key: "v" for key in keys})
+            nodes[NAMES[0]].legacy_without_multi_touch = True
+            with self.assertRaises(ServerTooOldError):
+                await client.get_many_and_touch(keys, 30)
+            with self.assertRaises(ServerTooOldError):
+                await client.touch_many(keys, 30)
+            # The single-key touch is untouched: that node knows `t`.
+            self.assertTrue(await client.touch(keys[0], 30))
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_unreachable_primary_is_a_connection_loss_with_the_other_hits_attached(self):
+        # R=1: the only owner of some keys is gone. Nothing answered `W`,
+        # so the error is not the wrong-node one, and no replica stands in
+        # for the dead primary.
+        nodes, discovery = await self.start_cluster(replication=1)
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = [f"k{i}" for i in range(24)]
+            await client.set_many({key: f"v{key}" for key in keys})
+            dead, live = NAMES[0], NAMES[1]
+            live_keys = [key for key in keys if self.owners_of(key, 1)[0] == live]
+            self.assertTrue(live_keys and len(live_keys) < len(keys))
+            await nodes[dead].close()
+            await wait_for(lambda: client._members[dead].connection.closed, "the client to see the FIN")
+            with self.assertRaises(PartialConnectionLostError) as raised:
+                await client.get_many_and_touch(keys, 30)
+            self.assertNotIsInstance(raised.exception, WrongNodeError)
+            self.assertEqual(raised.exception.partial_values, {key: f"v{key}" for key in live_keys})
+            self.assertIsNotNone(raised.exception.__cause__)
+            with self.assertRaises(ConnectionError) as raised_plain:
+                await client.touch_many(keys, 30)
+            self.assertNotIsInstance(raised_plain.exception, (WrongNodeError, PartialConnectionLostError))
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_a_chunk_that_fails_in_the_cluster_moves_only_the_tail_to_the_retry(self):
+        from nanocached.client import _MAX_BATCH_KEYS
+
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary = nodes[NAMES[0]]
+            keys = self.keys_by_primary(NAMES[0], _MAX_BATCH_KEYS + 50, "chunk")
+            values = {key: f"v-{key}" for key in keys}
+            await client.set_many(values)
+            primary.multi_touch_frames.clear()
+            primary.fail_multi_touch_after(1)
+            self.assertEqual(await client.get_many_and_touch(keys, 30), values)
+            # Chunk 1 answered; chunk 2 (the last 50) died once and was
+            # sent again alone — chunk 1's keys were not resent.
+            self.assertEqual(
+                [(len(f[1]), f[3]) for f in primary.multi_touch_frames],
+                [(_MAX_BATCH_KEYS, True), (50, True), (50, True)],
+            )
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_a_batch_touch_is_scoped_to_its_namespace_in_a_cluster(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            users = client.namespace("users")
+            await users.set_many({"a": "1", "b": "2"})
+            self.assertEqual(await client.touch_many(["a", "b"], 30), {"a": False, "b": False})
+            self.assertEqual(await users.get_many_and_touch(["a", "b"], 30), {"a": "1", "b": "2"})
+            for node in nodes.values():
+                self.assertEqual({frame[0] for frame in node.multi_touch_frames}, {b"", b"users"})
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_pure_replica_legs_may_run_in_the_background(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", discovery.port)], fire_and_forget_replicas=True
+        )
+        try:
+            keys = self.keys_by_primary(NAMES[0], 3)
+            values = {key: f"v-{key}" for key in keys}
+            await client.set_many(values)
+            self.assertEqual(await client.get_many_and_touch(keys, 55), values)
+            # The replica's plain frame is not awaited, but it does land.
+            await wait_for(
+                lambda: all(
+                    nodes[NAMES[1]].entry_ttl.get((b"", key.encode())) == 55 for key in keys
+                ),
+                "the background replica touch",
+            )
+        finally:
+            await self.stop(client, discovery, nodes)
+
+
 class ContentDigestTests(unittest.TestCase):
     # Compare-and-set (issue #141): docs/protocol.html "k / x" is the
     # authoritative wire spec content_digest() implements against.
