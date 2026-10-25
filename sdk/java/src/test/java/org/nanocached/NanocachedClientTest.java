@@ -1164,6 +1164,27 @@ class NanocachedClientTest {
         }
     }
 
+    @Test
+    void aReplicaThatPredatesTouchIsAskedOnceNotRedialledAndResent() throws Exception {
+        // Issue #924: an `En` is final, so the replica leg that gets one
+        // gives up at once, as the primary leg does, instead of paying a
+        // second dial for the same answer on every touch.
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-key";
+                client.set(key, "v", 100);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode replica = cluster.nodes().get(owners.get(1));
+                replica.rejectTouchLikeAnOldServer();
+
+                assertTrue(client.touch(key, 30));
+                assertEquals(1, replica.touchFrames.size(), "the replica was asked once");
+                assertEquals(Optional.of("v"), client.getAndTouch(key, 40));
+                assertEquals(2, replica.touchFrames.size(), "and once more for the second call");
+            }
+        }
+    }
+
     // ── Batched touch / get-and-touch (issue #871) ──────────────────
 
     private static List<String> keysWhosePrimaryIs(String name, int count) {

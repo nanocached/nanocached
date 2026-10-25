@@ -4986,8 +4986,8 @@ public final class NanocachedClient implements AutoCloseable {
      * replica leg keeps its plain retry: only the primary's answer is
      * reported, so a replica that already expired the entry changes
      * nothing. With {@code rejectionIsFinal} (issue #902, touch) an
-     * {@code En} from the primary is surfaced as it is instead of being
-     * redialled and resent.
+     * {@code En} from a node, a replica leg included (issue #924), is
+     * surfaced as it is instead of being redialled and resent.
      */
     private <T> T write(
             byte[] namespace, byte[] key, ConnectionOp<T> op,
@@ -5021,7 +5021,7 @@ public final class NanocachedClient implements AutoCloseable {
                 ConnectionOp<?> legOp = replicaOp != null ? replicaOp : backgroundOp;
                 Runnable replicaWrite = () -> {
                     try {
-                        applyReconnecting(() -> memberConnection(replica), legOp);
+                        applyReconnecting(() -> memberConnection(replica), legOp, rejectionIsFinal);
                     } catch (NanocachedException ignored) {
                         // Swallowed by design (client-side replication): a dead or disagreeing
                         // replica leaves the key under-replicated until the next
@@ -5062,7 +5062,7 @@ public final class NanocachedClient implements AutoCloseable {
             ConnectionOp<?> syncLegOp = replicaOp != null ? replicaOp : op;
             Runnable replicaWrite = () -> {
                 try {
-                    applyReconnecting(() -> memberConnection(replica), syncLegOp);
+                    applyReconnecting(() -> memberConnection(replica), syncLegOp, rejectionIsFinal);
                 } catch (NanocachedException ignored) {
                     // Swallowed by design (client-side replication) — see the
                     // matching catch in the fire-and-forget branch above for
