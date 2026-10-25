@@ -119,6 +119,8 @@ class MockNode:
         self.legacy_without_touch = False
         self._drop_next_touch_reply = False
         self._touch_wrong_kind_reply = False
+        # See answer_next_touch_with_raw(): None means "answer normally".
+        self._touch_raw_reply: bytes | None = None
         # See answer_next_with_wrong_tag(): command bytes whose next
         # applied request is answered with a mis-tagged success reply.
         self._wrong_tag_after_apply: set[bytes] = set()
@@ -325,6 +327,13 @@ class MockNode:
         well-formed reply of the wrong kind, the misaligned stream of
         issue #921."""
         self._touch_wrong_kind_reply = True
+
+    def answer_next_touch_with_raw(self, raw: bytes) -> None:
+        """Answers the next `t` or `y` request with exactly ``raw`` (say
+        ``b"E\\n"`` or ``b"E 7\\n"``, what nanocached-proxy sends when a
+        touch's outcome is unknown, issue #939) and closes the connection,
+        applying nothing."""
+        self._touch_raw_reply = raw
 
     def answer_next_with_wrong_tag(self, command: bytes) -> None:
         """Applies the next ``command`` request (`t` or `i`) and answers it
@@ -819,6 +828,12 @@ class MockNode:
                         writer.write(b"En\n")
                         await writer.drain()
                         return
+                    if self._touch_raw_reply is not None:
+                        raw, self._touch_raw_reply = self._touch_raw_reply, None
+                        writer.write(raw)
+                        await writer.drain()
+                        writer.close()
+                        return
                     if self._silent:
                         continue
                     if self._retryable_replies > 0:
@@ -1017,6 +1032,12 @@ class MockNode:
                     if self.legacy_without_touch or self.legacy_without_multi_touch:
                         writer.write(b"En\n")
                         await writer.drain()
+                        return
+                    if self._touch_raw_reply is not None:
+                        raw, self._touch_raw_reply = self._touch_raw_reply, None
+                        writer.write(raw)
+                        await writer.drain()
+                        writer.close()
                         return
                     if self._silent:
                         continue

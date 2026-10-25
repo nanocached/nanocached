@@ -2338,6 +2338,52 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
+    async def test_an_expiring_touch_is_not_resent_after_an_e_that_is_not_en(self):
+        # Issue #939: only the node's `En` is "server too old". The proxy's
+        # bare (or tagged) `E` means the outcome is unknown, so it is a loss
+        # after the send: reported as such, and an expiring touch is not
+        # sent again.
+        for tagged, raw in ((False, b"E\n"), (True, b"E 7\n")):
+            with self.subTest(tagged=tagged):
+                nodes, discovery = (
+                    await self.start_tagged_cluster() if tagged else await self.start_cluster()
+                )
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    primary_name, _ = self.owners_of("k")
+                    primary = nodes[primary_name]
+                    await client.set("k", "payload")
+                    primary.answer_next_touch_with_raw(raw)
+                    with self.assertRaises(ConnectionLostError) as raised:
+                        await client.touch("k", 0)
+                    self.assertNotIsInstance(raised.exception, ServerTooOldError)
+                    self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 1)
+
+                    primary.answer_next_touch_with_raw(raw)
+                    with self.assertRaises(ConnectionLostError):
+                        await client.get_and_touch("k", 0)
+                    self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 2)
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_an_en_to_an_expiring_touch_is_still_server_too_old(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            primary_name, _ = self.owners_of("k")
+            primary = nodes[primary_name]
+            await client.set("k", "payload")
+            primary.answer_next_touch_with_raw(b"En\n")
+            with self.assertRaises(ServerTooOldError):
+                await client.touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 1)
+            primary.answer_next_touch_with_raw(b"En\n")
+            with self.assertRaises(ServerTooOldError):
+                await client.get_and_touch("k", 0)
+            self.assertEqual(len([t for t in primary.touches if t[2] == 0]), 2)
+        finally:
+            await self.stop(client, discovery, nodes)
+
     async def test_an_expiring_touch_still_retries_a_request_that_was_never_sent(self):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
@@ -2866,6 +2912,30 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                     await call(keys, 0)
                 self.assertEqual(len(primary.multi_touch_frames), frames)
                 await client.set_many({key: f"v-{key}" for key in keys})
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_batch_is_not_resent_after_an_e_that_is_not_en(self):
+        # Issue #939: the proxy's bare `E` is an outcome-unknown loss after
+        # the send, not "server too old"; only `En` is.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            keys = self.keys_by_primary(NAMES[0], 4)
+            primary = nodes[NAMES[0]]
+            await client.set_many({key: f"v-{key}" for key in keys})
+            for frames, call in ((1, client.touch_many), (2, client.get_many_and_touch)):
+                primary.answer_next_touch_with_raw(b"E\n")
+                with self.assertRaises(ConnectionLostError) as raised:
+                    await call(keys, 0)
+                self.assertNotIsInstance(raised.exception, ServerTooOldError)
+                self.assertEqual(len(primary.multi_touch_frames), frames)
+                await client.set_many({key: f"v-{key}" for key in keys})
+
+            primary.answer_next_touch_with_raw(b"En\n")
+            with self.assertRaises(ServerTooOldError):
+                await client.touch_many(keys, 0)
+            self.assertEqual(len(primary.multi_touch_frames), 3)
         finally:
             await self.stop(client, discovery, nodes)
 
