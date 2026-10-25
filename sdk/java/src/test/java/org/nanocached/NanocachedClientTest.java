@@ -1627,6 +1627,11 @@ class NanocachedClientTest {
                 Map<String, String> values = new java.util.LinkedHashMap<>();
                 for (String key : keys) values.put(key, "value of " + key);
                 client.setMany(values);
+                // The replica's copy of the set is a background write too: a touch that reaches the
+                // replica first finds nothing to touch, and the set then lands without a TTL.
+                waitFor(() -> keys.stream().allMatch(
+                                key -> replica.store.containsKey(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8)))),
+                        "the background set to land on the replica");
 
                 assertTrue(client.touchMany(keys, 30).values().stream().allMatch(t -> t));
                 waitFor(() -> !replica.multiTouchFrames.isEmpty(), "the background touch to reach the replica");
