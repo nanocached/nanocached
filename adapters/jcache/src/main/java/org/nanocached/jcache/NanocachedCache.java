@@ -290,10 +290,14 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             wireKeys[i] = KeyCodec.toKeyBytes(Objects.requireNonNull(ordered.get(i), "key"));
         }
         Duration accessExpiry = expiryPolicy.getExpiryForAccess();
-        byte[][] raw = accessExpiry == null
-                ? getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys)
-                : getManyBytesResolvingWrongNode(
-                        pending -> namespace.getManyAndTouchBytes(pending, touchTtlSeconds(accessExpiry)), wireKeys);
+        byte[][] raw;
+        if (accessExpiry == null) {
+            raw = getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys, false);
+        } else {
+            long touchTtl = touchTtlSeconds(accessExpiry);
+            raw = getManyBytesResolvingWrongNode(
+                    pending -> namespace.getManyAndTouchBytes(pending, touchTtl), wireKeys, touchTtl == 0L);
+        }
 
         for (int i = 0; i < ordered.size(); i++) {
             byte[] value = raw[i];
@@ -353,9 +357,19 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * getManyBytes}, or (issue #871) {@code getManyAndTouchBytes} under an
      * access-based policy; both throw the same partial outcomes, and a
      * touch is idempotent, so retrying the remainder is as safe as for a
-     * plain read.
+     * plain read — with one exception, {@code expiring}: a batched touch
+     * with a zero TTL (an access expiry of {@code Duration.ZERO}) expires
+     * every key it finds, and the SDK's {@code PartialConnectionFailedRaw}
+     * for it lists as unresolved the keys of a frame that was sent and whose
+     * connection was then lost, keys the node may well have expired
+     * already. Fetching them again would ask for values the first frame
+     * consumed and report them as misses, so an expiring batch makes no
+     * follow-up on a connection failure: the failure propagates with the
+     * values resolved so far on it. The wrong-node remainder is still
+     * retried — a {@code W} key was not applied anywhere.
      */
-    private byte[][] getManyBytesResolvingWrongNode(UnaryOperator<byte[][]> fetch, byte[][] wireKeys) {
+    private byte[][] getManyBytesResolvingWrongNode(
+            UnaryOperator<byte[][]> fetch, byte[][] wireKeys, boolean expiring) {
         byte[][] result = new byte[wireKeys.length][];
         int[] positions = identityPositions(wireKeys.length);
         byte[][] pending = wireKeys;
@@ -385,7 +399,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 for (int i = 0; i < positions.length; i++) {
                     result[positions[i]] = partial.partialValues[i];
                 }
-                if (connectionRetried) {
+                if (connectionRetried || expiring) {
                     throw Wire.failure(partial);
                 }
                 connectionRetried = true;
@@ -677,7 +691,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             n++;
         }
 
-        byte[][] existing = getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys);
+        byte[][] existing = getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys, false);
 
         // Resolved TTL → the positions that share it. Insertion order is
         // kept so the groups' writes (and their listener events) follow

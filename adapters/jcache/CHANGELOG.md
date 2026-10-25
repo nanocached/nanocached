@@ -33,6 +33,18 @@ changed. What 1.0.0 will promise is described on the
   `CacheException` caused by the SDK's `ServerTooOld`. Without an access
   policy `getAll` is unchanged.
 
+### Fixed
+
+- `getAll()` under an access expiry of zero no longer re-fetches the keys of
+  a batched touch whose frame was sent and whose connection was then lost.
+  Those keys come back from the SDK as unresolved, like the keys it never
+  sent, and the adapter's one follow-up for a connection failure fetched them
+  again with the same zero TTL — asking for values the lost frame may already
+  have consumed and reporting them as misses. An expiring batch now
+  propagates the failure, with the values resolved so far on it; a positive
+  access TTL keeps the follow-up, and a wrong-node remainder is still retried
+  under any TTL.
+
 ## [0.4.8] - 2026-10-21
 
 ### Fixed
