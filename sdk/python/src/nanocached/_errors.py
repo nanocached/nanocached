@@ -91,6 +91,23 @@ class ServerTooOldError(NanocachedError):
         )
 
 
+class PartialServerTooOldError(ServerTooOldError):
+    """Raised by get_many_and_touch/get_many_and_touch_bytes in a cluster
+    when a primary answered ``En`` to ``y`` while other primaries had
+    already resolved their keys. A subclass of ServerTooOldError, so
+    ``except ServerTooOldError:`` keeps working unchanged;
+    ``partial_values`` holds every hit that DID resolve, keyed by the
+    original object the caller passed — with ``ttl_seconds == 0`` those
+    values were consumed on the nodes that returned them and cannot be
+    read again. get_many_and_touch() carries str values (UTF-8 decoded),
+    get_many_and_touch_bytes() the raw bytes. touch_many has nothing
+    partial worth attaching and raises a plain ServerTooOldError."""
+
+    def __init__(self, partial_values: dict) -> None:
+        super().__init__("y")
+        self.partial_values = partial_values
+
+
 class CompressionIncompatibleError(NanocachedError):
     """Raised by incr/decr (issue #321) on a client constructed with
     ``compress=True``, before any I/O. The protocol has no marker byte

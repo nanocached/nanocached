@@ -18,6 +18,11 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
   second one reported them as missing and a `get_and_touch` lost the value.
   They now raise `ConnectionLostError`, as the docstring of that class
   already said a misaligned reply does.
+- In a cluster, `get_many_and_touch` no longer discards the hits other
+  primaries returned when one primary answers `En` to `y`. It raises
+  `PartialServerTooOldError`, a `ServerTooOldError` subclass, with them in
+  `partial_values`; with `ttl_seconds=0` they were consumed on the nodes and
+  could not be read again. `touch_many` still raises the plain error.
 
 ### Added
 

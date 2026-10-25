@@ -22,6 +22,7 @@ from nanocached import (
     NanocachedError,
     NotNumericError,
     PartialConnectionLostError,
+    PartialServerTooOldError,
     PartialSetConnectionLostError,
     PartialWrongNodeError,
     RetryableError,
@@ -2855,6 +2856,40 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                 await client.touch_many(keys, 30)
             # The single-key touch is untouched: that node knows `t`.
             self.assertTrue(await client.touch(keys[0], 30))
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_a_primary_that_predates_y_hands_back_the_hits_other_primaries_returned(self):
+        # get_many_and_touch(ttl=0) consumes the values the other primaries
+        # return, so an `En` from one primary must not throw them away.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            old_keys = self.keys_by_primary(NAMES[0], 2)
+            new_keys = self.keys_by_primary(NAMES[1], 2)
+            await client.set_many({key: "v-" + key for key in old_keys + new_keys})
+            nodes[NAMES[0]].legacy_without_multi_touch = True
+            with self.assertRaises(ServerTooOldError) as raised:
+                await client.get_many_and_touch(old_keys + new_keys, 0)
+            self.assertIsInstance(raised.exception, PartialServerTooOldError)
+            self.assertEqual(raised.exception.command, "y")
+            self.assertEqual(raised.exception.partial_values, {key: "v-" + key for key in new_keys})
+            # The ttl=0 call above consumed them: this is the loss.
+            self.assertEqual(await client.get_many(new_keys), {})
+            await client.set_many({key: "v-" + key for key in new_keys})
+            with self.assertRaises(PartialServerTooOldError) as raised:
+                await client.get_many_and_touch_bytes(old_keys + new_keys, 30)
+            self.assertEqual(
+                raised.exception.partial_values, {key: ("v-" + key).encode() for key in new_keys}
+            )
+            # A plain touch has nothing partial worth attaching.
+            with self.assertRaises(ServerTooOldError) as raised:
+                await client.touch_many(old_keys + new_keys, 30)
+            self.assertNotIsInstance(raised.exception, PartialServerTooOldError)
+            # Nothing resolved elsewhere: the bare error, as before.
+            with self.assertRaises(ServerTooOldError) as raised:
+                await client.get_many_and_touch(old_keys, 30)
+            self.assertNotIsInstance(raised.exception, PartialServerTooOldError)
         finally:
             await self.stop(client, discovery, nodes)
 
