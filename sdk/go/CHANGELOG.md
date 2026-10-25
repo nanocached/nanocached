@@ -35,6 +35,15 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
   against a node that has `t` but not `y` they return the new
   `ErrServerTooOldBatch`, which also matches `ErrServerTooOld`.
 
+### Fixed
+
+- A node's `En` rejects only the request it answered: the requests
+  pipelined behind it on the same connection get the plain
+  connection-lost error and keep their one redial, instead of the
+  rejection, which `applyReconnecting` treats as final. A `Get` or `Set`
+  that merely shared the connection with a touch sent to a node that
+  predates `t` used to fail along with it (#940).
+
 ## [0.4.8] - 2026-10-21
 
 ### Fixed
