@@ -469,6 +469,13 @@ describe("tryParseResponse of a get-and-touch reply (issue #825)", () => {
     assert.throws(() => tryParseResponse(Buffer.from("En\n")), (error: Error) => error.name === "ServerRejectedError");
     assert.throws(() => tryParseResponse(Buffer.from("Z\n")), (error: Error) => error.name === "NanocachedError");
   });
+
+  it("does not call the proxy's bare E a server rejection (issue #939)", () => {
+    for (const [bytes, tagged] of [["E\n", false], ["E 7\n", true]] as const) {
+      assert.throws(() => tryParseResponse(Buffer.from(bytes), tagged), (error: Error) => error.name === "NanocachedError");
+    }
+    assert.equal(tryParseResponse(Buffer.from("E")), null);
+  });
 });
 
 describe("encodeTouch (issue #825)", () => {

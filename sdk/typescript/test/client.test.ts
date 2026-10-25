@@ -3920,6 +3920,40 @@ describe("NanocachedClient touch/getAndTouch against a single node (issue #825)"
       { withoutTouch: true },
     );
   });
+
+  // Issue #939: only the node's `En` is "server too old". The proxy answers
+  // a bare `E` (+ tag) when a touch's outcome is unknown.
+  for (const tagged of [false, true]) {
+    it(`reads a bare E as a lost connection after the send, not as a too-old server (issue #939, ${tagged ? "tagged" : "untagged"})`, async () => {
+      await withClient(
+        async (client, node) => {
+          for (const call of [() => client.touch("k", 0), () => client.getAndTouch("k", 0)]) {
+            const before = node.touches().length;
+            await assert.rejects(call, (error: unknown) => {
+              assert.ok(error instanceof ConnectionLostError, `expected ConnectionLostError, got ${String(error)}`);
+              assert.equal(error.requestWasSent, true);
+              assert.ok(!(error instanceof ServerTooOldError));
+              return true;
+            });
+            // Not resent: exactly one frame reached the node.
+            assert.equal(node.touches().length - before, 1);
+          }
+        },
+        { proxyStyleError: true, supportTags: tagged },
+      );
+    });
+  }
+
+  it("still reports the node's En to a ttl=0 touch as ServerTooOldError (issue #939)", async () => {
+    await withClient(
+      async (client, node) => {
+        await assert.rejects(() => client.touch("k", 0), ServerTooOldError);
+        await assert.rejects(() => client.getAndTouch("k", 0), ServerTooOldError);
+        assert.equal(node.touches().length, 2);
+      },
+      { withoutTouch: true },
+    );
+  });
 });
 
 describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
@@ -4116,6 +4150,23 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
       await node.close();
     }
   }
+
+  it("reads a bare E to a ttl=0 batch touch as a lost connection after the send (issue #939)", async () => {
+    await withClient(
+      async (client, node) => {
+        for (const call of [() => client.touchMany(["a", "b"], 0), () => client.getManyAndTouch(["a", "b"], 0)]) {
+          const before = node.multiTouchFrames().length;
+          await assert.rejects(call, (error: unknown) => {
+            assert.ok(error instanceof ConnectionLostError, `expected ConnectionLostError, got ${String(error)}`);
+            assert.ok(!(error instanceof ServerTooOldError));
+            return true;
+          });
+          assert.equal(node.multiTouchFrames().length - before, 1);
+        }
+      },
+      { proxyStyleError: true },
+    );
+  });
 
   it("touchMany replaces every TTL and reports which keys existed", async () => {
     await withClient(async (client, node) => {
