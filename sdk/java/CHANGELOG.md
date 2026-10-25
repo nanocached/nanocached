@@ -13,6 +13,13 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `touch`, `getAndTouch`, `touchMany` and `getManyAndTouch` raise
+  `ServerTooOld` only for a node's `En`. A bare `E` (`E\n`, or `E <tag>\n`
+  from `nanocached-proxy`, which sends it when a `ttlSeconds` `0` touch's
+  outcome is unknown or a request failed transiently) used to be reported as
+  "server too old, upgrade every node"; it is now the `ConnectionFailed` every
+  other command raises for it, a failure after the frame was written, so a
+  `ttlSeconds` `0` touch is not resent.
 - The documentation of `touchMany`, `getManyAndTouch` and
   `PartialConnectionFailed*` now says that with `ttlSeconds` `0` the keys a
   connection failure leaves unresolved include keys whose frame was sent and

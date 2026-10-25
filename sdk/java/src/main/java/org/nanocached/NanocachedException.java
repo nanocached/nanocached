@@ -135,6 +135,9 @@ public class NanocachedException extends RuntimeException {
      * #825). A {@link ConnectionFailed}, so every command other than
      * touch, getAndTouch, touchMany or getManyAndTouch sees exactly the
      * failure it always did; those four turn it into {@link ServerTooOld}.
+     * Only the node's {@code En} is this (issue #939): the proxy's bare
+     * {@code E} (a request whose outcome it could not determine) stays a
+     * plain {@link ConnectionFailed}.
      */
     static final class ServerRejected extends ConnectionFailed {
         ServerRejected() {
