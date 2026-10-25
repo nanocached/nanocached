@@ -12,6 +12,17 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- A touch with a TTL of 0 (`TouchAsync`, `GetAndTouchAsync`,
+  `TouchManyAsync`, `GetManyAndTouchAsync`) no longer sends the plain touch
+  to a key's replicas alongside the primary's. When the primary could not be
+  reached or answered `W`, the retry over the refreshed roster went to the
+  surviving replica, which had already expired its copy: it answered a miss
+  for a key that existed, and the value was lost. The replicas are now
+  touched only after the primary answered (for a batch: one fan-out after
+  both primary-only passes, for the keys a primary answered), so a rerouted
+  call finds the entry. A positive or removed TTL keeps the concurrent
+  fan-out. The replica legs of a TTL-0 touch now run after the primary
+  answered, outside the pipelined-order guarantee, as the retry paths do.
 - Only a node's `En` to a touch is reported as `ServerTooOldException`.
   Any other `E` answer to `TouchAsync`, `GetAndTouchAsync`, `TouchManyAsync`
   or `GetManyAndTouchAsync` (a bare `E`, or the tagged `E <tag>`
