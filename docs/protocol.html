@@ -303,7 +303,15 @@ entry from eviction.</p>
 like <code>i</code>, <code>k</code> and <code>x</code>: it is idempotent
 (the new expiry does not depend on what the entry holds), so every owner
 of the key accepts it, as it accepts an <code>S</code>, and a client sends
-it to each owner rather than writing a result to the others. A node that
+it to each owner rather than writing a result to the others &mdash; with
+one ordering rule for a TTL of <code>0</code>: a client (and
+<code>nanocached-proxy</code>) sends an expiring touch to the primary alone
+and the plain <code>t</code> to the other owners only once the primary has
+answered. Sent together, a replica would expire its copy while the primary
+leg was still failing (unreachable, or <code>W</code> from a stale ring),
+and the retry over the refreshed ring would then ask that replica, now the
+primary, for a key it no longer holds. Those deferred legs run outside the
+request order a pipelined connection otherwise keeps. A node that
 owns no copy of the key answers <code>W</code>. An owner that answers
 <code>N</code> has no live copy; the touch does not create one and
 nothing repairs it, while the owners that answered <code>S</code> keep the
@@ -371,7 +379,16 @@ sent it; with <code>G</code>, a key's primary is sent <code>G</code> for the
 keys it is primary of (its answer is the client's) and every other owner the
 plain form. A key whose primary answers <code>W</code>, or whose sub-frame
 fails, is sent again once over a refreshed ring, and one still wrong after
-that is answered <code>W</code> on its own.</p>
+that is answered <code>W</code> on its own. With a TTL of <code>0</code> the
+proxy, like a client, sends only the primaries first and the plain form to
+the other owners once they have answered, for the keys a primary answered
+(see <a href="#touch"><code>t</code></a>). The proxy also holds the merged
+<code>M</code> reply to the same 16 MiB of values each node holds its own
+sub-reply to, so through the proxy a <code>-</code> can stand for a key its
+node did touch: a value past the merged budget is left out of the reply
+although the node applied the TTL (and, with a TTL of <code>0</code>,
+expired the entry). The <em>left untouched</em> rule above holds for a
+node's own reply only.</p>
 <p><code>y</code> needs a node that knows it: an older node answers
 <code>En\n</code> and closes the connection, so upgrade every node before
 clients start sending it.</p>
