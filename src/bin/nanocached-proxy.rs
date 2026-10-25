@@ -4894,7 +4894,10 @@ struct MultiTouchBatch<'a> {
 /// decides a key's client-facing entry: a `W` pushes it to
 /// `retry_positions`, and so does a group that failed or came back
 /// malformed. A replica leg's `W` or failure is logged and swallowed, like
-/// `finish_touch`'s stance on a replica.
+/// `finish_touch`'s stance on a replica. The group's `addr`, the node this
+/// sub-reply came from, is recorded in `answered_by` for every entry it decides
+/// (issue #966): the one node an expiring batch's deferred replica legs
+/// must not send the touch to again.
 ///
 /// With `expiring` (`ttl=0`) a sent frame cannot be sent again: it expired
 /// the keys it found, so a second one would answer them as misses. A primary
@@ -4904,12 +4907,14 @@ struct MultiTouchBatch<'a> {
 /// (`request_not_sent`) or that the node refused is retried as before.
 fn settle_multi_touch_group(
     context: &ProxyContext,
-    legs: &[(usize, bool)],
+    group: &TouchGroup,
     reply: io::Result<NodeReply>,
     entries: &mut [Option<ProxyMultiEntry>],
+    answered_by: &mut [Option<String>],
     retry_positions: &mut Vec<usize>,
     expiring: bool,
 ) -> bool {
+    let legs = &group.legs;
     let may_have_applied = expiring
         && match &reply {
             Err(error) => !request_not_sent(error),
@@ -4939,6 +4944,7 @@ fn settle_multi_touch_group(
                     retry_positions.push(position);
                 } else {
                     entries[position] = Some(result);
+                    answered_by[position] = Some(group.addr.clone());
                 }
             }
         }
@@ -4975,29 +4981,39 @@ async fn finish_multi_touch(
     for position in missing {
         entries[position] = Some(ProxyMultiEntry::WrongNode);
     }
+    let mut answered_by: Vec<Option<String>> = vec![None; batch.keys.len()];
     let expiring = batch.ttl == Some(0);
     let mut unknown = false;
     for (group, reply) in groups.into_iter().zip(pending) {
         unknown |= settle_multi_touch_group(
             context,
-            &group.legs,
+            &group,
             reply.await,
             &mut entries,
+            &mut answered_by,
             &mut retry_positions,
             expiring,
         );
     }
-    if unknown {
-        return Err(Fatal::OutcomeUnknown);
-    }
-
-    if !retry_positions.is_empty()
-        && retry_multi_touch(context, batch, &retry_positions, &mut entries).await
-    {
-        return Err(Fatal::OutcomeUnknown);
+    if !unknown && !retry_positions.is_empty() {
+        unknown = retry_multi_touch(
+            context,
+            batch,
+            &retry_positions,
+            &mut entries,
+            &mut answered_by,
+        )
+        .await;
     }
     if expiring {
-        expire_batch_on_other_owners(context, &batch, &entries).await;
+        // Before the frame is answered, whatever that answer is (issue
+        // #966): the keys a primary answered have expired their copies
+        // there, so their other owners get theirs even when another leg's
+        // outcome is unknown and the client is told `E` — as the SDKs do.
+        expire_batch_on_other_owners(context, &batch, &entries, &answered_by).await;
+    }
+    if unknown {
+        return Err(Fatal::OutcomeUnknown);
     }
 
     let mut entries: Vec<ProxyMultiEntry> = entries
@@ -5020,10 +5036,18 @@ async fn finish_multi_touch(
 /// the primaries answered, these run outside the pipelined-order guarantee
 /// like every retry path; a failure is logged and swallowed as for any
 /// replica leg.
+///
+/// A key's other owners are every owner on the ring in force now except
+/// the node that answered for it (`answered_by`), as `expire_on_other_owners`
+/// and the SDKs pick them (issue #966) — not the ring's rank 1 and below:
+/// the retry pass refreshes the ring, so a key answered in the first pass
+/// can have a new first owner, which must be expired too, while the node
+/// that answered has already expired its copy.
 async fn expire_batch_on_other_owners(
     context: &ProxyContext,
     batch: &MultiTouchBatch<'_>,
     entries: &[Option<ProxyMultiEntry>],
+    answered_by: &[Option<String>],
 ) {
     let Some(ring) = current_ring(context) else {
         return;
@@ -5038,14 +5062,19 @@ async fn expire_batch_on_other_owners(
         ) {
             continue;
         }
+        let Some(answered) = answered_by[position].as_deref() else {
+            continue;
+        };
         ring.rank_owners(
             namespace_hash,
             &batch.keys[position],
             ring.replication,
             &mut top,
         );
-        for &(_, owner) in top.iter().skip(1) {
-            others.group_for(owner).push(batch.keys[position].clone());
+        for &(_, owner) in &top {
+            if ring.nodes[owner].1 != answered {
+                others.group_for(owner).push(batch.keys[position].clone());
+            }
         }
     }
     if others.is_empty() {
@@ -5101,6 +5130,7 @@ async fn retry_multi_touch(
     batch: MultiTouchBatch<'_>,
     retry_positions: &[usize],
     entries: &mut [Option<ProxyMultiEntry>],
+    answered_by: &mut [Option<String>],
 ) -> bool {
     force_refresh(context).await;
 
@@ -5137,9 +5167,10 @@ async fn retry_multi_touch(
     for (group, reply) in groups.iter().zip(replies) {
         unknown |= settle_multi_touch_group(
             context,
-            &group.legs,
+            group,
             reply,
             entries,
+            answered_by,
             &mut unresolved,
             expiring,
         );
@@ -8519,6 +8550,14 @@ mod tests {
                             roster.push(Some(current));
                         }
 
+                        // Issue #966: as the `t` arm, the node may apply the
+                        // batch and drop the connection before answering.
+                        if roster.iter().any(|entry| matches!(entry, Some(Some(_))))
+                            && close_after_touch_apply_once.swap(false, Ordering::SeqCst)
+                        {
+                            return Ok(());
+                        }
+
                         let mut header = format!("{} {count}", if get { "M" } else { "Y" });
                         for entry in &roster {
                             match (entry, get) {
@@ -11791,6 +11830,148 @@ mod tests {
             replica.touches(),
             vec![(Some(0), false), (Some(0), false)],
             "one plain batch of both keys, sent after the primaries answered"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_batch_touch_expires_the_replicas_of_the_answered_keys_when_another_leg_is_lost()
+     {
+        // Issue #966: two keys with different primaries. One primary
+        // applies its leg and drops the connection before answering, so
+        // the frame is `E` (outcome unknown, issue #919). The other primary
+        // answered and expired its copy, so its key's replica must still
+        // be sent the plain touch, as the SDKs send it; the proxy used to
+        // skip every deferred leg of an `E` frame.
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+        let key_with_primary = |node: &MockNode| {
+            (0..64u8)
+                .map(|index| format!("k{index}"))
+                .find(|key| ring.owners(b"", key.as_bytes())[0] == node.addr)
+                .expect("some key routes to the node first")
+        };
+        let lost_key = key_with_primary(&nodes[0]);
+        let answered_key = key_with_primary(&nodes[1]);
+        for key in [&lost_key, &answered_key] {
+            stream
+                .write_all(format!("S {} 1\n{key}v", key.len()).as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        }
+
+        nodes[0]
+            .close_after_touch_apply_once
+            .store(true, Ordering::SeqCst);
+        let request = format!(
+            "y 0 2 {} {} 0 G\n{lost_key}{answered_key}",
+            lost_key.len(),
+            answered_key.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+
+        // node-a applied its primary leg and dropped the connection, then
+        // was sent the plain touch for the key node-b answered.
+        assert_eq!(
+            nodes[0].touches(),
+            vec![(Some(0), true), (Some(0), false)],
+            "the answered key's replica is expired although the frame is E"
+        );
+        // node-b answered its primary leg; the lost key's outcome is
+        // unknown, so its replica is not touched.
+        assert_eq!(nodes[1].touches(), vec![(Some(0), true)]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_batch_touch_expires_the_fresh_first_owner_of_a_key_its_old_primary_answered()
+     {
+        // Issue #966: the ring changes between the two passes — the retry's
+        // refresh picks up a joiner. A key the old primary answered in the
+        // first pass has that joiner as its first owner on the fresh ring;
+        // the deferred legs must reach every current owner but the node
+        // that answered, the first owner included. Picking "the fresh
+        // ring's rank 1 and below" skipped the joiner and touched the old
+        // primary, which had already expired its copy, again.
+        let node_a = MockNode::start().await;
+        let node_b = MockNode::start().await;
+        let node_c = MockNode::start().await;
+        let old_roster = vec![
+            ("node-a".to_string(), node_a.addr.clone()),
+            ("node-b".to_string(), node_b.addr.clone()),
+        ];
+        let mut new_roster = old_roster.clone();
+        new_roster.push(("node-c".to_string(), node_c.addr.clone()));
+        let discovery = start_mock_discovery_handle(old_roster.clone(), 2).await;
+        let proxy = start_proxy(&discovery.addr, None, 64).await;
+        let old_ring = RingView::new(old_roster, 2);
+        let new_ring = RingView::new(new_roster.clone(), 2);
+        // Both keys have node-a first on the old ring. The answered key has
+        // node-c then node-a on the fresh ring; the retried key keeps
+        // node-a then node-b, so node-c sees nothing but the deferred leg.
+        let old_primary_a: Vec<String> = (0..512u16)
+            .map(|index| format!("k{index}"))
+            .filter(|key| old_ring.owners(b"", key.as_bytes())[0] == node_a.addr)
+            .collect();
+        let answered_key = old_primary_a
+            .iter()
+            .find(|key| {
+                new_ring.owners(b"", key.as_bytes())
+                    == vec![node_c.addr.clone(), node_a.addr.clone()]
+            })
+            .expect("a key with node-c then node-a on the fresh ring")
+            .clone();
+        let retried_key = old_primary_a
+            .iter()
+            .find(|key| {
+                new_ring.owners(b"", key.as_bytes())
+                    == vec![node_a.addr.clone(), node_b.addr.clone()]
+            })
+            .expect("a key with node-a then node-b on the fresh ring")
+            .clone();
+
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        for key in [&retried_key, &answered_key] {
+            stream
+                .write_all(format!("S {} 1\n{key}v", key.len()).as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        }
+
+        // The joiner is on the roster the retry's refresh fetches; node-a
+        // answers the frame's first key `W` to force that refresh.
+        *discovery.roster.lock().unwrap() = new_roster;
+        node_a.wrong_node_once.store(true, Ordering::SeqCst);
+        let request = format!(
+            "y 0 2 {} {} 0 G\n{retried_key}{answered_key}",
+            retried_key.len(),
+            answered_key.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"vv");
+
+        assert_eq!(
+            node_c.touches(),
+            vec![(Some(0), false)],
+            "the answered key's new first owner is sent the plain touch"
+        );
+        // node-a: the answered key in the first pass, the retried key in
+        // the second — and no plain touch, it is the node that answered.
+        assert_eq!(node_a.touches(), vec![(Some(0), true), (Some(0), true)]);
+        assert_eq!(
+            node_b.touches(),
+            vec![(Some(0), false)],
+            "the retried key's other owner is sent the plain touch"
         );
     }
 
