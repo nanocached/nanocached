@@ -231,6 +231,43 @@ Against a node older than the release that added the command, both raise
 `ServerTooOldError`: such a node answers `En` and closes the connection.
 Upgrade every node before using them.
 
+### Many keys at once (touch_many / get_many_and_touch)
+
+`touch_many` and `get_many_and_touch` (`get_many_and_touch_bytes` is the raw
+companion) are the same two operations for a list of keys, in one round trip
+per involved node instead of one per key:
+
+```python
+await client.set_many({"a": "1", "b": "2"}, ttl_seconds=60)
+await client.touch_many(["a", "b", "missing"], 300)
+# {"a": True, "b": True, "missing": False} — a touch never creates a key
+await client.get_many_and_touch(["a", "b", "missing"], 300)
+# {"a": "1", "b": "2"} — a miss is absent, as in get_many()
+```
+
+The TTL is one value for the whole batch and means what it means for
+`touch`: no default, `None` removes it, `0` expires the keys at once. A key
+given twice is touched once and keyed by its first occurrence, and a batch
+of more than 400 keys is split into several frames, as for `get_many`.
+`Namespace` has all three.
+
+Like `touch` it goes to every owner of each key and the primary's answer
+decides. `get_many_and_touch` asks only a key's primary for the value, so a
+node that is the primary of some keys in the batch and a replica of others
+receives two frames, one with `G` and one without. A replica's failure is
+counted in `stats().replica_write_failures` (once per key) and never fails
+the batch. A value that did not fit in the node's reply (16 MiB per frame)
+is left untouched and reads as a miss.
+
+Keys whose primary still answers a wrong-node after one refresh and retry
+raise `WrongNodeError` from `touch_many` and `PartialWrongNodeError`, with
+the keys that did resolve in `partial_values`, from `get_many_and_touch`. A
+primary that cannot be reached on both passes raises its connection error
+(`PartialConnectionLostError` with `partial_values` for
+`get_many_and_touch`, when some keys did resolve). A touch is idempotent, so
+a failed `touch_many` can simply be sent again. Both raise `ServerTooOldError`
+against a node that has `t` but not `y`.
+
 ## Batched get and set
 
 `get_many`/`get_many_bytes` and `set_many` (the `m`/`o` frames) fetch or

@@ -108,9 +108,11 @@ _REQUEST_TIMEOUT = 30.0
 
 # One parsed response's payload: plain bytes (V), (value, ttl_seconds)
 # (I), a multi_get roster (M — list[bytes | None | _MultiWrongNode]), a
-# multi_set roster (O — list[bool | _MultiWrongNode]), or None (every
-# other marker). Widened for issues #128/#150/#151; every pre-existing
-# marker's payload shape is unchanged.
+# multi_set roster (O — list[bool | _MultiWrongNode]), a multi_touch
+# roster (Y — list[bool | _MultiWrongNode], False for a key with no live
+# entry), or None (every other marker). Widened for issues
+# #128/#150/#151/#871; every pre-existing marker's payload shape is
+# unchanged.
 _ResponsePayload = bytes | tuple[bytes, int | None] | list[object] | None
 
 
@@ -273,6 +275,28 @@ def _encode_multi_set(
     header = b" ".join(fields) + _tag_field(tag) + b"\n"
     body = namespace + b"".join(key + value for key, value in zip(keys, values))
     return header + body
+
+
+# Batched touch (issue #871): y is t for n keys of one namespace under one
+# TTL — `y <ns-len> <n> <key-len-1>...<key-len-n> [<ttl>] [G] [<tag>]`.
+# Like t, an omitted TTL removes the TTL and 0 is sent and expires the keys
+# at once (the opposite of _encode_multi_set, where 0 means no expiry).
+# `get` appends the `G` token: the reply is then m's, for the keys touched.
+def _encode_multi_touch(
+    keys: Sequence[bytes],
+    ttl_seconds: int | None,
+    get: bool,
+    tag: int | None = None,
+    namespace: bytes = b"",
+) -> bytes:
+    fields = [b"y", b"%d" % len(namespace), b"%d" % len(keys)]
+    fields.extend(b"%d" % len(key) for key in keys)
+    if ttl_seconds is not None:
+        fields.append(b"%d" % ttl_seconds)
+    if get:
+        fields.append(b"G")
+    header = b" ".join(fields) + _tag_field(tag) + b"\n"
+    return header + namespace + b"".join(keys)
 
 
 async def _retire(writer: asyncio.StreamWriter) -> None:
@@ -612,6 +636,51 @@ class Connection:
             if len(entries) != len(keys):
                 raise self._desync(
                     "nanocached: multi-set reply has "
+                    f"{len(entries)} entries for {len(keys)} keys (connection desynced)"
+                )
+            return entries  # type: ignore[return-value]
+        raise self._mismatch(marker)
+
+    async def multi_touch(
+        self, keys: Sequence[bytes], ttl_seconds: int | None, namespace: bytes = b""
+    ) -> list[bool | _MultiWrongNode]:
+        """Sends one plain ``y`` request to *this* node only (issue #871)
+        — cluster fan-out to every owner is the client's job, as for
+        touch(). Returns one roster entry per key, in request order:
+        ``True`` for a touched key (``S``), ``False`` for a missing or
+        expired one (``N``; a touch never creates a key), or WRONG_NODE
+        for that key's own ``W`` — see multi_get(). Same entry-count
+        desync check as multi_get() (issue #181)."""
+        marker, entries = await self._request(
+            lambda tag: _encode_multi_touch(keys, ttl_seconds, False, tag, namespace)
+        )
+        if marker == b"Y":
+            assert entries is not None
+            if len(entries) != len(keys):
+                raise self._desync(
+                    "nanocached: multi-touch reply has "
+                    f"{len(entries)} entries for {len(keys)} keys (connection desynced)"
+                )
+            return entries  # type: ignore[return-value]
+        raise self._mismatch(marker)
+
+    async def multi_get_and_touch(
+        self, keys: Sequence[bytes], ttl_seconds: int | None, namespace: bytes = b""
+    ) -> list[bytes | None | _MultiWrongNode]:
+        """Sends one ``y ... G`` request to *this* node only (issue #871)
+        and returns multi_get()'s roster for it: the hit's raw bytes (the
+        key now has the frame's TTL), ``None`` for a miss or for a value
+        the node left out of a full reply (it is left untouched too), or
+        WRONG_NODE. Unlike get_and_touch(), the reply carries no per-key
+        TTL: every key has the one the frame carried."""
+        marker, entries = await self._request(
+            lambda tag: _encode_multi_touch(keys, ttl_seconds, True, tag, namespace)
+        )
+        if marker == b"M":
+            assert entries is not None
+            if len(entries) != len(keys):
+                raise self._desync(
+                    "nanocached: multi-get reply has "
                     f"{len(entries)} entries for {len(keys)} keys (connection desynced)"
                 )
             return entries  # type: ignore[return-value]
@@ -1120,34 +1189,20 @@ class Connection:
             # <result-1>...<result-n> [<tag>]\n` — no body, unlike `M`'s
             # hit values (a set has nothing to echo back). Each token is
             # "S" (stored) or "W" (wrong node); parsing otherwise mirrors
-            # `M` above. No cumulative-bytes bound needed here (issue
-            # #207, unlike `M` above): ack tokens are fixed-width single
-            # characters with no length-prefixed body, so this loop is
-            # already O(count), and count is already bounded by the
-            # header line's own length cap (readuntil's internal limit).
-            header = await self._reader.readuntil(b"\n")
-            fields = header[1:-1].split(b" ")
-            if len(fields) < 1:
-                raise NanocachedError("nanocached: invalid multi-set header in response")
-            try:
-                count = _parse_strict_uint(fields[0])
-            except ValueError:
-                count = -1
-            if count < 0:
-                raise NanocachedError("nanocached: invalid multi-set count in response")
-            want_fields = 1 + count + (1 if self._tagged else 0)
-            if len(fields) != want_fields:
-                raise NanocachedError("nanocached: invalid multi-set header in response")
-            tag = self._parse_tag(fields[1 + count]) if self._tagged else None
-            ack_entries: list[bool | _MultiWrongNode] = []
-            for token in fields[1 : 1 + count]:
-                if token == b"S":
-                    ack_entries.append(True)
-                elif token == b"W":
-                    ack_entries.append(WRONG_NODE)
-                else:
-                    raise NanocachedError("nanocached: invalid multi-set result token in response")
+            # `M` above.
+            ack_entries, tag = await self._read_ack_roster(
+                "multi-set", {b"S": True, b"W": WRONG_NODE}
+            )
             return marker, ack_entries, tag
+
+        if marker == b"Y":
+            # Batched touch's response (issue #871): `Y <n> <result-1>...
+            # <result-n> [<tag>]\n`, shaped like `O` — "S" (touched), "N"
+            # (no live entry) or "W" (wrong node).
+            touch_entries, tag = await self._read_ack_roster(
+                "multi-touch", {b"S": True, b"N": False, b"W": WRONG_NODE}
+            )
+            return marker, touch_entries, tag
 
         if marker in (b"S", b"D", b"N", b"W", b"C", b"R", b"T"):
             if self._tagged:
@@ -1188,6 +1243,38 @@ class Connection:
             raise _ServerRejectedError(f"nanocached: unexpected response from server: {marker!r}")
 
         raise NanocachedError(f"nanocached: unexpected response from server: {marker!r}")
+
+    async def _read_ack_roster(
+        self, what: str, tokens: dict[bytes, object]
+    ) -> tuple[list[object], int | None]:
+        """Reads the rest of a body-less roster reply (`O`, `Y`) after its
+        marker: `<n> <result-1>...<result-n> [<tag>]\n`. ``tokens`` maps
+        each result token the reply may carry to its entry. No
+        cumulative-bytes bound is needed here (issue #207, unlike `M`):
+        result tokens are fixed-width single characters with no
+        length-prefixed body, so this loop is already O(count), and count
+        is already bounded by the header line's own length cap
+        (readuntil's internal limit)."""
+        header = await self._reader.readuntil(b"\n")
+        fields = header[1:-1].split(b" ")
+        if len(fields) < 1:
+            raise NanocachedError(f"nanocached: invalid {what} header in response")
+        try:
+            count = _parse_strict_uint(fields[0])
+        except ValueError:
+            count = -1
+        if count < 0:
+            raise NanocachedError(f"nanocached: invalid {what} count in response")
+        want_fields = 1 + count + (1 if self._tagged else 0)
+        if len(fields) != want_fields:
+            raise NanocachedError(f"nanocached: invalid {what} header in response")
+        tag = self._parse_tag(fields[1 + count]) if self._tagged else None
+        entries: list[object] = []
+        for token in fields[1 : 1 + count]:
+            if token not in tokens:
+                raise NanocachedError(f"nanocached: invalid {what} result token in response")
+            entries.append(tokens[token])
+        return entries, tag
 
     @staticmethod
     def _parse_tag(field: bytes) -> int:

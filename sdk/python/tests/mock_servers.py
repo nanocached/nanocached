@@ -118,6 +118,17 @@ class MockNode:
         # exactly as the real node does for any command it does not know.
         self.legacy_without_touch = False
         self._drop_next_touch_reply = False
+        # Batched touch (issue #871): every `y` received as (namespace,
+        # keys, ttl, get), one entry per frame — what proves a frame's
+        # grouping, which the per-key `touches` above cannot.
+        self.multi_touch_frames: list[tuple[bytes, list[bytes], int | None, bool]] = []
+        # Behave like a node that knows `t` but predates `y`: answer it
+        # `En\n` and close (legacy_without_touch above implies this).
+        self.legacy_without_multi_touch = False
+        # See fail_multi_touch_after(): None means "don't fail any".
+        self._multi_touch_fail_after: int | None = None
+        # See answer_multi_touch_bad_count_once().
+        self._multi_touch_reply_count_override: int | None = None
         # Compare-and-set (issue #141): counts every `k`/`x` frame this
         # node receives, regardless of outcome — the key proof, alongside
         # incr_count above, that a replica leg of a cluster
@@ -304,6 +315,18 @@ class MockNode:
         A touch is idempotent, so the client may resend it, unlike an
         incr (see apply_and_drop_next_incr)."""
         self._drop_next_touch_reply = True
+
+    def fail_multi_touch_after(self, successes: int) -> None:
+        """Answers the next ``successes`` `y` requests normally, then closes
+        the connection instead of replying to the one right after (issue
+        #871) — a connection drop on chunk N>1 of a chunked batch touch."""
+        self._multi_touch_fail_after = successes
+
+    def answer_multi_touch_bad_count_once(self, count: int) -> None:
+        """The next `y` reply reports exactly ``count`` roster entries no
+        matter how many keys the request had (issue #871, as issue #181 for
+        `m`/`o`)."""
+        self._multi_touch_reply_count_override = count
 
     def apply_and_drop_next_cas_set(self) -> None:
         """Same as apply_and_drop_next_incr() but for the next matching
@@ -941,6 +964,80 @@ class MockNode:
                     header = (
                         b" ".join([b"M", b"%d" % len(roster_tokens), *roster_tokens]) + tag_suffix + b"\n"
                     )
+                    writer.write(header + body)
+                    await writer.drain()
+
+                elif parts[0] == b"y":
+                    # Batched touch (issue #871): `y <ns-len> <n>
+                    # <key-len-1>...<key-len-n> [<ttl>] [G] [<tag>]\n<ns>
+                    # <key-1>...<key-n>` — one TTL for the whole batch; no
+                    # ttl field removes the TTL, 0 expires the keys at
+                    # once. Plain: `Y <n> S|N|W...`; with `G`: `M`'s reply
+                    # for the keys touched.
+                    namespace = await reader.readexactly(int(parts[1]))
+                    count = int(parts[2])
+                    key_lengths = [int(x) for x in parts[3 : 3 + count]]
+                    keys = [await reader.readexactly(length) for length in key_lengths]
+                    tail = list(parts[3 + count :])
+                    if tagged:
+                        tail = tail[:-1]
+                    get = bool(tail) and tail[-1] == b"G"
+                    if get:
+                        tail = tail[:-1]
+                    ttl = int(tail[0]) if tail else None
+                    self.multi_touch_frames.append((namespace, keys, ttl, get))
+                    if self.legacy_without_touch or self.legacy_without_multi_touch:
+                        writer.write(b"En\n")
+                        await writer.drain()
+                        return
+                    if self._silent:
+                        continue
+                    if self._multi_touch_fail_after is not None:
+                        if self._multi_touch_fail_after > 0:
+                            self._multi_touch_fail_after -= 1
+                        else:
+                            self._multi_touch_fail_after = None
+                            writer.close()
+                            return
+                    if self._retryable_replies > 0:
+                        self._retryable_replies -= 1
+                        writer.write(b"R" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    consume_wrong = self._multi_wrong_node_times > 0
+                    if consume_wrong:
+                        self._multi_wrong_node_times -= 1
+                    results: list[tuple[bytes, bytes | None]] = []
+                    for key in keys:
+                        if consume_wrong and key in self._multi_wrong_node_keys:
+                            results.append((b"W", None))
+                            continue
+                        current = self._get_entry(namespace, key)
+                        if current is None:
+                            results.append((b"-" if get else b"N", None))
+                            continue
+                        if ttl == 0:
+                            self._delete_entry(namespace, key)
+                            self.entry_ttl.pop((namespace, key), None)
+                        else:
+                            self.entry_ttl[(namespace, key)] = ttl or 0
+                        if get:
+                            results.append((b"%d" % len(current), current))
+                        else:
+                            results.append((b"S", None))
+                    if self._drop_next_touch_reply:
+                        self._drop_next_touch_reply = False
+                        writer.close()
+                        return
+                    if self._multi_touch_reply_count_override is not None:
+                        override = self._multi_touch_reply_count_override
+                        self._multi_touch_reply_count_override = None
+                        pad = (b"-" if get else b"N", None)
+                        results = results[:override] + [pad] * max(0, override - len(results))
+                    tokens = [token for token, _ in results]
+                    marker = b"M" if get else b"Y"
+                    header = b" ".join([marker, b"%d" % len(tokens), *tokens]) + tag_suffix + b"\n"
+                    body = b"".join(value for _, value in results if value is not None)
                     writer.write(header + body)
                     await writer.drain()
 

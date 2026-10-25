@@ -21,6 +21,19 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
   (`get_and_touch` asks only the primary for the value). Against a node that
   predates the command they raise the new `ServerTooOldError`. Needs a
   server release that includes the `t` command.
+- `touch_many(keys, ttl_seconds)` and `get_many_and_touch(keys, ttl_seconds)`
+  (with `get_many_and_touch_bytes`, and all three on `Namespace`) are
+  `touch`/`get_and_touch` for a list of keys, in one round trip per involved
+  node. `touch_many` returns a dict of key to whether it existed;
+  `get_many_and_touch` returns the hits, as `get_many` does. One TTL for the
+  whole batch, with the meaning and no default of `touch`. Every owner is
+  sent the batch; only a key's primary is asked for the value, so a node
+  that is primary for some keys and a replica for others receives two
+  frames. Failures follow `set_many`/`get_many`: `WrongNodeError` from
+  `touch_many` and `PartialWrongNodeError`/`PartialConnectionLostError` from
+  `get_many_and_touch`. Needs a server release that includes the `y`
+  command; against a node that has `t` but not `y` they raise
+  `ServerTooOldError`, which now has a `command` attribute (`"t"` or `"y"`).
 
 ## [0.4.8] - 2026-10-21
 
