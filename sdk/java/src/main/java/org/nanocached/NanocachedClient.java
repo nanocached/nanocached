@@ -2618,7 +2618,7 @@ public final class NanocachedClient implements AutoCloseable {
             boolean expiring = expiresAtOnce(wireTtl);
             return withTouchRetry(expiring, () -> write(
                     namespace, key, connection -> connection.touch(namespace, key, wireTtl),
-                    null, null, !expiring));
+                    null, null, !expiring, true));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         }
@@ -2684,7 +2684,7 @@ public final class NanocachedClient implements AutoCloseable {
                     // return, and `G` there would only move the value over
                     // the wire for nothing.
                     connection -> connection.touch(namespace, key, wireTtl),
-                    !expiring));
+                    !expiring, true));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         }
@@ -4493,10 +4493,10 @@ public final class NanocachedClient implements AutoCloseable {
      * #901, {@code ttl == 0}) a connection failure is retried after a
      * refresh only if the request provably never reached the wire; the
      * node may already have applied anything else and expired the entry.
-     * {@code W} is always retried, as for every command.
+     * {@code W} is always retried, as for every command; an {@code En} (a
+     * node that predates the command) never is (issue #902).
      */
     private <T> T withTouchRetry(boolean expiring, java.util.function.Supplier<T> operation) {
-        if (!expiring) return withWrongNodeRetry(operation);
         try {
             return operation.get();
         } catch (NanocachedException.WrongNode error) {
@@ -4504,7 +4504,10 @@ public final class NanocachedClient implements AutoCloseable {
             maybeRefresh(true);
             return operation.get();
         } catch (NanocachedException.ConnectionFailed error) {
-            if (ring == null || !error.notSent()) throw error;
+            // An `En` is final (issue #902): a node that predates the
+            // command would answer it again after the refresh.
+            if (error instanceof NanocachedException.ServerRejected) throw error;
+            if (ring == null || (expiring && !error.notSent())) throw error;
             maybeRefresh(true);
             return operation.get();
         }
@@ -4963,7 +4966,16 @@ public final class NanocachedClient implements AutoCloseable {
             byte[] namespace, byte[] key, ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
             ConnectionOp<?> replicaOp) {
-        return write(namespace, key, op, backgroundSafeOp, replicaOp, true);
+        return write(namespace, key, op, backgroundSafeOp, replicaOp, true, false);
+    }
+
+    /** As the seven-argument {@code write}, with {@code rejectionIsFinal}
+     * false. */
+    private <T> T write(
+            byte[] namespace, byte[] key, ConnectionOp<T> op,
+            java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
+            ConnectionOp<?> replicaOp, boolean primaryReplaySafe) {
+        return write(namespace, key, op, backgroundSafeOp, replicaOp, primaryReplaySafe, false);
     }
 
     /**
@@ -4973,15 +4985,17 @@ public final class NanocachedClient implements AutoCloseable {
      * reached the wire (see {@link #applyReconnectingUnlessSent}). A
      * replica leg keeps its plain retry: only the primary's answer is
      * reported, so a replica that already expired the entry changes
-     * nothing.
+     * nothing. With {@code rejectionIsFinal} (issue #902, touch) an
+     * {@code En} from the primary is surfaced as it is instead of being
+     * redialled and resent.
      */
     private <T> T write(
             byte[] namespace, byte[] key, ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
-            ConnectionOp<?> replicaOp, boolean primaryReplaySafe) {
+            ConnectionOp<?> replicaOp, boolean primaryReplaySafe, boolean rejectionIsFinal) {
         if (ring == null) {
             return primaryReplaySafe
-                    ? applyReconnecting(this::singleConnection, op)
+                    ? applyReconnecting(this::singleConnection, op, rejectionIsFinal)
                     : applyReconnectingUnlessSent(this::singleConnection, op);
         }
 
@@ -5064,7 +5078,7 @@ public final class NanocachedClient implements AutoCloseable {
         RuntimeException primaryError = null;
         try {
             value = primaryReplaySafe
-                    ? applyReconnecting(() -> memberConnection(names.get(0)), op)
+                    ? applyReconnecting(() -> memberConnection(names.get(0)), op, rejectionIsFinal)
                     : applyReconnectingUnlessSent(() -> memberConnection(names.get(0)), op);
         } catch (RuntimeException error) {
             primaryError = error;
