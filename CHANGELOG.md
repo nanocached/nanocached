@@ -14,6 +14,38 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a copy that a re-replication pass delivered to a node
+  while that node's own join handoff was in flight — or had just taken its
+  key snapshot — was stored without the dead-copy mark the handoff gives
+  every key it moves to the joiner, although the handoff's ring already
+  gave the key to the joiner and not to this node. The node then held a
+  live copy of a key it did not own, which no write reached (clients route
+  by the published ring, no forwarding window covered it), and its next
+  join handoff passed that copy on: a key the owners had deleted or
+  expired meanwhile came back on the new joiner, as its primary, and the
+  SDK read it as present. Such a copy is now marked on arrival while the
+  join is still unconfirmed, like the keys the snapshot sent (it is still
+  relayed to the joiner), so the mark sweep removes it and the next
+  handoff never sees it; once discovery has confirmed the join a copy
+  arriving for a key the joiner owns is left live, since it may as well be
+  a promotion under a membership newer than the join's. The
+  re-replication pass a node runs when a join flips its ring had the
+  same effect from the other side: while the join was unconfirmed it
+  handed the dead copies the handoff had just marked to the joiner again,
+  put-if-absent, and one landing after a client had expired or deleted
+  the key on the joiner brought it back. A dead copy now never goes to
+  the joiner whose handoff took it (the slot's own or a lingering one);
+  another owner a ring change promoted still gets it while the marks are
+  held. And an expiry that reached a decommissioning node as a forwarded
+  handoff (a touch with a TTL of `0`, relayed through a window) was not
+  passed on to the node's entrant, because a handoff that leaves the value
+  as it was did not count as a change — the gate that stops a drained
+  value from circling back; the entrant kept the key alive and handed it to
+  the next joiner. A handoff that gives a key a TTL it did not have, removes
+  the one it had, or expires it now counts as a change; one that only
+  shortens a TTL still does not, since that is what an echo of the node's
+  own drain looks like.
+
 - `nanocached-node`: a write landing on a node during the forwarding
   window of a re-replication pass (the 60 s after a membership change in
   which such writes are mirrored to the owners the change promoted) was

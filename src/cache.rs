@@ -789,12 +789,18 @@ impl Cache {
     /// for the same reason a client write of it is, so it moves nothing.
     ///
     /// Returns whether the store's content changed: false when the key
-    /// already held exactly `value` (live, not expired). The write goes
-    /// in either way — a repeated handoff refreshes the TTL — but a
-    /// leaving node relays a handoff it receives to its entrant only
-    /// when it changed something here: its own drain comes back to it
-    /// through the entrant's join relay, and relaying that again is the
-    /// loop that overwrote newer writes (see the `U` arm in `server.rs`).
+    /// already held exactly `value` (live, not expired) with a TTL of the
+    /// same kind — one or none. The write goes in either way — a repeated
+    /// handoff refreshes the TTL — but a leaving node relays a handoff it
+    /// receives to its entrant only when it changed something here: its
+    /// own drain comes back to it through the entrant's join relay, and
+    /// relaying that again is the loop that overwrote newer writes (see
+    /// the `U` arm in `server.rs`). An echo carries the value with the
+    /// remaining TTL it left with, so a shorter TTL of the same kind is
+    /// not a change; a TTL given to a key that had none, removed from one
+    /// that had, or a TTL of zero — a forwarded expiry — is (issue #975:
+    /// an expiry relayed to a leaving node through a window went no
+    /// further, and the entrant kept the key alive).
     pub fn handoff_set(
         &mut self,
         key: Key,
@@ -807,9 +813,12 @@ impl Cache {
         let now = Instant::now();
         let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
         self.note_handoff(now, ahead_of_ring);
-        let unchanged = self
-            .peek(&key)
-            .is_some_and(|entry| !entry.is_expired_at(now) && entry.value == value);
+        let unchanged = !ttl.is_some_and(|ttl| ttl.is_zero())
+            && self.peek(&key).is_some_and(|entry| {
+                !entry.is_expired_at(now)
+                    && entry.value == value
+                    && entry.expires_at.is_some() == expires_at.is_some()
+            });
         self.insert(key, value, expires_at);
         !unchanged
     }
@@ -4108,13 +4117,13 @@ mod tests {
             "the same value again changes nothing"
         );
         assert!(
-            !cache.handoff_set(
+            cache.handoff_set(
                 k.clone(),
                 Bytes::from_static(b"v1"),
                 Some(Duration::from_secs(60)),
                 false
             ),
-            "a TTL alone is not a change of content"
+            "a TTL given to a key that had none is a change (issue #975)"
         );
         assert!(cache.handoff_set(k.clone(), Bytes::from_static(b"v2"), None, false));
         assert!(cache.handoff_delete(&k));
@@ -4123,6 +4132,32 @@ mod tests {
             "absent, so a change"
         );
         assert_eq!(cache.get(&k), Some(Bytes::from_static(b"v2")));
+
+        // Issue #975: a TTL where there was none, none where there was
+        // one, or an expiry is a change — a forwarded touch must go on to
+        // the entrant — while a shorter TTL of the same kind (an echo of
+        // this node's own drain, back with what remains) is not.
+        let ttl = |secs| Some(Duration::from_secs(secs));
+        assert!(
+            cache.handoff_set(k.clone(), Bytes::from_static(b"v2"), ttl(60), false),
+            "a TTL given"
+        );
+        assert!(
+            !cache.handoff_set(k.clone(), Bytes::from_static(b"v2"), ttl(59), false),
+            "an echo: same value, a TTL of the same kind"
+        );
+        assert!(
+            cache.handoff_set(k.clone(), Bytes::from_static(b"v2"), ttl(0), false),
+            "an expiry"
+        );
+        assert!(
+            cache.handoff_set(k.clone(), Bytes::from_static(b"v2"), ttl(60), false),
+            "expired, so a change"
+        );
+        assert!(
+            cache.handoff_set(k.clone(), Bytes::from_static(b"v2"), None, false),
+            "a TTL removed"
+        );
     }
 
     #[test]
