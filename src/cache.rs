@@ -840,6 +840,15 @@ impl Cache {
     /// [`Self::handoff_set_if_absent`] at `now`. A key under a live
     /// handoff tombstone is refused like a present one: the sender read
     /// it before the delete that the tombstone records.
+    ///
+    /// Issue #970: a copy that is still `migrated`-marked does *not*
+    /// count as present. The mark means a join took the key away and the
+    /// sender — an owner re-replicating after a membership change — saw
+    /// every write since, so its copy is at least as fresh; refusing it
+    /// left the dead copy to be revived or swept on its own, and the
+    /// sweep (`sweep_keeping`) now lets a dead copy go when such an owner
+    /// exists, counting on this write to bring the key back. The insert
+    /// releases the mark, as any write does.
     fn handoff_set_if_absent_at(
         &mut self,
         key: &Key,
@@ -849,7 +858,8 @@ impl Cache {
         now: Instant,
     ) -> CasResult {
         self.note_handoff(now, ahead_of_ring);
-        if self.tombstoned_at(key, now) || !self.condition_holds_at(key, CasCondition::Absent, now)
+        if self.tombstoned_at(key, now)
+            || (!self.condition_holds_at(key, CasCondition::Absent, now) && !self.is_marked(key))
         {
             return CasResult::Mismatch;
         }
@@ -1640,6 +1650,18 @@ impl Cache {
         self.peek_entry_at(key, Instant::now())
     }
 
+    /// `peek_entry` for a handoff sender (issue #970): `None` as well for
+    /// a copy that is `migrated`-marked — dead since a join took the key
+    /// away. The owners hold the live state, and a key they deleted or
+    /// expired since the mark must not come back from here through a
+    /// re-replication, a decommission drain or a later join's transfer.
+    pub fn peek_live_entry(&self, key: &Key) -> Option<(Key, Bytes, Option<Duration>)> {
+        if self.is_marked(key) {
+            return None;
+        }
+        self.peek_entry(key)
+    }
+
     fn peek_entry_at(&self, key: &Key, now: Instant) -> Option<(Key, Bytes, Option<Duration>)> {
         let entry = self.peek(key)?;
 
@@ -1806,13 +1828,18 @@ impl Cache {
     }
 
     /// `sweep`, keeping — and unmarking — a marked copy of a key `owned`
-    /// says this node owns. A mark means a join took the key away; when
-    /// that joiner is evicted the key is this node's again, and the copy
-    /// it kept is the live one, not a dead one to reclaim. Without this,
-    /// a put-if-absent re-replication arriving while the copy was still
+    /// says to keep. A mark means a join took the key away; when that
+    /// joiner is evicted the key is this node's again, and the copy it
+    /// kept is the live one, not a dead one to reclaim. Without this, a
+    /// put-if-absent re-replication arriving while the copy was still
     /// marked (the sweep pauses for as long as a later join's transfer
     /// runs) was refused as "present", and the sweep then deleted the
-    /// copy it had refused the write for.
+    /// copy it had refused the write for. Issue #970: `owned` is the
+    /// caller's whole judgement (`SweepOwnership`), not bare ownership — a
+    /// dead copy of a key this node owns again is let go when another
+    /// current owner saw the writes it missed, and `handoff_set_if_absent`
+    /// overwrites a marked copy, so that owner's re-replication brings the
+    /// key back only if it still exists.
     pub fn sweep_keeping(&mut self, owned: &dyn Fn(&Key) -> bool) -> usize {
         self.sweep_at(Instant::now(), true, Some(owned))
     }
@@ -3579,6 +3606,26 @@ mod tests {
     }
 
     #[test]
+    fn peek_live_entry_is_none_for_a_dead_copy() {
+        // Issue #970: a handoff sender never passes on a copy a join took
+        // away; once the mark is released by a write the copy is live.
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"k"), Bytes::from_static(b"v"));
+        assert!(cache.peek_live_entry(&key(b"k")).is_some());
+        cache.mark_migrated(&key(b"k"));
+        assert!(
+            cache.peek_entry(&key(b"k")).is_some(),
+            "the copy is still there"
+        );
+        assert!(cache.peek_live_entry(&key(b"k")).is_none());
+        cache.set(key(b"k"), Bytes::from_static(b"w"));
+        assert_eq!(
+            cache.peek_live_entry(&key(b"k")).map(|(_, v, _)| v),
+            Some(Bytes::from_static(b"w"))
+        );
+    }
+
+    #[test]
     fn peek_entry_is_none_for_a_missing_key() {
         let cache = Cache::new(UNBOUNDED);
 
@@ -3766,6 +3813,38 @@ mod tests {
         ));
         assert_eq!(cache.sweep(), 0);
         assert_eq!(cache.get(&key(b"mine")), Some(Bytes::from_static(b"1")));
+    }
+
+    #[test]
+    fn a_put_if_absent_handoff_overwrites_a_marked_copy_and_clears_the_mark() {
+        // Issue #970: the sender saw every write since the join took the
+        // key away; the dead copy here may predate a delete or a rewrite.
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"k"), Bytes::from_static(b"old"));
+        cache.mark_migrated(&key(b"k"));
+        assert!(matches!(
+            cache.handoff_set_if_absent(&key(b"k"), Bytes::from_static(b"new"), None, false),
+            CasResult::Stored
+        ));
+        assert_eq!(cache.get(&key(b"k")), Some(Bytes::from_static(b"new")));
+        assert!(!cache.is_marked(&key(b"k")));
+        // Live and unmarked, the copy is present: a second put-if-absent
+        // is refused, as before.
+        assert!(matches!(
+            cache.handoff_set_if_absent(&key(b"k"), Bytes::from_static(b"newer"), None, false),
+            CasResult::Mismatch
+        ));
+        assert_eq!(cache.get(&key(b"k")), Some(Bytes::from_static(b"new")));
+        // A marked copy under a live tombstone is still refused: the
+        // delete the tombstone records is newer than what the sender read.
+        cache.set(key(b"t"), Bytes::from_static(b"old"));
+        cache.mark_migrated(&key(b"t"));
+        assert!(cache.handoff_delete(&key(b"t")));
+        assert!(matches!(
+            cache.handoff_set_if_absent(&key(b"t"), Bytes::from_static(b"back"), None, false),
+            CasResult::Mismatch
+        ));
+        assert_eq!(cache.get(&key(b"t")), None);
     }
 
     #[test]

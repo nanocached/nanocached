@@ -12,6 +12,38 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-node`: a key deleted (`D`/`d`) or expired by a touch
+  (`t`/`y` with a TTL of `0`) while a former owner still held the dead copy
+  a join had taken from it came back — with the old value and no TTL
+  — when a leave made that node an owner of the key again before the
+  mark sweep had removed the copy (a decommission within a few seconds of
+  the join; a liveness eviction takes longer than the sweep). The sweep
+  kept and unmarked every dead copy of a key the node owned again, on the
+  assumption that only a joiner's eviction could hand a key back, and a
+  delete leaves nothing for the re-replication after the change to carry
+  over it (a rewritten key was repaired that way). The sweep now keeps a
+  dead copy only when no other current owner was an owner under the
+  previously published ring, that is when nobody else can re-replicate a
+  fresher state (replication factor 1 with the joiner gone, or every other
+  holder gone); otherwise the copy goes, and the put-if-absent
+  re-replication after the change — which now overwrites a copy that
+  is still marked instead of refusing it as present — brings the key
+  back only if an owner still has it. The sweep also runs as soon as a
+  membership is published rather than up to 5 s later. The same dead
+  copies were also handed on by the node that held them: a decommission
+  drain, a re-replication after a membership change and a join transfer
+  all read every key the node holds, dead copies included, so a displaced
+  node whose re-replication pass (after an eviction) outran the sweep sent
+  its dead, pre-expiry copies put-if-absent to a joiner that had just
+  expired the keys. A handoff sender now leaves out a copy whose mark has
+  been released (a join transfer always; a drain or a re-replication while
+  no join it sent is still undecided). Reproduced with
+  `tests/e2e/chaos.sh`'s touch workload (3–8 keys per 6-round run) and a
+  deterministic join → delete/expire → decommission script: 99–106 of
+  600 keys per class before, 0 after (issue #970).
+
 ## [0.5.0] - 2026-10-26
 
 ### Added

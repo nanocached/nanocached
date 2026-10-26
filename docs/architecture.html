@@ -159,7 +159,23 @@ no confirmed cause and no code fix, and is accepted as it stands:</p>
   within the grace is exactly what the grace waits for &mdash; so an old value
   can still come back and be served or re-replicated. Under back-to-back
   membership changes the pass keeps postponing and the leftovers look as they
-  did before; they go once the cluster has been quiet for the grace.</li>
+  did before; they go once the cluster has been quiet for the grace.
+  A dead copy that was <em>not</em> rewritten (still marked) is judged
+  differently when the node owns its key again: the mark sweep keeps it only
+  when no other current owner was an owner under the previously published
+  ring &mdash; the one case in which nobody else can re-replicate a fresher
+  state (a replication factor of 1 with the joiner gone, or every other
+  holder gone). Otherwise the dead copy goes, because every write since the
+  join went to the owners and a delete or an expiring touch leaves nothing a
+  re-replication could carry back over it; the re-replication after the
+  change, which overwrites a copy that is still marked, brings the key back
+  only if an owner still has it. The sweep runs as soon as a membership is
+  published, so a dead copy is served live for at most the moment between
+  the two. Nor is a dead copy handed on: a decommission drain, a
+  re-replication after a membership change and a join transfer leave out a
+  copy whose mark has been released (while the join that made the mark is
+  still undecided, a drain or a re-replication sends it as before, since an
+  abandoned join would make it live again).</li>
   <li>A replica write refused by a live node (<code>WrongNodeError</code>, while the
   client's node list and the nodes' views of the ring disagree) is swallowed by
   the SDK, so the key sits on one copy until its next write. If the node holding
@@ -463,10 +479,15 @@ here.</p>
   nodes one at a time and the case does not arise.</li>
   <li>A displaced copy loses its dead-copy mark on rewrite and is removed
   by the ownership reclaim pass after the 120&nbsp;s grace; an eviction
-  that flips membership back inside the grace makes it live again. The
-  mark is released on rewrite because a mark that outlived its value once
-  deleted fresh writes, and the grace exists so that a membership that
-  flips back is not treated as a loss.</li>
+  that flips membership back inside the grace makes it live again, so a
+  key deleted on the owners after that rewrite can come back with the
+  rewritten value. The mark is released on rewrite because a mark that
+  outlived its value once deleted fresh writes, and the grace exists so
+  that a membership that flips back is not treated as a loss. A displaced
+  copy that was never rewritten does not come back this way: the mark
+  sweep lets it go whenever another current owner saw the writes it
+  missed, and that owner's re-replication decides whether the key still
+  exists.</li>
   <li>A replica leg refused with <code>W</code> by a live node is
   swallowed by the SDK; the key sits on one copy until its next write, and
   if that node dies first the newest value is lost. Seen on

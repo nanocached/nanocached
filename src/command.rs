@@ -58,6 +58,72 @@ impl PartialEq for OwnerCheck {
 
 impl Eq for OwnerCheck {}
 
+/// Issue #970: what the mark sweep judges a dead copy against — this
+/// node's ownership under the ring it has adopted (`now`) and under the
+/// rings before it (`since`, newest first: the memberships published
+/// during the reclaim grace other than `now`, and the post-join ring of
+/// the handoff this node last sent, which discovery may publish later or
+/// never separately).
+///
+/// A marked copy is one a join took away: every write since then went to
+/// the owners, not here, so the copy is current only if nothing was
+/// written — and a delete or an expiring touch leaves nothing a later
+/// re-replication could carry back over it. Reviving such a copy whenever
+/// this node owns the key again brought deleted and expired keys back
+/// (join, delete, then a leave that made the displaced node an owner again
+/// inside the sweep's window). So the copy is kept only when no other
+/// current owner owned the key under any ring since the one that took it
+/// from this node (the newest ring in `since` under which this node is not
+/// an owner, and every ring newer than it): then nobody else has a more
+/// recent state to re-replicate from (R=1 with the joiner evicted, or
+/// every other holder gone, or an owner that gained the key only with the
+/// change that handed it back) and the dead copy is the best copy there
+/// is. Otherwise it goes, and the re-replication after the change
+/// (put-if-absent, which also overwrites a copy that is still marked —
+/// `Cache::handoff_set_if_absent`) brings the key back if it still exists
+/// on an owner that saw every write. With no ring in `since` under which
+/// this node lacked the key there is nothing to judge by, and the copy is
+/// kept as before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SweepOwnership {
+    pub now: OwnerCheck,
+    pub since: Vec<OwnerCheck>,
+}
+
+impl SweepOwnership {
+    /// Whether a marked copy of the key hashing to `key_hash` is kept
+    /// (and unmarked) rather than reclaimed — see the type's doc comment.
+    pub fn keeps_hashed(&self, key_hash: KeyHash) -> bool {
+        if !self.now.owns_hashed(key_hash) {
+            return false;
+        }
+        let others: Vec<&str> = self
+            .now
+            .ring
+            .owners_hashed(key_hash, self.now.replication)
+            .into_iter()
+            .filter(|owner| *owner != self.now.name)
+            .collect();
+        if others.is_empty() {
+            return true;
+        }
+        let Some(taken) = self
+            .since
+            .iter()
+            .position(|check| !check.owns_hashed(key_hash))
+        else {
+            return true;
+        };
+        !self.since[..=taken].iter().any(|check| {
+            others.iter().any(|other| {
+                check
+                    .ring
+                    .is_owner_hashed(key_hash, other, check.replication)
+            })
+        })
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Auth {
@@ -279,6 +345,17 @@ pub enum Command {
     PeekEntry {
         key: Key,
     },
+    /// Internal-only: `PeekEntry` that answers nothing for a copy this node
+    /// holds dead — `migrated`-marked since a join took the key away
+    /// (issue #970). A handoff sender (join transfer, decommission drain,
+    /// re-replication after a membership change) must not pass such a copy
+    /// on: the owners hold the live state, and a key they deleted or
+    /// expired since the mark would come back from the dead copy on the
+    /// receiver (seen on a joiner, put-if-absent, when a displaced node's
+    /// re-replication pass outran the sweep that was removing its marks).
+    PeekLiveEntry {
+        key: Key,
+    },
     /// Internal-only (staged node join): marks a key as handed off to another
     /// node during a migration this node was the source for. `Sweep`
     /// reclaims marked entries later.
@@ -359,10 +436,12 @@ pub enum Command {
     /// is still undecided, see `run_sweep` in `server.rs`.
     Sweep {
         marked: bool,
-        /// This node's ownership under its adopted ring, when it has one:
-        /// a marked copy of a key it owns is kept and unmarked rather than
-        /// reclaimed — see `Cache::sweep_keeping`.
-        owned: Option<OwnerCheck>,
+        /// This node's ownership under its adopted ring and the ones
+        /// before it, when it has one: a marked copy of a key it owns is
+        /// kept and unmarked rather than reclaimed when no other current
+        /// owner can re-replicate a fresher state — see `SweepOwnership`
+        /// and `Cache::sweep_keeping`.
+        owned: Option<SweepOwnership>,
     },
     /// Internal-only (issue #582): one chunk of the ownership reclaim
     /// pass, see `run_reclaim` in `server.rs`. Removes each of `keys` this
@@ -630,6 +709,10 @@ impl Command {
                 Response::Entries(cache.peek_entry(&key).into_iter().collect())
             }
 
+            Self::PeekLiveEntry { key } => {
+                Response::Entries(cache.peek_live_entry(&key).into_iter().collect())
+            }
+
             Self::MarkMigrated { key } => {
                 cache.mark_migrated(&key);
                 Response::Marked
@@ -656,9 +739,7 @@ impl Command {
                     let hasher = std::cell::RefCell::new(KeyHasher::default());
                     cache.sweep_keeping(&|key: &Key| {
                         let key_hash = hasher.borrow_mut().hash(key);
-                        owned
-                            .ring
-                            .is_owner_hashed(key_hash, &owned.name, owned.replication)
+                        owned.keeps_hashed(key_hash)
                     })
                 }
                 None => cache.sweep(),
@@ -2409,10 +2490,13 @@ mod tests {
         assert_eq!(
             Command::Sweep {
                 marked: true,
-                owned: Some(OwnerCheck {
-                    ring,
-                    name: "me".to_string(),
-                    replication: 1,
+                owned: Some(SweepOwnership {
+                    now: OwnerCheck {
+                        ring,
+                        name: "me".to_string(),
+                        replication: 1,
+                    },
+                    since: Vec::new(),
                 }),
             }
             .execute(&mut cache),
@@ -2611,10 +2695,13 @@ mod tests {
         let started = std::time::Instant::now();
         let response = Command::Sweep {
             marked: true,
-            owned: Some(OwnerCheck {
-                ring,
-                name: "a".to_string(),
-                replication: 1,
+            owned: Some(SweepOwnership {
+                now: OwnerCheck {
+                    ring,
+                    name: "a".to_string(),
+                    replication: 1,
+                },
+                since: Vec::new(),
             }),
         }
         .execute(&mut cache);
@@ -2699,6 +2786,101 @@ mod tests {
             Response::Swept(0)
         );
         assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));
+    }
+
+    // Issue #970: the keep rule for a dead copy, per membership shape.
+    // `since` is newest first, as `run_sweep` builds it.
+    fn ownership(now: &[&str], since: &[&[&str]], me: &str, replication: usize) -> SweepOwnership {
+        let check = |names: &[&str]| OwnerCheck {
+            ring: Arc::new(HashRing::new(
+                names.iter().map(|name| name.to_string()).collect(),
+            )),
+            name: me.to_string(),
+            replication,
+        };
+        SweepOwnership {
+            now: check(now),
+            since: since.iter().map(|names| check(names)).collect(),
+        }
+    }
+
+    /// A key whose owners are exactly `owners` under `ring` at `replication`
+    /// (the first found among many candidates).
+    fn key_owned_by(ring: &HashRing, replication: usize, owners: &[&str]) -> Key {
+        (0..100_000)
+            .map(|i| key(format!("k{i}").as_bytes()))
+            .find(|k| {
+                let mut got = ring.owners(k, replication);
+                got.sort_unstable();
+                let mut want = owners.to_vec();
+                want.sort_unstable();
+                got == want
+            })
+            .expect("some key has these owners")
+    }
+
+    #[test]
+    fn a_dead_copy_is_kept_when_no_earlier_ring_took_the_key() {
+        let own = ownership(&["x", "a"], &[], "x", 2);
+        let k = key_owned_by(&own.now.ring, 2, &["x", "a"]);
+        assert!(own.keeps_hashed(KeyHash::of(&k)));
+        let not_mine = ownership(&["x", "a", "b"], &[], "x", 1);
+        let k = key_owned_by(&not_mine.now.ring, 1, &["a"]);
+        assert!(!not_mine.keeps_hashed(KeyHash::of(&k)));
+        // Earlier rings under which this node owned the key too say
+        // nothing about who took it: kept, as before.
+        let always_mine = ownership(&["x", "a"], &[&["x", "a"], &["x", "a", "b"]], "x", 1);
+        let k = key_owned_by(&always_mine.since[1].ring, 1, &["x"]);
+        assert!(always_mine.keeps_hashed(KeyHash::of(&k)));
+    }
+
+    #[test]
+    fn a_dead_copy_is_kept_at_replication_one_when_the_joiner_is_gone() {
+        // {x} -> join d: {d} -> d evicted: {x}. Nobody else ever held the
+        // key: the copy x kept is the only one.
+        let own = ownership(&["x"], &[&["d", "x"], &["x"]], "x", 1);
+        let k = key_owned_by(&own.since[0].ring, 1, &["d"]);
+        assert!(own.keeps_hashed(KeyHash::of(&k)));
+    }
+
+    #[test]
+    fn a_dead_copy_goes_when_another_current_owner_saw_the_writes() {
+        // {a, x} -> join d: {d, a} -> d evicted: {a, x}. a owned the key
+        // throughout and re-replicates it to x; x's dead copy may predate a
+        // delete.
+        let flip_back = ownership(&["a", "x"], &[&["d", "a", "x"], &["a", "x"]], "x", 2);
+        let k = key_owned_by(&flip_back.since[0].ring, 2, &["d", "a"]);
+        assert!(!flip_back.keeps_hashed(KeyHash::of(&k)));
+
+        // {a, x} -> join d: {d, a} -> a leaves: {d, x}. d took the key at the
+        // join and saw every write since (issue #970's shape) — whether or
+        // not this node saw the post-join ring published (`run_sweep` puts
+        // the handoff's own post-join ring in `since`).
+        let leave = ownership(&["d", "x"], &[&["d", "a", "x"], &["a", "x"]], "x", 2);
+        assert!(!leave.keeps_hashed(KeyHash::of(&k)));
+    }
+
+    #[test]
+    fn a_dead_copy_is_kept_when_every_other_holder_is_gone() {
+        // {a, x} -> join d: {d, a} -> d and a both evicted: {x, y}. y never
+        // held the key and gained it only now; x's dead copy is the best
+        // copy left.
+        let own = ownership(
+            &["x", "y"],
+            &[&["d", "a", "x", "y"], &["a", "x", "y"]],
+            "x",
+            2,
+        );
+        let k = (0..100_000)
+            .map(|i| key(format!("k{i}").as_bytes()))
+            .find(|k| {
+                let h = KeyHash::of(k);
+                let mut taken = own.since[0].ring.owners_hashed(h, 2);
+                taken.sort_unstable();
+                taken == ["a", "d"] && own.now.owns_hashed(h)
+            })
+            .expect("some key moved from {a, x} to {d, a} and back to x");
+        assert!(own.keeps_hashed(KeyHash::of(&k)));
     }
 
     #[test]
