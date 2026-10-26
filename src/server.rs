@@ -9944,6 +9944,19 @@ fn leave_clear_targets(node_context: &NodeContext) -> Vec<ForwardTarget> {
 /// change newly promoted that this node is an eligible sender for — see
 /// `RereplicationForward`. An expired window is cleared here, lazily, as
 /// `migration_targets_for` clears an expired handoff slot.
+///
+/// Issue #973: a promoted owner is a target only while it still owns the
+/// key under the newest membership this node has adopted. The window is
+/// a snapshot; a join completed inside it (this node's own `M` handoff
+/// adopts the post-join ring at once) can take the key away from the
+/// owner the snapshot promoted, and a write forwarded there after that
+/// lands on the dead copy the join left, releases its mark and leaves a
+/// live copy nobody forwards to again — stale until the node owned the
+/// key once more and served it (a shortened TTL that was then removed on
+/// the owners expired it instead, and the SDK read a miss from the
+/// primary it had been handed on to). The adopted ring is never older
+/// than the window's own `after_ring`: both triggers of a pass adopt the
+/// ring first (`adopt_membership`, the join flip in `run_migration`).
 fn rereplication_targets_for_hashed(
     node_context: &NodeContext,
     key_hash: KeyHash,
@@ -9961,6 +9974,12 @@ fn rereplication_targets_for_hashed(
     let Some(window) = slot.as_ref() else {
         return Vec::new();
     };
+    let adopted = node_context
+        .known_ring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(Arc::clone);
     rereplication_targets(
         &window.before_ring,
         &window.after_ring,
@@ -9969,6 +9988,13 @@ fn rereplication_targets_for_hashed(
         &node_context.name,
     )
     .iter()
+    .filter(|name| {
+        adopted.as_ref().is_none_or(|membership| {
+            membership
+                .ring
+                .is_owner_hashed(key_hash, name, membership.replication)
+        })
+    })
     .filter_map(|name| window.forward_target(name))
     .collect()
 }
@@ -17031,6 +17057,84 @@ mod tests {
             ..node_context
         };
         assert!(handoff_targets_for(&other, &k).is_empty());
+    }
+
+    #[test]
+    fn rereplication_targets_skip_a_promoted_owner_a_later_join_displaced() {
+        // Issue #973: the window promoted `peer` for the keys `dead` held;
+        // a join of `newer` adopted inside the window takes some of those
+        // keys from `peer` again. A write of such a key must not be
+        // forwarded to `peer` any more — it would land on the dead copy
+        // the join left there and revive it — while a key `peer` still
+        // owns under the adopted ring is forwarded as before.
+        let node_context = NodeContext {
+            name: "me".to_string(),
+            token: "tk-me".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            rereplication_forward: Arc::new(Mutex::new(Some(rereplication_window(
+                "127.0.0.1:2",
+                Some(Instant::now()),
+            )))),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+        let adopted = Arc::new(HashRing::new(vec![
+            "me".to_string(),
+            "peer".to_string(),
+            "newer".to_string(),
+        ]));
+        let before = HashRing::new(vec!["dead".to_string(), "me".to_string()]);
+        // Keys this node sends for (an old owner under the window's
+        // before-ring), split by whether `peer` still owns them once
+        // `newer` is in.
+        let mut kept = None;
+        let mut taken = None;
+        for i in 0..200 {
+            let k = key(format!("k{i}").as_bytes());
+            let hash = KeyHash::of(&k);
+            if !before.is_owner_hashed(hash, "me", 2) {
+                continue;
+            }
+            if adopted.is_owner_hashed(hash, "peer", 2) {
+                kept.get_or_insert(k);
+            } else {
+                taken.get_or_insert(k);
+            }
+            if kept.is_some() && taken.is_some() {
+                break;
+            }
+        }
+        let (kept, taken) = (
+            kept.expect("a key peer keeps"),
+            taken.expect("a key newer takes"),
+        );
+
+        // Before the join is adopted the snapshot alone decides.
+        assert_eq!(handoff_targets_for(&node_context, &kept).len(), 1);
+        assert_eq!(handoff_targets_for(&node_context, &taken).len(), 1);
+
+        *node_context.known_ring.lock().unwrap() = Some(Arc::new(Membership {
+            ring: adopted,
+            replication: 2,
+        }));
+        let targets = handoff_targets_for(&node_context, &kept);
+        assert_eq!(targets.len(), 1, "peer still owns it: forwarded");
+        assert_eq!(targets[0].addr, "127.0.0.1:2");
+        assert!(
+            handoff_targets_for(&node_context, &taken).is_empty(),
+            "newer took it from peer: no forward to the displaced copy"
+        );
     }
 
     #[test]
