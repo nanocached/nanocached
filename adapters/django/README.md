@@ -279,7 +279,7 @@ decimal digits of an `int`), and after compression when
 
 ## Requirements
 
-Python 3.11+, Django 4.2+, `nanocached` (Python SDK) 0.4.8+ (what
+Python 3.11+, Django 4.2+, `nanocached` (Python SDK) 0.5.0+ (what
 `pyproject.toml` pins), a nanocached server 0.4.0 or later — the release
 that added namespaces, `CLEAR`, the put-if-absent `add()` uses, the
 `INCR` behind `incr`/`decr`, and the batched multi-get/multi-set behind

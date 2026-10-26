@@ -6,6 +6,8 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-26
+
 ### Fixed
 
 - A `Some(0)` touch (`touch`, `get_and_touch`, `touch_many`,

@@ -10,6 +10,8 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-26
+
 ### Added
 
 - `Touch(key, ttlSeconds)` replaces an entry's TTL in place and reports

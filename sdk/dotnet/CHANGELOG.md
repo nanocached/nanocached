@@ -10,6 +10,8 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-26
+
 ### Fixed
 
 - A touch with a TTL of 0 (`TouchAsync`, `GetAndTouchAsync`,
@@ -550,6 +552,7 @@ changes ship without a deprecation cycle and are listed below.
   earlier changes).
 
 [Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.5...HEAD
+[0.5.0]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.8...sdk/dotnet/v0.5.0
 [0.4.8]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.7...sdk/dotnet/v0.4.8
 [0.4.7]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.6...sdk/dotnet/v0.4.7
 [0.4.6]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.5...sdk/dotnet/v0.4.6

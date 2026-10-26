@@ -9,6 +9,8 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-26
+
 ### Changed
 
 - The minimum supported Node.js is 22 (`engines.node` is `>=22`, was

@@ -11,6 +11,8 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-26
+
 ### Fixed
 
 - `touch`, `getAndTouch`, `touchMany` and `getManyAndTouch` with `ttlSeconds`
@@ -555,6 +557,7 @@ without a deprecation cycle and are listed below.
   release history for earlier changes).
 
 [Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.5...HEAD
+[0.5.0]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.8...sdk/java/v0.5.0
 [0.4.8]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.7...sdk/java/v0.4.8
 [0.4.7]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.6...sdk/java/v0.4.7
 [0.4.6]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.5...sdk/java/v0.4.6
