@@ -2991,6 +2991,27 @@ async fn handle_connection(
                     },
                 )
                 .await?;
+                // Issue #975: a put-if-absent copy — a re-replication pass
+                // promoting this node under the ring it saw — that lands
+                // after this node's own join handoff took its key snapshot
+                // is a copy of a key that handoff's ring has already moved
+                // to the joiner. The relay below gets it to the joiner;
+                // this node's copy is marked like the keys the snapshot did
+                // send, or it stays a live copy of a key this node does not
+                // own, reached by no write (clients route by the published
+                // ring, no window covers it), and goes on to the next
+                // joiner holding whatever it had before the owners deleted
+                // or expired the key. An unconditional handoff is left
+                // alone: a leaver's drain can make this node an owner under
+                // a ring newer than the slot's, which cannot be told apart
+                // here.
+                if if_absent
+                    && matches!(response, Response::Stored)
+                    && let Some(node_context) = &config.node_context
+                    && join_took(node_context, &key)
+                {
+                    mark_migrated(&request_tx, &key).await;
+                }
                 // If this node has a join for the key that discovery has
                 // not confirmed yet, relay it to that joiner too — and only
                 // to that one, see `unconfirmed_join_target_for`: whoever
@@ -7615,6 +7636,30 @@ async fn run_rereplication(
     };
     // Issue #970: dead copies stay out of this handoff unless their marks are still held.
     let skip_dead = marks_released(&node_context.active_migration);
+    // Issue #975: even while the marks are held, a dead copy never goes to
+    // the joiner whose handoff took it (the slot's own, or a lingering
+    // one): that joiner got the key from the handoff itself, so this is at
+    // best a repeat and at worst — a client having deleted or expired the
+    // key on the joiner since — a put-if-absent that brings it back. The
+    // other new owners of a ring change that also dropped a member may
+    // hold nothing yet and still get it.
+    let joiners: HashSet<String> = {
+        let slot = node_context
+            .active_migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_ref() {
+            Some(active) if !active.expired() => std::iter::once(active.joining_name.clone())
+                .chain(
+                    active
+                        .lingering
+                        .iter()
+                        .map(|lingering| lingering.joining_name.clone()),
+                )
+                .collect(),
+            _ => HashSet::new(),
+        }
+    };
 
     let self_name = node_context.name.as_str();
     let mut streams: HashMap<String, ClientStream> = HashMap::new();
@@ -7650,8 +7695,17 @@ async fn run_rereplication(
         else {
             continue;
         };
+        let dead = !skip_dead
+            && !joiners.is_empty()
+            && peek_entry_for_handoff(&node_context.request_tx, &key, true)
+                .await
+                .is_none();
 
         for target in targets {
+            if dead && joiners.contains(&target) {
+                skipped += 1;
+                continue;
+            }
             let Some(addr) = addresses.get(&target) else {
                 skipped += 1;
                 continue;
@@ -9811,6 +9865,53 @@ fn unconfirmed_join_target_for(node_context: &NodeContext, key: &Key) -> Option<
         revoked: Arc::clone(&active.forward_revoked),
         as_handoff: true,
     })
+}
+
+/// Issue #975: whether the join handoff this node is running — in flight,
+/// or completed and not yet confirmed by discovery — moved `key` away from
+/// this node: under the handoff's ring the key's owners include its joiner
+/// or a lingering joiner, and not this node. Until discovery confirms the
+/// join, the handoff's ring is the newest membership this node knows, so
+/// a copy that arrives for a key it does not own under that ring is one
+/// the join took (a sender working from an older roster). Once the join is
+/// confirmed nothing is judged here: discovery may have published rings
+/// since that the slot's ring does not reflect — an eviction promoting
+/// this node for a key the joiner used to own — and a copy arriving then
+/// is just as likely that promotion, which the slot's ring would call
+/// taken (a chaos run marked 94 fresh copies that way). A key this node
+/// does not own under the handoff's ring but no joiner owns either was
+/// never this node's to mark (a ring newer than the handoff's, a leaver's,
+/// may be giving it the key). The key joins `marked_keys`, so an abandon
+/// rolls the mark back with the handoff's own.
+fn join_took(node_context: &NodeContext, key: &Key) -> bool {
+    let key_hash = KeyHash::of(key);
+    let mut slot = node_context
+        .active_migration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.as_ref().is_some_and(ActiveMigration::expired) {
+        *slot = None;
+    }
+    let Some(active) = slot.as_mut() else {
+        return false;
+    };
+    if active.remnant || active.confirmed {
+        return false;
+    }
+    let ring = &active.after_ring;
+    let replication = active.replication;
+    if ring.is_owner_hashed(key_hash, &node_context.name, replication) {
+        return false;
+    }
+    let taken = ring.is_owner_hashed(key_hash, &active.joining_name, replication)
+        || active
+            .lingering
+            .iter()
+            .any(|lingering| ring.is_owner_hashed(key_hash, &lingering.joining_name, replication));
+    if taken {
+        active.marked_keys.push(key.clone());
+    }
+    taken
 }
 
 /// `migration_targets_for` for a key whose hash is already known — see
@@ -18090,6 +18191,187 @@ mod tests {
 
     /// A node with a join slot for `joiner-0` (confirmed or not, window
     /// open), serving one connection; returns the frames the joiner saw.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_put_if_absent_handoff_for_a_key_the_slots_join_took_is_stored_marked() {
+        // Issue #975: a re-replication copy landing after this node's own
+        // handoff snapshot is stored (and relayed to the unconfirmed
+        // joiner) but marked, like the keys the snapshot sent; a key this
+        // node still owns under the slot's ring is stored live, and so is
+        // an unconditional handoff of a taken key (a leaver's drain).
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        // Three members, R=2: some keys are the joiner's and another
+        // member's — taken from this node — and some stay this node's.
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+            "other".to_string(),
+        ]));
+        let mut taken = None;
+        let mut kept = None;
+        for i in 0..200 {
+            let name = format!("k{i}");
+            let hash = KeyHash::of(&key(name.as_bytes()));
+            let mine = after_ring.is_owner_hashed(hash, "ready-node", 2);
+            let joiners = after_ring.is_owner_hashed(hash, "joiner-0", 2);
+            if !mine && joiners {
+                taken.get_or_insert(name);
+            } else if mine {
+                kept.get_or_insert(name);
+            }
+            if taken.is_some() && kept.is_some() {
+                break;
+            }
+        }
+        let taken = taken.expect("a key the join took");
+        let kept = kept.expect("a key this node keeps");
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
+                joining_name: "joiner-0".to_string(),
+                joining_addr: peer_addr,
+                joining_token: "tok-joiner-0".to_string(),
+                after_ring,
+                replication: 2,
+                generation: None,
+                completed_at: Some(Instant::now()),
+                forwarding_grace: Duration::from_secs(60),
+                acked_entries: Some(0),
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: Vec::new(),
+                confirmed: false,
+                pre_completion_ring: None,
+                pending_clears: PendingClears::default(),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
+                lingering: Vec::new(),
+                remnant: false,
+            }))),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        };
+        let slot = Arc::clone(&node_context.active_migration);
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        let unconditional = format!("{taken}-u");
+        let confirmed = format!("{taken}-c");
+        for (name, absent) in [
+            (&taken, true),
+            (&kept, true),
+            (&unconditional, false),
+            (&confirmed, true),
+        ] {
+            if name == &confirmed {
+                // Discovery has confirmed the join: a copy arriving now may
+                // be a promotion under a ring newer than the slot's.
+                slot.lock().unwrap().as_mut().unwrap().confirmed = true;
+            }
+            let frame = format!(
+                "U 0 {} 2 13{}\ntk-ready-node{name}v1",
+                name.len(),
+                if absent { " A" } else { "" }
+            );
+            client.write_all(frame.as_bytes()).await.unwrap();
+            let mut reply = [0_u8; 2];
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+                .await
+                .expect("a reply within 5 s")
+                .unwrap();
+            assert_eq!(&reply, b"S\n", "{frame:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        client.shutdown().await.unwrap();
+        connection_task.await.unwrap().unwrap();
+
+        let entry = |name: &str, live: bool| {
+            let key = key(name.as_bytes());
+            let command = if live {
+                Command::PeekLiveEntry { key }
+            } else {
+                Command::PeekEntry { key }
+            };
+            let request_tx = request_tx.clone();
+            async move {
+                match execute_command(&request_tx, command).await.unwrap() {
+                    Response::Entries(entries) => entries.len(),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        };
+        assert_eq!(entry(&taken, false).await, 1, "the taken key is stored");
+        assert_eq!(entry(&taken, true).await, 0, "and marked: not live");
+        assert_eq!(entry(&kept, true).await, 1, "a key this node keeps is live");
+        assert_eq!(
+            entry(&unconditional, true).await,
+            1,
+            "an unconditional handoff of a taken key is live (a leaver's drain)"
+        );
+        assert_eq!(
+            entry(&confirmed, true).await,
+            1,
+            "once the join is confirmed a put-if-absent copy is live: it may be a promotion"
+        );
+        assert_eq!(
+            slot.lock().unwrap().as_ref().unwrap().marked_keys,
+            vec![key(taken.as_bytes())],
+            "the mark joins the handoff's own, for an abandon to roll back"
+        );
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+        peer_task.abort();
+        let relayed = frames.lock().unwrap().clone();
+        assert!(
+            relayed.iter().any(|frame| {
+                frame.starts_with(b"U ") && frame.ends_with(format!("{taken}v1").as_bytes())
+            }),
+            "the taken key was still relayed to the unconfirmed joiner: {relayed:?}"
+        );
+    }
+
     async fn frames_relayed_to_the_slot_joiner(
         confirmed: bool,
         requests: &[(&str, &[u8])],
@@ -23964,6 +24246,121 @@ mod tests {
                 held.push(connection);
             }
         })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dead_copy_is_not_re_replicated_to_the_joiner_whose_handoff_took_it() {
+        // Issue #975: while the join is unconfirmed the marks are held and
+        // the pass may hand dead copies on (issue #970) — but never to the
+        // joiner that took them: it holds the key from the handoff, and a
+        // put-if-absent landing after a client expired or deleted it there
+        // brought it back. Another new owner still gets the dead copy.
+        async fn run(target: &str, confirmed: bool) -> Vec<Vec<u8>> {
+            let (request_tx, request_rx) = mpsc::channel(4);
+            let cache_task =
+                tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+            // Two members before and after, R=2: node-a owns every key under
+            // both rings and `target` is new for every key.
+            let before_ring = HashRing::new(vec!["node-a".to_string(), "gone".to_string()]);
+            let after_ring = HashRing::new(vec!["node-a".to_string(), target.to_string()]);
+            let replication = 2;
+            let dead = key(b"dead-copy");
+            let live = key(b"live-copy");
+            for name in [&dead, &live] {
+                send_command(
+                    &request_tx,
+                    Command::Set {
+                        key: name.clone(),
+                        value: Bytes::from_static(b"v"),
+                        ttl: None,
+                    },
+                )
+                .await;
+            }
+            send_command(&request_tx, Command::MarkMigrated { key: dead.clone() }).await;
+
+            let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let peer_addr = peer_listener.local_addr().unwrap().to_string();
+            let (frames, peer_task) = spawn_rereplication_recording_peer(peer_listener);
+
+            // The handoff that marked `dead` was to "joiner": completed,
+            // confirmed or not.
+            let slot = ActiveMigration {
+                joining_name: "joiner".to_string(),
+                joining_addr: peer_addr.clone(),
+                joining_token: "tok-joiner".to_string(),
+                after_ring: Arc::new(HashRing::new(vec![
+                    "node-a".to_string(),
+                    "joiner".to_string(),
+                ])),
+                replication,
+                generation: None,
+                completed_at: Some(Instant::now()),
+                forwarding_grace: Duration::from_secs(60),
+                acked_entries: Some(0),
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: vec![dead.clone()],
+                confirmed,
+                pre_completion_ring: None,
+                pending_clears: PendingClears::default(),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
+                lingering: Vec::new(),
+                remnant: false,
+            };
+            let mut node_context = test_node_context(
+                "node-a",
+                "tok-a",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(Some(slot))),
+            );
+            node_context.request_tx = request_tx.clone();
+            node_context.auth_secret = None;
+
+            let addresses = HashMap::from([(target.to_string(), peer_addr)]);
+            let tokens = HashMap::from([(target.to_string(), format!("tok-{target}"))]);
+            let abort_requested = Arc::new(AtomicBool::new(false));
+            let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+            run_rereplication(
+                &node_context,
+                &before_ring,
+                &after_ring,
+                replication,
+                &addresses,
+                &tokens,
+                &abort_requested,
+                &mut shutdown_rx,
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            drop(node_context);
+            drop(request_tx);
+            cache_task.await.unwrap();
+            peer_task.abort();
+            frames.lock().unwrap().clone()
+        }
+        fn keys_in(frames: &[Vec<u8>]) -> Vec<&'static str> {
+            ["dead-copy", "live-copy"]
+                .into_iter()
+                .filter(|name| {
+                    frames
+                        .iter()
+                        .any(|frame| frame.ends_with(format!("{name}v").as_bytes()))
+                })
+                .collect()
+        }
+
+        // Unconfirmed, the target is the joiner: the live copy only.
+        assert_eq!(keys_in(&run("joiner", false).await), vec!["live-copy"]);
+        // Unconfirmed, another new owner: it gets the dead copy too.
+        assert_eq!(
+            keys_in(&run("other", false).await),
+            vec!["dead-copy", "live-copy"]
+        );
+        // Confirmed: the marks are released and dead copies stay out either way.
+        assert_eq!(keys_in(&run("joiner", true).await), vec!["live-copy"]);
+        assert_eq!(keys_in(&run("other", true).await), vec!["live-copy"]);
     }
 
     #[tokio::test(flavor = "current_thread")]

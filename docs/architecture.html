@@ -254,7 +254,21 @@ are orchestrated by discovery in stages:</p>
 </ol>
 <p>Migrated-away entries are swept only after the join is confirmed, and
 the forwarding window stays open past completion to cover clients still
-routing with the older node list. Joins are serialized — one handoff at a
+routing with the older node list. A put-if-absent handoff that reaches the
+source after its snapshot was taken (a survivor&rsquo;s re-replication
+promoting it under a ring the join has already superseded) is stored and
+relayed to the joiner like any concurrent write, and &mdash; while the
+join is still unconfirmed, so its ring is the newest this node knows
+&mdash; marked like the keys the snapshot sent when that ring gives the key
+to a joiner and not to this node, so the sweep removes it instead of a
+later join handing it on. The re-replication pass the join itself triggers on the source
+never sends a dead copy to the joiner that took it, confirmed or not: the
+joiner holds the key from the handoff, and a put-if-absent landing after a
+client expired or deleted it there would bring it back. A decommissioning
+node relays a handoff it receives to its entrant only when it changed
+something, so its own drain echoing back through the entrant cannot
+circle; a TTL given, removed or set to zero counts as a change, a TTL
+merely shorter than the one held (what an echo carries) does not. Joins are serialized — one handoff at a
 time, cluster-wide — so a fleet started at once simply queues; a source
 that has finished one handoff accepts the next join's request while it is
 still forwarding for the previous one, and keeps forwarding to the earlier
