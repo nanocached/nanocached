@@ -87,6 +87,15 @@ framework adapters at one version, whether or not a component changed.
   as misses and a `G` lost the value the first one consumed. The client now
   gets the fatal `E`, as for `i`, `k` and `x`, and reads the key to learn what
   happened; a frame that provably never left the proxy is still retried.
+- `nanocached-proxy`: the deferred plain legs of a `ttl=0` `y` batch go to
+  every current owner of a key but the node that answered for it, as the
+  single-key `t` path and the SDKs send them, and they go out before the
+  frame is answered, whatever that answer is. They used to go to the ring's
+  rank 1 and below, which, once the retry pass had refreshed the ring, could
+  skip a key's new first owner and touch the node that had already expired
+  its copy again; and a frame whose outcome was unknown (`E`) skipped them
+  for every key, leaving the replicas of the keys that had been answered
+  holding copies the caller asked to expire.
 
 ### Security
 
