@@ -9,6 +9,8 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-26
+
 ### Fixed
 
 - A `ttl=0` `touch`, `get_and_touch`, `touch_many` or `get_many_and_touch`
@@ -511,6 +513,7 @@ without a deprecation cycle and are listed below.
   release history for earlier changes).
 
 [Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.5...HEAD
+[0.5.0]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.8...sdk/python/v0.5.0
 [0.4.8]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.7...sdk/python/v0.4.8
 [0.4.7]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.6...sdk/python/v0.4.7
 [0.4.6]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.5...sdk/python/v0.4.6

@@ -53,4 +53,4 @@ __all__ = [
 
 # Must match sdk/python/pyproject.toml's `version` — tools/release-all.sh
 # verifies both before tagging a release.
-__version__ = "0.4.8"
+__version__ = "0.5.0"
