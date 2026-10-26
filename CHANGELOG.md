@@ -14,6 +14,23 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a write landing on a node during the forwarding
+  window of a re-replication pass (the 60 s after a membership change in
+  which such writes are mirrored to the owners the change promoted) was
+  forwarded by the ring snapshot the pass was computed with. A join adopted
+  inside that window can take a key away from an owner the snapshot
+  promoted; the write still went there, as an unconditional handoff, landed
+  on the dead copy the join had left and revived it as a live copy no one
+  forwards to again. When a later eviction made that node an owner of the
+  key once more, the revived copy — stale by every write since — was
+  present, so the put-if-absent re-replication from the surviving owner was
+  refused and the node served and handed on the stale copy. A touch that
+  shortened the TTL in the window, followed by one that removed it on the
+  owners, left the copy to expire: a replica missing, and a miss from the
+  primary once a fresh joiner had been handed the copy. A write during the
+  window is now mirrored to a promoted owner only while that owner still
+  owns the key under the newest membership the node has adopted.
+
 - `nanocached-node`: a key deleted (`D`/`d`) or expired by a touch
   (`t`/`y` with a TTL of `0`) while a former owner still held the dead copy
   a join had taken from it came back — with the old value and no TTL

@@ -452,7 +452,11 @@ here.</p>
   refresh interval; and with R&nbsp;&ge;&nbsp;3 two senders&rsquo;
   unconditional forwards of one key can interleave at the promoted
   owner, which is the lagging-forward item above. Accepted: both are the
-  same exposure the join and decommission windows carry.</li>
+  same exposure the join and decommission windows carry. A join adopted
+  inside the window is not one of them: a write is mirrored to a
+  promoted owner only while that owner still owns the key under the
+  newest membership the node has adopted, so an owner the join has just
+  displaced gets nothing that would revive the dead copy it holds.</li>
   <li>Concurrent writes to one key have no order across its owners: each
   owner keeps the write that reached it last, so two callers (threads,
   tasks, or clients) racing a <code>set</code> or a <code>set</code>
