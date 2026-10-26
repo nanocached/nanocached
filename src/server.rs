@@ -1,5 +1,7 @@
 use crate::cache::{Cache, SWEEP_BUDGET};
-use crate::command::{Command, MigrateProgress, OwnerCheck, ParseError, parse_resumable};
+use crate::command::{
+    Command, MigrateProgress, OwnerCheck, ParseError, SweepOwnership, parse_resumable,
+};
 use crate::hash_ring::{HashRing, KeyHash, KeyHasher};
 use crate::key::Key;
 use crate::response::{MultiAckEntry, MultiEntry, MultiTouchEntry, Response};
@@ -1189,6 +1191,7 @@ pub(crate) async fn run_with_hooks(
             (
                 Arc::clone(&node_context.known_ring),
                 node_context.name.clone(),
+                node_context.ring_history.clone(),
             )
         }),
         shutdown_rx.clone(),
@@ -4981,7 +4984,16 @@ type KnownRing = Arc<Mutex<Option<Arc<Membership>>>>;
 /// was exactly a key owned under R0, not under R1 for eight seconds, and
 /// owned again under R2.
 #[derive(Clone, Default)]
-struct RingHistory(Arc<Mutex<RingHistoryInner>>);
+struct RingHistory(Arc<RingHistoryShared>);
+
+#[derive(Default)]
+struct RingHistoryShared {
+    inner: Mutex<RingHistoryInner>,
+    /// Issue #970: woken by every `record` and `touch`, so the mark sweep
+    /// re-judges its dead copies as soon as the membership moves instead of
+    /// up to `SWEEP_INTERVAL` later (`run_sweep`).
+    changed: tokio::sync::Notify,
+}
 
 #[derive(Default)]
 struct RingHistoryInner {
@@ -5003,6 +5015,7 @@ impl RingHistory {
     fn record_if_new_at(&self, membership: Arc<Membership>, now: Instant) {
         let mut inner = self
             .0
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some((_, newest)) = inner.epochs.last()
@@ -5013,12 +5026,15 @@ impl RingHistory {
         }
         inner.epochs.push((now, membership));
         inner.generation += 1;
+        drop(inner);
+        self.0.changed.notify_one();
     }
 
     #[cfg(test)]
     fn record_at(&self, membership: Arc<Membership>, now: Instant) {
         let mut inner = self
             .0
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.epochs.push((now, membership));
@@ -5034,14 +5050,48 @@ impl RingHistory {
     fn touch(&self) {
         let mut inner = self
             .0
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.generation += 1;
+        drop(inner);
+        self.0.changed.notify_one();
+    }
+
+    /// Issue #970: the memberships in the history other than `current`,
+    /// newest first — the rings the mark sweep judges a dead copy's other
+    /// owners against (`SweepOwnership::since`). Empty for a fresh node or
+    /// a membership that has stood longer than the reclaim grace keeps
+    /// rings for.
+    fn rings_before(&self, current: &Membership) -> Vec<Arc<Membership>> {
+        let inner = self
+            .0
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .epochs
+            .iter()
+            .rev()
+            .map(|(_, membership)| membership)
+            .filter(|membership| {
+                !std::ptr::eq(membership.as_ref(), current)
+                    && !same_members(membership, current.ring.nodes(), current.replication)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Resolves when the history next moves (`record_if_new`, `touch`) —
+    /// or at once if it moved since the last wait.
+    async fn changed(&self) {
+        self.0.changed.notified().await;
     }
 
     #[cfg(test)]
     fn generation(&self) -> u64 {
         self.0
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .generation
@@ -5065,6 +5115,7 @@ impl RingHistory {
     ) -> Option<(Vec<OwnerCheck>, u64)> {
         let mut inner = self
             .0
+            .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let cutoff = now.checked_sub(grace)?;
@@ -6040,7 +6091,12 @@ async fn run_migration(
             return;
         }
 
-        let Some((_, value, ttl)) = peek_entry(&node_context.request_tx, &key).await else {
+        // Issue #970: a copy an earlier join took away (dead, awaiting
+        // the sweep) is not handed to this joiner — the owners have the
+        // live state. The slot is this run's own, so no mark is held.
+        let Some((_, value, ttl)) =
+            peek_entry_for_handoff(&node_context.request_tx, &key, true).await
+        else {
             continue;
         };
 
@@ -6673,6 +6729,8 @@ async fn run_decommission(
         send_leave(&node_context, &discovery_addrs).await;
         return;
     };
+    // Issue #970: dead copies stay out of this handoff unless their marks are still held.
+    let skip_dead = marks_released(&node_context.active_migration);
     let mut streams: HashMap<String, ClientStream> = HashMap::new();
     let mut sent = 0usize;
     let mut left_behind = 0usize;
@@ -6733,7 +6791,9 @@ async fn run_decommission(
 
         // Live re-peek, same reasoning as the join transfer: a client
         // write racing this key's turn must win.
-        let Some((_, value, ttl)) = peek_entry(&node_context.request_tx, &key).await else {
+        let Some((_, value, ttl)) =
+            peek_entry_for_handoff(&node_context.request_tx, &key, skip_dead).await
+        else {
             continue;
         };
 
@@ -7553,6 +7613,8 @@ async fn run_rereplication(
         eprintln!("WARN re-replication: cache task is unavailable");
         return;
     };
+    // Issue #970: dead copies stay out of this handoff unless their marks are still held.
+    let skip_dead = marks_released(&node_context.active_migration);
 
     let self_name = node_context.name.as_str();
     let mut streams: HashMap<String, ClientStream> = HashMap::new();
@@ -7583,7 +7645,9 @@ async fn run_rereplication(
         // Live re-peek, same reasoning as the join transfer and the
         // decommission's own: a concurrent client write must win over
         // whatever this snapshot held.
-        let Some((_, value, ttl)) = peek_entry(&node_context.request_tx, &key).await else {
+        let Some((_, value, ttl)) =
+            peek_entry_for_handoff(&node_context.request_tx, &key, skip_dead).await
+        else {
             continue;
         };
 
@@ -7687,14 +7751,40 @@ async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Key>> 
     }
 }
 
-async fn peek_entry(
+/// The live re-peek a handoff sender does right before sending a key
+/// (`Cache::peek_entry`). With `skip_dead` (issue #970), a copy this node
+/// holds dead — `migrated`-marked since a join took the key away — reads
+/// as absent, so it is never passed on; `marks_released` says when that is
+/// safe.
+async fn peek_entry_for_handoff(
     request_tx: &mpsc::Sender<CacheRequest>,
     key: &Key,
+    skip_dead: bool,
 ) -> Option<(Key, Bytes, Option<Duration>)> {
-    match execute_command(request_tx, Command::PeekEntry { key: key.clone() }).await {
+    let command = if skip_dead {
+        Command::PeekLiveEntry { key: key.clone() }
+    } else {
+        Command::PeekEntry { key: key.clone() }
+    };
+    match execute_command(request_tx, command).await {
         Ok(Response::Entries(mut entries)) => entries.pop(),
         _ => None,
     }
+}
+
+/// Issue #970: whether this node's dead copies may be left out of a
+/// handoff it sends. Marks are held — the copies they name may become
+/// live again — only while the join that made them is undecided (a
+/// completed slot discovery has not confirmed, issue #62); once confirmed
+/// they are released to the sweep, and a decommission drain or a
+/// re-replication pass that runs before the sweep got to them must not
+/// hand them on as if live. With no slot there are no held marks.
+fn marks_released(active_migration: &Arc<Mutex<Option<ActiveMigration>>>) -> bool {
+    !active_migration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|active| active.completed_at.is_some() && !active.confirmed)
 }
 
 async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
@@ -8038,12 +8128,24 @@ fn reclaim_checks(node_context: &NodeContext) -> Option<(Vec<OwnerCheck>, u64)> 
 async fn run_sweep(
     request_tx: mpsc::Sender<CacheRequest>,
     active_migration: Arc<Mutex<Option<ActiveMigration>>>,
-    ownership: Option<(KnownRing, String)>,
+    ownership: Option<(KnownRing, String, RingHistory)>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
-        if wait_or_shutdown(SWEEP_INTERVAL, &mut shutdown_rx).await {
-            return;
+        // Issue #970: a membership change can make this node an owner of
+        // keys it holds dead copies of; judge those (`SweepOwnership`) as
+        // soon as the ring moves rather than up to an interval later,
+        // during which a dead copy of a deleted key would be served live.
+        let membership_moved = async {
+            match &ownership {
+                Some((_, _, history)) => history.changed().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = sleep(SWEEP_INTERVAL) => {}
+            _ = membership_moved => {}
+            _ = shutdown_rx.changed() => return,
         }
 
         loop {
@@ -8067,19 +8169,48 @@ async fn run_sweep(
                 break;
             }
 
-            // The ring as adopted now: a marked copy of a key this node
-            // owns under it — its joiner evicted since — is kept, not
-            // reclaimed (`Cache::sweep_keeping`).
-            let owned = ownership.as_ref().and_then(|(known_ring, name)| {
-                known_ring
+            // The ring as adopted now and the published one before it: a
+            // marked copy of a key this node owns again is kept only when
+            // no other current owner saw the writes it missed
+            // (`SweepOwnership`, issue #970); otherwise it is reclaimed and
+            // that owner's re-replication brings the key back if it still
+            // exists.
+            let owned = ownership.as_ref().and_then(|(known_ring, name, history)| {
+                let membership = known_ring
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .as_ref()
-                    .map(|membership| OwnerCheck {
-                        ring: Arc::clone(&membership.ring),
-                        name: name.clone(),
-                        replication: membership.replication,
+                    .map(Arc::clone)?;
+                let check = |ring: &Arc<HashRing>, replication: usize| OwnerCheck {
+                    ring: Arc::clone(ring),
+                    name: name.clone(),
+                    replication,
+                };
+                // The handoff this node last sent installed its post-join
+                // ring here at completion; discovery may publish that ring
+                // later, or the next heartbeat may already carry a later
+                // one, so it goes in front of the published history.
+                let handoff_ring = active_migration
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    .filter(|active| {
+                        !same_members(&membership, active.after_ring.nodes(), active.replication)
                     })
+                    .map(|active| check(&active.after_ring, active.replication));
+                let since = handoff_ring
+                    .into_iter()
+                    .chain(
+                        history
+                            .rings_before(&membership)
+                            .iter()
+                            .map(|older| check(&older.ring, older.replication)),
+                    )
+                    .collect();
+                Some(SweepOwnership {
+                    now: check(&membership.ring, membership.replication),
+                    since,
+                })
             });
             tokio::select! {
                 result = sweep(&request_tx, !marks_held, owned) => match result {
@@ -8095,7 +8226,7 @@ async fn run_sweep(
 async fn sweep(
     request_tx: &mpsc::Sender<CacheRequest>,
     marked: bool,
-    owned: Option<OwnerCheck>,
+    owned: Option<SweepOwnership>,
 ) -> Option<usize> {
     let (response_tx, response_rx) = oneshot::channel();
 
@@ -20248,7 +20379,7 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(Arc::ptr_eq(&checks[0].ring, &b.ring));
         assert_eq!(
-            history.0.lock().unwrap().epochs.len(),
+            history.0.inner.lock().unwrap().epochs.len(),
             1,
             "memberships older than the one in force at the window's start are dropped"
         );
@@ -20267,17 +20398,17 @@ mod tests {
         history.record_if_new_at(Arc::clone(&a), t0 + Duration::from_secs(5));
         history.record_if_new_at(a_again, t0 + Duration::from_secs(10));
         assert_eq!(
-            history.0.lock().unwrap().epochs.len(),
+            history.0.inner.lock().unwrap().epochs.len(),
             1,
             "a heartbeat repeat is not an epoch"
         );
-        assert_eq!(history.0.lock().unwrap().generation, 1);
+        assert_eq!(history.0.inner.lock().unwrap().generation, 1);
 
         history.record_if_new_at(a_r2, t0 + Duration::from_secs(15));
         history.record_if_new_at(b, t0 + Duration::from_secs(20));
         history.record_if_new_at(a, t0 + Duration::from_secs(25));
         assert_eq!(
-            history.0.lock().unwrap().epochs.len(),
+            history.0.inner.lock().unwrap().epochs.len(),
             4,
             "replication and member changes are"
         );
@@ -20589,6 +20720,35 @@ mod tests {
         drop(request_tx);
         drop(node_context);
         cache_task.await.unwrap();
+    }
+
+    #[test]
+    fn ring_history_lists_the_rings_published_before_the_current_one() {
+        // Issue #970: the sweep judges a dead copy's other owners against
+        // the rings before the one adopted now, newest first; a republished
+        // (same members) ring is not "before", and nothing is before a
+        // first ring.
+        let history = RingHistory::default();
+        let t0 = Instant::now();
+        let r0 = membership_of(&["a", "x"], 2);
+        let r1 = membership_of(&["a", "x", "d"], 2);
+        let r1_again = membership_of(&["d", "x", "a"], 2);
+        let r2 = membership_of(&["d", "x"], 2);
+        assert!(history.rings_before(&r0).is_empty());
+        history.record_if_new_at(Arc::clone(&r0), t0);
+        assert!(
+            history.rings_before(&r0).is_empty(),
+            "nothing before the first ring"
+        );
+        history.record_if_new_at(Arc::clone(&r1), t0 + Duration::from_secs(1));
+        let before = history.rings_before(&r1);
+        assert!(before.len() == 1 && Arc::ptr_eq(&before[0], &r0));
+        // The ring adopted now may be a fresh allocation of the same members.
+        let before = history.rings_before(&r1_again);
+        assert!(before.len() == 1 && Arc::ptr_eq(&before[0], &r0));
+        history.record_if_new_at(Arc::clone(&r2), t0 + Duration::from_secs(2));
+        let before = history.rings_before(&r2);
+        assert!(before.len() == 2 && Arc::ptr_eq(&before[0], &r1) && Arc::ptr_eq(&before[1], &r0));
     }
 
     #[test]
