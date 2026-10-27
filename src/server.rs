@@ -752,6 +752,9 @@ async fn drain_connection_tasks(
 /// the discovery server to report `C` once the handoff is done.
 #[derive(Clone)]
 struct NodeContext {
+    /// Test-only hold points (`RunHooks::gates`).
+    #[cfg(test)]
+    gates: Arc<SimGates>,
     /// This node's own random per-process identity (node identity decoupled from address), needed to
     /// identify this node as the sender when it reports `C`.
     name: String,
@@ -1049,6 +1052,56 @@ pub(crate) type ShutdownSignal = Pin<Box<dyn Future<Output = io::Result<()>> + S
 /// can run several nodes in one process (see `sim.rs`): when each of them is
 /// asked to stop, and the name it registers under. The binary uses the
 /// default: the process's own termination signals and a random name.
+/// Test-only hold points inside a node, for the in-process simulator
+/// (`sim.rs`): a scenario that needs one frame to land between two others
+/// holds the task that would send it and releases it when the others have
+/// landed. Open by default; a held gate stops the task before its next
+/// send, nothing in flight is touched.
+#[cfg(test)]
+pub(crate) struct Gate(tokio::sync::watch::Sender<bool>);
+
+#[cfg(test)]
+impl Default for Gate {
+    fn default() -> Self {
+        Gate(tokio::sync::watch::channel(true).0)
+    }
+}
+
+#[cfg(test)]
+impl Gate {
+    pub(crate) fn hold(&self) {
+        self.0.send_replace(false);
+    }
+
+    pub(crate) fn release(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// Returns once the gate is open.
+    pub(crate) async fn wait(&self) {
+        let mut open = self.0.subscribe();
+        while !*open.borrow_and_update() {
+            if open.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// The gates a node consults, one per sending task.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SimGates {
+    /// `drain_forward_queue`: a concurrent write forwarded to a joiner,
+    /// a handoff relayed to it, a write mirrored through a window.
+    pub(crate) forward: Gate,
+    /// `run_migration`'s transfer of this node's keys to a joiner.
+    pub(crate) transfer: Gate,
+    /// `run_rereplication`: the put-if-absent copies a membership change
+    /// sends to the owners it promoted.
+    pub(crate) pass: Gate,
+}
+
 pub(crate) struct RunHooks {
     /// Called for the first signal and again each time one is taken (a
     /// second signal while draining overrides the drain, issue #407), so it
@@ -1060,6 +1113,9 @@ pub(crate) struct RunHooks {
     /// `address`: a test that chose the port ahead of time keeps it bound
     /// until the node takes over, so nothing else can be handed it.
     pub(crate) listener: Option<TcpListener>,
+    /// Hold points for a simulator scenario; open unless it holds one.
+    #[cfg(test)]
+    pub(crate) gates: Arc<SimGates>,
 }
 
 impl Default for RunHooks {
@@ -1068,6 +1124,8 @@ impl Default for RunHooks {
             shutdown: Box::new(|| Box::pin(shutdown_signal())),
             node_name: None,
             listener: None,
+            #[cfg(test)]
+            gates: Arc::default(),
         }
     }
 }
@@ -1156,7 +1214,11 @@ pub(crate) async fn run_with_hooks(
     // isn't already lost anyway. Only meaningful when this node registers
     // with a discovery server at all.
     let mut node_name = hooks.node_name.take();
+    #[cfg(test)]
+    let gates = Arc::clone(&hooks.gates);
     let node_context = heartbeat.as_ref().map(|config| NodeContext {
+        #[cfg(test)]
+        gates: Arc::clone(&gates),
         name: node_name
             .take()
             .unwrap_or_else(|| Uuid::new_v4().to_string()),
@@ -6121,6 +6183,8 @@ async fn run_migration(
             continue;
         };
 
+        #[cfg(test)]
+        node_context.gates.transfer.wait().await;
         let sent = transfer_with_retries(
             &node_context,
             &joining_addr,
@@ -7754,6 +7818,8 @@ async fn run_rereplication(
                 let Some(stream) = streams.get_mut(addr) else {
                     continue;
                 };
+                #[cfg(test)]
+                node_context.gates.pass.wait().await;
                 let sent_one = tokio::select! {
                     biased;
                     _ = shutdown_requested(shutdown_rx) => None,
@@ -9269,6 +9335,8 @@ async fn drain_forward_queue(queues: Arc<ForwardQueues>, id: usize) {
     let _guard = Deactivate(Arc::clone(&queues), id);
 
     while let Some((node_context, target, write)) = queues.next(id) {
+        #[cfg(test)]
+        node_context.gates.forward.wait().await;
         forward_with_retries(node_context, target, write).await;
     }
 }
@@ -10462,6 +10530,7 @@ mod tests {
         });
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "reporter".to_string(),
             token: "tk-reporter".to_string(),
             discovery_addr,
@@ -10823,6 +10892,7 @@ mod tests {
         });
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -10917,6 +10987,7 @@ mod tests {
         });
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -11003,6 +11074,7 @@ mod tests {
         });
 
         let node_context = Arc::new(NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -11085,6 +11157,7 @@ mod tests {
         });
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -11161,6 +11234,7 @@ mod tests {
         });
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -11261,6 +11335,7 @@ mod tests {
         });
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -11391,6 +11466,7 @@ mod tests {
         });
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -11526,6 +11602,7 @@ mod tests {
             "joiner-0".to_string(),
         ]));
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -11678,6 +11755,7 @@ mod tests {
             "joiner-0".to_string(),
         ]));
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -14458,6 +14536,7 @@ mod tests {
             "joiner-0".to_string(),
         ]));
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -14568,6 +14647,7 @@ mod tests {
             "joiner-0".to_string(),
         ]));
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -14857,6 +14937,7 @@ mod tests {
         });
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr,
@@ -14967,6 +15048,7 @@ mod tests {
 
         // A membership view where some other node owns everything.
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "self".to_string(),
             token: "tk-self".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -15039,6 +15121,7 @@ mod tests {
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "self".to_string(),
             token: "tk-self".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -15132,6 +15215,7 @@ mod tests {
         let mut active_migration = test_active_migration(Some(Instant::now()));
         active_migration.joining_addr = joiner_addr;
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "test-node".to_string(),
             token: "tk-self".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -15316,6 +15400,7 @@ mod tests {
         .await;
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "self".to_string(),
             token: "tk-self".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -16244,6 +16329,7 @@ mod tests {
         ]));
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -16381,6 +16467,7 @@ mod tests {
         ]));
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -16517,6 +16604,7 @@ mod tests {
         tokens.insert("peer".to_string(), "tok-peer".to_string());
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -16657,6 +16745,7 @@ mod tests {
         tokens.insert("peer".to_string(), "tok-peer".to_string());
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -16771,6 +16860,7 @@ mod tests {
         tokens.insert("peer-b".to_string(), "tok-b".to_string());
         // peer-c: no token in the roster — not a target.
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -16848,6 +16938,7 @@ mod tests {
         tokens.insert("peer".to_string(), "tok-peer".to_string());
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -16978,6 +17069,7 @@ mod tests {
         tokens.insert("peer".to_string(), "tok-peer".to_string());
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -17095,6 +17187,7 @@ mod tests {
     #[test]
     fn rereplication_targets_for_follow_the_window_and_clear_it_once_the_grace_has_passed() {
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "me".to_string(),
             token: "tk-me".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -17150,6 +17243,7 @@ mod tests {
 
         // A node that was not an old owner of the key is no sender for it.
         let other = NodeContext {
+            gates: Default::default(),
             name: "peer".to_string(),
             rereplication_forward: Arc::new(Mutex::new(Some(rereplication_window(
                 "127.0.0.1:2",
@@ -17169,6 +17263,7 @@ mod tests {
         // the join left there and revive it — while a key `peer` still
         // owns under the adopted ring is forwarded as before.
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "me".to_string(),
             token: "tk-me".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -17241,6 +17336,7 @@ mod tests {
     #[test]
     fn rereplication_clear_targets_name_every_other_member_while_the_window_is_open() {
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "me".to_string(),
             token: "tk-me".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -17304,6 +17400,7 @@ mod tests {
         let (frames, peer_task) = spawn_recording_peer(peer_listener);
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "me".to_string(),
             token: "tk-me".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -17407,6 +17504,7 @@ mod tests {
         let (frames, peer_task) = spawn_recording_peer(peer_listener);
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "me".to_string(),
             token: "tk-me".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -17514,6 +17612,7 @@ mod tests {
         let (peer_frames, peer_task) = spawn_recording_peer(peer_listener);
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "me".to_string(),
             token: "tk-me".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -17822,6 +17921,7 @@ mod tests {
         let (request_tx, request_rx) = mpsc::channel(4);
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "entrant".to_string(),
             token: "tk-entrant".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -17923,6 +18023,7 @@ mod tests {
         tokens.insert("peer".to_string(), "tok-peer".to_string());
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -18058,6 +18159,7 @@ mod tests {
         tokens.insert("peer".to_string(), "tok-peer".to_string());
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -18231,6 +18333,7 @@ mod tests {
         let kept = kept.expect("a key this node keeps");
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -18389,6 +18492,7 @@ mod tests {
             "joiner-0".to_string(),
         ]));
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -18582,6 +18686,7 @@ mod tests {
 
     fn two_node_context(name: &str, request_tx: mpsc::Sender<CacheRequest>) -> NodeContext {
         NodeContext {
+            gates: Default::default(),
             name: name.to_string(),
             token: format!("tk-{name}"),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -18737,6 +18842,7 @@ mod tests {
         let active_migration: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -18893,6 +18999,7 @@ mod tests {
         let leaving: Arc<Mutex<Option<LeaveState>>> = Arc::new(Mutex::new(None));
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -19230,6 +19337,7 @@ mod tests {
         // function's before/after rings are used to decide handoff roles
         // from.
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "self".to_string(),
             token: "tok-self".to_string(),
             discovery_addr: "127.0.0.1:1".to_string(),
@@ -19400,6 +19508,7 @@ mod tests {
             spawn_mock_discovery(discovery_listener, peer_addr.clone(), None);
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: discovery_addr.clone(),
@@ -19495,6 +19604,7 @@ mod tests {
         shutdown_tx.send_replace(true);
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: discovery_addr.clone(),
@@ -19593,6 +19703,7 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: discovery_addr.clone(),
@@ -19693,6 +19804,7 @@ mod tests {
         // regardless of the capped deadline this test means to exercise.
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: discovery_addr.clone(),
@@ -19837,6 +19949,7 @@ mod tests {
         // this test checks.
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: discovery_addr.clone(),
@@ -20102,6 +20215,7 @@ mod tests {
         );
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "leaver".to_string(),
             token: "tk-leaver".to_string(),
             discovery_addr: discovery_addr.clone(),
@@ -20306,6 +20420,7 @@ mod tests {
         });
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr,
@@ -20604,6 +20719,7 @@ mod tests {
 
         let (rereplication_tx, mut rereplication_rx) = mpsc::channel::<RereplicationTask>(4);
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "node-x".to_string(),
             token: "tk-node-x".to_string(),
             discovery_addr,
@@ -20847,6 +20963,7 @@ mod tests {
     /// cache actor: the shape `reclaim_pass` runs against in production.
     fn reclaim_test_context(request_tx: mpsc::Sender<CacheRequest>) -> NodeContext {
         NodeContext {
+            gates: Default::default(),
             name: "me".to_string(),
             token: "tk-me".to_string(),
             discovery_addr: "d".to_string(),
@@ -21226,6 +21343,7 @@ mod tests {
         Box::leak(Box::new(request_rx));
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:1".to_string(),
@@ -21645,6 +21763,7 @@ mod tests {
         // migration_target_for clears the slot and stops forwarding.
         let (request_tx, _request_rx) = mpsc::channel(1);
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:1".to_string(),
@@ -22073,6 +22192,7 @@ mod tests {
 
     fn node_context_over(slot: Arc<Mutex<Option<ActiveMigration>>>) -> NodeContext {
         NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -22493,6 +22613,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
+                    gates: Default::default(),
                     name: "ready-node".to_string(),
                     token: "tk-ready-node".to_string(),
                     discovery_addr,
@@ -22642,6 +22763,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
+                    gates: Default::default(),
                     name: "ready-node".to_string(),
                     token: "tk-ready-node".to_string(),
                     discovery_addr: "127.0.0.1:1".to_string(),
@@ -22779,6 +22901,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
+                    gates: Default::default(),
                     name: "ready-node".to_string(),
                     token: "tk-ready-node".to_string(),
                     discovery_addr,
@@ -22909,6 +23032,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
+                    gates: Default::default(),
                     name: "ready-node".to_string(),
                     token: "tk-ready-node".to_string(),
                     discovery_addr,
@@ -23097,6 +23221,7 @@ mod tests {
         // so its marks) stays until the join is decided.
         let (request_tx, _request_rx) = mpsc::channel(1);
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:1".to_string(),
@@ -23220,6 +23345,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
+                    gates: Default::default(),
                     name: "ready-node".to_string(),
                     token: "tk-ready-node".to_string(),
                     discovery_addr,
@@ -23397,6 +23523,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
+                    gates: Default::default(),
                     name: "ready-node".to_string(),
                     token: "tk-ready-node".to_string(),
                     discovery_addr,
@@ -23596,6 +23723,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
+                    gates: Default::default(),
                     name: "ready-node".to_string(),
                     token: "tk-ready-node".to_string(),
                     discovery_addr,
@@ -23738,6 +23866,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
+                    gates: Default::default(),
                     name: "ready-node".to_string(),
                     token: "tk-ready-node".to_string(),
                     discovery_addr,
@@ -24612,6 +24741,7 @@ mod tests {
         active_migration: Arc<Mutex<Option<ActiveMigration>>>,
     ) -> NodeContext {
         NodeContext {
+            gates: Default::default(),
             name: name.to_string(),
             token: token.to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
@@ -24883,6 +25013,7 @@ mod tests {
             });
 
             let node_context = NodeContext {
+                gates: Default::default(),
                 name: "test-node".to_string(),
                 token: "tk-test-node".to_string(),
                 discovery_addr: discovery_addr.clone(),
@@ -25439,6 +25570,7 @@ mod tests {
         let (rereplication_tx, rereplication_rx) = mpsc::channel::<RereplicationTask>(4);
 
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "n1".to_string(),
             token: "tk-n1".to_string(),
             discovery_addr: discovery_addr.clone(),
@@ -26072,6 +26204,7 @@ mod tests {
             replication: 2,
         });
         let node_context = NodeContext {
+            gates: Default::default(),
             name: "ready-node".to_string(),
             token: "tk-ready-node".to_string(),
             discovery_addr: discovery_addr.clone(),
