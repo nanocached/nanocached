@@ -10,6 +10,12 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-27
+
+No changes. Version aligned with the rest of the project: every release
+ships the server, the six SDKs and the seven framework adapters at one
+version, whether or not a component changed.
+
 ## [0.5.0] - 2026-10-26
 
 ### Added
