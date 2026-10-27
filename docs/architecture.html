@@ -219,7 +219,13 @@ are orchestrated by discovery in stages:</p>
   put-if-absent on its own connection (and with replication, from
   several old owners at once), so a copy read before the delete can
   land after it, and the tombstone refuses it; an unconditional forward
-  and a client write are newer than the delete and go in. What
+  and a client write are newer than the delete and go in. A forwarded
+  touch that expires the key (a TTL of zero) is applied as such a
+  delete, removal and tombstone alike, rather than stored as an entry
+  that has just expired: an expired entry counts as absent to a
+  put-if-absent copy — the transfer's, or one an old owner relays from
+  its forward queue after a re-replication delivered it — and such a
+  copy landing after the expiry brought the key back on the joiner. What
   is queued for one joiner is bounded at 64&nbsp;MiB; once a joiner
   that has stopped answering has that much waiting, a client write for
   it is held before its ack until the queue drains, so the backlog
