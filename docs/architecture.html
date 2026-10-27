@@ -453,6 +453,24 @@ here.</p>
   again was tried and rejected: it removed nearly all of the
   whole-namespace misses but let a cleared key come back with its old value
   on a join followed by a decommission, which is the worse outcome.</li>
+  <li>During an eviction&rsquo;s re-replication pass or a decommission&rsquo;s
+  drain, a <code>clear()</code> can leave one key per sender connection
+  back with its old value. Both read each key just before they send it,
+  on a connection of their own, so a copy read before the clear can land
+  after it. A delete or an expiry is not exposed: the window passes it on
+  ahead of the copy and the receiver keeps a tombstone that refuses the
+  copy, and a clear has no counterpart of that. Measured on three nodes
+  with the pass held at its first key while the client changed every key
+  on both owners: a delete, an expiry, a rewrite and a TTL removal left
+  nothing behind; a clear left that one key with its old value (the pass;
+  the drain reads and sends the same way and was not measured). A join&rsquo;s
+  transfer is not exposed, because a clear that arrives during it is
+  replayed on the transfer&rsquo;s own stream, in order. Accepted
+  2026-10-28: the exposure is the one key in flight per clear during a
+  membership change, and closing it would need each copy to carry when it
+  was read, or the receiver to refuse every put-if-absent of the
+  namespace for a while, which would also refuse the copies of keys
+  written after the clear.</li>
   <li>A write a client sends to an old owner is relayed to that
   owner&rsquo;s joiner, but not on to the joiner&rsquo;s own joiner: a
   node relays a write that reached it as a handoff only to a joiner
