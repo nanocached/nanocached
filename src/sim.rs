@@ -40,7 +40,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::server::{self, ConnectionLimits, HeartbeatConfig, RunHooks};
+use crate::server::{self, ConnectionLimits, HeartbeatConfig, RunHooks, SimGates};
 
 /// A task that is always ready keeps the runtime from ever being idle, so
 /// the paused clock never auto-advances while real loopback I/O is in
@@ -124,6 +124,10 @@ fn start_discovery(port: &mut Port, liveness: Duration) -> JoinHandle<()> {
 struct Node {
     handle: JoinHandle<()>,
     leave: Arc<Notify>,
+    /// Hold points inside the node — see `server::SimGates`.
+    gates: Arc<SimGates>,
+    /// When it was started: its heartbeats fall every 5 s from here.
+    started: tokio::time::Instant,
 }
 
 impl Node {
@@ -137,6 +141,8 @@ fn start_node(port: &mut Port, discovery_port: u16, name: Option<&str>) -> Node 
     let port = port.number;
     let leave = Arc::new(Notify::new());
     let signal = Arc::clone(&leave);
+    let gates = Arc::new(SimGates::default());
+    let node_gates = Arc::clone(&gates);
     let name = name.map(str::to_string);
     let handle = tokio::spawn(async move {
         let address = format!("127.0.0.1:{port}");
@@ -164,6 +170,7 @@ fn start_node(port: &mut Port, discovery_port: u16, name: Option<&str>) -> Node 
             }),
             node_name: name,
             listener: Some(listener),
+            gates: node_gates,
         };
         let r = server::run_with_hooks(
             &address,
@@ -180,7 +187,12 @@ fn start_node(port: &mut Port, discovery_port: u16, name: Option<&str>) -> Node 
         .await;
         eprintln!("node {port} ended: {r:?}");
     });
-    Node { handle, leave }
+    Node {
+        handle,
+        leave,
+        gates,
+        started: tokio::time::Instant::now(),
+    }
 }
 
 /// How long a helper below may wait for its peer, in real time.
@@ -1222,6 +1234,447 @@ async fn an_expiry_relayed_to_a_leaving_node_goes_on_to_its_entrant() {
     assert_eq!(
         out.e_kept, 0,
         "the entrant kept keys the leaver was told had expired: {out:?}"
+    );
+}
+
+/// A, B, C with every key on both of its owners, settled past the
+/// bootstrap joins' forwarding windows. Returns the ports, the names A, B,
+/// C registered under, and the node handles (C's included, for the
+/// scenarios that kill it).
+struct Trio {
+    dport: u16,
+    disc: JoinHandle<()>,
+    a: u16,
+    b: u16,
+    names: [String; 3],
+    nodes: [Node; 3],
+    client: Client,
+}
+
+async fn trio(dp: &mut Port, pa: &mut Port, pb: &mut Port, pc: &mut Port, keys: &[String]) -> Trio {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let (dport, a, b, c) = (dp.number, pa.number, pb.number, pc.number);
+    let disc = start_discovery(dp, Duration::from_secs(15));
+    settle().await;
+    let mut client = Client::new();
+    let na = start_node(pa, dport, Some("node-a"));
+    run_for(Duration::from_secs(20)).await;
+    let nb = start_node(pb, dport, Some("node-b"));
+    run_for(Duration::from_secs(25)).await;
+    let nc = start_node(pc, dport, Some("node-c"));
+    run_for(Duration::from_secs(25)).await;
+    let roster3 = roster(dport).await;
+    assert_eq!(roster3.len(), 3, "A, B and C are members: {roster3:?}");
+    let names = [
+        name_at(&roster3, a),
+        name_at(&roster3, b),
+        name_at(&roster3, c),
+    ];
+    let ring3 = HashRing::new(names.to_vec());
+    for key in keys {
+        for owner in ring3.owners(&Key::unnamespaced(Bytes::from(key.clone())), 2) {
+            let port = [a, b, c][names.iter().position(|n| n == owner).unwrap()];
+            assert_eq!(client.set(port, key, "v1").await, "S", "{key} on {owner}");
+        }
+    }
+    run_for(Duration::from_secs(70)).await;
+    Trio {
+        dport,
+        disc,
+        a,
+        b,
+        names,
+        nodes: [na, nb, nc],
+        client,
+    }
+}
+
+/// What one run of the #977 scenario saw.
+#[derive(Debug)]
+struct RelayOutcome {
+    /// Keys A and C owned, that D takes from B once C is gone: A keeps
+    /// them, B gets a copy from A's pass while handing off to D and
+    /// relays it to D.
+    keys: usize,
+    /// Keys D holds once promoted, after the client expired them on A and
+    /// A forwarded the expiry to D: B's relay, released afterwards,
+    /// brought them back.
+    d_revived: usize,
+    a_kept: usize,
+}
+
+/// #977: a copy a re-replication pass delivered to a node whose handoff to
+/// the joiner was in flight is relayed to the joiner from that node's
+/// forward queue, as it arrived; a client's expiry forwarded to the joiner
+/// meanwhile is stored there as an entry that has just expired, and the
+/// relay, landing after it, counts the key as absent and revives it.
+///
+/// C dies while A's pass to B (promoted by the eviction) is held; D joins
+/// and B's transfer to D is held, so the pass copy lands on B with its
+/// handoff in flight; B's forward queue is held, so the relay waits;
+/// the client expires the keys on A alone, and A forwards the expiry to
+/// D; then B's relay is let through.
+async fn scenario_977() -> RelayOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc, mut pd) = (
+        Port::reserve(),
+        Port::reserve(),
+        Port::reserve(),
+        Port::reserve(),
+    );
+    let keys: Vec<String> = (0..300).map(|i| format!("y{i}")).collect();
+    let Trio {
+        dport,
+        disc,
+        a,
+        b: _,
+        names,
+        nodes: [na, nb, nc],
+        mut client,
+    } = trio(&mut dp, &mut pa, &mut pb, &mut pc, &keys).await;
+    let [name_a, name_b, name_c] = names;
+    let ring3 = HashRing::new(vec![name_a.clone(), name_b.clone(), name_c.clone()]);
+
+    // C dies. A's pass promotes B for the keys A and C owned, but is held
+    // before its first send.
+    na.gates.pass.hold();
+    nc.abort();
+    run_until_members(dport, 2).await;
+    run_for(Duration::from_secs(6)).await;
+
+    // D joins; B's transfer to D is held, so B's handoff stays in flight.
+    nb.gates.transfer.hold();
+    nb.gates.forward.hold();
+    let nd = start_node(&mut pd, dport, Some("node-d"));
+    run_for(Duration::from_secs(2)).await;
+    let roster = roster(dport).await;
+    assert_eq!(
+        roster.len(),
+        2,
+        "D is not promoted while B's transfer is held: {roster:?}"
+    );
+    let name_d = {
+        // Not in the roster yet: registered under the name it was started
+        // with, which discovery reports once promoted; compute the ring
+        // from the name it will have.
+        "node-d".to_string()
+    };
+    let ring_abd = HashRing::new(vec![name_a.clone(), name_b.clone(), name_d.clone()]);
+    let chosen: Vec<String> = keys
+        .iter()
+        .filter(|key| {
+            let k = Key::unnamespaced(Bytes::from((*key).clone()));
+            let before = ring3.owners(&k, 2);
+            let after = ring_abd.owners(&k, 2);
+            before.contains(&name_a.as_str())
+                && before.contains(&name_c.as_str())
+                && after.contains(&name_a.as_str())
+                && after.contains(&name_d.as_str())
+        })
+        .cloned()
+        .collect();
+    let mut out = RelayOutcome {
+        keys: chosen.len(),
+        d_revived: 0,
+        a_kept: 0,
+    };
+
+    // A's pass delivers the keys to B, which relays them to D — the relay
+    // waits in B's held forward queue.
+    na.gates.pass.release();
+    run_for(Duration::from_secs(1)).await;
+    // The client expires the keys on A alone; A forwards the expiry to D.
+    for key in &chosen {
+        assert_eq!(client.touch(a, key, Some(0)).await, "S", "{key}");
+    }
+    run_for(Duration::from_secs(1)).await;
+    // B's relay lands on D after the expiry.
+    nb.gates.forward.release();
+    run_for(Duration::from_secs(1)).await;
+    nb.gates.transfer.release();
+    run_until_members(dport, 3).await;
+    run_for(Duration::from_secs(10)).await;
+    let d = pd.number;
+    for key in &chosen {
+        if client.holds(d, key).await {
+            out.d_revived += 1;
+        }
+        if client.holds(a, key).await {
+            out.a_kept += 1;
+        }
+    }
+    disc.abort();
+    for node in [na, nb, nd] {
+        node.abort();
+    }
+    out
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_relayed_copy_landing_after_a_forwarded_expiry_does_not_revive_the_key_on_the_joiner() {
+    let _spin = spin();
+    let out = scenario_977().await;
+    eprintln!("{out:?}");
+    assert!(out.keys > 0, "nothing to check: {out:?}");
+    assert_eq!(out.a_kept, 0, "the expiry did not take on A: {out:?}");
+    assert_eq!(
+        out.d_revived, 0,
+        "the relay revived keys the client had expired on the joiner: {out:?}"
+    );
+}
+
+/// What one run of the #975 (first mechanism) scenario saw.
+#[derive(Debug)]
+struct LateCopyOutcome {
+    /// Keys A and C owned, that D takes from B once C is gone.
+    keys: usize,
+    /// Keys B serves once D is gone and B owns them again: the pass copy
+    /// that landed on B after its handoff snapshot was never marked, so
+    /// it outlived the join, and the client's expiry on the owners never
+    /// reached B.
+    b_revived: usize,
+    a_kept: usize,
+}
+
+/// #975, first mechanism: a re-replication copy that lands on a node after
+/// its own join handoff took its snapshot — for a key the joiner owns and
+/// this node does not — was stored without the dead-copy mark, so the
+/// sweep never removed it, no write reached it, and it came back when the
+/// node owned the key again.
+async fn scenario_975_late_copy() -> LateCopyOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc, mut pd) = (
+        Port::reserve(),
+        Port::reserve(),
+        Port::reserve(),
+        Port::reserve(),
+    );
+    let keys: Vec<String> = (0..300).map(|i| format!("p{i}")).collect();
+    let Trio {
+        dport,
+        disc,
+        a,
+        b,
+        names,
+        nodes: [na, nb, nc],
+        mut client,
+    } = trio(&mut dp, &mut pa, &mut pb, &mut pc, &keys).await;
+    let [name_a, name_b, name_c] = names;
+    let ring3 = HashRing::new(vec![name_a.clone(), name_b.clone(), name_c.clone()]);
+
+    na.gates.pass.hold();
+    nc.abort();
+    run_until_members(dport, 2).await;
+    run_for(Duration::from_secs(6)).await;
+    nb.gates.transfer.hold();
+    let nd = start_node(&mut pd, dport, Some("node-d"));
+    run_for(Duration::from_secs(2)).await;
+    assert_eq!(
+        roster(dport).await.len(),
+        2,
+        "D is not promoted while B's transfer is held"
+    );
+    let ring_abd = HashRing::new(vec![name_a.clone(), name_b.clone(), "node-d".to_string()]);
+    let chosen: Vec<String> = keys
+        .iter()
+        .filter(|key| {
+            let k = Key::unnamespaced(Bytes::from((*key).clone()));
+            let before = ring3.owners(&k, 2);
+            let after = ring_abd.owners(&k, 2);
+            before.contains(&name_a.as_str())
+                && before.contains(&name_c.as_str())
+                && after.contains(&name_a.as_str())
+                && !after.contains(&name_b.as_str())
+        })
+        .cloned()
+        .collect();
+    let mut out = LateCopyOutcome {
+        keys: chosen.len(),
+        b_revived: 0,
+        a_kept: 0,
+    };
+    // The pass copies land on B after its snapshot, while its handoff is
+    // in flight.
+    na.gates.pass.release();
+    run_for(Duration::from_secs(1)).await;
+    nb.gates.transfer.release();
+    run_until_members(dport, 3).await;
+    // Past the join's confirmation on B and the sweep that follows it.
+    run_for(Duration::from_secs(12)).await;
+    let d = pd.number;
+    // Both owners, as a replicating client does: the second leg may find
+    // the key gone already, the first owner having forwarded the expiry
+    // to the joiner ahead of it.
+    for key in &chosen {
+        for port in [a, d] {
+            let reply = client.touch(port, key, Some(0)).await;
+            assert!(reply == "S" || reply == "N", "{key} on {port}: {reply}");
+        }
+    }
+    run_for(Duration::from_secs(1)).await;
+    // D dies: B owns the keys again. A has nothing to re-replicate.
+    nd.abort();
+    run_until_members(dport, 2).await;
+    run_for(Duration::from_secs(10)).await;
+    for key in &chosen {
+        if client.holds(b, key).await {
+            out.b_revived += 1;
+        }
+        if client.holds(a, key).await {
+            out.a_kept += 1;
+        }
+    }
+    disc.abort();
+    na.abort();
+    nb.abort();
+    out
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_pass_copy_landing_after_the_handoff_snapshot_is_marked_like_the_keys_the_handoff_sent() {
+    let _spin = spin();
+    let out = scenario_975_late_copy().await;
+    eprintln!("{out:?}");
+    assert!(out.keys > 0, "nothing to check: {out:?}");
+    assert_eq!(out.a_kept, 0, "the expiry did not take on A: {out:?}");
+    assert_eq!(
+        out.b_revived, 0,
+        "B kept a copy of keys the join took from it and the client expired: {out:?}"
+    );
+}
+
+/// What one run of the #975 (second mechanism) scenario saw.
+#[derive(Debug)]
+struct FlipPassOutcome {
+    /// Keys A and B owned that D takes from B.
+    keys: usize,
+    /// Keys D holds after the client expired them on its owners (A and D):
+    /// B's join-flip pass, released afterwards, sent D the dead copy B's
+    /// handoff had marked.
+    d_revived: usize,
+    a_kept: usize,
+}
+
+/// #975, second mechanism: the re-replication pass a node runs when a join
+/// flips its ring — a join whose `M` reached it before its heartbeat had
+/// brought it the eviction the join follows, so the flip absorbs the
+/// eviction and the pass re-replicates for it — sent the joiner the dead
+/// copies its handoff had just marked, put-if-absent; one landing after
+/// the client had expired the key on the joiner brought it back.
+///
+/// C dies; D registers the moment discovery has evicted C, just after A's
+/// and B's heartbeats, so their `M` arrives while they still believe in C;
+/// B's pass is held until the client has expired the keys on A and D.
+async fn scenario_975_flip_pass() -> FlipPassOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc, mut pd) = (
+        Port::reserve(),
+        Port::reserve(),
+        Port::reserve(),
+        Port::reserve(),
+    );
+    let keys: Vec<String> = (0..300).map(|i| format!("f{i}")).collect();
+    let Trio {
+        dport,
+        disc,
+        a,
+        b: _,
+        names,
+        nodes: [na, nb, nc],
+        mut client,
+    } = trio(&mut dp, &mut pa, &mut pb, &mut pc, &keys).await;
+    let [name_a, name_b, name_c] = names;
+    let ring3 = HashRing::new(vec![name_a.clone(), name_b.clone(), name_c.clone()]);
+    let ring_abd = HashRing::new(vec![name_a.clone(), name_b.clone(), "node-d".to_string()]);
+    let chosen: Vec<String> = keys
+        .iter()
+        .filter(|key| {
+            let k = Key::unnamespaced(Bytes::from((*key).clone()));
+            let before = ring3.owners(&k, 2);
+            let after = ring_abd.owners(&k, 2);
+            before.contains(&name_a.as_str())
+                && before.contains(&name_b.as_str())
+                && after.contains(&name_a.as_str())
+                && after.contains(&"node-d")
+        })
+        .cloned()
+        .collect();
+    let mut out = FlipPassOutcome {
+        keys: chosen.len(),
+        d_revived: 0,
+        a_kept: 0,
+    };
+
+    // A's and B's heartbeats share a phase of the 5 s interval (A started
+    // at `trio`'s first node, B a whole number of intervals later). C is
+    // killed just after one, so discovery evicts it — 15 s of liveness
+    // plus its sweep — early in an interval, and D, started the moment
+    // the eviction shows, has its `M` on A and B before their next
+    // heartbeat brings them the roster without C.
+    nb.gates.pass.hold();
+    let heartbeat_phase = na.started;
+    while (tokio::time::Instant::now() - heartbeat_phase).as_millis() % 5000 != 500 {
+        run_for(Duration::from_millis(250)).await;
+    }
+    nc.abort();
+    run_until_members(dport, 2).await;
+    let since_heartbeat = (tokio::time::Instant::now() - heartbeat_phase).as_millis() % 5000;
+    assert!(
+        since_heartbeat < 3000,
+        "the eviction showed {since_heartbeat} ms after a heartbeat, too close to the next"
+    );
+    let nd = start_node(&mut pd, dport, Some("node-d"));
+    run_until_members(dport, 3).await;
+    let d = pd.number;
+    // Before B's slot is confirmed (its next heartbeat): the client expires
+    // the keys on their owners, then B's pass is let go. Both owners, as a
+    // replicating client does: the second leg may find the key gone
+    // already, the first owner having forwarded the expiry to the joiner
+    // ahead of it.
+    for key in &chosen {
+        for port in [a, d] {
+            let reply = client.touch(port, key, Some(0)).await;
+            assert!(reply == "S" || reply == "N", "{key} on {port}: {reply}");
+        }
+    }
+    nb.gates.pass.release();
+    run_for(Duration::from_secs(11)).await;
+    for key in &chosen {
+        if client.holds(d, key).await {
+            out.d_revived += 1;
+        }
+        if client.holds(a, key).await {
+            out.a_kept += 1;
+        }
+    }
+    disc.abort();
+    for node in [na, nb, nd] {
+        node.abort();
+    }
+    out
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_join_flip_pass_does_not_send_the_joiner_the_dead_copies_its_handoff_marked() {
+    let _spin = spin();
+    let out = scenario_975_flip_pass().await;
+    eprintln!("{out:?}");
+    assert!(out.keys > 0, "nothing to check: {out:?}");
+    assert_eq!(out.a_kept, 0, "the expiry did not take on A: {out:?}");
+    assert_eq!(
+        out.d_revived, 0,
+        "the join-flip pass revived keys the client had expired on the joiner: {out:?}"
     );
 }
 
