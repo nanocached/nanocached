@@ -6,6 +6,12 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-27
+
+No changes. Version aligned with the rest of the project: every release
+ships the server, the six SDKs and the seven framework adapters at one
+version, whether or not a component changed.
+
 ## [0.5.0] - 2026-10-26
 
 ### Fixed
