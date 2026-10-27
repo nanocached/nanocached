@@ -801,6 +801,18 @@ impl Cache {
     /// that had, or a TTL of zero — a forwarded expiry — is (issue #975:
     /// an expiry relayed to a leaving node through a window went no
     /// further, and the entrant kept the key alive).
+    ///
+    /// A TTL of zero is applied as [`Self::handoff_delete`]: the key is
+    /// removed and tombstoned, not stored as an entry that has just
+    /// expired (issue #977). A touch that expires a key reaches a joiner
+    /// as this frame, on the forwarding connection, while the key's old
+    /// copy is still on its way put-if-absent — a join transfer's or a
+    /// re-replication's on its own connection, or one an old owner
+    /// relays from its forward queue after a re-replication delivered
+    /// it, as it arrived; an expired entry counted as absent to that
+    /// copy, so the key came back live on the joiner and its next
+    /// re-replication handed it on. The tombstone refuses the copy, as
+    /// it does for a relayed delete.
     pub fn handoff_set(
         &mut self,
         key: Key,
@@ -811,14 +823,26 @@ impl Cache {
         // Same TTL-overflow stance as `set_with_ttl`: too far out to
         // represent is "never expires", not a panic.
         let now = Instant::now();
-        let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
         self.note_handoff(now, ahead_of_ring);
-        let unchanged = !ttl.is_some_and(|ttl| ttl.is_zero())
-            && self.peek(&key).is_some_and(|entry| {
-                !entry.is_expired_at(now)
-                    && entry.value == value
-                    && entry.expires_at.is_some() == expires_at.is_some()
-            });
+        if ttl.is_some_and(|ttl| ttl.is_zero()) {
+            // Issue #977: a forwarded expiry is a relayed delete — the
+            // key goes, and a tombstone keeps out a put-if-absent copy
+            // read before the touch and delivered after it: a join
+            // transfer's or a re-replication's, on its own connection,
+            // or one an old owner relays to the joiner from its forward
+            // queue after a re-replication delivered it, as it arrived.
+            // Left as an entry that had just expired, the key counted as
+            // absent to that copy, which brought it back on the joiner;
+            // the joiner's next re-replication handed it on from there.
+            self.handoff_delete_at(&key, now);
+            return true;
+        }
+        let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
+        let unchanged = self.peek(&key).is_some_and(|entry| {
+            !entry.is_expired_at(now)
+                && entry.value == value
+                && entry.expires_at.is_some() == expires_at.is_some()
+        });
         self.insert(key, value, expires_at);
         !unchanged
     }
@@ -4195,6 +4219,57 @@ mod tests {
             CasResult::Mismatch
         );
         assert!(!cache.contains(&k));
+    }
+
+    #[test]
+    fn a_forwarded_expiry_keeps_a_later_put_if_absent_handoff_of_the_key_out() {
+        // Issue #977: a client's `touch(key, 0)` reaches the joiner as an
+        // unconditional `U` with a TTL of zero, on the forwarding
+        // connection, while the key's live copy is still on its way
+        // put-if-absent — from another old owner's transfer, or relayed
+        // from an old owner's forward queue after a re-replication
+        // delivered it there: the expiry must hold against that copy,
+        // exactly as a relayed delete does. Left as an entry that had
+        // just expired, the key counted as absent and the copy brought
+        // it back.
+        let mut cache = Cache::new(UNBOUNDED);
+        let k = key(b"k");
+        cache.set(k.clone(), Bytes::from_static(b"v0"));
+        assert!(
+            cache.handoff_set(
+                k.clone(),
+                Bytes::from_static(b"v0"),
+                Some(Duration::ZERO),
+                true
+            ),
+            "an expiry is a change"
+        );
+        assert!(!cache.contains(&k), "removed, not stored as expired");
+        assert_eq!(
+            cache.handoff_set_if_absent(&k, Bytes::from_static(b"v0"), None, true),
+            CasResult::Mismatch,
+            "the transfer's copy was read before the expiry"
+        );
+        assert!(!cache.contains(&k));
+        // An expiry of a key this node never held tombstones it too: the
+        // transfer's copy may still be on its way.
+        let other = key(b"other");
+        assert!(cache.handoff_set(
+            other.clone(),
+            Bytes::from_static(b"o"),
+            Some(Duration::ZERO),
+            true
+        ));
+        assert_eq!(
+            cache.handoff_set_if_absent(&other, Bytes::from_static(b"o"), None, true),
+            CasResult::Mismatch
+        );
+        // A later unconditional handoff or client write is newer than
+        // the expiry and goes in.
+        assert!(cache.handoff_set(k.clone(), Bytes::from_static(b"v1"), None, true));
+        assert_eq!(cache.get(&k), Some(Bytes::from_static(b"v1")));
+        cache.set(other.clone(), Bytes::from_static(b"o1"));
+        assert_eq!(cache.get(&other), Some(Bytes::from_static(b"o1")));
     }
 
     #[test]

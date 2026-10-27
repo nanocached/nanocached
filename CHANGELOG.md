@@ -14,6 +14,25 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a key expired by a touch (`t`/`y` with a TTL of
+  `0`) while a join's handoff was in flight came back on the joiner. The
+  expiry reached the joiner as an unconditional handoff on the forwarding
+  connection and was stored as an entry that had just expired. A copy of
+  the key that a re-replication pass had delivered put-if-absent to
+  another old owner moments earlier — one whose own handoff to the joiner
+  was in flight — was relayed to the joiner from that node's forward
+  queue, as it arrived, and the queue drained behind other forwards: the
+  relay landed after the expiry, the expired entry counted as absent to
+  it, and the key was live again on the joiner, with no TTL; the joiner's
+  next re-replication (after the following membership change) handed it
+  on to the other owner, which had expired it too. A forwarded delete
+  already left a tombstone on the joiner for this ordering; a handoff
+  with a TTL of `0` now does the same — removal and tombstone — so the
+  late put-if-absent copy is refused. Seen in `tests/e2e/chaos.sh`'s
+  touch workload (2 keys in 1 of 6 runs; the order traced per key in a
+  passing run, where a second forwarded expiry happened to land after
+  the relay; issue #977).
+
 - `nanocached-node`: a copy that a re-replication pass delivered to a node
   while that node's own join handoff was in flight — or had just taken its
   key snapshot — was stored without the dead-copy mark the handoff gives
