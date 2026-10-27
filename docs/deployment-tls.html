@@ -342,13 +342,13 @@ After=docker.service
 Requires=docker.service
 [Service]
 ExecStartPre=-/usr/bin/docker rm -f nanocached-node
-ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:e2748e6a256a0a1323e693c379f7cd15b3c995f48c6053c887c40240b6409532
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:f82e89a350ef059c1d7651bb7f214ea9dcfb3cd93df3bcebe4fdd6cebbd6561c
 ExecStartPre=/usr/local/bin/nanocached-fetch-tls
 ExecStart=/usr/bin/docker run --rm --name nanocached-node \
   --network host \
   --env-file /etc/nanocached/env \
   --volume /etc/nanocached/tls:/etc/nanocached/tls:ro \
-  ghcr.io/nanocached/nanocached-node@sha256:e2748e6a256a0a1323e693c379f7cd15b3c995f48c6053c887c40240b6409532 \
+  ghcr.io/nanocached/nanocached-node@sha256:f82e89a350ef059c1d7651bb7f214ea9dcfb3cd93df3bcebe4fdd6cebbd6561c \
   --host 0.0.0.0 --port 8356 --metrics-port 9356 \
   --tls-cert /etc/nanocached/tls/cert.pem --tls-key /etc/nanocached/tls/key.pem \
   --max-memory 1073741824
@@ -497,12 +497,12 @@ After=docker.service nanocached-tls.service
 Requires=docker.service nanocached-tls.service
 [Service]
 ExecStartPre=-/usr/bin/docker rm -f nanocached-discovery
-ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-discovery@sha256:7424a96f85f9d66c0dc6a5c74c902eaf492bbd2fe046e0a483c3e1db4d7a18a2
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-discovery@sha256:d4fd3fdd1158b482f6c4b8b76cb99eaa525b0580e6fdb87ca06e454a083356a8
 ExecStart=/usr/bin/docker run --rm --name nanocached-discovery \
   --network host \
   --env-file /etc/nanocached/env \
   --volume /run/nanocached/tls:/etc/nanocached/tls:ro \
-  ghcr.io/nanocached/nanocached-discovery@sha256:7424a96f85f9d66c0dc6a5c74c902eaf492bbd2fe046e0a483c3e1db4d7a18a2 \
+  ghcr.io/nanocached/nanocached-discovery@sha256:d4fd3fdd1158b482f6c4b8b76cb99eaa525b0580e6fdb87ca06e454a083356a8 \
   --host 0.0.0.0 --port 8357 --metrics-port 9357 \
   --replication-factor 2 \
   --tls-cert /etc/nanocached/tls/cert.pem --tls-key /etc/nanocached/tls/key.pem --tls-ca /etc/nanocached/tls/ca.pem
@@ -519,12 +519,12 @@ After=docker.service nanocached-tls.service nanocached-discovery.service
 Requires=docker.service nanocached-tls.service
 [Service]
 ExecStartPre=-/usr/bin/docker rm -f nanocached-node
-ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:e2748e6a256a0a1323e693c379f7cd15b3c995f48c6053c887c40240b6409532
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:f82e89a350ef059c1d7651bb7f214ea9dcfb3cd93df3bcebe4fdd6cebbd6561c
 ExecStart=/usr/bin/docker run --rm --name nanocached-node \
   --network host \
   --env-file /etc/nanocached/env \
   --volume /run/nanocached/tls:/etc/nanocached/tls:ro \
-  ghcr.io/nanocached/nanocached-node@sha256:e2748e6a256a0a1323e693c379f7cd15b3c995f48c6053c887c40240b6409532 \
+  ghcr.io/nanocached/nanocached-node@sha256:f82e89a350ef059c1d7651bb7f214ea9dcfb3cd93df3bcebe4fdd6cebbd6561c \
   --host 0.0.0.0 --port 8356 --metrics-port 9356 \
   --discovery 10.0.0.11:8357 --drain-timeout 20 \
   --tls-cert /etc/nanocached/tls/cert.pem --tls-key /etc/nanocached/tls/key.pem --tls-ca /etc/nanocached/tls/ca.pem \
@@ -711,7 +711,7 @@ and its own stream prefix:</p>
 },
 {
   "name": "nanocached-node",
-  "image": "ghcr.io/nanocached/nanocached-node@sha256:e2748e6a256a0a1323e693c379f7cd15b3c995f48c6053c887c40240b6409532",
+  "image": "ghcr.io/nanocached/nanocached-node@sha256:f82e89a350ef059c1d7651bb7f214ea9dcfb3cd93df3bcebe4fdd6cebbd6561c",
   "essential": true,
   "dependsOn": [{"containerName": "tls-init", "condition": "SUCCESS"}],
   "command": ["--host", "0.0.0.0", "--port", "8356", "--discovery", "disc.nanocached.local:8357",
@@ -881,7 +881,7 @@ spec:
             - {name: tls-signing, mountPath: /tls-signing, readOnly: true}
       containers:
         - name: node
-          image: ghcr.io/nanocached/nanocached-node@sha256:e2748e6a256a0a1323e693c379f7cd15b3c995f48c6053c887c40240b6409532
+          image: ghcr.io/nanocached/nanocached-node@sha256:f82e89a350ef059c1d7651bb7f214ea9dcfb3cd93df3bcebe4fdd6cebbd6561c
           args: ["--host", "0.0.0.0", "--port", "8356", "--discovery", "disc:8357",
                  "--drain-timeout", "20", "--metrics-port", "9356", "--max-memory", "536870912",
                  "--tls-cert", "/tls/cert.pem", "--tls-key", "/tls/key.pem", "--tls-ca", "/tls/ca.pem"]
@@ -1122,7 +1122,7 @@ spec:
             - {name: tls-signing, mountPath: /tls-signing, readOnly: true}
       containers:
         - name: proxy
-          image: ghcr.io/nanocached/nanocached-proxy@sha256:b75057ea7de051cef77c096e390d3267421bf4ab27709620d4da225bd9a9e713
+          image: ghcr.io/nanocached/nanocached-proxy@sha256:852d8323a1d4043bc4771b4226aad9e909314b952e72c836d14aa90170c2dc19
           args: ["--host", "0.0.0.0", "--port", "8358", "--discovery", "disc:8357",
                  "--drain-timeout", "20", "--metrics-port", "9358",
                  "--tls-cert", "/tls/cert.pem", "--tls-key", "/tls/key.pem", "--tls-ca", "/tls/ca.pem"]
