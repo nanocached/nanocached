@@ -45,6 +45,17 @@
 # passed no node holds it (SDK read-back, then ttlcheck.py raw on every live
 # node). Output in $L/ttl.log. Off by default until it has run clean a few
 # times in a row on main.
+# CAS_ORACLE=1 adds casload.py: compare-and-set from two clients with their
+# own ring views, one burst of turns per round. cc: two contenders append a
+# tag each to a chain value (get_with_token + replace), cp: two put_if_absent
+# race for a fresh key. Asserted: no tag twice or one nobody tried, at most
+# one put_if_absent wins and its value is the one left, no key vanishes (SDK
+# read-back, then cascheck.py raw on every owner). Printed, not asserted:
+# acknowledged tags missing from the final value or from an owner, and owners
+# holding different chains; a join's or a kill's rejoin window lets a lagging
+# forward rewind a key, so the next replace succeeds on the older value
+# (accepted behaviour in docs/architecture.html). Output in $L/cas.log. Off by default until it has run clean a few
+# times in a row on main.
 #   docker build --target node -t nanocached-node:dev .
 #   docker build --target discovery -t nanocached-discovery:dev .
 #   NODE=nanocached-node:dev DISC=nanocached-discovery:dev ROUNDS=6 ./chaos.sh
@@ -96,6 +107,12 @@ if [ "${TTL_ORACLE:-0}" = 1 ]; then
   for _ in $(seq 1 120); do docker logs $P-ttl 2>&1 | grep -q '"phase": "seeded"' && break; sleep 1; done
   docker logs $P-ttl 2>&1 | grep -q '"phase": "seeded"' || { T "FAIL: set-with-TTL workload did not finish seeding"; fail=1; }
 fi
+if [ "${CAS_ORACLE:-0}" = 1 ]; then
+  T "start the compare-and-set workload (casload.py: cc/cp 2000 keys each, two clients, one burst of turns per round on SIGUSR1; stopped with the writer)"
+  docker run -d --name $P-cas --network $NET -v "$E:/w" -w /w $CLIENT python casload.py --addr $D --n 2000 --workers 4 --turns 3 --bursts $ROUNDS --burst-secs 15 --settle 30 --report-every 30 --state logs/chaos-$RUN/casstate.json --oplog logs/chaos-$RUN/casops.json >/dev/null
+  for _ in $(seq 1 120); do docker logs $P-cas 2>&1 | grep -q '"phase": "seeded"' && break; sleep 1; done
+  docker logs $P-cas 2>&1 | grep -q '"phase": "seeded"' || { T "FAIL: compare-and-set workload did not finish seeding"; fail=1; }
+fi
 entries_snapshot seeded
 T "start ${LOAD_SECS}s mixed load (8 conns, get 70%, hedge 10ms, reconnect on error)"
 docker run -d --name $P-load --network $NET -v "$E:/w" -w /w $CLIENT python ${LOADER:-load.py} --addr $D --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label chaos --reconnect-on-error --hedge 0.01 --report-every 30 >/dev/null
@@ -107,6 +124,7 @@ for r in $(seq 1 $ROUNDS); do
   docker kill -s USR1 $P-touch >/dev/null 2>&1   # this round's share of the touch loader's shorten/remove/expire turns
   [ "${DELETE_ORACLE:-0}" = 1 ] && docker kill -s USR1 $P-del >/dev/null 2>&1   # and of the delete loader's turns
   [ "${TTL_ORACLE:-0}" = 1 ] && docker kill -s USR1 $P-ttl >/dev/null 2>&1   # and of the set-with-TTL loader's turns
+  [ "${CAS_ORACLE:-0}" = 1 ] && docker kill -s USR1 $P-cas >/dev/null 2>&1   # and of the compare-and-set loader's turns
   case $a in
     join)
       spawn; n=$spawned; T "round $r JOIN $n (members ${#live[@]})"
@@ -138,7 +156,7 @@ for r in $(seq 1 $ROUNDS); do
   entries_snapshot "round$r-$a"
 done
 T "stop the versioned writer and the touch workload (settle 15s / 50s, then read back every key)"
-tmo 300 docker stop -t 240 $P-swriter $P-touch $( [ "${DELETE_ORACLE:-0}" = 1 ] && echo $P-del ) $( [ "${TTL_ORACLE:-0}" = 1 ] && echo $P-ttl ) >/dev/null
+tmo 300 docker stop -t 240 $P-swriter $P-touch $( [ "${DELETE_ORACLE:-0}" = 1 ] && echo $P-del ) $( [ "${TTL_ORACLE:-0}" = 1 ] && echo $P-ttl ) $( [ "${CAS_ORACLE:-0}" = 1 ] && echo $P-cas ) >/dev/null
 versioned=$(docker logs $P-swriter 2>&1 | grep '"phase": "checked"' | tail -1)
 echo "=== versioned: ${versioned:-NO RESULT}"
 docker logs $P-swriter > "$L/swriter.log" 2>&1
@@ -167,6 +185,15 @@ if [ "${TTL_ORACLE:-0}" = 1 ]; then
   T "per-owner raw check of the set-with-TTL keys on every live node (ttlcheck.py)"
   tcheck2=$(tmo 600 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python ttlcheck.py --state logs/chaos-$RUN/ttlstate.json --nodes $nodes | tail -1)
   echo "=== ttl (owners): ${tcheck2:-NO RESULT}"
+fi
+csdk=; ccheck=
+if [ "${CAS_ORACLE:-0}" = 1 ]; then
+  csdk=$(docker logs $P-cas 2>&1 | grep '"phase": "checked"' | tail -1)
+  echo "=== cas (sdk): ${csdk:-NO RESULT}"
+  docker logs $P-cas > "$L/cas.log" 2>&1
+  T "per-owner raw check of the compare-and-set keys on every live node (cascheck.py)"
+  ccheck=$(tmo 600 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python cascheck.py --state logs/chaos-$RUN/casstate.json --nodes $nodes | tail -1)
+  echo "=== cas (owners): ${ccheck:-NO RESULT}"
 fi
 T "waiting for the load to finish (<= $LOAD_SECS s total)"
 tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
@@ -225,6 +252,21 @@ for k in ('ts_lingering_keys','tp_lingering_keys','other_reply'):
   if own.get(k): print(f'owners {k}={own[k]}')
 " "$tsdk" "$tcheck2")
   [ -z "$xbad" ] || { T "FAIL: ttl oracle: $(echo $xbad | tr '\n' ' ')"; fail=1; }
+fi
+if [ "${CAS_ORACLE:-0}" = 1 ]; then
+  cbad=$(python3 -c "
+import json,sys
+sdk=json.loads(sys.argv[1]) if sys.argv[1].startswith('{') else {}; own=json.loads(sys.argv[2]) if sys.argv[2].startswith('{') else {}
+if not sdk: print('no sdk result')
+if not own: print('no owners result')
+for k in ('cc_vanished','cc_dup','cc_foreign','cc_head','cp_double_win','cp_lost','cp_corrupt','cp_winner_overwritten','read_err'):
+  if sdk.get(k): print(f'sdk {k}={sdk[k]}')
+if sdk.get('anomalies',{}).get('chain_miss'): print(f'sdk chain_miss={sdk[\"anomalies\"][\"chain_miss\"]}')
+for k in ('cc_no_owner','cc_missing_on_owner','cc_dup_on_owner','cc_head_on_owner','cc_other_reply','cp_no_owner','cp_missing_on_owner','cp_wrong_on_owner','cp_other_reply'):
+  if own.get(k): print(f'owners {k}={own[k]}')
+" "$csdk" "$ccheck")
+  [ -z "$cbad" ] || { T "FAIL: cas oracle: $(echo $cbad | tr '\n' ' ')"; fail=1; }
+  echo "$csdk $ccheck" | grep -oE '"(cc_lost_ack|cc_lost_ack_tags|cc_lost_on_owner|cc_owners_differ|cc_unfinished|cc_conflicts|cc_acked)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== cas accepted (printed, not asserted): /'; echo
 fi
 for c in $(docker ps -aq --filter name=$P-); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); ip=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $c); echo "$n $ip" >> "$L/ipmap.txt"; [ -f "$L/$n.log" ] || docker logs -t $c > "$L/$n.log" 2>&1; done
 echo "=== entries:"; cat "$L/entries.txt"
