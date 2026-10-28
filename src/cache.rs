@@ -952,6 +952,7 @@ impl Cache {
         for key in keys {
             if self.peek(key).is_some() && !owned(key) && self.remove_entry(key).is_some() {
                 removed += 1;
+                self.forget_tombstone(key);
             }
         }
         ReclaimReport {
@@ -1132,6 +1133,28 @@ impl Cache {
         self.handoff_tombstones.remove(key);
         self.used_bytes -= tombstone_bytes(key);
         true
+    }
+
+    /// Drops `key`'s tombstone, whatever its age, crediting its charge
+    /// back. Called when this node lets go of a copy that was not its own
+    /// any more (a dead copy swept, an unowned one reclaimed): an entry
+    /// can sit under a tombstone only if it was written after it — a
+    /// put-if-absent copy is refused under one, and a delete removes the
+    /// entry — so the delete the tombstone records is older than that
+    /// copy, which the node has now removed. Kept, the tombstone would
+    /// refuse the fresh copy a re-replication offers when a later
+    /// membership change makes this node an owner again, within its two
+    /// minutes, leaving the key one copy short until the next pass.
+    fn forget_tombstone(&mut self, key: &Key) {
+        // Hashing the key hashes its namespace; most nodes hold no tombstone
+        // at all, and a sweep of many keys under a large namespace must not
+        // pay for that once per key (`tombstoned_at` guards the same way).
+        if self.handoff_tombstones.is_empty() {
+            return;
+        }
+        if self.handoff_tombstones.remove(key).is_some() {
+            self.used_bytes -= tombstone_bytes(key);
+        }
     }
 
     /// Total entries across every namespace.
@@ -1942,6 +1965,9 @@ impl Cache {
 
             if (marked || expired) && self.remove_entry(&key).is_some() {
                 removed += 1;
+                if marked {
+                    self.forget_tombstone(&key);
+                }
                 // A marked reclaim is migration bookkeeping, not a
                 // client-visible expiry — see the counter's field docs.
                 if expired {
@@ -3878,6 +3904,63 @@ mod tests {
             CasResult::Mismatch
         ));
         assert_eq!(cache.get(&key(b"t")), None);
+    }
+
+    #[test]
+    fn sweeping_a_dead_copy_written_under_a_tombstone_drops_the_tombstone() {
+        // A relayed delete, then the value created again (a handoff write,
+        // which a tombstone does not refuse), then a join takes the key:
+        // the copy is dead, and the sweep removes it. The tombstone
+        // records a delete older than that copy; kept, it would refuse the
+        // fresh copy an owner offers once this node owns the key again.
+        let mut cache = Cache::new(UNBOUNDED);
+        let before = cache.used_bytes;
+        assert!(!cache.handoff_delete(&key(b"k")));
+        cache.handoff_set(key(b"k"), Bytes::from_static(b"new"), None, false);
+        cache.mark_migrated(&key(b"k"));
+        assert_eq!(cache.sweep_keeping(&|_| false), 1);
+        assert_eq!(cache.get(&key(b"k")), None);
+        assert!(matches!(
+            cache.handoff_set_if_absent(&key(b"k"), Bytes::from_static(b"back"), None, false),
+            CasResult::Stored
+        ));
+        assert_eq!(cache.get(&key(b"k")), Some(Bytes::from_static(b"back")));
+        // The tombstone's charge went with it.
+        cache.delete(&key(b"k"));
+        assert_eq!(cache.used_bytes, before);
+    }
+
+    #[test]
+    fn a_live_copy_under_a_tombstone_keeps_it_and_so_refuses_a_stale_copy() {
+        // Nothing removed: the key is present, which refuses a put-if-absent
+        // copy by itself, and the tombstone stays for the day it is not.
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.handoff_delete(&key(b"k"));
+        cache.handoff_set(key(b"k"), Bytes::from_static(b"new"), None, false);
+        assert_eq!(cache.sweep_keeping(&|_| false), 0);
+        assert!(matches!(
+            cache.handoff_set_if_absent(&key(b"k"), Bytes::from_static(b"old"), None, false),
+            CasResult::Mismatch
+        ));
+        // A client delete leaves no tombstone of its own and keeps this one.
+        cache.delete(&key(b"k"));
+        assert!(matches!(
+            cache.handoff_set_if_absent(&key(b"k"), Bytes::from_static(b"old"), None, false),
+            CasResult::Mismatch
+        ));
+    }
+
+    #[test]
+    fn reclaiming_an_unowned_copy_written_under_a_tombstone_drops_the_tombstone() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.handoff_delete(&key(b"k"));
+        cache.handoff_set(key(b"k"), Bytes::from_static(b"new"), None, false);
+        let report = cache.reclaim_unowned(&[key(b"k")], &|_| false, Duration::ZERO);
+        assert_eq!(report.removed, 1);
+        assert!(matches!(
+            cache.handoff_set_if_absent(&key(b"k"), Bytes::from_static(b"back"), None, false),
+            CasResult::Stored
+        ));
     }
 
     #[test]

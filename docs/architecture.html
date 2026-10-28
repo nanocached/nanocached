@@ -471,6 +471,26 @@ here.</p>
   was read, or the receiver to refuse every put-if-absent of the
   namespace for a while, which would also refuse the copies of keys
   written after the clear.</li>
+  <li>A key deleted and set again within two minutes of the delete can
+  be one copy short after a membership change, until the next
+  re-replication or the next write. A delete relayed through a window
+  leaves a tombstone for two minutes on the node that received it, and
+  the set that follows reaches only the owners the sender knew at that
+  moment. If a membership change then makes that node an owner, the
+  sender&rsquo;s put-if-absent copy is refused by the tombstone, because
+  the receiver cannot tell it from a copy read before the delete. The
+  SDKs read the other owner and see the value. Measured with 2,000 keys
+  deleted and set again 1&ndash;6 seconds later across join, decommission
+  and kill/restart rounds: 3 to 8 keys per run were missing on one owner
+  (the refusal came 40 to 45 seconds after the delete, on a node with no
+  entry written after the tombstone). A tombstone that sat on top of a
+  copy written after the delete is dropped when that copy is swept or
+  reclaimed, which removed the larger share of the same loss (37 to 42
+  keys per run before). Accepted 2026-10-28: the copy stays short only for
+  keys recreated that quickly during a membership change, and telling the
+  two copies apart would need each copy to carry when it was last written,
+  a wire change; a shorter tombstone would let a copy read before a delete
+  come back.</li>
   <li>A write a client sends to an old owner is relayed to that
   owner&rsquo;s joiner, but not on to the joiner&rsquo;s own joiner: a
   node relays a write that reached it as a handoff only to a joiner
