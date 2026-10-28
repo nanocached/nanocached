@@ -1146,6 +1146,12 @@ impl Cache {
     /// membership change makes this node an owner again, within its two
     /// minutes, leaving the key one copy short until the next pass.
     fn forget_tombstone(&mut self, key: &Key) {
+        // Hashing the key hashes its namespace; most nodes hold no tombstone
+        // at all, and a sweep of many keys under a large namespace must not
+        // pay for that once per key (`tombstoned_at` guards the same way).
+        if self.handoff_tombstones.is_empty() {
+            return;
+        }
         if self.handoff_tombstones.remove(key).is_some() {
             self.used_bytes -= tombstone_bytes(key);
         }
