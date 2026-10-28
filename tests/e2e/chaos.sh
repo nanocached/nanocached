@@ -39,6 +39,12 @@
 # value (a lagging forward) are printed, not asserted: both are accepted
 # behaviour in docs/architecture.html. Output in $L/del.log. Off by default
 # until it has run clean a few times in a row on main.
+# TTL_ORACLE=1 adds ttlload.py: sets with a TTL of 20/40 s (ts: new keys, tp:
+# keys that held a no-TTL value), one burst of turns per round. Asserted: a
+# key read at half its TTL answers (no early miss), and once TTL + 10 s has
+# passed no node holds it (SDK read-back, then ttlcheck.py raw on every live
+# node). Output in $L/ttl.log. Off by default until it has run clean a few
+# times in a row on main.
 #   docker build --target node -t nanocached-node:dev .
 #   docker build --target discovery -t nanocached-discovery:dev .
 #   NODE=nanocached-node:dev DISC=nanocached-discovery:dev ROUNDS=6 ./chaos.sh
@@ -84,6 +90,12 @@ if [ "${DELETE_ORACLE:-0}" = 1 ]; then
   for _ in $(seq 1 120); do docker logs $P-del 2>&1 | grep -q '"phase": "seeded"' && break; sleep 1; done
   docker logs $P-del 2>&1 | grep -q '"phase": "seeded"' || { T "FAIL: delete workload did not finish seeding"; fail=1; }
 fi
+if [ "${TTL_ORACLE:-0}" = 1 ]; then
+  T "start the set-with-TTL workload (ttlload.py: ts/tp 2000 keys each, TTL 20/40 s, one burst of turns per round on SIGUSR1; stopped with the writer)"
+  docker run -d --name $P-ttl --network $NET -v "$E:/w" -w /w $CLIENT python ttlload.py --addr $D --n 2000 --workers 4 --ttl-short 20 --ttl-long 40 --bursts $ROUNDS --burst-secs 15 --settle 30 --report-every 30 --state logs/chaos-$RUN/ttlstate.json >/dev/null
+  for _ in $(seq 1 120); do docker logs $P-ttl 2>&1 | grep -q '"phase": "seeded"' && break; sleep 1; done
+  docker logs $P-ttl 2>&1 | grep -q '"phase": "seeded"' || { T "FAIL: set-with-TTL workload did not finish seeding"; fail=1; }
+fi
 entries_snapshot seeded
 T "start ${LOAD_SECS}s mixed load (8 conns, get 70%, hedge 10ms, reconnect on error)"
 docker run -d --name $P-load --network $NET -v "$E:/w" -w /w $CLIENT python ${LOADER:-load.py} --addr $D --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label chaos --reconnect-on-error --hedge 0.01 --report-every 30 >/dev/null
@@ -94,6 +106,7 @@ for r in $(seq 1 $ROUNDS); do
   t0=$(date +%s)
   docker kill -s USR1 $P-touch >/dev/null 2>&1   # this round's share of the touch loader's shorten/remove/expire turns
   [ "${DELETE_ORACLE:-0}" = 1 ] && docker kill -s USR1 $P-del >/dev/null 2>&1   # and of the delete loader's turns
+  [ "${TTL_ORACLE:-0}" = 1 ] && docker kill -s USR1 $P-ttl >/dev/null 2>&1   # and of the set-with-TTL loader's turns
   case $a in
     join)
       spawn; n=$spawned; T "round $r JOIN $n (members ${#live[@]})"
@@ -125,7 +138,7 @@ for r in $(seq 1 $ROUNDS); do
   entries_snapshot "round$r-$a"
 done
 T "stop the versioned writer and the touch workload (settle 15s / 50s, then read back every key)"
-tmo 300 docker stop -t 240 $P-swriter $P-touch $( [ "${DELETE_ORACLE:-0}" = 1 ] && echo $P-del ) >/dev/null
+tmo 300 docker stop -t 240 $P-swriter $P-touch $( [ "${DELETE_ORACLE:-0}" = 1 ] && echo $P-del ) $( [ "${TTL_ORACLE:-0}" = 1 ] && echo $P-ttl ) >/dev/null
 versioned=$(docker logs $P-swriter 2>&1 | grep '"phase": "checked"' | tail -1)
 echo "=== versioned: ${versioned:-NO RESULT}"
 docker logs $P-swriter > "$L/swriter.log" 2>&1
@@ -145,6 +158,15 @@ if [ "${DELETE_ORACLE:-0}" = 1 ]; then
   T "per-owner raw check of the delete keys on every live node (delcheck.py)"
   dcheck=$(tmo 600 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python delcheck.py --state logs/chaos-$RUN/delstate.json --nodes $nodes | tail -1)
   echo "=== delete (owners): ${dcheck:-NO RESULT}"
+fi
+tsdk=; tcheck2=
+if [ "${TTL_ORACLE:-0}" = 1 ]; then
+  tsdk=$(docker logs $P-ttl 2>&1 | grep '"phase": "checked"' | tail -1)
+  echo "=== ttl (sdk): ${tsdk:-NO RESULT}"
+  docker logs $P-ttl > "$L/ttl.log" 2>&1
+  T "per-owner raw check of the set-with-TTL keys on every live node (ttlcheck.py)"
+  tcheck2=$(tmo 600 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python ttlcheck.py --state logs/chaos-$RUN/ttlstate.json --nodes $nodes | tail -1)
+  echo "=== ttl (owners): ${tcheck2:-NO RESULT}"
 fi
 T "waiting for the load to finish (<= $LOAD_SECS s total)"
 tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
@@ -188,6 +210,21 @@ for k in ('dr_no_owner','dr_wrong_value','dr_other_reply','x_lingering_keys','x_
 " "$dsdk" "$dcheck")
   [ -z "$dbad" ] || { T "FAIL: delete oracle: $(echo $dbad | tr '\n' ' ')"; fail=1; }
   echo "$dsdk $dcheck" | grep -oE '"(r_stale|dr_stale_on_owner|dr_keys_with_stale_copy|dr_missing_on_owner|dr_keys_with_missing_copy)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== delete accepted (printed, not asserted): /'; echo
+fi
+if [ "${TTL_ORACLE:-0}" = 1 ]; then
+  xbad=$(python3 -c "
+import json,sys
+sdk=json.loads(sys.argv[1]) if sys.argv[1].startswith('{') else {}; own=json.loads(sys.argv[2]) if sys.argv[2].startswith('{') else {}
+if not sdk: print('no sdk result')
+if not own: print('no owners result')
+for k in ('x_present','read_err'):
+  if sdk.get(k): print(f'sdk {k}={sdk[k]}')
+for k in ('early_miss','early_corrupt'):
+  if sdk.get('anomalies',{}).get(k): print(f'sdk {k}={sdk[\"anomalies\"][k]}')
+for k in ('ts_lingering_keys','tp_lingering_keys','other_reply'):
+  if own.get(k): print(f'owners {k}={own[k]}')
+" "$tsdk" "$tcheck2")
+  [ -z "$xbad" ] || { T "FAIL: ttl oracle: $(echo $xbad | tr '\n' ' ')"; fail=1; }
 fi
 for c in $(docker ps -aq --filter name=$P-); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); ip=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $c); echo "$n $ip" >> "$L/ipmap.txt"; [ -f "$L/$n.log" ] || docker logs -t $c > "$L/$n.log" 2>&1; done
 echo "=== entries:"; cat "$L/entries.txt"
