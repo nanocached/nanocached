@@ -29,6 +29,16 @@
 # after a join an old owner forwards a touch to the joiner as the value with
 # its new TTL, so the client's own leg to the joiner finds an expiring touch
 # already applied. Output in $L/touch.log.
+# DELETE_ORACLE=1 adds delload.py: client deletes (dx: absent everywhere
+# afterwards) and deletes followed 1-6 s later by a set (dr: every owner holds
+# the new value), one burst of turns per round like the touch loader, read back
+# through the SDK and then raw on every live node by delcheck.py. Asserted: 0
+# lingering dx copies, 0 dr keys missing or wrong through the SDK, 0 dr copies
+# of another value on an owner; a dr copy missing on an owner (a tombstone
+# refusing a fresh copy after a membership change) and one holding the deleted
+# value (a lagging forward) are printed, not asserted: both are accepted
+# behaviour in docs/architecture.html. Output in $L/del.log. Off by default
+# until it has run clean a few times in a row on main.
 #   docker build --target node -t nanocached-node:dev .
 #   docker build --target discovery -t nanocached-discovery:dev .
 #   NODE=nanocached-node:dev DISC=nanocached-discovery:dev ROUNDS=6 ./chaos.sh
@@ -68,6 +78,12 @@ T "start the touch workload (touchload.py: tk/tn/tx 2000 keys each, one burst of
 docker run -d --name $P-touch --network $NET -v "$E:/w" -w /w $CLIENT python touchload.py --addr $D --n 2000 --workers 4 --ttl 60 --pass-secs 4 --n-short 40 --n-gap 6 --bursts $ROUNDS --burst-secs 15 --short 30 --settle 50 --report-every 30 --state logs/chaos-$RUN/touchstate.json >/dev/null
 for _ in $(seq 1 120); do docker logs $P-touch 2>&1 | grep -q '"phase": "seeded"' && break; sleep 1; done
 docker logs $P-touch 2>&1 | grep -q '"phase": "seeded"' || { T "FAIL: touch workload did not finish seeding"; fail=1; }
+if [ "${DELETE_ORACLE:-0}" = 1 ]; then
+  T "start the delete workload (delload.py: dx/dr 2000 keys each, one burst of turns per round on SIGUSR1; stopped with the writer)"
+  docker run -d --name $P-del --network $NET -v "$E:/w" -w /w $CLIENT python delload.py --addr $D --n 2000 --workers 4 --bursts $ROUNDS --burst-secs 15 --gap-min 1 --gap-max 6 --settle 30 --report-every 30 --state logs/chaos-$RUN/delstate.json >/dev/null
+  for _ in $(seq 1 120); do docker logs $P-del 2>&1 | grep -q '"phase": "seeded"' && break; sleep 1; done
+  docker logs $P-del 2>&1 | grep -q '"phase": "seeded"' || { T "FAIL: delete workload did not finish seeding"; fail=1; }
+fi
 entries_snapshot seeded
 T "start ${LOAD_SECS}s mixed load (8 conns, get 70%, hedge 10ms, reconnect on error)"
 docker run -d --name $P-load --network $NET -v "$E:/w" -w /w $CLIENT python ${LOADER:-load.py} --addr $D --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label chaos --reconnect-on-error --hedge 0.01 --report-every 30 >/dev/null
@@ -77,6 +93,7 @@ for r in $(seq 1 $ROUNDS); do
   a=${actions[$(( (r-1) % 3 ))]}
   t0=$(date +%s)
   docker kill -s USR1 $P-touch >/dev/null 2>&1   # this round's share of the touch loader's shorten/remove/expire turns
+  [ "${DELETE_ORACLE:-0}" = 1 ] && docker kill -s USR1 $P-del >/dev/null 2>&1   # and of the delete loader's turns
   case $a in
     join)
       spawn; n=$spawned; T "round $r JOIN $n (members ${#live[@]})"
@@ -108,7 +125,7 @@ for r in $(seq 1 $ROUNDS); do
   entries_snapshot "round$r-$a"
 done
 T "stop the versioned writer and the touch workload (settle 15s / 50s, then read back every key)"
-tmo 300 docker stop -t 240 $P-swriter $P-touch >/dev/null
+tmo 300 docker stop -t 240 $P-swriter $P-touch $( [ "${DELETE_ORACLE:-0}" = 1 ] && echo $P-del ) >/dev/null
 versioned=$(docker logs $P-swriter 2>&1 | grep '"phase": "checked"' | tail -1)
 echo "=== versioned: ${versioned:-NO RESULT}"
 docker logs $P-swriter > "$L/swriter.log" 2>&1
@@ -120,6 +137,15 @@ T "per-owner raw check of the touch keys on every live node (touchcheck.py)"
 nodes=$(printf "%s:8356," "${live[@]}"); nodes=${nodes%,}
 tcheck=$(tmo 600 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python touchcheck.py --state logs/chaos-$RUN/touchstate.json --nodes $nodes | tail -1)
 echo "=== touch (owners): ${tcheck:-NO RESULT}"
+dsdk=; dcheck=
+if [ "${DELETE_ORACLE:-0}" = 1 ]; then
+  dsdk=$(docker logs $P-del 2>&1 | grep '"phase": "checked"' | tail -1)
+  echo "=== delete (sdk): ${dsdk:-NO RESULT}"
+  docker logs $P-del > "$L/del.log" 2>&1
+  T "per-owner raw check of the delete keys on every live node (delcheck.py)"
+  dcheck=$(tmo 600 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python delcheck.py --state logs/chaos-$RUN/delstate.json --nodes $nodes | tail -1)
+  echo "=== delete (owners): ${dcheck:-NO RESULT}"
+fi
 T "waiting for the load to finish (<= $LOAD_SECS s total)"
 tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
 load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)
@@ -149,6 +175,20 @@ for k in ('k_no_owner','n_no_owner','k_missing_on_owner','n_missing_on_owner','k
   if own.get(k): print(f'owners {k}={own[k]}')
 " "$touched" "$tcheck")
 [ -z "$tbad" ] || { T "FAIL: touch oracle: $(echo $tbad | tr '\n' ' ')"; fail=1; }
+if [ "${DELETE_ORACLE:-0}" = 1 ]; then
+  dbad=$(python3 -c "
+import json,sys
+sdk=json.loads(sys.argv[1]) if sys.argv[1].startswith('{') else {}; own=json.loads(sys.argv[2]) if sys.argv[2].startswith('{') else {}
+if not sdk: print('no sdk result')
+if not own: print('no owners result')
+for k in ('x_present','r_miss','r_corrupt','read_err'):
+  if sdk.get(k): print(f'sdk {k}={sdk[k]}')
+for k in ('dr_no_owner','dr_wrong_value','dr_other_reply','x_lingering_keys','x_other_reply'):
+  if own.get(k): print(f'owners {k}={own[k]}')
+" "$dsdk" "$dcheck")
+  [ -z "$dbad" ] || { T "FAIL: delete oracle: $(echo $dbad | tr '\n' ' ')"; fail=1; }
+  echo "$dsdk $dcheck" | grep -oE '"(r_stale|dr_stale_on_owner|dr_keys_with_stale_copy|dr_missing_on_owner|dr_keys_with_missing_copy)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== delete accepted (printed, not asserted): /'; echo
+fi
 for c in $(docker ps -aq --filter name=$P-); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); ip=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $c); echo "$n $ip" >> "$L/ipmap.txt"; [ -f "$L/$n.log" ] || docker logs -t $c > "$L/$n.log" 2>&1; done
 echo "=== entries:"; cat "$L/entries.txt"
 echo "=== logs in $L"; cat "$L/ipmap.txt"

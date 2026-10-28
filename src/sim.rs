@@ -1698,3 +1698,178 @@ async fn a_leave_right_after_a_join_does_not_revive_the_keys_the_join_took_and_t
         "the leave revived dead copies of keys the client removed: {out:?}"
     );
 }
+
+/// What one run of the tombstone-outliving-its-copy scenario saw.
+#[derive(Debug)]
+struct TombstoneOutcome {
+    /// Keys A and C owned, that D takes from B once C is gone.
+    keys: usize,
+    b_held_after_the_recreation: usize,
+    /// Keys B does not hold once D is gone and A's re-replication pass has
+    /// offered it the fresh copy back.
+    b_missing: usize,
+    a_missing: usize,
+}
+
+/// A key deleted and created again within the tombstone's two minutes lost
+/// a copy when its owner was displaced and then came back: the delete A's
+/// window relayed to B left a tombstone there; the new value, which the
+/// window relayed too and B stored as a handoff write, was under it; a
+/// join displaced B and the sweep removed its dead copy, but not the
+/// tombstone; the joiner's eviction made B an owner again, and A's
+/// put-if-absent re-replication was refused by that tombstone, which
+/// records a delete older than the copy being refused.
+///
+/// A, B and C hold keys; C is evicted, A's pass promotes B and opens A's
+/// window toward it; inside the window the client deletes the keys on A
+/// and creates them again; D joins and takes them from B; once the sweep
+/// has removed B's dead copies, D dies, inside the tombstone's two
+/// minutes, and B owns the keys again.
+async fn scenario_tombstone_swept() -> TombstoneOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc, mut pd) = (
+        Port::reserve(),
+        Port::reserve(),
+        Port::reserve(),
+        Port::reserve(),
+    );
+    let (dport, a, b, c, d) = (dp.number, pa.number, pb.number, pc.number, pd.number);
+    let disc = start_discovery(&mut dp, Duration::from_secs(15));
+    settle().await;
+    let mut client = Client::new();
+    let na = start_node(&mut pa, dport, Some("node-a"));
+    run_for(Duration::from_secs(20)).await;
+    let nb = start_node(&mut pb, dport, Some("node-b"));
+    run_for(Duration::from_secs(25)).await;
+    let nc = start_node(&mut pc, dport, Some("node-c"));
+    run_for(Duration::from_secs(25)).await;
+    let roster3 = roster(dport).await;
+    assert_eq!(roster3.len(), 3, "A, B and C are members: {roster3:?}");
+    let (name_a, name_b, name_c) = (
+        name_at(&roster3, a),
+        name_at(&roster3, b),
+        name_at(&roster3, c),
+    );
+    let port_of = |name: &str| -> u16 {
+        [(&name_a, a), (&name_b, b), (&name_c, c)]
+            .into_iter()
+            .find(|(n, _)| n.as_str() == name)
+            .map(|(_, port)| port)
+            .unwrap()
+    };
+    let ring3 = HashRing::new(vec![name_a.clone(), name_b.clone(), name_c.clone()]);
+    let keys: Vec<String> = (0..300).map(|i| format!("z{i}")).collect();
+    for key in &keys {
+        for owner in ring3.owners(&Key::unnamespaced(Bytes::from(key.clone())), 2) {
+            assert_eq!(
+                client.set(port_of(owner), key, "v1").await,
+                "S",
+                "{key} on {owner}"
+            );
+        }
+    }
+    run_for(Duration::from_secs(70)).await;
+
+    // C dies; A's pass promotes B for the keys A and C owned and opens A's
+    // window toward B for 60 s.
+    nc.abort();
+    run_until_members(dport, 2).await;
+    let chosen: Vec<String> = keys
+        .iter()
+        .filter(|key| {
+            let owners = ring3.owners(&Key::unnamespaced(Bytes::from((*key).clone())), 2);
+            owners.contains(&name_a.as_str()) && owners.contains(&name_c.as_str())
+        })
+        .cloned()
+        .collect();
+    let mut waited = Duration::ZERO;
+    loop {
+        let mut held = 0;
+        for key in &chosen {
+            if client.holds(b, key).await {
+                held += 1;
+            }
+        }
+        if held == chosen.len() || waited >= Duration::from_secs(15) {
+            assert_eq!(held, chosen.len(), "B was not promoted for the keys");
+            break;
+        }
+        run_for(Duration::from_millis(250)).await;
+        waited += Duration::from_millis(250);
+    }
+
+    // Inside the window: delete on A, which relays the delete to B (a
+    // tombstone there), then create the keys again.
+    for key in &chosen {
+        let reply = client.delete(a, key).await;
+        assert!(reply == "D" || reply == "N", "{key}: {reply}");
+    }
+    run_for(Duration::from_secs(2)).await;
+    for key in &chosen {
+        assert_eq!(client.set(a, key, "v2").await, "S", "{key}");
+    }
+    run_for(Duration::from_secs(1)).await;
+    let mut b_held = 0;
+    for key in &chosen {
+        if client.holds(b, key).await {
+            b_held += 1;
+        }
+    }
+
+    // D joins and takes the keys from B while A stays; the sweep after the
+    // join's confirmation removes B's dead copies. D then dies and B owns
+    // the keys again.
+    let nd = start_node(&mut pd, dport, Some("node-d"));
+    run_until_members(dport, 3).await;
+    let name_d = name_at(&roster(dport).await, d);
+    let ring_abd = HashRing::new(vec![name_a.clone(), name_b.clone(), name_d.clone()]);
+    let chosen: Vec<String> = chosen
+        .into_iter()
+        .filter(|key| {
+            let owners = ring_abd.owners(&Key::unnamespaced(Bytes::from(key.clone())), 2);
+            owners.contains(&name_a.as_str()) && owners.contains(&name_d.as_str())
+        })
+        .collect();
+    run_for(Duration::from_secs(20)).await;
+    nd.abort();
+    run_until_members(dport, 2).await;
+    run_for(Duration::from_secs(30)).await;
+    let mut out = TombstoneOutcome {
+        keys: chosen.len(),
+        b_held_after_the_recreation: b_held,
+        b_missing: 0,
+        a_missing: 0,
+    };
+    for key in &chosen {
+        if !client.holds(b, key).await {
+            out.b_missing += 1;
+        }
+        if !client.holds(a, key).await {
+            out.a_missing += 1;
+        }
+    }
+    disc.abort();
+    na.abort();
+    nb.abort();
+    out
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_delete_tombstone_does_not_outlive_the_dead_copy_that_a_later_write_put_under_it() {
+    let _spin = spin();
+    let out = scenario_tombstone_swept().await;
+    eprintln!("{out:?}");
+    assert!(out.keys > 0, "nothing to check: {out:?}");
+    assert!(
+        out.b_held_after_the_recreation > 0,
+        "nothing to check, the window did not carry the new value to B: {out:?}"
+    );
+    assert_eq!(out.a_missing, 0, "A lost keys it owned throughout: {out:?}");
+    assert_eq!(
+        out.b_missing, 0,
+        "B refused its owner's copy of a key created again after the delete: {out:?}"
+    );
+}
