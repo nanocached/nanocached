@@ -410,8 +410,15 @@ here.</p>
   usually one to three increments are lost (five were seen among twelve
   parallel increments) on about one counter per join in a
   loaded cluster (serial increments are practically exact, about one
-  in 12,000). The old owner cannot tell a replicated result from a
-  client&rsquo;s write it must forward. Accepted 2026-10-17: the stale
+  in 12,000). A compare-and-set loop is exposed the same way: the
+  result of an acknowledged <code>replace</code> that a lagging forward
+  rewinds is gone, and the next <code>replace</code> succeeds on the older
+  value (one to seven of 2,000 chains lost an acknowledged update, out
+  of about 11,000 acknowledged replaces, in each of three six-round join,
+  decommission and kill runs with two clients appending to the same
+  key). The old owner cannot tell a replicated result from a
+  client&rsquo;s write it must forward. Accepted 2026-10-17, and for
+  compare-and-set 2026-10-28: the stale
   is bounded by TTL and needs a membership change, a double write with
   changed content and a lagging forward to coincide, and removing it
   would need versioned writes in the server and every SDK. Revisit if a
