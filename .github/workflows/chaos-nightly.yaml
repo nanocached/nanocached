@@ -1,0 +1,141 @@
+name: Chaos nightly
+
+# tests/e2e/chaos.sh with every oracle on: R=2, three nodes, six rounds of
+# join, decommission and kill-restart under mixed load, with the touch,
+# delete, TTL, compare-and-set, INCR, namespace-clear and multi-set
+# workloads each crossing those membership changes and every key read back
+# from every live node. One run takes about 16 minutes on a laptop.
+#
+# Not per push. Every night three cells run on runners of their own (the load
+# is timed against the membership change, and several clusters on one runner
+# would share its CPU): an early warning, so a regression is looked at while
+# the commits that could have caused it are few. Before a release of the node
+# or discovery, run it by hand with `cells` set to 21 on the release commit:
+# the failures the oracles found before a release showed in one run of six
+# to nine, so a single pass says little and twenty-one clean runs are what the
+# release criteria in tests/e2e/README.md ask for.
+#
+# A failing cell is a finding to look at, not noise: the oracles assert only
+# behaviour the architecture page does not accept, and the accepted behaviour
+# is printed in the job summary so its size can be followed from run to run.
+#
+# It reports; it does not gate release tagging.
+
+on:
+  # TEMPORARY: runs the three cells on the PR that adds this file; removed before merge.
+  pull_request:
+    paths:
+      - .github/workflows/chaos-nightly.yaml
+  schedule:
+    - cron: "29 1 * * *"
+  workflow_dispatch:
+    inputs:
+      cells:
+        description: "Number of chaos runs, one runner each (21 before a release)"
+        default: "3"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      runs: ${{ steps.plan.outputs.runs }}
+    steps:
+      - name: List the cells
+        id: plan
+        env:
+          CELLS: ${{ inputs.cells }}
+        run: |
+          n="${CELLS:-3}"
+          case "$n" in ''|*[!0-9]*) echo "cells must be a number, got '$n'" >&2; exit 1;; esac
+          [ "$n" -ge 1 ] && [ "$n" -le 30 ] || { echo "cells must be 1 to 30, got $n" >&2; exit 1; }
+          echo "runs=[$(seq 1 "$n" | paste -sd, -)]" >> "$GITHUB_OUTPUT"
+
+  chaos:
+    needs: plan
+    name: run ${{ matrix.run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJSON(needs.plan.outputs.runs) }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build the node image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: node
+          load: true
+          tags: nanocached-node:chaos
+          cache-from: type=gha,scope=node
+          cache-to: type=gha,mode=max,scope=node
+
+      - name: Build the discovery image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: discovery
+          load: true
+          tags: nanocached-discovery:chaos
+          cache-from: type=gha,scope=discovery
+          cache-to: type=gha,mode=max,scope=discovery
+
+      # The loaders are Python scripts that import the SDK; the image is the
+      # SDK of this commit, so a change to it is part of what runs.
+      - name: Build the client image
+        run: |
+          docker build -t e2e-client:chaos -f - sdk/python <<'EOF'
+          FROM python:3.12-slim
+          COPY . /sdk
+          RUN pip install --no-cache-dir /sdk
+          EOF
+
+      - name: Run chaos with every oracle
+        # chaos.sh bounds its own waits; this is the outer bound for the step.
+        env:
+          NODE: nanocached-node:chaos
+          DISC: nanocached-discovery:chaos
+          CLIENT: e2e-client:chaos
+          ROUNDS: "6"
+          RUN: ci${{ matrix.run }}
+          DELETE_ORACLE: "1"
+          TTL_ORACLE: "1"
+          CAS_ORACLE: "1"
+          INCR_ORACLE: "1"
+          CLEAR_ORACLE: "1"
+          MULTI_ORACLE: "1"
+        run: |
+          set -o pipefail
+          timeout 3000 tests/e2e/chaos.sh 2>&1 | tee chaos.log
+
+      - name: Summarise the run
+        if: always()
+        run: |
+          {
+            echo "### chaos run ${{ matrix.run }}"
+            echo '```'
+            grep -E "DONE|FAIL|^=== (check|discovery|.* accepted)" chaos.log | cut -c1-700 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the run's logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chaos-${{ matrix.run }}
+          path: |
+            chaos.log
+            tests/e2e/logs/chaos-ci${{ matrix.run }}/
+          if-no-files-found: warn
+          retention-days: 14
