@@ -82,6 +82,39 @@ half-open ~1 MiB frames from four source IPs), #701 (`PendingClears`), #695
 (`/metrics` with many namespaces), #697 (`--max-memory` against tiny entries),
 #692 (an `m`/`o` frame of one-byte keys).
 
+## Chaos nightly and the release criteria
+
+`.github/workflows/chaos-nightly.yaml` runs `chaos.sh` with every oracle on
+(`DELETE_ORACLE`, `TTL_ORACLE`, `CAS_ORACLE`, `INCR_ORACLE`, `CLEAR_ORACLE`,
+`MULTI_ORACLE`, and the touch oracle that is always on), `ROUNDS=6`, one run
+per runner. It reports and does not gate tagging. The accepted behaviour each
+oracle prints is in the job summary, so its size can be followed from run to
+run; the logs are kept for 14 days.
+
+- Every night it runs 3 cells: an early warning, so a regression is looked at
+  while the commits that could have caused it are few.
+- By hand (`gh workflow run chaos-nightly.yaml -f cells=21`, or Run workflow
+  in the Actions tab) it runs as many cells as asked, in parallel.
+
+Why 21 and not one pass: the failures the oracles found before a release
+showed in one run of six to nine. Against a failure that shows in one run of
+seven, one clean run (what a pre-release check had) leaves it unseen in 86 %
+of cases, three clean runs in 63 %, and twenty-one clean runs in 4 %.
+
+A release of the node or discovery is judged by:
+
+1. `chaos-nightly.yaml` run by hand with `cells=21` on the release commit:
+   all 21 cells PASS.
+2. `scalein.sh` and `proxydrain.sh` pass once on images built from the
+   release commit.
+3. A failure in either is followed to its mechanism, from a trace or a
+   deterministic reproduction, before the release goes on. A rerun that
+   passes is not a resolution; the families behind the touch and expiry
+   fixes failed one run in six to nine.
+
+SDK and adapter releases that do not change the node or discovery are
+judged by their own test suites.
+
 ## Shared helpers
 
 - `cl.sh` — sourced by the scenarios: `disc_up`, `node_up`, `members`,
