@@ -477,7 +477,17 @@ here.</p>
   mixed join/decommission sequences: a clear that broke the invariants in
   12 of 16 runs, mostly one whose new keys were missing on every owner (a
   cache miss, not a stale read); the same client with no membership change
-  did not (6 runs). Accepted 2026-10-23: the missing write is a miss on a
+  did not (6 runs). The size of it, measured with 600 such cycles of 20
+  keys each in a namespace of its own, spread over six join, decommission
+  and kill rounds with the clears landing in the forwarding windows: 7,300
+  to 8,300 of the 12,000 keys set after a clear were missing on every
+  owner (three runs), in 400 to 450 of the 600 cycles. In two traced runs a clear was
+  not applied once on each node but 30 to 50 times, because a forwarded clear
+  goes on to every joiner still inside its grace, and the copies arrive a
+  median 5 to 7&nbsp;ms and up to 1.8&nbsp;s after the client&rsquo;s clear
+  was acknowledged; nearly all of the new keys that were dropped were
+  dropped by such a copy. The same cycles in a steady three-node cluster
+  lost none. Accepted 2026-10-23: the missing write is a miss on a
   cache, and acknowledging a clear only after its copies were applied
   would make every clear wait for every window&rsquo;s queue and needs a
   delivery signal on the forward path. Not passing a forwarded clear on
@@ -501,7 +511,9 @@ here.</p>
   membership change, and closing it would need each copy to carry when it
   was read, or the receiver to refuse every put-if-absent of the
   namespace for a while, which would also refuse the copies of keys
-  written after the clear.</li>
+  written after the clear. The same runs left 0 to 44 keys with their old
+  value (up to 10 in one cycle, 0 to 8 cycles of 600), more than one per
+  sender connection; the path of the extra copies was not traced.</li>
   <li>A key deleted and set again within two minutes of the delete can
   be one copy short after a membership change, until the next
   re-replication or the next write. A delete relayed through a window

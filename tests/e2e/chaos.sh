@@ -69,6 +69,17 @@
 # the primary (ia_short_on_replica); both are accepted behaviour in
 # docs/architecture.html. Output in $L/incr.log. Off
 # by default until it has run clean a few times in a row on main.
+# CLEAR_ORACLE=1 adds clearload.py: cycles of 20 sets, a namespace clear and 20
+# sets of other keys, each cycle in a namespace of its own, one burst of
+# cycles per round. Asserted: no key written after a clear holds a value
+# other than its own, the control keys (never cleared, default and own
+# namespace) are all there, no node answers a clear with anything but
+# success once retried (SDK read-back, then clearcheck.py raw on every
+# owner). Printed, not asserted: keys set before a clear that are still there
+# (a read-before-clear copy landing after it) and keys set after it that are
+# missing on an owner (a clear forwarded late); both are accepted behaviour in
+# docs/architecture.html. Output in $L/clear.log. Off by default until it has
+# run clean a few times in a row on main.
 #   docker build --target node -t nanocached-node:dev .
 #   docker build --target discovery -t nanocached-discovery:dev .
 #   NODE=nanocached-node:dev DISC=nanocached-discovery:dev ROUNDS=6 ./chaos.sh
@@ -132,6 +143,12 @@ if [ "${INCR_ORACLE:-0}" = 1 ]; then
   for _ in $(seq 1 120); do docker logs $P-incr 2>&1 | grep -q '"phase": "seeded"' && break; sleep 1; done
   docker logs $P-incr 2>&1 | grep -q '"phase": "seeded"' || { T "FAIL: INCR workload did not finish seeding"; fail=1; }
 fi
+if [ "${CLEAR_ORACLE:-0}" = 1 ]; then
+  T "start the clear workload (clearload.py: 600 cycles of 20 sets, clear, 20 sets, one burst of cycles per round on SIGUSR1; stopped with the writer)"
+  docker run -d --name $P-clear --network $NET -v "$E:/w" -w /w $CLIENT python clearload.py --addr $D --cycles 600 --k 20 --workers 4 --bursts $ROUNDS --burst-secs 15 --settle 30 --report-every 30 --state logs/chaos-$RUN/clearstate.json >/dev/null
+  for _ in $(seq 1 120); do docker logs $P-clear 2>&1 | grep -q '"phase": "seeded"' && break; sleep 1; done
+  docker logs $P-clear 2>&1 | grep -q '"phase": "seeded"' || { T "FAIL: clear workload did not finish seeding"; fail=1; }
+fi
 entries_snapshot seeded
 T "start ${LOAD_SECS}s mixed load (8 conns, get 70%, hedge 10ms, reconnect on error)"
 docker run -d --name $P-load --network $NET -v "$E:/w" -w /w $CLIENT python ${LOADER:-load.py} --addr $D --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label chaos --reconnect-on-error --hedge 0.01 --report-every 30 >/dev/null
@@ -145,6 +162,7 @@ for r in $(seq 1 $ROUNDS); do
   [ "${TTL_ORACLE:-0}" = 1 ] && docker kill -s USR1 $P-ttl >/dev/null 2>&1   # and of the set-with-TTL loader's turns
   [ "${CAS_ORACLE:-0}" = 1 ] && docker kill -s USR1 $P-cas >/dev/null 2>&1   # and of the compare-and-set loader's turns
   [ "${INCR_ORACLE:-0}" = 1 ] && docker kill -s USR1 $P-incr >/dev/null 2>&1   # and of the INCR loader's turns
+  [ "${CLEAR_ORACLE:-0}" = 1 ] && docker kill -s USR1 $P-clear >/dev/null 2>&1   # and of the clear loader's cycles
   case $a in
     join)
       spawn; n=$spawned; T "round $r JOIN $n (members ${#live[@]})"
@@ -176,7 +194,7 @@ for r in $(seq 1 $ROUNDS); do
   entries_snapshot "round$r-$a"
 done
 T "stop the versioned writer and the touch workload (settle 15s / 50s, then read back every key)"
-tmo 300 docker stop -t 240 $P-swriter $P-touch $( [ "${DELETE_ORACLE:-0}" = 1 ] && echo $P-del ) $( [ "${TTL_ORACLE:-0}" = 1 ] && echo $P-ttl ) $( [ "${CAS_ORACLE:-0}" = 1 ] && echo $P-cas ) $( [ "${INCR_ORACLE:-0}" = 1 ] && echo $P-incr ) >/dev/null
+tmo 300 docker stop -t 240 $P-swriter $P-touch $( [ "${DELETE_ORACLE:-0}" = 1 ] && echo $P-del ) $( [ "${TTL_ORACLE:-0}" = 1 ] && echo $P-ttl ) $( [ "${CAS_ORACLE:-0}" = 1 ] && echo $P-cas ) $( [ "${INCR_ORACLE:-0}" = 1 ] && echo $P-incr ) $( [ "${CLEAR_ORACLE:-0}" = 1 ] && echo $P-clear ) >/dev/null
 versioned=$(docker logs $P-swriter 2>&1 | grep '"phase": "checked"' | tail -1)
 echo "=== versioned: ${versioned:-NO RESULT}"
 docker logs $P-swriter > "$L/swriter.log" 2>&1
@@ -223,6 +241,15 @@ if [ "${INCR_ORACLE:-0}" = 1 ]; then
   T "per-owner raw check of the INCR counters on every live node (incrcheck.py)"
   icheck=$(tmo 600 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python incrcheck.py --state logs/chaos-$RUN/incrstate.json --nodes $nodes | tail -1)
   echo "=== incr (owners): ${icheck:-NO RESULT}"
+fi
+lsdk=; lcheck=
+if [ "${CLEAR_ORACLE:-0}" = 1 ]; then
+  lsdk=$(docker logs $P-clear 2>&1 | grep '"phase": "checked"' | tail -1)
+  echo "=== clear (sdk): ${lsdk:-NO RESULT}"
+  docker logs $P-clear > "$L/clear.log" 2>&1
+  T "per-owner raw check of the clear keys on every live node (clearcheck.py)"
+  lcheck=$(tmo 900 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python clearcheck.py --state logs/chaos-$RUN/clearstate.json --nodes $nodes | tail -1)
+  echo "=== clear (owners): ${lcheck:-NO RESULT}"
 fi
 T "waiting for the load to finish (<= $LOAD_SECS s total)"
 tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
@@ -315,6 +342,20 @@ for k in ('counter_miss','not_numeric','is_phantom'):
 " "$isdk" "$icheck")
   [ -z "$ibad" ] || { T "FAIL: incr oracle: $(echo $ibad | tr '\n' ' ')"; fail=1; }
   echo "$isdk $icheck" | grep -oE '"(ia_short|ia_lost_min|ia_dup_returns|is_short|is_lost_min|is_dup_returns|ia_short_on_owner|ia_short_on_primary|ia_short_on_replica|ia_lost_min_on_owner|ia_owners_differ|is_short_on_owner|is_short_on_primary|is_short_on_replica|is_owners_differ|is_rewind|is_skip|acked_a|maybe_a|acked_s|maybe_s)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr accepted (printed, not asserted): /'; echo
+fi
+if [ "${CLEAR_ORACLE:-0}" = 1 ]; then
+  lbad=$(python3 -c "
+import json,sys
+sdk=json.loads(sys.argv[1]) if sys.argv[1].startswith('{') else {}; own=json.loads(sys.argv[2]) if sys.argv[2].startswith('{') else {}
+if not sdk: print('no sdk result')
+if not own: print('no owners result')
+for k in ('new_corrupt','control_miss','control_corrupt','read_err'):
+  if sdk.get(k): print('sdk', k, sdk[k])
+for k in ('new_wrong_value','new_other_reply','old_other_reply','ctl_no_owner','ctl_missing_on_owner','ctl_wrong_value','ctl_other_reply'):
+  if own.get(k): print('owners', k, own[k])
+" "$lsdk" "$lcheck")
+  [ -z "$lbad" ] || { T "FAIL: clear oracle: $(echo $lbad | tr '\n' ' ')"; fail=1; }
+  echo "$lsdk $lcheck" | grep -oE '"(stale_old|cycles_stale_old|stale_max_in_cycle|new_miss|cycles_new_miss|new_ok|cycles_checked|cycles_unknown|old_lingering_keys|old_lingering_copies|cycles_old_lingering|new_keys_with_missing_copy|new_missing_on_owner)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== clear accepted (printed, not asserted): /'; echo
 fi
 for c in $(docker ps -aq --filter name=$P-); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); ip=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $c); echo "$n $ip" >> "$L/ipmap.txt"; [ -f "$L/$n.log" ] || docker logs -t $c > "$L/$n.log" 2>&1; done
 echo "=== entries:"; cat "$L/entries.txt"
