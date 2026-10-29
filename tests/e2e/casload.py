@@ -49,6 +49,7 @@ ap.add_argument("--duration", type=float, default=0); ap.add_argument("--settle"
 ap.add_argument("--op-timeout", type=float, default=15); ap.add_argument("--max-attempts", type=int, default=30)
 ap.add_argument("--report-every", type=float, default=30); ap.add_argument("--state", default="")
 ap.add_argument("--max-examples", type=int, default=50); ap.add_argument("--oplog", default="")
+ap.add_argument("--clients", type=int, default=2)   # 1: both contenders of a turn share one client (one connection per node)
 a = ap.parse_args()
 addrs = [(x.rsplit(":", 1)[0], int(x.rsplit(":", 1)[1])) for x in a.addr.split(",")]
 T0 = time.time()
@@ -135,7 +136,7 @@ async def contender(c, i, ci):
 
 async def cc_turn(clients, i):
     counts["cc_turns"] += 1
-    await asyncio.gather(*[contender(c, i, ci) for ci, c in enumerate(clients)])
+    await asyncio.gather(*[contender(c, i, ci) for ci, c in enumerate((clients * 2)[:2])])
 
 async def cp_turn(clients, i):
     counts["cp_turns"] += 1
@@ -143,7 +144,7 @@ async def cp_turn(clients, i):
     async def one(c, v):
         try: return "T" if await op(c.put_if_absent(k, v)) else "F"
         except Exception as e: err(e, "cp-put"); return "?"
-    res = await asyncio.gather(*[one(c, f"{i}:{n}".encode()) for n, c in enumerate(clients)])
+    res = await asyncio.gather(*[one(c, f"{i}:{n}".encode()) for n, c in enumerate((clients * 2)[:2])])
     race[i] = "".join(res)
 
 async def worker(w, clients):
@@ -229,7 +230,7 @@ async def main():
         global bursts_signalled
         bursts_signalled += 1; print(json.dumps(dict(at=now_s(), t=int(time.time() - T0), burst=bursts_signalled)), flush=True)
     loop.add_signal_handler(signal.SIGUSR1, on_burst)
-    clients = [await NanocachedClient.connect(addrs), await NanocachedClient.connect(addrs)]
+    clients = [await NanocachedClient.connect(addrs) for _ in range(a.clients)]
     fc = await seed(clients[0])
     print(json.dumps(dict(t=int(time.time() - T0), phase="seeded", n=a.n, seed_failed=fc)), flush=True)
     if a.duration > 0: loop.call_later(a.duration, stop.set)

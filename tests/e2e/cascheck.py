@@ -43,6 +43,10 @@ class Conn:
             if not d: raise EOFError("closed")
             self.buf += d
         data, self.buf = self.buf[:n], self.buf[n:]; return data
+    def probe_primary(self, key):
+        """True when this node is the key's primary: a delta-0 `i` gets `T` (not an integer) there and `W` anywhere else."""
+        self.s.sendall(f"i 0 {len(key)} 0\n".encode() + key)
+        return self._line().split()[0] != b"W"
     def get(self, key):
         self.s.sendall(f"G {len(key)}\n".encode() + key)
         line = self._line()
@@ -80,7 +84,12 @@ for i in range(st["n"]):
         tags = [p for p in parts[1:] if p]
         gone = [t for t in acked if t not in tags]
         if parts[0] != "S": bump("cc_head_on_owner"); ex("cc_head_on_owner", key.decode(), n, r[1][:32].decode("latin-1")); bad = True
-        if gone: bump("cc_lost_on_owner"); ex("cc_lost_on_owner", key.decode(), n, gone, tags); bad = True
+        if gone:
+            bump("cc_lost_on_owner"); bad = True
+            try: primary = conns[n].probe_primary(key)
+            except Exception: primary = None
+            bump("cc_lost_on_primary" if primary else "cc_lost_on_replica" if primary is False else "cc_lost_primary_unknown")
+            ex("cc_lost_on_owner", key.decode(), n, gone, tags, "primary" if primary else "replica")
         if len(set(tags)) != len(tags): bump("cc_dup_on_owner"); ex("cc_dup_on_owner", key.decode(), n, tags); bad = True
     if len(values) > 1: bump("cc_owners_differ"); ex("cc_owners_differ", key.decode(), sorted(v.decode("latin-1") for v in values))
     if not bad: bump("cc_ok_everywhere")
