@@ -22,10 +22,6 @@ name: Chaos nightly
 # It reports; it does not gate release tagging.
 
 on:
-  # TEMPORARY: runs the three cells on the PR that adds this file; removed before merge.
-  pull_request:
-    paths:
-      - .github/workflows/chaos-nightly.yaml
   schedule:
     - cron: "29 1 * * *"
   workflow_dispatch:
