@@ -409,8 +409,13 @@ here.</p>
   and when it lands after a later increment it rewinds the counter, so
   usually one to three increments are lost (five were seen among twelve
   parallel increments) on about one counter per join in a
-  loaded cluster (serial increments are practically exact, about one
-  in 12,000). A compare-and-set loop is exposed the same way: the
+  loaded cluster. One caller is exposed too when its increments follow
+  each other within a few milliseconds, as a forward lags that long:
+  with four back-to-back increments about 1&nbsp;ms apart on each counter,
+  357 to 395 of 2,000 counters lost an acknowledged increment in
+  six-round join, decommission and kill runs. With increments spaced well
+  above the lag they are practically exact (about one in 12,000 in a
+  join window, measured). A compare-and-set loop is exposed the same way: the
   result of an acknowledged <code>replace</code> that a lagging forward
   rewinds is gone, and the next <code>replace</code> succeeds on the older
   value (one to seven of 2,000 chains lost an acknowledged update, out
@@ -423,6 +428,25 @@ here.</p>
   changed content and a lagging forward to coincide, and removing it
   would need versioned writes in the server and every SDK. Revisit if a
   versioned write path is adopted for other reasons.</li>
+  <li>Two clients incrementing the same counter at the same time can leave
+  a replica behind the primary, with no membership change involved. The
+  primary applies the increments in one order, but each client writes the
+  result it got to the replica as an ordinary set once its own answer
+  arrives, and two clients read their answers from different connections, so
+  the replica can receive the larger result first and the smaller one
+  after it. The primary holds the right value; the replica holds one or
+  two increments less until the next increment of the key writes it
+  again, and a primary lost before then leaves the replica&rsquo;s value
+  as the counter. Measured with the Python SDK on three nodes, after the
+  join window had passed, with counters each incremented 12 times in turns
+  of four concurrent increments: 4 of 600, 7 of 2,000 and 21 of 2,000
+  counters had a replica behind in three runs (in 11 of the 21 the replica
+  writes were issued in the opposite order of the primary&rsquo;s values),
+  against none of 2,000 with one client
+  (one connection per node) and none with serial increments. Accepted
+  2026-10-29: ordering the replica writes would need a version on every
+  replica write in the server and every SDK. A single client, or one
+  client per counter, does not see it.</li>
   <li>During a join&rsquo;s or a decommission&rsquo;s forwarding window, a
   touch (<code>t</code>, or a key of a <code>y</code> batch) is forwarded as the value the old owner holds with
   the new TTL, written like a set, not as a touch: the joiner may not hold
@@ -533,8 +557,10 @@ here.</p>
   2026-10-20: ordering it would need a version on every write in the
   server and every SDK, and a per-key lock inside one SDK would not
   cover two clients. A proxy serialises the writes of one key, so routing
-  through <code>nanocached-proxy</code> removes it; counters and
-  compare-and-set are not affected, they run on the primary alone.</li>
+  through <code>nanocached-proxy</code> removes it; compare-and-set runs on
+  the primary alone and showed no disagreement between owners in the
+  measurements below (about 34,000 acknowledged replaces in three runs).
+  A counter is exposed in one case, the next item.</li>
   <li>Re-replication handoff carries no version: when two survivors hold
   different copies, the first to reach the fresh node is kept, newer or
   not. A version would have to ride on every entry and every SDK write

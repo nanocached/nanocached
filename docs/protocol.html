@@ -193,8 +193,13 @@ an old owner forwards every write it receives to the joiner, the
 replicated result of an increment included, and that unconditional
 forward can land after a later increment and rewind the counter &mdash;
 a counter incremented concurrently by several callers during that
-window can lose a few increments (serial increments are practically
-exact). See <a href="architecture.html#accepted-behaviour">accepted
+window can lose a few increments; so can one caller whose increments
+follow each other within a few milliseconds, while increments spaced well
+above that are practically exact. Separately, two clients incrementing the
+same key at the same time can leave a replica one or two increments behind
+the primary, because each writes its result to the replica on its own and
+the writes are not ordered.
+See <a href="architecture.html#accepted-behaviour">accepted
 behaviour</a>.</p>
 
 <h2 id="cas">k / x — compare-and-set</h2>
