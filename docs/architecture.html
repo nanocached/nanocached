@@ -603,7 +603,12 @@ here.</p>
   ring lagging the published list by up to a heartbeat, longer while a
   join is pending on it — is closed by the node asking discovery before
   it refuses; what remains accepted is the refusal when that ask fails or
-  takes over a second, and when the client's list is the older one.</li>
+  takes over a second, and when the client's list is the older one.
+  Multi-set takes the same path: the answer of a key's primary decides its
+  outcome and a replica leg's failure is only counted. In chaos runs that
+  write 2,000 keys per class in batches of ten, 5&ndash;25 keys per class
+  ended with an owner one generation behind, the same as when the batches
+  were sent as single sets (almost all on the replica).</li>
   <li>The proxy re-enqueues a retried request (stale-view <code>W</code>,
   replica fallback) outside the client&rsquo;s send order; a pipelined
   <code>G</code> then <code>S</code> on one connection can read its own
