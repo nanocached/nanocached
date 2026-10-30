@@ -8,11 +8,22 @@ use std::time::Duration;
 /// field — a leading space plus the whole-seconds count when `ttl` is
 /// `Some`, or nothing at all when it's `None` (same "present field or no
 /// field" shape `S`'s own optional TTL field uses on the request side).
-/// Whole seconds, rounded down — matches every other TTL this protocol
-/// forwards (see `set_message`'s own rounding in `src/server.rs`).
+/// Whole seconds, rounded up — see `ttl_wire_seconds`.
 fn ttl_field(ttl: Option<Duration>) -> String {
-    ttl.map(|ttl| format!(" {}", ttl.as_secs()))
+    ttl.map(|ttl| format!(" {}", ttl_wire_seconds(ttl)))
         .unwrap_or_default()
+}
+
+/// A TTL as the whole seconds put on the wire, rounded up. The protocol has
+/// no sub-second TTL, and `0` is a value of its own: a copy forwarded with
+/// `0` is stored already expired (`S`) or becomes a delete (`U`), and an SDK
+/// replicating a reply's TTL reads `0` as "no expiry" or as "expire now",
+/// depending on the SDK. A remaining TTL of 0.9 s rounded down to `0` made
+/// the copy immortal or dead at once; rounded up it is 1 s, so a replica
+/// outlives its primary by less than a second at most. A zero `Duration`
+/// stays `0`: that is the expiring touch, forwarded as such.
+pub(crate) fn ttl_wire_seconds(ttl: Duration) -> u64 {
+    ttl.as_secs() + u64::from(ttl.subsec_nanos() > 0)
 }
 
 /// One key's outcome inside a `Response::Multi` (issues #128/#150) — the
@@ -143,8 +154,8 @@ pub enum Response {
     /// follows `S`'s own `[ttl] [tag]` idiom: a present-but-unlabeled
     /// trailing field, disambiguated only by the connection's
     /// already-known tagged-or-not mode, never guessed frame by frame.
-    /// TTL rounds down to whole seconds, same as every other TTL this
-    /// protocol forwards.
+    /// TTL rounds up to whole seconds (`ttl_wire_seconds`), as every other
+    /// TTL this protocol forwards does.
     Incremented(Bytes, Option<Duration>),
     /// In answer to `Touch` (issue #823): the value of the entry whose
     /// expiry was just replaced, plus the TTL now in effect (`None`: it
@@ -520,11 +531,25 @@ mod tests {
     }
 
     #[test]
-    fn encodes_incremented_response_rounds_a_sub_second_ttl_down() {
+    fn encodes_incremented_response_rounds_a_sub_second_ttl_up() {
         let response =
             Response::Incremented(Bytes::from_static(b"11"), Some(Duration::from_millis(1500)));
 
-        assert_eq!(response.encode(), b"I 2 1\n11");
+        assert_eq!(response.encode(), b"I 2 2\n11");
+
+        // Under a second left is 1, not 0: a 0 is read as "no expiry" or as
+        // "expire now" by whoever replicates the reply.
+        let nearly_gone =
+            Response::Incremented(Bytes::from_static(b"11"), Some(Duration::from_millis(900)));
+        assert_eq!(nearly_gone.encode(), b"I 2 1\n11");
+        assert_eq!(nearly_gone.encode_with_tag(4), b"I 2 1 4\n11");
+    }
+
+    #[test]
+    fn a_zero_ttl_stays_zero_on_the_wire() {
+        assert_eq!(ttl_wire_seconds(Duration::ZERO), 0);
+        assert_eq!(ttl_wire_seconds(Duration::from_nanos(1)), 1);
+        assert_eq!(ttl_wire_seconds(Duration::from_secs(60)), 60);
     }
 
     #[test]
@@ -541,7 +566,7 @@ mod tests {
             Bytes::from_static(b"Alice"),
             Some(Duration::from_millis(1500)),
         );
-        assert_eq!(sub_second.encode(), b"V 5 1\nAlice");
+        assert_eq!(sub_second.encode(), b"V 5 2\nAlice");
     }
 
     #[test]

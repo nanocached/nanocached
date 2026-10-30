@@ -4,7 +4,7 @@ use crate::command::{
 };
 use crate::hash_ring::{HashRing, KeyHash, KeyHasher};
 use crate::key::Key;
-use crate::response::{MultiAckEntry, MultiEntry, MultiTouchEntry, Response};
+use crate::response::{MultiAckEntry, MultiEntry, MultiTouchEntry, Response, ttl_wire_seconds};
 use bytes::{Bytes, BytesMut};
 use nanocached::infra;
 use nanocached::infra::{
@@ -4967,7 +4967,7 @@ fn set_message(key: &Key, value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
     };
 
     if let Some(ttl) = ttl {
-        header.push_str(&format!(" {}", ttl.as_secs()));
+        header.push_str(&format!(" {}", ttl_wire_seconds(ttl)));
     }
 
     header.push('\n');
@@ -7082,7 +7082,7 @@ fn handoff_message(
         token.len()
     );
     if let Some(ttl) = ttl {
-        header.push_str(&format!(" {}", ttl.as_secs()));
+        header.push_str(&format!(" {}", ttl_wire_seconds(ttl)));
     }
     if if_absent {
         header.push_str(" A");
@@ -21736,10 +21736,44 @@ mod tests {
     }
 
     #[test]
-    fn set_message_with_a_ttl_rounds_down_to_whole_seconds() {
+    fn set_message_with_a_ttl_rounds_up_to_whole_seconds() {
         assert_eq!(
-            set_message(&key(b"name"), b"Alice", Some(Duration::from_millis(4900))),
-            b"S 4 5 4\nnameAlice".to_vec()
+            set_message(&key(b"name"), b"Alice", Some(Duration::from_millis(4100))),
+            b"S 4 5 5\nnameAlice".to_vec()
+        );
+        // Under a second left must not go out as 0: the receiving copy would
+        // be stored already expired.
+        assert_eq!(
+            set_message(&key(b"name"), b"Alice", Some(Duration::from_millis(900))),
+            b"S 4 5 1\nnameAlice".to_vec()
+        );
+        // An expiring touch forwarded as a set keeps its 0.
+        assert_eq!(
+            set_message(&key(b"name"), b"Alice", Some(Duration::ZERO)),
+            b"S 4 5 0\nnameAlice".to_vec()
+        );
+    }
+
+    #[test]
+    fn handoff_message_rounds_a_sub_second_ttl_up_and_keeps_zero() {
+        let token = "0123456789abcdef";
+        let one = handoff_message(
+            &key(b"name"),
+            b"Alice",
+            Some(Duration::from_millis(900)),
+            false,
+            token,
+        );
+        assert!(
+            one.starts_with(b"U 0 4 5 16 1\n"),
+            "{:?}",
+            String::from_utf8_lossy(&one)
+        );
+        let zero = handoff_message(&key(b"name"), b"Alice", Some(Duration::ZERO), false, token);
+        assert!(
+            zero.starts_with(b"U 0 4 5 16 0\n"),
+            "{:?}",
+            String::from_utf8_lossy(&zero)
         );
     }
 
