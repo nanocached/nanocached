@@ -638,6 +638,21 @@ here.</p>
   never repaired; ordering the legs per key would put a lock on every
   background write. Without fire-and-forget the write waits for its
   replica legs and the race does not exist.</li>
+  <li>A touch that changes only the TTL of a key (removes it, shortens it,
+  or expires the key) and reaches one owner but not the other is not
+  repaired. The leg can fail while a node is leaving or restarting, or the
+  copy can be one the sender no longer counts as an owner until a ring
+  change makes it one again. Re-replication writes only where the key is
+  absent, so the copy that missed the change keeps its old TTL: it expires
+  later than it should (a key expired by a touch lingers) or earlier (a key
+  whose TTL was removed is missing on that owner), and if the copy that took
+  the change is lost before the other expires, the key is gone from both. A
+  repair would have to know which TTL is newer, which takes a version on
+  every write; taking the longer TTL instead would bring back keys a touch
+  had expired. In six-round join, decommission and kill runs, 1 to 19 of 2,000
+  keys whose TTL was removed ended missing on an owner in the CI runs that showed
+  it (2,000 keys, two-core runners), and in one run 46 of 2,000 expired keys
+  lingered on a copy; on a laptop it showed in a handful of runs.</li>
   <li>A batched touch with <code>G</code> leaves a value that does not fit
   the 16&nbsp;MiB reply untouched on the primary, but the plain form its
   other owners receive has no such bound, so their copies of that key get
