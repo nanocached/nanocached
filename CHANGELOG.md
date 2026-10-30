@@ -33,6 +33,13 @@ framework adapters at one version, whether or not a component changed.
   kept the whole received frame, value included, in memory until the sweep
   or an abandon, while the memory bound counted only the key name. The mark
   now holds a copy of the name.
+- `nanocached-node`: a copy that a join took away while this node was still
+  sending to the joiner (a re-replicated put-if-absent for a key the join
+  moved) was marked dead but missing from the handoff's list of marks, so
+  an abandoned join left it marked although this node owns the key again:
+  skipped by re-replication, and removed by a sweep when another owner
+  exists. The list now keeps those marks, on completion and when the
+  transfer is cancelled or fails.
 
 ## [0.5.1] - 2026-10-27
 

@@ -5883,6 +5883,24 @@ impl MigrationGuard {
         }
     }
 
+    /// The marks `join_took` recorded in this guard's own slot while the
+    /// transfer ran, taken out for an abort to roll back: the slot is
+    /// cleared when the guard drops, and `run_migration` knows only the
+    /// marks it made itself. Empty when the slot is no longer this guard's
+    /// (another handoff replaced it; its marks are its own).
+    fn take_join_marks(&self) -> Vec<Key> {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_mut() {
+            Some(active) if Arc::ptr_eq(&active.abort_requested, &self.abort_requested) => {
+                std::mem::take(&mut active.marked_keys)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Consumes the guard after a successful transfer: instead of
     /// clearing the slot (which would close the write-forwarding window
     /// the moment THIS node finishes — issue #3), it stamps the
@@ -5904,7 +5922,10 @@ impl MigrationGuard {
         {
             active.completed_at = Some(Instant::now());
             active.forwarding_grace = forwarding_grace(entries_sent);
-            active.marked_keys = marked_keys;
+            // Added to, not replaced: `join_took` records the copies it
+            // marks while this transfer is still running, and an abandon
+            // rolls back the marks listed here.
+            active.marked_keys.extend(marked_keys);
             active.pre_completion_ring = pre_completion_ring;
         }
         self.completed = true;
@@ -6168,7 +6189,10 @@ async fn run_migration(
         // races this key's peek is caught by the next iteration's drain,
         // which then lands after the stale key and wipes it.)
         if !drain_pending_clears(&node_context, &joining_addr, &mut stream).await {
-            for key in marked_this_run {
+            for key in marked_this_run
+                .into_iter()
+                .chain(migration_guard.take_join_marks())
+            {
                 unmark_migrated(&node_context.request_tx, &key).await;
             }
 
@@ -6201,7 +6225,10 @@ async fn run_migration(
         .await;
 
         if !sent {
-            for key in marked_this_run {
+            for key in marked_this_run
+                .into_iter()
+                .chain(migration_guard.take_join_marks())
+            {
                 unmark_migrated(&node_context.request_tx, &key).await;
             }
 
@@ -6219,7 +6246,10 @@ async fn run_migration(
     }
 
     if migration_guard.abort_requested.load(Ordering::SeqCst) {
-        for key in marked_this_run {
+        for key in marked_this_run
+            .into_iter()
+            .chain(migration_guard.take_join_marks())
+        {
             unmark_migrated(&node_context.request_tx, &key).await;
         }
 
@@ -6261,7 +6291,10 @@ async fn run_migration(
     // Issue #106: whatever clears queued up after the last key's drain
     // go out before the slot flips to "completed" ...
     if !drain_pending_clears(&node_context, &joining_addr, &mut stream).await {
-        for key in marked_this_run {
+        for key in marked_this_run
+            .into_iter()
+            .chain(migration_guard.take_join_marks())
+        {
             unmark_migrated(&node_context.request_tx, &key).await;
         }
 
@@ -21325,6 +21358,109 @@ mod tests {
             AbandonOutcome::Completed(_)
         ));
         assert_eq!(node_context.ring_history.generation(), 0);
+    }
+
+    fn fresh_migration_guard(node_context: &NodeContext, joiner: &str) -> MigrationGuard {
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            joiner.to_string(),
+        ]));
+        let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
+        MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            joiner.to_string(),
+            "127.0.0.1:9".to_string(),
+            format!("tok-{joiner}"),
+            after_ring,
+            2,
+            None,
+            &joined,
+            &node_context.known_ring,
+            &node_context.ring_history,
+        )
+        .unwrap_new()
+    }
+
+    #[test]
+    fn completing_a_handoff_keeps_the_marks_join_took_recorded_during_the_transfer() {
+        let node_context = test_node_context(
+            "ready-node",
+            "tok-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let guard = fresh_migration_guard(&node_context, "joiner-0");
+
+        // `join_took` runs while the transfer is still going.
+        node_context
+            .active_migration
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .marked_keys
+            .push(key(b"taken"));
+        guard.completed(1, vec![key(b"sent")], None);
+
+        let marked = node_context
+            .active_migration
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .marked_keys
+            .clone();
+        assert_eq!(
+            marked,
+            vec![key(b"taken"), key(b"sent")],
+            "an abandon of the completed handoff must roll back both"
+        );
+    }
+
+    #[test]
+    fn an_aborted_handoff_hands_back_the_marks_join_took_recorded_in_its_own_slot_only() {
+        let node_context = test_node_context(
+            "ready-node",
+            "tok-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let guard = fresh_migration_guard(&node_context, "joiner-0");
+        node_context
+            .active_migration
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .marked_keys
+            .push(key(b"taken"));
+
+        assert_eq!(guard.take_join_marks(), vec![key(b"taken")]);
+        assert!(guard.take_join_marks().is_empty(), "taken once");
+
+        // The slot now belongs to another handoff: its marks are not this
+        // guard's to roll back.
+        node_context.active_migration.lock().unwrap().take();
+        let _other = fresh_migration_guard(&node_context, "joiner-1");
+        node_context
+            .active_migration
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .marked_keys
+            .push(key(b"theirs"));
+        assert!(guard.take_join_marks().is_empty());
+        assert_eq!(
+            node_context
+                .active_migration
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .marked_keys,
+            vec![key(b"theirs")]
+        );
     }
 
     #[test]
