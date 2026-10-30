@@ -121,6 +121,33 @@ describe("NanocachedClient against a single node", () => {
     }
   });
 
+  it("rejects a string with a lone surrogate instead of sending U+FFFD for it", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        // Both would be encoded as the same U+FFFD key, so one write would
+        // answer for the other; a value or a namespace would be rewritten.
+        await assert.rejects(client.set("x\ud800", "A"), RangeError);
+        await assert.rejects(client.get("x\ud801"), RangeError);
+        await assert.rejects(client.delete("x\ud800"), RangeError);
+        await assert.rejects(client.set("k", "v\udc00"), RangeError);
+        await assert.rejects(client.setMany({ k: "v\udc00" }), RangeError);
+        await assert.rejects(client.setMany({ ["x\ud800"]: "v" }), RangeError);
+        assert.throws(() => client.namespace("n\ud800"), RangeError);
+
+        // Well-formed text, including a surrogate pair, still goes through
+        // and the rejected calls left the shared connection alone.
+        await client.set("k\u{1F600}", "v\u{1F600}");
+        assert.equal(await client.get("k\u{1F600}"), "v\u{1F600}");
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("rejects an empty key before writing, without poisoning the shared connection", async () => {
     const node = await startMockNode();
     try {

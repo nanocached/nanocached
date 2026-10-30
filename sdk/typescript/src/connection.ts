@@ -18,6 +18,7 @@ import {
   MAX_RESPONSE_FRAME_LENGTH,
   parseCounterValue,
   peekMultiFrameLength,
+  utf8Bytes,
   tryParseResponse,
   type CasCondition,
   type MultiAckEntry,
@@ -86,7 +87,7 @@ interface Waiter {
 // unchanged here; only the string case needs a fresh Buffer, since encoding
 // text to bytes has no existing buffer to reuse.
 function toBytes(value: string | Uint8Array): Uint8Array {
-  return typeof value === "string" ? Buffer.from(value, "utf8") : value;
+  return typeof value === "string" ? utf8Bytes(value) : value;
 }
 
 /** Bounds how long the connection may go without progress while requests

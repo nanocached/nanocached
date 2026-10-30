@@ -10,6 +10,7 @@ import { NanocachedError } from "./errors.js";
 import {
   checkKey,
   checkKeyAndValue,
+  utf8Bytes,
   checkTouchTtl,
   contentDigest,
   EMPTY_NAMESPACE,
@@ -431,7 +432,7 @@ type Target =
  * 130 MiB of copies. The caller must leave the bytes alone until the call
  * settles; the Go, Java, .NET and Rust SDKs do not copy it either. */
 function valueBytesOf(value: string | Uint8Array): Buffer {
-  if (typeof value === "string") return Buffer.from(value, "utf8");
+  if (typeof value === "string") return utf8Bytes(value);
   return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
 }
 
@@ -1708,7 +1709,7 @@ export class NanocachedClient {
   private async setInNamespace(namespace: Uint8Array, key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
+    const keyBytes = typeof key === "string" ? utf8Bytes(key) : Buffer.from(key);
     const valueBytes = valueBytesOf(value);
     // Validate the *original* value's size before compressing, matching
     // Python's Set (issue #47 audit item 3) — an oversized value must be
@@ -1739,7 +1740,7 @@ export class NanocachedClient {
   private async touchInNamespace(namespace: Uint8Array, key: string | Uint8Array, ttlSeconds: number | null): Promise<boolean> {
     if (this.closed) throw new AlreadyClosedError();
     checkTouchTtl(ttlSeconds);
-    checkKey(typeof key === "string" ? Buffer.from(key, "utf8") : key, namespace);
+    checkKey(typeof key === "string" ? utf8Bytes(key) : key, namespace);
     await this.maybeRefreshNodeList();
     // A touch that expires the entry is resent only if never sent (issue #901).
     const expiring = ttlSeconds === 0;
@@ -1765,7 +1766,7 @@ export class NanocachedClient {
   private async getAndTouchBytesInNamespace(namespace: Uint8Array, key: string | Uint8Array, ttlSeconds: number | null): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
     checkTouchTtl(ttlSeconds);
-    checkKey(typeof key === "string" ? Buffer.from(key, "utf8") : key, namespace);
+    checkKey(typeof key === "string" ? utf8Bytes(key) : key, namespace);
     await this.maybeRefreshNodeList();
     let value: Buffer | null;
     // See touchInNamespace: ttl 0 is resent only if never sent (issue #901).
@@ -1833,7 +1834,7 @@ export class NanocachedClient {
     // Eager, up-front, before any network I/O — see
     // getManyBytesInNamespace's own doc comment for why.
     const keyBytes = keys.map((key) => {
-      const bytes = Buffer.from(key, "utf8");
+      const bytes = utf8Bytes(key);
       checkKey(bytes, namespace);
       return bytes;
     });
@@ -2270,7 +2271,7 @@ export class NanocachedClient {
     // encoder; a bad key deep in a 900-key batch must not leave earlier
     // sub-frames already sent before it's discovered.
     const keyBytes = keys.map((key) => {
-      const bytes = Buffer.from(key, "utf8");
+      const bytes = utf8Bytes(key);
       checkKey(bytes, namespace);
       return bytes;
     });
@@ -2550,7 +2551,7 @@ export class NanocachedClient {
     // prototype instead of adding an own property, so a key with that
     // name would be silently dropped from the batch (`set` stores it).
     const raw: Record<string, Uint8Array> = Object.create(null) as Record<string, Uint8Array>;
-    for (const [key, value] of Object.entries(values)) raw[key] = Buffer.from(value, "utf8");
+    for (const [key, value] of Object.entries(values)) raw[key] = utf8Bytes(value);
     return this.setManyInNamespace(namespace, raw, ttlSeconds);
   }
 
@@ -2608,7 +2609,7 @@ export class NanocachedClient {
     const keyBytes = new Array<Buffer>(keys.length);
     const valueBytes = new Array<Buffer>(keys.length);
     for (let i = 0; i < keys.length; i++) {
-      const key = Buffer.from(keys[i], "utf8");
+      const key = utf8Bytes(keys[i]);
       const original = Buffer.from(values[keys[i]]);
       checkKeyAndValue(key, original, namespace);
       keyBytes[i] = key;
@@ -2932,7 +2933,7 @@ export class NanocachedClient {
   ): Promise<boolean> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
+    const keyBytes = typeof key === "string" ? utf8Bytes(key) : Buffer.from(key);
     const valueBytes = valueBytesOf(value);
     // Same two-layer size check setInNamespace uses: the *original* value
     // must fit MAX_REQUEST_BYTES, not just its compressed form (issue #47
@@ -2994,7 +2995,7 @@ export class NanocachedClient {
    * (namespace, key)-taking methods — it opens nothing of its own and
    * duplicates none of this client's networking. */
   namespace(ns: string | Uint8Array): NanocachedNamespace {
-    const namespaceBytes = typeof ns === "string" ? Buffer.from(ns, "utf8") : Buffer.from(ns);
+    const namespaceBytes = typeof ns === "string" ? utf8Bytes(ns) : Buffer.from(ns);
     return new NanocachedNamespace(namespaceBytes, {
       get: (key) => this.getInNamespace(namespaceBytes, key),
       getBytes: (key) => this.getBytesInNamespace(namespaceBytes, key),
@@ -3025,7 +3026,7 @@ export class NanocachedClient {
    * (client-side replication). Only meaningful in cluster mode. */
   private ownerNames(key: string | Uint8Array, namespace: Uint8Array): string[] {
     if (this.target.kind !== "cluster") return [];
-    const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
+    const keyBytes = typeof key === "string" ? utf8Bytes(key) : Buffer.from(key);
     return this.target.ring.owners(keyBytes, this.target.replication, namespace);
   }
 
