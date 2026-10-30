@@ -172,6 +172,19 @@ use tokio::time::{Instant, sleep, timeout};
 /// more per request than a node would accept.
 const MAX_REQUEST_SIZE: usize = 1_048_576;
 
+/// The most a frame grows when the proxy re-heads it for a backend: every
+/// backend frame carries the connection's own tag (`{tag}`, a `u32`), a space
+/// and up to ten digits, where the client's frame may carry none.
+const BACKEND_TAG_MAX_BYTES: usize = 1 + 10;
+
+/// The largest frame accepted from an authenticated client. The node refuses
+/// a request over `MAX_REQUEST_SIZE` and closes the connection, so a client
+/// frame at that size, re-headed with a tag, would be refused, and the reply
+/// the proxy cannot match poisons the shared backend connection for every
+/// other client on it. Taking the tag's bytes off the bound keeps every
+/// backend frame within what a node accepts.
+const MAX_CLIENT_FRAME_SIZE: usize = MAX_REQUEST_SIZE - BACKEND_TAG_MAX_BYTES;
+
 /// Mirrors the node's `MAX_MULTI_REPLY_VALUE_BYTES`: the most value bytes
 /// one `M` reply carries. A node's reply can legitimately exceed the 1 MiB
 /// request bound (a few large hits in one batch), so `read_reply` must
@@ -1709,7 +1722,7 @@ fn parse_request(
     tagged: bool,
     scan: &mut RequestScanState,
 ) -> io::Result<ParseOutcome> {
-    parse_request_limited(input, tagged, scan, MAX_REQUEST_SIZE)
+    parse_request_limited(input, tagged, scan, MAX_CLIENT_FRAME_SIZE)
 }
 
 /// `parse_request` with the frame bound lowered to `max_frame` (header
@@ -6124,7 +6137,7 @@ async fn handle_client(
             // small `A` (`PREAUTH_MAX_BYTES`); anything bigger is a parse
             // error here, before its body is ever buffered.
             let max_frame = if authenticated {
-                MAX_REQUEST_SIZE
+                MAX_CLIENT_FRAME_SIZE
             } else {
                 PREAUTH_MAX_BYTES
             };
@@ -7512,6 +7525,47 @@ mod tests {
         let error = super::read_line(&mut server, &mut buf).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(started.elapsed(), UPSTREAM_IO_TIMEOUT);
+    }
+
+    #[test]
+    fn a_client_frame_at_the_bound_is_still_within_the_nodes_limit_once_re_headed() {
+        // The largest `S` the proxy accepts from an untagged client: header
+        // `S 1 <value-length>\n`, a 1-byte key and a value filling the bound.
+        let header_len = |value_len: usize| format!("S 1 {value_len}\n").len();
+        let mut value_len = MAX_CLIENT_FRAME_SIZE;
+        while header_len(value_len) + 1 + value_len > MAX_CLIENT_FRAME_SIZE {
+            value_len -= 1;
+        }
+        let mut input = BytesMut::from(&format!("S 1 {value_len}\n").into_bytes()[..]);
+        input.extend_from_slice(b"k");
+        input.extend_from_slice(&vec![b'v'; value_len]);
+        assert_eq!(input.len(), MAX_CLIENT_FRAME_SIZE);
+
+        let ParseOutcome::Ready(request, _) =
+            parse_request(&mut input, false, &mut RequestScanState::default()).unwrap()
+        else {
+            panic!("the largest accepted frame must parse");
+        };
+        let Request::Set { key, value, .. } = request else {
+            panic!("expected a set");
+        };
+
+        // Re-headed for a backend with the widest tag: still within the
+        // node's own bound.
+        let (header, body) = substitute_tag(frame_set(b"", &key, &value, None), u32::MAX);
+        assert!(
+            header.len() + body.len() <= MAX_REQUEST_SIZE,
+            "backend frame is {} bytes",
+            header.len() + body.len()
+        );
+    }
+
+    #[test]
+    fn a_client_frame_over_the_bound_is_refused_at_the_header() {
+        let value_len = MAX_CLIENT_FRAME_SIZE;
+        let mut input = BytesMut::from(&format!("S 1 {value_len}\n").into_bytes()[..]);
+        let error = parse_request(&mut input, false, &mut RequestScanState::default()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
