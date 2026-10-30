@@ -5,7 +5,10 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-RUN cargo build --locked --release --bin nanocached-node --bin nanocached-discovery --bin nanocached-proxy
+# Cargo features to build with; the release images use none. The chaos run builds
+# with `trace` (see src/trace.rs).
+ARG FEATURES=
+RUN cargo build --locked --release --features "$FEATURES" --bin nanocached-node --bin nanocached-discovery --bin nanocached-proxy
 
 FROM alpine:3.21 AS node
 

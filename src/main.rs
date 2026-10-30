@@ -1,3 +1,5 @@
+#[macro_use]
+mod trace;
 mod cache;
 mod command;
 mod hash_ring;

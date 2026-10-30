@@ -4983,6 +4983,7 @@ fn set_message(key: &Key, value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
 /// is moving to the joining node too (see `forward_delete_to_joining_node`).
 /// Same legacy-vs-namespaced frame choice as `set_message`.
 fn delete_message(key: &Key) -> Vec<u8> {
+    trace!(&key.name, "send_D key={}", crate::trace::name(&key.name));
     let mut message = if key.is_namespaced() {
         format!("d {} {}\n", key.namespace.len(), key.name.len()).into_bytes()
     } else {
@@ -7065,6 +7066,14 @@ fn handoff_message(
     if_absent: bool,
     token: &str,
 ) -> Vec<u8> {
+    trace!(
+        &key.name,
+        "send_U key={} ttl={:?} if_absent={} token={}",
+        crate::trace::name(&key.name),
+        ttl.map(|t| t.as_secs()),
+        if_absent,
+        &token[..token.len().min(8)]
+    );
     let mut header = format!(
         "U {} {} {} {}",
         key.namespace.len(),
@@ -7091,6 +7100,12 @@ fn handoff_message(
 /// the handoff letter, mirroring `handoff_message` for `U`, including its
 /// issue #295 `token` field and body ordering.
 fn handoff_delete_message(key: &Key, token: &str) -> Vec<u8> {
+    trace!(
+        &key.name,
+        "send_u key={} token={}",
+        crate::trace::name(&key.name),
+        &token[..token.len().min(8)]
+    );
     let mut message = format!(
         "u {} {} {}\n",
         key.namespace.len(),
@@ -8438,6 +8453,12 @@ async fn send_set(
     value: &[u8],
     ttl: Option<Duration>,
 ) -> io::Result<()> {
+    trace!(
+        &key.name,
+        "send_S key={} ttl={:?}",
+        crate::trace::name(&key.name),
+        ttl.map(|t| t.as_secs())
+    );
     timeout(OUTBOUND_IO_TIMEOUT, async {
         stream.write_all(&set_message(key, value, ttl)).await?;
 

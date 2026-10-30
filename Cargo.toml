@@ -9,6 +9,10 @@ rust-version = "1.96"
 name = "nanocached-node"
 path = "src/main.rs"
 
+[features]
+# Per-key trace lines on stderr, selected by NANOCACHED_TRACE_PREFIX (src/trace.rs).
+trace = []
+
 [dependencies]
 bytes = "1"
 lru = "0.18"
