@@ -12,6 +12,17 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-node`: a remaining TTL under one second went on the wire as
+  `0`: in an INCR reply, in a get-and-touch reply and in a forward or handoff
+  of the entry. An SDK replicating an INCR reply read `0` as "no expiry"
+  (Python, TypeScript, Rust, .NET) or as "expire now" (Go, Java), so a
+  counter's replica could outlive the counter for good, and a forwarded `U`
+  carrying `0` was applied as a delete with a tombstone. Remaining TTLs are
+  now rounded up to whole seconds; a TTL of exactly `0` (an expiring touch)
+  is unchanged.
+
 ## [0.5.1] - 2026-10-27
 
 ### Fixed

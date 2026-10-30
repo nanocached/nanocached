@@ -161,7 +161,7 @@ grammar <code>INCR</code> itself writes back: an optional leading
 pre-namespace legacy form, so a <code>&lt;namespace-length&gt;</code> of 0
 addresses the default namespace like everywhere else. The optional
 <code>&lt;ttl-seconds&gt;</code> field on a successful reply is the
-entry's <em>remaining</em> TTL, rounded down to whole seconds, present
+entry's <em>remaining</em> TTL, rounded up to whole seconds, present
 only when the entry has one — <code>INCR</code> never resets or clears an
 existing TTL, unlike <code>S</code>. The TTL isn't cosmetic: a client or
 <code>nanocached-proxy</code> replicating the result to a key's other
@@ -299,7 +299,7 @@ a touch works on a compressed value as well.</p>
 the reply is that of a read:</p>
 <pre><code>V &lt;value-length&gt; [&lt;ttl-seconds&gt;]\n&lt;value&gt;</code></pre>
 <p>or <code>N\n</code>. The optional <code>&lt;ttl-seconds&gt;</code> is
-the TTL now in effect, rounded down to whole seconds, present only when
+the TTL now in effect, rounded up to whole seconds, present only when
 the entry has one. A get and touch counts as a hit or a miss and makes the
 entry the most recently used, as <code>G</code> does; a plain touch
 changes only the expiry, so it counts as neither and does not protect the
