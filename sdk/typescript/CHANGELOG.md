@@ -9,6 +9,14 @@ tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- A string with a lone surrogate (`"x\ud800"`) as a key, value or namespace
+  was encoded by `Buffer.from` as U+FFFD, so two different keys could be one
+  entry and a value or namespace came back rewritten. The call now rejects it
+  with a `RangeError` before any I/O, as the Python, Java and .NET SDKs do.
+  A `Uint8Array` is unaffected.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release
