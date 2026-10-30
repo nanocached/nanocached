@@ -1814,7 +1814,13 @@ impl Cache {
             crate::trace::name(&key.name),
             namespace.entries.contains(&key.name[..])
         );
-        if namespace.entries.contains(&key.name[..]) && namespace.migrated.insert(key.name.clone())
+        // The name is copied, not cloned: a key from a `U` frame is a slice of
+        // the received frame, value included, and a clone would pin all of it
+        // for the life of the mark while only the name is charged below (the
+        // same reason `insert_into` and `tombstone` copy theirs).
+        if namespace.entries.contains(&key.name[..])
+            && !namespace.migrated.contains(&key.name[..])
+            && namespace.migrated.insert(Bytes::copy_from_slice(&key.name))
         {
             let mark_bytes = namespace.name.len() + key.name.len();
             self.used_bytes += mark_bytes;
@@ -3804,6 +3810,34 @@ mod tests {
         cache.mark_migrated(&key(b"missing"));
 
         assert_eq!(cache.sweep(), 0);
+    }
+
+    #[test]
+    fn a_mark_does_not_pin_the_frame_its_key_was_sliced_from() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+
+        // A key as the `U` arm parses it: a slice of the received frame.
+        let frame = Bytes::from(vec![b'x'; 4096]);
+        let mut frame_bytes = frame.to_vec();
+        frame_bytes[100..104].copy_from_slice(b"name");
+        let frame = Bytes::from(frame_bytes);
+        let sliced = Key::new(Bytes::new(), frame.slice(100..104));
+        let frame_range = frame.as_ptr() as usize..frame.as_ptr() as usize + frame.len();
+
+        cache.mark_migrated(&sliced);
+
+        let stored = cache
+            .slots
+            .values()
+            .flat_map(|namespace| namespace.migrated.iter())
+            .next()
+            .expect("the key is marked");
+        assert_eq!(&stored[..], b"name");
+        assert!(
+            !frame_range.contains(&(stored.as_ptr() as usize)),
+            "the mark shares the frame's allocation"
+        );
     }
 
     #[test]
