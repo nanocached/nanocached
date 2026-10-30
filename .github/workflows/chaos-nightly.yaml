@@ -19,10 +19,9 @@ name: Chaos nightly
 # behaviour the architecture page does not accept, and the accepted behaviour
 # is printed in the job summary so its size can be followed from run to run.
 #
-# The node image is built with the `trace` cargo feature (src/trace.rs) and
-# the touch and compare-and-set keys are traced, which adds a stderr line per
-# write to those keys and nothing else; the images that are released are built
-# without it.
+# The node image is built without the `trace` cargo feature (src/trace.rs):
+# with it on, cells failed on oracles whose keys were not traced, and the cause
+# is not known yet. See tests/e2e/README.md.
 #
 # It reports; it does not gate release tagging.
 
@@ -77,11 +76,10 @@ jobs:
         with:
           context: .
           target: node
-          build-args: FEATURES=trace
           load: true
           tags: nanocached-node:chaos
-          cache-from: type=gha,scope=node-trace
-          cache-to: type=gha,mode=max,scope=node-trace
+          cache-from: type=gha,scope=node
+          cache-to: type=gha,mode=max,scope=node
 
       - name: Build the discovery image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -118,11 +116,6 @@ jobs:
           INCR_ORACLE: "1"
           CLEAR_ORACLE: "1"
           MULTI_ORACLE: "1"
-          # The node is built with the trace feature: the keys the touch and
-          # compare-and-set workloads use are followed through the cache and the
-          # forward paths in the node logs, so a failing cell comes with the
-          # history of its key and does not have to be reproduced.
-          NENV: "-e NANOCACHED_TRACE_PREFIX=tn,cp,cc"
         run: |
           set -o pipefail
           timeout 3000 tests/e2e/chaos.sh 2>&1 | tee chaos.log
