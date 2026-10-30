@@ -22,6 +22,13 @@ framework adapters at one version, whether or not a component changed.
   carrying `0` was applied as a delete with a tombstone. Remaining TTLs are
   now rounded up to whole seconds; a TTL of exactly `0` (an expiring touch)
   is unchanged.
+- `nanocached-proxy`: a request frame of exactly 1 MiB, or up to ten bytes
+  under it, passed the proxy but was refused by the node once the proxy
+  added its own tag to the header; the proxy could not match the node's
+  `En` reply, dropped the shared backend connection and failed the other
+  clients' requests in flight on it. The proxy now refuses a client frame
+  that would be over the node's limit after the tag is added (SDKs stop at
+  1 MiB minus 256 bytes and are not affected).
 
 ## [0.5.1] - 2026-10-27
 
