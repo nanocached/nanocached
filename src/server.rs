@@ -9998,7 +9998,12 @@ fn join_took(node_context: &NodeContext, key: &Key) -> bool {
             .iter()
             .any(|lingering| ring.is_owner_hashed(key_hash, &lingering.joining_name, replication));
     if taken {
-        active.marked_keys.push(key.clone());
+        // Copied: `key` is sliced from the received frame, and the slot keeps
+        // it until the join is confirmed or abandoned.
+        active.marked_keys.push(Key::new(
+            Bytes::copy_from_slice(&key.namespace),
+            Bytes::copy_from_slice(&key.name),
+        ));
     }
     taken
 }

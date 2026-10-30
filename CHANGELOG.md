@@ -29,6 +29,10 @@ framework adapters at one version, whether or not a component changed.
   clients' requests in flight on it. The proxy now refuses a client frame
   that would be over the node's limit after the tag is added (SDKs stop at
   1 MiB minus 256 bytes and are not affected).
+- `nanocached-node`: a migration mark made from a re-replicated `U` frame
+  kept the whole received frame, value included, in memory until the sweep
+  or an abandon, while the memory bound counted only the key name. The mark
+  now holds a copy of the name.
 
 ## [0.5.1] - 2026-10-27
 
