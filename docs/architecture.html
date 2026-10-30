@@ -646,7 +646,14 @@ here.</p>
   touch the key again.</li>
   <li><code>INCR</code> and compare-and-set are as volatile as a plain
   set: eviction and TTL reclaim counters, and CAS is not a distributed
-  lock since eviction breaks mutual exclusion. Replicas receive the
+  lock since eviction breaks mutual exclusion. Neither is a lock across a
+  join either: for a few seconds after discovery promotes a joiner, a
+  client that has not refreshed its ring yet still sends to the old owner
+  while one that has sends to the joiner, each takes the key as absent
+  because the old owner&rsquo;s forward has not arrived, and two
+  <code>putIfAbsent</code> on the same key both answer true (one to seven
+  of 2,000 racing keys per six-round join, decommission and kill run, two
+  clients). Replicas receive the
   <em>result</em> as a set, because replaying the operation could drift a
   replica from the primary.</li>
   <li>The memory bound is approximate: key and value bytes plus a

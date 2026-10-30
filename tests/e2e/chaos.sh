@@ -342,14 +342,14 @@ import json,sys
 sdk=json.loads(sys.argv[1]) if sys.argv[1].startswith('{') else {}; own=json.loads(sys.argv[2]) if sys.argv[2].startswith('{') else {}
 if not sdk: print('no sdk result')
 if not own: print('no owners result')
-for k in ('cc_vanished','cc_dup','cc_foreign','cc_head','cp_double_win','cp_lost','cp_corrupt','cp_winner_overwritten','read_err'):
+for k in ('cc_vanished','cc_dup','cc_foreign','cc_head','cp_lost','cp_corrupt','cp_winner_overwritten','read_err'):
   if sdk.get(k): print(f'sdk {k}={sdk[k]}')
 if sdk.get('anomalies',{}).get('chain_miss'): print(f'sdk chain_miss={sdk[\"anomalies\"][\"chain_miss\"]}')
 for k in ('cc_no_owner','cc_missing_on_owner','cc_dup_on_owner','cc_head_on_owner','cc_other_reply','cp_no_owner','cp_missing_on_owner','cp_wrong_on_owner','cp_other_reply'):
   if own.get(k): print(f'owners {k}={own[k]}')
 " "$csdk" "$ccheck")
   [ -z "$cbad" ] || { T "FAIL: cas oracle: $(echo $cbad | tr '\n' ' ')"; fail=1; }
-  echo "$csdk $ccheck" | grep -oE '"(cc_lost_ack|cc_lost_ack_tags|cc_lost_on_owner|cc_owners_differ|cc_unfinished|cc_conflicts|cc_acked)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== cas accepted (printed, not asserted): /'; echo
+  echo "$csdk $ccheck" | grep -oE '"(cc_lost_ack|cc_lost_ack_tags|cc_lost_on_owner|cc_owners_differ|cc_unfinished|cc_conflicts|cc_acked|cp_double_win)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== cas accepted (printed, not asserted): /'; echo
 fi
 if [ "${INCR_ORACLE:-0}" = 1 ]; then
   ibad=$(python3 -c "

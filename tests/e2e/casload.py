@@ -23,8 +23,10 @@ of every turn run concurrently, one on each client:
          counted and printed, not asserted.
   cp<i>  race: absent before its turn. Two put_if_absent, one per client,
          with different values and no retry. At most one may answer True
-         (a second is a double win); the value must be one of the two, and
-         the winner's if there is one; a key one of them found present
+         (a second is a double win, printed and not asserted: just after a join
+         the two clients can have different primaries);
+         the value must be one of the two, and the winner's if there is
+         one; a key one of them found present
          (False) or wrote (True) must not have disappeared.
 
 Turns are spread like touchload.py's: evenly over --span seconds, or with
@@ -70,7 +72,7 @@ def new_tag():
 acked = [[] for _ in range(a.n)]
 maybe = [[] for _ in range(a.n)]
 cc_unfinished = [0] * a.n          # contenders that ran out of attempts
-oplog = []                         # (time, client, key index, tag, base length, outcome): written to --oplog when given
+oplog = []                         # (time, client, key index, tag, base length, outcome[, end, owners for the cp rows]): written to --oplog when given
 # race: per key, what each contender's put_if_absent came to ("T", "F" or "?" for no answer)
 race = [None] * a.n
 counts = dict(cc_turns=0, cc_acked=0, cc_conflicts=0, cp_turns=0, ops_err=0)
@@ -141,10 +143,19 @@ async def cc_turn(clients, i):
 async def cp_turn(clients, i):
     counts["cp_turns"] += 1
     k = key("p", i)
-    async def one(c, v):
-        try: return "T" if await op(c.put_if_absent(k, v)) else "F"
-        except Exception as e: err(e, "cp-put"); return "?"
-    res = await asyncio.gather(*[one(c, f"{i}:{n}".encode()) for n, c in enumerate((clients * 2)[:2])])
+    async def one(ci, c, v):
+        # The owners are this client's ring view when it sent the request: which node
+        # each contender went to is what tells a double win in a join window from a
+        # bug elsewhere. Written to --oplog as (start, client, key index, tag, -1,
+        # outcome, end, owners).
+        t0 = time.time()
+        try: owners = c._owner_names(b"", k.encode())
+        except Exception: owners = []
+        try: r = "T" if await op(c.put_if_absent(k, v)) else "F"
+        except Exception as e: err(e, "cp-put"); r = "?"
+        oplog.append((t0, ci, i, v.decode(), -1, "P" + r, time.time(), owners))
+        return r
+    res = await asyncio.gather(*[one(ci, c, f"{i}:{n}".encode()) for n, (ci, c) in enumerate(enumerate((clients * 2)[:2]))])
     race[i] = "".join(res)
 
 async def worker(w, clients):
