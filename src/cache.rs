@@ -636,6 +636,12 @@ impl Cache {
         };
 
         let Some(entry) = entry else {
+            trace!(
+                name,
+                "touch_miss key={} new_ttl={:?}",
+                crate::trace::name(name),
+                ttl.map(|t| t.as_secs())
+            );
             self.touch_misses += 1;
             if promote {
                 self.misses += 1;
@@ -653,6 +659,15 @@ impl Cache {
             return None;
         }
 
+        trace!(
+            name,
+            "touch key={} old_ttl={:?} new_ttl={:?}",
+            crate::trace::name(name),
+            entry
+                .expires_at
+                .map(|x| x.saturating_duration_since(now).as_secs()),
+            ttl.map(|t| t.as_secs())
+        );
         entry.expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
         let remaining = entry
             .expires_at
@@ -824,6 +839,19 @@ impl Cache {
         // represent is "never expires", not a panic.
         let now = Instant::now();
         self.note_handoff(now, ahead_of_ring);
+        trace!(
+            &key.name,
+            "handoff_set key={} marked={} had={:?} new_ttl={:?} ahead={}",
+            crate::trace::name(&key.name),
+            self.is_marked(&key),
+            self.peek(&key).map(|e| (
+                e.is_expired_at(now),
+                e.expires_at
+                    .map(|x| x.saturating_duration_since(now).as_secs())
+            )),
+            ttl.map(|t| t.as_secs()),
+            ahead_of_ring
+        );
         if ttl.is_some_and(|ttl| ttl.is_zero()) {
             // Issue #977: a forwarded expiry is a relayed delete — the
             // key goes, and a tombstone keeps out a put-if-absent copy
@@ -891,9 +919,23 @@ impl Cache {
         now: Instant,
     ) -> CasResult {
         self.note_handoff(now, ahead_of_ring);
-        if self.tombstoned_at(key, now)
-            || (!self.condition_holds_at(key, CasCondition::Absent, now) && !self.is_marked(key))
-        {
+        let refused = self.tombstoned_at(key, now)
+            || (!self.condition_holds_at(key, CasCondition::Absent, now) && !self.is_marked(key));
+        trace!(
+            &key.name,
+            "handoff_if_absent key={} refused={} marked={} had={:?} new_ttl={:?} ahead={}",
+            crate::trace::name(&key.name),
+            refused,
+            self.is_marked(key),
+            self.peek(key).map(|e| (
+                e.is_expired_at(now),
+                e.expires_at
+                    .map(|x| x.saturating_duration_since(now).as_secs())
+            )),
+            ttl.map(|t| t.as_secs()),
+            ahead_of_ring
+        );
+        if refused {
             return CasResult::Mismatch;
         }
         let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
@@ -1059,6 +1101,12 @@ impl Cache {
     }
 
     fn handoff_delete_at(&mut self, key: &Key, now: Instant) -> bool {
+        trace!(
+            &key.name,
+            "handoff_delete key={} present={}",
+            crate::trace::name(&key.name),
+            self.peek(key).is_some()
+        );
         let removed = self.delete_at(key, now);
         self.tombstone(key, now);
         removed
@@ -1256,6 +1304,13 @@ impl Cache {
     /// `self.incrs` instead — see its own doc comment for why counting an
     /// INCR as a `sets_total` GET/SET-shaped write would be misleading).
     fn insert(&mut self, key: Key, value: Bytes, expires_at: Option<Instant>) {
+        trace!(
+            &key.name,
+            "insert key={} ttl={:?} marked_before={}",
+            crate::trace::name(&key.name),
+            expires_at.map(|x| x.saturating_duration_since(Instant::now()).as_secs()),
+            self.is_marked(&key)
+        );
         let id = self.ensure_namespace(&key.namespace);
         self.insert_into(id, key.name, value, expires_at);
     }
@@ -1550,6 +1605,12 @@ impl Cache {
 
     fn delete_at(&mut self, key: &Key, now: Instant) -> bool {
         let expired = self.peek(key).is_some_and(|entry| entry.is_expired_at(now));
+        trace!(
+            &key.name,
+            "delete key={} present={}",
+            crate::trace::name(&key.name),
+            self.peek(key).is_some()
+        );
 
         if expired {
             self.remove_entry(key);
@@ -1747,6 +1808,12 @@ impl Cache {
             return;
         };
 
+        trace!(
+            &key.name,
+            "mark key={} present={}",
+            crate::trace::name(&key.name),
+            namespace.entries.contains(&key.name[..])
+        );
         if namespace.entries.contains(&key.name[..]) && namespace.migrated.insert(key.name.clone())
         {
             let mark_bytes = namespace.name.len() + key.name.len();
@@ -1958,6 +2025,15 @@ impl Cache {
                 .peek(&key)
                 .is_some_and(|entry| entry.is_expired_at(now));
 
+            if marked {
+                trace!(
+                    &key.name,
+                    "sweep key={} expired={} keep={}",
+                    crate::trace::name(&key.name),
+                    expired,
+                    owned.is_some_and(|owned| owned(&key))
+                );
+            }
             if marked && !expired && owned.is_some_and(|owned| owned(&key)) {
                 self.clear_migrated_mark(&key);
                 continue;

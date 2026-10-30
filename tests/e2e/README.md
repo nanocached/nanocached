@@ -96,6 +96,16 @@ run; the logs are kept for 14 days.
 - By hand (`gh workflow run chaos-nightly.yaml -f cells=21`, or Run workflow
   in the Actions tab) it runs as many cells as asked, in parallel.
 
+The node image of these runs is built with the `trace` cargo feature and
+`NANOCACHED_TRACE_PREFIX=tn,cp,cc`: the touch and compare-and-set keys are
+followed through the cache and the forward paths in the node logs
+(`nch-n*.log` in the artifact, lines starting `TRACE`), so a failing cell
+carries the history of its key. The feature adds a stderr line per write to
+those keys and nothing else; the images that are released are built without it.
+To trace other keys in a local run, build the node with
+`docker build --target node --build-arg FEATURES=trace .` and pass
+`NENV="-e NANOCACHED_TRACE_PREFIX=<prefix>[,<prefix>...]"` to `chaos.sh`.
+
 Why 21 and not one pass: the failures the oracles found before a release
 showed in one run of six to nine. Against a failure that shows in one run of
 seven, one clean run (what a pre-release check had) leaves it unseen in 86 %
