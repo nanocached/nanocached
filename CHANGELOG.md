@@ -56,6 +56,20 @@ framework adapters at one version, whether or not a component changed.
   before it is allocated, as the node does, and released when the buffer
   shrinks; a connection that cannot get the growth by its frame deadline is
   closed.
+- `nanocached-proxy`: a request's admission asked for its whole cost although
+  the connection already held part of every budget as its receive buffer's
+  charge (a frame over 64 KiB). A request costing the whole budget — a
+  batched read of 64 keys or more in front of four or more nodes, or a 100 KB
+  `S` on the smallest `--max-in-flight-bytes` — therefore waited for the
+  connection's own charge until the admission wait (60 s) and was answered
+  `R`/`B`, and again on every resend. The charge also outlived its frame: a
+  buffer whose capacity fell to the free threshold when the frame was cut
+  from it was not shrunk, so an idle connection kept part of its source IP's
+  share until it closed and a neighbour asking for the whole share waited
+  for it, with the IP share's queue then closing other connections that
+  could not grow their buffer in time. Admission now asks only for what the
+  connection does not already hold, and the receive charge is released as
+  soon as the buffer holds nothing chargeable.
 - `nanocached-proxy`: a batched read (`m`, or `y` with `G`) spread over
   several nodes held up to 16 MiB of values per node while it was
   answered, plus a second copy for the client, but was charged for 16 MiB
