@@ -40,6 +40,15 @@ framework adapters at one version, whether or not a component changed.
   skipped by re-replication, and removed by a sweep when another owner
   exists. The list now keeps those marks, on completion and when the
   transfer is cancelled or fails.
+- `nanocached-discovery`: a joiner whose host died without closing its
+  connection (power loss, hypervisor failure, a partition) stayed registered,
+  because nothing set TCP keepalive on the connection that is a joiner's
+  liveness. If it was the oldest waiting joiner its join started, every
+  node's migration to the dead address failed without a report, and the join
+  held the queue until the migration timeout (60 s and up to 2 h). Discovery
+  now enables TCP keepalive on the connections it accepts (first probe after
+  10 s idle, then every 5 s, 3 probes on Linux), so such a joiner is dropped
+  after about 25 s.
 
 ## [0.5.1] - 2026-10-27
 

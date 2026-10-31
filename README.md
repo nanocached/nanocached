@@ -105,6 +105,11 @@ staged handoff, so nodes started together (or in quick succession) queue
 and join one after another — each join takes roughly the time its handoff
 needs, and no key is lost to a join that has to be retried (a source keeps
 the copies it handed off until discovery confirms the join).
+A joiner is tracked by its connection to discovery, which enables TCP
+keepalive on it: a joiner whose host vanishes without closing the
+connection (power loss, a partition) is dropped from the queue once
+keepalive gives up, about 25 seconds on Linux, instead of holding up the
+joiners behind it.
 
 Liveness is binary: a node is a member until it misses heartbeats for the
 liveness timeout, and a node that is slow but answering — a saturated
