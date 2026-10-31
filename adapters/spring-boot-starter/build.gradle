@@ -49,11 +49,11 @@ dependencies {
     // the only nanocached-related dependency a Boot app needs, so both the
     // adapter and Boot's own autoconfigure/base starter are `api`.
     api 'org.nanocached:nanocached-spring:0.5.1'
-    api platform('org.springframework.boot:spring-boot-dependencies:3.5.16')
+    api platform('org.springframework.boot:spring-boot-dependencies:4.1.2')
     api 'org.springframework.boot:spring-boot-starter'
     implementation 'org.springframework.boot:spring-boot-autoconfigure'
 
-    annotationProcessor platform('org.springframework.boot:spring-boot-dependencies:3.5.16')
+    annotationProcessor platform('org.springframework.boot:spring-boot-dependencies:4.1.2')
     annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
 
     // The Boot-interaction tests boot a real ApplicationContext (yaml-only
