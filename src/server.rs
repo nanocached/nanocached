@@ -3842,7 +3842,15 @@ async fn handle_connection(
             let mut shrunk = BytesMut::with_capacity(received.len());
             shrunk.extend_from_slice(&received);
             received = shrunk;
-            // The released capacity is released from the budget too.
+        }
+        // The released capacity is released from the budget too. A buffer
+        // whose capacity fell to the free threshold on its own is not
+        // shrunk but holds nothing chargeable either: `split_to` leaves a
+        // frame's bytes with the frame, so a 256 KiB buffer that gave up
+        // a 200 KB frame has 56 KiB left. Its charge goes as well, or an
+        // idle connection would pin up to a frame's worth of the shared
+        // budget until it closed.
+        if received.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
             receive_charge = None;
             receive_charged = 0;
         }
@@ -11171,6 +11179,50 @@ mod tests {
         let _ = timeout(Duration::from_secs(5), connection_task).await;
         assert_eq!(budget.available(), MAX_REQUEST_SIZE);
 
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_idle_connection_holds_no_receive_charge_after_a_frame_over_the_threshold() {
+        // Receiving a 200 KB frame grows the buffer to 256 KiB and charges
+        // the growth beyond the free 64 KiB. Cutting the frame out leaves
+        // the buffer at 56 KiB — under the threshold, so it is not shrunk —
+        // and the charge must go with the frame all the same, or every
+        // idle connection that ever received a large frame would pin part
+        // of the shared budget until it closed.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(4 * MAX_REQUEST_SIZE);
+        let (mut client, server) = tcp_pair().await;
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        let mut frame = b"S 1 200000\nk".to_vec();
+        frame.extend(std::iter::repeat_n(b'v', 200_000));
+        client.write_all(&frame).await.unwrap();
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"S\n");
+        // The reply is written before the connection task gets back to
+        // its buffer bookkeeping; let it.
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            budget.available(),
+            4 * MAX_REQUEST_SIZE,
+            "an idle connection must hold nothing of the budget"
+        );
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), connection_task).await;
         drop(request_tx);
         cache_task.await.unwrap();
     }
