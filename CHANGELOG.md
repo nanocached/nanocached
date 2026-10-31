@@ -53,6 +53,16 @@ framework adapters at one version, whether or not a component changed.
   count. The proxy also gives a backend connection's read buffer back after
   a large reply (it kept about 14 MiB per connection after one 16 MiB
   reply).
+- `nanocached-discovery`: an `M` retry to a ready node that was slow to
+  answer kept going after the join it belonged to had been abandoned and its
+  `X` sent. A retry that reached the node after that `X` (a no-op there,
+  nothing was pending yet) started a handoff to a joiner discovery had
+  already dropped, and if that joiner re-registered under the same name the
+  occupied slot rejected its new join until the timeout. Each `M` attempt
+  now checks that its join is still the pending one, and an abandoned join's
+  retry sends an `X` instead. The sweep's abandon also names the join it was
+  decided for and leaves a different join that came to occupy the slot in
+  the meantime alone.
 - `nanocached-discovery`: `--liveness-timeout` took any number. `0` made the
   sweep run every millisecond, evict every node on its first tick and gave a
   restarted server no startup grace; a value at or below the 5 s heartbeat
