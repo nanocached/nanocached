@@ -185,7 +185,7 @@ pub enum Response {
     Keys(Vec<Key>),
     /// Internal-only (staged node join), in answer to `Command::MarkMigrated`.
     Marked,
-    /// Internal-only (staged node join), in answer to `Command::UnmarkMigrated`.
+    /// Internal-only (staged node join), in answer to `Command::UnmarkMigratedMany`.
     Unmarked,
     /// Internal-only (staged node join), in answer to `Command::Sweep` — how many
     /// entries the sweep actually removed.

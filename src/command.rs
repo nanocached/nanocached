@@ -362,14 +362,11 @@ pub enum Command {
     MarkMigrated {
         key: Key,
     },
-    /// Internal-only (staged node join): reverses `MarkMigrated` for a key whose
-    /// migration was cancelled (see `Command::CancelMigration`), so
-    /// `Sweep` doesn't reclaim it after all.
-    UnmarkMigrated {
-        key: Key,
-    },
-    /// Internal-only: `UnmarkMigrated` for a whole restore in one round
-    /// trip to the cache task (see `Cache::unmark_migrated_many`).
+    /// Internal-only (staged node join): reverses `MarkMigrated` for every
+    /// key of a restore (a cancelled or superseded migration, see
+    /// `Command::CancelMigration`) in one round trip to the cache task, so
+    /// `Sweep` doesn't reclaim them after all (see
+    /// `Cache::unmark_migrated_many`).
     UnmarkMigratedMany {
         keys: Vec<Key>,
     },
@@ -725,11 +722,6 @@ impl Command {
             Self::MarkMigrated { key } => {
                 cache.mark_migrated(&key);
                 Response::Marked
-            }
-
-            Self::UnmarkMigrated { key } => {
-                cache.unmark_migrated(&key);
-                Response::Unmarked
             }
 
             Self::UnmarkMigratedMany { keys } => {

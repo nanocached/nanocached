@@ -3782,7 +3782,7 @@ async fn handle_connection(
                 continue;
             }
             Ok((command, _)) => {
-                // `ListEntries`/`MarkMigrated`/`UnmarkMigrated`/`Sweep`/
+                // `ListEntries`/`MarkMigrated`/`UnmarkMigratedMany`/`Sweep`/
                 // `PeekEntry`: internal-only, constructed directly by
                 // server-side tasks, never by `parse()` — this arm exists
                 // only so the match stays exhaustive.
@@ -4208,9 +4208,9 @@ async fn abandon_departed_joiner(
          copies",
         restore.len()
     );
-    for key in &restore {
-        unmark_migrated(&node_context.request_tx, key).await;
-    }
+    // One round trip for the lot: this runs inline in the heartbeat loop,
+    // so one per key delayed the next heartbeat by the whole restore.
+    unmark_migrated_many(&node_context.request_tx, restore).await;
     Some(after_ring)
 }
 
@@ -6332,12 +6332,13 @@ async fn run_migration(
         // races this key's peek is caught by the next iteration's drain,
         // which then lands after the stale key and wipes it.)
         if !drain_pending_clears(&node_context, &joining_addr, &mut stream).await {
-            for key in marked_this_run
+            // One round trip for the lot: one per key kept the migration slot
+            // occupied for the whole restore.
+            let restore: Vec<Key> = marked_this_run
                 .into_iter()
                 .chain(migration_guard.take_join_marks())
-            {
-                unmark_migrated(&node_context.request_tx, &key).await;
-            }
+                .collect();
+            unmark_migrated_many(&node_context.request_tx, restore).await;
 
             return;
         }
@@ -6368,12 +6369,13 @@ async fn run_migration(
         .await;
 
         if !sent {
-            for key in marked_this_run
+            // One round trip for the lot: one per key kept the migration slot
+            // occupied for the whole restore.
+            let restore: Vec<Key> = marked_this_run
                 .into_iter()
                 .chain(migration_guard.take_join_marks())
-            {
-                unmark_migrated(&node_context.request_tx, &key).await;
-            }
+                .collect();
+            unmark_migrated_many(&node_context.request_tx, restore).await;
 
             return;
         }
@@ -6389,12 +6391,13 @@ async fn run_migration(
     }
 
     if migration_guard.abort_requested.load(Ordering::SeqCst) {
-        for key in marked_this_run
+        // One round trip for the lot: one per key kept the migration slot
+        // occupied for the whole restore.
+        let restore: Vec<Key> = marked_this_run
             .into_iter()
             .chain(migration_guard.take_join_marks())
-        {
-            unmark_migrated(&node_context.request_tx, &key).await;
-        }
+            .collect();
+        unmark_migrated_many(&node_context.request_tx, restore).await;
 
         eprintln!("WARN migration to {joining_addr} cancelled by discovery; rolled back its marks");
 
@@ -6434,12 +6437,13 @@ async fn run_migration(
     // Issue #106: whatever clears queued up after the last key's drain
     // go out before the slot flips to "completed" ...
     if !drain_pending_clears(&node_context, &joining_addr, &mut stream).await {
-        for key in marked_this_run
+        // One round trip for the lot: one per key kept the migration slot
+        // occupied for the whole restore.
+        let restore: Vec<Key> = marked_this_run
             .into_iter()
             .chain(migration_guard.take_join_marks())
-        {
-            unmark_migrated(&node_context.request_tx, &key).await;
-        }
+            .collect();
+        unmark_migrated_many(&node_context.request_tx, restore).await;
 
         return;
     }
@@ -8102,12 +8106,8 @@ async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
     let _ = execute_command(request_tx, Command::MarkMigrated { key: key.clone() }).await;
 }
 
-async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
-    let _ = execute_command(request_tx, Command::UnmarkMigrated { key: key.clone() }).await;
-}
-
-/// `unmark_migrated` for a whole restore in one cache round trip — see
-/// `Cache::unmark_migrated_many` for why one per key was too slow.
+/// Reverses `mark_migrated` for a whole restore in one cache round trip —
+/// see `Cache::unmark_migrated_many` for why one per key was too slow.
 async fn unmark_migrated_many(request_tx: &mpsc::Sender<CacheRequest>, keys: Vec<Key>) {
     if keys.is_empty() {
         return;
@@ -27046,6 +27046,282 @@ mod tests {
             node_context.known_ring.lock().unwrap().as_ref().unwrap(),
             &pre_completion_ring
         ));
+    }
+
+    /// What a restore costs the cache task: a stand-in in front of the
+    /// real one that counts the mark and unmark commands passing through.
+    #[derive(Default)]
+    struct MarkCounts {
+        marks: std::sync::atomic::AtomicUsize,
+        batched_unmarks: std::sync::atomic::AtomicUsize,
+        batched_keys: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MarkCounts {
+        fn marks(&self) -> usize {
+            self.marks.load(Ordering::SeqCst)
+        }
+        fn batched_unmarks(&self) -> usize {
+            self.batched_unmarks.load(Ordering::SeqCst)
+        }
+        fn batched_keys(&self) -> usize {
+            self.batched_keys.load(Ordering::SeqCst)
+        }
+    }
+
+    fn counting_cache(
+        inner: mpsc::Sender<CacheRequest>,
+    ) -> (
+        mpsc::Sender<CacheRequest>,
+        Arc<MarkCounts>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let counts = Arc::new(MarkCounts::default());
+        let seen = Arc::clone(&counts);
+        let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(64);
+        let task = tokio::spawn(async move {
+            while let Some(request) = request_rx.recv().await {
+                match &request.command {
+                    Command::MarkMigrated { .. } => {
+                        seen.marks.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Command::UnmarkMigratedMany { keys } => {
+                        seen.batched_unmarks.fetch_add(1, Ordering::SeqCst);
+                        seen.batched_keys.fetch_add(keys.len(), Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+                if inner.send(request).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (request_tx, counts, task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_gone_verdict_restores_every_dead_copy_in_one_cache_command() {
+        // The `G` restore runs inline in the heartbeat loop, so one cache
+        // round trip per marked key held the next heartbeat back by about
+        // 12.5 us per key — enough marked keys and a live node is evicted.
+        // Counted in commands rather than timed, so the check is exact.
+        const KEYS: usize = 5_000;
+        let names: Vec<String> = (0..KEYS).map(|index| format!("dead-{index}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (mut node_context, _after_ring, _pre_completion_ring) =
+            completed_unconfirmed_context(&names);
+        let (inner_tx, inner_rx) = mpsc::channel(8);
+        let cache_task = tokio::spawn(run_cache(inner_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let (request_tx, counts, proxy_task) = counting_cache(inner_tx);
+        node_context.request_tx = request_tx;
+
+        let (_name, identity) = unconfirmed_completed_joiner(&node_context).unwrap();
+        let after_ring =
+            abandon_departed_joiner(&node_context, "joiner-0", &identity, "127.0.0.1:1").await;
+
+        assert!(after_ring.is_some(), "the matching slot is abandoned");
+        assert_eq!(counts.batched_unmarks(), 1, "one command for the lot");
+        assert_eq!(counts.batched_keys(), KEYS);
+
+        proxy_task.abort();
+        drop(node_context);
+        cache_task.abort();
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum RollbackVia {
+        /// Discovery cancels the handoff part-way through its keys.
+        Abort,
+        /// The joiner drops the connection and the key can't be delivered.
+        TransferFailure,
+        /// A clear queued mid-run can't be replayed before the next key.
+        ClearBeforeNextKey,
+        /// A clear queued after the last key can't be replayed.
+        ClearAfterLastKey,
+    }
+
+    async fn rollback_restores_in_one_cache_command(via: RollbackVia) {
+        const KEYS: usize = 240;
+        const DELIVERED_BEFORE_THE_FAULT: usize = 30;
+        let (inner_tx, inner_rx) = mpsc::channel(8);
+        let cache_task = tokio::spawn(run_cache(inner_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let (request_tx, counts, proxy_task) = counting_cache(inner_tx.clone());
+
+        let users = Bytes::from_static(b"users");
+        for index in 0..KEYS {
+            send_command(
+                &inner_tx,
+                Command::Set {
+                    key: Key::new(users.clone(), Bytes::from(format!("k{index}"))),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+
+        let node_context = NodeContext {
+            gates: Default::default(),
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr,
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        };
+        let joined = vec![
+            ("ready-node".to_string(), "127.0.0.1:1".to_string()),
+            ("other-node".to_string(), "127.0.0.1:1".to_string()),
+        ];
+        let (before_ring, after_ring) = migration_rings(&node_context, "joiner-0", &joined);
+        let after_ring = Arc::new(after_ring);
+        let migration_guard = MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            "joiner-0".to_string(),
+            joining_addr.clone(),
+            "tok-joiner-0".to_string(),
+            Arc::clone(&after_ring),
+            2,
+            None,
+            &joined,
+            &node_context.known_ring,
+            &node_context.ring_history,
+        )
+        .unwrap_new();
+        let keys = list_keys(&request_tx).await;
+
+        // How many keys this node actually sends the joiner.
+        let mut hasher = KeyHasher::default();
+        let sendable = keys
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|key| {
+                let hash = hasher.hash(key);
+                after_ring.is_owner_hashed(hash, "joiner-0", 2)
+                    && before_ring.is_owner_hashed(hash, "ready-node", 2)
+            })
+            .count();
+        assert!(
+            sendable > DELIVERED_BEFORE_THE_FAULT + 10,
+            "sanity: {sendable}"
+        );
+        let fault_after = if via == RollbackVia::ClearAfterLastKey {
+            sendable
+        } else {
+            DELIVERED_BEFORE_THE_FAULT
+        };
+
+        let abort = Arc::clone(&migration_guard.abort_requested);
+        let joiner_context = node_context.clone();
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 4096];
+            for delivered in 1..=fault_after {
+                if connection.read(&mut buffer).await.unwrap() == 0 {
+                    return;
+                }
+                if delivered == fault_after {
+                    match via {
+                        RollbackVia::Abort => abort.store(true, Ordering::SeqCst),
+                        RollbackVia::TransferFailure => return,
+                        RollbackVia::ClearBeforeNextKey | RollbackVia::ClearAfterLastKey => {
+                            assert!(matches!(
+                                route_clear(&joiner_context, &ClearScope::All),
+                                ClearRoute::Queued
+                            ));
+                        }
+                    }
+                }
+                connection.write_all(b"S\n").await.unwrap();
+            }
+            if via == RollbackVia::Abort {
+                while connection.read(&mut buffer).await.unwrap_or(0) > 0 {}
+            }
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            run_migration(
+                node_context.clone(),
+                "joiner-0".to_string(),
+                joining_addr,
+                "tok-joiner-0".to_string(),
+                None,
+                2,
+                before_ring,
+                after_ring,
+                migration_guard,
+                keys,
+            ),
+        )
+        .await
+        .expect("the migration returns");
+
+        assert!(
+            counts.marks() > 0,
+            "{via:?}: the run marked displaced copies"
+        );
+        assert_eq!(
+            counts.batched_unmarks(),
+            1,
+            "{via:?}: one command for the lot"
+        );
+        assert_eq!(counts.batched_keys(), counts.marks(), "{via:?}");
+        // The restore took: nothing is left for the sweep to reclaim.
+        assert_eq!(
+            send_command(
+                &inner_tx,
+                Command::Sweep {
+                    marked: true,
+                    owned: None
+                }
+            )
+            .await,
+            Response::Swept(0),
+            "{via:?}"
+        );
+
+        joining_task.abort();
+        proxy_task.abort();
+        drop(node_context);
+        cache_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abort_rollback_restores_in_one_cache_command() {
+        rollback_restores_in_one_cache_command(RollbackVia::Abort).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_transfer_failure_rollback_restores_in_one_cache_command() {
+        rollback_restores_in_one_cache_command(RollbackVia::TransferFailure).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clear_replay_failure_rollback_restores_in_one_cache_command() {
+        rollback_restores_in_one_cache_command(RollbackVia::ClearBeforeNextKey).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clear_replay_failure_after_the_last_key_restores_in_one_cache_command() {
+        rollback_restores_in_one_cache_command(RollbackVia::ClearAfterLastKey).await;
     }
 
     #[test]
