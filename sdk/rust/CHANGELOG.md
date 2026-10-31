@@ -8,6 +8,16 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Fixed
 
+- A large request over TLS could stall until `request_timeout` and fail with
+  `ConnectionLostTimedOut` (a `set` is not retried) when the server read
+  slowly. A request was written with `write_all` and never flushed;
+  tokio-rustls's `write` returns once rustls has accepted the plaintext, so up
+  to ~64 KiB of the frame's tail could stay queued inside rustls, and nothing
+  else on the connection (the read half never writes) pushed it to the
+  socket: the server never saw the end of the frame and never replied. The
+  request now flushes after the write, inside the same shutdown-cancellable
+  step, and the identify handshake (`A`, `L`, `Q`) flushes its writes too.
+  Plain TCP is unaffected (flush is a no-op there). (#1104)
 - A compressed value whose DEFLATE body was cut short is now an
   `Error::Decompression` instead of a silent prefix of the original. The
   decoder was driven through flate2's `Read` adapters (`DeflateDecoder` +
