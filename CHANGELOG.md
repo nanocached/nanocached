@@ -46,6 +46,16 @@ framework adapters at one version, whether or not a component changed.
   at most 50 times a second; the rest are counted and reported in one `…
   more connections accepted` or `… more connection errors` summary line
   ahead of the next line written.
+- `nanocached-proxy`: a request was charged to the in-flight byte budgets
+  only once its frame was fully parsed, so each authenticated connection
+  could buffer up to about 1 MiB of a declared frame outside them, bounded
+  only by the idle deadline and the connection caps: with the default 1,024
+  connections about 1 GiB beside the 256 MiB budget meant to bound the
+  proxy's working memory. A receive buffer's growth beyond 64 KiB is now
+  charged to the connection's, the source IP's and the proxy's budgets
+  before it is allocated, as the node does, and released when the buffer
+  shrinks; a connection that cannot get the growth by its frame deadline is
+  closed.
 - `nanocached-proxy`: a batched read (`m`, or `y` with `G`) spread over
   several nodes held up to 16 MiB of values per node while it was
   answered, plus a second copy for the client, but was charged for 16 MiB
