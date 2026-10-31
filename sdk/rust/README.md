@@ -688,7 +688,9 @@ has no checksum). There is no dual-mode migration path: only turn this on
 for a fresh keyspace, or only after every client touching an existing one
 has upgraded and enabled it together. Incompressible data
 (already-compressed media, random bytes) is passed through unchanged
-rather than bloated.
+rather than bloated. A compressed value whose DEFLATE stream is cut short
+(or has no body at all) is an `Error::Decompression`, never a silent prefix
+of the original.
 
 **Incompatible with counters.** `compress(true)` also rules out
 `incr`/`decr` on this client (see Counters above): an INCR result carries
