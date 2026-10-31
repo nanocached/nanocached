@@ -14,6 +14,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a request waited for the in-flight byte budget with no
+  time limit, and `IDLE_TIMEOUT` did not cover that wait. A client that read
+  1 MiB replies at about 20 KB/s is never evicted, so five such connections
+  pipelining reads held the whole 256 MiB proxy-wide budget and every other
+  client's requests waited behind them for as long as they kept dribbling.
+  A request that cannot get its bytes within 60 seconds is now answered `R`
+  (`B` to a client without the retryable-error capability) and the
+  connection goes on, and one source IP may hold at most a quarter of the
+  proxy-wide budget (64 MiB by default), so one slow consumer cannot starve
+  the rest. Clients behind one NAT or egress IP share that quarter.
 - `nanocached-node`: a remaining TTL under one second went on the wire as
   `0`: in an INCR reply, in a get-and-touch reply and in a forward or handoff
   of the entry. An SDK replicating an INCR reply read `0` as "no expiry"

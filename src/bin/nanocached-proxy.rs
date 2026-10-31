@@ -395,6 +395,25 @@ const CLIENT_IN_FLIGHT_BYTES: usize = 3 * MAX_REQUEST_SIZE + 4096;
 /// connection buffers, the backend reply ledgers and the runtime.
 const DEFAULT_MAX_IN_FLIGHT_BYTES: usize = 256 * 1024 * 1024;
 
+/// How long a request waits for in-flight bytes (its connection's, its
+/// source IP's share and the proxy's) before it is answered `R` (`B` to
+/// a client that did not declare the capability) instead. Without a
+/// bound a handful of connections that read their replies slowly hold
+/// the whole proxy-wide budget indefinitely: `CLIENT_WRITE_TIMEOUT`
+/// bounds one write, not the client's read rate, and `IDLE_TIMEOUT` does
+/// not cover this wait, so every other client stalled behind them for as
+/// long as they cared to dribble. Equal to `IDLE_TIMEOUT`: a request
+/// that has waited as long as a silent client may stay silent is not
+/// going to be admitted by waiting longer.
+const ADMISSION_WAIT: Duration = IDLE_TIMEOUT;
+
+/// A source IP may hold at most `1 / IP_IN_FLIGHT_SHARE_DIVISOR` of the
+/// proxy-wide in-flight budget (`--max-in-flight-bytes`) at once, so a
+/// client that fills its own share, with one connection or many (the
+/// per-IP connection cap does not limit bytes), still leaves the rest of
+/// the budget to everyone else.
+const IP_IN_FLIGHT_SHARE_DIVISOR: usize = 4;
+
 /// Smallest accepted `--max-in-flight-bytes`: one request-sized frame.
 /// Below that every request would run alone (a request costing more
 /// than the budget takes all of it), which is a serialising proxy, not
@@ -897,6 +916,11 @@ struct ConnectionLimits {
     /// every client connection draws on (see `CLIENT_IN_FLIGHT_BYTES`
     /// for the per-connection one).
     max_in_flight_bytes: usize,
+    /// The part of `max_in_flight_bytes` one source IP may hold
+    /// (`IP_IN_FLIGHT_SHARE_DIVISOR`).
+    max_in_flight_bytes_per_ip: usize,
+    /// How long a request waits for in-flight bytes (`ADMISSION_WAIT`).
+    admission_wait: Duration,
 }
 
 /// An unset per-IP cap follows a lowered total down (a 100-connection
@@ -910,7 +934,15 @@ fn connection_limits(args: &Args) -> ConnectionLimits {
             .max_connections_per_ip
             .unwrap_or_else(|| DEFAULT_MAX_CONNECTIONS_PER_IP.min(args.max_connections)),
         max_in_flight_bytes: args.max_in_flight_bytes,
+        max_in_flight_bytes_per_ip: ip_in_flight_share(args.max_in_flight_bytes),
+        admission_wait: ADMISSION_WAIT,
     }
+}
+
+/// One source IP's share of a proxy-wide in-flight budget of `total`
+/// bytes.
+fn ip_in_flight_share(total: usize) -> usize {
+    (total / IP_IN_FLIGHT_SHARE_DIVISOR).max(1)
 }
 
 // ─── TLS plumbing ───────────────────────────────────────────────────
@@ -5951,6 +5983,104 @@ impl InFlightBudget {
     }
 }
 
+/// The proxy-wide in-flight budget's per-source-IP shares: one
+/// `InFlightBudget` of `share_bytes` per IP with a live connection
+/// (keyed like the per-IP connection cap, so an IPv6 source counts per
+/// /64), shared by that IP's connections and dropped with the last of
+/// them. A request is charged against its IP's share before the
+/// proxy-wide budget, so an IP at its share waits on itself and never in
+/// the proxy-wide queue ahead of other sources.
+#[derive(Clone)]
+struct IpInFlightShares {
+    budgets: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, Arc<InFlightBudget>>>>,
+    share_bytes: usize,
+}
+
+impl IpInFlightShares {
+    fn new(share_bytes: usize) -> Self {
+        Self {
+            budgets: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            share_bytes,
+        }
+    }
+
+    fn acquire(&self, ip: std::net::IpAddr) -> IpInFlightShare {
+        let ip = infra::per_ip_key(ip);
+        let mut budgets = self
+            .budgets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let budget = Arc::clone(
+            budgets
+                .entry(ip)
+                .or_insert_with(|| Arc::new(InFlightBudget::new(self.share_bytes))),
+        );
+        drop(budgets);
+        IpInFlightShare {
+            shares: Arc::clone(&self.budgets),
+            ip,
+            budget,
+        }
+    }
+}
+
+/// One connection's hold on its source IP's share; removes the IP's
+/// entry on drop when no other connection of that IP still holds it, so
+/// the map does not grow with every address that ever connected.
+struct IpInFlightShare {
+    shares: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, Arc<InFlightBudget>>>>,
+    ip: std::net::IpAddr,
+    budget: Arc<InFlightBudget>,
+}
+
+impl Drop for IpInFlightShare {
+    fn drop(&mut self) {
+        let mut budgets = self
+            .shares
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The map's own reference and this one: nobody else holds it.
+        if Arc::strong_count(&self.budget) <= 2 {
+            budgets.remove(&self.ip);
+        }
+    }
+}
+
+/// What `serve` builds the in-flight budgets of each accepted connection
+/// from.
+#[derive(Clone)]
+struct InFlightAdmission {
+    proxy: InFlightBudget,
+    ip_shares: IpInFlightShares,
+    admission_wait: Duration,
+}
+
+impl InFlightAdmission {
+    fn new(limits: &ConnectionLimits) -> Self {
+        Self {
+            proxy: InFlightBudget::new(limits.max_in_flight_bytes),
+            ip_shares: IpInFlightShares::new(limits.max_in_flight_bytes_per_ip),
+            admission_wait: limits.admission_wait,
+        }
+    }
+
+    fn for_connection(&self, ip: std::net::IpAddr) -> ClientBudgets {
+        ClientBudgets {
+            proxy: self.proxy.clone(),
+            ip: self.ip_shares.acquire(ip),
+            admission_wait: self.admission_wait,
+        }
+    }
+}
+
+/// The budgets a connection's requests are admitted against besides its
+/// own, and how long it waits for them.
+struct ClientBudgets {
+    proxy: InFlightBudget,
+    ip: IpInFlightShare,
+    admission_wait: Duration,
+}
+
 /// What a client request is charged against the in-flight byte budgets
 /// while it is undelivered: its own frame plus the worst case of what
 /// the proxy will hold for it. `frame_bytes` is what the request took
@@ -6042,18 +6172,24 @@ impl ClientReply {
     }
 }
 
-/// The per-connection and proxy-wide reservations of one request, in
-/// the order they were taken.
+/// The per-connection, per-source-IP and proxy-wide reservations of one
+/// request, in the order they were taken.
 struct InFlightCharge {
     _connection: tokio::sync::OwnedSemaphorePermit,
+    _ip: tokio::sync::OwnedSemaphorePermit,
     _proxy: tokio::sync::OwnedSemaphorePermit,
 }
 
 async fn handle_client(
     stream: ServerStream,
     context: Arc<ProxyContext>,
-    proxy_in_flight_bytes: InFlightBudget,
+    budgets: ClientBudgets,
 ) -> io::Result<()> {
+    let ClientBudgets {
+        proxy: proxy_in_flight_bytes,
+        ip: ip_in_flight_share,
+        admission_wait,
+    } = budgets;
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
     // The FIFO between reader and writer: each entry resolves to the
@@ -6204,24 +6340,50 @@ async fn handle_client(
                         break 'connection Ok(());
                     }
                     // Admission: reserve the request's worst-case bytes
-                    // (this connection's share first, then the proxy's)
-                    // before it is dispatched, so a client that
-                    // pipelines faster than its replies drain stops
-                    // here instead of growing the proxy. Stops waiting
-                    // for the same reasons the read below does.
+                    // (this connection's share first, then its source
+                    // IP's, then the proxy's) before it is dispatched,
+                    // so a client that pipelines faster than its replies
+                    // drain stops here instead of growing the proxy.
+                    // Stops waiting for the same reasons the read below
+                    // does, and after `admission_wait`: a request that
+                    // cannot get its bytes by then is answered with the
+                    // transient reply and the connection goes on.
                     let replication = current_ring(&context).map_or(1, |ring| ring.replication);
                     let cost = request_cost(&request, buffered - buf.len(), replication);
-                    let charge = tokio::select! {
-                        charge = async {
+                    let admitted = tokio::select! {
+                        admitted = timeout(admission_wait, async {
                             let connection = connection_in_flight_bytes.charge(cost).await?;
+                            let ip = ip_in_flight_share.budget.charge(cost).await?;
                             let proxy = proxy_in_flight_bytes.charge(cost).await?;
-                            Some(InFlightCharge { _connection: connection, _proxy: proxy })
-                        } => charge,
+                            Some(InFlightCharge {
+                                _connection: connection,
+                                _ip: ip,
+                                _proxy: proxy,
+                            })
+                        }) => admitted,
                         () = drained(&mut drain) => break 'connection Ok(()),
                         () = fifo_tx.closed() => break 'connection Ok(()),
                     };
-                    let Some(charge) = charge else {
-                        break 'connection Ok(());
+                    let charge = match admitted {
+                        Ok(Some(charge)) => charge,
+                        Ok(None) => break 'connection Ok(()),
+                        Err(_) => {
+                            // Nothing was dispatched, so the request was
+                            // not applied. The request is done with, so
+                            // the idle deadline starts over like after
+                            // any completed frame.
+                            deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                            let (response_tx, response_rx) = oneshot::channel();
+                            let _ = response_tx.send(Ok(transient_reply(retry_capable, tag)));
+                            if fifo_tx
+                                .send(ClientReply::uncharged(response_rx))
+                                .await
+                                .is_err()
+                            {
+                                break 'connection Ok(());
+                            }
+                            continue;
+                        }
                     };
                     deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
                     // Dispatch inline (awaiting the ordered backend
@@ -6440,7 +6602,7 @@ async fn run(
             permits,
             per_ip_connections,
             max_connections_per_ip: limits.max_connections_per_ip,
-            in_flight_bytes: InFlightBudget::new(limits.max_in_flight_bytes),
+            in_flight: InFlightAdmission::new(&limits),
         },
         args.drain_timeout,
     )
@@ -6631,7 +6793,7 @@ struct ClientAdmission {
     permits: Arc<Semaphore>,
     per_ip_connections: PerIpConnections,
     max_connections_per_ip: usize,
-    in_flight_bytes: InFlightBudget,
+    in_flight: InFlightAdmission,
 }
 
 async fn serve(
@@ -6645,7 +6807,7 @@ async fn serve(
         permits,
         per_ip_connections,
         max_connections_per_ip,
-        in_flight_bytes,
+        in_flight,
     } = admission;
     let mut connections = tokio::task::JoinSet::new();
     let mut drain = context.drain.clone();
@@ -6704,7 +6866,7 @@ async fn serve(
 
         let context = Arc::clone(&context);
         let acceptor = tls_acceptor.clone();
-        let in_flight_bytes = in_flight_bytes.clone();
+        let budgets = in_flight.for_connection(peer.ip());
         connections.spawn(async move {
             let _permit = permit;
             let _per_ip_permit = per_ip_permit;
@@ -6730,7 +6892,7 @@ async fn serve(
                     }
                 }
             };
-            if let Err(error) = handle_client(stream, context, in_flight_bytes).await {
+            if let Err(error) = handle_client(stream, context, budgets).await {
                 eprintln!("WARN connection error from {peer}: {error}");
             }
         });
@@ -7366,7 +7528,7 @@ mod tests {
         let connection = tokio::spawn(handle_client(
             ServerStream::Plain(server),
             context,
-            InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            standalone_budgets(),
         ));
 
         // The handshake runs in real time: pausing the clock before an
@@ -7592,6 +7754,8 @@ mod tests {
                 max_connections: 8,
                 max_connections_per_ip: 8,
                 max_in_flight_bytes: 2 * MAX_REQUEST_SIZE + 4096,
+                max_in_flight_bytes_per_ip: 2 * MAX_REQUEST_SIZE + 4096,
+                admission_wait: ADMISSION_WAIT,
             }),
         )
         .await;
@@ -7618,6 +7782,206 @@ mod tests {
         }
         assert_eq!(context.requests_total.load(Ordering::Relaxed), 6);
         drop(node);
+    }
+
+    /// Budgets sized for exactly one read, so one slow request holds
+    /// everything; `admission_wait` short enough to observe.
+    fn one_read_limits() -> ConnectionLimits {
+        ConnectionLimits {
+            max_connections: 8,
+            max_connections_per_ip: 8,
+            max_in_flight_bytes: MAX_REQUEST_SIZE + 4096,
+            max_in_flight_bytes_per_ip: MAX_REQUEST_SIZE + 4096,
+            admission_wait: Duration::from_millis(150),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_that_cannot_get_in_flight_bytes_in_time_is_answered_r_and_the_connection_goes_on()
+     {
+        // One read's worth of budget, held for 400 ms by a slow reply.
+        // A second client's read waits 150 ms, is answered `R` with its
+        // own tag (not applied, not dispatched), and its connection is
+        // still good: the retry is admitted once the first reply has
+        // been written.
+        let (node, proxy, context) =
+            slow_single_node(b"k", Duration::from_millis(400), Some(one_read_limits())).await;
+        let (mut holder, mut holder_buf) = connect_and_auth(&proxy).await;
+        holder.write_all(b"G 1\nk").await.unwrap();
+        sleep(Duration::from_millis(40)).await;
+        assert_eq!(context.requests_total.load(Ordering::Relaxed), 1);
+
+        let (mut waiter, mut waiter_buf) = connect_and_auth_tagged(&proxy).await;
+        let start = Instant::now();
+        waiter.write_all(b"G 1 5\nk").await.unwrap();
+        assert_eq!(
+            read_line(&mut waiter, &mut waiter_buf).await.unwrap(),
+            "R 5"
+        );
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(150) && waited < Duration::from_millis(380),
+            "the wait must end at the bound, not at the holder's reply: {waited:?}"
+        );
+        assert_eq!(
+            context.requests_total.load(Ordering::Relaxed),
+            1,
+            "the refused request must not have been dispatched"
+        );
+
+        // The holder's reply frees the budget; only then is the retry sent
+        // (sent earlier it would wait out another bound and get `R` again).
+        assert_eq!(
+            read_line(&mut holder, &mut holder_buf).await.unwrap(),
+            "V 1"
+        );
+        waiter.write_all(b"G 1 6\nk").await.unwrap();
+        assert_eq!(
+            read_line(&mut waiter, &mut waiter_buf).await.unwrap(),
+            "V 1 6"
+        );
+        drop(node);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_legacy_client_that_cannot_get_in_flight_bytes_in_time_is_answered_b_and_goes_on() {
+        let (node, proxy, _context) =
+            slow_single_node(b"k", Duration::from_millis(400), Some(one_read_limits())).await;
+        let (mut holder, mut holder_buf) = connect_and_auth(&proxy).await;
+        holder.write_all(b"G 1\nk").await.unwrap();
+        sleep(Duration::from_millis(40)).await;
+
+        let (mut waiter, mut waiter_buf) = connect_and_auth(&proxy).await;
+        waiter.write_all(b"G 1\nk").await.unwrap();
+        assert_eq!(read_line(&mut waiter, &mut waiter_buf).await.unwrap(), "B");
+
+        assert_eq!(
+            read_line(&mut holder, &mut holder_buf).await.unwrap(),
+            "V 1"
+        );
+        waiter.write_all(b"G 1\nk").await.unwrap();
+        assert_eq!(
+            read_line(&mut waiter, &mut waiter_buf).await.unwrap(),
+            "V 1"
+        );
+        drop(node);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_source_ip_stops_at_its_share_while_the_proxy_wide_budget_has_room() {
+        // The proxy-wide budget holds eight reads and one source IP's
+        // share two. Three reads pipelined over two connections of that
+        // IP get two dispatched although six reads' worth of the
+        // proxy-wide budget is free; the third follows once a reply has
+        // been written.
+        let (node, proxy, context) = slow_single_node(
+            b"k",
+            Duration::from_millis(300),
+            Some(ConnectionLimits {
+                max_connections: 8,
+                max_connections_per_ip: 8,
+                max_in_flight_bytes: 8 * MAX_REQUEST_SIZE + 4096,
+                max_in_flight_bytes_per_ip: 2 * MAX_REQUEST_SIZE + 4096,
+                admission_wait: Duration::from_secs(5),
+            }),
+        )
+        .await;
+        let (mut first, mut first_buf) = connect_and_auth(&proxy).await;
+        let (mut second, mut second_buf) = connect_and_auth(&proxy).await;
+        first.write_all(b"G 1\nk").await.unwrap();
+        first.write_all(b"G 1\nk").await.unwrap();
+        second.write_all(b"G 1\nk").await.unwrap();
+        sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            context.requests_total.load(Ordering::Relaxed),
+            2,
+            "one source IP must not hold more than its share"
+        );
+
+        for (stream, buf, count) in [
+            (&mut first, &mut first_buf, 2),
+            (&mut second, &mut second_buf, 1),
+        ] {
+            for _ in 0..count {
+                assert_eq!(read_line(stream, buf).await.unwrap(), "V 1");
+                read_exact_into(stream, buf, 1).await.unwrap();
+                let _ = buf.split_to(1);
+            }
+        }
+        assert_eq!(context.requests_total.load(Ordering::Relaxed), 3);
+        drop(node);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_source_ip_holding_its_share_does_not_block_another() {
+        // The registry `serve` draws each connection's IP share from:
+        // an IP that has spent its whole share waits on itself, while a
+        // different IP is admitted at once. An IPv4-mapped IPv6 address
+        // counts as the IPv4 address it carries.
+        let admission = InFlightAdmission::new(&ConnectionLimits {
+            max_connections: 8,
+            max_connections_per_ip: 8,
+            max_in_flight_bytes: 4 * MAX_REQUEST_SIZE,
+            max_in_flight_bytes_per_ip: MAX_REQUEST_SIZE,
+            admission_wait: Duration::from_secs(1),
+        });
+        let greedy: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let mapped: std::net::IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        let other: std::net::IpAddr = "192.0.2.2".parse().unwrap();
+
+        let greedy_budgets = admission.for_connection(greedy);
+        let _held = greedy_budgets
+            .ip
+            .budget
+            .charge(MAX_REQUEST_SIZE)
+            .await
+            .expect("the share is free");
+
+        let same_ip_again = admission.for_connection(mapped);
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                same_ip_again.ip.budget.charge(1)
+            )
+            .await
+            .is_err(),
+            "a second connection of the same source shares its budget"
+        );
+
+        let other_budgets = admission.for_connection(other);
+        let _admitted = timeout(
+            Duration::from_millis(100),
+            other_budgets.ip.budget.charge(MAX_REQUEST_SIZE),
+        )
+        .await
+        .expect("another source is not blocked by the first")
+        .expect("admitted");
+    }
+
+    #[test]
+    fn a_source_ips_share_is_forgotten_with_its_last_connection() {
+        let shares = IpInFlightShares::new(1024);
+        let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let first = shares.acquire(ip);
+        let second = shares.acquire(ip);
+        assert_eq!(shares.budgets.lock().unwrap().len(), 1);
+        drop(first);
+        assert_eq!(
+            shares.budgets.lock().unwrap().len(),
+            1,
+            "still held by the second connection"
+        );
+        drop(second);
+        assert!(shares.budgets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_share_is_a_quarter_of_the_proxy_wide_budget() {
+        assert_eq!(
+            ip_in_flight_share(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            64 * 1024 * 1024
+        );
+        assert_eq!(ip_in_flight_share(1), 1);
     }
 
     #[test]
@@ -8853,7 +9217,15 @@ mod tests {
             max_connections,
             max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP.min(max_connections),
             max_in_flight_bytes: DEFAULT_MAX_IN_FLIGHT_BYTES,
+            max_in_flight_bytes_per_ip: ip_in_flight_share(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            admission_wait: ADMISSION_WAIT,
         }
+    }
+
+    /// Default-sized budgets for a test that drives `handle_client` on a
+    /// socket pair of its own.
+    fn standalone_budgets() -> ClientBudgets {
+        InFlightAdmission::new(&test_limits(8)).for_connection(std::net::Ipv4Addr::LOCALHOST.into())
     }
 
     async fn start_proxy_full(
@@ -8900,7 +9272,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(limits.max_connections)),
                 per_ip_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 max_connections_per_ip: limits.max_connections_per_ip,
-                in_flight_bytes: InFlightBudget::new(limits.max_in_flight_bytes),
+                in_flight: InFlightAdmission::new(&limits),
             },
             Duration::from_secs(5),
         ));
@@ -9011,7 +9383,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(limits.max_connections)),
                 per_ip_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 max_connections_per_ip: limits.max_connections_per_ip,
-                in_flight_bytes: InFlightBudget::new(limits.max_in_flight_bytes),
+                in_flight: InFlightAdmission::new(&limits),
             },
             Duration::from_secs(5),
         ));
@@ -13527,7 +13899,7 @@ mod tests {
             ConnectionLimits {
                 max_connections: 10,
                 max_connections_per_ip: 1,
-                max_in_flight_bytes: DEFAULT_MAX_IN_FLIGHT_BYTES,
+                ..test_limits(10)
             },
         )
         .await;

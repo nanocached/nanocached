@@ -183,9 +183,15 @@ node's definition. The choices that matter:</p>
   replies (counted at their worst case, so a batched read is charged
   the largest reply it could get), and the proxy as a whole holds
   <code>--max-in-flight-bytes</code> (256 MiB by default) across every
-  connection; a client that pipelines past its share is simply read
-  more slowly until its replies have gone out. Raise the flag together
-  with the task's memory. Watch CPU and
+  connection. One source IP, with however many connections, may hold at
+  most a quarter of that (64&nbsp;MiB by default), so a client that reads
+  its replies slowly cannot starve the others; clients behind one NAT
+  or egress IP share that quarter. A client that pipelines past a
+  budget is read more slowly until its replies have gone out, and a
+  request that cannot get its bytes within 60&nbsp;seconds is not
+  dispatched but answered <code>R</code> (<code>B</code> to a client
+  without the retryable-error capability) on the same connection, for
+  the client to retry. Raise the flag together with the task's memory. Watch CPU and
   <code>nanocached_proxy_client_connections</code> before sizing up
   or out.</li>
   <li><b>No service registry.</b> Discovery is the proxy roster; nothing
