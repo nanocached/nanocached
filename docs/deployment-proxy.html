@@ -192,7 +192,23 @@ node's definition. The choices that matter:</p>
   connection. One source IP, with however many connections, may hold at
   most a quarter of that (64&nbsp;MiB by default), so a client that reads
   its replies slowly cannot starve the others; clients behind one NAT
-  or egress IP share that quarter. A client that pipelines past a
+  or egress IP share that quarter. That quarter also decides how many
+  large batched reads one address runs at once: a batched read is
+  charged at its worst case (up to 16&nbsp;MiB per node it can reach,
+  held until its reply has been written), so on four or more nodes a
+  read of 64 or more keys takes the whole 64&nbsp;MiB and the next one
+  from the same address waits for it, however small the values turn
+  out to be. Clients behind one NAT or load balancer share that single
+  slot. Measured on loopback against four nodes, 16 connections from
+  one address reading 100 keys each: about 3,400 requests a second at
+  the default, about 12,900 with <code>--max-in-flight-bytes</code> set
+  to 4&nbsp;GiB. To run N such reads at once from one address, set
+  <code>--max-in-flight-bytes</code> to at least four times N times
+  the read's charge (nodes &times; 16&nbsp;MiB; 512&nbsp;MiB for two
+  on four nodes), and raise the task's memory by the same amount: it is
+  the proxy's ceiling for what it holds in flight. The proxy logs a
+  warning at startup, the first time the cluster is large enough for
+  this to apply. A client that pipelines past a
   budget is read more slowly until its replies have gone out, and a
   request that cannot get its bytes within 60&nbsp;seconds is not
   dispatched but answered <code>R</code> (<code>B</code> to a client

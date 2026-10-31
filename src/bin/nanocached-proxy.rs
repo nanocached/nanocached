@@ -806,6 +806,8 @@ fn usage() -> String {
      [--max-connections-per-ip <n>] [--max-in-flight-bytes <bytes>] \
      [--tls-cert <pem> --tls-key <pem>] [--tls-ca <pem>] [--metrics-port <port>]\n\
      [--drain-timeout <secs>]\n\
+     A source IP may hold 1/4 of --max-in-flight-bytes; that share decides how many large batched \
+     reads (m, or y with G) one address runs at once.\n\
      The shared auth secret is read from NANOCACHED_AUTH_SECRET."
         .to_string()
 }
@@ -1257,6 +1259,10 @@ struct RefresherConfig {
     /// task that sends announces is what guarantees no `Y` follows the
     /// `Z` and quietly re-registers a draining proxy.
     drain: watch::Receiver<bool>,
+    /// One source IP's in-flight byte share (`ip_in_flight_share`), what
+    /// `batch_read_share_warning` compares a batched read's worst-case
+    /// charge to.
+    ip_in_flight_share: usize,
 }
 
 /// Appended to a backend failure when this proxy dials in plaintext and the
@@ -1305,6 +1311,32 @@ fn half_tls_warning(client_tls: bool, backend_tls: bool) -> Option<&'static str>
     }
 }
 
+/// The startup-time warning for a cluster so large that one batched read
+/// (`m`, or `y` with `G`), charged at its worst case of
+/// `MAX_MULTI_REPLY_VALUE_BYTES` for every primary it reaches
+/// (`request_cost`), leaves room in a source IP's share for no second one:
+/// clients behind one address, a NAT or a load balancer then run such reads
+/// one at a time. `None` while two fit (or the ring is empty).
+fn batch_read_share_warning(primaries: usize, ip_share: usize) -> Option<String> {
+    let cost = primaries.checked_mul(MAX_MULTI_REPLY_VALUE_BYTES)?;
+    if cost == 0 || ip_share / cost >= 2 {
+        return None;
+    }
+    const MIB: usize = 1024 * 1024;
+    Some(format!(
+        "WARN a batched read of {} or more keys on {primaries} nodes is charged {} MiB of \
+         in-flight bytes against a source IP's share of {} MiB (1/{IP_IN_FLIGHT_SHARE_DIVISOR} \
+         of --max-in-flight-bytes), so clients behind one address run such reads one at a \
+         time; --max-in-flight-bytes {} allows two at once (the proxy's memory limit has to \
+         grow with it)",
+        cost / MAX_REQUEST_SIZE,
+        cost / MIB,
+        ip_share / MIB,
+        cost.saturating_mul(2)
+            .saturating_mul(IP_IN_FLIGHT_SHARE_DIVISOR),
+    ))
+}
+
 async fn run_refresher(
     config: RefresherConfig,
     ring_tx: watch::Sender<Option<Arc<RingView>>>,
@@ -1317,7 +1349,10 @@ async fn run_refresher(
         tls_connector,
         announce,
         mut drain,
+        ip_in_flight_share,
     } = config;
+    // Said once, the first time the roster is that large.
+    let mut warned_about_batch_share = false;
 
     // `force_refresh` callers waiting on the next successful fetch. Kept
     // across a failed fetch (the old wait was for "the view changes", which
@@ -1337,6 +1372,13 @@ async fn run_refresher(
                 // an address that dropped off the ring stops accumulating
                 // map entries from this point on.
                 backends.prune(&ring);
+                if !warned_about_batch_share
+                    && let Some(warning) =
+                        batch_read_share_warning(ring.distinct_addresses(), ip_in_flight_share)
+                {
+                    warned_about_batch_share = true;
+                    eprintln!("{warning}");
+                }
                 // An identical roster is not republished: `send` would
                 // wake every `ring` subscriber for nothing.
                 ring_tx.send_if_modified(|current| {
@@ -6688,6 +6730,7 @@ async fn run(
             tls_connector: tls_connector.clone(),
             announce: Some((identity, args.port)),
             drain: drain_rx.clone(),
+            ip_in_flight_share: ip_in_flight_share(args.max_in_flight_bytes),
         },
         ring_tx,
         refresh_rx,
@@ -7704,6 +7747,29 @@ mod tests {
             request_cost(&touch(100), 100, 2, primaries),
             100 * 3 + 100 * MULTI_KEY_OVERHEAD_BYTES + primaries * MAX_MULTI_REPLY_VALUE_BYTES
         );
+    }
+
+    #[test]
+    fn a_ring_that_leaves_room_for_one_batched_read_per_ip_is_warned_about() {
+        let share = ip_in_flight_share(DEFAULT_MAX_IN_FLIGHT_BYTES);
+        // Two nodes: two 32 MiB reads fit in the 64 MiB share.
+        assert_eq!(batch_read_share_warning(2, share), None);
+        assert_eq!(batch_read_share_warning(0, share), None);
+        // Four nodes: one read takes the whole share.
+        let warning = batch_read_share_warning(4, share).expect("4 nodes");
+        assert!(warning.starts_with("WARN a batched read of 64 or more keys on 4 nodes"));
+        assert!(warning.contains("64 MiB of in-flight bytes"), "{warning}");
+        assert!(
+            warning.contains("--max-in-flight-bytes 536870912"),
+            "{warning}"
+        );
+        assert!(batch_read_share_warning(3, share).is_some());
+        // Raising the total until two fit silences it.
+        assert_eq!(
+            batch_read_share_warning(4, ip_in_flight_share(512 << 20)),
+            None
+        );
+        assert!(batch_read_share_warning(usize::MAX, share).is_none());
     }
 
     #[test]
@@ -9622,6 +9688,7 @@ mod tests {
                 tls_connector: None,
                 announce: announce.map(|identity| (identity, 0)),
                 drain: drain_rx.clone(),
+                ip_in_flight_share: ip_in_flight_share(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             ring_tx,
             refresh_rx,
@@ -9732,6 +9799,7 @@ mod tests {
                 tls_connector: None,
                 announce: None,
                 drain: drain_rx.clone(),
+                ip_in_flight_share: ip_in_flight_share(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             ring_tx,
             refresh_rx,

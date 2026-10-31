@@ -70,6 +70,18 @@ framework adapters at one version, whether or not a component changed.
   count. The proxy also gives a backend connection's read buffer back after
   a large reply (it kept about 14 MiB per connection after one 16 MiB
   reply).
+- `nanocached-proxy`: on four or more nodes a batched read of 64 or more
+  keys is charged 64 MiB, the whole of a source IP's in-flight share (a
+  quarter of `--max-in-flight-bytes`), so reads from one address, or from
+  clients behind one NAT or load balancer, ran one at a time (16
+  connections reading 100 keys: about 3,400 requests a second against
+  about 12,900 with the budget raised to 4 GiB). The charge is a worst
+  case and stays; the behaviour is now documented in the usage text, the
+  README and the proxy deployment guide, with the setting that allows more
+  at once (`--max-in-flight-bytes` of four times the parallel reads wanted
+  times nodes × 16 MiB), and the proxy logs a warning at startup, once,
+  when the cluster is large enough for a source IP to fit only one such
+  read.
 - `nanocached-discovery`: an `M` retry to a ready node that was slow to
   answer kept going after the join it belonged to had been abandoned and its
   `X` sent. A retry that reached the node after that `X` (a no-op there,

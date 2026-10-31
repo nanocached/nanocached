@@ -650,6 +650,14 @@ loud `WARN` if that disagrees with its own configured value.
   budget (64 MiB by default), so a client that reads its replies slowly
   cannot starve everyone else; behind NAT or on Kubernetes, where
   clients share a source IP, that quarter is the whole fleet's ceiling.
+  That quarter also sets how many large batched reads one source IP runs
+  at once: on four or more nodes a read of 64 or more keys is charged
+  the whole 64 MiB, so reads from one address run one at a time (about
+  3,400 requests a second against about 12,900 with the flag raised to
+  4 GiB, 16 loopback connections, 100 keys, four nodes). Raise
+  `--max-in-flight-bytes` to four times the number of parallel reads
+  wanted times nodes × 16 MiB (and the proxy's memory with it); the
+  proxy warns at startup when the cluster is large enough for this.
   A client that pipelines past a budget is read more slowly until its
   replies have been written. A request that cannot get its bytes within
   60 seconds is not dispatched: it is answered `R` (`B` to a client that
