@@ -137,3 +137,32 @@ fn a_hostname_that_resolves_to_loopback_is_silent() {
 fn a_secret_silences_the_warning_on_all_interfaces() {
     assert_silent("0.0.0.0", Some("a-secret"));
 }
+
+/// A secret that is set but not valid UTF-8 used to count as unset, and the
+/// server started without authentication (silently, on a loopback bind).
+/// Each binary now refuses to start and says why.
+#[cfg(unix)]
+#[test]
+fn a_secret_that_is_not_utf8_stops_the_server_from_starting() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    for (name, binary, extra) in servers() {
+        let output = Command::new(binary)
+            .args(extra)
+            .args(["--host", "127.0.0.1", "--port", "0"])
+            .env("NANOCACHED_AUTH_SECRET", OsStr::from_bytes(&[0xff, 0xfe]))
+            .stdin(Stdio::null())
+            .output()
+            .expect("the binary runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{name} must not start: {stderr}");
+        assert!(
+            stderr.contains("NANOCACHED_AUTH_SECRET is set but is not valid UTF-8"),
+            "{name} must say why: {stderr}"
+        );
+        assert!(
+            !stderr.contains(WARNING),
+            "{name} must not warn about a missing secret: {stderr}"
+        );
+    }
+}

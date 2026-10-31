@@ -1017,12 +1017,10 @@ struct ConnectionConfig {
 /// Reads the shared auth secret from the environment rather than a CLI
 /// flag, since CLI arguments are visible to anyone who can list processes
 /// (e.g. `ps`) on the host. An unset or empty value means auth is not
-/// required.
-fn read_auth_secret() -> Option<Bytes> {
-    std::env::var(AUTH_SECRET_ENV_VAR)
-        .ok()
-        .filter(|secret| !secret.is_empty())
-        .map(Bytes::from)
+/// required; a value that is not valid UTF-8 is a startup error
+/// (`infra::read_env_secret`).
+fn read_auth_secret() -> Result<Option<Bytes>, String> {
+    infra::read_env_secret(AUTH_SECRET_ENV_VAR).map(|secret| secret.map(Bytes::from))
 }
 
 /// Per-source-IP cooldown state guarding new registry insertions via `P`
@@ -5125,6 +5123,13 @@ async fn main() -> ExitCode {
     }
 
     let address = format!("{}:{}", args.host, args.port);
+    let auth_secret = match read_auth_secret() {
+        Ok(secret) => secret,
+        Err(message) => {
+            eprintln!("discovery: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Err(err) = run(
         &address,
         args.liveness_timeout,
@@ -5134,7 +5139,7 @@ async fn main() -> ExitCode {
         // timeout. Not separately configurable.
         args.liveness_timeout,
         args.replication_factor,
-        read_auth_secret(),
+        auth_secret,
         tls_acceptor,
         tls_connector,
         args.metrics_port

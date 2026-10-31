@@ -153,7 +153,9 @@ same `NANOCACHED_AUTH_SECRET` value to authenticate its own heartbeats.
 
 Leaving `NANOCACHED_AUTH_SECRET` unset (or empty) disables authentication —
 matching Redis's own `requirepass`-unset default — and `A` becomes a no-op
-that always succeeds. This is a secondary layer of defense, not a substitute
+that always succeeds. A value that is set but is not valid UTF-8 is refused
+at startup (every SDK sends the secret as UTF-8, so no client could present
+it) rather than treated as unset. This is a secondary layer of defense, not a substitute
 for network isolation: without [TLS](#tls), the protocol has no transport
 encryption, so an attacker who can already observe the connection can read
 the secret and every key/value in cleartext. Bind to `127.0.0.1` or a
