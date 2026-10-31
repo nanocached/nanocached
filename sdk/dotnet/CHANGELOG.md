@@ -10,6 +10,17 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- A compressed value whose DEFLATE stream ends early (a truncated or corrupt
+  write) was returned as the prefix `DeflateStream` could inflate, with no
+  error. The SDK now turns on `System.IO.Compression.UseStrictValidation` for
+  the process when its assembly loads (unless the application set the switch
+  itself), so such a value fails the read with a `DecompressionException`, as
+  in the other SDKs. The switch is read once, on the first use of
+  `DeflateStream` in the process; an application that uses it before loading
+  the SDK sets the switch in its own runtime configuration instead.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release
