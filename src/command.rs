@@ -792,6 +792,21 @@ pub enum ParseError {
     /// A name/address field in `M` wasn't valid UTF-8.
     InvalidUtf8,
     Incomplete,
+    /// A fully buffered `m`/`o`/`y` frame whose per-key working memory the
+    /// caller has not charged yet (see `parse_resumable`'s `frame_charged`).
+    /// Like `Incomplete`, it leaves `input` untouched and keeps the
+    /// resumable progress, and it carries what the caller needs to charge
+    /// and to apply its request-size limit before the key vectors exist.
+    ChargeRequired {
+        /// The number of keys the frame's header declares (and has, as the
+        /// header was walked in full to learn the frame's length).
+        keys: usize,
+        /// Whether each key also has a value (`o`), so that a second
+        /// `Bytes` handle per key is built.
+        values: bool,
+        /// The frame's length in bytes, from the start of `input`.
+        frame_len: usize,
+    },
 }
 
 /// Parses one request from the front of `input`. On success, the consumed
@@ -800,7 +815,7 @@ pub enum ParseError {
 /// (no copy). On `Incomplete`, `input` is left untouched.
 #[cfg(test)]
 pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
-    parse_with_mode(input, false, &mut MigrateProgress::default()).map(|(command, _)| command)
+    parse_with_mode(input, false, &mut MigrateProgress::default(), true).map(|(command, _)| command)
 }
 
 /// Echoed response tags: `parse` for a connection whose `A ... T` negotiation
@@ -809,7 +824,7 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
 /// that never carry one (`A`, `M`, `X`) return `None`.
 #[cfg(test)]
 pub fn parse_tagged(input: &mut BytesMut) -> Result<(Command, Option<u32>), ParseError> {
-    parse_with_mode(input, true, &mut MigrateProgress::default())
+    parse_with_mode(input, true, &mut MigrateProgress::default(), true)
 }
 
 /// `parse`/`parse_tagged` for a connection's read loop, which calls this
@@ -823,14 +838,28 @@ pub fn parse_tagged(input: &mut BytesMut) -> Result<(Command, Option<u32>), Pars
 /// hand in a fresh one) whenever `input`'s front changes for any reason
 /// other than bytes being appended — i.e. after every successfully
 /// parsed command.
+///
+/// `frame_charged` is the two-phase gate for the multi-key frames (`m`,
+/// `o`, `y`): they build a vector of key handles (two for `o`) that is
+/// about 32 bytes per key — 10 MB for a 1 MiB frame of one-byte keys —
+/// which the connection must have charged against the in-flight budget
+/// *before* it exists, since charging can wait. While `frame_charged` is
+/// false, such a frame that is fully buffered answers
+/// `ParseError::ChargeRequired` instead of being parsed (`input` untouched,
+/// `progress` kept); the caller charges what it names and parses again
+/// with `frame_charged` true. Every other command ignores the flag.
 pub fn parse_resumable(
     input: &mut BytesMut,
     tagged: bool,
     progress: &mut MigrateProgress,
+    frame_charged: bool,
 ) -> Result<(Command, Option<u32>), ParseError> {
-    let parsed = parse_with_mode(input, tagged, progress);
+    let parsed = parse_with_mode(input, tagged, progress, frame_charged);
 
-    if !matches!(parsed, Err(ParseError::Incomplete)) {
+    if !matches!(
+        parsed,
+        Err(ParseError::Incomplete | ParseError::ChargeRequired { .. })
+    ) {
         *progress = MigrateProgress::default();
     }
 
@@ -867,6 +896,10 @@ pub struct MigrateProgress {
     /// the buffer reaches this length the answer is `Incomplete` without
     /// looking at the header again.
     frame_end: Option<usize>,
+    /// The key count of the frame `frame_end` belongs to, so the charge a
+    /// buffered multi-key frame needs is known without walking its header
+    /// again.
+    frame_keys: usize,
 }
 
 /// Finds the top-level header line's terminating `\n`, resuming
@@ -899,6 +932,7 @@ fn parse_with_mode(
     input: &mut BytesMut,
     tagged: bool,
     progress: &mut MigrateProgress,
+    frame_charged: bool,
 ) -> Result<(Command, Option<u32>), ParseError> {
     let header_end = find_header_line_end(&input[..], progress).ok_or(ParseError::Incomplete)?;
     let header = &input[..header_end];
@@ -1054,8 +1088,8 @@ fn parse_with_mode(
         // — `key_lengths` only ever grows to as many fields as are
         // genuinely present in the (already length-bounded) header.
         b"m" => {
-            if progress.frame_end.is_some_and(|end| input.len() < end) {
-                return Err(ParseError::Incomplete);
+            if progress.frame_end.is_some() {
+                multi_frame_gate(input.len(), progress, frame_charged, false)?;
             }
             let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
             let count = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
@@ -1094,6 +1128,8 @@ fn parse_with_mode(
             }
 
             progress.frame_end = Some(cursor);
+            progress.frame_keys = count;
+            multi_frame_gate(input.len(), progress, frame_charged, false)?;
             let frame = take_frame(input, cursor)?;
             let namespace = frame.slice(namespace_start..namespace_start + namespace_length);
             let keys = key_spans
@@ -1109,8 +1145,8 @@ fn parse_with_mode(
         // with `t`'s `[ttl] [G]` tail, and the same "claimed `n` can't outrun
         // the header" defense.
         b"y" => {
-            if progress.frame_end.is_some_and(|end| input.len() < end) {
-                return Err(ParseError::Incomplete);
+            if progress.frame_end.is_some() {
+                multi_frame_gate(input.len(), progress, frame_charged, false)?;
             }
             let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
             let count = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
@@ -1159,6 +1195,8 @@ fn parse_with_mode(
             }
 
             progress.frame_end = Some(cursor);
+            progress.frame_keys = count;
+            multi_frame_gate(input.len(), progress, frame_charged, false)?;
             let frame = take_frame(input, cursor)?;
             let namespace = frame.slice(namespace_start..namespace_start + namespace_length);
             let keys = key_spans
@@ -1182,8 +1220,8 @@ fn parse_with_mode(
         // <key-n><value-n>` — see `Command::MultiSet`'s doc comment. Same
         // "claimed `n` can't outrun the header" defense as `m`'s loop.
         b"o" => {
-            if progress.frame_end.is_some_and(|end| input.len() < end) {
-                return Err(ParseError::Incomplete);
+            if progress.frame_end.is_some() {
+                multi_frame_gate(input.len(), progress, frame_charged, true)?;
             }
             let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
             let count = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
@@ -1221,6 +1259,8 @@ fn parse_with_mode(
             }
 
             progress.frame_end = Some(cursor);
+            progress.frame_keys = count;
+            multi_frame_gate(input.len(), progress, frame_charged, true)?;
             let frame = take_frame(input, cursor)?;
             let namespace = frame.slice(namespace_start..namespace_start + namespace_length);
             let mut keys = Vec::with_capacity(spans.len());
@@ -1827,6 +1867,7 @@ fn parse_migrate(
         line_end: Some(header_end),
         line_scanned_to: progress.line_scanned_to,
         frame_end: None,
+        frame_keys: 0,
     };
 
     let scanned = scan_joined_entries(input, cursor, joined_count, &mut entry_spans);
@@ -1930,6 +1971,34 @@ fn field_ends<const N: usize>(start: usize, lengths: [usize; N]) -> Result<[usiz
         *end = cursor;
     }
     Ok(ends)
+}
+
+/// The answer for a multi-key frame whose end `progress` knows: still
+/// `Incomplete` while it is not all buffered, and — once it is — the
+/// request to charge it (`ChargeRequired`) unless the caller already has.
+fn multi_frame_gate(
+    buffered: usize,
+    progress: &MigrateProgress,
+    frame_charged: bool,
+    values: bool,
+) -> Result<(), ParseError> {
+    let Some(frame_len) = progress.frame_end else {
+        return Ok(());
+    };
+
+    if buffered < frame_len {
+        return Err(ParseError::Incomplete);
+    }
+
+    if frame_charged {
+        return Ok(());
+    }
+
+    Err(ParseError::ChargeRequired {
+        keys: progress.frame_keys,
+        values,
+        frame_len,
+    })
 }
 
 /// Splits the frame ending at `end` off the front of `input`, or returns
@@ -2985,7 +3054,7 @@ mod tests {
         for (index, byte) in frame.iter().enumerate() {
             input.extend_from_slice(&[*byte]);
 
-            match parse_resumable(&mut input, false, &mut progress) {
+            match parse_resumable(&mut input, false, &mut progress, true) {
                 Err(ParseError::Incomplete) => {
                     // Never regresses: the recorded spans only grow.
                     assert!(
@@ -3027,7 +3096,7 @@ mod tests {
             b"M 6 14 5 2 2 5\ntok-bnode-b127.0.0.1:8357tok-j6 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358",
         );
 
-        let (command, _) = parse_resumable(&mut input, false, &mut progress).unwrap();
+        let (command, _) = parse_resumable(&mut input, false, &mut progress, true).unwrap();
 
         assert!(matches!(command, Command::Migrate { joined, .. } if joined.len() == 2));
     }
@@ -3049,7 +3118,7 @@ mod tests {
 
         for (index, byte) in frame.iter().enumerate() {
             input.extend_from_slice(&[*byte]);
-            match parse_resumable(&mut input, true, &mut progress) {
+            match parse_resumable(&mut input, true, &mut progress, true) {
                 Err(ParseError::Incomplete) => {}
                 Ok(result) => {
                     parsed = Some(result);
@@ -3077,7 +3146,7 @@ mod tests {
             let mut parsed = None;
             for byte in frame {
                 input.extend_from_slice(&[*byte]);
-                match parse_resumable(&mut input, false, &mut progress) {
+                match parse_resumable(&mut input, false, &mut progress, true) {
                     Err(ParseError::Incomplete) => {}
                     Ok((command, _)) => {
                         parsed = Some(command);
@@ -3094,6 +3163,81 @@ mod tests {
         }
     }
 
+    // The two-phase gate of the multi-key frames: a fully buffered one is
+    // not parsed until the caller says it has charged the frame, so the key
+    // vectors do not exist while the caller waits for the budget. The
+    // frame stays untouched in `input`, the answer names what to charge,
+    // and parsing again with the charge in place gives exactly what the
+    // ungated parse gives.
+    #[test]
+    fn parse_resumable_asks_for_the_charge_of_a_buffered_multi_key_frame_first() {
+        for (frame, keys, values) in [
+            (&b"m 2 3 1 1 1\nnsabc"[..], 3, false),
+            (&b"y 2 3 1 1 1 G\nnsabc"[..], 3, false),
+            (&b"o 2 2 1 2 1 3 60\nnsaXvvbYvvv"[..], 2, true),
+        ] {
+            let mut expected_input = BytesMut::from(frame);
+            let expected = parse(&mut expected_input).unwrap();
+            let frame_len = frame.len() - expected_input.len();
+
+            let mut input = BytesMut::from(frame);
+            let mut progress = MigrateProgress::default();
+            assert_eq!(
+                parse_resumable(&mut input, false, &mut progress, false),
+                Err(ParseError::ChargeRequired {
+                    keys,
+                    values,
+                    frame_len,
+                })
+            );
+            assert_eq!(&input[..], frame, "the frame must stay in the buffer");
+            // Asking again answers the same, and does not look at the
+            // header again.
+            input[2] = b'x';
+            assert!(matches!(
+                parse_resumable(&mut input, false, &mut progress, false),
+                Err(ParseError::ChargeRequired { .. })
+            ));
+            input[2] = frame[2];
+
+            assert_eq!(
+                parse_resumable(&mut input, false, &mut progress, true).map(|(c, _)| c),
+                Ok(expected)
+            );
+            assert_eq!(input.len(), frame.len() - frame_len);
+            assert_eq!(progress.frame_end, None);
+        }
+    }
+
+    #[test]
+    fn parse_resumable_asks_for_the_charge_only_once_the_whole_multi_key_frame_is_buffered() {
+        let frame = &b"m 2 3 1 1 1\nnsabc"[..];
+        let mut input = BytesMut::new();
+        let mut progress = MigrateProgress::default();
+
+        for (index, byte) in frame.iter().enumerate() {
+            input.extend_from_slice(&[*byte]);
+            let parsed = parse_resumable(&mut input, false, &mut progress, false);
+            if index + 1 < frame.len() {
+                assert_eq!(parsed, Err(ParseError::Incomplete), "at byte {index}");
+            } else {
+                assert!(matches!(parsed, Err(ParseError::ChargeRequired { .. })));
+            }
+        }
+    }
+
+    // A lying key count never reaches the gate: the header has to carry
+    // that many lengths, so the charge it asks for is for keys that exist.
+    #[test]
+    fn parse_resumable_does_not_ask_for_a_charge_for_a_header_that_lies_about_its_key_count() {
+        let mut input = BytesMut::from(&b"m 0 4000000000 1 1\nab"[..]);
+        let mut progress = MigrateProgress::default();
+        assert_eq!(
+            parse_resumable(&mut input, false, &mut progress, false),
+            Err(ParseError::InvalidLength)
+        );
+    }
+
     // The header of an `m`/`o` frame is O(keys) tokens; once it has been
     // validated and the frame length is known, a body trickling in must
     // not trigger another walk of it. White-box: with the frame end
@@ -3107,7 +3251,7 @@ mod tests {
             input.extend_from_slice(b"ns");
             let mut progress = MigrateProgress::default();
             assert_eq!(
-                parse_resumable(&mut input, false, &mut progress),
+                parse_resumable(&mut input, false, &mut progress, true),
                 Err(ParseError::Incomplete)
             );
             assert!(progress.frame_end.is_some_and(|end| end > input.len()));
@@ -3115,7 +3259,7 @@ mod tests {
             // The namespace-length field: `x` is not a length.
             input[2] = b'x';
             assert_eq!(
-                parse_resumable(&mut input, false, &mut progress),
+                parse_resumable(&mut input, false, &mut progress, true),
                 Err(ParseError::Incomplete)
             );
         }
@@ -3141,7 +3285,7 @@ mod tests {
 
         for (index, byte) in frame.iter().enumerate() {
             input.extend_from_slice(&[*byte]);
-            match parse_resumable(&mut input, true, &mut progress) {
+            match parse_resumable(&mut input, true, &mut progress, true) {
                 Err(ParseError::Incomplete) => {
                     assert_eq!(
                         lf_scan_bytes(),

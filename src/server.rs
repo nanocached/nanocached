@@ -171,28 +171,43 @@ fn reply_bytes(response: &Response) -> usize {
 
 /// What a multi-key frame (`m`, `o`, `y`) is charged against the in-flight
 /// budget for each key, on top of its receive buffer and its reply. The
-/// arms build several per-key vectors before the cache sees the frame —
-/// the key list, the hashes, the owned and forwarded splits, the result
-/// vector and the reply entries — about 100 bytes per key, and a frame of
-/// one-byte keys carries about 350,000 keys in its 1 MiB, so tens of
-/// megabytes of working memory that the buffer's own charge (about 1 MiB)
-/// does not account for. 128 bytes covers that with some room.
-const MULTI_KEY_FRAME_BYTES_PER_KEY: usize = 128;
+/// parser builds the key list (a `Bytes` handle, 32 bytes, per key) and the
+/// arm then builds the hashes, the owned and forwarded splits, the result
+/// vector and the reply entries. A frame of one-byte keys carries about
+/// 350,000 keys in its 1 MiB, so that is tens of megabytes of working
+/// memory that the buffer's own charge (about 1 MiB) does not account for.
+/// Measured on the release build, a single frame costs 185 bytes per key
+/// (`m`, `y`) to 194 (`o`) of resident memory at its peak; 256 covers that
+/// with room for the allocator.
+const MULTI_KEY_FRAME_BYTES_PER_KEY: usize = 256;
+
+/// What an `o` frame adds to `MULTI_KEY_FRAME_BYTES_PER_KEY` for each key:
+/// the second vector of handles, one per value.
+const MULTI_SET_VALUE_BYTES_PER_KEY: usize = 32;
 
 /// Charges a multi-key frame's per-key working memory against the
-/// in-flight budget before the arm builds its per-key vectors; the caller
-/// holds the permit until the reply is written. A frame costing more than
-/// the whole budget takes all of it and runs alone — the connection's own
-/// receive-buffer charge is part of what it already holds, so it asks only
-/// for the rest and does not wait for itself. Waits at most
+/// in-flight budget; the caller holds the permit until the reply is
+/// written. It is called before the parser builds the frame's key vectors
+/// (`parse_resumable`'s `ParseError::ChargeRequired`), so a connection
+/// waiting here holds no uncharged per-key memory. A frame costing more
+/// than the whole budget takes all of it and runs alone — the connection's
+/// own receive-buffer charge is part of what it already holds, so it asks
+/// only for the rest and does not wait for itself. Waits at most
 /// `WRITE_TIMEOUT`, like a reply, and fails the connection if the budget
 /// does not free in that time.
 async fn charge_multi_key_frame(
     config: &ConnectionConfig,
     receive_charged: usize,
     keys: usize,
+    values: bool,
 ) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
-    let cost = keys.saturating_mul(MULTI_KEY_FRAME_BYTES_PER_KEY);
+    let per_key = MULTI_KEY_FRAME_BYTES_PER_KEY
+        + if values {
+            MULTI_SET_VALUE_BYTES_PER_KEY
+        } else {
+            0
+        };
+    let cost = keys.saturating_mul(per_key);
     let cost = config
         .in_flight_bytes
         .clamp(cost.saturating_add(receive_charged))
@@ -2514,7 +2529,32 @@ async fn handle_connection(
         }
 
         let buffered_before = received.len();
-        let parsed = parse_resumable(&mut received, tagged, &mut parse_progress);
+        let mut parsed = parse_resumable(&mut received, tagged, &mut parse_progress, false);
+        // A multi-key frame (`m`, `o`, `y`) is charged for its per-key
+        // working memory before the parser builds its key vectors, not
+        // after: a connection waiting for the budget would otherwise hold
+        // those vectors (about 32 bytes per key) uncharged for as long as
+        // it waits. The parse stopped short of building them; charge, then
+        // parse again. The size limit comes first, so that a frame that is
+        // refused does not wait for the budget either.
+        let mut frame_charge = None;
+        if let Err(ParseError::ChargeRequired {
+            keys,
+            values,
+            frame_len,
+        }) = parsed
+        {
+            if request_is_too_large(frame_len) {
+                return Err(reject_oversized_request(
+                    &mut stream,
+                    "request is too large".to_string(),
+                )
+                .await);
+            }
+            frame_charge =
+                Some(charge_multi_key_frame(&config, receive_charged, keys, values).await?);
+            parsed = parse_resumable(&mut received, tagged, &mut parse_progress, true);
+        }
 
         if parsed.is_ok() {
             // `MAX_REQUEST_SIZE` is a bound on one frame, so it is checked
@@ -2844,8 +2884,7 @@ async fn handle_connection(
             // order before replying — the client never sees the owned/
             // not-owned split.
             Ok((Command::MultiGet { namespace, keys }, tag)) => {
-                let _frame_charge =
-                    charge_multi_key_frame(&config, receive_charged, keys.len()).await?;
+                let _frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -2912,8 +2951,7 @@ async fn handle_connection(
                 },
                 tag,
             )) => {
-                let _frame_charge =
-                    charge_multi_key_frame(&config, receive_charged, keys.len()).await?;
+                let _frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiAckEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -3492,8 +3530,7 @@ async fn handle_connection(
                 },
                 tag,
             )) => {
-                let _frame_charge =
-                    charge_multi_key_frame(&config, receive_charged, keys.len()).await?;
+                let _frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -11063,9 +11100,9 @@ mod tests {
     async fn multi_key_frames_are_charged_per_key_until_they_are_answered() {
         // The cache is a stand-in that answers when the test says so, so
         // the frame is "in flight" for as long as the test wants. With a
-        // 1 MiB budget, one 6,000-key frame holds 6,000 x the per-key
+        // 1 MiB budget, one 3,000-key frame holds 3,000 x the per-key
         // charge and a second one cannot start until the first is answered.
-        const KEYS: usize = 6_000;
+        const KEYS: usize = 3_000;
         const CHARGE: usize = KEYS * MULTI_KEY_FRAME_BYTES_PER_KEY;
         let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(8);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -11117,7 +11154,7 @@ mod tests {
             .await
             .expect("the first frame is answered")
             .unwrap();
-        assert_eq!(&header, b"M 6000 ");
+        assert_eq!(&header, b"M 3000 ");
         let second_request = timeout(Duration::from_secs(5), request_rx.recv())
             .await
             .expect("the second frame proceeds once the first is answered")
@@ -11131,7 +11168,7 @@ mod tests {
             .await
             .expect("the second frame is answered")
             .unwrap();
-        assert_eq!(&header, b"M 6000 ");
+        assert_eq!(&header, b"M 3000 ");
 
         drop(first);
         drop(second);
@@ -11140,9 +11177,159 @@ mod tests {
         assert_eq!(budget.available(), MAX_REQUEST_SIZE);
     }
 
+    /// Bytes allocated minus bytes freed by the current thread, so that a
+    /// test can see what a task on its (single-threaded) runtime holds.
+    struct ThreadLiveBytes;
+
+    thread_local! {
+        static LIVE_BYTES: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn live_bytes() -> isize {
+        LIVE_BYTES.with(|live| live.get())
+    }
+
+    fn add_live_bytes(delta: isize) {
+        let _ = LIVE_BYTES.try_with(|live| live.set(live.get() + delta));
+    }
+
+    // SAFETY: every method forwards to the system allocator unchanged and
+    // only adds to a thread-local counter that never allocates.
+    unsafe impl std::alloc::GlobalAlloc for ThreadLiveBytes {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let pointer = unsafe { std::alloc::System.alloc(layout) };
+            if !pointer.is_null() {
+                add_live_bytes(layout.size() as isize);
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+            add_live_bytes(-(layout.size() as isize));
+            unsafe { std::alloc::System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let pointer = unsafe { std::alloc::System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                add_live_bytes(layout.size() as isize);
+            }
+            pointer
+        }
+
+        unsafe fn realloc(
+            &self,
+            pointer: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            let moved = unsafe { std::alloc::System.realloc(pointer, layout, new_size) };
+            if !moved.is_null() {
+                add_live_bytes(new_size as isize - layout.size() as isize);
+            }
+            moved
+        }
+    }
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: ThreadLiveBytes = ThreadLiveBytes;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_waiting_for_the_budget_has_not_built_its_key_vector() {
+        // 200,000 one-byte keys cost 51 MB of budget; a 64 MiB budget with
+        // 60 MiB held elsewhere cannot give that, so the connection waits
+        // for it. While it waits it must hold the 600 KB frame in its
+        // receive buffer and nothing per key: the key vector alone is 6.4 MB
+        // of `Bytes` handles, which used to be built before the wait, so
+        // before the frame was charged for.
+        const KEYS: usize = 200_000;
+        let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let budget = InFlightBudget::new(64 << 20);
+        let held = budget.charge(60 << 20).await;
+        let frame = multi_get_frame(KEYS);
+
+        let (mut client, server) = tcp_pair().await;
+        let live_before = live_bytes();
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        client.write_all(&frame).await.unwrap();
+        sleep(Duration::from_millis(500)).await;
+
+        assert!(
+            request_rx.try_recv().is_err(),
+            "the frame must be waiting for the budget"
+        );
+        let held_by_the_connection = live_bytes() - live_before;
+        assert!(
+            held_by_the_connection < 3 << 20,
+            "a connection waiting for the budget holds {held_by_the_connection} bytes; \
+             the 600 KB frame is about 1 MB with its buffer growth, the 200,000 \
+             key handles would add 6.4 MB"
+        );
+
+        // Releasing the budget lets the frame through.
+        drop(held);
+        let request = timeout(Duration::from_secs(5), request_rx.recv())
+            .await
+            .expect("the frame proceeds once the budget is free")
+            .unwrap();
+        request
+            .response_tx
+            .send(Response::Multi(vec![MultiEntry::Miss; KEYS]))
+            .ok()
+            .unwrap();
+        let mut header = [0u8; 9];
+        timeout(Duration::from_secs(5), client.read_exact(&mut header))
+            .await
+            .expect("the frame is answered")
+            .unwrap();
+        assert_eq!(&header, b"M 200000 ");
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), connection_task).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversized_multi_key_frame_is_refused_without_waiting_for_the_budget() {
+        // 400,000 keys are a 1.2 MB frame, above the request limit: it is
+        // refused as too large at once, not charged (which would wait for
+        // the budget, held elsewhere here, for WRITE_TIMEOUT).
+        const KEYS: usize = 400_000;
+        let (request_tx, _request_rx) = mpsc::channel::<CacheRequest>(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let budget = InFlightBudget::new(64 << 20);
+        let _held = budget.charge(60 << 20).await;
+
+        let (mut client, server) = tcp_pair().await;
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        let frame = multi_get_frame(KEYS);
+        let _ = client.write_all(&frame).await;
+        let error = timeout(Duration::from_secs(5), connection_task)
+            .await
+            .expect("the oversized frame is refused, not left waiting for the budget")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("too large"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_multi_key_frame_costing_more_than_the_budget_still_runs_alone() {
-        // 100,000 keys cost 12.8 MB against a 1 MiB budget, and the
+        // 100,000 keys cost 25.6 MB against a 1 MiB budget, and the
         // 300 KB frame is already holding part of that budget as its
         // receive buffer: the frame takes what is left, does not wait for
         // itself, and is answered.
@@ -11183,13 +11370,15 @@ mod tests {
         // The charge is the key count times the per-key figure, less
         // nothing; a connection already holding receive-buffer bytes asks
         // only for the rest of the budget when the frame costs more.
-        let small = charge_multi_key_frame(&config, 0, 100).await.unwrap();
+        let small = charge_multi_key_frame(&config, 0, 100, false)
+            .await
+            .unwrap();
         assert_eq!(
             budget.available(),
             MAX_REQUEST_SIZE - 100 * MULTI_KEY_FRAME_BYTES_PER_KEY
         );
         drop(small);
-        let all_the_rest = charge_multi_key_frame(&config, 300_000, 1_000_000)
+        let all_the_rest = charge_multi_key_frame(&config, 300_000, 1_000_000, false)
             .await
             .unwrap();
         assert_eq!(budget.available(), 300_000);
@@ -11199,7 +11388,9 @@ mod tests {
         // WRITE_TIMEOUT with the budget error and holds nothing.
         let held = budget.charge(MAX_REQUEST_SIZE).await;
         let started = tokio::time::Instant::now();
-        let error = charge_multi_key_frame(&config, 0, 10).await.unwrap_err();
+        let error = charge_multi_key_frame(&config, 0, 10, false)
+            .await
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(
             error.to_string().contains("in-flight byte budget"),
