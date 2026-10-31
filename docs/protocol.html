@@ -43,9 +43,10 @@ covers.</p>
 <p>Multiple requests per connection and pipelining are both supported. A
 <code>&lt;key-length&gt;</code> of <code>0</code> is rejected for every
 command; there is no dedicated key or value length limit beyond the
-overall request-size limit (1 MiB per request on a node). A request over
-it, like one the server cannot parse, is answered <code>En\n</code> and
-the connection closed.</p>
+overall request-size limit (1 MiB per request on a node, counted per
+frame: what is pipelined behind a frame does not count towards it). A
+request over it, like one the server cannot parse, is answered
+<code>En\n</code> and the connection closed.</p>
 
 <h2 id="a">A — authenticate</h2>
 <pre><code>A &lt;secret-length&gt;\n&lt;secret&gt;</code></pre>
