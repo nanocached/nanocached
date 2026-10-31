@@ -374,6 +374,17 @@ const ANNOUNCE_INSERT_COOLDOWN: Duration = Duration::from_secs(2);
 /// addresses in one cluster's network.
 const MAX_ANNOUNCE_LIMITER_ENTRIES: usize = 4096;
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
+/// Smallest `--liveness-timeout` accepted, in seconds. A node heartbeats
+/// every 5 s, so a window at or below that evicts live members between two
+/// heartbeats and the membership flaps for good; `0` also made the sweep
+/// tick every millisecond, evict every node on its first tick and set the
+/// startup grace to nothing.
+const MIN_LIVENESS_TIMEOUT_SECS: u64 = 6;
+/// Largest `--liveness-timeout` accepted, in seconds (7 days, the node's
+/// own `--drain-timeout` cap). The value is added to `Instant::now()` for
+/// the startup grace and the sweep deadlines, and an unbounded `u64` there
+/// panics on overflow instead of failing as a usage error.
+const MAX_LIVENESS_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
 /// Staged node join pattern-3 guard: a ready node can be alive (heartbeating
 /// normally) yet never report `C` for a handoff it's mid-`Migrate` for —
 /// no TCP-level signal distinguishes "legitimately still working" from
@@ -1157,6 +1168,7 @@ impl Default for Args {
 /// exit code 0) from an actual parsing error (printed to stderr with exit
 /// code 1) — both previously took the same `Err` path, so `--help` looked
 /// like a failure to shell scripts and CLI conventions alike.
+#[derive(Debug)]
 enum ArgsError {
     Help(String),
     Invalid(String),
@@ -1169,8 +1181,12 @@ impl From<String> for ArgsError {
 }
 
 fn parse_args() -> Result<Args, ArgsError> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, ArgsError> {
     let mut args = Args::default();
-    let mut raw = std::env::args().skip(1);
+    let mut raw = raw;
 
     while let Some(flag) = raw.next() {
         let mut value = || raw.next().ok_or_else(|| format!("{flag} requires a value"));
@@ -1188,6 +1204,13 @@ fn parse_args() -> Result<Args, ArgsError> {
                 let secs: u64 = raw_secs
                     .parse()
                     .map_err(|_| format!("invalid value for --liveness-timeout: {raw_secs}"))?;
+                if !(MIN_LIVENESS_TIMEOUT_SECS..=MAX_LIVENESS_TIMEOUT_SECS).contains(&secs) {
+                    return Err(ArgsError::Invalid(format!(
+                        "--liveness-timeout must be between {MIN_LIVENESS_TIMEOUT_SECS} and \
+                         {MAX_LIVENESS_TIMEOUT_SECS} seconds (a node heartbeats every 5 s; \
+                         {secs} would evict live nodes between heartbeats or overflow the clock)"
+                    )));
+                }
                 args.liveness_timeout = Duration::from_secs(secs);
             }
             "--replication-factor" => {
@@ -1236,7 +1259,8 @@ Usage: nanocached-discovery [options]
   --host <addr>                 bind address (default 127.0.0.1)
   --port <port>                 bind port (default 8357)
   --liveness-timeout <secs>     drop a node after this many seconds without
-                                 a heartbeat (default 15)
+                                 a heartbeat (default 15; at least 6, at most
+                                 604800)
   --replication-factor <n>      how many nodes hold each key (client-side replication);
                                  distributed to clients via L and to nodes
                                  via M (default 2, min 1)
@@ -11771,5 +11795,35 @@ mod tests {
 
         shutdown_tx.send_replace(true);
         sweep_task.await.unwrap();
+    }
+
+    #[test]
+    fn liveness_timeout_is_bounded_below_and_above() {
+        let parse = |secs: &str| {
+            parse_args_from(["--liveness-timeout".to_string(), secs.to_string()].into_iter())
+        };
+        for rejected in ["0", "5", "604801", "18446744073709551615"] {
+            match parse(rejected) {
+                Err(ArgsError::Invalid(message)) => assert!(
+                    message.starts_with("--liveness-timeout must be between 6 and 604800 seconds"),
+                    "{rejected}: {message}"
+                ),
+                Ok(_) => panic!("{rejected} must be refused"),
+                Err(ArgsError::Help(_)) => {
+                    panic!("{rejected} must be refused, not answered with help")
+                }
+            }
+        }
+        assert_eq!(parse("6").unwrap().liveness_timeout, Duration::from_secs(6));
+        assert_eq!(
+            parse("604800").unwrap().liveness_timeout,
+            Duration::from_secs(604_800)
+        );
+        assert_eq!(
+            parse_args_from(std::iter::empty())
+                .unwrap()
+                .liveness_timeout,
+            DEFAULT_LIVENESS_TIMEOUT
+        );
     }
 }

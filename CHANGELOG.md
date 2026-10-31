@@ -38,6 +38,12 @@ framework adapters at one version, whether or not a component changed.
   count. The proxy also gives a backend connection's read buffer back after
   a large reply (it kept about 14 MiB per connection after one 16 MiB
   reply).
+- `nanocached-discovery`: `--liveness-timeout` took any number. `0` made the
+  sweep run every millisecond, evict every node on its first tick and gave a
+  restarted server no startup grace; a value at or below the 5 s heartbeat
+  interval evicted live nodes between two heartbeats; a very large value
+  overflowed the clock arithmetic and crashed. The flag now accepts 6 to
+  604800 seconds (7 days) and refuses anything else as a usage error.
 - `nanocached-node`: a remaining TTL under one second went on the wire as
   `0`: in an INCR reply, in a get-and-touch reply and in a forward or handoff
   of the entry. An SDK replicating an INCR reply read `0` as "no expiry"
