@@ -20,6 +20,12 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
   in the other SDKs. The switch is read once, on the first use of
   `DeflateStream` in the process; an application that uses it before loading
   the SDK sets the switch in its own runtime configuration instead.
+- The per-address reconnect cooldown and the node-list staleness check were
+  measured on the wall clock (`DateTime.UtcNow`). A backward step of that
+  clock (an NTP correction, a VM restore) suppressed non-forced node-list
+  refreshes and kept an armed cooldown failing fast for the size of the step.
+  Both now use the monotonic `Stopwatch` clock, as the Python and Java SDKs
+  use theirs.
 
 ## [0.5.1] - 2026-10-27
 
