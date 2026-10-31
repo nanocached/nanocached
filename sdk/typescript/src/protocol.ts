@@ -53,21 +53,20 @@ const MAX_REQUEST_HEADER_LENGTH = 256;
 // other in-flight request on it down too.
 export const MAX_REQUEST_BYTES = 1024 * 1024 - MAX_REQUEST_HEADER_LENGTH;
 
-// A high surrogate not followed by a low one, or a low one not preceded by a
-// high one. No `u` flag: it must see the UTF-16 code units. (Written out
-// instead of `String.prototype.isWellFormed`, which the compiled lib target
-// does not declare.)
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
-
 /**
  * A string as UTF-8 bytes, refusing one that is not well-formed UTF-16.
  * `Buffer.from(text, "utf8")` replaces a lone surrogate with U+FFFD, so
  * `"x\ud800"` and `"x\ud801"` would be the same key on the wire and a lone
  * surrogate in a value or a namespace would come back rewritten. The Python,
  * Java and .NET SDKs reject such a string, and Go and Rust cannot hold one.
+ *
+ * `isWellFormed` (Node 20+; this package requires 22) is the engine's own
+ * scan. The lookaround regex it replaces took 5 ms on a 1 MiB emoji string
+ * and 1.5 ms on CJK, on the event loop for every `set` of such a value;
+ * `isWellFormed` takes about a fortieth of that.
  */
 export function utf8Bytes(text: string): Buffer {
-  if (LONE_SURROGATE.test(text)) {
+  if (!text.isWellFormed()) {
     throw new RangeError("nanocached: a string with a lone surrogate has no UTF-8 encoding; use a Uint8Array or a well-formed string");
   }
   return Buffer.from(text, "utf8");

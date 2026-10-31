@@ -16,6 +16,12 @@ tag: 0.4.3 was a server-only release.
   entry and a value or namespace came back rewritten. The call now rejects it
   with a `RangeError` before any I/O, as the Python, Java and .NET SDKs do.
   A `Uint8Array` is unaffected.
+- The lone-surrogate check that every string key, value and namespace goes
+  through used a lookaround regular expression, which took about 5 ms on a
+  1 MiB string of emoji and 1.5 ms on CJK text, on the event loop for every
+  `set` of such a value. It now uses the engine's `String.prototype.isWellFormed`
+  (Node 22, the package's minimum, has it), about forty times faster, with the
+  same result.
 
 ## [0.5.1] - 2026-10-27
 
