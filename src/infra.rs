@@ -18,6 +18,7 @@
 use bytes::{Buf, BytesMut};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::io;
 use std::io::BufReader;
@@ -32,6 +33,60 @@ use tokio::io::{
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+// ─── TCP keepalive ─────────────────────────────────────────────────────
+
+/// Idle time before the kernel sends the first keepalive probe on a
+/// connection that [`enable_tcp_keepalive`] was applied to.
+pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+
+/// Gap between unanswered keepalive probes.
+pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Unanswered probes after which the kernel gives up and fails the
+/// connection. Together the three constants detect a peer that vanished
+/// without a FIN or RST (power loss, hypervisor failure, a partition)
+/// after about `10 s + 3 * 5 s = 25 s` on Linux. That is the same order as
+/// the 5 s heartbeat and 15 s liveness window: slow enough that a
+/// momentary stall does not drop a healthy peer (a probe is answered by
+/// the peer's kernel, not its application), fast enough to be far below
+/// the minutes a default Linux keepalive (2 h idle) or a migration timeout
+/// (60 s and up) would take.
+///
+/// Not every platform can set the probe count (see `socket2`'s
+/// `TcpKeepalive::with_retries`); there the OS default count applies, with
+/// the idle time and interval above.
+pub const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Turns on TCP keepalive for an accepted or dialed connection, using the
+/// constants above, so a read pending on a peer whose host died silently
+/// eventually fails instead of waiting forever. Best effort: the error is
+/// returned for the caller to log or ignore.
+pub fn enable_tcp_keepalive(stream: &TcpStream) -> io::Result<()> {
+    #[allow(unused_mut)]
+    let mut keepalive = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "visionos",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "cygwin",
+    ))]
+    {
+        keepalive = keepalive.with_retries(TCP_KEEPALIVE_RETRIES);
+    }
+    SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
 
 // ─── TLS-or-plaintext streams ──────────────────────────────────────────
 

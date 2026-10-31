@@ -557,7 +557,11 @@ window is the same one the pre-tags protocol always had.</p>
     may have reached it — because a re-send could apply the command
     twice: that case is the fatal <code>E</code>, and the client reads
     the key to learn what happened. A <code>t</code> is idempotent, so a
-    proxy that cannot reach its node answers it <code>R</code>. Tagged connections receive
+    proxy that cannot reach its node answers it <code>R</code>. A proxy
+    also answers <code>R</code> to a request it could not admit within
+    60 seconds because the in-flight byte budgets (per connection, per
+    source IP and proxy-wide) stayed full; the request was not
+    dispatched, so any command is safe to retry. Tagged connections receive
     <code>R &lt;tag&gt;\n</code>. Today the proxy is the only emitter —
     nodes and discovery accept the capability token but have no
     transient per-request failure to report.</td></tr>

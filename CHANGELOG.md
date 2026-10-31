@@ -14,6 +14,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a request waited for the in-flight byte budget with no
+  time limit, and `IDLE_TIMEOUT` did not cover that wait. A client that read
+  1 MiB replies at about 20 KB/s is never evicted, so five such connections
+  pipelining reads held the whole 256 MiB proxy-wide budget and every other
+  client's requests waited behind them for as long as they kept dribbling.
+  A request that cannot get its bytes within 60 seconds is now answered `R`
+  (`B` to a client without the retryable-error capability) and the
+  connection goes on, and one source IP may hold at most a quarter of the
+  proxy-wide budget (64 MiB by default), so one slow consumer cannot starve
+  the rest. Clients behind one NAT or egress IP share that quarter.
 - `nanocached-node`: a remaining TTL under one second went on the wire as
   `0`: in an INCR reply, in a get-and-touch reply and in a forward or handoff
   of the entry. An SDK replicating an INCR reply read `0` as "no expiry"
@@ -22,6 +32,17 @@ framework adapters at one version, whether or not a component changed.
   carrying `0` was applied as a delete with a tombstone. Remaining TTLs are
   now rounded up to whole seconds; a TTL of exactly `0` (an expiring touch)
   is unchanged.
+- `nanocached-node`: the request-size limit was checked against the whole
+  receive buffer after each read instead of against one frame. The buffer
+  grows by doubling, so once it was past 1 MiB a single read could bring the
+  tail of a valid large frame together with the frames pipelined behind it,
+  and the node refused the lot as one request over the limit (`En`, connection
+  closed) although no frame was over it. Through the proxy, which writes every
+  client's frames back to back on a shared backend connection, a value of
+  about 650 KiB or more set by one client could trigger it; the proxy then
+  dropped that connection and failed the other clients' requests in flight on
+  it. The limit is now applied to the frame itself: to the frame just parsed,
+  or to the one still arriving.
 - `nanocached-proxy`: a request frame of exactly 1 MiB, or up to ten bytes
   under it, passed the proxy but was refused by the node once the proxy
   added its own tag to the header; the proxy could not match the node's
@@ -40,17 +61,15 @@ framework adapters at one version, whether or not a component changed.
   skipped by re-replication, and removed by a sweep when another owner
   exists. The list now keeps those marks, on completion and when the
   transfer is cancelled or fails.
-- `nanocached-node`: the request-size limit was checked against the whole
-  receive buffer after each read instead of against one frame. The buffer
-  grows by doubling, so once it was past 1 MiB a single read could bring the
-  tail of a valid large frame together with the frames pipelined behind it,
-  and the node refused the lot as one request over the limit (`En`, connection
-  closed) although no frame was over it. Through the proxy, which writes every
-  client's frames back to back on a shared backend connection, a value of
-  about 650 KiB or more set by one client could trigger it; the proxy then
-  dropped that connection and failed the other clients' requests in flight on
-  it. The limit is now applied to the frame itself: to the frame just parsed,
-  or to the one still arriving.
+- `nanocached-discovery`: a joiner whose host died without closing its
+  connection (power loss, hypervisor failure, a partition) stayed registered,
+  because nothing set TCP keepalive on the connection that is a joiner's
+  liveness. If it was the oldest waiting joiner its join started, every
+  node's migration to the dead address failed without a report, and the join
+  held the queue until the migration timeout (60 s and up to 2 h). Discovery
+  now enables TCP keepalive on the connections it accepts (first probe after
+  10 s idle, then every 5 s, 3 probes on Linux), so such a joiner is dropped
+  after about 25 s.
 
 ## [0.5.1] - 2026-10-27
 
