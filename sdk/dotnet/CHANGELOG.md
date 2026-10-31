@@ -12,6 +12,13 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- With `Ca` set, a server certificate issued through an intermediate CA was
+  refused: the validation callback rebuilt the chain from the leaf alone and
+  never looked at the intermediates the server sent, so the build stopped
+  at `PartialChain` whenever the CA file held only the root (a private CA's
+  usual shape), while the Java and Rust SDKs accepted the same setup. The
+  presented intermediates are now used to build the chain; the root in `Ca`
+  stays the only trust anchor.
 - A compressed value whose DEFLATE stream ends early (a truncated or corrupt
   write) was returned as the prefix `DeflateStream` could inflate, with no
   error. The SDK now turns on `System.IO.Compression.UseStrictValidation` for

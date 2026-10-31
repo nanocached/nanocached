@@ -595,7 +595,9 @@ For a private CA, point `Ca` at a PEM file of trusted root certificate(s)
 — it replaces the default trust store and is only consulted when `Tls`
 is true (a set `Ca` with `Tls` false is rejected by `ConnectAsync`; an
 unreadable or unparseable CA file when `Tls` is true is a
-connect-time error too):
+connect-time error too). The root is enough: a server certificate
+issued through an intermediate CA is verified with the intermediates the
+server sends in the handshake, as the Java and Rust SDKs do:
 
 ```csharp
 using NanocachedClient client = await NanocachedClient.ConnectAsync(

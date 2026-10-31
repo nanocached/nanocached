@@ -5051,6 +5051,69 @@ public class NanocachedClientTests
         }
     }
 
+    [Fact]
+    public async Task TlsAcceptsALeafIssuedThroughAnIntermediateWhenOnlyTheRootIsTrusted()
+    {
+        // A private CA's usual shape: Ca holds the root alone and the
+        // server presents its leaf plus the intermediate that issued it.
+        // The validation callback used to rebuild the chain from the leaf
+        // by itself, never looking at the intermediates the server sent,
+        // so the build stopped at PartialChain and the connect failed
+        // while Java and Rust accepted the same setup.
+        var (root, intermediate, leaf) = Tls.GenerateChain(IPAddress.Loopback);
+        string pemPath = Tls.WritePemCertificate(root);
+        try
+        {
+            using MockNode node = MockNode.WithTls(leaf, new X509Certificate2Collection { intermediate });
+
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+            {
+                Addresses = { ("127.0.0.1", node.Port) },
+                Tls = true,
+                Ca = pemPath,
+            });
+            await client.SetAsync("k", "v");
+            Assert.Equal("v", await client.GetAsync("k"));
+        }
+        finally
+        {
+            File.Delete(pemPath);
+            root.Dispose();
+            intermediate.Dispose();
+            leaf.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task TlsRejectsAChainWhoseRootIsNotTheTrustedOne()
+    {
+        // The presented intermediate is a link to verify, not an anchor:
+        // a complete chain under a different root is still refused when
+        // Ca names another root.
+        var (_, intermediate, leaf) = Tls.GenerateChain(IPAddress.Loopback);
+        var (otherRoot, _, _) = Tls.GenerateChain(IPAddress.Loopback, rootName: "another root");
+        string pemPath = Tls.WritePemCertificate(otherRoot);
+        try
+        {
+            using MockNode node = MockNode.WithTls(leaf, new X509Certificate2Collection { intermediate });
+
+            await Assert.ThrowsAsync<AuthenticationException>(() =>
+                NanocachedClient.ConnectAsync(new NanocachedClient.Options
+                {
+                    Addresses = { ("127.0.0.1", node.Port) },
+                    Tls = true,
+                    Ca = pemPath,
+                }));
+        }
+        finally
+        {
+            File.Delete(pemPath);
+            otherRoot.Dispose();
+            intermediate.Dispose();
+            leaf.Dispose();
+        }
+    }
+
     // ── ヘッジ読み取り (Hedged reads, issue #64) ─────────────────────
 
     // Generous versus the FireAndForgetReplicas suite's 20ms — hedging's

@@ -178,6 +178,10 @@ public sealed class MockNode : IDisposable
     /// identical to a plain MockNode, since <see cref="ServeAsync"/> only
     /// ever talks to a generic <see cref="Stream"/>.</summary>
     private readonly X509Certificate2? _serverCertificate;
+    /// <summary>Intermediate CA certificates sent after the leaf in the
+    /// handshake, the way a server deployed under a subordinate CA sends
+    /// them; <c>null</c> sends the leaf alone.</summary>
+    private readonly X509Certificate2Collection? _serverIntermediates;
 
     public MockNode(
         string? requiredSecret = null,
@@ -185,13 +189,15 @@ public sealed class MockNode : IDisposable
         bool closeOnExtendedAuth = false,
         bool closeOnRetryableAuth = false,
         X509Certificate2? serverCertificate = null,
-        int port = 0)
+        int port = 0,
+        X509Certificate2Collection? serverIntermediates = null)
     {
         _requiredSecret = requiredSecret is null ? null : Encoding.UTF8.GetBytes(requiredSecret);
         _supportTags = supportTags;
         _closeOnExtendedAuth = closeOnExtendedAuth;
         _closeOnRetryableAuth = closeOnRetryableAuth;
         _serverCertificate = serverCertificate;
+        _serverIntermediates = serverIntermediates;
         // port = 0 (the default) picks any free port, as before; a
         // caller that needs to revive a node on a specific, previously
         // advertised address (issue #67's redial-after-cooldown test)
@@ -205,6 +211,11 @@ public sealed class MockNode : IDisposable
     /// name="serverCertificate"/>.</summary>
     public static MockNode WithTls(X509Certificate2 serverCertificate) =>
         new(serverCertificate: serverCertificate);
+
+    /// <summary>A TLS node whose leaf was issued through <paramref
+    /// name="intermediates"/>, which it sends along in the handshake.</summary>
+    public static MockNode WithTls(X509Certificate2 serverCertificate, X509Certificate2Collection intermediates) =>
+        new(serverCertificate: serverCertificate, serverIntermediates: intermediates);
 
     public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
 
@@ -482,8 +493,21 @@ public sealed class MockNode : IDisposable
             if (_serverCertificate is not null)
             {
                 var ssl = new SslStream(stream, leaveInnerStreamOpen: false);
-                await ssl.AuthenticateAsServerAsync(_serverCertificate, clientCertificateRequired: false,
-                    checkCertificateRevocation: false);
+                if (_serverIntermediates is null)
+                {
+                    await ssl.AuthenticateAsServerAsync(_serverCertificate, clientCertificateRequired: false,
+                        checkCertificateRevocation: false);
+                }
+                else
+                {
+                    await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                    {
+                        ServerCertificateContext = SslStreamCertificateContext.Create(
+                            _serverCertificate, _serverIntermediates, offline: true),
+                        ClientCertificateRequired = false,
+                        CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+                    });
+                }
                 stream = ssl;
             }
             // Echoed response tags: set when this connection's `A ... T` was
@@ -1598,6 +1622,67 @@ internal static class Tls
             cert.Export(X509ContentType.Pfx), password: null,
             X509KeyStorageFlags.Exportable);
     }
+
+    /// <summary>A private CA's usual shape: a self-signed root, an
+    /// intermediate it issued, and a server leaf (for <paramref
+    /// name="sanIpAddress"/>) the intermediate issued. The leaf carries
+    /// its private key; the root and intermediate are returned without
+    /// theirs, as a server would hold them.</summary>
+    internal static (X509Certificate2 Root, X509Certificate2 Intermediate, X509Certificate2 Leaf) GenerateChain(
+        IPAddress sanIpAddress, string rootName = "nanocached test root")
+    {
+        using RSA rootKey = RSA.Create(2048);
+        var rootRequest = new CertificateRequest(
+            $"CN={rootName}", rootKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        rootRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+        rootRequest.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
+        rootRequest.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(rootRequest.PublicKey, false));
+        DateTimeOffset notBefore = DateTimeOffset.UtcNow.AddDays(-1);
+        DateTimeOffset notAfter = DateTimeOffset.UtcNow.AddDays(3650);
+        using X509Certificate2 rootWithKey = rootRequest.CreateSelfSigned(notBefore, notAfter);
+
+        using RSA intermediateKey = RSA.Create(2048);
+        var intermediateRequest = new CertificateRequest(
+            $"CN={rootName} intermediate", intermediateKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        intermediateRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, true, 0, true));
+        intermediateRequest.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
+        intermediateRequest.CertificateExtensions.Add(
+            new X509SubjectKeyIdentifierExtension(intermediateRequest.PublicKey, false));
+        intermediateRequest.CertificateExtensions.Add(
+            X509AuthorityKeyIdentifierExtension.CreateFromCertificate(rootWithKey, true, false));
+        using X509Certificate2 intermediateWithKey = intermediateRequest
+            .Create(rootWithKey, notBefore, notAfter.AddDays(-1), Serial(2))
+            .CopyWithPrivateKey(intermediateKey);
+
+        using RSA leafKey = RSA.Create(2048);
+        var leafRequest = new CertificateRequest(
+            $"CN={sanIpAddress}", leafKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        var san = new SubjectAlternativeNameBuilder();
+        san.AddIpAddress(sanIpAddress);
+        leafRequest.CertificateExtensions.Add(san.Build());
+        leafRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, false));
+        leafRequest.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
+        leafRequest.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+            new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, false));
+        leafRequest.CertificateExtensions.Add(
+            X509AuthorityKeyIdentifierExtension.CreateFromCertificate(intermediateWithKey, true, false));
+        using X509Certificate2 leafWithKey = leafRequest
+            .Create(intermediateWithKey, notBefore, notAfter.AddDays(-2), Serial(3))
+            .CopyWithPrivateKey(leafKey);
+
+        // Same PFX round trip as GenerateSelfSigned, for the same reason.
+        X509Certificate2 leaf = X509CertificateLoader.LoadPkcs12(
+            leafWithKey.Export(X509ContentType.Pfx), password: null, X509KeyStorageFlags.Exportable);
+        X509Certificate2 root = X509CertificateLoader.LoadCertificate(rootWithKey.Export(X509ContentType.Cert));
+        X509Certificate2 intermediate = X509CertificateLoader.LoadCertificate(
+            intermediateWithKey.Export(X509ContentType.Cert));
+        return (root, intermediate, leaf);
+    }
+
+    private static byte[] Serial(byte value) => new byte[] { 0x01, value };
 
     /// <summary>Writes just the public certificate (no private key) as a
     /// PEM file — the same shape <c>Options.Ca</c> expects from a real

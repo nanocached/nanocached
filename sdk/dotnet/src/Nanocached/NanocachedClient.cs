@@ -477,7 +477,7 @@ public sealed class NanocachedClient : IDisposable
 
         return new SslClientAuthenticationOptions
         {
-            RemoteCertificateValidationCallback = (_, certificate, _, sslPolicyErrors) =>
+            RemoteCertificateValidationCallback = (_, certificate, presented, sslPolicyErrors) =>
             {
                 if (certificate is null) return false;
 
@@ -506,6 +506,20 @@ public sealed class NanocachedClient : IDisposable
                 chain.ChainPolicy.CustomTrustStore.Clear();
                 chain.ChainPolicy.CustomTrustStore.AddRange(roots);
                 chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                // The intermediates the server sent in the handshake, so a
+                // leaf issued through a subordinate CA (a private CA's usual
+                // shape) chains up to the root in Ca. They go in ExtraStore,
+                // never into the trust store: a presented intermediate is a
+                // link to verify, not an anchor. Without this the build
+                // stopped at PartialChain whenever Ca held only the root,
+                // while Java and Rust accepted the same setup.
+                if (presented is not null)
+                {
+                    foreach (X509ChainElement element in presented.ChainElements)
+                    {
+                        chain.ChainPolicy.ExtraStore.Add(element.Certificate);
+                    }
+                }
                 using var leaf = new X509Certificate2(certificate);
                 return chain.Build(leaf);
             },
