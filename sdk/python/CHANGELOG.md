@@ -18,6 +18,10 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
   `WrongNodeError` and dropped the values, which for `get_many_and_touch`
   with `ttl_seconds=0` meant the hits were gone from the node as well.
   `touch_many` still raises a plain `WrongNodeError`.
+- A compressed value whose DEFLATE stream ends early (a truncated or corrupt
+  write) was returned as the prefix that could be inflated, with no error.
+  `get` and the batched reads now raise `DecompressionError` for it, as the
+  Java, Go, TypeScript and Rust SDKs do.
 
 ## [0.5.1] - 2026-10-27
 
