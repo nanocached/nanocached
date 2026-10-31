@@ -2622,10 +2622,10 @@ async fn handle_connection(
                     MigrationOutcome::New { guard, restore } => {
                         // Issue #62: before the key snapshot below, so
                         // the restored copies are listed — and re-sent
-                        // if this joiner owns them.
-                        for key in &restore {
-                            unmark_migrated(&node_context.request_tx, key).await;
-                        }
+                        // if this joiner owns them. One round trip for
+                        // the lot: one per key kept discovery waiting
+                        // past its ack timeout on a large restore.
+                        unmark_migrated_many(&node_context.request_tx, restore).await;
                         guard
                     }
                     // A discovery retry of `M` for the handoff already
@@ -2748,9 +2748,7 @@ async fn handle_connection(
                              node's handoff completed; restoring {} dead copies",
                             restore.len()
                         );
-                        for key in &restore {
-                            unmark_migrated(&node_context.request_tx, key).await;
-                        }
+                        unmark_migrated_many(&node_context.request_tx, restore).await;
                     }
                     // Still transferring: wait for `run_migration`'s own
                     // unwind to actually clear the slot before acking —
@@ -8037,6 +8035,15 @@ async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
 
 async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
     let _ = execute_command(request_tx, Command::UnmarkMigrated { key: key.clone() }).await;
+}
+
+/// `unmark_migrated` for a whole restore in one cache round trip — see
+/// `Cache::unmark_migrated_many` for why one per key was too slow.
+async fn unmark_migrated_many(request_tx: &mpsc::Sender<CacheRequest>, keys: Vec<Key>) {
+    if keys.is_empty() {
+        return;
+    }
+    let _ = execute_command(request_tx, Command::UnmarkMigratedMany { keys }).await;
 }
 
 /// What `abandon_migration` found for `joining_name` in `active_migration`.

@@ -1865,6 +1865,20 @@ impl Cache {
         self.clear_migrated_mark(key);
     }
 
+    /// `unmark_migrated` for every key in `keys` in one call. The two
+    /// restores a node makes (an `M` superseding a completed handoff, an
+    /// `X` abandoning one) used to send one command per marked key and
+    /// await each before acking, about 12 µs a key on the single-threaded
+    /// runtime: a node holding a million marked copies answered 12 s late,
+    /// past discovery's wait for the ack. Returns how many were marked.
+    pub fn unmark_migrated_many(&mut self, keys: &[Key]) -> usize {
+        let before = self.marked;
+        for key in keys {
+            self.clear_migrated_mark(key);
+        }
+        before - self.marked
+    }
+
     /// Issue #124: one consistent snapshot of the counters, accounting,
     /// and per-namespace breakdown, for the metrics endpoint. O(#live
     /// namespaces) — never a walk over entries.
@@ -3936,6 +3950,36 @@ mod tests {
 
         assert_eq!(cache.get(&key(b"a")), Some(Bytes::from_static(b"1")));
         assert_eq!(cache.get(&key(b"b")), Some(Bytes::from_static(b"2")));
+    }
+
+    #[test]
+    fn unmark_migrated_many_clears_every_mark_in_one_call_and_counts_only_the_marked() {
+        // The batched form a restore uses (issue #1026): one cache command
+        // for the whole list instead of one round trip per key. Same
+        // outcome as `unmark_migrated` per key — the marks are gone, the
+        // duplicate bytes are credited back — and the count skips keys
+        // that were never marked.
+        let mut cache = Cache::new(1 << 20);
+        let keys: Vec<Key> = (0..5u8).map(|i| key(&[b'k', i])).collect();
+        for k in &keys {
+            cache.set(k.clone(), Bytes::from_static(b"v"));
+        }
+        let before = cache.used_bytes;
+        for k in &keys[..3] {
+            cache.mark_migrated(k);
+        }
+        assert_eq!(cache.marked, 3);
+        assert!(cache.used_bytes > before, "a mark is charged");
+
+        assert_eq!(cache.unmark_migrated_many(&keys), 3);
+
+        assert_eq!(cache.marked, 0);
+        assert_eq!(cache.used_bytes, before);
+        for k in &keys {
+            assert_eq!(cache.get(k), Some(Bytes::from_static(b"v")));
+        }
+        assert_eq!(cache.unmark_migrated_many(&keys), 0);
+        assert_eq!(cache.unmark_migrated_many(&[]), 0);
     }
 
     #[test]
