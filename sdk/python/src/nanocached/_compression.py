@@ -90,7 +90,17 @@ def decompress_value(value: bytes) -> bytes:
                     "nanocached: decompressed value exceeds the maximum size — "
                     "possible decompression bomb"
                 )
-            return out + decompressor.flush()
+            out += decompressor.flush()
+            # zlib stops at the end of the input and reports what it has;
+            # only ``eof`` says the stream's final block was reached. A
+            # value cut short (a truncated or corrupt write) used to come
+            # back as its decodable prefix, silently.
+            if not decompressor.eof:
+                raise DecompressionError(
+                    "nanocached: a value marked as compressed ends before its DEFLATE stream "
+                    "does (truncated or corrupt) — it was not written whole"
+                )
+            return out
         except zlib.error as error:
             raise DecompressionError(
                 "nanocached: failed to decompress a value marked as compressed — "

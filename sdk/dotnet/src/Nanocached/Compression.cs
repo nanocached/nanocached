@@ -13,6 +13,34 @@ namespace Nanocached;
 /// </summary>
 internal static class Compression
 {
+    /// <summary>
+    /// Turns on <c>System.IO.Compression</c>'s strict validation for the
+    /// process the first time this class is used, before its own first
+    /// <see cref="DeflateStream"/>. Without it, <see cref="DeflateStream"/>
+    /// treats input that ends before the stream's final block as the end
+    /// of the stream and returns the prefix it could inflate, so a
+    /// truncated or corrupt value came back from a read as a shorter value
+    /// with no error; with it, the read throws
+    /// <see cref="InvalidDataException"/> ("truncated data"), which
+    /// <see cref="DecompressValue(byte[])"/> reports as a
+    /// <see cref="DecompressionException"/>, as the other SDKs do. The
+    /// switch is read once, when <see cref="DeflateStream"/> is first used
+    /// in the process, so this only takes effect if nothing used that class
+    /// before; an application that does should set
+    /// <c>System.IO.Compression.UseStrictValidation</c> in its own runtime
+    /// configuration (README, value compression). An application that
+    /// already set the switch, either way, is left alone.
+    /// </summary>
+    static Compression()
+    {
+        if (!AppContext.TryGetSwitch(StrictValidationSwitch, out _))
+        {
+            AppContext.SetSwitch(StrictValidationSwitch, true);
+        }
+    }
+
+    internal const string StrictValidationSwitch = "System.IO.Compression.UseStrictValidation";
+
     private const byte MarkerRaw = 0x00;
     private const byte MarkerDeflate = 0x01;
 

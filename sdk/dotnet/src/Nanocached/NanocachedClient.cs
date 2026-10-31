@@ -344,7 +344,10 @@ public sealed class NanocachedClient : IDisposable
     /// slot (node name) can be reassigned to a different address by a
     /// refresh, but the address itself is what's actually unreachable.
     /// Mirrors TypeScript's reconnectCooldowns.</summary>
-    private readonly ConcurrentDictionary<string, (DateTime Until, Exception Error)> _reconnectCooldowns = new();
+    // Deadlines are Stopwatch timestamps (see MonotonicNow): the wall
+    // clock stepping back (an NTP correction, a VM restore) must not keep
+    // an address failing fast for the size of the step.
+    private readonly ConcurrentDictionary<string, (long Until, Exception Error)> _reconnectCooldowns = new();
     // Fire-and-forget replica writes: bounds in-flight background replica writes and
     // lets Close() drain them before tearing down connections.
     private readonly SemaphoreSlim _backgroundReplicaPermits;
@@ -399,7 +402,28 @@ public sealed class NanocachedClient : IDisposable
     private readonly Dictionary<string, Member> _members = new();
     private HashRing? _ring;
     private int _replication = 1;
-    private DateTime _lastFetch = DateTime.UtcNow;
+    // A Stopwatch timestamp, not a DateTime: on a monotonic clock a
+    // backward step of the wall clock cannot make the list look fresh for
+    // the size of the step (Python's time.monotonic(), Java's nanoTime()).
+    private long _lastFetch = MonotonicNow();
+
+    /// <summary>The monotonic clock the reconnect cooldown and the
+    /// node-list staleness are measured on: <see cref="System.Diagnostics.Stopwatch"/>
+    /// ticks, compared with <see cref="Elapsed"/> and advanced with
+    /// <see cref="Plus"/>.</summary>
+    private static long MonotonicNow() => System.Diagnostics.Stopwatch.GetTimestamp();
+
+    private static TimeSpan Elapsed(long since) => System.Diagnostics.Stopwatch.GetElapsedTime(since);
+
+    /// <summary><paramref name="timestamp"/> moved forward by <paramref
+    /// name="by"/>, saturating rather than overflowing for a span far
+    /// beyond any deadline this client sets.</summary>
+    private static long Plus(long timestamp, TimeSpan by)
+    {
+        double ticks = by.TotalSeconds * System.Diagnostics.Stopwatch.Frequency;
+        if (ticks >= long.MaxValue - timestamp) return long.MaxValue;
+        return timestamp + (long)ticks;
+    }
 
     // The address that answered connect() — a node's own address in
     // single mode, the winning discovery server's address in cluster
@@ -4578,7 +4602,7 @@ public sealed class NanocachedClient : IDisposable
     /// gate.</summary>
     private async Task<Connection> DialWithCooldownAsync(string address)
     {
-        if (_reconnectCooldowns.TryGetValue(address, out var cooldown) && DateTime.UtcNow < cooldown.Until)
+        if (_reconnectCooldowns.TryGetValue(address, out var cooldown) && MonotonicNow() < cooldown.Until)
         {
             throw cooldown.Error;
         }
@@ -4612,7 +4636,7 @@ public sealed class NanocachedClient : IDisposable
     {
         if (_reconnectCooldown is TimeSpan resolvedCooldown)
         {
-            DateTime now = DateTime.UtcNow;
+            long now = MonotonicNow();
             // Issue #486: drop every entry whose window has already passed
             // while we're here — an expired entry is inert
             // (DialWithCooldownAsync checks the deadline on every read) and
@@ -4627,7 +4651,7 @@ public sealed class NanocachedClient : IDisposable
                     _reconnectCooldowns.TryRemove(pair.Key, out _);
                 }
             }
-            _reconnectCooldowns[address] = (now + resolvedCooldown, error);
+            _reconnectCooldowns[address] = (Plus(now, resolvedCooldown), error);
         }
     }
 
@@ -4747,7 +4771,7 @@ public sealed class NanocachedClient : IDisposable
     private async Task MaybeRefreshAsync(bool force)
     {
         if (_ring is null) return;
-        if (!force && DateTime.UtcNow - _lastFetch < NodeListStaleAfter) return;
+        if (!force && Elapsed(_lastFetch) < NodeListStaleAfter) return;
 
         // Forced refreshes are single-flight: a forced caller that waited
         // for the gate while another refresh ran reuses that refresh
@@ -4758,11 +4782,11 @@ public sealed class NanocachedClient : IDisposable
         // did not need. A refresh that completed — including one whose
         // fetch failed, which also advances _lastFetch — is what the
         // waiter would have got from its own attempt moments later.
-        DateTime observed = _lastFetch;
+        long observed = _lastFetch;
         await _refreshGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (!force && DateTime.UtcNow - _lastFetch < NodeListStaleAfter) return;
+            if (!force && Elapsed(_lastFetch) < NodeListStaleAfter) return;
             if (force && _lastFetch > observed) return;
             await RefreshNodeListAsync().ConfigureAwait(false);
         }
@@ -4775,7 +4799,7 @@ public sealed class NanocachedClient : IDisposable
     private async Task RefreshNodeListAsync()
     {
         Identify.ClusterTarget? cluster = await FetchNodeListAsync().ConfigureAwait(false);
-        _lastFetch = DateTime.UtcNow;
+        _lastFetch = MonotonicNow();
         if (cluster is null) return;
 
         // Dedupe first (issue #461): a duplicated name in cluster.Nodes

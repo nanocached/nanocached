@@ -60,6 +60,19 @@ class CompressValueTests(unittest.TestCase):
         with self.assertRaises(DecompressionError):
             decompress_value(b"")
 
+    def test_a_truncated_deflate_value_raises_instead_of_returning_a_prefix(self):
+        # The stream is cut before its final block: zlib has no error to
+        # report, only "not at eof". Returning the prefix hid the loss.
+        value = os.urandom(20_000).hex().encode()
+        stored = compress_value(value, 0)
+        self.assertEqual(stored[0], 0x01)
+        for cut in (len(stored) // 2, len(stored) - 3):
+            with self.subTest(cut=cut):
+                with self.assertRaises(DecompressionError) as raised:
+                    decompress_value(stored[:cut])
+                self.assertIn("truncated", str(raised.exception))
+        self.assertEqual(decompress_value(stored), value)
+
     def test_corrupt_deflate_marked_value_raises(self):
         with self.assertRaises(DecompressionError):
             decompress_value(bytes([0x01, 0xFF, 0xFF, 0xFF, 0xFF]))

@@ -10,6 +10,15 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- A `TouchMany` or `GetManyAndTouch` with a TTL of 0 whose primary leg for
+  some keys lost its connection after the frame was written (the keys are
+  lost: not safe to resend) and whose retry pass then failed to dial another
+  key's primary reported the dial failure, marked as never sent, instead of
+  the connection loss that says the request may have been applied. The lost
+  keys' own failure is now the one reported, as in the TypeScript SDK.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release

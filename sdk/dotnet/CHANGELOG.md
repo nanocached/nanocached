@@ -19,6 +19,20 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
   usual shape), while the Java and Rust SDKs accepted the same setup. The
   presented intermediates are now used to build the chain; the root in `Ca`
   stays the only trust anchor.
+- A compressed value whose DEFLATE stream ends early (a truncated or corrupt
+  write) was returned as the prefix `DeflateStream` could inflate, with no
+  error. The SDK now turns on `System.IO.Compression.UseStrictValidation` for
+  the process when its assembly loads (unless the application set the switch
+  itself), so such a value fails the read with a `DecompressionException`, as
+  in the other SDKs. The switch is read once, on the first use of
+  `DeflateStream` in the process; an application that uses it before loading
+  the SDK sets the switch in its own runtime configuration instead.
+- The per-address reconnect cooldown and the node-list staleness check were
+  measured on the wall clock (`DateTime.UtcNow`). A backward step of that
+  clock (an NTP correction, a VM restore) suppressed non-forced node-list
+  refreshes and kept an armed cooldown failing fast for the size of the step.
+  Both now use the monotonic `Stopwatch` clock, as the Python and Java SDKs
+  use theirs.
 
 ## [0.5.1] - 2026-10-27
 
