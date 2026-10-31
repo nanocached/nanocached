@@ -14,6 +14,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `verify-staged-join`: the tool's log directory, `$TMPDIR/verify-staged-join-<pid>`,
+  had a predictable name and was created with `create_dir_all`, which follows
+  a symlink another user planted at that path in a shared `/tmp`, so the
+  logs could be written over that user's chosen file. The name now carries a
+  random component, the directory is created with mode 0700, and anything
+  already at the path (a file, a directory or a symlink) stops the tool with
+  an error instead of being written through.
 - `nanocached-proxy`: a request waited for the in-flight byte budget with no
   time limit, and `IDLE_TIMEOUT` did not cover that wait. A client that read
   1 MiB replies at about 20 KB/s is never evicted, so five such connections

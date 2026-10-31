@@ -238,7 +238,7 @@ async fn main() -> std::process::ExitCode {
     };
 
     let log_dir = log_dir();
-    if let Err(error) = std::fs::create_dir_all(&log_dir) {
+    if let Err(error) = create_log_dir(&log_dir) {
         eprintln!("cannot create log directory {}: {error}", log_dir.display());
         return std::process::ExitCode::FAILURE;
     }
@@ -356,8 +356,35 @@ impl Process {
 /// Where each spawned process's stdout/stderr goes — not discarded, since
 /// diagnosing a scenario failure (an unresponsive node, a rejected
 /// command) means reading these after the fact. Printed once at startup.
+///
+/// Issue #1033: the name carries a random component as well as the pid,
+/// and `create_log_dir` creates exactly this directory, private to the
+/// user (mode 0700) and refusing to proceed if anything is already at the
+/// path. The predictable `$TMPDIR/verify-staged-join-<pid>` created with
+/// `create_dir_all` followed a symlink another user could plant in a
+/// shared `/tmp`, which made the tool write its logs over that user's
+/// chosen file.
 fn log_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("verify-staged-join-{}", std::process::id()))
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    std::env::temp_dir().join(format!(
+        "verify-staged-join-{}-{nonce:08x}",
+        std::process::id()
+    ))
+}
+
+/// Creates `log_dir` itself (not its parents) with mode 0700, failing with
+/// `AlreadyExists` when a file, directory or symlink is already there —
+/// see `log_dir`.
+fn create_log_dir(log_dir: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(log_dir)
 }
 
 fn log_file(log_dir: &Path, name: &str) -> io::Result<Stdio> {
@@ -2140,6 +2167,55 @@ mod tests {
         // node-b's promotion — this was a properly serialized join despite
         // the harness's labels being swapped from chronological order.
         assert!(later_started_at > earlier_promoted_at);
+    }
+
+    /// Issue #1033: the log directory is created private to the user and
+    /// never through something already at its path.
+    #[test]
+    fn create_log_dir_makes_a_private_directory_and_refuses_a_planted_path() {
+        let scratch = std::env::temp_dir().join(format!(
+            "verify-staged-join-test-{}-{}",
+            std::process::id(),
+            test_scratch_id()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let fresh = scratch.join("logs");
+        create_log_dir(&fresh).unwrap();
+        assert!(fresh.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "mode {mode:o}");
+        }
+
+        // A directory already at the path — what a symlink planted by
+        // another user resolves to — is refused rather than reused.
+        let error = create_log_dir(&fresh).expect_err("an existing path is refused");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        #[cfg(unix)]
+        {
+            let target = scratch.join("victim");
+            std::fs::create_dir(&target).unwrap();
+            let planted = scratch.join("planted");
+            std::os::unix::fs::symlink(&target, &planted).unwrap();
+            let error = create_log_dir(&planted).expect_err("a symlink at the path is refused");
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        }
+
+        // Two names drawn in the same process differ by their nonce only
+        // when the clock moved; both still carry the pid.
+        assert!(
+            log_dir()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("verify-staged-join-{}-", std::process::id()))
+        );
+
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[tokio::test]
