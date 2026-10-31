@@ -10,6 +10,16 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- With `Ca` set, a server certificate issued through an intermediate CA was
+  refused: the validation callback rebuilt the chain from the leaf alone and
+  never looked at the intermediates the server sent, so the build stopped
+  at `PartialChain` whenever the CA file held only the root (a private CA's
+  usual shape), while the Java and Rust SDKs accepted the same setup. The
+  presented intermediates are now used to build the chain; the root in `Ca`
+  stays the only trust anchor.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release
