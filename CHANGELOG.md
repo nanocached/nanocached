@@ -59,6 +59,13 @@ framework adapters at one version, whether or not a component changed.
   interval evicted live nodes between two heartbeats; a very large value
   overflowed the clock arithmetic and crashed. The flag now accepts 6 to
   604800 seconds (7 days) and refuses anything else as a usage error.
+- `nanocached-discovery`: the ack for the `C` that completed a join was
+  written only after the next waiting node's `M` fan-out, which can take up
+  to three 10 s attempts against a ready node that is slow to answer, while
+  the reporting node waits about 10 s for that ack. The node then logged a
+  false "reporting completion … failed" warning and its join-flip
+  re-replication waited for the retry. The ack now goes out first and the
+  fan-out follows.
 - `nanocached-node`: a `/metrics` scrape built and sorted a row for every live
   namespace on the cache task although it renders only the largest 256, so a
   node holding very many namespaces (300,000 took 45 ms) paused every client
