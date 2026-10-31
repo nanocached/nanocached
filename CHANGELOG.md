@@ -14,6 +14,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a request waited for the in-flight byte budget with no
+  time limit, and `IDLE_TIMEOUT` did not cover that wait. A client that read
+  1 MiB replies at about 20 KB/s is never evicted, so five such connections
+  pipelining reads held the whole 256 MiB proxy-wide budget and every other
+  client's requests waited behind them for as long as they kept dribbling.
+  A request that cannot get its bytes within 60 seconds is now answered `R`
+  (`B` to a client without the retryable-error capability) and the
+  connection goes on, and one source IP may hold at most a quarter of the
+  proxy-wide budget (64 MiB by default), so one slow consumer cannot starve
+  the rest. Clients behind one NAT or egress IP share that quarter.
 - `nanocached-node`: a remaining TTL under one second went on the wire as
   `0`: in an INCR reply, in a get-and-touch reply and in a forward or handoff
   of the entry. An SDK replicating an INCR reply read `0` as "no expiry"
@@ -33,13 +43,6 @@ framework adapters at one version, whether or not a component changed.
   kept the whole received frame, value included, in memory until the sweep
   or an abandon, while the memory bound counted only the key name. The mark
   now holds a copy of the name.
-- `nanocached-node`: a copy that a join took away while this node was still
-  sending to the joiner (a re-replicated put-if-absent for a key the join
-  moved) was marked dead but missing from the handoff's list of marks, so
-  an abandoned join left it marked although this node owns the key again:
-  skipped by re-replication, and removed by a sweep when another owner
-  exists. The list now keeps those marks, on completion and when the
-  transfer is cancelled or fails.
 - `nanocached-node`: a migration mark (the record that a staged join took a
   key away, kept until the sweep removes the copy) was charged the length of
   the namespace's name as well as the key's, once per marked key, although a
@@ -48,6 +51,22 @@ framework adapters at one version, whether or not a component changed.
   per key (64 MiB for a thousand keys under a 64 KiB name) and the next write
   evicted other namespaces' live entries to make room for it. A mark is now
   charged its key copy plus a fixed overhead, whatever the namespace's name.
+- `nanocached-node`: a copy that a join took away while this node was still
+  sending to the joiner (a re-replicated put-if-absent for a key the join
+  moved) was marked dead but missing from the handoff's list of marks, so
+  an abandoned join left it marked although this node owns the key again:
+  skipped by re-replication, and removed by a sweep when another owner
+  exists. The list now keeps those marks, on completion and when the
+  transfer is cancelled or fails.
+- `nanocached-discovery`: a joiner whose host died without closing its
+  connection (power loss, hypervisor failure, a partition) stayed registered,
+  because nothing set TCP keepalive on the connection that is a joiner's
+  liveness. If it was the oldest waiting joiner its join started, every
+  node's migration to the dead address failed without a report, and the join
+  held the queue until the migration timeout (60 s and up to 2 h). Discovery
+  now enables TCP keepalive on the connections it accepts (first probe after
+  10 s idle, then every 5 s, 3 probes on Linux), so such a joiner is dropped
+  after about 25 s.
 
 ## [0.5.1] - 2026-10-27
 

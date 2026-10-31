@@ -332,6 +332,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "sha2",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "uuid",

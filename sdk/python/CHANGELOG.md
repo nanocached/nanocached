@@ -9,6 +9,16 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- `get_many_and_touch` and `get_many` against a single node or the proxy
+  now raise `PartialWrongNodeError` with the keys that did resolve in
+  `partial_values` when the node answers `W` for some of the keys, as they
+  already did in a cluster and as the other SDKs do. They raised a plain
+  `WrongNodeError` and dropped the values, which for `get_many_and_touch`
+  with `ttl_seconds=0` meant the hits were gone from the node as well.
+  `touch_many` still raises a plain `WrongNodeError`.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release
