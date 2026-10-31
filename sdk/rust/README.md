@@ -150,11 +150,11 @@ unknown — check with a subsequent `get` if that matters.
 **What "never sent" means.** A non-idempotent request is
 replayed after a redial only when this SDK can prove no complete frame
 reached the server: the connection was already closed before the frame
-was written, or the write call itself failed while the connection was
-still the SDK's own — a failed write leaves at most a truncated frame on
-the wire, and the server never executes an incomplete request. Anything
-after the frame was handed over in full (no reply, a request timeout, a
-desynced reply, a close by another request's failure or by the timeout
+was written, or the write (including its flush) itself failed while the
+connection was still the SDK's own — a failed write leaves at most a
+truncated frame on the wire, and the server never executes an incomplete
+request. Anything after the frame was handed over in full (no reply, a
+request timeout, a desynced reply, a close by another request's failure or by the timeout
 watchdog while the write was in progress) is ambiguous and is never
 replayed. Every SDK applies this same rule; the Node and asyncio SDKs,
 whose runtimes buffer writes in user space and flush them in the

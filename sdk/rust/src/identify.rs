@@ -437,9 +437,16 @@ async fn do_connect_and_identify(
     // `connect_and_identify`'s fallback chain).
     let mut auth = format!("A {}{}\n", secret.len(), stage.suffix()).into_bytes();
     auth.extend_from_slice(secret);
+    // `flush` after every write here: over TLS a write can leave its tail
+    // queued inside rustls until flushed (a no-op on plain TCP).
     stream
         .get_mut()
         .write_all(&auth)
+        .await
+        .map_err(classify_auth_io_error)?;
+    stream
+        .get_mut()
+        .flush()
         .await
         .map_err(classify_auth_io_error)?;
 
@@ -528,6 +535,11 @@ async fn do_connect_and_identify(
                 .write_all(b"L\n")
                 .await
                 .map_err(|error| AuthFailure::Other(error.into()))?;
+            stream
+                .get_mut()
+                .flush()
+                .await
+                .map_err(|error| AuthFailure::Other(error.into()))?;
             read_node_list(&mut stream)
                 .await
                 .map_err(AuthFailure::Other)
@@ -536,6 +548,11 @@ async fn do_connect_and_identify(
             stream
                 .get_mut()
                 .write_all(b"Q\n")
+                .await
+                .map_err(|error| AuthFailure::Other(error.into()))?;
+            stream
+                .get_mut()
+                .flush()
                 .await
                 .map_err(|error| AuthFailure::Other(error.into()))?;
             read_proxy_list(&mut stream)

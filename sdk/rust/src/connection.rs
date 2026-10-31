@@ -286,14 +286,14 @@ fn cas_condition_token(condition: CasCondition) -> String {
 }
 
 /// RAII guard around the write half of a round trip: if the enclosing
-/// future is dropped while `write_all` is still pending (a caller
-/// abandoning the request, e.g. via `tokio::time::timeout`), the frame
-/// may be only partially on the wire — desyncing every request queued
+/// future is dropped while `write_all` or the `flush` after it is still
+/// pending (a caller abandoning the request, e.g. via
+/// `tokio::time::timeout`), the frame may be only partially on the wire — desyncing every request queued
 /// behind this one too, unlike abandoning a request *after* its write
 /// completed (see `Connection::request`, which leaves that case for the
 /// read task to handle by simply finding no one listening). `completed`
-/// is set only once `write_all` actually returns (Ok or Err); Drop while
-/// it's still `false` means we were cancelled mid-write.
+/// is set only once the write and flush actually return (Ok or Err); Drop
+/// while it's still `false` means we were cancelled mid-write.
 struct WriteGuard<'a> {
     shared: &'a Shared,
     shutdown: &'a watch::Sender<bool>,
@@ -955,7 +955,18 @@ impl Connection {
                 ))
             } else {
                 tokio::select! {
-                    result = write_half.write_all(&frame) => result,
+                    // `flush` as well as `write_all`: over TLS, `write_all`
+                    // returns once rustls has accepted the plaintext, which
+                    // can leave up to ~64 KiB of the frame queued inside
+                    // rustls, and nothing else on this connection ever
+                    // pushes it to the socket (the read half never writes).
+                    // On plain TCP `flush` is a no-op. A shutdown while
+                    // flushing cancels it exactly as a shutdown while
+                    // writing does.
+                    result = async {
+                        write_half.write_all(&frame).await?;
+                        write_half.flush().await
+                    } => result,
                     _ = shutdown_rx.changed() => Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionAborted,
                         "connection closed while the request was being written",
@@ -973,8 +984,8 @@ impl Connection {
             }
         }
 
-        // Everything past this point runs only once `write_all` above has
-        // returned `Ok` — the frame is fully on the wire, so any failure
+        // Everything past this point runs only once the write and flush above
+        // have returned `Ok` — the frame is fully on the wire, so any failure
         // from here on can no longer be reported as "never sent" (issue
         // #225): `apply_reconnecting_no_replay`'s non-idempotent callers
         // (incr/decr, CAS, delete_if_matches) key off exactly this
@@ -2550,5 +2561,154 @@ mod tests {
             ResponseKind::try_from((b'T', None, None, None)),
             Err(Error::NotNumeric)
         ));
+    }
+
+    /// A request must be flushed out of the TLS session, not just handed to
+    /// it. tokio-rustls's `poll_write` accepts plaintext into rustls and
+    /// returns `Ready` once the socket would block, leaving up to ~64 KiB of
+    /// encrypted output queued inside rustls; only `flush` pushes that tail
+    /// to the socket, and nothing else on a connection does (the read half
+    /// never writes). A large frame to a server that reads slowly therefore
+    /// stopped short, the server never saw its end and never answered, and
+    /// the request timed out.
+    ///
+    /// Kernel socket buffers are what normally decide whether a write blocks
+    /// (and they differ per OS), so this test sets both ends' buffers small
+    /// and has the server read nothing for a while after the request header,
+    /// then drain the body in small steps: the kernel buffers and rustls's
+    /// queue are then full when the client's last plaintext is accepted, so
+    /// without a flush ~64 KiB is left in rustls and never sent.
+    #[cfg(feature = "tls")]
+    mod tls_flush {
+        use super::*;
+        use tokio::net::{TcpSocket, TcpStream};
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+        use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        // Throwaway test-only credentials (100-year validity): a CA and a
+        // `localhost` / `127.0.0.1` server leaf signed by it.
+        const CA_PEM: &str = include_str!("../tests/fixtures/tls-test-ca.pem");
+        const SERVER_CERT_PEM: &str = include_str!("../tests/fixtures/tls-test-server.pem");
+        const SERVER_KEY_PEM: &str = include_str!("../tests/fixtures/tls-test-server-key.pem");
+
+        const VALUE_LEN: usize = 1_000_000;
+        const SMALL_SOCKET_BUFFER: u32 = 4096;
+        /// How long the server reads nothing after the request header.
+        const STALL: Duration = Duration::from_millis(300);
+        const DRAIN_CHUNK: usize = 4096;
+        const DRAIN_PAUSE: Duration = Duration::from_micros(200);
+        const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+        async fn read_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> String {
+            let mut line = Vec::new();
+            loop {
+                let byte = reader.read_u8().await.unwrap();
+                if byte == b'\n' {
+                    return String::from_utf8(line).unwrap();
+                }
+                line.push(byte);
+            }
+        }
+
+        /// Serves one untagged `S <key-len> <value-len>` request: stalls,
+        /// drains the body slowly, and answers `S` only once its last byte
+        /// has arrived.
+        async fn serve_one_set(tcp: TcpStream, acceptor: TlsAcceptor) {
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let header = read_line(&mut tls).await;
+            let fields: Vec<&str> = header.split(' ').collect();
+            assert_eq!(fields[0], "S", "unexpected request header {header:?}");
+            let body: usize =
+                fields[1].parse::<usize>().unwrap() + fields[2].parse::<usize>().unwrap();
+            tokio::time::sleep(STALL).await;
+            let mut buf = vec![0u8; DRAIN_CHUNK];
+            let mut got = 0;
+            while got < body {
+                let want = (body - got).min(DRAIN_CHUNK);
+                if tls.read_exact(&mut buf[..want]).await.is_err() {
+                    return; // the client gave up (test failure) or closed
+                }
+                got += want;
+                tokio::time::sleep(DRAIN_PAUSE).await;
+            }
+            tls.write_all(b"S\n").await.unwrap();
+            tls.flush().await.unwrap();
+            // Hold the connection open until the client has read the reply.
+            let _ = tls.read_u8().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_large_set_over_tls_is_flushed_to_a_slow_reading_server() {
+            let certs: Vec<CertificateDer<'static>> =
+                rustls_pemfile::certs(&mut SERVER_CERT_PEM.as_bytes())
+                    .map(|cert| cert.unwrap())
+                    .collect();
+            let key: PrivateKeyDer<'static> =
+                rustls_pemfile::private_key(&mut SERVER_KEY_PEM.as_bytes())
+                    .unwrap()
+                    .unwrap();
+            let server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+            // Set before `listen`, so the accepted socket inherits it.
+            let listener_socket = TcpSocket::new_v4().unwrap();
+            listener_socket
+                .set_recv_buffer_size(SMALL_SOCKET_BUFFER)
+                .unwrap();
+            listener_socket
+                .bind("127.0.0.1:0".parse().unwrap())
+                .unwrap();
+            let listener = listener_socket.listen(1).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                serve_one_set(tcp, acceptor).await;
+            });
+
+            let mut roots = RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut CA_PEM.as_bytes()) {
+                roots.add(cert.unwrap()).unwrap();
+            }
+            let client_config = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let client_socket = TcpSocket::new_v4().unwrap();
+            client_socket
+                .set_send_buffer_size(SMALL_SOCKET_BUFFER)
+                .unwrap();
+            let tcp = client_socket.connect(addr).await.unwrap();
+            tcp.set_nodelay(true).unwrap();
+            let tls = TlsConnector::from(Arc::new(client_config))
+                .connect(ServerName::try_from("localhost").unwrap(), tcp)
+                .await
+                .unwrap();
+
+            let connection = Connection::new(
+                Stream::Tls(Box::new(tls)),
+                "127.0.0.1:0".to_string(),
+                false,
+                Arc::new(AtomicU64::new(0)),
+                REQUEST_TIMEOUT,
+            );
+            let value: Vec<u8> = (0..VALUE_LEN as u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+                .collect();
+
+            let started = Instant::now();
+            let result =
+                tokio::time::timeout(REQUEST_TIMEOUT, connection.set(b"", b"k", &value, 0)).await;
+            assert!(
+                matches!(result, Ok(Ok(()))),
+                "a {VALUE_LEN}-byte set over TLS did not complete: {result:?} after {:?} \
+                 (the tail of the request is stuck in rustls's send buffer without a flush)",
+                started.elapsed()
+            );
+            connection.close();
+            server.abort();
+        }
     }
 }
