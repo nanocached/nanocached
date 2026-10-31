@@ -1,0 +1,184 @@
+name: Dependency audit
+
+# Vulnerability scans of every component's dependencies, weekly and on
+# demand. CI tests what the code does; nothing there asks whether a
+# dependency has a published advisory, and Dependabot alerts alone left
+# Spring Framework and Spring Boot several security patch releases behind
+# for months (the Gradle `api` declarations were not seen) and a Rust SDK
+# lockfile on a rustls with four advisories.
+#
+# Each job fails on a vulnerability and prints what it found. Warnings
+# that are not vulnerabilities (an unmaintained crate, an advisory for an
+# API the crate does not use) are reported in the log but do not fail the
+# job: cargo-audit's own default. A failure is a finding to act on, not
+# noise: bump the dependency, or record why the advisory does not apply.
+#
+# The Java SDK and the three Java adapters are covered by Dependabot
+# (.github/dependabot.yml names their four Gradle projects), which opens a
+# pull request for an advisory instead of failing a job here.
+
+on:
+  schedule:
+    # Mondays 06:00 UTC, after the weekend's nightly runs.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    # The server crate (one lockfile at the root), the Rust SDK and the
+    # bulk benchmark tool. The SDK's lockfile is not tracked (a library),
+    # so its audit resolves one first, against today's registry.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@d5f9268ff7620505a81ada10ddf18cdd72240185 # nextest
+        with:
+          tool: cargo-audit
+
+      - name: Audit the server crate
+        run: cargo audit
+
+      - name: Audit the Rust SDK
+        working-directory: sdk/rust
+        run: |
+          cargo generate-lockfile
+          cargo audit
+
+      - name: Audit the bulk benchmark tool
+        working-directory: tools/bulkbench
+        run: cargo audit
+
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.23"
+          cache: false
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      # Stdlib-only module: this reports advisories against the Go
+      # standard library itself for the toolchain in use.
+      - name: Audit the Go SDK
+        working-directory: sdk/go
+        run: govulncheck ./...
+
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade "pip>=26.2.2"
+          python -m pip install pip-audit
+
+      # Each project is installed into a virtual environment of its own
+      # and that environment is audited, so the result covers what a user
+      # who installs the package today gets, transitive dependencies
+      # included (the Django adapter pulls in Django and the published
+      # SDK).
+      - name: Audit the Python SDK
+        run: |
+          python -m venv .venv-sdk
+          .venv-sdk/bin/python -m pip install --quiet --upgrade "pip>=26.2.2"
+          .venv-sdk/bin/python -m pip install --quiet ./sdk/python
+          pip-audit --strict --python .venv-sdk/bin/python
+
+      - name: Audit the Django adapter
+        run: |
+          python -m venv .venv-django
+          .venv-django/bin/python -m pip install --quiet --upgrade "pip>=26.2.2"
+          .venv-django/bin/python -m pip install --quiet ./adapters/django
+          pip-audit --strict --python .venv-django/bin/python
+
+  npm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [sdk/typescript, adapters/cache-manager, adapters/keyv]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          package_json_file: ${{ matrix.package }}/package.json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          check-latest: true
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.package }}
+        run: pnpm install
+
+      # `--prod`: what the package's users install; the dev tooling is
+      # audited by Dependabot.
+      - name: Audit
+        working-directory: ${{ matrix.package }}
+        run: pnpm audit --prod
+
+  dotnet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          - sdk/dotnet/src/Nanocached/Nanocached.csproj
+          - adapters/dotnet/src/Nanocached.Caching/Nanocached.Caching.csproj
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore
+        run: dotnet restore "${{ matrix.project }}"
+
+      # `dotnet list package --vulnerable` exits 0 whatever it finds, so
+      # the job fails on the line the command prints for a hit.
+      - name: Audit
+        run: |
+          dotnet list "${{ matrix.project }}" package --vulnerable --include-transitive | tee audit.txt
+          if grep -q "has the following vulnerable packages" audit.txt; then
+            echo "::error::vulnerable packages found in ${{ matrix.project }}"
+            exit 1
+          fi
