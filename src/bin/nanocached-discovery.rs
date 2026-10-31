@@ -2801,7 +2801,13 @@ async fn start_join(
 
 /// Records a ready node's completion report for the in-progress join. If
 /// this was the last of `expected` to report in, promotes the joining
-/// node and lets the next `Waiting` node (if any) start.
+/// node and returns `true`; the caller then acks the report and starts
+/// the next `Waiting` node (if any) with `try_begin_next_join`. Issue
+/// #1029: that fan-out used to run in here, before the ack, so a ready
+/// node that was slow to answer its `M` (up to three attempts of 10 s
+/// each) held the `A` past the reporter's own 10 s wait for it; the
+/// reporter then logged a false "reporting completion failed" WARN and
+/// its join-flip re-replication waited for the retry.
 ///
 /// Tenth-pass audit (2026-09-02), issue #421(c)/#34: `generation`, if the
 /// reporter's own `M` carried one, must match the in-progress
@@ -2837,27 +2843,23 @@ async fn start_join(
 async fn handle_complete(
     registry: &Registry,
     current_join: &CurrentJoin,
-    auth_secret: &Option<Bytes>,
-    tls_connector: &Option<TlsConnector>,
-    replication: usize,
-    joins_ready_at: Instant,
     reporting_name: &str,
     for_joining_name: &str,
     token: &str,
     generation: Option<u64>,
-) {
+) -> bool {
     let joining_name = {
         let mut join_guard = lock_current_join(current_join);
 
         let Some(pending) = join_guard.as_mut() else {
-            return;
+            return false;
         };
 
         // Issue #5: a report for an earlier, since-abandoned join must
         // not be credited to this one — the reporter has sent this join's
         // target nothing.
         if pending.joining_name != for_joining_name {
-            return;
+            return false;
         }
 
         // Issue #421(c): a report for the right `joining_name` but a
@@ -2877,7 +2879,7 @@ async fn handle_complete(
                  superseded incarnation of this join",
                 pending.generation
             );
-            return;
+            return false;
         }
 
         // Issue #34 forged-completion fix: verify `token` against the
@@ -2898,7 +2900,7 @@ async fn handle_complete(
                 "WARN ignored handoff-complete report from {reporting_name} for \
                  {for_joining_name}: not a ready member of this join"
             );
-            return;
+            return false;
         };
         if !constant_time_eq(expected_token.as_bytes(), token.as_bytes()) {
             eprintln!(
@@ -2907,7 +2909,7 @@ async fn handle_complete(
                  when this join started — either a forged report or a stale one from a \
                  node that re-registered under this name since"
             );
-            return;
+            return false;
         }
 
         pending.completed.insert(reporting_name.to_string());
@@ -2918,7 +2920,7 @@ async fn handle_complete(
         );
 
         if pending.completed.len() < pending.expected.len() {
-            return;
+            return false;
         }
 
         let joining_name = pending.joining_name.clone();
@@ -2927,15 +2929,7 @@ async fn handle_complete(
     };
 
     promote_to_joined(registry, &joining_name);
-    try_begin_next_join(
-        registry,
-        current_join,
-        auth_secret,
-        tls_connector,
-        replication,
-        joins_ready_at,
-    )
-    .await;
+    true
 }
 
 /// Called whenever any node's connection to discovery ends (cleanly or
@@ -4987,20 +4981,34 @@ async fn handle_connection(
                 token,
                 generation,
             }) => {
-                handle_complete(
+                let completed = handle_complete(
                     &registry,
                     &current_join,
-                    &config.auth_secret,
-                    &config.tls_connector,
-                    config.replication,
-                    config.list_ready_at,
                     &name,
                     &joining_name,
                     &token,
                     generation,
                 )
                 .await;
-                write_response(&mut stream, b"A\n").await?;
+                // Ack first, then start the next waiting node (issue
+                // #1029): the `M` fan-out below can take up to three
+                // 10 s attempts against a slow ready node, and the
+                // reporter waits only about 10 s for this ack. The
+                // fan-out runs whether or not the ack was delivered — a
+                // reporter that gave up on it has still handed off.
+                let acked = write_response(&mut stream, b"A\n").await;
+                if completed {
+                    try_begin_next_join(
+                        &registry,
+                        &current_join,
+                        &config.auth_secret,
+                        &config.tls_connector,
+                        config.replication,
+                        config.list_ready_at,
+                    )
+                    .await;
+                }
+                acked?;
                 continue;
             }
             Err(ParseError::Incomplete) => {}
@@ -9661,6 +9669,108 @@ mod tests {
         assert_eq!(
             lock(&registry).get("node-b").unwrap().state,
             NodeState::Joined
+        );
+    }
+
+    /// Issue #1029: the `A` for the last `C` goes out before the next
+    /// waiting node's `M` fan-out, not after it. A ready node that never
+    /// answers its `M` used to hold the ack for the fan-out's attempts
+    /// (three of 10 s), past the reporter's own 10 s wait for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_completion_ack_is_written_before_the_next_joins_fan_out() {
+        // Node A is ready, at the address of a listener that accepts the
+        // next join's `M` and never answers it.
+        let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_addr = blackhole.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (connection, _) = blackhole.accept().await.unwrap();
+                held.push(connection);
+            }
+        });
+
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(blackhole_addr, NodeState::Joined, "tk-node-a".to_string()),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
+        );
+        lock(&registry).insert(
+            "node-c".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:3".to_string(),
+                NodeState::Waiting,
+                "tk-node-c".to_string(),
+            ),
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation: 1,
+        })));
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_a, server_a) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_a),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        // A's report completes B's join; C is next and its `M` to A hangs
+        // for the fan-out's three 10 s attempts. Real time, not the paused
+        // clock: the ack travels through a real socket, and the paused
+        // clock jumps to the fan-out's timers while it is in flight.
+        node_a
+            .write_all(b"C 6 6 9\nnode-anode-btk-node-a")
+            .await
+            .unwrap();
+        let mut ack = [0u8; 2];
+        timeout(Duration::from_secs(3), node_a.read_exact(&mut ack))
+            .await
+            .expect("the ack must not wait for the next join's M fan-out")
+            .unwrap();
+        assert_eq!(&ack, b"A\n");
+        assert_eq!(
+            lock(&registry).get("node-b").unwrap().state,
+            NodeState::Joined
+        );
+
+        // The next join still starts; only the ack no longer waits for it.
+        for _ in 0..1000 {
+            if lock(&registry).get("node-c").map(|info| info.state) == Some(NodeState::Joining) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            lock(&registry).get("node-c").map(|info| info.state),
+            Some(NodeState::Joining)
         );
     }
 
