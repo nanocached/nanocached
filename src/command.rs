@@ -427,7 +427,11 @@ pub enum Command {
     /// Internal-only (issue #124): the metrics endpoint's snapshot
     /// request — never produced by `parse()`, constructed by the metrics
     /// server task. Answered with `Response::Stats`.
-    Stats,
+    /// Internal-only: the metrics snapshot, with at most this many
+    /// per-namespace rows (the largest by bytes) — see `Cache::stats_top`.
+    Stats {
+        largest_namespaces: usize,
+    },
     /// Internal-only (staged node join): the active-deletion pass, run
     /// periodically by a background task. Since TTL expiry is otherwise
     /// only checked lazily on access, proactively removes anything
@@ -723,7 +727,9 @@ impl Command {
                 Response::Unmarked
             }
 
-            Self::Stats => Response::Stats(Box::new(cache.stats())),
+            Self::Stats { largest_namespaces } => {
+                Response::Stats(Box::new(cache.stats_top(largest_namespaces)))
+            }
 
             Self::Sweep {
                 marked: true,
