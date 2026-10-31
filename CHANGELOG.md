@@ -105,6 +105,13 @@ framework adapters at one version, whether or not a component changed.
   more than the whole budget waits for it to be free and then runs alone;
   one that cannot get its charge within 10 seconds closes its connection,
   like a reply that cannot be charged.
+- `nanocached-node`, `nanocached-proxy`, `nanocached-discovery`: a
+  `NANOCACHED_AUTH_SECRET` (or, for the proxy, the deprecated
+  `NANOCACHED_SECRET`) that was set but not valid UTF-8 counted as unset, so
+  the server started without authentication, on a loopback bind without a
+  warning. Such a value is now refused at startup with a message naming the
+  variable: every SDK sends the secret as UTF-8, so no client could have
+  presented it.
 
 ## [0.5.1] - 2026-10-27
 

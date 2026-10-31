@@ -36,6 +36,34 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // ─── TCP keepalive ─────────────────────────────────────────────────────
 
+/// Reads the shared auth secret `name` from the environment: unset or empty
+/// means no secret (authentication is not required), a value that is set
+/// but not valid UTF-8 is an error. It used to count as unset: every SDK
+/// sends its secret as UTF-8, so no client could ever present such a
+/// value, and starting without authentication because of it opened the
+/// server silently (on a loopback bind without so much as a warning).
+pub fn read_env_secret(name: &str) -> Result<Option<String>, String> {
+    env_secret_value(name, std::env::var(name))
+}
+
+/// `read_env_secret` on an already-read value, so the not-UTF-8 case can
+/// be tested without touching the process environment.
+pub fn env_secret_value(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<String>, String> {
+    match value {
+        Ok(secret) if secret.is_empty() => Ok(None),
+        Ok(secret) => Ok(Some(secret)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "{name} is set but is not valid UTF-8; every client sends its secret as UTF-8, so \
+             no client could present this one, and it is refused rather than treated as unset \
+             (which would start the server without authentication)"
+        )),
+    }
+}
+
 /// Idle time before the kernel sends the first keepalive probe on a
 /// connection that [`enable_tcp_keepalive`] was applied to.
 pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
@@ -1074,5 +1102,35 @@ mod tests {
 
         drop(try_acquire_per_ip(&counts, ip, 4).expect("fits"));
         assert!(counts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_env_secret_that_is_unset_or_empty_means_no_secret() {
+        assert_eq!(
+            env_secret_value("X", Err(std::env::VarError::NotPresent)),
+            Ok(None)
+        );
+        assert_eq!(env_secret_value("X", Ok(String::new())), Ok(None));
+        assert_eq!(
+            env_secret_value("X", Ok("s3cret".to_string())),
+            Ok(Some("s3cret".to_string()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_env_secret_that_is_not_utf8_is_an_error_not_an_unset_variable() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        let error = env_secret_value(
+            "NANOCACHED_AUTH_SECRET",
+            Err(std::env::VarError::NotUnicode(raw)),
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("NANOCACHED_AUTH_SECRET is set but is not valid UTF-8"),
+            "{error}"
+        );
+        assert!(error.contains("rather than treated as unset"), "{error}");
     }
 }

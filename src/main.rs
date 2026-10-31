@@ -10,7 +10,7 @@ mod server;
 mod sim;
 
 use bytes::Bytes;
-use nanocached::infra::{load_tls_acceptor, load_tls_connector};
+use nanocached::infra::{self, load_tls_acceptor, load_tls_connector};
 use server::HeartbeatConfig;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -58,12 +58,10 @@ const MAX_SEMAPHORE_PERMITS: usize = tokio::sync::Semaphore::MAX_PERMITS;
 /// Reads the shared auth secret from the environment rather than a CLI
 /// flag, since CLI arguments are visible to anyone who can list processes
 /// (e.g. `ps`) on the host. An unset or empty value means auth is not
-/// required, matching Redis's own `requirepass`-unset default.
-fn read_auth_secret() -> Option<Bytes> {
-    std::env::var(AUTH_SECRET_ENV_VAR)
-        .ok()
-        .filter(|secret| !secret.is_empty())
-        .map(Bytes::from)
+/// required, matching Redis's own `requirepass`-unset default; a value
+/// that is not valid UTF-8 is a startup error (`infra::read_env_secret`).
+fn read_auth_secret() -> Result<Option<Bytes>, String> {
+    infra::read_env_secret(AUTH_SECRET_ENV_VAR).map(|secret| secret.map(Bytes::from))
 }
 
 struct Args {
@@ -474,7 +472,13 @@ async fn main() -> ExitCode {
     }
 
     let address = format!("{}:{}", args.host, args.port);
-    let auth_secret = read_auth_secret();
+    let auth_secret = match read_auth_secret() {
+        Ok(secret) => secret,
+        Err(message) => {
+            eprintln!("nanocached-node: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
     // An unauthenticated connection is held to a 4096-byte `A` frame (see
     // `server::UNAUTHENTICATED_MAX_REQUEST_SIZE`), so a longer secret could
     // never be presented by anyone: refuse it up front rather than start a
