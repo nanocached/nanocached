@@ -94,6 +94,12 @@ framework adapters at one version, whether or not a component changed.
   per key (64 MiB for a thousand keys under a 64 KiB name) and the next write
   evicted other namespaces' live entries to make room for it. A mark is now
   charged its key copy plus a fixed overhead, whatever the namespace's name.
+- `nanocached-node`: an `M` that supersedes a completed handoff, or an `X`
+  that abandons one, restored the handoff's marked copies one cache round
+  trip per key before writing its ack, about 12 µs a key: a node holding a
+  million marked copies answered 12 s late, past the 10 s discovery waits for
+  the ack, so discovery retried the `M` into a conflict and abandoned the
+  join again. The restore is now one cache command for the whole list.
 - `nanocached-node`: a copy that a join took away while this node was still
   sending to the joiner (a re-replicated put-if-absent for a key the join
   moved) was marked dead but missing from the handoff's list of marks, so

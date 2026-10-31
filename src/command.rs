@@ -368,6 +368,11 @@ pub enum Command {
     UnmarkMigrated {
         key: Key,
     },
+    /// Internal-only: `UnmarkMigrated` for a whole restore in one round
+    /// trip to the cache task (see `Cache::unmark_migrated_many`).
+    UnmarkMigratedMany {
+        keys: Vec<Key>,
+    },
     /// `U <ns-len> <key-len> <val-len> <token-len> [ttl] [A] [tag]\n
     /// <token><ns><key><value>` (issue #124, cluster-internal like
     /// `M`/`X`): a decommissioning node handing one of its entries to the
@@ -724,6 +729,11 @@ impl Command {
 
             Self::UnmarkMigrated { key } => {
                 cache.unmark_migrated(&key);
+                Response::Unmarked
+            }
+
+            Self::UnmarkMigratedMany { keys } => {
+                cache.unmark_migrated_many(&keys);
                 Response::Unmarked
             }
 
