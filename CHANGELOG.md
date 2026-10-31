@@ -40,6 +40,17 @@ framework adapters at one version, whether or not a component changed.
   skipped by re-replication, and removed by a sweep when another owner
   exists. The list now keeps those marks, on completion and when the
   transfer is cancelled or fails.
+- `nanocached-node`: the request-size limit was checked against the whole
+  receive buffer after each read instead of against one frame. The buffer
+  grows by doubling, so once it was past 1 MiB a single read could bring the
+  tail of a valid large frame together with the frames pipelined behind it,
+  and the node refused the lot as one request over the limit (`En`, connection
+  closed) although no frame was over it. Through the proxy, which writes every
+  client's frames back to back on a shared backend connection, a value of
+  about 650 KiB or more set by one client could trigger it; the proxy then
+  dropped that connection and failed the other clients' requests in flight on
+  it. The limit is now applied to the frame itself: to the frame just parsed,
+  or to the one still arriving.
 
 ## [0.5.1] - 2026-10-27
 

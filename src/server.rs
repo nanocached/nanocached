@@ -400,6 +400,11 @@ const MAX_FORWARD_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 /// queue for 140,000 pairs).
 const FORWARD_ENTRY_OVERHEAD_BYTES: usize = 320;
 
+/// Whether one frame of `size` bytes is over `MAX_REQUEST_SIZE`. A bound
+/// on a frame, not on the receive buffer: `handle_connection` applies it
+/// to the frame `parse` took, or to the front frame still arriving, never
+/// to the buffer after a read (which also holds what was pipelined
+/// behind that frame).
 fn request_is_too_large(size: usize) -> bool {
     size > MAX_REQUEST_SIZE
 }
@@ -2418,14 +2423,33 @@ async fn handle_connection(
             ));
         }
 
+        let buffered_before = received.len();
         let parsed = parse_resumable(&mut received, tagged, &mut parse_progress);
 
-        // Only a fully parsed command extends the deadline — an
-        // `Incomplete` result (more bytes needed) leaves it untouched, so
-        // a client that trickles bytes in without ever finishing a
-        // command can't renew its own budget one byte at a time. See
-        // `IDLE_TIMEOUT`'s doc comment.
         if parsed.is_ok() {
+            // `MAX_REQUEST_SIZE` is a bound on one frame, so it is checked
+            // against the frame `parse` just took off the front of
+            // `received` — never against `received.len()` after a read,
+            // which also holds whatever the client pipelined behind that
+            // frame. A buffer grown past the limit by doubling (see the
+            // `reserve` below) once took the tail of a valid 700 KiB frame
+            // and the frames behind it in one read, and the sum was
+            // refused as "too large" although no frame was. Through the
+            // proxy's shared backend connection, where every client's
+            // frames arrive back to back, that poisoned the connection
+            // for the other clients.
+            if request_is_too_large(buffered_before - received.len()) {
+                return Err(reject_oversized_request(
+                    &mut stream,
+                    "request is too large".to_string(),
+                )
+                .await);
+            }
+            // Only a fully parsed command extends the deadline — an
+            // `Incomplete` result (more bytes needed) leaves it untouched,
+            // so a client that trickles bytes in without ever finishing a
+            // command can't renew its own budget one byte at a time. See
+            // `IDLE_TIMEOUT`'s doc comment.
             deadline = Instant::now() + config.idle_timeout;
         }
 
@@ -3680,6 +3704,18 @@ async fn handle_connection(
                     )
                     .await);
                 }
+                // `parse` leaves `received` untouched on `Incomplete` and
+                // every complete frame before this one has been taken off,
+                // so what is buffered here is the front frame alone: the
+                // one place the limit can be applied to a frame still
+                // arriving (the complete-frame case is handled above).
+                if request_is_too_large(received.len()) {
+                    return Err(reject_oversized_request(
+                        &mut stream,
+                        "request is too large".to_string(),
+                    )
+                    .await);
+                }
             }
             Err(error) => {
                 return Err(reject_request(&mut stream, format!("{error:?}")).await);
@@ -3778,12 +3814,6 @@ async fn handle_connection(
                 io::ErrorKind::UnexpectedEof,
                 "connection closed before request was complete",
             ));
-        }
-
-        if request_is_too_large(received.len()) {
-            return Err(
-                reject_oversized_request(&mut stream, "request is too large".to_string()).await,
-            );
         }
     }
 }
@@ -14310,6 +14340,108 @@ mod tests {
         let mut request = format!("S 4 {}\nname", MAX_REQUEST_SIZE).into_bytes();
         request.extend_from_slice(&vec![b'v'; MAX_REQUEST_SIZE]);
         client.write_all(&request).await.unwrap();
+        assert_eq!(read_until_close(&mut client).await, b"En\n");
+        drop(client);
+
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "request is too large");
+
+        drop(senders);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_large_frame_and_the_frames_pipelined_behind_it_are_served_whatever_one_read_brings()
+    {
+        // The limit is per frame. A 1,000 KiB `S` whose last bytes arrive
+        // in the same read as the `G` frames pipelined behind it used to
+        // be refused as one "request" over 1 MiB: the receive buffer grows
+        // by doubling, so once its capacity is past the limit a single
+        // read can bring a valid frame's tail together with what is
+        // queued after it.
+        //
+        // The writes are paced so the node drains each before the next: a
+        // 100 KiB `S` and the first 40 KiB of the big one leave the buffer
+        // shrunk to 40 KiB once the small one is answered; the big one's
+        // body then grows it 80, 160, 320, 640, 1280 KiB and stops 10 KiB
+        // short of its end; and the last write (that tail plus 48 KiB of
+        // `G`s) lands in a buffer holding 1,014 KiB with 266 KiB spare, so
+        // the read that completes the big frame also brings `G`s past the
+        // 1 MiB mark whatever size the kernel hands over at once.
+        let (mut client, server) = tcp_pair().await;
+        let (connection_task, cache_task, senders) =
+            spawn_secret_connection(server, b"correct-secret", IDLE_TIMEOUT);
+
+        client.write_all(b"A 14\ncorrect-secret").await.unwrap();
+        let mut ack = [0_u8; 3];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"On\n");
+
+        const SMALL_LEN: usize = 100 * 1024;
+        const VALUE_LEN: usize = 1000 * 1024;
+        const HEAD: usize = 40 * 1024;
+        const HELD_BACK: usize = 10 * 1024;
+        const PIPELINED_GETS: usize = 8_000;
+        let mut small = format!("S 5 {SMALL_LEN}\nsmall").into_bytes();
+        small.extend_from_slice(&vec![b's'; SMALL_LEN]);
+        let mut big = format!("S 4 {VALUE_LEN}\nname").into_bytes();
+        big.extend_from_slice(&vec![b'v'; VALUE_LEN]);
+        let (head, rest) = big.split_at(HEAD);
+        let (middle, tail) = rest.split_at(rest.len() - HELD_BACK);
+
+        small.extend_from_slice(head);
+        client.write_all(&small).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        client.write_all(middle).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut last = tail.to_vec();
+        for _ in 0..PIPELINED_GETS {
+            last.extend_from_slice(b"G 2\nzz");
+        }
+        client.write_all(&last).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let response = read_until_close(&mut client).await;
+        let mut expected = b"S\nS\n".to_vec();
+        for _ in 0..PIPELINED_GETS {
+            expected.extend_from_slice(b"N\n");
+        }
+        assert_eq!(
+            response.len(),
+            expected.len(),
+            "{:?}",
+            String::from_utf8_lossy(&response[..response.len().min(40)])
+        );
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(senders);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_over_the_limit_that_completes_within_one_read_is_still_refused() {
+        // The complement of the test above: a frame can now complete
+        // inside a buffer bigger than the limit, so the limit is applied
+        // to the frame `parse` took, not only to a frame still arriving.
+        // 600 KiB first, so the buffer's capacity is past 1 MiB when the
+        // rest of the 1 MiB + 1 byte value lands in one read.
+        let (mut client, server) = tcp_pair().await;
+        let (connection_task, cache_task, senders) =
+            spawn_secret_connection(server, b"correct-secret", IDLE_TIMEOUT);
+
+        client.write_all(b"A 14\ncorrect-secret").await.unwrap();
+        let mut ack = [0_u8; 3];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"On\n");
+
+        let mut request = format!("S 4 {}\nname", MAX_REQUEST_SIZE).into_bytes();
+        request.extend_from_slice(&vec![b'v'; MAX_REQUEST_SIZE]);
+        let (head, tail) = request.split_at(600 * 1024);
+        client.write_all(head).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        client.write_all(tail).await.unwrap();
         assert_eq!(read_until_close(&mut client).await, b"En\n");
         drop(client);
 
