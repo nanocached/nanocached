@@ -967,6 +967,26 @@ struct PendingJoin {
     generation: u64,
 }
 
+impl PendingJoin {
+    fn identity(&self) -> JoinIdentity {
+        JoinIdentity {
+            joining_name: self.joining_name.clone(),
+            generation: self.generation,
+        }
+    }
+}
+
+/// Which incarnation of a join a decision was made about (issue #1030):
+/// its joining node's name and `PendingJoin::generation`. An abandon
+/// decided for one join must not take a different join that came to
+/// occupy the slot in the meantime, and a retried `M` must not go out
+/// for a join that has since been abandoned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JoinIdentity {
+    joining_name: String,
+    generation: u64,
+}
+
 type CurrentJoin = Arc<Mutex<Option<PendingJoin>>>;
 
 /// The node registry and staged node join join-orchestration state, bundled since
@@ -2146,6 +2166,7 @@ async fn try_begin_next_join(
         // same lock scope, so this lookup is always present.
         let ready_token = ready_tokens.get(&ready_name).cloned().unwrap_or_default();
         let fanout_limit = Arc::clone(&fanout_limit);
+        let current_join = Arc::clone(current_join);
 
         sends.spawn(async move {
             let _permit = fanout_limit
@@ -2165,6 +2186,13 @@ async fn try_begin_next_join(
                 replication,
                 generation,
                 OUTBOUND_IO_TIMEOUT,
+                || {
+                    lock_current_join(&current_join)
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.joining_name == joining_name && pending.generation == generation
+                        })
+                },
             )
             .await;
 
@@ -2242,7 +2270,9 @@ fn credit_migrate_send_result(
 /// connect) since a failed write/read leaves the previous connection's
 /// state unknown. This only bounds the *send* — the handoff itself,
 /// reported back asynchronously via `C`, stays a separate, unretried
-/// concern (see `send_migrate`'s own docs).
+/// concern (see `send_migrate`'s own docs). `still_current` says whether
+/// the join this `M` is for is still the pending one; checked before
+/// every attempt (issue #1030, see the loop).
 #[allow(clippy::too_many_arguments)]
 async fn send_migrate_with_retry(
     token: &str,
@@ -2257,10 +2287,41 @@ async fn send_migrate_with_retry(
     replication: usize,
     generation: u64,
     io_timeout: Duration,
+    still_current: impl Fn() -> bool,
 ) -> io::Result<usize> {
     let mut last_error = None;
 
     for attempt in 1..=MIGRATE_SEND_ATTEMPTS {
+        // Issue #1030: an abandon (`abandon_current_join`, which sends `X`
+        // to every ready member) can land between two attempts. A retry
+        // after it would reach the node after its `X` — a no-op there,
+        // since nothing was pending yet — and start a handoff to a joiner
+        // discovery has already dropped; if that joiner re-registers, the
+        // occupied slot then rejects the new join's `M`. So the send stops
+        // here, and if an earlier attempt may have landed (its ack lost in
+        // transit), an `X` of this send's own follows it.
+        if !still_current() {
+            if attempt > 1
+                && let Err(error) = send_cancel(
+                    token,
+                    address,
+                    auth_secret,
+                    tls_connector,
+                    joining_name,
+                    io_timeout,
+                )
+                .await
+            {
+                eprintln!(
+                    "WARN failed to send X (cancel) to {ready_name} for the abandoned join of \
+                     {joining_name}: {error}"
+                );
+            }
+            return Err(io::Error::other(format!(
+                "join of {joining_name} (generation {generation}) abandoned before attempt \
+                 {attempt}/{MIGRATE_SEND_ATTEMPTS}"
+            )));
+        }
         match send_migrate(
             token,
             address,
@@ -3014,12 +3075,16 @@ async fn on_node_connection_ended(
     // this function's own doc comment, issue #3/#9) — abandons it here.
     // A ready member's connection dying deliberately never does, for the
     // separate reason explained above.
-    let is_current_joining_node = owns_entry
-        && lock_current_join(current_join)
+    let join_of_this_node: Option<JoinIdentity> = if owns_entry {
+        lock_current_join(current_join)
             .as_ref()
-            .is_some_and(|pending| pending.joining_name == name);
+            .filter(|pending| pending.joining_name == name)
+            .map(PendingJoin::identity)
+    } else {
+        None
+    };
 
-    if is_current_joining_node {
+    if let Some(join) = join_of_this_node {
         abandon_current_join(
             registry,
             current_join,
@@ -3027,13 +3092,15 @@ async fn on_node_connection_ended(
             tls_connector,
             replication,
             joins_ready_at,
+            &join,
             "joining node disconnected",
         )
         .await;
     }
 }
 
-/// Scraps the current join (if any), returning every node it touched to
+/// Scraps the current join — if it is still `join`, the one the caller
+/// decided to abandon (issue #1030) — returning every node it touched to
 /// its pre-migration state: clears `current_join`, removes the joining
 /// node from the registry (it was never in `L` to begin with, so this is
 /// nothing more than dropping bookkeeping), and tells every still-
@@ -3041,6 +3108,7 @@ async fn on_node_connection_ended(
 /// `send_cancel`) — a ready node that already finished, or never gets the
 /// message, is unaffected. Then lets the next `Waiting` node (if any)
 /// start. A no-op if no join is in progress.
+#[allow(clippy::too_many_arguments)]
 async fn abandon_current_join(
     registry: &Registry,
     current_join: &CurrentJoin,
@@ -3048,9 +3116,26 @@ async fn abandon_current_join(
     tls_connector: &Option<TlsConnector>,
     replication: usize,
     joins_ready_at: Instant,
+    join: &JoinIdentity,
     reason: &str,
 ) {
-    let Some(pending) = lock_current_join(current_join).take() else {
+    // Issue #1030: only the join this abandon was decided for. The sweep
+    // decides on one tick and runs the abandon on a spawned task; a `C`
+    // or a disconnect in between can have completed or replaced that join,
+    // and the join now in the slot has done nothing to deserve an `X`.
+    let pending = {
+        let mut guard = lock_current_join(current_join);
+        match guard.as_ref() {
+            Some(pending) if pending.identity() == *join => guard.take(),
+            _ => None,
+        }
+    };
+    let Some(pending) = pending else {
+        println!(
+            "INFO abandon of {} (generation {}) skipped: no longer the pending join \
+             (reason={reason})",
+            join.joining_name, join.generation
+        );
         return;
     };
     registry
@@ -3912,9 +3997,12 @@ fn cached_node_roster(registry: &Registry, replication: usize) -> Arc<[u8]> {
 /// What `sweep_expired` hands off to a background task instead of
 /// awaiting inline — the two join operations that fan out to other nodes.
 enum JoinFanout {
-    /// `abandon_current_join`: an `X` to every ready member of the join,
-    /// then the next join's `M`s.
-    Abandon(&'static str),
+    /// `abandon_current_join` for `join`: an `X` to every ready member of
+    /// the join, then the next join's `M`s.
+    Abandon {
+        reason: &'static str,
+        join: JoinIdentity,
+    },
     /// `try_begin_next_join`: the post-grace kick-off.
     BeginNext,
 }
@@ -3942,7 +4030,7 @@ impl JoinFanoutContext {
         let (replication, joins_ready_at) = (self.replication, self.joins_ready_at);
         fanouts.spawn(async move {
             match action {
-                JoinFanout::Abandon(reason) => {
+                JoinFanout::Abandon { reason, join } => {
                     abandon_current_join(
                         &registry,
                         &current_join,
@@ -3950,6 +4038,7 @@ impl JoinFanoutContext {
                         &tls_connector,
                         replication,
                         joins_ready_at,
+                        &join,
                         reason,
                     )
                     .await;
@@ -4118,23 +4207,33 @@ async fn sweep_expired(
                 // them (the abandon in flight already took it, or it never
                 // did).
                 evicted_members.extend(heartbeat_evicted.iter().cloned());
-                let ready_member_evicted_mid_join = !evicted_members.is_empty()
-                    && lock_current_join(&current_join)
-                        .as_ref()
-                        .is_some_and(|pending| {
-                            evicted_members.iter().any(|name| {
-                                pending.expected.contains_key(name)
-                                    && !pending.completed.contains(name)
+                let join_with_evicted_member: Option<JoinIdentity> =
+                    if evicted_members.is_empty() {
+                        None
+                    } else {
+                        lock_current_join(&current_join)
+                            .as_ref()
+                            .filter(|pending| {
+                                evicted_members.iter().any(|name| {
+                                    pending.expected.contains_key(name)
+                                        && !pending.completed.contains(name)
+                                })
                             })
-                        });
-                if !ready_member_evicted_mid_join {
-                    evicted_members.clear();
-                } else if fanouts.is_empty() {
-                    evicted_members.clear();
-                    fanout_context.spawn(
-                        &mut fanouts,
-                        JoinFanout::Abandon("ready member evicted mid-join"),
-                    );
+                            .map(PendingJoin::identity)
+                    };
+                match join_with_evicted_member {
+                    None => evicted_members.clear(),
+                    Some(join) if fanouts.is_empty() => {
+                        evicted_members.clear();
+                        fanout_context.spawn(
+                            &mut fanouts,
+                            JoinFanout::Abandon {
+                                reason: "ready member evicted mid-join",
+                                join,
+                            },
+                        );
+                    }
+                    Some(_) => {}
                 }
 
                 for (name, promoted) in waiting_evicted {
@@ -4155,16 +4254,25 @@ async fn sweep_expired(
 
                 // Staged node join pattern 3: a ready node alive but never
                 // reporting `C` (see `migration_timeout_for`).
-                let timed_out = lock_current_join(&current_join)
+                let timed_out: Option<JoinIdentity> = lock_current_join(&current_join)
                     .as_ref()
-                    .is_some_and(|pending| {
+                    .filter(|pending| {
                         pending.started_at.elapsed() >= migration_timeout_for(pending.max_entries)
-                    });
+                    })
+                    .map(PendingJoin::identity);
 
                 // State-based: still true on the next tick if a fan-out in
                 // flight kept this one from starting now.
-                if timed_out && fanouts.is_empty() {
-                    fanout_context.spawn(&mut fanouts, JoinFanout::Abandon("migration timeout"));
+                if let Some(join) = timed_out
+                    && fanouts.is_empty()
+                {
+                    fanout_context.spawn(
+                        &mut fanouts,
+                        JoinFanout::Abandon {
+                            reason: "migration timeout",
+                            join,
+                        },
+                    );
                 }
 
                 // Issue #63: a `J` accepted during the startup grace was
@@ -4604,23 +4712,25 @@ async fn handle_connection(
                         // later join behind it until
                         // `migration_timeout_for` eventually reaps the
                         // ghost.
-                        let abandon_reason = match removed_state {
+                        let abandon: Option<(JoinIdentity, &str)> = match removed_state {
                             Some(NodeState::Joined) => lock_current_join(&current_join)
                                 .as_ref()
-                                .is_some_and(|pending| {
+                                .filter(|pending| {
                                     pending.expected.contains_key(&name)
                                         && !pending.completed.contains(&name)
                                 })
-                                .then_some("ready member left mid-join"),
+                                .map(|pending| (pending.identity(), "ready member left mid-join")),
                             Some(NodeState::Joining) | Some(NodeState::Waiting) => {
                                 lock_current_join(&current_join)
                                     .as_ref()
-                                    .is_some_and(|pending| pending.joining_name == name)
-                                    .then_some("joining node left mid-join")
+                                    .filter(|pending| pending.joining_name == name)
+                                    .map(|pending| {
+                                        (pending.identity(), "joining node left mid-join")
+                                    })
                             }
                             None => None,
                         };
-                        if let Some(reason) = abandon_reason {
+                        if let Some((join, reason)) = abandon {
                             abandon_current_join(
                                 &registry,
                                 &current_join,
@@ -4628,6 +4738,7 @@ async fn handle_connection(
                                 &config.tls_connector,
                                 config.replication,
                                 config.list_ready_at,
+                                &join,
                                 reason,
                             )
                             .await;
@@ -8410,6 +8521,10 @@ mod tests {
             tuple
         };
 
+        let join = lock_current_join(&current_join)
+            .as_ref()
+            .unwrap()
+            .identity();
         abandon_current_join(
             &registry,
             &current_join,
@@ -8417,6 +8532,7 @@ mod tests {
             &None,
             2,
             Instant::now(),
+            &join,
             "test",
         )
         .await;
@@ -8964,6 +9080,10 @@ mod tests {
             .unwrap()
             .generation;
 
+        let join = lock_current_join(&current_join)
+            .as_ref()
+            .unwrap()
+            .identity();
         abandon_current_join(
             &registry,
             &current_join,
@@ -8971,6 +9091,7 @@ mod tests {
             &None,
             2,
             Instant::now(),
+            &join,
             "test: superseded by an immediate re-registration",
         )
         .await;
@@ -9539,6 +9660,10 @@ mod tests {
             generation: 1,
         })));
 
+        let join = lock_current_join(&current_join)
+            .as_ref()
+            .unwrap()
+            .identity();
         tokio::time::timeout(
             Duration::from_secs(30),
             abandon_current_join(
@@ -9548,6 +9673,7 @@ mod tests {
                 &None,
                 2,
                 Instant::now(),
+                &join,
                 "test",
             ),
         )
@@ -11174,6 +11300,7 @@ mod tests {
             2,
             9,
             OUTBOUND_IO_TIMEOUT,
+            || true,
         )
         .await;
 
@@ -11214,6 +11341,7 @@ mod tests {
             2,
             9,
             OUTBOUND_IO_TIMEOUT,
+            || true,
         )
         .await;
 
@@ -11224,6 +11352,159 @@ mod tests {
         );
 
         node_task.abort();
+    }
+
+    /// Issue #1030: the join is abandoned between two `M` attempts. The
+    /// retry must not go out — it would reach the node after the
+    /// abandon's `X` and start a handoff to a dropped joiner — and since
+    /// the first attempt may have landed with its ack lost, an `X` of this
+    /// send's own follows instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_with_retry_stops_after_an_abandon_and_cancels_instead_of_retrying() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        let received: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_task = Arc::clone(&received);
+        let node_task = tokio::spawn(async move {
+            // Attempt 1: accepted, then dropped without an ack.
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+            // Whatever comes next is recorded and acked.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = stream.read(&mut buffer).await.unwrap();
+            received_task
+                .lock()
+                .unwrap()
+                .push(buffer[..bytes_read].to_vec());
+            stream.write_all(b"A\n").await.unwrap();
+        });
+
+        // Current for the first attempt, abandoned by the time of the retry.
+        let checks = std::sync::atomic::AtomicU32::new(0);
+        let result = send_migrate_with_retry(
+            "ready-token",
+            "ready-node",
+            &address,
+            &None,
+            &None,
+            "joining-node",
+            "127.0.0.1:9",
+            "joiner-token",
+            &[],
+            2,
+            9,
+            OUTBOUND_IO_TIMEOUT,
+            || checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0,
+        )
+        .await;
+
+        let error = result.expect_err("an abandoned join's M is not retried");
+        assert!(
+            error.to_string().contains("abandoned before attempt 2"),
+            "{error}"
+        );
+        node_task.await.unwrap();
+        let frames = received.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(
+            frames[0].starts_with(b"X "),
+            "the second frame must be an X (cancel), got {:?}",
+            String::from_utf8_lossy(&frames[0])
+        );
+    }
+
+    /// Issue #1030: the sweep decides to abandon a join on one tick and
+    /// runs the abandon on a spawned task; if a different join occupies
+    /// the slot by then, the abandon must leave it alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandon_current_join_leaves_a_join_it_was_not_decided_for_alone() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation: 7,
+        })));
+
+        // Decided for an earlier incarnation of node-b's join (or, the same
+        // way, for a different joiner): a no-op.
+        let stale = JoinIdentity {
+            joining_name: "node-b".to_string(),
+            generation: 6,
+        };
+        abandon_current_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            &stale,
+            "test: stale decision",
+        )
+        .await;
+        assert_eq!(
+            lock_current_join(&current_join)
+                .as_ref()
+                .map(|pending| pending.generation),
+            Some(7),
+            "the join in the slot is not the one the abandon was decided for"
+        );
+        assert!(lock(&registry).contains_key("node-b"));
+        assert_eq!(
+            registry
+                .joins_abandoned_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        // Decided for the join actually in the slot: abandoned as before.
+        let current = lock_current_join(&current_join)
+            .as_ref()
+            .unwrap()
+            .identity();
+        abandon_current_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            &current,
+            "test: current decision",
+        )
+        .await;
+        assert!(lock_current_join(&current_join).is_none());
+        assert!(!lock(&registry).contains_key("node-b"));
+        assert_eq!(
+            registry
+                .joins_abandoned_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
