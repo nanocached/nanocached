@@ -1992,7 +1992,14 @@ async fn serve_metrics_connection(
     let path = read_http_request_path(&mut stream).await?;
 
     let (status, body): (&str, String) = match path.as_str() {
-        "/metrics" => match execute_command(&request_tx, Command::Stats).await {
+        "/metrics" => match execute_command(
+            &request_tx,
+            Command::Stats {
+                largest_namespaces: METRICS_MAX_NAMESPACE_SERIES,
+            },
+        )
+        .await
+        {
             Ok(Response::Stats(stats)) => {
                 let connections =
                     max_connections.saturating_sub(connection_limit.available_permits());
@@ -2215,14 +2222,17 @@ fn render_node_metrics(
         ),
     );
 
-    // `stats.namespaces` is largest-first, so the cap keeps the ones that
-    // matter for capacity.
+    // `stats.namespaces` holds the largest `METRICS_MAX_NAMESPACE_SERIES`
+    // by bytes, largest first — the cache task cut the rest off before
+    // sorting (`Cache::stats_top`), so the ones that matter for capacity
+    // are listed and a node with a million namespaces does not sort them
+    // all per scrape.
     let listed = stats.namespaces.len().min(METRICS_MAX_NAMESPACE_SERIES);
     metric(
         "nanocached_node_namespaces",
         "gauge",
         "Live namespaces (those holding at least one entry).",
-        format!("nanocached_node_namespaces {}\n", stats.namespaces.len()),
+        format!("nanocached_node_namespaces {}\n", stats.namespace_count),
     );
     metric(
         "nanocached_node_namespaces_unlisted",
@@ -2232,7 +2242,7 @@ fn render_node_metrics(
          in the node-wide gauges.",
         format!(
             "nanocached_node_namespaces_unlisted {}\n",
-            stats.namespaces.len() - listed
+            stats.namespace_count - listed
         ),
     );
 

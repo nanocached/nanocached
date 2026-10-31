@@ -171,6 +171,9 @@ impl Namespace {
 /// Issue #124: `Cache::stats`'s snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheStats {
+    /// Live namespaces (those holding at least one entry), whether or not
+    /// each has a row in `namespaces`.
+    pub namespace_count: usize,
     pub used_bytes: usize,
     pub max_memory_bytes: usize,
     pub entries: usize,
@@ -1867,8 +1870,27 @@ impl Cache {
 
     /// Issue #124: one consistent snapshot of the counters, accounting,
     /// and per-namespace breakdown, for the metrics endpoint. O(#live
-    /// namespaces) — never a walk over entries.
+    /// namespaces) — never a walk over entries. Every namespace gets a
+    /// row; `stats_top` is the bounded form the endpoint uses, and the
+    /// only one outside tests.
+    #[cfg(test)]
     pub fn stats(&self) -> CacheStats {
+        self.stats_top(usize::MAX)
+    }
+
+    /// `stats` with at most `largest` namespace rows, the largest by bytes
+    /// (ties by name); `namespace_count` still counts them all. The
+    /// endpoint renders only this many, and sorting every live namespace
+    /// for the ones it then dropped stalled the cache task for every
+    /// connection on each scrape (45 ms at 300,000 namespaces). The rows
+    /// beyond `largest` are cut off with a selection, linear in the count,
+    /// and only the kept rows are sorted.
+    pub fn stats_top(&self, largest: usize) -> CacheStats {
+        let order = |a: &NamespaceStats, b: &NamespaceStats| {
+            b.used_bytes
+                .cmp(&a.used_bytes)
+                .then_with(|| a.namespace.cmp(&b.namespace))
+        };
         let mut namespaces: Vec<NamespaceStats> = self
             .slots
             .values()
@@ -1879,15 +1901,19 @@ impl Cache {
                 budget_bytes: sub_map.budget,
             })
             .collect();
+        let namespace_count = namespaces.len();
+        if largest == 0 {
+            namespaces.clear();
+        } else if namespaces.len() > largest {
+            namespaces.select_nth_unstable_by(largest - 1, order);
+            namespaces.truncate(largest);
+        }
         // Deterministic output order (HashMap iteration isn't), largest
         // first — the read a capacity dashboard wants.
-        namespaces.sort_by(|a, b| {
-            b.used_bytes
-                .cmp(&a.used_bytes)
-                .then_with(|| a.namespace.cmp(&b.namespace))
-        });
+        namespaces.sort_by(order);
 
         CacheStats {
+            namespace_count,
             used_bytes: self.used_bytes,
             max_memory_bytes: self.max_memory_bytes,
             entries: self.entry_count,
@@ -3936,6 +3962,60 @@ mod tests {
 
         assert_eq!(cache.get(&key(b"a")), Some(Bytes::from_static(b"1")));
         assert_eq!(cache.get(&key(b"b")), Some(Bytes::from_static(b"2")));
+    }
+
+    #[test]
+    fn stats_top_keeps_the_largest_namespaces_in_order_and_counts_them_all() {
+        // 1,000 namespaces of distinct sizes; the metrics endpoint asks for
+        // the largest few. The rows it gets are the largest by bytes,
+        // largest first, and the count still says how many exist.
+        let mut cache = Cache::new(UNBOUNDED);
+        for index in 0..1_000_u32 {
+            let name = format!("ns-{index:04}");
+            // Distinct sizes: namespace i holds a value of i + 1 bytes.
+            cache.set(
+                namespaced(name.as_bytes(), b"k"),
+                Bytes::from(vec![b'v'; index as usize + 1]),
+            );
+        }
+
+        let top = cache.stats_top(3);
+        assert_eq!(top.namespace_count, 1_000);
+        let names: Vec<&[u8]> = top.namespaces.iter().map(|n| &n.namespace[..]).collect();
+        assert_eq!(names, [&b"ns-0999"[..], b"ns-0998", b"ns-0997"]);
+        assert!(
+            top.namespaces
+                .windows(2)
+                .all(|w| w[0].used_bytes >= w[1].used_bytes)
+        );
+
+        // The unbounded form lists them all, in the same order.
+        let all = cache.stats();
+        assert_eq!(all.namespace_count, 1_000);
+        assert_eq!(all.namespaces.len(), 1_000);
+        assert_eq!(all.namespaces[..3].len(), 3);
+        assert!(
+            all.namespaces[..3]
+                .iter()
+                .zip(&top.namespaces)
+                .all(|(a, b)| a.namespace == b.namespace && a.used_bytes == b.used_bytes)
+        );
+        assert!(cache.stats_top(0).namespaces.is_empty());
+        assert_eq!(cache.stats_top(0).namespace_count, 1_000);
+        assert_eq!(cache.stats_top(5_000).namespaces.len(), 1_000);
+
+        // Ties by bytes break by name, in both forms.
+        let mut tied = Cache::new(UNBOUNDED);
+        for name in [&b"b"[..], b"a", b"c"] {
+            tied.set(namespaced(name, b"k"), Bytes::from_static(b"v"));
+        }
+        let tied_top = tied.stats_top(2);
+        let names: Vec<&[u8]> = tied_top
+            .namespaces
+            .iter()
+            .map(|n| &n.namespace[..])
+            .collect();
+        assert_eq!(names, [&b"a"[..], b"b"]);
     }
 
     #[test]

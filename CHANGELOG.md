@@ -50,6 +50,12 @@ framework adapters at one version, whether or not a component changed.
   interval evicted live nodes between two heartbeats; a very large value
   overflowed the clock arithmetic and crashed. The flag now accepts 6 to
   604800 seconds (7 days) and refuses anything else as a usage error.
+- `nanocached-node`: a `/metrics` scrape built and sorted a row for every live
+  namespace on the cache task although it renders only the largest 256, so a
+  node holding very many namespaces (300,000 took 45 ms) paused every client
+  for the sort on each scrape. The cache task now selects the largest 256
+  before sorting; the `nanocached_node_namespaces` and
+  `nanocached_node_namespaces_unlisted` gauges are unchanged.
 - `nanocached-node`: a remaining TTL under one second went on the wire as
   `0`: in an INCR reply, in a get-and-touch reply and in a forward or handoff
   of the entry. An SDK replicating an INCR reply read `0` as "no expiry"
