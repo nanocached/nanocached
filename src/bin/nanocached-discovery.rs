@@ -965,6 +965,10 @@ struct PendingJoin {
     started_at: Instant,
     max_entries: usize,
     generation: u64,
+    /// The ready roster (name, address) this join's `M` carried, so a node
+    /// admitted by `P` while the join is pending can be sent the same `M`
+    /// (issue #1031, see `hand_off_from_late_member`).
+    roster: Vec<(String, String)>,
 }
 
 impl PendingJoin {
@@ -2122,6 +2126,7 @@ async fn try_begin_next_join(
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: joined.clone(),
             generation,
         });
 
@@ -2858,6 +2863,97 @@ async fn start_join(
     .await;
 
     Ok(promoted)
+}
+
+/// Issue #1031: a node admitted as `Joined` by `P` while a join is
+/// pending — one heartbeat-evicted before the join started (a partition
+/// longer than the liveness window) that healed and re-announced — is not
+/// in the join's `expected` roster, which was snapshotted at join start,
+/// so it received no `M`: its copies of the keys the joiner now owns were
+/// never handed off, and with replication 1 those keys missed on the new
+/// owner. It is now added to `expected` and sent the join's own `M` (the
+/// same roster and generation the other ready nodes received; the node
+/// adds itself to the before-ring, as every recipient does), so the join
+/// waits for its `C` like the others'. The send runs on its own task:
+/// `P` is the heartbeat path and its `R` must not wait for a dial.
+#[allow(clippy::too_many_arguments)]
+fn hand_off_from_late_member(
+    registry: &Registry,
+    current_join: &CurrentJoin,
+    auth_secret: &Option<Bytes>,
+    tls_connector: &Option<TlsConnector>,
+    replication: usize,
+    name: &str,
+    addr: &str,
+    token: &str,
+) {
+    let (joining_name, generation, roster) = {
+        let mut join_guard = lock_current_join(current_join);
+        let Some(pending) = join_guard.as_mut() else {
+            return;
+        };
+        if pending.joining_name == name || pending.expected.contains_key(name) {
+            return;
+        }
+        pending.expected.insert(name.to_string(), token.to_string());
+        (
+            pending.joining_name.clone(),
+            pending.generation,
+            pending.roster.clone(),
+        )
+    };
+    let Some((joining_addr, joining_token)) = lock(registry)
+        .get(&joining_name)
+        .map(|info| (info.address.clone(), info.token.clone()))
+    else {
+        return;
+    };
+    println!(
+        "INFO join in progress: {joining_name} — sending M to {name}, admitted by P after the \
+         join started"
+    );
+
+    let registry = Arc::clone(registry);
+    let current_join = Arc::clone(current_join);
+    let auth_secret = auth_secret.clone();
+    let tls_connector = tls_connector.clone();
+    let (name, addr, token) = (name.to_string(), addr.to_string(), token.to_string());
+    tokio::spawn(async move {
+        let result = send_migrate_with_retry(
+            &token,
+            &name,
+            &addr,
+            &auth_secret,
+            &tls_connector,
+            &joining_name,
+            &joining_addr,
+            &joining_token,
+            &roster,
+            replication,
+            generation,
+            OUTBOUND_IO_TIMEOUT,
+            || {
+                lock_current_join(&current_join)
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.joining_name == joining_name && pending.generation == generation
+                    })
+            },
+        )
+        .await;
+        match result {
+            Ok(entries) => {
+                let mut join_guard = lock_current_join(&current_join);
+                credit_migrate_send_result(&mut join_guard, &joining_name, generation, entries);
+            }
+            Err(error) => eprintln!(
+                "WARN permanently failed to send M to {name} (admitted by P mid-join) after \
+                 {MIGRATE_SEND_ATTEMPTS} attempts: {error}"
+            ),
+        }
+        // Keep the registry alive for the duration like the other fan-outs.
+        drop(registry);
+    });
 }
 
 /// Records a ready node's completion report for the in-progress join. If
@@ -4999,9 +5095,9 @@ async fn handle_connection(
                     };
                     match existing {
                         Some(Ok(_address_changed)) => {
-                            break 'decide None;
+                            break 'decide Ok(false);
                         }
-                        Some(Err(reason)) => break 'decide Some(reason),
+                        Some(Err(reason)) => break 'decide Err(reason),
                         None => {}
                     }
 
@@ -5009,7 +5105,7 @@ async fn handle_connection(
                     // that's already full doesn't also spend a limiter
                     // slot on a source it's about to reject anyway.
                     if lock(&registry).len() >= MAX_REGISTRY_SIZE {
-                        break 'decide Some("registry is full");
+                        break 'decide Err("registry is full");
                     }
 
                     // Issue: `P` holds no connection open the way `J`
@@ -5030,10 +5126,8 @@ async fn handle_connection(
                              ANNOUNCE_INSERT_COOLDOWN)",
                             ANNOUNCE_INSERT_COOLDOWN.as_secs()
                         );
-                        break 'decide Some(
-                            "too many new announces from this source; retry \
-                                            shortly",
-                        );
+                        break 'decide Err("too many new announces from this source; retry \
+                                            shortly");
                     }
 
                     // Re-validate: another connection may have registered
@@ -5047,25 +5141,43 @@ async fn handle_connection(
                             if address_changed {
                                 bump_roster(&registry);
                             }
-                            break 'decide None;
+                            break 'decide Ok(false);
                         }
-                        Some(Err(reason)) => break 'decide Some(reason),
+                        Some(Err(reason)) => break 'decide Err(reason),
                         None => {}
                     }
                     if guard.len() >= MAX_REGISTRY_SIZE {
-                        break 'decide Some("registry is full");
+                        break 'decide Err("registry is full");
                     }
 
                     println!("INFO node announced: {name} at {addr} (re-registered)");
                     forget_departed(&registry, &name);
-                    guard.insert(name.clone(), NodeInfo::new(addr, NodeState::Joined, token));
+                    guard.insert(
+                        name.clone(),
+                        NodeInfo::new(addr.clone(), NodeState::Joined, token.clone()),
+                    );
                     // A newly (re-)admitted `Joined` node changes the roster.
                     bump_roster(&registry);
-                    None
+                    Ok(true)
                 };
 
-                if let Some(reason) = rejection {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
+                let newly_admitted = match rejection {
+                    Ok(newly_admitted) => newly_admitted,
+                    Err(reason) => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
+                    }
+                };
+                if newly_admitted {
+                    hand_off_from_late_member(
+                        &registry,
+                        &current_join,
+                        &config.auth_secret,
+                        &config.tls_connector,
+                        config.replication,
+                        &name,
+                        &addr,
+                        &token,
+                    );
                 }
 
                 // Same bookkeeping as `J`, and — like `J` — only now that
@@ -6423,6 +6535,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -7160,6 +7273,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -7245,6 +7359,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -7343,6 +7458,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -7436,6 +7552,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -8740,6 +8857,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -8944,6 +9062,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 5,
+            roster: Vec::new(),
             generation: 2,
         });
 
@@ -9273,6 +9392,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -9345,6 +9465,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -9437,6 +9558,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -9508,6 +9630,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -9657,6 +9780,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -9845,6 +9969,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -9898,6 +10023,149 @@ mod tests {
             lock(&registry).get("node-c").map(|info| info.state),
             Some(NodeState::Joining)
         );
+    }
+
+    /// Issue #1031: a node admitted by `P` while a join is pending was not
+    /// in the join's roster and received no `M`, so its copies of the
+    /// joiner's keys were never handed off. It is now expected to report
+    /// like the others and sent the join's own `M`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_announced_during_a_pending_join_is_sent_m_and_expected_to_report() {
+        // The late node: a listener that records the `M` it receives and
+        // acks it.
+        let late_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let late_port = late_listener.local_addr().unwrap().port();
+        let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_task = Arc::clone(&received);
+        tokio::spawn(async move {
+            let (mut connection, _) = late_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 1024];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            connection.write_all(b"A 3\n").await.unwrap();
+        });
+
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation: 4,
+            roster: vec![("node-a".to_string(), "127.0.0.1:1".to_string())],
+        })));
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = || ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+        };
+
+        // node-c, unknown to the registry, announces while B's join waits
+        // for A's report.
+        let (mut node_c, server_c) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_c),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_c
+            .write_all(format!("P 6 {late_port} 9\nnode-ctk-node-c").as_bytes())
+            .await
+            .unwrap();
+        let mut reply = [0u8; 2];
+        node_c.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"R\n", "the announce is accepted as before");
+
+        for _ in 0..1000 {
+            if !received.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let frame = received.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&frame);
+        assert!(text.starts_with("M "), "node-c received {text:?}");
+        assert!(text.contains("node-b"), "the M names the joiner: {text:?}");
+        assert!(
+            text.contains("tk-node-c"),
+            "the M carries node-c's own token: {text:?}"
+        );
+        {
+            let guard = lock_current_join(&current_join);
+            let pending = guard.as_ref().expect("the join is still pending");
+            assert_eq!(
+                pending.expected.get("node-c").map(String::as_str),
+                Some("tk-node-c"),
+                "node-c is expected to report"
+            );
+            assert_eq!(pending.max_entries, 3, "its M ack sized the timeout");
+        }
+
+        // node-c's report alone does not complete the join; A's does.
+        node_c
+            .write_all(b"C 6 6 9\nnode-cnode-btk-node-c")
+            .await
+            .unwrap();
+        node_c.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"A\n");
+        assert_eq!(
+            lock(&registry).get("node-b").unwrap().state,
+            NodeState::Joining
+        );
+
+        let (mut node_a, server_a) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_a),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_a
+            .write_all(b"C 6 6 9\nnode-anode-btk-node-a")
+            .await
+            .unwrap();
+        node_a.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"A\n");
+        assert_eq!(
+            lock(&registry).get("node-b").unwrap().state,
+            NodeState::Joined
+        );
+        assert!(lock_current_join(&current_join).is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11446,6 +11714,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 7,
         })));
 
@@ -11579,6 +11848,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -11660,6 +11930,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -11742,6 +12013,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -11861,6 +12133,7 @@ mod tests {
                 .checked_sub(MIGRATION_TIMEOUT_BASE + Duration::from_secs(1))
                 .expect("the clock has run long enough to backdate"),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         }
     }
@@ -11991,6 +12264,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 2,
         });
 
@@ -12097,6 +12371,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            roster: Vec::new(),
             generation: 1,
         })));
 
@@ -12155,6 +12430,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 100_000,
+            roster: Vec::new(),
             generation: 1,
         })));
 

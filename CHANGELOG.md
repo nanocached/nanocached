@@ -93,6 +93,13 @@ framework adapters at one version, whether or not a component changed.
   false "reporting completion … failed" warning and its join-flip
   re-replication waited for the retry. The ack now goes out first and the
   fan-out follows.
+- `nanocached-discovery`: a node admitted by `P` while a join was pending (one
+  heartbeat-evicted before the join started, healed and re-announcing) was not
+  in the roster the join snapshotted at its start, so it received no `M`: its
+  copies of the keys the joiner now owns were never handed off, and with
+  replication 1 those keys missed on the new owner. Such a node is now added
+  to the nodes the join expects a report from and sent the join's own `M`,
+  with the same roster and generation the other ready nodes received.
 - `nanocached-node`: a `/metrics` scrape built and sorted a row for every live
   namespace on the cache task although it renders only the largest 256, so a
   node holding very many namespaces (300,000 took 45 ms) paused every client
