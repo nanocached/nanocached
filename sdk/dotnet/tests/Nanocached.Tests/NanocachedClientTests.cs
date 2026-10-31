@@ -5284,11 +5284,17 @@ public class NanocachedClientTests
     [Fact]
     public async Task AFastPrimaryIsNeverHedged()
     {
+        // The hedge delay is far above any scheduling noise the suite
+        // produces, so "fast" is a property of the mock primary (it answers
+        // at once) rather than of the wall clock: with 50 ms, the primary's
+        // reply took longer than that under a full-suite load and the hedge
+        // fired, failing the assertion below with no hedging code involved.
+        // The GETs still complete at once, so the test is no slower.
         using Cluster cluster = StartCluster(replication: 2);
         using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
         {
             Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
-            ReadHedgeAfter = TimeSpan.FromMilliseconds(50),
+            ReadHedgeAfter = TimeSpan.FromSeconds(2),
         });
         await client.SetAsync("k", "v");
         string replica = OwnersOf("k")[1];
