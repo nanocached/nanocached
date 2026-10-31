@@ -38,7 +38,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"],
 # feature-gated: unlike `tls`/`compression`, CAS has no alternative
 # backend or opt-out story worth threading through the rest of this
 # crate.
-sha2 = "0.10"
+sha2 = "0.11"
 
 [features]
 default = ["tls", "compression"]
