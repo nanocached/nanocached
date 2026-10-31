@@ -1864,6 +1864,7 @@ impl Cache {
     /// regardless (see `sweep_at`), since cancellation only runs while
     /// `migration_in_progress` keeps `sweep` paused, so nothing this node
     /// marks can have reached `pending_removal` yet.
+    #[cfg(test)]
     pub fn unmark_migrated(&mut self, key: &Key) {
         self.clear_migrated_mark(key);
     }

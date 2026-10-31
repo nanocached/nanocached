@@ -172,6 +172,17 @@ framework adapters at one version, whether or not a component changed.
   skipped by re-replication, and removed by a sweep when another owner
   exists. The list now keeps those marks, on completion and when the
   transfer is cancelled or fails.
+- `nanocached-node`: restoring a handoff's dead copies after a `G` verdict
+  from discovery, or after a migration was cancelled or failed part-way,
+  still sent the cache one command per marked key, about 12.5 us each (3.7 s
+  for 300,000 keys; 12 s per million). The `G` restore runs inline in the
+  heartbeat loop, so a node with enough marked keys (about 800,000 at the
+  default liveness timeout, 80,000 at the minimum) stopped heartbeating
+  until discovery evicted it; the rollback kept the migration slot occupied
+  for the whole restore, so an `X` gave up waiting for it and acked anyway
+  and the next `M` for the same joiner was refused as a conflict. Both
+  restores are now one cache command for the whole list, as the `M` and `X`
+  restores already were.
 - `nanocached-discovery`: a joiner whose host died without closing its
   connection (power loss, hypervisor failure, a partition) stayed registered,
   because nothing set TCP keepalive on the connection that is a joiner's
