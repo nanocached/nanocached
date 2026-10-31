@@ -32,6 +32,15 @@ pub(crate) const SWEEP_BUDGET: usize = 2_000;
 /// it. If the allocator or the map changes, re-measure here.
 pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 180;
 
+/// What a `migrated` mark costs beyond the key bytes it duplicates: the
+/// `Bytes` handle in the namespace's `migrated` set (32 B), the set's slot
+/// and control byte at its worst load after a resize (about 2× the
+/// handle), and the heap header of the copied name — about 80 B, from the
+/// struct sizes rather than measured. Only the key is copied into a mark
+/// (the namespace's name is stored once, whatever is marked under it), so
+/// this and the key's own length are all a mark is charged.
+pub(crate) const MARK_OVERHEAD_BYTES: usize = 80;
+
 struct Entry {
     value: Bytes,
     expires_at: Option<Instant>,
@@ -90,8 +99,9 @@ struct Namespace {
     name: Bytes,
     entries: Entries,
     /// This namespace's share of `Cache::used_bytes`: key + value +
-    /// `ENTRY_OVERHEAD_BYTES` per entry, plus the duplicate key bytes of
-    /// any of this namespace's entries currently `migrated`-marked
+    /// `ENTRY_OVERHEAD_BYTES` per entry, plus the duplicate key bytes and
+    /// `MARK_OVERHEAD_BYTES` of any of this namespace's entries currently
+    /// `migrated`-marked
     /// (`mark_migrated`/`clear_migrated_mark` credit/debit this alongside
     /// the global `Cache::used_bytes`, so the per-namespace rows stay
     /// consistent with the total mid-migration — see `mark_migrated`'s
@@ -212,6 +222,12 @@ pub const HANDOFF_TOMBSTONE_TTL: Duration = Duration::from_secs(120);
 /// At most this many handoff tombstones are kept; past it the oldest
 /// goes first. Each is charged to `used_bytes` like a `migrated` mark.
 const MAX_HANDOFF_TOMBSTONES: usize = 65_536;
+
+/// What a `migrated` mark for the key `name` is charged — see
+/// `MARK_OVERHEAD_BYTES`.
+fn mark_charge(name: &[u8]) -> usize {
+    name.len() + MARK_OVERHEAD_BYTES
+}
 
 /// What a tombstone is charged: the key it names, as a mark is.
 fn tombstone_bytes(key: &Key) -> usize {
@@ -1666,7 +1682,7 @@ impl Cache {
             return;
         }
         if namespace.migrated.remove(name) {
-            let mark_bytes = namespace.name.len() + name.len();
+            let mark_bytes = mark_charge(name);
             namespace.used_bytes -= mark_bytes;
             *used_bytes -= mark_bytes;
             *marked -= 1;
@@ -1797,9 +1813,14 @@ impl Cache {
     /// was the source for. A no-op if the key is already marked or no
     /// longer present; `sweep` reclaims marked entries later. The
     /// namespace's `migrated` set holds its own copy of the key name (see
-    /// its field docs), and a freshly marked key is charged an extra
-    /// namespace+name length — the audit behind issue #19 flagged this
-    /// duplicate as otherwise invisible to the memory limit.
+    /// its field docs), and a freshly marked key is charged that copy:
+    /// its length plus `MARK_OVERHEAD_BYTES` (`mark_charge`) — the audit
+    /// behind issue #19 flagged the duplicate as otherwise invisible to the
+    /// memory limit. The namespace's name is not part of the charge: a mark
+    /// does not copy it, and charging it per marked key once let a join
+    /// that handed off many small keys under a long-named namespace inflate
+    /// `used_bytes` by the name's length per key, evicting other
+    /// namespaces' live entries for the length of the migration.
     pub fn mark_migrated(&mut self, key: &Key) {
         let Some(namespace) = self
             .find_namespace(&key.namespace)
@@ -1822,7 +1843,7 @@ impl Cache {
             && !namespace.migrated.contains(&key.name[..])
             && namespace.migrated.insert(Bytes::copy_from_slice(&key.name))
         {
-            let mark_bytes = namespace.name.len() + key.name.len();
+            let mark_bytes = mark_charge(&key.name);
             self.used_bytes += mark_bytes;
             self.marked += 1;
             // Credit the owning namespace too, so per-namespace accounting
@@ -3650,7 +3671,10 @@ mod tests {
         // entry's own.
         assert_eq!(
             cache.used_bytes,
-            marked_bytes - (5 + 1) - (1 + 3 + ENTRY_OVERHEAD_BYTES) - name_charge(b"users")
+            marked_bytes
+                - mark_charge(b"a")
+                - (1 + 3 + ENTRY_OVERHEAD_BYTES)
+                - name_charge(b"users")
         );
 
         cache.set(namespaced(b"users", b"a"), Bytes::from_static(b"new"));
@@ -3865,6 +3889,38 @@ mod tests {
 
         assert_eq!(cache.get(&key(b"a")), None);
         assert_eq!(cache.get(&key(b"b")), Some(Bytes::from_static(b"2")));
+    }
+
+    #[test]
+    fn a_mark_is_charged_its_key_copy_whatever_the_namespace_name_length() {
+        // A mark copies the key, not the namespace's name, and is charged
+        // accordingly. It used to be charged the name's length as well,
+        // once per marked key: 1,000 one-byte keys marked under a 64 KiB
+        // name added 64 MiB to `used_bytes` against about 85 KB actually
+        // held, and the next write evicted other namespaces' live entries
+        // to make room for the phantom.
+        let long_name = vec![b'n'; 64 * 1024];
+        let mut cache = Cache::new(UNBOUNDED);
+        for index in 0..1_000_u32 {
+            cache.set(
+                namespaced(&long_name, &index.to_be_bytes()),
+                Bytes::from_static(b"v"),
+            );
+        }
+        let before = cache.used_bytes;
+
+        for index in 0..1_000_u32 {
+            cache.mark_migrated(&namespaced(&long_name, &index.to_be_bytes()));
+        }
+
+        assert_eq!(cache.marked, 1_000);
+        assert_eq!(cache.used_bytes - before, 1_000 * mark_charge(&[0; 4]));
+        assert_eq!(cache.used_bytes - before, 1_000 * (4 + MARK_OVERHEAD_BYTES));
+
+        for index in 0..1_000_u32 {
+            cache.unmark_migrated(&namespaced(&long_name, &index.to_be_bytes()));
+        }
+        assert_eq!(cache.used_bytes, before);
     }
 
     #[test]

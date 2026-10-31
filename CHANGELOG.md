@@ -68,6 +68,14 @@ framework adapters at one version, whether or not a component changed.
   kept the whole received frame, value included, in memory until the sweep
   or an abandon, while the memory bound counted only the key name. The mark
   now holds a copy of the name.
+- `nanocached-node`: a migration mark (the record that a staged join took a
+  key away, kept until the sweep removes the copy) was charged the length of
+  the namespace's name as well as the key's, once per marked key, although a
+  mark copies only the key. A join that handed off many small keys under a
+  long-named namespace inflated the memory accounting by the name's length
+  per key (64 MiB for a thousand keys under a 64 KiB name) and the next write
+  evicted other namespaces' live entries to make room for it. A mark is now
+  charged its key copy plus a fixed overhead, whatever the namespace's name.
 - `nanocached-node`: a copy that a join took away while this node was still
   sending to the joiner (a re-replicated put-if-absent for a key the join
   moved) was marked dead but missing from the handoff's list of marks, so
