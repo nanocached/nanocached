@@ -9,6 +9,13 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Security
+
+- The Spring Boot dependencies platform moves from 3.5.3 to 3.5.16, the latest
+  3.5 patch release (it manages Spring Framework 6.2.19). 3.5.3 predates
+  several published security fixes in later 3.5 releases, and as an `api`
+  platform it is the version an application inherits unless it overrides it.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release
