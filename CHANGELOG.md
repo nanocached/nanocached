@@ -31,6 +31,18 @@ framework adapters at one version, whether or not a component changed.
   connection goes on, and one source IP may hold at most a quarter of the
   proxy-wide budget (64 MiB by default), so one slow consumer cannot starve
   the rest. Clients behind one NAT or egress IP share that quarter.
+- `nanocached-node`: a multi-key read (`m`, or `y` with `G`) kept its per-key
+  in-flight charge while it charged its reply's bytes against the same
+  budget. A reply that needed more than what was left waited for the
+  connection's own permit until `WRITE_TIMEOUT` (10 s) and the connection
+  was closed unanswered; with several connections the budget's FIFO made
+  every holder wait on another's reply, so under a modest burst of batch
+  reads (255 connections × 10,000 hits on the default 256 MiB budget) most
+  replies were delayed 10 s and some connections were closed. The per-key
+  charge is now released once the reply entries are built, before the reply
+  is charged, and a reply charge asks only for what the connection does not
+  already hold (its receive buffer's charge), so a connection never waits for
+  bytes it holds itself.
 - `nanocached-node`, `nanocached-proxy`, `nanocached-discovery`: a `--tls-ca`
   file with no certificate in it (empty, not PEM, or a private key given by
   mistake) built a connector that trusted nothing and the process started;
