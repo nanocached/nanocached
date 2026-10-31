@@ -104,11 +104,13 @@ pub(crate) const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
 /// before allocating it (an unfinished frame is held until the frame
 /// deadline), and releases both as soon as the bytes are gone. A
 /// multi-key frame also charges `MULTI_KEY_FRAME_BYTES_PER_KEY` for each
-/// of its keys, held until its reply is written. A cost
-/// above the budget is clamped to it, so such a request takes the whole
-/// budget and runs alone rather than waiting forever; a connection that
-/// cannot get its charge in time is closed, the way a stalled write or a
-/// trickled frame is.
+/// of its keys, held until its reply entries are built and released
+/// before the reply's own bytes are charged. A cost above the budget is
+/// clamped to it, so such a request takes the whole budget and runs
+/// alone rather than waiting forever; a holder never waits for bytes it
+/// holds itself (a charge taken while another is held asks only for the
+/// rest of the budget), and a connection that cannot get its charge in
+/// time is closed, the way a stalled write or a trickled frame is.
 #[derive(Clone)]
 pub(crate) struct InFlightBudget {
     permits: Arc<Semaphore>,
@@ -124,6 +126,10 @@ impl InFlightBudget {
     }
 
     /// Reserves `cost` bytes (clamped to the budget), waiting for them.
+    /// Every holder in the server charges in steps on top of what it
+    /// already holds, so they go through `charge_exact` with their own
+    /// clamp; this is the tests' way to hold a budget.
+    #[cfg(test)]
     async fn charge(&self, cost: usize) -> tokio::sync::OwnedSemaphorePermit {
         self.charge_exact(self.clamp(cost)).await
     }
@@ -186,13 +192,14 @@ const MULTI_KEY_FRAME_BYTES_PER_KEY: usize = 256;
 const MULTI_SET_VALUE_BYTES_PER_KEY: usize = 32;
 
 /// Charges a multi-key frame's per-key working memory against the
-/// in-flight budget; the caller holds the permit until the reply is
-/// written. It is called before the parser builds the frame's key vectors
-/// (`parse_resumable`'s `ParseError::ChargeRequired`), so a connection
-/// waiting here holds no uncharged per-key memory. A frame costing more
-/// than the whole budget takes all of it and runs alone — the connection's
-/// own receive-buffer charge is part of what it already holds, so it asks
-/// only for the rest and does not wait for itself. Waits at most
+/// in-flight budget; the caller holds the permit until the reply entries
+/// are built and drops it before the reply itself is charged
+/// (`write_reply`). It is called before the parser builds the frame's key
+/// vectors (`parse_resumable`'s `ParseError::ChargeRequired`), so a
+/// connection waiting here holds no uncharged per-key memory. A frame
+/// costing more than the whole budget takes all of it and runs alone — the
+/// connection's own receive-buffer charge is part of what it already holds,
+/// so it asks only for the rest and does not wait for itself. Waits at most
 /// `WRITE_TIMEOUT`, like a reply, and fails the connection if the budget
 /// does not free in that time.
 async fn charge_multi_key_frame(
@@ -224,21 +231,30 @@ async fn charge_multi_key_frame(
 
 /// Encodes and writes a reply that may carry values, holding its bytes
 /// against the in-flight budget from before the encoded copy exists
-/// until it has been written. Waits at most `WRITE_TIMEOUT` for the
-/// budget — the same bound a stalled write gets — and fails the
-/// connection like one if it runs out.
+/// until it has been written. `held` is what the connection already
+/// holds (its receive buffer's charge): a reply that would take more
+/// than the budget takes only the rest of it, so the connection ends up
+/// holding the whole budget rather than waiting on its own permit. The
+/// caller holds nothing else by then — a multi-key frame's per-key
+/// charge is released before its reply is charged, for the same reason.
+/// Waits at most `WRITE_TIMEOUT` for the budget — the same bound a
+/// stalled write gets — and fails the connection like one if it runs out.
 async fn write_reply(
     stream: &mut ServerStream,
     config: &ConnectionConfig,
     response: &Response,
     tag: Option<u32>,
+    held: usize,
 ) -> io::Result<()> {
-    let bytes = reply_bytes(response);
+    let bytes = config
+        .in_flight_bytes
+        .clamp(reply_bytes(response).saturating_add(held))
+        .saturating_sub(held);
     let _charge = if bytes == 0 {
         None
     } else {
         Some(
-            timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge(bytes))
+            timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge_exact(bytes))
                 .await
                 .map_err(|_| {
                     io::Error::new(
@@ -2870,7 +2886,7 @@ async fn handle_connection(
                 }
 
                 let response = execute_command(&request_tx, Command::Get { key }).await?;
-                write_reply(&mut stream, &config, &response, tag).await?;
+                write_reply(&mut stream, &config, &response, tag, receive_charged).await?;
 
                 continue;
             }
@@ -2884,7 +2900,7 @@ async fn handle_connection(
             // order before replying — the client never sees the owned/
             // not-owned split.
             Ok((Command::MultiGet { namespace, keys }, tag)) => {
-                let _frame_charge = frame_charge;
+                let frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -2933,7 +2949,20 @@ async fn handle_connection(
                     .into_iter()
                     .map(|entry| entry.expect("every position filled by one of the two branches"))
                     .collect();
-                write_reply(&mut stream, &config, &Response::Multi(entries), tag).await?;
+                // The per-key vectors are gone; release their charge before
+                // charging the reply, or this connection would wait on its
+                // own permit (and, through the budget's FIFO, on every other
+                // connection doing the same) when the two together exceed
+                // what is free.
+                drop(frame_charge);
+                write_reply(
+                    &mut stream,
+                    &config,
+                    &Response::Multi(entries),
+                    tag,
+                    receive_charged,
+                )
+                .await?;
 
                 continue;
             }
@@ -3530,7 +3559,7 @@ async fn handle_connection(
                 },
                 tag,
             )) => {
-                let _frame_charge = frame_charge;
+                let frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -3641,8 +3670,17 @@ async fn handle_connection(
                     .into_iter()
                     .map(|entry| entry.expect("every position filled by one of the two branches"))
                     .collect();
+                // Released before the reply is charged, like an `m`'s.
+                drop(frame_charge);
                 if get {
-                    write_reply(&mut stream, &config, &Response::Multi(entries), tag).await?;
+                    write_reply(
+                        &mut stream,
+                        &config,
+                        &Response::Multi(entries),
+                        tag,
+                        receive_charged,
+                    )
+                    .await?;
                 } else {
                     let roster = entries
                         .into_iter()
@@ -3698,7 +3736,7 @@ async fn handle_connection(
 
                 if get {
                     let reply = Response::Touched(value, remaining_ttl);
-                    write_reply(&mut stream, &config, &reply, tag).await?;
+                    write_reply(&mut stream, &config, &reply, tag, receive_charged).await?;
                 } else {
                     write_response(&mut stream, &encode_response(&Response::Stored, tag)).await?;
                 }
@@ -10948,8 +10986,9 @@ mod tests {
             },
         )
         .await;
-        // The 16-key batch also holds its per-key charge while it is in flight.
-        let total = 17 * MIB + 16 * MULTI_KEY_FRAME_BYTES_PER_KEY;
+        // The 16-key batch's per-key charge is released before its reply
+        // is charged, so the reply alone is what the budget sees.
+        let total = 17 * MIB;
         let budget = InFlightBudget::new(total);
         let mut batch = b"m 0 16".to_vec();
         batch.extend(std::iter::repeat_n(b" 5", 16).flatten());
@@ -11412,6 +11451,126 @@ mod tests {
         let _ = timeout(Duration::from_secs(5), connection_task).await;
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_reply_does_not_wait_on_the_frame_charge_its_own_connection_holds() {
+        // 20,000 keys cost more than the 1 MiB budget, so the frame takes
+        // all of it. Every key hits, so the reply has bytes to charge: if
+        // the frame charge were still held, the reply would wait for the
+        // connection's own permit until WRITE_TIMEOUT and the connection
+        // would be closed unanswered.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: key(b"k"),
+                value: Bytes::from_static(b"0123456789"),
+                ttl: None,
+            },
+        )
+        .await;
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+
+        let (mut client, server) = tcp_pair().await;
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        client.write_all(&multi_get_frame(20_000)).await.unwrap();
+        let mut header = [0u8; 8];
+        timeout(Duration::from_secs(5), client.read_exact(&mut header))
+            .await
+            .expect("the reply is charged after the frame charge is released, not behind it")
+            .unwrap();
+        assert_eq!(&header, b"M 20000 ");
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), connection_task).await;
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_key_connections_do_not_hold_their_frame_charge_while_waiting_for_a_reply_charge()
+    {
+        // Two frames of 600 KiB each against a 1 MiB budget. The first
+        // holds its charge while the cache works; the second queues for
+        // the budget behind it. When the first is answered it needs bytes
+        // for its reply: were it still holding its frame charge, it would
+        // queue behind the second (the budget is FIFO) while the second
+        // waits for it — hold-and-wait, broken only by WRITE_TIMEOUT.
+        const KEYS: usize = 600 * 1024 / MULTI_KEY_FRAME_BYTES_PER_KEY;
+        let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let frame = multi_get_frame(KEYS);
+        let hits = || {
+            Response::Multi(vec![
+                MultiEntry::Value(Bytes::from_static(b"0123456789"));
+                KEYS
+            ])
+        };
+
+        let (mut first, server) = tcp_pair().await;
+        let first_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        first.write_all(&frame).await.unwrap();
+        let first_request = timeout(Duration::from_secs(5), request_rx.recv())
+            .await
+            .expect("the first frame reaches the cache")
+            .unwrap();
+
+        let (mut second, server) = tcp_pair().await;
+        let second_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        second.write_all(&frame).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            request_rx.try_recv().is_err(),
+            "the second frame must wait for the budget"
+        );
+
+        first_request.response_tx.send(hits()).ok().unwrap();
+        let mut header = [0u8; 7];
+        timeout(Duration::from_secs(5), first.read_exact(&mut header))
+            .await
+            .expect("the first reply must not wait behind the second frame's charge")
+            .unwrap();
+        assert_eq!(&header, format!("M {KEYS} ").as_bytes());
+        let second_request = timeout(Duration::from_secs(5), request_rx.recv())
+            .await
+            .expect("the second frame proceeds once the first releases its frame charge")
+            .unwrap();
+        second_request.response_tx.send(hits()).ok().unwrap();
+        timeout(Duration::from_secs(5), second.read_exact(&mut header))
+            .await
+            .expect("the second frame is answered")
+            .unwrap();
+        assert_eq!(&header, format!("M {KEYS} ").as_bytes());
+
+        drop(first);
+        drop(second);
+        let _ = timeout(Duration::from_secs(5), first_task).await;
+        let _ = timeout(Duration::from_secs(5), second_task).await;
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
