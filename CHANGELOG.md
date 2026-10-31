@@ -132,6 +132,17 @@ framework adapters at one version, whether or not a component changed.
   dropped that connection and failed the other clients' requests in flight on
   it. The limit is now applied to the frame itself: to the frame just parsed,
   or to the one still arriving.
+- `nanocached-node`: a multi-key frame (`m`, `o`, `y`) that had to wait for
+  `--max-in-flight-bytes` held its parsed key list, 32 bytes per key (about
+  11 MB for a 1 MiB frame of one-byte keys), uncharged for as long as it
+  waited, because the per-key charge was taken after the frame was parsed.
+  With 300 connections each sending one such frame the node reached 2.5 GB
+  against the 256 MiB budget. The connection now charges the frame as soon
+  as it is fully buffered, before the key list is built, and a frame over the
+  request-size limit is still refused without waiting. The charge was also
+  below the measured 185 (`m`, `y`) to 194 (`o`) bytes per key of resident
+  memory at a frame's peak: it is now 256 bytes per key, and 288 for `o`,
+  which builds a second list for the values.
 - `nanocached-proxy`: a request frame of exactly 1 MiB, or up to ten bytes
   under it, passed the proxy but was refused by the node once the proxy
   added its own tag to the header; the proxy could not match the node's
