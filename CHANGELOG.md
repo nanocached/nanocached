@@ -100,6 +100,16 @@ framework adapters at one version, whether or not a component changed.
   replication 1 those keys missed on the new owner. Such a node is now added
   to the nodes the join expects a report from and sent the join's own `M`,
   with the same roster and generation the other ready nodes received.
+- `nanocached-discovery`: the `M` sends to nodes admitted by `P` during a
+  pending join were not bounded like the join's own fan-out. They skipped the
+  64-dial limit, were not owned by the join (each could run three 10 s
+  attempts on its own), and each copied the whole roster (up to about
+  1 MiB) for a `P` of a few dozen bytes, so a sender announcing new names
+  during a join grew dials and memory up to the registry limit. They now
+  take a permit of the join's dial limit before dialing, share the join's
+  one roster, and are aborted when the join is promoted or abandoned. A
+  join hands off to at most 64 such nodes; further new names are refused
+  with a retry-shortly error until it ends.
 - `nanocached-node`: a `/metrics` scrape built and sorted a row for every live
   namespace on the cache task although it renders only the largest 256, so a
   node holding very many namespaces (300,000 took 45 ms) paused every client
