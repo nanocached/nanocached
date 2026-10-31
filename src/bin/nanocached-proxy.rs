@@ -6063,7 +6063,24 @@ impl InFlightBudget {
     /// reserves them. `None` only if the semaphore was closed, which
     /// nothing does.
     async fn charge(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let permits = u32::try_from(self.clamp(cost)).unwrap_or(u32::MAX);
+        self.charge_exact(self.clamp(cost)).await
+    }
+
+    /// `charge` for a holder that already holds `held` bytes of this
+    /// budget (a connection's receive-buffer charge, when it admits a
+    /// request): the total is clamped, so the holder asks only for the
+    /// rest of the budget and never waits for bytes it holds itself.
+    async fn charge_beyond(
+        &self,
+        held: usize,
+        cost: usize,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let cost = self.clamp(cost.saturating_add(held)).saturating_sub(held);
+        self.charge_exact(cost).await
+    }
+
+    async fn charge_exact(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let permits = u32::try_from(cost).unwrap_or(u32::MAX);
         Arc::clone(&self.permits)
             .acquire_many_owned(permits)
             .await
@@ -6484,11 +6501,18 @@ async fn handle_client(
                         .as_ref()
                         .map_or(1, |ring| ring.distinct_addresses().max(1));
                     let cost = request_cost(&request, buffered - buf.len(), replication, primaries);
+                    // The connection's receive-buffer charge is part of
+                    // what it already holds on all three budgets: a
+                    // request costing the whole budget asks only for the
+                    // rest, or it would wait on itself (until
+                    // `admission_wait`, then be answered `R`/`B` although
+                    // nothing else was in its way).
+                    let held = receive_charged;
                     let admitted = tokio::select! {
                         admitted = timeout(admission_wait, async {
-                            let connection = connection_in_flight_bytes.charge(cost).await?;
-                            let ip = ip_in_flight_share.budget.charge(cost).await?;
-                            let proxy = proxy_in_flight_bytes.charge(cost).await?;
+                            let connection = connection_in_flight_bytes.charge_beyond(held, cost).await?;
+                            let ip = ip_in_flight_share.budget.charge_beyond(held, cost).await?;
+                            let proxy = proxy_in_flight_bytes.charge_beyond(held, cost).await?;
                             Some(InFlightCharge {
                                 _connection: connection,
                                 _ip: ip,
@@ -6544,8 +6568,15 @@ async fn handle_client(
                 }
             }
         }
-        if shrink_drained_buffer(&mut buf) {
-            // The released capacity is released from the budgets too.
+        // The released capacity is released from the budgets too. A
+        // buffer whose capacity fell to the free threshold on its own
+        // (`split_to` leaves a frame's bytes with the frame, so a 128 KiB
+        // buffer that gave up a 70 KiB frame has 58 KiB) is not shrunk
+        // but holds nothing chargeable either: its charge goes as well,
+        // or an idle connection would keep part of its source IP's share
+        // until it closed, and a neighbour asking for the whole share
+        // would wait for it.
+        if shrink_drained_buffer(&mut buf) || buf.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
             receive_charge = None;
             receive_charged = 0;
         }
@@ -8108,6 +8139,88 @@ mod tests {
         read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
         let _ = buf.split_to(1);
         assert_eq!(context.requests_total.load(Ordering::Relaxed), 2);
+        drop(node);
+    }
+
+    /// An `m` of 400 keys of 200 bytes: an 80 KiB frame, so receiving it
+    /// charges the buffer's growth beyond the free 64 KiB, and a batch
+    /// cost (one 16 MiB reply) above every test-sized budget.
+    fn over_threshold_multi_get_frame() -> Vec<u8> {
+        let mut frame = b"m 0 400".to_vec();
+        frame.extend(std::iter::repeat_n(b" 200", 400).flatten());
+        frame.push(b'\n');
+        frame.extend(std::iter::repeat_n(b'k', 400 * 200));
+        frame
+    }
+
+    fn short_admission_wait_limits() -> ConnectionLimits {
+        ConnectionLimits {
+            max_connections: 8,
+            max_connections_per_ip: 8,
+            max_in_flight_bytes: 8 * MAX_REQUEST_SIZE + 4096,
+            max_in_flight_bytes_per_ip: 2 * MAX_REQUEST_SIZE + 4096,
+            admission_wait: Duration::from_secs(2),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_costing_the_whole_budget_does_not_wait_on_its_own_receive_charge() {
+        // The frame is over the free threshold, so while it is parsed the
+        // connection holds part of every budget as its receive buffer's
+        // charge. Its cost takes the whole budget: asked for in full, the
+        // request would wait for the connection's own charge until
+        // `admission_wait` and be answered `B`. It asks only for the rest.
+        let (node, proxy, _context) =
+            slow_single_node(b"k", Duration::ZERO, Some(short_admission_wait_limits())).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream
+            .write_all(&over_threshold_multi_get_frame())
+            .await
+            .unwrap();
+        let header = timeout(
+            Duration::from_millis(1500),
+            read_line(&mut stream, &mut buf),
+        )
+        .await
+        .expect("an over-threshold batch is admitted at once, not after admission_wait")
+        .unwrap();
+        assert!(header.starts_with("M 400 "), "{header}");
+        drop(node);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_idle_connection_holds_no_receive_charge_so_a_neighbour_can_take_the_whole_share() {
+        // After its over-threshold frame is cut from the buffer, the
+        // buffer's capacity is under the free threshold and it is not
+        // shrunk; the charge for the growth must go all the same. If it
+        // stayed, a second connection from the same source IP whose
+        // request costs the whole IP share would wait for the idle one
+        // until `admission_wait` and be answered `B`.
+        let (node, proxy, _context) =
+            slow_single_node(b"k", Duration::ZERO, Some(short_admission_wait_limits())).await;
+        let (mut first, mut first_buf) = connect_and_auth(&proxy).await;
+        first
+            .write_all(&over_threshold_multi_get_frame())
+            .await
+            .unwrap();
+        let header = read_line(&mut first, &mut first_buf).await.unwrap();
+        assert!(header.starts_with("M 400 "), "{header}");
+        // 400 misses: the reply is its header. The connection now idles.
+
+        let (mut second, mut second_buf) = connect_and_auth(&proxy).await;
+        let mut frame = b"m 0 20".to_vec();
+        frame.extend(std::iter::repeat_n(b" 1", 20).flatten());
+        frame.push(b'\n');
+        frame.extend(std::iter::repeat_n(b'k', 20));
+        second.write_all(&frame).await.unwrap();
+        let header = timeout(
+            Duration::from_millis(1500),
+            read_line(&mut second, &mut second_buf),
+        )
+        .await
+        .expect("the neighbour's whole-share batch is admitted while the first connection idles")
+        .unwrap();
+        assert!(header.starts_with("M 20 "), "{header}");
         drop(node);
     }
 
