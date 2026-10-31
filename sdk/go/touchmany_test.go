@@ -676,6 +676,46 @@ func TestClusterExpiringBatchWhoseReplyWasLostIsNotResent(t *testing.T) {
 	t.Run("GetManyAndTouch", func(t *testing.T) { expiringBatchWhoseReplyWasLost(t, true) })
 }
 
+func TestALostExpiringTouchIsReportedOverALaterNotSentFailure(t *testing.T) {
+	// R=1, keys on both nodes. Node A applies the expiring touch and drops
+	// the connection (the keys are lost: the frame was written, not safe to
+	// resend); node B is gone, so its keys fail to dial in both passes. The
+	// error must be A's connection loss, which says the request may have
+	// been applied, not B's not-sent dial failure, which a caller may
+	// retry blindly.
+	for _, get := range []bool{false, true} {
+		t.Run(fmt.Sprintf("get=%v", get), func(t *testing.T) {
+			nodes, discovery := startBatchTouchCluster(t, 1, [2]mockNodeOpts{})
+			client := connectCluster(t, discovery, Config{})
+			lostKeys := keysWithPrimary(testNames[0], 2, "lost")
+			deadKeys := keysWithPrimary(testNames[1], 2, "dead")
+			keys := append(append([]string(nil), lostKeys...), deadKeys...)
+			if _, err := client.SetMany(valuesFor(keys), 0); err != nil {
+				t.Fatal(err)
+			}
+			nodes[testNames[0]].applyThenCloseTouchTimes(1)
+			nodes[testNames[1]].close()
+			time.Sleep(50 * time.Millisecond) // let the FIN land
+
+			var err error
+			if get {
+				_, err = client.GetManyAndTouch(keys, 0)
+			} else {
+				_, err = client.TouchMany(keys, 0)
+			}
+			if !errors.Is(err, ErrConnectionLost) {
+				t.Fatalf("err = %v, want ErrConnectionLost", err)
+			}
+			if errors.Is(err, errRequestNotSent) {
+				t.Fatalf("err = %v, want the lost keys' own failure, not the retry pass's not-sent one", err)
+			}
+			if !strings.Contains(err.Error(), "could not reach the primary of 4 of 4 keys") {
+				t.Fatalf("err = %q, want the 4 keys named", err)
+			}
+		})
+	}
+}
+
 func expiringBatchWhoseReplyWasLost(t *testing.T, get bool) {
 	// Issue #901: R=1 and keys on both nodes, so the node that loses its
 	// reply is the primary of some keys only and the other node's hits are
