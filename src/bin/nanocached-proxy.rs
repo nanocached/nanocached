@@ -6021,11 +6021,19 @@ impl InFlightBudget {
     /// reserves them. `None` only if the semaphore was closed, which
     /// nothing does.
     async fn charge(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let permits = u32::try_from(cost.min(self.bytes)).unwrap_or(u32::MAX);
+        let permits = u32::try_from(self.clamp(cost)).unwrap_or(u32::MAX);
         Arc::clone(&self.permits)
             .acquire_many_owned(permits)
             .await
             .ok()
+    }
+
+    /// The most one holder can charge: a cost above the budget takes all
+    /// of it. A holder that charges in steps (a connection's receive
+    /// buffer) clamps its running total here, so the steps never add up
+    /// to more than exists and wait on themselves.
+    fn clamp(&self, cost: usize) -> usize {
+        cost.min(self.bytes)
     }
 }
 
@@ -6198,14 +6206,18 @@ fn request_cost(
 /// (see the constant). Checked on the remainder rather than on exact
 /// emptiness so a connection whose next header always lands in the same
 /// read as the previous frame's tail still releases the allocation.
-fn shrink_drained_buffer(buf: &mut BytesMut) {
+/// Returns whether it did, so the caller releases the buffer's charge on
+/// the in-flight budgets with it (issue #1034).
+fn shrink_drained_buffer(buf: &mut BytesMut) -> bool {
     if buf.capacity() > REQUEST_BUFFER_SHRINK_THRESHOLD
         && buf.len() <= REQUEST_BUFFER_SHRINK_THRESHOLD
     {
         let mut shrunk = BytesMut::with_capacity(buf.len());
         shrunk.extend_from_slice(buf);
         *buf = shrunk;
+        return true;
     }
+    false
 }
 
 /// One entry of a client connection's writer FIFO: the reply to send
@@ -6233,6 +6245,16 @@ struct InFlightCharge {
     _connection: tokio::sync::OwnedSemaphorePermit,
     _ip: tokio::sync::OwnedSemaphorePermit,
     _proxy: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl InFlightCharge {
+    /// Folds a further charge on the same three budgets into this one,
+    /// so a receive buffer that grew in steps holds one charge.
+    fn merge(&mut self, more: InFlightCharge) {
+        self._connection.merge(more._connection);
+        self._ip.merge(more._ip);
+        self._proxy.merge(more._proxy);
+    }
 }
 
 async fn handle_client(
@@ -6294,6 +6316,17 @@ async fn handle_client(
     });
 
     let mut buf = BytesMut::new();
+    // Issue #1034: what `buf`'s capacity beyond
+    // `REQUEST_BUFFER_SHRINK_THRESHOLD` is charged against the in-flight
+    // budgets (this connection's, its source IP's, the proxy's), and the
+    // charge holding it: grown before the buffer is, released when the
+    // buffer shrinks. A request is charged only once its frame is fully
+    // parsed; without this, each of a thousand authenticated connections
+    // could buffer a declared 1 MiB frame outside the budget that is
+    // meant to bound the proxy's working memory. The node charges its
+    // receive buffer the same way.
+    let mut receive_charge: Option<InFlightCharge> = None;
+    let mut receive_charged = 0usize;
     let mut authenticated = context.secret.is_none();
     // Whether an `A` handshake has already been processed on this
     // connection. Distinct from `authenticated` (true from the start in
@@ -6469,7 +6502,11 @@ async fn handle_client(
                 }
             }
         }
-        shrink_drained_buffer(&mut buf);
+        if shrink_drained_buffer(&mut buf) {
+            // The released capacity is released from the budgets too.
+            receive_charge = None;
+            receive_charged = 0;
+        }
 
         // Issue #124: a drain stops the intake — everything already
         // dispatched still flows back through the writer's FIFO below.
@@ -6477,12 +6514,69 @@ async fn handle_client(
             break 'connection Ok(());
         }
 
-        let mut chunk = [0u8; 4096];
         let read_deadline = if authenticated {
             deadline
         } else {
             auth_deadline
         };
+
+        // Grow the buffer under control (issue #1034): a doubling, charged
+        // against the in-flight budgets *before* it is allocated, so what
+        // a thousand connections mid-frame hold is bounded by the budgets
+        // rather than by the connection count. The first 64 KiB of every
+        // connection are free (a pre-handshake buffer never gets past
+        // them); a connection that cannot get the growth by its frame
+        // deadline is closed, like one that trickled.
+        const READ_CHUNK: usize = 4096;
+        if buf.capacity() - buf.len() < READ_CHUNK {
+            let grown = (buf.capacity() * 2).max(buf.len() + READ_CHUNK);
+            let want = [
+                &connection_in_flight_bytes,
+                &*ip_in_flight_share.budget,
+                &proxy_in_flight_bytes,
+            ]
+            .into_iter()
+            .fold(
+                grown.saturating_sub(REQUEST_BUFFER_SHRINK_THRESHOLD),
+                |want, budget| budget.clamp(want),
+            );
+            if want > receive_charged {
+                let more = want - receive_charged;
+                let charged = tokio::select! {
+                    charged = tokio::time::timeout_at(read_deadline, async {
+                        let connection = connection_in_flight_bytes.charge(more).await?;
+                        let ip = ip_in_flight_share.budget.charge(more).await?;
+                        let proxy = proxy_in_flight_bytes.charge(more).await?;
+                        Some(InFlightCharge {
+                            _connection: connection,
+                            _ip: ip,
+                            _proxy: proxy,
+                        })
+                    }) => charged,
+                    () = drained(&mut drain) => break 'connection Ok(()),
+                    () = fifo_tx.closed() => break 'connection Ok(()),
+                };
+                match charged {
+                    Ok(Some(more)) => {
+                        receive_charged = want;
+                        match receive_charge.as_mut() {
+                            Some(held) => held.merge(more),
+                            None => receive_charge = Some(more),
+                        }
+                    }
+                    Ok(None) => break 'connection Ok(()),
+                    Err(_) => {
+                        break 'connection Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "in-flight byte budget exhausted while receiving a request",
+                        ));
+                    }
+                }
+            }
+            buf.reserve(grown - buf.len());
+        }
+
+        let mut chunk = [0u8; READ_CHUNK];
         let read = tokio::select! {
             read = tokio::time::timeout_at(read_deadline, read_half.read(&mut chunk)) => read,
             () = drained(&mut drain) => break 'connection Ok(()),
@@ -7742,6 +7836,60 @@ mod tests {
         let mut small = BytesMut::with_capacity(4096);
         shrink_drained_buffer(&mut small);
         assert_eq!(small.capacity(), 4096);
+    }
+
+    /// Issue #1034: a frame that is still arriving is charged to the
+    /// in-flight budgets as its buffer grows past the shrink threshold,
+    /// and the charge goes with the connection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_partial_frame_is_charged_to_the_in_flight_budgets_while_it_is_buffered() {
+        let (mut client, server) = tcp_pair().await;
+        let context = Arc::new(bare_context());
+        let budgets = standalone_budgets();
+        let proxy_budget = budgets.proxy.clone();
+        let connection = tokio::spawn(handle_client(ServerStream::Plain(server), context, budgets));
+
+        let mut buf = BytesMut::new();
+        client.write_all(b"A 1\nx").await.unwrap();
+        assert_eq!(read_line(&mut client, &mut buf).await.unwrap(), "On");
+        assert_eq!(
+            proxy_budget.permits.available_permits(),
+            proxy_budget.bytes,
+            "nothing is charged for an idle connection"
+        );
+
+        // A 300,000-byte value declared, 200,000 bytes of it sent.
+        let declared = 300_000;
+        let sent = 200_000;
+        client
+            .write_all(format!("S 3 {declared}\nkey").as_bytes())
+            .await
+            .unwrap();
+        client.write_all(&vec![b'v'; sent]).await.unwrap();
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if proxy_budget.permits.available_permits() < proxy_budget.bytes {
+                break;
+            }
+        }
+        let held = proxy_budget.bytes - proxy_budget.permits.available_permits();
+        assert!(
+            held >= sent - REQUEST_BUFFER_SHRINK_THRESHOLD,
+            "{held} bytes charged for a {sent}-byte partial frame"
+        );
+        assert!(
+            held <= 2 * declared,
+            "{held} bytes charged: more than a doubling"
+        );
+
+        // The client gives up: the connection ends and the charge with it.
+        drop(client);
+        connection.await.unwrap().unwrap();
+        assert_eq!(
+            proxy_budget.permits.available_permits(),
+            proxy_budget.bytes,
+            "the charge is released with the connection"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
