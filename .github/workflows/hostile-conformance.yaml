@@ -16,7 +16,8 @@ name: Hostile conformance
 
 on:
   schedule:
-    - cron: "11 4 * * *"
+    # UTC; 01:41 in Japan.
+    - cron: "41 16 * * *"
   workflow_dispatch:
 
 permissions:

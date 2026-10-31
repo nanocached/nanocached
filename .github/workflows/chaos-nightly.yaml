@@ -27,7 +27,8 @@ name: Chaos nightly
 
 on:
   schedule:
-    - cron: "29 1 * * *"
+    # UTC; 00:23 in Japan.
+    - cron: "23 15 * * *"
   workflow_dispatch:
     inputs:
       cells:
