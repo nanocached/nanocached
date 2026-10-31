@@ -16,7 +16,8 @@ name: Membership matrix
 
 on:
   schedule:
-    - cron: "43 2 * * *"
+    # UTC; 00:47 in Japan.
+    - cron: "47 15 * * *"
   workflow_dispatch:
 
 permissions:
