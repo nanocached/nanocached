@@ -268,8 +268,13 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 	// No primary answered `W` for these keys: each one's primary was
 	// unreachable on both passes, or (ttlSeconds == 0) lost its connection
 	// after the frame was written and was not resent. That is a connection
-	// loss and is reported as one, as getManyNS does.
+	// loss and is reported as one, as getManyNS does. A lost key's own
+	// failure is reported, never a later not-sent one (a dial that failed
+	// in the retry pass): only it says the request may have been applied.
 	cause := state.lastErr
+	if len(state.lost) > 0 && state.lostErr != nil {
+		cause = state.lostErr
+	}
 	if cause == nil {
 		cause = connectionLost("no owner is reachable for these keys", nil)
 	}
@@ -338,8 +343,11 @@ type multiTouchState struct {
 	rejected  bool
 	// lost holds the indices a ttlSeconds == 0 call must not resend (issue
 	// #901): their primary leg failed after the frame was written, so the
-	// node may have expired them already.
-	lost map[int]bool
+	// node may have expired them already. lostErr is that failure, kept
+	// apart from lastErr so a later not-sent failure in the retry pass
+	// cannot replace it.
+	lost    map[int]bool
+	lostErr error
 	// answeredBy names the node whose primary answer is in results[idx], so
 	// the deferred replica fan-out of a ttlSeconds == 0 call (issue #934)
 	// does not touch it a second time.
@@ -442,6 +450,9 @@ func (c *Client) multiTouchPass(
 				lostIsFinal = ttlSeconds == 0 &&
 					(errors.Is(err, ErrConnectionLost) || errors.Is(err, ErrProtocol)) &&
 					!errors.Is(err, errRequestNotSent)
+				if lostIsFinal {
+					state.lostErr = err
+				}
 			}
 		}
 		for i, idx := range leg.indices {

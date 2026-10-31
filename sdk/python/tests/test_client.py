@@ -3046,6 +3046,37 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
+    async def test_a_lost_expiring_touch_is_reported_over_a_later_not_sent_failure(self):
+        # R=1, keys on both nodes. Node A applies the expiring touch and
+        # drops the connection (the keys are lost: the frame was written,
+        # not safe to resend); node B is gone, so its keys fail to dial in
+        # both passes. The error must be A's connection loss, which says
+        # the request may have been applied, not B's connect failure,
+        # which the class docs call safe to retry.
+        for get in (False, True):
+            with self.subTest(get=get):
+                nodes, discovery = await self.start_cluster(replication=1)
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    lost_keys = self.keys_by_primary(NAMES[0], 2, "lost")
+                    dead_keys = self.keys_by_primary(NAMES[1], 2, "dead")
+                    keys = lost_keys + dead_keys
+                    await client.set_many({key: f"v-{key}" for key in keys})
+                    nodes[NAMES[0]].apply_and_drop_next_touch()
+                    await nodes[NAMES[1]].close()
+                    await asyncio.sleep(0.05)  # let the FIN poison the connection
+                    # No key resolved, so even the get form raises the cause
+                    # itself rather than a PartialConnectionLostError.
+                    with self.assertRaises(ConnectionLostError) as raised:
+                        if get:
+                            await client.get_many_and_touch(keys, 0)
+                        else:
+                            await client.touch_many(keys, 0)
+                    self.assertNotIsInstance(raised.exception, ConnectFailedError)
+                    self.assertEqual(len(nodes[NAMES[0]].multi_touch_frames), 1)
+                finally:
+                    await self.stop(client, discovery, nodes)
+
     async def test_an_expiring_batch_reaches_the_replicas_only_after_the_primary_answered(self):
         # Issue #934, as for a single key: the replica frame is one plain
         # frame after the primary's answer. A positive TTL keeps the
