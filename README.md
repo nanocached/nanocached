@@ -626,9 +626,16 @@ loud `WARN` if that disagrees with its own configured value.
   requests and replies, counted at their worst case (a batched read is
   charged the largest reply it could get), and the proxy as a whole
   holds 256 MiB across every connection, configurable with
-  `--max-in-flight-bytes <bytes>` (at least 1 MiB). A client that
-  pipelines past either budget is read more slowly until its replies
-  have been written; nothing is refused
+  `--max-in-flight-bytes <bytes>` (at least 1 MiB). One source IP, with
+  however many connections, may hold at most a quarter of the proxy-wide
+  budget (64 MiB by default), so a client that reads its replies slowly
+  cannot starve everyone else; behind NAT or on Kubernetes, where
+  clients share a source IP, that quarter is the whole fleet's ceiling.
+  A client that pipelines past a budget is read more slowly until its
+  replies have been written. A request that cannot get its bytes within
+  60 seconds is not dispatched: it is answered `R` (`B` to a client that
+  did not declare the retryable-error capability), the connection stays
+  open and the client may retry
 - Idle connection timeout: 60 seconds, measured from the last complete
   frame (a frame trickled in a byte at a time does not extend it), the
   node's own rule
