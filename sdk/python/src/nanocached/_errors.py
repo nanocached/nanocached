@@ -27,9 +27,11 @@ class WrongNodeError(NanocachedError):
 
 
 class PartialWrongNodeError(WrongNodeError):
-    """Raised by get_many/get_many_bytes (issues #128/#150/#151) when some
-    keys are still wrong-node after the one bounded refresh-and-retry
-    every batch gets (see NanocachedClient's own multi-get docstring). A
+    """Raised by get_many/get_many_bytes (issues #128/#150/#151) and
+    get_many_and_touch when some keys are still wrong-node after the one
+    bounded refresh-and-retry every batch gets (see NanocachedClient's own
+    multi-get docstring), or at once in single-node/proxy mode, where
+    there is no ring to refresh. A
     subclass of WrongNodeError, so existing ``except WrongNodeError:``
     handling keeps working unchanged; ``partial_values`` holds every key
     that DID resolve, keyed by the original object the caller passed, so

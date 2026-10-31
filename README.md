@@ -105,6 +105,11 @@ staged handoff, so nodes started together (or in quick succession) queue
 and join one after another — each join takes roughly the time its handoff
 needs, and no key is lost to a join that has to be retried (a source keeps
 the copies it handed off until discovery confirms the join).
+A joiner is tracked by its connection to discovery, which enables TCP
+keepalive on it: a joiner whose host vanishes without closing the
+connection (power loss, a partition) is dropped from the queue once
+keepalive gives up, about 25 seconds on Linux, instead of holding up the
+joiners behind it.
 
 Liveness is binary: a node is a member until it misses heartbeats for the
 liveness timeout, and a node that is slow but answering — a saturated
@@ -632,9 +637,16 @@ loud `WARN` if that disagrees with its own configured value.
   large batched read takes a connection's whole 64 MiB and runs alone,
   and on a large cluster it can take the proxy's whole budget (at the
   default 256 MiB, sixteen nodes): raise `--max-in-flight-bytes`, and
-  the proxy's memory with it, as the cluster grows. A client that
-  pipelines past either budget is read more slowly until its replies
-  have been written; nothing is refused
+  the proxy's memory with it, as the cluster grows. One source IP, with
+  however many connections, may hold at most a quarter of the proxy-wide
+  budget (64 MiB by default), so a client that reads its replies slowly
+  cannot starve everyone else; behind NAT or on Kubernetes, where
+  clients share a source IP, that quarter is the whole fleet's ceiling.
+  A client that pipelines past a budget is read more slowly until its
+  replies have been written. A request that cannot get its bytes within
+  60 seconds is not dispatched: it is answered `R` (`B` to a client that
+  did not declare the retryable-error capability), the connection stays
+  open and the client may retry
 - Idle connection timeout: 60 seconds, measured from the last complete
   frame (a frame trickled in a byte at a time does not extend it), the
   node's own rule

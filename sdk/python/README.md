@@ -319,7 +319,9 @@ could not be reached at all (no `W` was ever received) raises
 `PartialSetConnectionLostError` instead, `.partial_keys` the keys whose
 primary did store them. In single-node/proxy mode a `W` propagates
 immediately, exactly like `get`/`set`'s own single-mode behavior — there
-is no ring to refresh against.
+is no ring to refresh against. For the batched reads (`get_many`,
+`get_many_and_touch`) the same single-node/proxy `W` raises
+`PartialWrongNodeError` with the keys that did resolve, without a retry.
 
 Within one `set_many` batch, the same node can be one key's primary and
 another key's replica at once; it receives exactly one `o` sub-frame
