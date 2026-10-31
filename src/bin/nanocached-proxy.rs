@@ -806,6 +806,8 @@ fn usage() -> String {
      [--max-connections-per-ip <n>] [--max-in-flight-bytes <bytes>] \
      [--tls-cert <pem> --tls-key <pem>] [--tls-ca <pem>] [--metrics-port <port>]\n\
      [--drain-timeout <secs>]\n\
+     A source IP may hold 1/4 of --max-in-flight-bytes; that share decides how many large batched \
+     reads (m, or y with G) one address runs at once.\n\
      The shared auth secret is read from NANOCACHED_AUTH_SECRET."
         .to_string()
 }
@@ -1257,6 +1259,10 @@ struct RefresherConfig {
     /// task that sends announces is what guarantees no `Y` follows the
     /// `Z` and quietly re-registers a draining proxy.
     drain: watch::Receiver<bool>,
+    /// One source IP's in-flight byte share (`ip_in_flight_share`), what
+    /// `batch_read_share_warning` compares a batched read's worst-case
+    /// charge to.
+    ip_in_flight_share: usize,
 }
 
 /// Appended to a backend failure when this proxy dials in plaintext and the
@@ -1305,6 +1311,32 @@ fn half_tls_warning(client_tls: bool, backend_tls: bool) -> Option<&'static str>
     }
 }
 
+/// The startup-time warning for a cluster so large that one batched read
+/// (`m`, or `y` with `G`), charged at its worst case of
+/// `MAX_MULTI_REPLY_VALUE_BYTES` for every primary it reaches
+/// (`request_cost`), leaves room in a source IP's share for no second one:
+/// clients behind one address, a NAT or a load balancer then run such reads
+/// one at a time. `None` while two fit (or the ring is empty).
+fn batch_read_share_warning(primaries: usize, ip_share: usize) -> Option<String> {
+    let cost = primaries.checked_mul(MAX_MULTI_REPLY_VALUE_BYTES)?;
+    if cost == 0 || ip_share / cost >= 2 {
+        return None;
+    }
+    const MIB: usize = 1024 * 1024;
+    Some(format!(
+        "WARN a batched read of {} or more keys on {primaries} nodes is charged {} MiB of \
+         in-flight bytes against a source IP's share of {} MiB (1/{IP_IN_FLIGHT_SHARE_DIVISOR} \
+         of --max-in-flight-bytes), so clients behind one address run such reads one at a \
+         time; --max-in-flight-bytes {} allows two at once (the proxy's memory limit has to \
+         grow with it)",
+        cost / MAX_REQUEST_SIZE,
+        cost / MIB,
+        ip_share / MIB,
+        cost.saturating_mul(2)
+            .saturating_mul(IP_IN_FLIGHT_SHARE_DIVISOR),
+    ))
+}
+
 async fn run_refresher(
     config: RefresherConfig,
     ring_tx: watch::Sender<Option<Arc<RingView>>>,
@@ -1317,7 +1349,10 @@ async fn run_refresher(
         tls_connector,
         announce,
         mut drain,
+        ip_in_flight_share,
     } = config;
+    // Said once, the first time the roster is that large.
+    let mut warned_about_batch_share = false;
 
     // `force_refresh` callers waiting on the next successful fetch. Kept
     // across a failed fetch (the old wait was for "the view changes", which
@@ -1337,6 +1372,13 @@ async fn run_refresher(
                 // an address that dropped off the ring stops accumulating
                 // map entries from this point on.
                 backends.prune(&ring);
+                if !warned_about_batch_share
+                    && let Some(warning) =
+                        batch_read_share_warning(ring.distinct_addresses(), ip_in_flight_share)
+                {
+                    warned_about_batch_share = true;
+                    eprintln!("{warning}");
+                }
                 // An identical roster is not republished: `send` would
                 // wake every `ring` subscriber for nothing.
                 ring_tx.send_if_modified(|current| {
@@ -6021,7 +6063,24 @@ impl InFlightBudget {
     /// reserves them. `None` only if the semaphore was closed, which
     /// nothing does.
     async fn charge(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let permits = u32::try_from(self.clamp(cost)).unwrap_or(u32::MAX);
+        self.charge_exact(self.clamp(cost)).await
+    }
+
+    /// `charge` for a holder that already holds `held` bytes of this
+    /// budget (a connection's receive-buffer charge, when it admits a
+    /// request): the total is clamped, so the holder asks only for the
+    /// rest of the budget and never waits for bytes it holds itself.
+    async fn charge_beyond(
+        &self,
+        held: usize,
+        cost: usize,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let cost = self.clamp(cost.saturating_add(held)).saturating_sub(held);
+        self.charge_exact(cost).await
+    }
+
+    async fn charge_exact(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let permits = u32::try_from(cost).unwrap_or(u32::MAX);
         Arc::clone(&self.permits)
             .acquire_many_owned(permits)
             .await
@@ -6442,11 +6501,18 @@ async fn handle_client(
                         .as_ref()
                         .map_or(1, |ring| ring.distinct_addresses().max(1));
                     let cost = request_cost(&request, buffered - buf.len(), replication, primaries);
+                    // The connection's receive-buffer charge is part of
+                    // what it already holds on all three budgets: a
+                    // request costing the whole budget asks only for the
+                    // rest, or it would wait on itself (until
+                    // `admission_wait`, then be answered `R`/`B` although
+                    // nothing else was in its way).
+                    let held = receive_charged;
                     let admitted = tokio::select! {
                         admitted = timeout(admission_wait, async {
-                            let connection = connection_in_flight_bytes.charge(cost).await?;
-                            let ip = ip_in_flight_share.budget.charge(cost).await?;
-                            let proxy = proxy_in_flight_bytes.charge(cost).await?;
+                            let connection = connection_in_flight_bytes.charge_beyond(held, cost).await?;
+                            let ip = ip_in_flight_share.budget.charge_beyond(held, cost).await?;
+                            let proxy = proxy_in_flight_bytes.charge_beyond(held, cost).await?;
                             Some(InFlightCharge {
                                 _connection: connection,
                                 _ip: ip,
@@ -6502,8 +6568,15 @@ async fn handle_client(
                 }
             }
         }
-        if shrink_drained_buffer(&mut buf) {
-            // The released capacity is released from the budgets too.
+        // The released capacity is released from the budgets too. A
+        // buffer whose capacity fell to the free threshold on its own
+        // (`split_to` leaves a frame's bytes with the frame, so a 128 KiB
+        // buffer that gave up a 70 KiB frame has 58 KiB) is not shrunk
+        // but holds nothing chargeable either: its charge goes as well,
+        // or an idle connection would keep part of its source IP's share
+        // until it closed, and a neighbour asking for the whole share
+        // would wait for it.
+        if shrink_drained_buffer(&mut buf) || buf.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
             receive_charge = None;
             receive_charged = 0;
         }
@@ -6688,6 +6761,7 @@ async fn run(
             tls_connector: tls_connector.clone(),
             announce: Some((identity, args.port)),
             drain: drain_rx.clone(),
+            ip_in_flight_share: ip_in_flight_share(args.max_in_flight_bytes),
         },
         ring_tx,
         refresh_rx,
@@ -7707,6 +7781,29 @@ mod tests {
     }
 
     #[test]
+    fn a_ring_that_leaves_room_for_one_batched_read_per_ip_is_warned_about() {
+        let share = ip_in_flight_share(DEFAULT_MAX_IN_FLIGHT_BYTES);
+        // Two nodes: two 32 MiB reads fit in the 64 MiB share.
+        assert_eq!(batch_read_share_warning(2, share), None);
+        assert_eq!(batch_read_share_warning(0, share), None);
+        // Four nodes: one read takes the whole share.
+        let warning = batch_read_share_warning(4, share).expect("4 nodes");
+        assert!(warning.starts_with("WARN a batched read of 64 or more keys on 4 nodes"));
+        assert!(warning.contains("64 MiB of in-flight bytes"), "{warning}");
+        assert!(
+            warning.contains("--max-in-flight-bytes 536870912"),
+            "{warning}"
+        );
+        assert!(batch_read_share_warning(3, share).is_some());
+        // Raising the total until two fit silences it.
+        assert_eq!(
+            batch_read_share_warning(4, ip_in_flight_share(512 << 20)),
+            None
+        );
+        assert!(batch_read_share_warning(usize::MAX, share).is_none());
+    }
+
+    #[test]
     fn the_ring_counts_a_shared_address_once() {
         assert_eq!(ring_of(0).distinct_addresses(), 0);
         assert_eq!(ring_of(3).distinct_addresses(), 3);
@@ -8042,6 +8139,88 @@ mod tests {
         read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
         let _ = buf.split_to(1);
         assert_eq!(context.requests_total.load(Ordering::Relaxed), 2);
+        drop(node);
+    }
+
+    /// An `m` of 400 keys of 200 bytes: an 80 KiB frame, so receiving it
+    /// charges the buffer's growth beyond the free 64 KiB, and a batch
+    /// cost (one 16 MiB reply) above every test-sized budget.
+    fn over_threshold_multi_get_frame() -> Vec<u8> {
+        let mut frame = b"m 0 400".to_vec();
+        frame.extend(std::iter::repeat_n(b" 200", 400).flatten());
+        frame.push(b'\n');
+        frame.extend(std::iter::repeat_n(b'k', 400 * 200));
+        frame
+    }
+
+    fn short_admission_wait_limits() -> ConnectionLimits {
+        ConnectionLimits {
+            max_connections: 8,
+            max_connections_per_ip: 8,
+            max_in_flight_bytes: 8 * MAX_REQUEST_SIZE + 4096,
+            max_in_flight_bytes_per_ip: 2 * MAX_REQUEST_SIZE + 4096,
+            admission_wait: Duration::from_secs(2),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_costing_the_whole_budget_does_not_wait_on_its_own_receive_charge() {
+        // The frame is over the free threshold, so while it is parsed the
+        // connection holds part of every budget as its receive buffer's
+        // charge. Its cost takes the whole budget: asked for in full, the
+        // request would wait for the connection's own charge until
+        // `admission_wait` and be answered `B`. It asks only for the rest.
+        let (node, proxy, _context) =
+            slow_single_node(b"k", Duration::ZERO, Some(short_admission_wait_limits())).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream
+            .write_all(&over_threshold_multi_get_frame())
+            .await
+            .unwrap();
+        let header = timeout(
+            Duration::from_millis(1500),
+            read_line(&mut stream, &mut buf),
+        )
+        .await
+        .expect("an over-threshold batch is admitted at once, not after admission_wait")
+        .unwrap();
+        assert!(header.starts_with("M 400 "), "{header}");
+        drop(node);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_idle_connection_holds_no_receive_charge_so_a_neighbour_can_take_the_whole_share() {
+        // After its over-threshold frame is cut from the buffer, the
+        // buffer's capacity is under the free threshold and it is not
+        // shrunk; the charge for the growth must go all the same. If it
+        // stayed, a second connection from the same source IP whose
+        // request costs the whole IP share would wait for the idle one
+        // until `admission_wait` and be answered `B`.
+        let (node, proxy, _context) =
+            slow_single_node(b"k", Duration::ZERO, Some(short_admission_wait_limits())).await;
+        let (mut first, mut first_buf) = connect_and_auth(&proxy).await;
+        first
+            .write_all(&over_threshold_multi_get_frame())
+            .await
+            .unwrap();
+        let header = read_line(&mut first, &mut first_buf).await.unwrap();
+        assert!(header.starts_with("M 400 "), "{header}");
+        // 400 misses: the reply is its header. The connection now idles.
+
+        let (mut second, mut second_buf) = connect_and_auth(&proxy).await;
+        let mut frame = b"m 0 20".to_vec();
+        frame.extend(std::iter::repeat_n(b" 1", 20).flatten());
+        frame.push(b'\n');
+        frame.extend(std::iter::repeat_n(b'k', 20));
+        second.write_all(&frame).await.unwrap();
+        let header = timeout(
+            Duration::from_millis(1500),
+            read_line(&mut second, &mut second_buf),
+        )
+        .await
+        .expect("the neighbour's whole-share batch is admitted while the first connection idles")
+        .unwrap();
+        assert!(header.starts_with("M 20 "), "{header}");
         drop(node);
     }
 
@@ -9622,6 +9801,7 @@ mod tests {
                 tls_connector: None,
                 announce: announce.map(|identity| (identity, 0)),
                 drain: drain_rx.clone(),
+                ip_in_flight_share: ip_in_flight_share(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             ring_tx,
             refresh_rx,
@@ -9732,6 +9912,7 @@ mod tests {
                 tls_connector: None,
                 announce: None,
                 drain: drain_rx.clone(),
+                ip_in_flight_share: ip_in_flight_share(DEFAULT_MAX_IN_FLIGHT_BYTES),
             },
             ring_tx,
             refresh_rx,

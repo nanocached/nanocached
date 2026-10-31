@@ -18,6 +18,17 @@ follow the `sdk/rust/vX.Y.Z` tags.
   request now flushes after the write, inside the same shutdown-cancellable
   step, and the identify handshake (`A`, `L`, `Q`) flushes its writes too.
   Plain TCP is unaffected (flush is a no-op there). (#1104)
+- A compressed value whose DEFLATE body was cut short is now an
+  `Error::Decompression` instead of a silent prefix of the original. The
+  decoder was driven through flate2's `Read` adapters (`DeflateDecoder` +
+  `take` + `read_to_end`), which on some flate2 versions return `Ok` at end of
+  input without checking that the stream reached its final block, so a
+  40,000-byte value whose body was cut to 1 byte, half, or all but the last
+  bytes decoded without error to 0, about 12,700, or up to all 40,000 bytes.
+  Decompression now drives
+  `flate2::Decompress` directly and succeeds only on `Status::StreamEnd`; a
+  marker-only value (empty body) is an error too, and the 64 MiB decompressed
+  size cap is unchanged. (#1106)
 
 ## [0.5.1] - 2026-10-27
 

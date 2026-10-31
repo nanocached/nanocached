@@ -603,10 +603,11 @@ loud `WARN` if that disagrees with its own configured value.
   `--max-in-flight-bytes <bytes>` (at least 1 MiB). A reply's values
   are charged before it is built and released once written; a receive
   buffer's growth past 64 KiB is charged before it is allocated; and a
-  multi-key frame (`m`, `o` or `y`) is charged 128 bytes per key for the
-  per-key lists the node builds while it runs, held until the reply is
-  written (a frame of one-byte keys can carry about 350,000 keys, so
-  about 44 MiB). A frame that costs more than the whole budget waits for
+  multi-key frame (`m`, `o` or `y`) is charged 256 bytes per key (288
+  for `o`) for the per-key lists the node builds while it runs, taken as
+  soon as the frame is fully received and before those lists exist, and
+  held until the reply is written (a frame of one-byte keys can carry
+  about 350,000 keys, so about 85 MiB). A frame that costs more than the whole budget waits for
   it to be free and then runs alone. A connection that cannot get its
   share in time is closed, like a stalled one. Size a process at
   `--max-memory` plus this plus headroom
@@ -649,6 +650,14 @@ loud `WARN` if that disagrees with its own configured value.
   budget (64 MiB by default), so a client that reads its replies slowly
   cannot starve everyone else; behind NAT or on Kubernetes, where
   clients share a source IP, that quarter is the whole fleet's ceiling.
+  That quarter also sets how many large batched reads one source IP runs
+  at once: on four or more nodes a read of 64 or more keys is charged
+  the whole 64 MiB, so reads from one address run one at a time (about
+  3,400 requests a second against about 12,900 with the flag raised to
+  4 GiB, 16 loopback connections, 100 keys, four nodes). Raise
+  `--max-in-flight-bytes` to four times the number of parallel reads
+  wanted times nodes × 16 MiB (and the proxy's memory with it); the
+  proxy warns at startup when the cluster is large enough for this.
   A client that pipelines past a budget is read more slowly until its
   replies have been written. A request that cannot get its bytes within
   60 seconds is not dispatched: it is answered `R` (`B` to a client that

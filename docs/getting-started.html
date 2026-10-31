@@ -199,8 +199,9 @@ and clustered production use identical code. See
     arriving, the per-key working memory of multi-key frames)</td><td>256 MiB
     by default (<code>--max-in-flight-bytes</code>), node-wide, outside
     <code>--max-memory</code>; a multi-key frame (<code>m</code>,
-    <code>o</code>, <code>y</code>) is charged 128 bytes per key until its
-    reply is written; a connection that cannot get its share in time is
+    <code>o</code>, <code>y</code>) is charged 256 bytes per key (288 for
+    <code>o</code>) before its key lists are built, until its reply is
+    written; a connection that cannot get its share in time is
     closed</td><td>—</td></tr>
     <tr><td>Idle connection timeout</td><td>60 s</td><td>60 s</td></tr>
   </tbody>

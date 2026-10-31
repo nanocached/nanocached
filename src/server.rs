@@ -171,28 +171,43 @@ fn reply_bytes(response: &Response) -> usize {
 
 /// What a multi-key frame (`m`, `o`, `y`) is charged against the in-flight
 /// budget for each key, on top of its receive buffer and its reply. The
-/// arms build several per-key vectors before the cache sees the frame —
-/// the key list, the hashes, the owned and forwarded splits, the result
-/// vector and the reply entries — about 100 bytes per key, and a frame of
-/// one-byte keys carries about 350,000 keys in its 1 MiB, so tens of
-/// megabytes of working memory that the buffer's own charge (about 1 MiB)
-/// does not account for. 128 bytes covers that with some room.
-const MULTI_KEY_FRAME_BYTES_PER_KEY: usize = 128;
+/// parser builds the key list (a `Bytes` handle, 32 bytes, per key) and the
+/// arm then builds the hashes, the owned and forwarded splits, the result
+/// vector and the reply entries. A frame of one-byte keys carries about
+/// 350,000 keys in its 1 MiB, so that is tens of megabytes of working
+/// memory that the buffer's own charge (about 1 MiB) does not account for.
+/// Measured on the release build, a single frame costs 185 bytes per key
+/// (`m`, `y`) to 194 (`o`) of resident memory at its peak; 256 covers that
+/// with room for the allocator.
+const MULTI_KEY_FRAME_BYTES_PER_KEY: usize = 256;
+
+/// What an `o` frame adds to `MULTI_KEY_FRAME_BYTES_PER_KEY` for each key:
+/// the second vector of handles, one per value.
+const MULTI_SET_VALUE_BYTES_PER_KEY: usize = 32;
 
 /// Charges a multi-key frame's per-key working memory against the
-/// in-flight budget before the arm builds its per-key vectors; the caller
-/// holds the permit until the reply is written. A frame costing more than
-/// the whole budget takes all of it and runs alone — the connection's own
-/// receive-buffer charge is part of what it already holds, so it asks only
-/// for the rest and does not wait for itself. Waits at most
+/// in-flight budget; the caller holds the permit until the reply is
+/// written. It is called before the parser builds the frame's key vectors
+/// (`parse_resumable`'s `ParseError::ChargeRequired`), so a connection
+/// waiting here holds no uncharged per-key memory. A frame costing more
+/// than the whole budget takes all of it and runs alone — the connection's
+/// own receive-buffer charge is part of what it already holds, so it asks
+/// only for the rest and does not wait for itself. Waits at most
 /// `WRITE_TIMEOUT`, like a reply, and fails the connection if the budget
 /// does not free in that time.
 async fn charge_multi_key_frame(
     config: &ConnectionConfig,
     receive_charged: usize,
     keys: usize,
+    values: bool,
 ) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
-    let cost = keys.saturating_mul(MULTI_KEY_FRAME_BYTES_PER_KEY);
+    let per_key = MULTI_KEY_FRAME_BYTES_PER_KEY
+        + if values {
+            MULTI_SET_VALUE_BYTES_PER_KEY
+        } else {
+            0
+        };
+    let cost = keys.saturating_mul(per_key);
     let cost = config
         .in_flight_bytes
         .clamp(cost.saturating_add(receive_charged))
@@ -2514,7 +2529,32 @@ async fn handle_connection(
         }
 
         let buffered_before = received.len();
-        let parsed = parse_resumable(&mut received, tagged, &mut parse_progress);
+        let mut parsed = parse_resumable(&mut received, tagged, &mut parse_progress, false);
+        // A multi-key frame (`m`, `o`, `y`) is charged for its per-key
+        // working memory before the parser builds its key vectors, not
+        // after: a connection waiting for the budget would otherwise hold
+        // those vectors (about 32 bytes per key) uncharged for as long as
+        // it waits. The parse stopped short of building them; charge, then
+        // parse again. The size limit comes first, so that a frame that is
+        // refused does not wait for the budget either.
+        let mut frame_charge = None;
+        if let Err(ParseError::ChargeRequired {
+            keys,
+            values,
+            frame_len,
+        }) = parsed
+        {
+            if request_is_too_large(frame_len) {
+                return Err(reject_oversized_request(
+                    &mut stream,
+                    "request is too large".to_string(),
+                )
+                .await);
+            }
+            frame_charge =
+                Some(charge_multi_key_frame(&config, receive_charged, keys, values).await?);
+            parsed = parse_resumable(&mut received, tagged, &mut parse_progress, true);
+        }
 
         if parsed.is_ok() {
             // `MAX_REQUEST_SIZE` is a bound on one frame, so it is checked
@@ -2844,8 +2884,7 @@ async fn handle_connection(
             // order before replying — the client never sees the owned/
             // not-owned split.
             Ok((Command::MultiGet { namespace, keys }, tag)) => {
-                let _frame_charge =
-                    charge_multi_key_frame(&config, receive_charged, keys.len()).await?;
+                let _frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -2912,8 +2951,7 @@ async fn handle_connection(
                 },
                 tag,
             )) => {
-                let _frame_charge =
-                    charge_multi_key_frame(&config, receive_charged, keys.len()).await?;
+                let _frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiAckEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -3492,8 +3530,7 @@ async fn handle_connection(
                 },
                 tag,
             )) => {
-                let _frame_charge =
-                    charge_multi_key_frame(&config, receive_charged, keys.len()).await?;
+                let _frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -3782,7 +3819,7 @@ async fn handle_connection(
                 continue;
             }
             Ok((command, _)) => {
-                // `ListEntries`/`MarkMigrated`/`UnmarkMigrated`/`Sweep`/
+                // `ListEntries`/`MarkMigrated`/`UnmarkMigratedMany`/`Sweep`/
                 // `PeekEntry`: internal-only, constructed directly by
                 // server-side tasks, never by `parse()` — this arm exists
                 // only so the match stays exhaustive.
@@ -3842,7 +3879,15 @@ async fn handle_connection(
             let mut shrunk = BytesMut::with_capacity(received.len());
             shrunk.extend_from_slice(&received);
             received = shrunk;
-            // The released capacity is released from the budget too.
+        }
+        // The released capacity is released from the budget too. A buffer
+        // whose capacity fell to the free threshold on its own is not
+        // shrunk but holds nothing chargeable either: `split_to` leaves a
+        // frame's bytes with the frame, so a 256 KiB buffer that gave up
+        // a 200 KB frame has 56 KiB left. Its charge goes as well, or an
+        // idle connection would pin up to a frame's worth of the shared
+        // budget until it closed.
+        if received.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
             receive_charge = None;
             receive_charged = 0;
         }
@@ -4208,9 +4253,9 @@ async fn abandon_departed_joiner(
          copies",
         restore.len()
     );
-    for key in &restore {
-        unmark_migrated(&node_context.request_tx, key).await;
-    }
+    // One round trip for the lot: this runs inline in the heartbeat loop,
+    // so one per key delayed the next heartbeat by the whole restore.
+    unmark_migrated_many(&node_context.request_tx, restore).await;
     Some(after_ring)
 }
 
@@ -6332,12 +6377,13 @@ async fn run_migration(
         // races this key's peek is caught by the next iteration's drain,
         // which then lands after the stale key and wipes it.)
         if !drain_pending_clears(&node_context, &joining_addr, &mut stream).await {
-            for key in marked_this_run
+            // One round trip for the lot: one per key kept the migration slot
+            // occupied for the whole restore.
+            let restore: Vec<Key> = marked_this_run
                 .into_iter()
                 .chain(migration_guard.take_join_marks())
-            {
-                unmark_migrated(&node_context.request_tx, &key).await;
-            }
+                .collect();
+            unmark_migrated_many(&node_context.request_tx, restore).await;
 
             return;
         }
@@ -6368,12 +6414,13 @@ async fn run_migration(
         .await;
 
         if !sent {
-            for key in marked_this_run
+            // One round trip for the lot: one per key kept the migration slot
+            // occupied for the whole restore.
+            let restore: Vec<Key> = marked_this_run
                 .into_iter()
                 .chain(migration_guard.take_join_marks())
-            {
-                unmark_migrated(&node_context.request_tx, &key).await;
-            }
+                .collect();
+            unmark_migrated_many(&node_context.request_tx, restore).await;
 
             return;
         }
@@ -6389,12 +6436,13 @@ async fn run_migration(
     }
 
     if migration_guard.abort_requested.load(Ordering::SeqCst) {
-        for key in marked_this_run
+        // One round trip for the lot: one per key kept the migration slot
+        // occupied for the whole restore.
+        let restore: Vec<Key> = marked_this_run
             .into_iter()
             .chain(migration_guard.take_join_marks())
-        {
-            unmark_migrated(&node_context.request_tx, &key).await;
-        }
+            .collect();
+        unmark_migrated_many(&node_context.request_tx, restore).await;
 
         eprintln!("WARN migration to {joining_addr} cancelled by discovery; rolled back its marks");
 
@@ -6434,12 +6482,13 @@ async fn run_migration(
     // Issue #106: whatever clears queued up after the last key's drain
     // go out before the slot flips to "completed" ...
     if !drain_pending_clears(&node_context, &joining_addr, &mut stream).await {
-        for key in marked_this_run
+        // One round trip for the lot: one per key kept the migration slot
+        // occupied for the whole restore.
+        let restore: Vec<Key> = marked_this_run
             .into_iter()
             .chain(migration_guard.take_join_marks())
-        {
-            unmark_migrated(&node_context.request_tx, &key).await;
-        }
+            .collect();
+        unmark_migrated_many(&node_context.request_tx, restore).await;
 
         return;
     }
@@ -8102,12 +8151,8 @@ async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
     let _ = execute_command(request_tx, Command::MarkMigrated { key: key.clone() }).await;
 }
 
-async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
-    let _ = execute_command(request_tx, Command::UnmarkMigrated { key: key.clone() }).await;
-}
-
-/// `unmark_migrated` for a whole restore in one cache round trip — see
-/// `Cache::unmark_migrated_many` for why one per key was too slow.
+/// Reverses `mark_migrated` for a whole restore in one cache round trip —
+/// see `Cache::unmark_migrated_many` for why one per key was too slow.
 async fn unmark_migrated_many(request_tx: &mpsc::Sender<CacheRequest>, keys: Vec<Key>) {
     if keys.is_empty() {
         return;
@@ -11063,9 +11108,9 @@ mod tests {
     async fn multi_key_frames_are_charged_per_key_until_they_are_answered() {
         // The cache is a stand-in that answers when the test says so, so
         // the frame is "in flight" for as long as the test wants. With a
-        // 1 MiB budget, one 6,000-key frame holds 6,000 x the per-key
+        // 1 MiB budget, one 3,000-key frame holds 3,000 x the per-key
         // charge and a second one cannot start until the first is answered.
-        const KEYS: usize = 6_000;
+        const KEYS: usize = 3_000;
         const CHARGE: usize = KEYS * MULTI_KEY_FRAME_BYTES_PER_KEY;
         let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(8);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -11117,7 +11162,7 @@ mod tests {
             .await
             .expect("the first frame is answered")
             .unwrap();
-        assert_eq!(&header, b"M 6000 ");
+        assert_eq!(&header, b"M 3000 ");
         let second_request = timeout(Duration::from_secs(5), request_rx.recv())
             .await
             .expect("the second frame proceeds once the first is answered")
@@ -11131,7 +11176,7 @@ mod tests {
             .await
             .expect("the second frame is answered")
             .unwrap();
-        assert_eq!(&header, b"M 6000 ");
+        assert_eq!(&header, b"M 3000 ");
 
         drop(first);
         drop(second);
@@ -11140,9 +11185,159 @@ mod tests {
         assert_eq!(budget.available(), MAX_REQUEST_SIZE);
     }
 
+    /// Bytes allocated minus bytes freed by the current thread, so that a
+    /// test can see what a task on its (single-threaded) runtime holds.
+    struct ThreadLiveBytes;
+
+    thread_local! {
+        static LIVE_BYTES: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn live_bytes() -> isize {
+        LIVE_BYTES.with(|live| live.get())
+    }
+
+    fn add_live_bytes(delta: isize) {
+        let _ = LIVE_BYTES.try_with(|live| live.set(live.get() + delta));
+    }
+
+    // SAFETY: every method forwards to the system allocator unchanged and
+    // only adds to a thread-local counter that never allocates.
+    unsafe impl std::alloc::GlobalAlloc for ThreadLiveBytes {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let pointer = unsafe { std::alloc::System.alloc(layout) };
+            if !pointer.is_null() {
+                add_live_bytes(layout.size() as isize);
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+            add_live_bytes(-(layout.size() as isize));
+            unsafe { std::alloc::System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let pointer = unsafe { std::alloc::System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                add_live_bytes(layout.size() as isize);
+            }
+            pointer
+        }
+
+        unsafe fn realloc(
+            &self,
+            pointer: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            let moved = unsafe { std::alloc::System.realloc(pointer, layout, new_size) };
+            if !moved.is_null() {
+                add_live_bytes(new_size as isize - layout.size() as isize);
+            }
+            moved
+        }
+    }
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: ThreadLiveBytes = ThreadLiveBytes;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_waiting_for_the_budget_has_not_built_its_key_vector() {
+        // 200,000 one-byte keys cost 51 MB of budget; a 64 MiB budget with
+        // 60 MiB held elsewhere cannot give that, so the connection waits
+        // for it. While it waits it must hold the 600 KB frame in its
+        // receive buffer and nothing per key: the key vector alone is 6.4 MB
+        // of `Bytes` handles, which used to be built before the wait, so
+        // before the frame was charged for.
+        const KEYS: usize = 200_000;
+        let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let budget = InFlightBudget::new(64 << 20);
+        let held = budget.charge(60 << 20).await;
+        let frame = multi_get_frame(KEYS);
+
+        let (mut client, server) = tcp_pair().await;
+        let live_before = live_bytes();
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        client.write_all(&frame).await.unwrap();
+        sleep(Duration::from_millis(500)).await;
+
+        assert!(
+            request_rx.try_recv().is_err(),
+            "the frame must be waiting for the budget"
+        );
+        let held_by_the_connection = live_bytes() - live_before;
+        assert!(
+            held_by_the_connection < 3 << 20,
+            "a connection waiting for the budget holds {held_by_the_connection} bytes; \
+             the 600 KB frame is about 1 MB with its buffer growth, the 200,000 \
+             key handles would add 6.4 MB"
+        );
+
+        // Releasing the budget lets the frame through.
+        drop(held);
+        let request = timeout(Duration::from_secs(5), request_rx.recv())
+            .await
+            .expect("the frame proceeds once the budget is free")
+            .unwrap();
+        request
+            .response_tx
+            .send(Response::Multi(vec![MultiEntry::Miss; KEYS]))
+            .ok()
+            .unwrap();
+        let mut header = [0u8; 9];
+        timeout(Duration::from_secs(5), client.read_exact(&mut header))
+            .await
+            .expect("the frame is answered")
+            .unwrap();
+        assert_eq!(&header, b"M 200000 ");
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), connection_task).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversized_multi_key_frame_is_refused_without_waiting_for_the_budget() {
+        // 400,000 keys are a 1.2 MB frame, above the request limit: it is
+        // refused as too large at once, not charged (which would wait for
+        // the budget, held elsewhere here, for WRITE_TIMEOUT).
+        const KEYS: usize = 400_000;
+        let (request_tx, _request_rx) = mpsc::channel::<CacheRequest>(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let budget = InFlightBudget::new(64 << 20);
+        let _held = budget.charge(60 << 20).await;
+
+        let (mut client, server) = tcp_pair().await;
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        let frame = multi_get_frame(KEYS);
+        let _ = client.write_all(&frame).await;
+        let error = timeout(Duration::from_secs(5), connection_task)
+            .await
+            .expect("the oversized frame is refused, not left waiting for the budget")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("too large"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_multi_key_frame_costing_more_than_the_budget_still_runs_alone() {
-        // 100,000 keys cost 12.8 MB against a 1 MiB budget, and the
+        // 100,000 keys cost 25.6 MB against a 1 MiB budget, and the
         // 300 KB frame is already holding part of that budget as its
         // receive buffer: the frame takes what is left, does not wait for
         // itself, and is answered.
@@ -11175,6 +11370,50 @@ mod tests {
         cache_task.await.unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_idle_connection_holds_no_receive_charge_after_a_frame_over_the_threshold() {
+        // Receiving a 200 KB frame grows the buffer to 256 KiB and charges
+        // the growth beyond the free 64 KiB. Cutting the frame out leaves
+        // the buffer at 56 KiB — under the threshold, so it is not shrunk —
+        // and the charge must go with the frame all the same, or every
+        // idle connection that ever received a large frame would pin part
+        // of the shared budget until it closed.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(4 * MAX_REQUEST_SIZE);
+        let (mut client, server) = tcp_pair().await;
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        let mut frame = b"S 1 200000\nk".to_vec();
+        frame.extend(std::iter::repeat_n(b'v', 200_000));
+        client.write_all(&frame).await.unwrap();
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"S\n");
+        // The reply is written before the connection task gets back to
+        // its buffer bookkeeping; let it.
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            budget.available(),
+            4 * MAX_REQUEST_SIZE,
+            "an idle connection must hold nothing of the budget"
+        );
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), connection_task).await;
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn the_multi_key_charge_is_bounded_and_fails_like_a_reply_that_cannot_be_charged() {
         let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
@@ -11183,13 +11422,15 @@ mod tests {
         // The charge is the key count times the per-key figure, less
         // nothing; a connection already holding receive-buffer bytes asks
         // only for the rest of the budget when the frame costs more.
-        let small = charge_multi_key_frame(&config, 0, 100).await.unwrap();
+        let small = charge_multi_key_frame(&config, 0, 100, false)
+            .await
+            .unwrap();
         assert_eq!(
             budget.available(),
             MAX_REQUEST_SIZE - 100 * MULTI_KEY_FRAME_BYTES_PER_KEY
         );
         drop(small);
-        let all_the_rest = charge_multi_key_frame(&config, 300_000, 1_000_000)
+        let all_the_rest = charge_multi_key_frame(&config, 300_000, 1_000_000, false)
             .await
             .unwrap();
         assert_eq!(budget.available(), 300_000);
@@ -11199,7 +11440,9 @@ mod tests {
         // WRITE_TIMEOUT with the budget error and holds nothing.
         let held = budget.charge(MAX_REQUEST_SIZE).await;
         let started = tokio::time::Instant::now();
-        let error = charge_multi_key_frame(&config, 0, 10).await.unwrap_err();
+        let error = charge_multi_key_frame(&config, 0, 10, false)
+            .await
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(
             error.to_string().contains("in-flight byte budget"),
@@ -27046,6 +27289,282 @@ mod tests {
             node_context.known_ring.lock().unwrap().as_ref().unwrap(),
             &pre_completion_ring
         ));
+    }
+
+    /// What a restore costs the cache task: a stand-in in front of the
+    /// real one that counts the mark and unmark commands passing through.
+    #[derive(Default)]
+    struct MarkCounts {
+        marks: std::sync::atomic::AtomicUsize,
+        batched_unmarks: std::sync::atomic::AtomicUsize,
+        batched_keys: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MarkCounts {
+        fn marks(&self) -> usize {
+            self.marks.load(Ordering::SeqCst)
+        }
+        fn batched_unmarks(&self) -> usize {
+            self.batched_unmarks.load(Ordering::SeqCst)
+        }
+        fn batched_keys(&self) -> usize {
+            self.batched_keys.load(Ordering::SeqCst)
+        }
+    }
+
+    fn counting_cache(
+        inner: mpsc::Sender<CacheRequest>,
+    ) -> (
+        mpsc::Sender<CacheRequest>,
+        Arc<MarkCounts>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let counts = Arc::new(MarkCounts::default());
+        let seen = Arc::clone(&counts);
+        let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(64);
+        let task = tokio::spawn(async move {
+            while let Some(request) = request_rx.recv().await {
+                match &request.command {
+                    Command::MarkMigrated { .. } => {
+                        seen.marks.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Command::UnmarkMigratedMany { keys } => {
+                        seen.batched_unmarks.fetch_add(1, Ordering::SeqCst);
+                        seen.batched_keys.fetch_add(keys.len(), Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+                if inner.send(request).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (request_tx, counts, task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_gone_verdict_restores_every_dead_copy_in_one_cache_command() {
+        // The `G` restore runs inline in the heartbeat loop, so one cache
+        // round trip per marked key held the next heartbeat back by about
+        // 12.5 us per key — enough marked keys and a live node is evicted.
+        // Counted in commands rather than timed, so the check is exact.
+        const KEYS: usize = 5_000;
+        let names: Vec<String> = (0..KEYS).map(|index| format!("dead-{index}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (mut node_context, _after_ring, _pre_completion_ring) =
+            completed_unconfirmed_context(&names);
+        let (inner_tx, inner_rx) = mpsc::channel(8);
+        let cache_task = tokio::spawn(run_cache(inner_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let (request_tx, counts, proxy_task) = counting_cache(inner_tx);
+        node_context.request_tx = request_tx;
+
+        let (_name, identity) = unconfirmed_completed_joiner(&node_context).unwrap();
+        let after_ring =
+            abandon_departed_joiner(&node_context, "joiner-0", &identity, "127.0.0.1:1").await;
+
+        assert!(after_ring.is_some(), "the matching slot is abandoned");
+        assert_eq!(counts.batched_unmarks(), 1, "one command for the lot");
+        assert_eq!(counts.batched_keys(), KEYS);
+
+        proxy_task.abort();
+        drop(node_context);
+        cache_task.abort();
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum RollbackVia {
+        /// Discovery cancels the handoff part-way through its keys.
+        Abort,
+        /// The joiner drops the connection and the key can't be delivered.
+        TransferFailure,
+        /// A clear queued mid-run can't be replayed before the next key.
+        ClearBeforeNextKey,
+        /// A clear queued after the last key can't be replayed.
+        ClearAfterLastKey,
+    }
+
+    async fn rollback_restores_in_one_cache_command(via: RollbackVia) {
+        const KEYS: usize = 240;
+        const DELIVERED_BEFORE_THE_FAULT: usize = 30;
+        let (inner_tx, inner_rx) = mpsc::channel(8);
+        let cache_task = tokio::spawn(run_cache(inner_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let (request_tx, counts, proxy_task) = counting_cache(inner_tx.clone());
+
+        let users = Bytes::from_static(b"users");
+        for index in 0..KEYS {
+            send_command(
+                &inner_tx,
+                Command::Set {
+                    key: Key::new(users.clone(), Bytes::from(format!("k{index}"))),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+
+        let node_context = NodeContext {
+            gates: Default::default(),
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr,
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        };
+        let joined = vec![
+            ("ready-node".to_string(), "127.0.0.1:1".to_string()),
+            ("other-node".to_string(), "127.0.0.1:1".to_string()),
+        ];
+        let (before_ring, after_ring) = migration_rings(&node_context, "joiner-0", &joined);
+        let after_ring = Arc::new(after_ring);
+        let migration_guard = MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            "joiner-0".to_string(),
+            joining_addr.clone(),
+            "tok-joiner-0".to_string(),
+            Arc::clone(&after_ring),
+            2,
+            None,
+            &joined,
+            &node_context.known_ring,
+            &node_context.ring_history,
+        )
+        .unwrap_new();
+        let keys = list_keys(&request_tx).await;
+
+        // How many keys this node actually sends the joiner.
+        let mut hasher = KeyHasher::default();
+        let sendable = keys
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|key| {
+                let hash = hasher.hash(key);
+                after_ring.is_owner_hashed(hash, "joiner-0", 2)
+                    && before_ring.is_owner_hashed(hash, "ready-node", 2)
+            })
+            .count();
+        assert!(
+            sendable > DELIVERED_BEFORE_THE_FAULT + 10,
+            "sanity: {sendable}"
+        );
+        let fault_after = if via == RollbackVia::ClearAfterLastKey {
+            sendable
+        } else {
+            DELIVERED_BEFORE_THE_FAULT
+        };
+
+        let abort = Arc::clone(&migration_guard.abort_requested);
+        let joiner_context = node_context.clone();
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 4096];
+            for delivered in 1..=fault_after {
+                if connection.read(&mut buffer).await.unwrap() == 0 {
+                    return;
+                }
+                if delivered == fault_after {
+                    match via {
+                        RollbackVia::Abort => abort.store(true, Ordering::SeqCst),
+                        RollbackVia::TransferFailure => return,
+                        RollbackVia::ClearBeforeNextKey | RollbackVia::ClearAfterLastKey => {
+                            assert!(matches!(
+                                route_clear(&joiner_context, &ClearScope::All),
+                                ClearRoute::Queued
+                            ));
+                        }
+                    }
+                }
+                connection.write_all(b"S\n").await.unwrap();
+            }
+            if via == RollbackVia::Abort {
+                while connection.read(&mut buffer).await.unwrap_or(0) > 0 {}
+            }
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            run_migration(
+                node_context.clone(),
+                "joiner-0".to_string(),
+                joining_addr,
+                "tok-joiner-0".to_string(),
+                None,
+                2,
+                before_ring,
+                after_ring,
+                migration_guard,
+                keys,
+            ),
+        )
+        .await
+        .expect("the migration returns");
+
+        assert!(
+            counts.marks() > 0,
+            "{via:?}: the run marked displaced copies"
+        );
+        assert_eq!(
+            counts.batched_unmarks(),
+            1,
+            "{via:?}: one command for the lot"
+        );
+        assert_eq!(counts.batched_keys(), counts.marks(), "{via:?}");
+        // The restore took: nothing is left for the sweep to reclaim.
+        assert_eq!(
+            send_command(
+                &inner_tx,
+                Command::Sweep {
+                    marked: true,
+                    owned: None
+                }
+            )
+            .await,
+            Response::Swept(0),
+            "{via:?}"
+        );
+
+        joining_task.abort();
+        proxy_task.abort();
+        drop(node_context);
+        cache_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abort_rollback_restores_in_one_cache_command() {
+        rollback_restores_in_one_cache_command(RollbackVia::Abort).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_transfer_failure_rollback_restores_in_one_cache_command() {
+        rollback_restores_in_one_cache_command(RollbackVia::TransferFailure).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clear_replay_failure_rollback_restores_in_one_cache_command() {
+        rollback_restores_in_one_cache_command(RollbackVia::ClearBeforeNextKey).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clear_replay_failure_after_the_last_key_restores_in_one_cache_command() {
+        rollback_restores_in_one_cache_command(RollbackVia::ClearAfterLastKey).await;
     }
 
     #[test]

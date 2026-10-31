@@ -56,6 +56,20 @@ framework adapters at one version, whether or not a component changed.
   before it is allocated, as the node does, and released when the buffer
   shrinks; a connection that cannot get the growth by its frame deadline is
   closed.
+- `nanocached-proxy`: a request's admission asked for its whole cost although
+  the connection already held part of every budget as its receive buffer's
+  charge (a frame over 64 KiB). A request costing the whole budget — a
+  batched read of 64 keys or more in front of four or more nodes, or a 100 KB
+  `S` on the smallest `--max-in-flight-bytes` — therefore waited for the
+  connection's own charge until the admission wait (60 s) and was answered
+  `R`/`B`, and again on every resend. The charge also outlived its frame: a
+  buffer whose capacity fell to the free threshold when the frame was cut
+  from it was not shrunk, so an idle connection kept part of its source IP's
+  share until it closed and a neighbour asking for the whole share waited
+  for it, with the IP share's queue then closing other connections that
+  could not grow their buffer in time. Admission now asks only for what the
+  connection does not already hold, and the receive charge is released as
+  soon as the buffer holds nothing chargeable.
 - `nanocached-proxy`: a batched read (`m`, or `y` with `G`) spread over
   several nodes held up to 16 MiB of values per node while it was
   answered, plus a second copy for the client, but was charged for 16 MiB
@@ -70,6 +84,18 @@ framework adapters at one version, whether or not a component changed.
   count. The proxy also gives a backend connection's read buffer back after
   a large reply (it kept about 14 MiB per connection after one 16 MiB
   reply).
+- `nanocached-proxy`: on four or more nodes a batched read of 64 or more
+  keys is charged 64 MiB, the whole of a source IP's in-flight share (a
+  quarter of `--max-in-flight-bytes`), so reads from one address, or from
+  clients behind one NAT or load balancer, ran one at a time (16
+  connections reading 100 keys: about 3,400 requests a second against
+  about 12,900 with the budget raised to 4 GiB). The charge is a worst
+  case and stays; the behaviour is now documented in the usage text, the
+  README and the proxy deployment guide, with the setting that allows more
+  at once (`--max-in-flight-bytes` of four times the parallel reads wanted
+  times nodes × 16 MiB), and the proxy logs a warning at startup, once,
+  when the cluster is large enough for a source IP to fit only one such
+  read.
 - `nanocached-discovery`: an `M` retry to a ready node that was slow to
   answer kept going after the join it belonged to had been abandoned and its
   `X` sent. A retry that reached the node after that `X` (a no-op there,
@@ -86,6 +112,14 @@ framework adapters at one version, whether or not a component changed.
   interval evicted live nodes between two heartbeats; a very large value
   overflowed the clock arithmetic and crashed. The flag now accepts 6 to
   604800 seconds (7 days) and refuses anything else as a usage error.
+- `nanocached-discovery`: the 2 s cooldown on registering a new node name
+  was keyed by the raw source address, while the join waiting cap and the
+  connection cap fold an IPv6 source to its /64. A sender inside one /64
+  rotated source addresses to get a fresh cooldown each time and could
+  register forged entries up to the registry limit, which first made
+  legitimate joins fail with a too-large roster and then refused legitimate
+  announces with `registry is full`. The cooldown is now keyed the same way,
+  so a /64 is one source. (#1101)
 - `nanocached-discovery`: the ack for the `C` that completed a join was
   written only after the next waiting node's `M` fan-out, which can take up
   to three 10 s attempts against a ready node that is slow to answer, while
@@ -100,12 +134,33 @@ framework adapters at one version, whether or not a component changed.
   replication 1 those keys missed on the new owner. Such a node is now added
   to the nodes the join expects a report from and sent the join's own `M`,
   with the same roster and generation the other ready nodes received.
+- `nanocached-discovery`: the `M` sends to nodes admitted by `P` during a
+  pending join were not bounded like the join's own fan-out. They skipped the
+  64-dial limit, were not owned by the join (each could run three 10 s
+  attempts on its own), and each copied the whole roster (up to about
+  1 MiB) for a `P` of a few dozen bytes, so a sender announcing new names
+  during a join grew dials and memory up to the registry limit. They now
+  take a permit of the join's dial limit before dialing, share the join's
+  one roster, and are aborted when the join is promoted or abandoned. A
+  join hands off to at most 64 such nodes; further new names are refused
+  with a retry-shortly error until it ends.
 - `nanocached-node`: a `/metrics` scrape built and sorted a row for every live
   namespace on the cache task although it renders only the largest 256, so a
   node holding very many namespaces (300,000 took 45 ms) paused every client
   for the sort on each scrape. The cache task now selects the largest 256
   before sorting; the `nanocached_node_namespaces` and
   `nanocached_node_namespaces_unlisted` gauges are unchanged.
+- `nanocached-node`: a connection that received a frame over 64 KiB kept the
+  in-flight charge for its receive buffer's growth after the frame was cut
+  from the buffer, because the charge was released only when the buffer was
+  shrunk and a buffer left at or under the threshold by the frame it gave up
+  is not. Every persistent connection that had once received a large frame —
+  an SDK connection after one large `set` — pinned up to a frame's worth of
+  `--max-in-flight-bytes` while idle, until it closed; a few hundred such
+  connections could hold the whole default 256 MiB with nothing in flight,
+  after which other connections' replies and multi-key frames waited and
+  timed out. The charge is now released whenever the buffer holds nothing
+  chargeable.
 - `nanocached-node`: on an `M`, the count of entries this node will send to
   the joiner (which sizes discovery's migration timeout) hashed every key
   of the snapshot in one go on the runtime thread, about 60 ms per million
@@ -132,6 +187,17 @@ framework adapters at one version, whether or not a component changed.
   dropped that connection and failed the other clients' requests in flight on
   it. The limit is now applied to the frame itself: to the frame just parsed,
   or to the one still arriving.
+- `nanocached-node`: a multi-key frame (`m`, `o`, `y`) that had to wait for
+  `--max-in-flight-bytes` held its parsed key list, 32 bytes per key (about
+  11 MB for a 1 MiB frame of one-byte keys), uncharged for as long as it
+  waited, because the per-key charge was taken after the frame was parsed.
+  With 300 connections each sending one such frame the node reached 2.5 GB
+  against the 256 MiB budget. The connection now charges the frame as soon
+  as it is fully buffered, before the key list is built, and a frame over the
+  request-size limit is still refused without waiting. The charge was also
+  below the measured 185 (`m`, `y`) to 194 (`o`) bytes per key of resident
+  memory at a frame's peak: it is now 256 bytes per key, and 288 for `o`,
+  which builds a second list for the values.
 - `nanocached-proxy`: a request frame of exactly 1 MiB, or up to ten bytes
   under it, passed the proxy but was refused by the node once the proxy
   added its own tag to the header; the proxy could not match the node's
@@ -164,6 +230,17 @@ framework adapters at one version, whether or not a component changed.
   skipped by re-replication, and removed by a sweep when another owner
   exists. The list now keeps those marks, on completion and when the
   transfer is cancelled or fails.
+- `nanocached-node`: restoring a handoff's dead copies after a `G` verdict
+  from discovery, or after a migration was cancelled or failed part-way,
+  still sent the cache one command per marked key, about 12.5 us each (3.7 s
+  for 300,000 keys; 12 s per million). The `G` restore runs inline in the
+  heartbeat loop, so a node with enough marked keys (about 800,000 at the
+  default liveness timeout, 80,000 at the minimum) stopped heartbeating
+  until discovery evicted it; the rollback kept the migration slot occupied
+  for the whole restore, so an `X` gave up waiting for it and acked anyway
+  and the next `M` for the same joiner was refused as a conflict. Both
+  restores are now one cache command for the whole list, as the `M` and `X`
+  restores already were.
 - `nanocached-discovery`: a joiner whose host died without closing its
   connection (power loss, hypervisor failure, a partition) stayed registered,
   because nothing set TCP keepalive on the connection that is a joiner's
