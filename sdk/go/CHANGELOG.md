@@ -19,6 +19,16 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
   the connection loss that says the request may have been applied. The lost
   keys' own failure is now the one reported, as in the TypeScript SDK.
 
+- `Incr`, `Decr`, `PutIfAbsent`, `Replace`, `ReplaceIfPresent` and
+  `DeleteIfMatches` on a key whose primary had died and been dropped from
+  discovery failed with a connection error instead of being rerouted, until
+  the periodic refresh (up to 30 s) or another operation forced one. A failed
+  dial to the primary, on the first attempt or on the redial, wrote nothing
+  but was not marked as never sent, so the cluster retry did not refresh and
+  retry. It is now marked, as it already was for a `Touch` with a TTL of 0, so
+  these operations are rerouted like `Set`. A request whose frame was written
+  is still never resent.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release
