@@ -150,6 +150,17 @@ framework adapters at one version, whether or not a component changed.
   for the sort on each scrape. The cache task now selects the largest 256
   before sorting; the `nanocached_node_namespaces` and
   `nanocached_node_namespaces_unlisted` gauges are unchanged.
+- `nanocached-node`: a connection that received a frame over 64 KiB kept the
+  in-flight charge for its receive buffer's growth after the frame was cut
+  from the buffer, because the charge was released only when the buffer was
+  shrunk and a buffer left at or under the threshold by the frame it gave up
+  is not. Every persistent connection that had once received a large frame —
+  an SDK connection after one large `set` — pinned up to a frame's worth of
+  `--max-in-flight-bytes` while idle, until it closed; a few hundred such
+  connections could hold the whole default 256 MiB with nothing in flight,
+  after which other connections' replies and multi-key frames waited and
+  timed out. The charge is now released whenever the buffer holds nothing
+  chargeable.
 - `nanocached-node`: on an `M`, the count of entries this node will send to
   the joiner (which sizes discovery's migration timeout) hashed every key
   of the snapshot in one go on the runtime thread, about 60 ms per million
