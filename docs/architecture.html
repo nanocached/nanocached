@@ -372,7 +372,11 @@ decommission, and the ownership reclaim pass each begin by taking a
 snapshot of every live key the node holds, and that walk runs on the
 node&rsquo;s single cache task, so requests that arrive during it wait.
 Measured in release builds at about 25&nbsp;ms per million live keys
-(5&nbsp;ms at 200k, 52&nbsp;ms at 2M); at the default
+(5&nbsp;ms at 200k, 52&nbsp;ms at 2M). A staged handoff also counts, from
+that snapshot, how many entries this node will send to the joiner, about
+60&nbsp;ms per million keys; that count runs in 2,000-key slices that
+yield to other tasks between them, so it spreads out over the request
+traffic instead of adding to the pause. At the default
 <code>--max-memory</code> of 256&nbsp;MiB a node holds on the order of
 1.3&ndash;1.5M small entries, so one membership change costs a few pauses of
 some tens of milliseconds each (one per walker that runs, and the
@@ -622,8 +626,11 @@ here.</p>
   awaits the <code>G</code> reply first.</li>
   <li>A ring change pauses a node about 25&nbsp;ms per million live keys
   (a snapshot walk on the single cache task), with a transient allocation
-  of 64 bytes per key. Bounding it would need an ordered per-namespace key
-  index maintained on every write; see Known limits above.</li>
+  of 64 bytes per key; a staged handoff&rsquo;s count of the entries to
+  send (about 60&nbsp;ms per million) runs in slices that yield between
+  them and does not add to the pause. Bounding the snapshot would need an
+  ordered per-namespace key index maintained on every write; see Known
+  limits above.</li>
   <li>Hedged and fallback reads: a miss means the primary answered miss; a
   non-hedged read falls to the next owner only on connection failure. The
   primary&rsquo;s answer is the answer; probing the other owners on a miss

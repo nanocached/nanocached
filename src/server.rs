@@ -2665,16 +2665,20 @@ async fn handle_connection(
                 // independently checks for the same `None` and aborts on
                 // its own.
                 let keys_snapshot = list_keys(&node_context.request_tx).await;
-                let entries_to_send = keys_snapshot.as_deref().map_or(0, |keys| {
-                    entries_to_send_count(
-                        keys,
-                        &before_ring,
-                        &after_ring,
-                        &node_context.name,
-                        &joining_name,
-                        replication,
-                    )
-                });
+                let entries_to_send = match keys_snapshot.as_deref() {
+                    Some(keys) => {
+                        entries_to_send_count(
+                            keys,
+                            &before_ring,
+                            &after_ring,
+                            &node_context.name,
+                            &joining_name,
+                            replication,
+                        )
+                        .await
+                    }
+                    None => 0,
+                };
 
                 // Stamped before acking, not after, so a retry of this
                 // same `M` arriving right after the ack goes out (but
@@ -6095,7 +6099,16 @@ fn migration_rings(
 /// avoid the clone-the-whole-cache cost entirely, but needs the
 /// migration protocol to support resuming a partial listing — a larger
 /// change than this bug fix warrants.
-fn entries_to_send_count(
+///
+/// The count itself hashes every key twice against a ring, about 60 ms
+/// per million keys (issue #1027), and used to run to completion on the
+/// single runtime thread right after the snapshot, so a node with
+/// millions of keys served no client and sent no heartbeat for that long
+/// on top of the snapshot's own pause. It now walks the snapshot in
+/// `SWEEP_BUDGET`-sized chunks and yields between them, as the sweep and
+/// the reclaim pass do, so other tasks interleave; the `M` ack is a little
+/// later, the stall is gone.
+async fn entries_to_send_count(
     keys: &[Key],
     before_ring: &HashRing,
     after_ring: &HashRing,
@@ -6104,13 +6117,19 @@ fn entries_to_send_count(
     replication: usize,
 ) -> usize {
     let mut hasher = KeyHasher::default();
-    keys.iter()
-        .filter(|key| {
-            let key_hash = hasher.hash(key);
-            after_ring.is_owner_hashed(key_hash, joining_name, replication)
-                && before_ring.is_owner_hashed(key_hash, self_name, replication)
-        })
-        .count()
+    let mut count = 0;
+    for chunk in keys.chunks(SWEEP_BUDGET) {
+        count += chunk
+            .iter()
+            .filter(|key| {
+                let key_hash = hasher.hash(key);
+                after_ring.is_owner_hashed(key_hash, joining_name, replication)
+                    && before_ring.is_owner_hashed(key_hash, self_name, replication)
+            })
+            .count();
+        tokio::task::yield_now().await;
+    }
+    count
 }
 
 /// Staged node join (generalized by client-side replication): triggered by an incoming `M`.
@@ -10466,6 +10485,61 @@ mod tests {
 
     fn key(name: &[u8]) -> Key {
         Key::unnamespaced(Bytes::copy_from_slice(name))
+    }
+
+    /// Issue #1027: the owner count over a large snapshot yields between
+    /// `SWEEP_BUDGET`-sized chunks, so other tasks on the runtime run
+    /// while it works, and it still counts exactly what the one-pass
+    /// filter counted.
+    #[tokio::test]
+    async fn entries_to_send_count_yields_between_chunks_and_counts_the_same() {
+        let keys: Vec<Key> = (0..(3 * SWEEP_BUDGET + 1) as u32)
+            .map(|index| key(&index.to_be_bytes()))
+            .collect();
+        let members: Vec<String> = ["n1", "n2", "n3"].map(String::from).to_vec();
+        let before_ring = HashRing::new(members.clone());
+        let after_ring = HashRing::new([members, vec!["joiner".to_string()]].concat());
+        let replication = 2;
+
+        let other_task_ran = Arc::new(AtomicUsize::new(0));
+        let ticks = Arc::clone(&other_task_ran);
+        let ticker = tokio::spawn(async move {
+            loop {
+                ticks.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let counted = entries_to_send_count(
+            &keys,
+            &before_ring,
+            &after_ring,
+            "n1",
+            "joiner",
+            replication,
+        )
+        .await;
+        ticker.abort();
+
+        let mut hasher = KeyHasher::default();
+        let expected = keys
+            .iter()
+            .filter(|key| {
+                let key_hash = hasher.hash(key);
+                after_ring.is_owner_hashed(key_hash, "joiner", replication)
+                    && before_ring.is_owner_hashed(key_hash, "n1", replication)
+            })
+            .count();
+        assert_eq!(counted, expected);
+        assert!(expected > 0, "the sample must contain keys this node sends");
+
+        // Four chunks, so the other task got at least three turns while the
+        // count was in progress (the one-pass version gave it none).
+        let turns = other_task_ran.load(Ordering::Relaxed);
+        assert!(
+            turns >= 3,
+            "the other task ran {turns} times during the count"
+        );
     }
     use bytes::Bytes;
 
