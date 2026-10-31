@@ -2808,6 +2808,57 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_single_node_get_many_and_touch_attaches_the_hits_to_a_wrong_node(self):
+        # Issue #1013: the cluster path raises PartialWrongNodeError with the
+        # keys that resolved; the single-node/proxy path used to raise a
+        # plain WrongNodeError and drop them, which with ttl_seconds=0 loses
+        # the values for good (the touch consumed them on the node).
+        for ttl in (0, 30):
+            with self.subTest(ttl=ttl):
+                client = await self.connect()
+                try:
+                    await client.set_many({"a": "1", "b": "2"})
+                    self.node.answer_wrong_node_for_keys({b"a"}, times=1)
+                    with self.assertRaises(PartialWrongNodeError) as raised:
+                        await client.get_many_and_touch(["a", "b"], ttl)
+                    self.assertEqual(raised.exception.partial_values, {"b": "2"})
+                    self.assertIsInstance(raised.exception, WrongNodeError)
+                finally:
+                    await client.close()
+
+    async def test_single_node_get_many_and_touch_bytes_attaches_the_hits(self):
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"})
+            self.node.answer_wrong_node_for_keys({b"a"}, times=1)
+            with self.assertRaises(PartialWrongNodeError) as raised:
+                await client.get_many_and_touch_bytes(["a", "b"], 0)
+            self.assertEqual(raised.exception.partial_values, {"b": b"2"})
+        finally:
+            await client.close()
+
+    async def test_single_node_touch_many_still_raises_a_plain_wrong_node_error(self):
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"})
+            self.node.answer_wrong_node_for_keys({b"a"}, times=1)
+            with self.assertRaises(WrongNodeError) as raised:
+                await client.touch_many(["a", "b"], 30)
+            self.assertNotIsInstance(raised.exception, PartialWrongNodeError)
+        finally:
+            await client.close()
+
+    async def test_single_node_get_many_attaches_the_resolved_values_to_a_wrong_node(self):
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"})
+            self.node.answer_wrong_node_for_keys({b"a"}, times=1)
+            with self.assertRaises(PartialWrongNodeError) as raised:
+                await client.get_many(["a", "b"])
+            self.assertEqual(raised.exception.partial_values, {"b": "2"})
+        finally:
+            await client.close()
+
     async def test_a_reply_with_the_wrong_number_of_entries_is_a_desync(self):
         # The same count check multi_get/multi_set make (issue #181): a
         # short roster would otherwise shift every later key's answer onto
