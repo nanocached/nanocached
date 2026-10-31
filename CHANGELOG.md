@@ -100,6 +100,12 @@ framework adapters at one version, whether or not a component changed.
   replication 1 those keys missed on the new owner. Such a node is now added
   to the nodes the join expects a report from and sent the join's own `M`,
   with the same roster and generation the other ready nodes received.
+- `nanocached-node`: a `/metrics` scrape built and sorted a row for every live
+  namespace on the cache task although it renders only the largest 256, so a
+  node holding very many namespaces (300,000 took 45 ms) paused every client
+  for the sort on each scrape. The cache task now selects the largest 256
+  before sorting; the `nanocached_node_namespaces` and
+  `nanocached_node_namespaces_unlisted` gauges are unchanged.
 - `nanocached-node`: a connection that received a frame over 64 KiB kept the
   in-flight charge for its receive buffer's growth after the frame was cut
   from the buffer, because the charge was released only when the buffer was
@@ -111,12 +117,6 @@ framework adapters at one version, whether or not a component changed.
   after which other connections' replies and multi-key frames waited and
   timed out. The charge is now released whenever the buffer holds nothing
   chargeable.
-- `nanocached-node`: a `/metrics` scrape built and sorted a row for every live
-  namespace on the cache task although it renders only the largest 256, so a
-  node holding very many namespaces (300,000 took 45 ms) paused every client
-  for the sort on each scrape. The cache task now selects the largest 256
-  before sorting; the `nanocached_node_namespaces` and
-  `nanocached_node_namespaces_unlisted` gauges are unchanged.
 - `nanocached-node`: on an `M`, the count of entries this node will send to
   the joiner (which sizes discovery's migration timeout) hashed every key
   of the snapshot in one go on the runtime thread, about 60 ms per million
