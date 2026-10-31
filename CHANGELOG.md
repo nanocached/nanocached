@@ -65,6 +65,13 @@ framework adapters at one version, whether or not a component changed.
   for the sort on each scrape. The cache task now selects the largest 256
   before sorting; the `nanocached_node_namespaces` and
   `nanocached_node_namespaces_unlisted` gauges are unchanged.
+- `nanocached-node`: on an `M`, the count of entries this node will send to
+  the joiner (which sizes discovery's migration timeout) hashed every key
+  of the snapshot in one go on the runtime thread, about 60 ms per million
+  keys on top of the snapshot's 25 ms, so a node holding millions of keys
+  served no client and sent no heartbeat for that long (3M keys: 170 to
+  200 ms). The count now runs in 2,000-key slices that yield between them;
+  the architecture page's pause figure names the two parts.
 - `nanocached-node`: a remaining TTL under one second went on the wire as
   `0`: in an INCR reply, in a get-and-touch reply and in a forward or handoff
   of the entry. An SDK replicating an INCR reply read `0` as "no expiry"
