@@ -59,6 +59,19 @@ framework adapters at one version, whether or not a component changed.
   now enables TCP keepalive on the connections it accepts (first probe after
   10 s idle, then every 5 s, 3 probes on Linux), so such a joiner is dropped
   after about 25 s.
+- `nanocached-node`: the per-key working memory of a multi-key frame (`m`,
+  `o`, `y`) was not counted against `--max-in-flight-bytes`. The node builds
+  several lists with an entry per key, about 100 bytes each, and a 1 MiB
+  frame of one-byte keys holds about 350,000 keys, so tens of megabytes
+  while it runs; the budget charged only the receive buffer (about 1 MiB)
+  and the reply's values, so the default 256 MiB admitted hundreds of such
+  frames at once. In a test, 50 simultaneous 1 MiB `m` frames took the node
+  to 2 GiB and 200 to about 6.7 GiB, enough to kill a 1 GiB task from a
+  single client address. A multi-key frame is now charged 128 bytes per key
+  before the lists are built, until its reply is written. A frame that costs
+  more than the whole budget waits for it to be free and then runs alone;
+  one that cannot get its charge within 10 seconds closes its connection,
+  like a reply that cannot be charged.
 
 ## [0.5.1] - 2026-10-27
 

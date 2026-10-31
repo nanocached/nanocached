@@ -365,7 +365,9 @@ Usage: nanocached-node [options]
                                --max-in-flight-bytes plus headroom
   --max-in-flight-bytes <bytes> what client connections may hold outside
                                the cache, node-wide: replies being
-                               written and requests still arriving
+                               written, requests still arriving, and
+                               128 bytes per key of a multi-key frame
+                               (m, o, y) until it is answered
                                (default {} — 256 MiB, minimum {} — 1 MiB).
                                A connection that cannot get its share
                                in time is closed, like a stalled one

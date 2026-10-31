@@ -102,7 +102,9 @@ pub(crate) const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
 /// holds for up to `WRITE_TIMEOUT` while a client does not read) and a
 /// receive buffer's growth beyond `REQUEST_BUFFER_SHRINK_THRESHOLD`
 /// before allocating it (an unfinished frame is held until the frame
-/// deadline), and releases both as soon as the bytes are gone. A cost
+/// deadline), and releases both as soon as the bytes are gone. A
+/// multi-key frame also charges `MULTI_KEY_FRAME_BYTES_PER_KEY` for each
+/// of its keys, held until its reply is written. A cost
 /// above the budget is clamped to it, so such a request takes the whole
 /// budget and runs alone rather than waiting forever; a connection that
 /// cannot get its charge in time is closed, the way a stalled write or a
@@ -165,6 +167,44 @@ fn reply_bytes(response: &Response) -> usize {
             .sum(),
         _ => 0,
     }
+}
+
+/// What a multi-key frame (`m`, `o`, `y`) is charged against the in-flight
+/// budget for each key, on top of its receive buffer and its reply. The
+/// arms build several per-key vectors before the cache sees the frame —
+/// the key list, the hashes, the owned and forwarded splits, the result
+/// vector and the reply entries — about 100 bytes per key, and a frame of
+/// one-byte keys carries about 350,000 keys in its 1 MiB, so tens of
+/// megabytes of working memory that the buffer's own charge (about 1 MiB)
+/// does not account for. 128 bytes covers that with some room.
+const MULTI_KEY_FRAME_BYTES_PER_KEY: usize = 128;
+
+/// Charges a multi-key frame's per-key working memory against the
+/// in-flight budget before the arm builds its per-key vectors; the caller
+/// holds the permit until the reply is written. A frame costing more than
+/// the whole budget takes all of it and runs alone — the connection's own
+/// receive-buffer charge is part of what it already holds, so it asks only
+/// for the rest and does not wait for itself. Waits at most
+/// `WRITE_TIMEOUT`, like a reply, and fails the connection if the budget
+/// does not free in that time.
+async fn charge_multi_key_frame(
+    config: &ConnectionConfig,
+    receive_charged: usize,
+    keys: usize,
+) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
+    let cost = keys.saturating_mul(MULTI_KEY_FRAME_BYTES_PER_KEY);
+    let cost = config
+        .in_flight_bytes
+        .clamp(cost.saturating_add(receive_charged))
+        .saturating_sub(receive_charged);
+    timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge_exact(cost))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "in-flight byte budget exhausted while serving a request",
+            )
+        })
 }
 
 /// Encodes and writes a reply that may carry values, holding its bytes
@@ -2728,6 +2768,8 @@ async fn handle_connection(
             // order before replying — the client never sees the owned/
             // not-owned split.
             Ok((Command::MultiGet { namespace, keys }, tag)) => {
+                let _frame_charge =
+                    charge_multi_key_frame(&config, receive_charged, keys.len()).await?;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -2794,6 +2836,8 @@ async fn handle_connection(
                 },
                 tag,
             )) => {
+                let _frame_charge =
+                    charge_multi_key_frame(&config, receive_charged, keys.len()).await?;
                 let mut entries: Vec<Option<MultiAckEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -3372,6 +3416,8 @@ async fn handle_connection(
                 },
                 tag,
             )) => {
+                let _frame_charge =
+                    charge_multi_key_frame(&config, receive_charged, keys.len()).await?;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -10696,7 +10742,9 @@ mod tests {
             },
         )
         .await;
-        let budget = InFlightBudget::new(17 * MIB);
+        // The 16-key batch also holds its per-key charge while it is in flight.
+        let total = 17 * MIB + 16 * MULTI_KEY_FRAME_BYTES_PER_KEY;
+        let budget = InFlightBudget::new(total);
         let mut batch = b"m 0 16".to_vec();
         batch.extend(std::iter::repeat_n(b" 5", 16).flatten());
         batch.push(b'\n');
@@ -10778,7 +10826,7 @@ mod tests {
         assert_eq!(&header, b"M 16 ");
         drop(waiting);
         let _ = timeout(Duration::from_secs(5), waiting_task).await;
-        assert_eq!(budget.available(), 17 * MIB);
+        assert_eq!(budget.available(), total);
 
         drop(request_tx);
         cache_task.await.unwrap();
@@ -10839,6 +10887,166 @@ mod tests {
         drop(first);
         let _ = timeout(Duration::from_secs(5), first_task).await;
         assert_eq!(budget.available(), 16 * 1024);
+    }
+
+    /// An `m` frame of `keys` one-byte keys in the root namespace.
+    fn multi_get_frame(keys: usize) -> Vec<u8> {
+        let mut frame = format!("m 0 {keys}").into_bytes();
+        frame.extend(std::iter::repeat_n(b" 1", keys).flatten());
+        frame.push(b'\n');
+        frame.extend(std::iter::repeat_n(b'k', keys));
+        frame
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_key_frames_are_charged_per_key_until_they_are_answered() {
+        // The cache is a stand-in that answers when the test says so, so
+        // the frame is "in flight" for as long as the test wants. With a
+        // 1 MiB budget, one 6,000-key frame holds 6,000 x the per-key
+        // charge and a second one cannot start until the first is answered.
+        const KEYS: usize = 6_000;
+        const CHARGE: usize = KEYS * MULTI_KEY_FRAME_BYTES_PER_KEY;
+        let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let frame = multi_get_frame(KEYS);
+
+        let (mut first, server) = tcp_pair().await;
+        let first_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        first.write_all(&frame).await.unwrap();
+        let first_request = timeout(Duration::from_secs(5), request_rx.recv())
+            .await
+            .expect("the first frame reaches the cache")
+            .unwrap();
+        assert_eq!(
+            budget.available(),
+            MAX_REQUEST_SIZE - CHARGE,
+            "the frame must hold its per-key charge while it is in flight"
+        );
+
+        let (mut second, server) = tcp_pair().await;
+        let second_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        second.write_all(&frame).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            request_rx.try_recv().is_err(),
+            "the second frame must wait for the budget, not reach the cache"
+        );
+
+        // Answering the first frame releases its charge; the second goes on.
+        first_request
+            .response_tx
+            .send(Response::Multi(vec![MultiEntry::Miss; KEYS]))
+            .ok()
+            .unwrap();
+        let mut header = [0u8; 7];
+        timeout(Duration::from_secs(5), first.read_exact(&mut header))
+            .await
+            .expect("the first frame is answered")
+            .unwrap();
+        assert_eq!(&header, b"M 6000 ");
+        let second_request = timeout(Duration::from_secs(5), request_rx.recv())
+            .await
+            .expect("the second frame proceeds once the first is answered")
+            .unwrap();
+        second_request
+            .response_tx
+            .send(Response::Multi(vec![MultiEntry::Miss; KEYS]))
+            .ok()
+            .unwrap();
+        timeout(Duration::from_secs(5), second.read_exact(&mut header))
+            .await
+            .expect("the second frame is answered")
+            .unwrap();
+        assert_eq!(&header, b"M 6000 ");
+
+        drop(first);
+        drop(second);
+        let _ = timeout(Duration::from_secs(5), first_task).await;
+        let _ = timeout(Duration::from_secs(5), second_task).await;
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_costing_more_than_the_budget_still_runs_alone() {
+        // 100,000 keys cost 12.8 MB against a 1 MiB budget, and the
+        // 300 KB frame is already holding part of that budget as its
+        // receive buffer: the frame takes what is left, does not wait for
+        // itself, and is answered.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+
+        let (mut client, server) = tcp_pair().await;
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        client.write_all(&multi_get_frame(100_000)).await.unwrap();
+        let mut header = [0u8; 9];
+        timeout(Duration::from_secs(5), client.read_exact(&mut header))
+            .await
+            .expect("the oversized frame is served, not left waiting for the budget")
+            .unwrap();
+        assert_eq!(&header, b"M 100000 ");
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), connection_task).await;
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_multi_key_charge_is_bounded_and_fails_like_a_reply_that_cannot_be_charged() {
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let config = connection_config_with_budget(&budget, IDLE_TIMEOUT);
+
+        // The charge is the key count times the per-key figure, less
+        // nothing; a connection already holding receive-buffer bytes asks
+        // only for the rest of the budget when the frame costs more.
+        let small = charge_multi_key_frame(&config, 0, 100).await.unwrap();
+        assert_eq!(
+            budget.available(),
+            MAX_REQUEST_SIZE - 100 * MULTI_KEY_FRAME_BYTES_PER_KEY
+        );
+        drop(small);
+        let all_the_rest = charge_multi_key_frame(&config, 300_000, 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(budget.available(), 300_000);
+        drop(all_the_rest);
+
+        // With the budget held elsewhere, the charge gives up after
+        // WRITE_TIMEOUT with the budget error and holds nothing.
+        let held = budget.charge(MAX_REQUEST_SIZE).await;
+        let started = tokio::time::Instant::now();
+        let error = charge_multi_key_frame(&config, 0, 10).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error.to_string().contains("in-flight byte budget"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(started.elapsed(), WRITE_TIMEOUT);
+        drop(held);
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
