@@ -558,6 +558,72 @@ pub fn warn_if_exposed_without_secret(who: &str, local: SocketAddr, has_secret: 
     }
 }
 
+// ─── connection log rate limit ──────────────────────────────────────────
+
+/// Bounds how many log lines of one kind a process writes per window, so a
+/// flood of connections cannot turn into a flood of `println!`s: those are
+/// blocking writes on the runtime thread, and when the log pipe pushes
+/// back (a slow journald, a full pipe) every request waits behind them.
+/// Lines past the budget are counted, not written; the count is reported
+/// in one summary line ahead of the next line the limiter admits.
+pub struct LogLimiter {
+    budget: u32,
+    window: Duration,
+    state: Mutex<LogLimiterState>,
+}
+
+struct LogLimiterState {
+    /// Start of the current window; `None` until the first line.
+    window_start: Option<Instant>,
+    /// Lines admitted in the current window.
+    admitted: u32,
+    /// Lines dropped since the last summary.
+    suppressed: u64,
+}
+
+impl LogLimiter {
+    pub const fn new(budget: u32, window: Duration) -> Self {
+        Self {
+            budget,
+            window,
+            state: Mutex::new(LogLimiterState {
+                window_start: None,
+                admitted: 0,
+                suppressed: 0,
+            }),
+        }
+    }
+
+    /// Whether the caller may write one line now. `Some(n)` admits it,
+    /// with `n` the lines dropped since the last admitted one (`0` most
+    /// of the time) for the caller to mention first; `None` means this
+    /// window's budget is spent and the line is counted instead.
+    pub fn admit(&self) -> Option<u64> {
+        self.admit_at(Instant::now())
+    }
+
+    pub fn admit_at(&self, now: Instant) -> Option<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let in_window = state
+            .window_start
+            .is_some_and(|start| now.duration_since(start) < self.window);
+        if !in_window {
+            state.window_start = Some(now);
+            state.admitted = 0;
+        }
+        if state.admitted < self.budget {
+            state.admitted += 1;
+            Some(std::mem::take(&mut state.suppressed))
+        } else {
+            state.suppressed += 1;
+            None
+        }
+    }
+}
+
 // ─── constant-time comparison ───────────────────────────────────────────
 
 /// Compares two byte strings without leaking, via timing, how many leading
@@ -1115,6 +1181,41 @@ mod tests {
 
         drop(try_acquire_per_ip(&counts, ip, 4).expect("fits"));
         assert!(counts.lock().unwrap().is_empty());
+    }
+
+    // ── connection log rate limit ──
+
+    #[test]
+    fn a_log_limiter_admits_its_budget_then_counts_the_rest_until_the_window_rolls() {
+        let limiter = LogLimiter::new(3, Duration::from_secs(1));
+        let start = Instant::now();
+
+        assert_eq!(limiter.admit_at(start), Some(0));
+        assert_eq!(limiter.admit_at(start), Some(0));
+        assert_eq!(
+            limiter.admit_at(start + Duration::from_millis(999)),
+            Some(0)
+        );
+        assert_eq!(limiter.admit_at(start + Duration::from_millis(999)), None);
+        assert_eq!(limiter.admit_at(start + Duration::from_millis(999)), None);
+
+        // The next window admits again and reports the two dropped lines once.
+        let next = start + Duration::from_secs(1);
+        assert_eq!(limiter.admit_at(next), Some(2));
+        assert_eq!(limiter.admit_at(next), Some(0));
+    }
+
+    #[test]
+    fn a_log_limiter_carries_a_suppressed_count_across_quiet_windows() {
+        let limiter = LogLimiter::new(1, Duration::from_secs(1));
+        let start = Instant::now();
+        assert_eq!(limiter.admit_at(start), Some(0));
+        assert_eq!(limiter.admit_at(start), None);
+
+        // Nothing is logged for a while; the drop is still reported with
+        // the first line that is.
+        assert_eq!(limiter.admit_at(start + Duration::from_secs(30)), Some(1));
+        assert_eq!(limiter.admit_at(start + Duration::from_secs(60)), Some(0));
     }
 
     // ── TLS loaders ──

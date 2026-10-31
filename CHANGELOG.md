@@ -30,6 +30,15 @@ framework adapters at one version, whether or not a component changed.
   every outbound TLS handshake then failed with an unknown-issuer error that
   pointed at the peer. Such a file is now refused at startup with a message
   naming it.
+- `nanocached-node`: every accepted connection wrote an `INFO accepted
+  connection from …` line and every failed one a `WARN connection error …`
+  (or TLS handshake) line, synchronously on the runtime thread, so a
+  connection flood within the connection caps produced log volume in
+  proportion and a log pipe that pushed back (a slow journald, a full pipe)
+  stalled every request behind the writes. Each kind of line is now written
+  at most 50 times a second; the rest are counted and reported in one `…
+  more connections accepted` or `… more connection errors` summary line
+  ahead of the next line written.
 - `nanocached-proxy`: a batched read (`m`, or `y` with `G`) spread over
   several nodes held up to 16 MiB of values per node while it was
   answered, plus a second copy for the client, but was charged for 16 MiB

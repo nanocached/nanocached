@@ -8,7 +8,7 @@ use crate::response::{MultiAckEntry, MultiEntry, MultiTouchEntry, Response, ttl_
 use bytes::{Bytes, BytesMut};
 use nanocached::infra;
 use nanocached::infra::{
-    ACCEPT_ERROR_BACKOFF, METRICS_MAX_CONNECTIONS, PerIpConnections, constant_time_eq,
+    ACCEPT_ERROR_BACKOFF, LogLimiter, METRICS_MAX_CONNECTIONS, PerIpConnections, constant_time_eq,
     read_http_request_path, reject_over_limit, should_backoff_after_accept_error, shutdown_signal,
     try_acquire_per_ip, write_http_response,
 };
@@ -329,6 +329,20 @@ const HEARTBEAT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 /// should never need close to this long.
 const DECOMMISSION_OVERRIDE_GRACE: Duration = Duration::from_secs(2);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Issue #1028: the per-connection log lines (`INFO accepted connection
+/// from …`, `WARN connection error from …`, the TLS handshake failures)
+/// are each written at most this many times a second; the rest are counted
+/// and reported in one summary line. Without the bound a connection flood
+/// within the connection caps produced log volume proportional to the
+/// flood, and since `println!` blocks the runtime thread, a log pipe that
+/// pushed back stalled every request behind it. Accepts and errors have
+/// separate budgets so a flood of one never hides the other.
+const CONNECTION_LOG_LINES_PER_SECOND: u32 = 50;
+static ACCEPT_LOG: LogLimiter =
+    LogLimiter::new(CONNECTION_LOG_LINES_PER_SECOND, Duration::from_secs(1));
+static CONNECTION_ERROR_LOG: LogLimiter =
+    LogLimiter::new(CONNECTION_LOG_LINES_PER_SECOND, Duration::from_secs(1));
 /// Bounds each individual outbound dial, write, and ack read this node
 /// makes toward another node — the migration handoff (`run_migration`) and
 /// the concurrent forwarding of client `S`/`D` to a joiner
@@ -1759,18 +1773,27 @@ fn dispatch_connection(
             Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                 Ok(Ok(tls_stream)) => ServerStream::Tls(Box::new(tls_stream)),
                 Ok(Err(error)) => {
-                    eprintln!("WARN TLS handshake with {address} failed: {error}");
+                    log_connection_warning(format_args!(
+                        "WARN TLS handshake with {address} failed: {error}"
+                    ));
                     return;
                 }
                 Err(_) => {
-                    eprintln!("WARN TLS handshake with {address} timed out");
+                    log_connection_warning(format_args!(
+                        "WARN TLS handshake with {address} timed out"
+                    ));
                     return;
                 }
             },
             None => ServerStream::Plain(stream),
         };
 
-        println!("INFO accepted connection from {address}");
+        if let Some(suppressed) = ACCEPT_LOG.admit() {
+            if suppressed > 0 {
+                println!("INFO {suppressed} more connections accepted (not logged individually)");
+            }
+            println!("INFO accepted connection from {address}");
+        }
 
         let _connection_permit = permit;
         let _per_ip_permit = per_ip_permit;
@@ -1810,10 +1833,27 @@ async fn execute_command(
 fn log_connection_error(address: &SocketAddr, error: &io::Error) {
     let text = error.to_string();
     if text.contains("close_notify") {
-        println!("INFO connection from {address} closed without TLS close_notify");
+        log_connection_warning(format_args!(
+            "INFO connection from {address} closed without TLS close_notify"
+        ));
     } else {
-        eprintln!("WARN connection error from {address}: {error}");
+        log_connection_warning(format_args!(
+            "WARN connection error from {address}: {error}"
+        ));
     }
+}
+
+/// One line about a connection that failed, through `CONNECTION_ERROR_LOG`
+/// (issue #1028): written when the budget allows, counted otherwise, with
+/// the count reported ahead of the next line written.
+fn log_connection_warning(line: std::fmt::Arguments<'_>) {
+    let Some(suppressed) = CONNECTION_ERROR_LOG.admit() else {
+        return;
+    };
+    if suppressed > 0 {
+        eprintln!("WARN {suppressed} more connection errors (not logged individually)");
+    }
+    eprintln!("{line}");
 }
 
 /// Bounds every response write in `handle_connection` (issue #4): the read
