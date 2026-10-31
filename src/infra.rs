@@ -196,6 +196,19 @@ pub fn load_tls_connector(ca_path: &str) -> io::Result<TlsConnector> {
             .add(cert)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     }
+    // An empty file, a file that is not PEM, or a private key given by
+    // mistake all parse to no certificates at all. A connector with no
+    // roots used to be built from that and the process started normally;
+    // every outbound handshake then failed with an unknown-issuer error,
+    // which pointed at the peer rather than at this file.
+    if roots.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "no certificate found in {ca_path}: --tls-ca must be a PEM file with at least one CA certificate"
+            ),
+        ));
+    }
 
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
@@ -1102,6 +1115,54 @@ mod tests {
 
         drop(try_acquire_per_ip(&counts, ip, 4).expect("fits"));
         assert!(counts.lock().unwrap().is_empty());
+    }
+
+    // ── TLS loaders ──
+
+    fn pem_file(name: &str, contents: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "nanocached-infra-{}-{name}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_tls_ca_file_with_no_certificate_is_refused_not_turned_into_an_empty_trust_store() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rcgen::CertifiedKey { signing_key, .. } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        for (name, contents) in [
+            ("empty", String::new()),
+            ("junk", "this is not a certificate\n".to_string()),
+            ("key-only", signing_key.serialize_pem()),
+        ] {
+            let path = pem_file(name, &contents);
+            let error = match load_tls_connector(&path) {
+                Ok(_) => panic!("{name}: a file with no certificate must be refused"),
+                Err(error) => error,
+            };
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{name}");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("no certificate found in {path}")),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tls_ca_file_with_a_certificate_still_loads() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rcgen::CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let path = pem_file("cert", &cert.pem());
+        let loaded = load_tls_connector(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(loaded.is_ok(), "a CA certificate loads");
     }
 
     #[test]

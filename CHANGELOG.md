@@ -24,6 +24,12 @@ framework adapters at one version, whether or not a component changed.
   connection goes on, and one source IP may hold at most a quarter of the
   proxy-wide budget (64 MiB by default), so one slow consumer cannot starve
   the rest. Clients behind one NAT or egress IP share that quarter.
+- `nanocached-node`, `nanocached-proxy`, `nanocached-discovery`: a `--tls-ca`
+  file with no certificate in it (empty, not PEM, or a private key given by
+  mistake) built a connector that trusted nothing and the process started;
+  every outbound TLS handshake then failed with an unknown-issuer error that
+  pointed at the peer. Such a file is now refused at startup with a message
+  naming it.
 - `nanocached-proxy`: a batched read (`m`, or `y` with `G`) spread over
   several nodes held up to 16 MiB of values per node while it was
   answered, plus a second copy for the client, but was charged for 16 MiB
