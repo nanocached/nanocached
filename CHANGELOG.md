@@ -86,6 +86,14 @@ framework adapters at one version, whether or not a component changed.
   interval evicted live nodes between two heartbeats; a very large value
   overflowed the clock arithmetic and crashed. The flag now accepts 6 to
   604800 seconds (7 days) and refuses anything else as a usage error.
+- `nanocached-discovery`: the 2 s cooldown on registering a new node name
+  was keyed by the raw source address, while the join waiting cap and the
+  connection cap fold an IPv6 source to its /64. A sender inside one /64
+  rotated source addresses to get a fresh cooldown each time and could
+  register forged entries up to the registry limit, which first made
+  legitimate joins fail with a too-large roster and then refused legitimate
+  announces with `registry is full`. The cooldown is now keyed the same way,
+  so a /64 is one source. (#1101)
 - `nanocached-discovery`: the ack for the `C` that completed a join was
   written only after the next waiting node's `M` fan-out, which can take up
   to three 10 s attempts against a ready node that is slow to answer, while

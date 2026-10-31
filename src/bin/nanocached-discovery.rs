@@ -1073,6 +1073,10 @@ type AnnounceLimiter = Arc<Mutex<FxHashMap<std::net::IpAddr, Instant>>>;
 /// name (see the `P` handler) — a refresh of an existing entry must not
 /// consume or be gated by this limiter at all.
 fn announce_insert_allowed(limiter: &AnnounceLimiter, peer_ip: std::net::IpAddr) -> bool {
+    // Keyed like the join waiting cap and the connection cap: an IPv6
+    // source counts as its /64, so rotating addresses inside one prefix
+    // doesn't earn a fresh cooldown each time.
+    let peer_ip = per_ip_key(peer_ip);
     let now = Instant::now();
     let mut guard = limiter
         .lock()
@@ -5807,6 +5811,37 @@ mod tests {
         // Once the cooldown has elapsed, the original source is allowed
         // again.
         assert!(announce_insert_allowed(&limiter, ip));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn announce_insert_allowed_counts_an_ipv6_64_as_one_source() {
+        // Regression: the cooldown was keyed by the raw peer address, so a
+        // sender in one IPv6 /64 rotated its source address to walk around
+        // the 2 s cooldown and fill the registry with forged entries. It
+        // is keyed by `per_ip_key` now, like the waiting cap and the
+        // connection cap.
+        let limiter: AnnounceLimiter = Arc::new(Mutex::new(FxHashMap::default()));
+        let first: std::net::IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let same_64: std::net::IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let other_64: std::net::IpAddr = "2001:db8:1:3::1".parse().unwrap();
+
+        assert!(announce_insert_allowed(&limiter, first));
+        assert!(
+            !announce_insert_allowed(&limiter, same_64),
+            "a second address in the same /64 is the same source"
+        );
+        assert!(
+            announce_insert_allowed(&limiter, other_64),
+            "a different /64 is unaffected"
+        );
+        assert_eq!(
+            limiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            2,
+            "the limiter holds one entry per /64"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
