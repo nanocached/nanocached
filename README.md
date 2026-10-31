@@ -595,9 +595,14 @@ loud `WARN` if that disagrees with its own configured value.
   node-wide at 256 MiB by default, configurable with
   `--max-in-flight-bytes <bytes>` (at least 1 MiB). A reply's values
   are charged before it is built and released once written; a receive
-  buffer's growth past 64 KiB is charged before it is allocated. A
-  connection that cannot get its share in time is closed, like a
-  stalled one. Size a process at `--max-memory` plus this plus headroom
+  buffer's growth past 64 KiB is charged before it is allocated; and a
+  multi-key frame (`m`, `o` or `y`) is charged 128 bytes per key for the
+  per-key lists the node builds while it runs, held until the reply is
+  written (a frame of one-byte keys can carry about 350,000 keys, so
+  about 44 MiB). A frame that costs more than the whole budget waits for
+  it to be free and then runs alone. A connection that cannot get its
+  share in time is closed, like a stalled one. Size a process at
+  `--max-memory` plus this plus headroom
 - Per-namespace caps: `--namespace-budget <ns>=<bytes>` (repeatable)
   caps one namespace's share — over its cap it evicts from *itself*,
   oldest first, so a churny namespace (a session store, say) can't
