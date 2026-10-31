@@ -110,10 +110,20 @@ class _MultiTouchState:
     predates ``y``). ``answered_by`` names the node behind each result.
     ``lost`` holds the indices a ``ttl_seconds == 0``
     call must not resend (issue #901): their primary leg failed after the
-    frame was written, so the node may have expired them already.
+    frame was written, so the node may have expired them already;
+    ``lost_cause`` is that failure, kept apart from ``last_cause`` so a
+    later not-sent failure in the retry pass cannot replace it.
     Single-threaded (asyncio), so no locking."""
 
-    __slots__ = ("results", "answered_by", "wrong_node", "last_cause", "rejected", "lost")
+    __slots__ = (
+        "results",
+        "answered_by",
+        "wrong_node",
+        "last_cause",
+        "lost_cause",
+        "rejected",
+        "lost",
+    )
 
     def __init__(self) -> None:
         self.results: dict[int, object] = {}
@@ -122,6 +132,7 @@ class _MultiTouchState:
         self.answered_by: dict[int, str] = {}
         self.wrong_node: set[int] = set()
         self.last_cause: BaseException | None = None
+        self.lost_cause: BaseException | None = None
         self.rejected = False
         self.lost: set[int] = set()
 
@@ -2249,7 +2260,11 @@ class NanocachedClient:
         # unreachable on both passes, or (``ttl_seconds == 0``) lost its
         # connection after the frame was written and was not resent. That
         # is a connection loss and is reported as one, as get_many() does.
-        cause = state.last_cause
+        # A lost key's own failure is reported, never a later not-sent one
+        # (a dial that failed in the retry pass): only it says the request
+        # may have been applied, which is what the caller must know before
+        # retrying a ``ttl_seconds == 0`` touch.
+        cause = state.lost_cause if state.lost else state.last_cause
         if cause is None:
             cause = ConnectionError("nanocached: no owner is reachable for these keys")
         if get and state.results:
@@ -2375,6 +2390,8 @@ class NanocachedClient:
                     state.rejected = True
                 else:
                     lost_is_final = ttl_seconds == 0 and isinstance(error, ConnectionLostError)
+                    if lost_is_final:
+                        state.lost_cause = error
             leg_retry: list[int] = []
             for pos, (idx, primary) in enumerate(zip(leg_indices, is_primary)):
                 answered = pos < resolved and entries[pos] is not WRONG_NODE

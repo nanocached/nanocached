@@ -44,6 +44,12 @@ framework adapters at one version, whether or not a component changed.
   count. The proxy also gives a backend connection's read buffer back after
   a large reply (it kept about 14 MiB per connection after one 16 MiB
   reply).
+- `nanocached-discovery`: `--liveness-timeout` took any number. `0` made the
+  sweep run every millisecond, evict every node on its first tick and gave a
+  restarted server no startup grace; a value at or below the 5 s heartbeat
+  interval evicted live nodes between two heartbeats; a very large value
+  overflowed the clock arithmetic and crashed. The flag now accepts 6 to
+  604800 seconds (7 days) and refuses anything else as a usage error.
 - `nanocached-node`: a remaining TTL under one second went on the wire as
   `0`: in an INCR reply, in a get-and-touch reply and in a forward or handoff
   of the entry. An SDK replicating an INCR reply read `0` as "no expiry"
@@ -111,6 +117,13 @@ framework adapters at one version, whether or not a component changed.
   more than the whole budget waits for it to be free and then runs alone;
   one that cannot get its charge within 10 seconds closes its connection,
   like a reply that cannot be charged.
+- `nanocached-node`, `nanocached-proxy`, `nanocached-discovery`: a
+  `NANOCACHED_AUTH_SECRET` (or, for the proxy, the deprecated
+  `NANOCACHED_SECRET`) that was set but not valid UTF-8 counted as unset, so
+  the server started without authentication, on a loopback bind without a
+  warning. Such a value is now refused at startup with a message naming the
+  variable: every SDK sends the secret as UTF-8, so no client could have
+  presented it.
 
 ## [0.5.1] - 2026-10-27
 

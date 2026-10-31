@@ -639,6 +639,21 @@ client touching an existing one has upgraded and enabled it together.
 Incompressible data (already-compressed media, random bytes) is passed
 through unchanged rather than bloated.
 
+A compressed value whose DEFLATE stream ends early (a truncated or
+corrupt write) fails the read with a `DecompressionException`, as in
+the other SDKs. .NET's `DeflateStream` only reports that with
+`System.IO.Compression.UseStrictValidation` on, so the SDK sets that
+switch for the process the first time it compresses or decompresses,
+unless the application has set it either way itself. .NET reads the
+switch once, on the first use of `DeflateStream` in the process: an
+application that uses `DeflateStream`, `GZipStream` or `ZLibStream`
+before its first nanocached read or write should set the switch in its
+own runtime configuration (`<RuntimeHostConfigurationOption
+Include="System.IO.Compression.UseStrictValidation" Value="true" />` in
+the project file) to get the same detection. With the switch on, those
+streams also throw on truncated input elsewhere in the application
+instead of returning a prefix.
+
 Decompression is bounded three ways: one value may expand to at most
 64 MiB, one `GetManyAsync`/`GetManyBytesAsync` response to at most
 256 MiB across the batch, and one client to at most 256 MiB of DEFLATE

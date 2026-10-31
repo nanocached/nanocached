@@ -92,6 +92,28 @@ public class CompressionTests
     }
 
     [Fact]
+    public void ATruncatedDeflateValueThrowsInsteadOfReturningAPrefix()
+    {
+        // DeflateStream treats input that ends before the final block as
+        // the end of the stream unless strict validation is on; the
+        // module initializer turns it on, so a value cut short (a
+        // truncated or corrupt write) fails like it does in the other
+        // SDKs instead of coming back as a shorter value.
+        var random = new Random(7);
+        byte[] value = new byte[40_000];
+        for (int i = 0; i < value.Length; i++) value[i] = (byte)('a' + random.Next(16));
+        byte[] stored = Compression.CompressValue(value, 0);
+        Assert.Equal(0x01, stored[0]);
+        Assert.True(AppContext.TryGetSwitch(Compression.StrictValidationSwitch, out bool strict) && strict);
+        foreach (int cut in new[] { stored.Length / 2, stored.Length - 3 })
+        {
+            var error = Assert.Throws<DecompressionException>(() => Compression.DecompressValue(stored[..cut]));
+            Assert.Contains("truncated", error.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        Assert.Equal(value, Compression.DecompressValue(stored));
+    }
+
+    [Fact]
     public void AnOverCapDecompressedValueThrowsInsteadOfExhaustingMemory()
     {
         // Regression (issue #41): a small compressed value expanding past

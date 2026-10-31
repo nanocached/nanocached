@@ -472,8 +472,15 @@ const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 /// renames the variable.
 const LEGACY_AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_SECRET";
 
-fn read_auth_secret() -> Option<Bytes> {
-    read_auth_secret_from(|name| std::env::var(name).ok())
+fn read_auth_secret() -> io::Result<Option<Bytes>> {
+    // Either name set to a value that is not UTF-8 is refused, not
+    // skipped: `read_auth_secret_from`'s `None` for it would fall through
+    // to "no secret" (see `infra::read_env_secret`).
+    for name in [AUTH_SECRET_ENV_VAR, LEGACY_AUTH_SECRET_ENV_VAR] {
+        infra::read_env_secret(name)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    }
+    Ok(read_auth_secret_from(|name| std::env::var(name).ok()))
 }
 
 fn read_auth_secret_from(var: impl Fn(&str) -> Option<String>) -> Option<Bytes> {
@@ -6572,7 +6579,7 @@ async fn run(
     tls_acceptor: Option<TlsAcceptor>,
     tls_connector: Option<TlsConnector>,
 ) -> io::Result<()> {
-    let secret = read_auth_secret();
+    let secret = read_auth_secret()?;
 
     let (ring_tx, ring_rx) = watch::channel(None);
     let (refresh_tx, refresh_rx) = mpsc::channel(16);
