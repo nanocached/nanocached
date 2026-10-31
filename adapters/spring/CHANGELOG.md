@@ -9,6 +9,15 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Security
+
+- The `api` dependency on Spring Framework moves from 6.2.8 to 6.2.19, the
+  latest 6.2 patch release. 6.2.8 predates several published security fixes in
+  later 6.2 releases, and as an `api` dependency it is the version an
+  application inherits unless it overrides it. The Spring Boot version the
+  tests run against moves from 3.5.3 to 3.5.16, which manages the same Spring
+  Framework version.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release

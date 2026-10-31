@@ -279,7 +279,11 @@ time, cluster-wide — so a fleet started at once simply queues; a source
 that has finished one handoff accepts the next join's request while it is
 still forwarding for the previous one, and keeps forwarding to the earlier
 joiner until its own window ends — also when that later handoff is
-abandoned, its joiner evicted, or its transfer cut short.</p>
+abandoned, its joiner evicted, or its transfer cut short. A joiner is tracked by its connection to discovery,
+which enables TCP keepalive on it, so a joiner whose host vanishes without
+closing the connection (power loss, a partition) is dropped once keepalive
+gives up, about 25&nbsp;seconds on Linux, rather than holding up the
+joiners queued behind it.</p>
 
 <h2>Discovery without a single point of failure</h2>
 <p>The registry is deliberately soft state: nodes announce themselves and

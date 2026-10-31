@@ -1478,9 +1478,9 @@ class NanocachedClient:
         keys that did resolve, its ``__cause__`` the last connection
         error), or the bare connection error when nothing resolved — a
         connection loss is never reported as a wrong-node answer. In
-        single-node/proxy mode a ``W`` propagates immediately as a plain
-        WrongNodeError, exactly as get()'s own single-mode behavior
-        does — there is no ring to refresh against.
+        single-node/proxy mode a ``W`` propagates immediately, with no
+        refresh-and-retry (there is no ring to refresh against), but as
+        the same PartialWrongNodeError carrying the keys that did resolve.
 
         Larger batches are transparently split into more than one ``m``
         sub-frame per owner, bounded by both _MAX_BATCH_KEYS and
@@ -1543,7 +1543,10 @@ class NanocachedClient:
                     ) from error
                 raise error
             if any(entry is WRONG_NODE for entry in entries):
-                raise WrongNodeError()
+                # As in a cluster, the keys that did resolve are attached:
+                # there is no ring to refresh against here, but the values
+                # are already in hand and dropping them helps nobody.
+                raise PartialWrongNodeError(values)
             return values
 
         values = {}
@@ -2194,6 +2197,19 @@ class NanocachedClient:
                     ) from error
                 raise error
             if any(entry is WRONG_NODE for entry in entries[:resolved]):
+                if get:
+                    # As in a cluster: the hits the node returned are
+                    # attached. With ttl_seconds == 0 they were consumed
+                    # by the touch, so dropping them would lose them.
+                    raise PartialWrongNodeError(
+                        collect(
+                            {
+                                idx: entry
+                                for idx, entry in enumerate(entries[:resolved])
+                                if entry is not WRONG_NODE
+                            }
+                        )
+                    )
                 raise WrongNodeError()
             return collect(dict(enumerate(entries)))
 

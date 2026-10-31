@@ -3448,6 +3448,19 @@ fn dispatch_connection(
     // small writes waiting to coalesce with more data (Nagle's algorithm).
     let _ = stream.set_nodelay(true);
 
+    // A joining node's liveness is this connection: `wait_for_promotion`
+    // reads it until promotion, and the sweep never evicts a `Waiting` or
+    // `Joining` entry. A joiner whose host dies without a FIN or RST
+    // (power loss, hypervisor failure, a partition) would otherwise stay
+    // registered, and if it is the oldest `Waiting` entry its join would
+    // start, fail silently on every ready node and hold the whole join
+    // queue until `migration_timeout_for` (60 s and up to 2 h). TCP
+    // keepalive makes the kernel fail the read after about 25 s of
+    // silence instead; see `infra::TCP_KEEPALIVE_IDLE`.
+    if let Err(error) = infra::enable_tcp_keepalive(&stream) {
+        eprintln!("WARN enabling TCP keepalive for {address} failed: {error}");
+    }
+
     // CRITICAL — everything below (the connection-limit check, the TLS
     // handshake, and the over-limit "Busy" reply) runs inside the spawned
     // task, never inline here in `run`'s accept loop. This used to await
@@ -10206,6 +10219,65 @@ mod tests {
         let (server, _) = server.unwrap();
 
         (client, server)
+    }
+
+    /// A joiner's liveness is its `J` connection, so every accepted socket
+    /// must have TCP keepalive on, with the idle time and interval from
+    /// `infra`; otherwise a joiner whose host dies without a FIN or RST
+    /// stays registered. A peer vanishing without a FIN cannot be
+    /// simulated in-process, so this checks the socket options instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_connection_enables_tcp_keepalive_on_accepted_sockets() {
+        let (_client, server) = tcp_pair().await;
+        let address = server.peer_addr().unwrap();
+        // Dispatch consumes the stream; keep a duplicate handle to the same
+        // socket to read the options back.
+        let observer = server.into_std().unwrap();
+        let stream = TcpStream::from_std(observer.try_clone().unwrap()).unwrap();
+
+        let connection_limit = Arc::new(Semaphore::new(1));
+        let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let cluster_state = ClusterState {
+            registry: Arc::new(RegistryState::default()),
+            current_join: Arc::new(Mutex::new(None)),
+        };
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut connection_tasks = JoinSet::new();
+
+        dispatch_connection(
+            stream,
+            address,
+            cluster_state,
+            connection_limit,
+            per_ip_connections,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            &mut connection_tasks,
+        );
+
+        let socket = socket2::SockRef::from(&observer);
+        assert!(socket.keepalive().unwrap());
+        assert_eq!(
+            socket.tcp_keepalive_time().unwrap(),
+            infra::TCP_KEEPALIVE_IDLE
+        );
+        assert_eq!(
+            socket.tcp_keepalive_interval().unwrap(),
+            infra::TCP_KEEPALIVE_INTERVAL
+        );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(
+            socket.tcp_keepalive_retries().unwrap(),
+            infra::TCP_KEEPALIVE_RETRIES
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -14,19 +14,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
-- `nanocached-node`: the per-key working memory of a multi-key frame (`m`,
-  `o`, `y`) was not counted against `--max-in-flight-bytes`. The node builds
-  several lists with an entry per key, about 100 bytes each, and a 1 MiB
-  frame of one-byte keys holds about 350,000 keys, so tens of megabytes
-  while it runs; the budget charged only the receive buffer (about 1 MiB)
-  and the reply's values, so the default 256 MiB admitted hundreds of such
-  frames at once. In a test, 50 simultaneous 1 MiB `m` frames took the node
-  to 2 GiB and 200 to about 6.7 GiB, enough to kill a 1 GiB task from a
-  single client address. A multi-key frame is now charged 128 bytes per key
-  before the lists are built, until its reply is written. A frame that costs
-  more than the whole budget waits for it to be free and then runs alone;
-  one that cannot get its charge within 10 seconds closes its connection,
-  like a reply that cannot be charged.
+- `nanocached-proxy`: a request waited for the in-flight byte budget with no
+  time limit, and `IDLE_TIMEOUT` did not cover that wait. A client that read
+  1 MiB replies at about 20 KB/s is never evicted, so five such connections
+  pipelining reads held the whole 256 MiB proxy-wide budget and every other
+  client's requests waited behind them for as long as they kept dribbling.
+  A request that cannot get its bytes within 60 seconds is now answered `R`
+  (`B` to a client without the retryable-error capability) and the
+  connection goes on, and one source IP may hold at most a quarter of the
+  proxy-wide budget (64 MiB by default), so one slow consumer cannot starve
+  the rest. Clients behind one NAT or egress IP share that quarter.
 - `nanocached-node`: a remaining TTL under one second went on the wire as
   `0`: in an INCR reply, in a get-and-touch reply and in a forward or handoff
   of the entry. An SDK replicating an INCR reply read `0` as "no expiry"
@@ -53,6 +50,28 @@ framework adapters at one version, whether or not a component changed.
   skipped by re-replication, and removed by a sweep when another owner
   exists. The list now keeps those marks, on completion and when the
   transfer is cancelled or fails.
+- `nanocached-discovery`: a joiner whose host died without closing its
+  connection (power loss, hypervisor failure, a partition) stayed registered,
+  because nothing set TCP keepalive on the connection that is a joiner's
+  liveness. If it was the oldest waiting joiner its join started, every
+  node's migration to the dead address failed without a report, and the join
+  held the queue until the migration timeout (60 s and up to 2 h). Discovery
+  now enables TCP keepalive on the connections it accepts (first probe after
+  10 s idle, then every 5 s, 3 probes on Linux), so such a joiner is dropped
+  after about 25 s.
+- `nanocached-node`: the per-key working memory of a multi-key frame (`m`,
+  `o`, `y`) was not counted against `--max-in-flight-bytes`. The node builds
+  several lists with an entry per key, about 100 bytes each, and a 1 MiB
+  frame of one-byte keys holds about 350,000 keys, so tens of megabytes
+  while it runs; the budget charged only the receive buffer (about 1 MiB)
+  and the reply's values, so the default 256 MiB admitted hundreds of such
+  frames at once. In a test, 50 simultaneous 1 MiB `m` frames took the node
+  to 2 GiB and 200 to about 6.7 GiB, enough to kill a 1 GiB task from a
+  single client address. A multi-key frame is now charged 128 bytes per key
+  before the lists are built, until its reply is written. A frame that costs
+  more than the whole budget waits for it to be free and then runs alone;
+  one that cannot get its charge within 10 seconds closes its connection,
+  like a reply that cannot be charged.
 
 ## [0.5.1] - 2026-10-27
 
