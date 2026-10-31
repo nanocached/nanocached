@@ -32,8 +32,9 @@ pub(crate) fn resolve_compression(enabled: bool) -> Result<bool> {
 #[cfg(feature = "compression")]
 mod deflate {
     use super::*;
-    use flate2::read::{DeflateDecoder, DeflateEncoder};
+    use flate2::read::DeflateEncoder;
     use flate2::Compression as Flate2Compression;
+    use flate2::{Decompress, FlushDecompress, Status};
     use std::io::Read;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -113,32 +114,60 @@ mod deflate {
 
         match marker {
             MARKER_RAW => Ok(body.to_vec()),
-            MARKER_DEFLATE => {
-                let decoder = DeflateDecoder::new(body);
-                // +1 so an output of exactly the cap still reads, letting a
-                // value that exceeds it be detected, not silently truncated.
-                let mut limited = decoder.take(MAX_DECOMPRESSED_LENGTH + 1);
-                let mut out = Vec::new();
-                limited.read_to_end(&mut out).map_err(|error| {
+            MARKER_DEFLATE => inflate_bounded(body),
+            other => Err(Error::Decompression(format!(
+                "nanocached: unrecognized compression marker byte {other} — was this value \
+                 written by a client with compress disabled (value compression)?"
+            ))),
+        }
+    }
+
+    /// Inflates a raw-DEFLATE `body` to its end, bounded by
+    /// `MAX_DECOMPRESSED_LENGTH`. Drives `flate2::Decompress` directly
+    /// because the `Read` adapters report `Ok` at end of input without
+    /// checking that the stream reached its final block, so a truncated
+    /// body would decode to a silent prefix. Anything short of
+    /// `Status::StreamEnd` — including an empty body — is an error.
+    fn inflate_bounded(body: &[u8]) -> Result<Vec<u8>> {
+        let mut decompress = Decompress::new(false);
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 32 * 1024];
+        loop {
+            let consumed_before = decompress.total_in();
+            let produced_before = decompress.total_out();
+            let input = &body[consumed_before as usize..];
+            let status = decompress
+                .decompress(input, &mut chunk, FlushDecompress::None)
+                .map_err(|error| {
                     Error::Decompression(format!(
                         "nanocached: failed to decompress a value marked as compressed — did \
                          every client sharing this key enable compress (value compression)? \
                          ({error})"
                     ))
                 })?;
-                if out.len() as u64 > MAX_DECOMPRESSED_LENGTH {
-                    return Err(Error::Decompression(
-                        "nanocached: decompressed value exceeds the maximum size — possible \
-                         decompression bomb"
-                            .to_string(),
-                    ));
-                }
-                Ok(out)
+            let produced = (decompress.total_out() - produced_before) as usize;
+            out.extend_from_slice(&chunk[..produced]);
+            if out.len() as u64 > MAX_DECOMPRESSED_LENGTH {
+                return Err(Error::Decompression(
+                    "nanocached: decompressed value exceeds the maximum size — possible \
+                     decompression bomb"
+                        .to_string(),
+                ));
             }
-            other => Err(Error::Decompression(format!(
-                "nanocached: unrecognized compression marker byte {other} — was this value \
-                 written by a client with compress disabled (value compression)?"
-            ))),
+            match status {
+                Status::StreamEnd => return Ok(out),
+                Status::Ok | Status::BufError => {
+                    // No input consumed and no output produced: the body
+                    // ended before the final DEFLATE block.
+                    if decompress.total_in() == consumed_before && produced == 0 {
+                        return Err(Error::Decompression(
+                            "nanocached: compressed value is truncated — the DEFLATE stream \
+                             ended before its final block"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -268,5 +297,42 @@ mod tests {
     #[test]
     fn corrupt_deflate_marked_value_errors() {
         assert!(decompress_value(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF]).is_err());
+    }
+
+    // A value whose compressed body was cut short must be an error, not a
+    // silent prefix of the original (the `Read` adapters return Ok at end
+    // of input without checking for the final block).
+    #[test]
+    fn truncated_deflate_body_errors() {
+        // Deterministic, moderately compressible 40,000-byte value.
+        let value: Vec<u8> = (0..40_000u32)
+            .map(|i| b"abcdefgh"[((i * 7 + i / 13) % 8) as usize] ^ ((i / 997) as u8 & 3))
+            .collect();
+        let stored = compress_value(&value, 256);
+        assert_eq!(stored[0], 0x01);
+        assert_eq!(decompress_value(&stored).unwrap(), value);
+
+        let body_len = stored.len() - 1;
+        for cut in [1, body_len / 2, body_len - 3, body_len - 1] {
+            let truncated = &stored[..1 + cut];
+            assert!(
+                decompress_value(truncated).is_err(),
+                "a body cut to {cut} of {body_len} bytes must be an error"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_only_deflate_value_errors() {
+        assert!(decompress_value(&[0x01]).is_err());
+    }
+
+    #[test]
+    fn decompressed_size_over_the_cap_errors() {
+        // 65 MiB of zeros compresses to ~64 KiB and must trip the bomb cap.
+        let value = vec![0u8; 65 * 1024 * 1024];
+        let stored = compress_value(&value, 256);
+        assert_eq!(stored[0], 0x01);
+        assert!(decompress_value(&stored).is_err());
     }
 }
