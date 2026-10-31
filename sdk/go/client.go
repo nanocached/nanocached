@@ -2643,11 +2643,16 @@ func (c *Client) applyReconnecting(slot string, op func(*connection) error) erro
 // (ErrConnectionLost or ErrProtocol) is returned to the caller as-is:
 // the operation may already be applied at the primary, so this
 // deliberately does not retry — see Incr/Replace/DeleteIfMatches' own
-// doc comments for the resulting at-least-once caveat.
+// doc comments for the resulting at-least-once caveat. A failure to obtain
+// a connection at all — a dial that failed, on the first attempt or on the
+// redial — wrote no frame, so it is marked errRequestNotSent too (as
+// applyExpiring does): withClusterRetryNonIdempotent then refreshes the
+// node list and reroutes instead of surfacing a dial error for a primary
+// that discovery has already dropped.
 func (c *Client) applyNonIdempotent(slot string, op func(*connection) error) error {
 	conn, err := c.slotConnection(slot)
 	if err != nil {
-		return err
+		return notSentIfLost(err)
 	}
 	if err := op(conn); err != nil {
 		if !errors.Is(err, errRequestNotSent) || errors.Is(err, errRequestTimedOut) {
@@ -2655,7 +2660,7 @@ func (c *Client) applyNonIdempotent(slot string, op func(*connection) error) err
 		}
 		conn, redialErr := c.slotConnection(slot)
 		if redialErr != nil {
-			return redialErr
+			return notSentIfLost(redialErr)
 		}
 		return op(conn)
 	}

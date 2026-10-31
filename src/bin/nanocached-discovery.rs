@@ -330,6 +330,19 @@ const MAX_REGISTRY_SIZE: usize = 1 << 16;
 /// so normal operation never notices it.
 const MAX_FANOUT_CONCURRENCY: usize = 64;
 
+/// Issue #1100: how many nodes `P` may admit, and send the join's `M` to,
+/// while one join is pending (see `hand_off_from_late_member`). Each is an
+/// outbound dial of up to `MIGRATE_SEND_ATTEMPTS` x `OUTBOUND_IO_TIMEOUT`
+/// and a join the pending slot has to wait for, and a `P` costs its sender
+/// a few dozen bytes — so without a bound one source rotating names during
+/// a join (60 s or more) grows that work as far as `MAX_REGISTRY_SIZE`.
+/// Further `P`s for new names are refused until the join ends; a node that
+/// healed from a partition retries its announce and is admitted by the
+/// next join's own roster or after this one. The same width as
+/// `MAX_FANOUT_CONCURRENCY`: far above the handful of nodes a partition
+/// heal brings back in practice.
+const MAX_LATE_MEMBERS_PER_JOIN: usize = 64;
+
 /// Issue #122: bound on registered proxies — a fleet has orders of
 /// magnitude fewer proxies than clients, so this is generous, and it
 /// keeps a secret-holder from growing the proxy map without bound.
@@ -967,8 +980,33 @@ struct PendingJoin {
     generation: u64,
     /// The ready roster (name, address) this join's `M` carried, so a node
     /// admitted by `P` while the join is pending can be sent the same `M`
-    /// (issue #1031, see `hand_off_from_late_member`).
-    roster: Vec<(String, String)>,
+    /// (issue #1031, see `hand_off_from_late_member`). Shared with the
+    /// join's own fan-out and with every late member's task instead of
+    /// copied per recipient.
+    roster: Arc<Vec<(String, String)>>,
+    /// The `M` sends to nodes admitted by `P` after the join started.
+    late: LateHandoffs,
+}
+
+/// Issue #1100: the `M` sends `hand_off_from_late_member` makes for one
+/// join. They draw on the same dial limit as the join's own fan-out
+/// (`fanout_limit`, `MAX_FANOUT_CONCURRENCY`) and are owned by the join:
+/// dropping the `PendingJoin` (promotion, abandon, eviction) drops the
+/// `JoinSet`, which aborts every send still running, so none outlives the
+/// join it was for. The number of sends is capped at
+/// `MAX_LATE_MEMBERS_PER_JOIN`.
+struct LateHandoffs {
+    fanout_limit: Arc<Semaphore>,
+    sends: JoinSet<()>,
+}
+
+impl Default for LateHandoffs {
+    fn default() -> Self {
+        Self {
+            fanout_limit: Arc::new(Semaphore::new(MAX_FANOUT_CONCURRENCY)),
+            sends: JoinSet::new(),
+        }
+    }
 }
 
 impl PendingJoin {
@@ -1073,6 +1111,10 @@ type AnnounceLimiter = Arc<Mutex<FxHashMap<std::net::IpAddr, Instant>>>;
 /// name (see the `P` handler) — a refresh of an existing entry must not
 /// consume or be gated by this limiter at all.
 fn announce_insert_allowed(limiter: &AnnounceLimiter, peer_ip: std::net::IpAddr) -> bool {
+    // Keyed like the join waiting cap and the connection cap: an IPv6
+    // source counts as its /64, so rotating addresses inside one prefix
+    // doesn't earn a fresh cooldown each time.
+    let peer_ip = per_ip_key(peer_ip);
     let now = Instant::now();
     let mut guard = limiter
         .lock()
@@ -2046,7 +2088,7 @@ async fn try_begin_next_join(
     // again after each bootstrap promotion; the next candidate then
     // finds a `Joined` member and starts a real staged join, after which
     // `C`/abandon chain the rest as usual.
-    let (name, joining_addr, joining_token, joined, ready_tokens, generation) = loop {
+    let (name, joining_addr, joining_token, joined, ready_tokens, generation, fanout_limit) = loop {
         let mut join_guard = lock_current_join(current_join);
 
         if join_guard.is_some() {
@@ -2119,6 +2161,11 @@ async fn try_begin_next_join(
         // just reusing it rather than a second registry pass.
         let expected = ready_tokens.clone();
         let generation = next_join_generation();
+        // One roster, shared with the join's late members (issue #1100)
+        // and with every send of the fan-out below.
+        let joined = Arc::new(joined);
+        let late = LateHandoffs::default();
+        let fanout_limit = Arc::clone(&late.fanout_limit);
 
         *join_guard = Some(PendingJoin {
             joining_name: name.clone(),
@@ -2126,7 +2173,8 @@ async fn try_begin_next_join(
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: joined.clone(),
+            roster: Arc::clone(&joined),
+            late,
             generation,
         });
 
@@ -2137,6 +2185,7 @@ async fn try_begin_next_join(
             joined,
             ready_tokens,
             generation,
+            fanout_limit,
         );
     };
 
@@ -2149,8 +2198,8 @@ async fn try_begin_next_join(
     // Issue #299: bounds how many of these `M` sends are dialing out at
     // once — see `MAX_FANOUT_CONCURRENCY`'s own doc comment. Every ready
     // node is still spawned and still contacted; a permit just gates when
-    // each spawned task's own dial actually starts.
-    let fanout_limit = Arc::new(Semaphore::new(MAX_FANOUT_CONCURRENCY));
+    // each spawned task's own dial actually starts. Issue #1100: the
+    // limit is the join's own, shared with its late members' sends.
     // Issue #409(a): share the invariant roster via one `Arc` instead of
     // deep-cloning the whole `Vec` on every iteration below. The roster is
     // identical for every ready node in this fanout, so a per-iteration
@@ -2158,7 +2207,7 @@ async fn try_begin_next_join(
     // the current_thread runtime — for a large `joined` roster that stalls
     // heartbeats/accepts long enough to risk spurious liveness evictions.
     // Cloning the `Arc` instead is O(1) per iteration.
-    let joined_roster = Arc::new(joined);
+    let joined_roster = joined;
 
     for (ready_name, ready_addr) in joined_roster.iter().cloned() {
         let auth_secret = auth_secret.clone();
@@ -2876,6 +2925,16 @@ async fn start_join(
 /// adds itself to the before-ring, as every recipient does), so the join
 /// waits for its `C` like the others'. The send runs on its own task:
 /// `P` is the heartbeat path and its `R` must not wait for a dial.
+///
+/// Issue #1100: that task is bounded like the join's own fan-out. It takes
+/// a permit of the join's dial limit (`MAX_FANOUT_CONCURRENCY`) before it
+/// dials, it shares the join's roster instead of copying it, and it is
+/// owned by the `PendingJoin` (aborted when the join ends). At most
+/// `MAX_LATE_MEMBERS_PER_JOIN` nodes are handed off per join; the `P`
+/// handler refuses further new names while the join is full (see
+/// `late_handoffs_exhausted`), so the limit reached here is a backstop
+/// and a node it turns away is left out of `expected` — admitted, but
+/// without an `M`, as before #1031.
 #[allow(clippy::too_many_arguments)]
 fn hand_off_from_late_member(
     registry: &Registry,
@@ -2887,27 +2946,34 @@ fn hand_off_from_late_member(
     addr: &str,
     token: &str,
 ) {
-    let (joining_name, generation, roster) = {
-        let mut join_guard = lock_current_join(current_join);
-        let Some(pending) = join_guard.as_mut() else {
-            return;
-        };
-        if pending.joining_name == name || pending.expected.contains_key(name) {
-            return;
-        }
-        pending.expected.insert(name.to_string(), token.to_string());
-        (
-            pending.joining_name.clone(),
-            pending.generation,
-            pending.roster.clone(),
-        )
+    let mut join_guard = lock_current_join(current_join);
+    let Some(pending) = join_guard.as_mut() else {
+        return;
     };
+    if pending.joining_name == name || pending.expected.contains_key(name) {
+        return;
+    }
+    if pending.late.sends.len() >= MAX_LATE_MEMBERS_PER_JOIN {
+        eprintln!(
+            "WARN {name} admitted by P while the join of {} is pending, but \
+             {MAX_LATE_MEMBERS_PER_JOIN} late members were already handed off: not sending it M",
+            pending.joining_name
+        );
+        return;
+    }
+    // Registry lock under the join lock: the order `try_begin_next_join`
+    // takes them in.
     let Some((joining_addr, joining_token)) = lock(registry)
-        .get(&joining_name)
+        .get(&pending.joining_name)
         .map(|info| (info.address.clone(), info.token.clone()))
     else {
         return;
     };
+    pending.expected.insert(name.to_string(), token.to_string());
+    let joining_name = pending.joining_name.clone();
+    let generation = pending.generation;
+    let roster = Arc::clone(&pending.roster);
+    let fanout_limit = Arc::clone(&pending.late.fanout_limit);
     println!(
         "INFO join in progress: {joining_name} — sending M to {name}, admitted by P after the \
          join started"
@@ -2918,7 +2984,11 @@ fn hand_off_from_late_member(
     let auth_secret = auth_secret.clone();
     let tls_connector = tls_connector.clone();
     let (name, addr, token) = (name.to_string(), addr.to_string(), token.to_string());
-    tokio::spawn(async move {
+    pending.late.sends.spawn(async move {
+        let _permit = fanout_limit
+            .acquire_owned()
+            .await
+            .expect("fanout_limit semaphore is never closed");
         let result = send_migrate_with_retry(
             &token,
             &name,
@@ -2954,6 +3024,17 @@ fn hand_off_from_late_member(
         // Keep the registry alive for the duration like the other fan-outs.
         drop(registry);
     });
+}
+
+/// Whether the pending join (if any) has already handed off to
+/// `MAX_LATE_MEMBERS_PER_JOIN` nodes admitted by `P`, so one more new name
+/// must wait for the join to end (issue #1100). Checked by the `P` handler
+/// before it admits a new name and, on the single-threaded runtime, with no
+/// `.await` between that check and `hand_off_from_late_member`.
+fn late_handoffs_exhausted(current_join: &CurrentJoin) -> bool {
+    lock_current_join(current_join)
+        .as_ref()
+        .is_some_and(|pending| pending.late.sends.len() >= MAX_LATE_MEMBERS_PER_JOIN)
 }
 
 /// Records a ready node's completion report for the in-progress join. If
@@ -3226,7 +3307,7 @@ async fn abandon_current_join(
             _ => None,
         }
     };
-    let Some(pending) = pending else {
+    let Some(mut pending) = pending else {
         println!(
             "INFO abandon of {} (generation {}) skipped: no longer the pending join \
              (reason={reason})",
@@ -3234,6 +3315,9 @@ async fn abandon_current_join(
         );
         return;
     };
+    // Issue #1100: the `M` sends to this join's late members stop here,
+    // before the `X`s below, rather than at some later attempt.
+    pending.late.sends.abort_all();
     registry
         .joins_abandoned_total
         .fetch_add(1, Ordering::Relaxed);
@@ -5108,6 +5192,15 @@ async fn handle_connection(
                         break 'decide Err("registry is full");
                     }
 
+                    // Issue #1100: a join that has already handed off to
+                    // `MAX_LATE_MEMBERS_PER_JOIN` late members takes no
+                    // more new names until it ends. Before the limiter
+                    // call so a refused `P` doesn't spend a cooldown slot.
+                    if late_handoffs_exhausted(&current_join) {
+                        break 'decide Err("too many nodes announced while a join is pending; \
+                                           retry shortly");
+                    }
+
                     // Issue: `P` holds no connection open the way `J`
                     // does, so nothing else bounds how fast one source
                     // can grow the registry toward `MAX_REGISTRY_SIZE`
@@ -5807,6 +5900,37 @@ mod tests {
         // Once the cooldown has elapsed, the original source is allowed
         // again.
         assert!(announce_insert_allowed(&limiter, ip));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn announce_insert_allowed_counts_an_ipv6_64_as_one_source() {
+        // Regression: the cooldown was keyed by the raw peer address, so a
+        // sender in one IPv6 /64 rotated its source address to walk around
+        // the 2 s cooldown and fill the registry with forged entries. It
+        // is keyed by `per_ip_key` now, like the waiting cap and the
+        // connection cap.
+        let limiter: AnnounceLimiter = Arc::new(Mutex::new(FxHashMap::default()));
+        let first: std::net::IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let same_64: std::net::IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let other_64: std::net::IpAddr = "2001:db8:1:3::1".parse().unwrap();
+
+        assert!(announce_insert_allowed(&limiter, first));
+        assert!(
+            !announce_insert_allowed(&limiter, same_64),
+            "a second address in the same /64 is the same source"
+        );
+        assert!(
+            announce_insert_allowed(&limiter, other_64),
+            "a different /64 is unaffected"
+        );
+        assert_eq!(
+            limiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            2,
+            "the limiter holds one entry per /64"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -6535,7 +6659,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -7273,7 +7398,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -7359,7 +7485,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -7458,7 +7585,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -7552,7 +7680,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -8857,7 +8986,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -9062,7 +9192,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 5,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 2,
         });
 
@@ -9392,7 +9523,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -9465,7 +9597,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -9558,7 +9691,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -9630,7 +9764,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -9780,7 +9915,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -9969,7 +10105,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -10074,7 +10211,8 @@ mod tests {
             started_at: Instant::now(),
             max_entries: 0,
             generation: 4,
-            roster: vec![("node-a".to_string(), "127.0.0.1:1".to_string())],
+            roster: Arc::new(vec![("node-a".to_string(), "127.0.0.1:1".to_string())]),
+            late: LateHandoffs::default(),
         })));
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -10166,6 +10304,223 @@ mod tests {
             NodeState::Joined
         );
         assert!(lock_current_join(&current_join).is_none());
+    }
+
+    /// A registry with a ready `node-a` and a joining `node-b`, and the
+    /// join of `node-b` pending on `node-a`'s report.
+    fn registry_with_a_pending_join() -> (Registry, CurrentJoin) {
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation: 4,
+            roster: Arc::new(vec![("node-a".to_string(), "127.0.0.1:1".to_string())]),
+            late: LateHandoffs::default(),
+        })));
+        (registry, current_join)
+    }
+
+    fn hand_off_to(registry: &Registry, current_join: &CurrentJoin, name: &str, addr: &str) {
+        hand_off_from_late_member(
+            registry,
+            current_join,
+            &None,
+            &None,
+            2,
+            name,
+            addr,
+            &format!("tk-{name}"),
+        );
+    }
+
+    /// Issue #1100: the `M` send to a node admitted mid-join dials only
+    /// once the join's dial limit (`MAX_FANOUT_CONCURRENCY`, shared with
+    /// the join's own fan-out) has a free permit, like every other send.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_late_members_m_send_waits_for_the_joins_dial_limit() {
+        let late_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let late_addr = late_listener.local_addr().unwrap().to_string();
+        let (registry, current_join) = registry_with_a_pending_join();
+        let limit = Arc::clone(
+            &lock_current_join(&current_join)
+                .as_ref()
+                .unwrap()
+                .late
+                .fanout_limit,
+        );
+
+        // Every permit of the join's dial limit is in use.
+        let held = limit
+            .try_acquire_many(MAX_FANOUT_CONCURRENCY as u32)
+            .unwrap();
+        hand_off_to(&registry, &current_join, "node-c", &late_addr);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), late_listener.accept())
+                .await
+                .is_err(),
+            "the late member must not be dialed while the dial limit is exhausted"
+        );
+
+        // Once a permit frees up, the send goes ahead.
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), late_listener.accept())
+            .await
+            .expect("the late member is dialed once a permit is free")
+            .unwrap();
+    }
+
+    /// Issue #1100: the late members' sends belong to the join. When it is
+    /// abandoned they are aborted, not left to run out their attempts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoning_a_join_aborts_its_late_members_m_sends() {
+        let (registry, current_join) = registry_with_a_pending_join();
+        let limit = Arc::clone(
+            &lock_current_join(&current_join)
+                .as_ref()
+                .unwrap()
+                .late
+                .fanout_limit,
+        );
+        // Borrowed permits: they hold no clone of the semaphore's `Arc`,
+        // so the count below is the tasks' alone.
+        let held = limit
+            .try_acquire_many(MAX_FANOUT_CONCURRENCY as u32)
+            .unwrap();
+        for i in 0..3 {
+            hand_off_to(
+                &registry,
+                &current_join,
+                &format!("late-{i}"),
+                "127.0.0.1:1",
+            );
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            Arc::strong_count(&limit),
+            1 + 1 + 3,
+            "the join, this test and the three queued sends hold the limit"
+        );
+
+        let join = lock_current_join(&current_join)
+            .as_ref()
+            .unwrap()
+            .identity();
+        abandon_current_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            &join,
+            "test",
+        )
+        .await;
+        tokio::task::yield_now().await;
+
+        assert!(lock_current_join(&current_join).is_none());
+        assert_eq!(
+            Arc::strong_count(&limit),
+            1,
+            "no late send is left running after the abandon"
+        );
+        drop(held);
+    }
+
+    /// Issue #1100: a join hands off to at most `MAX_LATE_MEMBERS_PER_JOIN`
+    /// late members; the `P` handler refuses further new names until it
+    /// ends, rather than admitting nodes that would get no `M`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_join_takes_at_most_a_bounded_number_of_late_members() {
+        let (registry, current_join) = registry_with_a_pending_join();
+        let limit = Arc::clone(
+            &lock_current_join(&current_join)
+                .as_ref()
+                .unwrap()
+                .late
+                .fanout_limit,
+        );
+        // Keep every send queued behind the dial limit.
+        let held = limit
+            .try_acquire_many(MAX_FANOUT_CONCURRENCY as u32)
+            .unwrap();
+
+        assert!(!late_handoffs_exhausted(&current_join));
+        for i in 0..MAX_LATE_MEMBERS_PER_JOIN + 5 {
+            hand_off_to(
+                &registry,
+                &current_join,
+                &format!("late-{i}"),
+                "127.0.0.1:1",
+            );
+        }
+        assert!(late_handoffs_exhausted(&current_join));
+        {
+            let guard = lock_current_join(&current_join);
+            let pending = guard.as_ref().unwrap();
+            assert_eq!(pending.late.sends.len(), MAX_LATE_MEMBERS_PER_JOIN);
+            assert_eq!(
+                pending.expected.len(),
+                1 + MAX_LATE_MEMBERS_PER_JOIN,
+                "nodes past the bound are not added to the report set"
+            );
+        }
+
+        // A `P` for one more new name is refused and registers nothing.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_x, server_x) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_x),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_x
+            .write_all(b"P 6 4000 9\nnode-xtk-node-x")
+            .await
+            .unwrap();
+        let mut reply = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(5), node_x.read(&mut reply))
+            .await
+            .expect("the refused announce is answered by closing the connection");
+        assert!(
+            !matches!(read, Ok(n) if reply[..n].starts_with(b"R")),
+            "the announce must not be accepted"
+        );
+        assert!(!lock(&registry).contains_key("node-x"));
+        drop(held);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11714,7 +12069,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 7,
         })));
 
@@ -11848,7 +12204,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -11930,7 +12287,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -12013,7 +12371,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -12133,7 +12492,8 @@ mod tests {
                 .checked_sub(MIGRATION_TIMEOUT_BASE + Duration::from_secs(1))
                 .expect("the clock has run long enough to backdate"),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         }
     }
@@ -12264,7 +12624,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 2,
         });
 
@@ -12371,7 +12732,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
@@ -12430,7 +12792,8 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 100_000,
-            roster: Vec::new(),
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
             generation: 1,
         })));
 
