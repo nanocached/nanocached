@@ -541,6 +541,17 @@ struct RingView {
 }
 
 impl RingView {
+    /// How many distinct backend addresses the ring has: the most primaries
+    /// any one batch can spread over, and so the most `M` replies a batched
+    /// read can be answered with (`request_cost`).
+    fn distinct_addresses(&self) -> usize {
+        self.addr_slot
+            .iter()
+            .enumerate()
+            .filter(|&(index, &slot)| index == slot)
+            .count()
+    }
+
     fn new(nodes: Vec<(String, String)>, replication: usize) -> Self {
         let node_hashes = nodes
             .iter()
@@ -2584,7 +2595,7 @@ async fn run_backend(
             };
             let result = timeout(
                 UPSTREAM_IO_TIMEOUT,
-                read_reply(&mut read_half, &mut buf, tag, expect),
+                read_reply_and_shrink(&mut read_half, &mut buf, tag, expect),
             )
             .await
             .unwrap_or_else(|_| {
@@ -2830,6 +2841,23 @@ fn substitute_tag(frame: Bytes, tag: u32) -> (Bytes, Bytes) {
     header.push(b'\n');
     let body = frame.slice(header_end + 1..);
     (header.into(), body)
+}
+
+/// `read_reply`, then gives a read buffer that grew for a large reply back
+/// (`shrink_drained_buffer`). A backend connection is long-lived and its
+/// buffer is not charged against anything: after one 16 MiB `M` it would
+/// keep most of that allocated until the connection closes. The values
+/// already split off the buffer keep their own allocation alive only as
+/// long as a reply holds them.
+async fn read_reply_and_shrink<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut BytesMut,
+    tag: u32,
+    expect: Expect,
+) -> io::Result<NodeReply> {
+    let reply = read_reply(stream, buf, tag, expect).await;
+    shrink_drained_buffer(buf);
+    reply
 }
 
 async fn read_reply<S: AsyncRead + Unpin>(
@@ -4471,25 +4499,30 @@ async fn finish_multi_get(
             }
             _ => retry_positions.extend(group_positions),
         }
+        // Held to the cap as each group lands, not once all have: `entries`
+        // never carries more than the cap plus the one group just added.
+        cap_multi_reply_values(entries.iter_mut().flatten());
     }
 
     if !retry_positions.is_empty() {
         retry_multi_get(context, namespace, keys, &retry_positions, &mut entries).await;
     }
 
-    let mut entries: Vec<ProxyMultiEntry> = entries
+    let entries: Vec<ProxyMultiEntry> = entries
         .into_iter()
         .map(|entry| entry.unwrap_or(ProxyMultiEntry::WrongNode))
         .collect();
-    cap_multi_reply_values(&mut entries);
     Ok(respond_multi(&entries, tag))
 }
 
 /// Holds the client-facing `M` reply to `MAX_MULTI_REPLY_VALUE_BYTES` of
 /// values: each node caps its own group, but a batch spread over several
 /// primaries can sum to more. Hits past the budget become misses, the same
-/// answer the node gives for its own overflow.
-fn cap_multi_reply_values(entries: &mut [ProxyMultiEntry]) {
+/// answer the node gives for its own overflow. Applied after every group's
+/// reply is merged (`finish_multi_get`, `retry_multi_get`, the `y` batch's
+/// equivalents), so the values a batch holds stay within the cap while the
+/// groups are consumed rather than only once all of them have been.
+fn cap_multi_reply_values<'a>(entries: impl IntoIterator<Item = &'a mut ProxyMultiEntry>) {
     let mut value_bytes: usize = 0;
     for entry in entries {
         if let ProxyMultiEntry::Value(value) = entry {
@@ -4597,6 +4630,7 @@ async fn retry_multi_get(
                 }
                 _ => still_unresolved.extend(group_positions),
             }
+            cap_multi_reply_values(entries.iter_mut().flatten());
         }
 
         unresolved = still_unresolved;
@@ -5007,6 +5041,9 @@ async fn finish_multi_touch(
             &mut retry_positions,
             expiring,
         );
+        if get {
+            cap_multi_reply_values(entries.iter_mut().flatten());
+        }
     }
     if !unknown && !retry_positions.is_empty() {
         unknown = retry_multi_touch(
@@ -5029,12 +5066,11 @@ async fn finish_multi_touch(
         return Err(Fatal::OutcomeUnknown);
     }
 
-    let mut entries: Vec<ProxyMultiEntry> = entries
+    let entries: Vec<ProxyMultiEntry> = entries
         .into_iter()
         .map(|entry| entry.unwrap_or(ProxyMultiEntry::WrongNode))
         .collect();
     if get {
-        cap_multi_reply_values(&mut entries);
         Ok(respond_multi(&entries, tag))
     } else {
         Ok(respond_multi_touch(&entries, tag))
@@ -5187,6 +5223,9 @@ async fn retry_multi_touch(
             &mut unresolved,
             expiring,
         );
+        if batch.get {
+            cap_multi_reply_values(entries.iter_mut().flatten());
+        }
     }
     for position in unresolved {
         entries[position] = Some(ProxyMultiEntry::WrongNode);
@@ -5957,13 +5996,30 @@ impl InFlightBudget {
 /// on the wire (its value slices are pinned until the backend legs are
 /// written), `replication` the ring's owner count.
 ///
-/// - a read is answered with up to one full value (`G`) or up to
-///   `MAX_MULTI_REPLY_VALUE_BYTES` (`m`, less when the batch is small);
+/// - a read is answered with up to one full value (`G`), or (`m`, `y` with
+///   `G`) with up to one value per key and at most
+///   `MAX_MULTI_REPLY_VALUE_BYTES` per primary the batch can reach:
+///   `primaries` is the ring's address count, the most primaries any batch
+///   can spread over (an upper bound, so the keys need not be hashed a
+///   second time before dispatch hashes them);
 /// - a write is re-framed once per owner leg on top of its pinned slice;
 /// - an `m`/`o` key costs `MULTI_KEY_OVERHEAD_BYTES` of bookkeeping
 ///   beyond its bytes.
-fn request_cost(request: &Request, frame_bytes: usize, replication: usize) -> usize {
+fn request_cost(
+    request: &Request,
+    frame_bytes: usize,
+    replication: usize,
+    primaries: usize,
+) -> usize {
     let legs = replication.max(1) + 1;
+    // What a batched read can be answered with: one value per key, and at
+    // most one `MAX_MULTI_REPLY_VALUE_BYTES` reply per primary it reaches
+    // (each node caps its own group's reply; nothing caps the replies of
+    // different groups against each other until they are merged).
+    let batch_reply = |keys: usize| {
+        keys.saturating_mul(MAX_REQUEST_SIZE)
+            .min(primaries.saturating_mul(MAX_MULTI_REPLY_VALUE_BYTES))
+    };
     match request {
         Request::Get { .. } => frame_bytes.saturating_add(MAX_REQUEST_SIZE),
         // A get-and-touch is answered with up to one full value, like `G`,
@@ -5981,11 +6037,7 @@ fn request_cost(request: &Request, frame_bytes: usize, replication: usize) -> us
         | Request::ClearAll => frame_bytes.saturating_mul(legs),
         Request::MultiGet { keys, .. } => frame_bytes
             .saturating_add(keys.len().saturating_mul(MULTI_KEY_OVERHEAD_BYTES))
-            .saturating_add(
-                keys.len()
-                    .saturating_mul(MAX_REQUEST_SIZE)
-                    .min(MAX_MULTI_REPLY_VALUE_BYTES),
-            ),
+            .saturating_add(batch_reply(keys.len())),
         Request::MultiSet { keys, .. } => frame_bytes
             .saturating_mul(legs)
             .saturating_add(keys.len().saturating_mul(MULTI_KEY_OVERHEAD_BYTES)),
@@ -5996,11 +6048,7 @@ fn request_cost(request: &Request, frame_bytes: usize, replication: usize) -> us
                 .saturating_mul(legs)
                 .saturating_add(keys.len().saturating_mul(MULTI_KEY_OVERHEAD_BYTES));
             if *get {
-                framed.saturating_add(
-                    keys.len()
-                        .saturating_mul(MAX_REQUEST_SIZE)
-                        .min(MAX_MULTI_REPLY_VALUE_BYTES),
-                )
+                framed.saturating_add(batch_reply(keys.len()))
             } else {
                 framed
             }
@@ -6209,8 +6257,12 @@ async fn handle_client(
                     // pipelines faster than its replies drain stops
                     // here instead of growing the proxy. Stops waiting
                     // for the same reasons the read below does.
-                    let replication = current_ring(&context).map_or(1, |ring| ring.replication);
-                    let cost = request_cost(&request, buffered - buf.len(), replication);
+                    let ring = current_ring(&context);
+                    let replication = ring.as_ref().map_or(1, |ring| ring.replication);
+                    let primaries = ring
+                        .as_ref()
+                        .map_or(1, |ring| ring.distinct_addresses().max(1));
+                    let cost = request_cost(&request, buffered - buf.len(), replication, primaries);
                     let charge = tokio::select! {
                         charge = async {
                             let connection = connection_in_flight_bytes.charge(cost).await?;
@@ -7289,7 +7341,7 @@ mod tests {
             key: key.clone(),
         };
         // A read is its frame plus one full value.
-        assert_eq!(request_cost(&get, 7, 2), 7 + MAX_REQUEST_SIZE);
+        assert_eq!(request_cost(&get, 7, 2, 3), 7 + MAX_REQUEST_SIZE);
 
         let set = Request::Set {
             namespace: Bytes::new(),
@@ -7298,8 +7350,8 @@ mod tests {
             ttl: None,
         };
         // A write is pinned once and re-framed once per owner.
-        assert_eq!(request_cost(&set, 1000, 2), 3000);
-        assert_eq!(request_cost(&set, 1000, 0), 2000);
+        assert_eq!(request_cost(&set, 1000, 2, 3), 3000);
+        assert_eq!(request_cost(&set, 1000, 0, 3), 2000);
 
         let keys = |n: usize| vec![key.clone(); n];
         let small = Request::MultiGet {
@@ -7308,7 +7360,7 @@ mod tests {
         };
         // A small batch can be answered with one value per key...
         assert_eq!(
-            request_cost(&small, 20, 1),
+            request_cost(&small, 20, 1, 1),
             20 + 3 * MULTI_KEY_OVERHEAD_BYTES + 3 * MAX_REQUEST_SIZE
         );
         let large = Request::MultiGet {
@@ -7318,7 +7370,7 @@ mod tests {
         // ...a large one with at most the reply cap, plus per-key
         // bookkeeping that dwarfs its wire size.
         assert_eq!(
-            request_cost(&large, 200_000, 1),
+            request_cost(&large, 200_000, 1, 1),
             200_000 + 100_000 * MULTI_KEY_OVERHEAD_BYTES + MAX_MULTI_REPLY_VALUE_BYTES
         );
 
@@ -7329,9 +7381,178 @@ mod tests {
             ttl: None,
         };
         assert_eq!(
-            request_cost(&multi_set, 100, 2),
+            request_cost(&multi_set, 100, 2, 3),
             300 + 4 * MULTI_KEY_OVERHEAD_BYTES
         );
+    }
+
+    fn ring_of(nodes: usize) -> RingView {
+        RingView::new(
+            (0..nodes)
+                .map(|i| (format!("node-{i}"), format!("10.0.0.{i}:8356")))
+                .collect(),
+            2,
+        )
+    }
+
+    #[test]
+    fn a_batched_read_is_charged_a_reply_per_primary_it_can_reach() {
+        let key = Bytes::from_static(b"k");
+        let keys = |n: usize| vec![key.clone(); n];
+        let batch = |n: usize| Request::MultiGet {
+            namespace: Bytes::new(),
+            keys: keys(n),
+        };
+        let touch = |n: usize| Request::MultiTouch {
+            namespace: Bytes::new(),
+            keys: keys(n),
+            ttl: Some(1),
+            get: true,
+        };
+        let primaries = ring_of(4).distinct_addresses();
+        assert_eq!(primaries, 4);
+
+        // Fewer keys than a reply per primary: one value (1 MiB) per key.
+        let few = 20;
+        assert!(few * MAX_REQUEST_SIZE < primaries * MAX_MULTI_REPLY_VALUE_BYTES);
+        assert_eq!(
+            request_cost(&batch(few), 100, 2, primaries),
+            100 + few * MULTI_KEY_OVERHEAD_BYTES + few * MAX_REQUEST_SIZE
+        );
+
+        // More: a full reply from every primary, however many keys.
+        for many in [100, 100_000] {
+            assert!(many * MAX_REQUEST_SIZE > primaries * MAX_MULTI_REPLY_VALUE_BYTES);
+            assert_eq!(
+                request_cost(&batch(many), 100, 2, primaries),
+                100 + many * MULTI_KEY_OVERHEAD_BYTES + primaries * MAX_MULTI_REPLY_VALUE_BYTES
+            );
+        }
+
+        // A single primary keeps the one-reply bound.
+        assert_eq!(
+            request_cost(&batch(100), 100, 2, 1),
+            100 + 100 * MULTI_KEY_OVERHEAD_BYTES + MAX_MULTI_REPLY_VALUE_BYTES
+        );
+
+        // A get-and-touch batch is charged the same reply on top of its
+        // re-framed copies.
+        assert_eq!(
+            request_cost(&touch(100), 100, 2, primaries),
+            100 * 3 + 100 * MULTI_KEY_OVERHEAD_BYTES + primaries * MAX_MULTI_REPLY_VALUE_BYTES
+        );
+    }
+
+    #[test]
+    fn the_ring_counts_a_shared_address_once() {
+        assert_eq!(ring_of(0).distinct_addresses(), 0);
+        assert_eq!(ring_of(3).distinct_addresses(), 3);
+        let shared = RingView::new(
+            vec![
+                ("a".to_string(), "10.0.0.1:8356".to_string()),
+                ("b".to_string(), "10.0.0.1:8356".to_string()),
+                ("c".to_string(), "10.0.0.2:8356".to_string()),
+            ],
+            2,
+        );
+        assert_eq!(shared.distinct_addresses(), 2);
+    }
+
+    #[test]
+    fn groups_merged_one_at_a_time_never_hold_more_than_the_value_budget() {
+        // Three groups of ten 1 MiB hits each, merged into the batch's
+        // entries as `finish_multi_get` does: the values held never pass the
+        // cap after any group, where merging all three first would hold 30.
+        let chunk = Bytes::from(vec![b'x'; MAX_REQUEST_SIZE]);
+        let mut entries: Vec<Option<ProxyMultiEntry>> = vec![None; 30];
+        let held = |entries: &[Option<ProxyMultiEntry>]| -> usize {
+            entries
+                .iter()
+                .flatten()
+                .map(|entry| match entry {
+                    ProxyMultiEntry::Value(value) => value.len(),
+                    _ => 0,
+                })
+                .sum()
+        };
+        for group in 0..3 {
+            for entry in &mut entries[group * 10..(group + 1) * 10] {
+                *entry = Some(ProxyMultiEntry::Value(chunk.clone()));
+            }
+            cap_multi_reply_values(entries.iter_mut().flatten());
+            assert!(held(&entries) <= MAX_MULTI_REPLY_VALUE_BYTES);
+        }
+        assert_eq!(held(&entries), MAX_MULTI_REPLY_VALUE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_multi_get_over_several_primaries_is_answered_within_the_value_budget() {
+        let chunk = Bytes::from(vec![b'x'; MAX_REQUEST_SIZE]);
+        let context = bare_context();
+        let keys = vec![Bytes::from_static(b"k"); 30];
+        let positions: Vec<Vec<usize>> = (0..3).map(|g| (g * 10..(g + 1) * 10).collect()).collect();
+        let pending: Vec<PendingReply> = (0..3)
+            .map(|_| {
+                let group = vec![ProxyMultiEntry::Value(chunk.clone()); 10];
+                Box::pin(async move { Ok(NodeReply::Multi(group)) }) as PendingReply
+            })
+            .collect();
+
+        let reply = finish_multi_get(&context, b"", &keys, Vec::new(), positions, pending, None)
+            .await
+            .unwrap_or_else(|_| panic!("the groups answered"));
+
+        let newline = reply.iter().position(|byte| *byte == b'\n').unwrap();
+        let header = std::str::from_utf8(&reply[..newline]).unwrap();
+        let hits = header
+            .split(' ')
+            .skip(2)
+            .filter(|token| token.parse::<usize>().is_ok())
+            .count();
+        let misses = header.split(' ').filter(|token| *token == "-").count();
+        assert_eq!(hits, MAX_MULTI_REPLY_VALUE_BYTES / MAX_REQUEST_SIZE);
+        assert_eq!(hits + misses, 30);
+        assert_eq!(
+            reply.len() - newline - 1,
+            MAX_MULTI_REPLY_VALUE_BYTES,
+            "the client reply carries exactly the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_buffer_is_released_after_a_large_reply() {
+        let value_len = MAX_REQUEST_SIZE;
+        let values = MAX_MULTI_REPLY_VALUE_BYTES / value_len;
+        let mut wire =
+            format!("M {values}{} 7\n", format!(" {value_len}").repeat(values)).into_bytes();
+        wire.extend(std::iter::repeat_n(b'v', values * value_len));
+
+        // The plain read leaves the buffer sized for the whole reply...
+        let mut buf = BytesMut::new();
+        read_reply(
+            &mut std::io::Cursor::new(wire.clone()),
+            &mut buf,
+            7,
+            Expect::Multi,
+        )
+        .await
+        .expect("a full-size M reply is valid");
+        assert!(buf.capacity() > REQUEST_BUFFER_SHRINK_THRESHOLD);
+
+        // ...the backend reader's read hands it back.
+        let mut buf = BytesMut::new();
+        let reply =
+            read_reply_and_shrink(&mut std::io::Cursor::new(wire), &mut buf, 7, Expect::Multi)
+                .await
+                .expect("a full-size M reply is valid");
+        assert!(buf.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD);
+        let NodeReply::Multi(entries) = reply else {
+            panic!("expected a Multi reply");
+        };
+        assert_eq!(entries.len(), values);
+        assert!(entries.iter().all(
+            |e| matches!(e, ProxyMultiEntry::Value(v) if v.len() == value_len && v[0] == b'v')
+        ));
     }
 
     #[test]
@@ -11155,7 +11376,7 @@ mod tests {
     fn a_get_and_touch_is_charged_for_the_value_it_can_return() {
         let plain = touch_request(b"", b"key", Some(1), false);
         let get = touch_request(b"", b"key", Some(1), true);
-        assert!(request_cost(&get, 20, 2) >= request_cost(&plain, 20, 2) + MAX_REQUEST_SIZE);
+        assert!(request_cost(&get, 20, 2, 3) >= request_cost(&plain, 20, 2, 3) + MAX_REQUEST_SIZE);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11331,7 +11552,7 @@ mod tests {
     fn a_batch_touch_with_get_is_charged_for_the_values_it_can_return() {
         let plain = multi_touch_request(b"", &[b"a", b"b"], Some(1), false);
         let get = multi_touch_request(b"", &[b"a", b"b"], Some(1), true);
-        assert!(request_cost(&get, 30, 2) > request_cost(&plain, 30, 2));
+        assert!(request_cost(&get, 30, 2, 3) > request_cost(&plain, 30, 2, 3));
     }
 
     /// Two keys, one primaried by `nodes[0]` and one by `nodes[1]` at R = 2.

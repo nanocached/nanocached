@@ -623,10 +623,16 @@ loud `WARN` if that disagrees with its own configured value.
   application pod reaches the proxy through one egress IP, the per-IP
   cap is the whole fleet's ceiling — raise it
 - In-flight bytes: a client connection may hold 64 MiB of undelivered
-  requests and replies, counted at their worst case (a batched read is
-  charged the largest reply it could get), and the proxy as a whole
-  holds 256 MiB across every connection, configurable with
-  `--max-in-flight-bytes <bytes>` (at least 1 MiB). A client that
+  requests and replies, counted at their worst case, and the proxy as a
+  whole holds 256 MiB across every connection, configurable with
+  `--max-in-flight-bytes <bytes>` (at least 1 MiB). A batched read can
+  be answered by every node it reaches with up to 16 MiB of values
+  each, so it is charged one value (1 MiB) per key up to 16 MiB for
+  each node in the cluster; on a cluster of four or more nodes one
+  large batched read takes a connection's whole 64 MiB and runs alone,
+  and on a large cluster it can take the proxy's whole budget (at the
+  default 256 MiB, sixteen nodes): raise `--max-in-flight-bytes`, and
+  the proxy's memory with it, as the cluster grows. A client that
   pipelines past either budget is read more slowly until its replies
   have been written; nothing is refused
 - Idle connection timeout: 60 seconds, measured from the last complete

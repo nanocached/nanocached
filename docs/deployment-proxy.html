@@ -180,8 +180,14 @@ node's definition. The choices that matter:</p>
   <li><b>0.25 vCPU, 512 MiB.</b> The proxy holds no data; its memory is
   connection buffers and the requests in flight. Those are bounded:
   each client connection may hold 64 MiB of undelivered requests and
-  replies (counted at their worst case, so a batched read is charged
-  the largest reply it could get), and the proxy as a whole holds
+  replies (counted at their worst case: a batched read can be
+  answered by every node it reaches with up to 16&nbsp;MiB of values
+  each, so it is charged one value per key up to 16&nbsp;MiB for each
+  node in the cluster, and on four or more nodes one large batched
+  read takes a connection's whole share and runs alone, and on a large
+  cluster it can take the proxy's whole budget: raise
+  <code>--max-in-flight-bytes</code> and the task's memory with the
+  node count), and the proxy as a whole holds
   <code>--max-in-flight-bytes</code> (256 MiB by default) across every
   connection; a client that pipelines past its share is simply read
   more slowly until its replies have gone out. Raise the flag together

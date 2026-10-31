@@ -14,6 +14,20 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a batched read (`m`, or `y` with `G`) spread over
+  several nodes held up to 16 MiB of values per node while it was
+  answered, plus a second copy for the client, but was charged for 16 MiB
+  in all, so a few such batches could take a proxy past the 512 MiB the
+  deployment guides size it at. The batch is now charged one value per key
+  up to 16 MiB for each node in the cluster, and the 16 MiB limit on the
+  values in a reply is applied as each node's reply is merged instead of
+  after all of them. A large batched read on a cluster of four or more
+  nodes now takes a connection's whole 64 MiB in-flight share and runs
+  alone, and on a large cluster (sixteen nodes at the default 256 MiB)
+  the proxy's whole budget: raise `--max-in-flight-bytes` with the node
+  count. The proxy also gives a backend connection's read buffer back after
+  a large reply (it kept about 14 MiB per connection after one 16 MiB
+  reply).
 - `nanocached-node`: a remaining TTL under one second went on the wire as
   `0`: in an INCR reply, in a get-and-touch reply and in a forward or handoff
   of the entry. An SDK replicating an INCR reply read `0` as "no expiry"
