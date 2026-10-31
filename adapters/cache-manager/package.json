@@ -50,10 +50,10 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "cache-manager": "^5",
+    "cache-manager": "^7",
     "typescript": "^5.9.0"
   },
   "peerDependencies": {
-    "cache-manager": "^5"
+    "cache-manager": "^7"
   }
 }
