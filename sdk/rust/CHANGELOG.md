@@ -8,6 +8,16 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Fixed
 
+- `keep_alive_interval(Duration::ZERO)` turned the keep-alive task into a
+  `sleep(0)` loop that pinged continuously, `request_timeout(Duration::ZERO)`
+  made every request time out and close its connection, and
+  `reconnect_cooldown(Duration::MAX)` panicked on the first failed dial
+  (`Instant::now() + cooldown` overflows). `connect()` now returns
+  `Error::InvalidArgument` for a zero `keep_alive_interval` or
+  `request_timeout`, and for any of those two, `reconnect_cooldown` and
+  `read_hedge_after` above 24 hours (`reconnect_cooldown(ZERO)` still means
+  "use the default"). (#1186)
+
 - With `read_hedge_after` set, a `get` whose hedge leg panicked could wait
   forever. Each leg reported its outcome only at the end of its task, and
   `read_hedged` held the original sender itself, so once every owner was in

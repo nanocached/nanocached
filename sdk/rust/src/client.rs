@@ -442,6 +442,24 @@ impl ReconnectCooldown {
     }
 }
 
+/// Upper bound for the duration options (24 hours). Far above any sensible
+/// value, and low enough that `Instant::now() + duration` cannot overflow.
+const MAX_DURATION_OPTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn check_duration_option(name: &str, duration: Duration, require_positive: bool) -> Result<()> {
+    if require_positive && duration.is_zero() {
+        return Err(Error::InvalidArgument(format!(
+            "nanocached: {name} must be a positive duration"
+        )));
+    }
+    if duration > MAX_DURATION_OPTION {
+        return Err(Error::InvalidArgument(format!(
+            "nanocached: {name} must be at most {MAX_DURATION_OPTION:?}, got {duration:?}"
+        )));
+    }
+    Ok(())
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -585,6 +603,11 @@ impl Options {
     /// attempt instead of reusing a cached failure — call
     /// [`Self::disable_reconnect_cooldown`] instead (the Go SDK's
     /// equivalent is a negative `Config.ReconnectCooldown`).
+    ///
+    /// Values above 24 hours are rejected at
+    /// [`NanocachedClient::connect`] time with [`Error::InvalidArgument`]
+    /// (the deadline is computed as `Instant::now() + cooldown`, which
+    /// panics on overflow for an extreme value such as `Duration::MAX`).
     pub fn reconnect_cooldown(mut self, duration: Duration) -> Self {
         self.reconnect_cooldown = ReconnectCooldown::Explicit(duration);
         self
@@ -632,7 +655,8 @@ impl Options {
     /// so it runs to completion detached, and [`NanocachedClient::close`]
     /// drains it exactly like a fire-and-forget replica write.
     ///
-    /// `duration` must be positive; a zero duration is rejected at
+    /// `duration` must be positive and at most [`MAX_DURATION_OPTION`]
+    /// (24 hours); anything else is rejected at
     /// [`NanocachedClient::connect`] time, the same as this crate's other
     /// invalid-argument checks.
     pub fn read_hedge_after(mut self, duration: Duration) -> Self {
@@ -672,6 +696,11 @@ impl Options {
     /// How often each connection sends an internal keep-alive when
     /// otherwise idle (issue #27). Unset defers to the SDK default (half
     /// the server's 60s idle timeout). Read once per connection at connect.
+    ///
+    /// Must be positive and at most 24 hours; anything
+    /// else is rejected at [`NanocachedClient::connect`] time with
+    /// [`Error::InvalidArgument`]. A zero interval would turn the
+    /// keep-alive task into a busy loop that pings continuously.
     pub fn keep_alive_interval(mut self, interval: Duration) -> Self {
         self.keep_alive_interval = Some(interval);
         self
@@ -681,6 +710,10 @@ impl Options {
     /// then poisons its connection (a half-open server that accepts but
     /// never answers is indistinguishable from a slow one). Unset defers to
     /// the SDK default (30s). Read fresh on every request.
+    ///
+    /// Must be positive and at most 24 hours; anything
+    /// else is rejected at [`NanocachedClient::connect`] time with
+    /// [`Error::InvalidArgument`]. A zero timeout would fail every request.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = Some(timeout);
         self
@@ -1301,10 +1334,22 @@ impl NanocachedClient {
                 "nanocached: connect() needs a non-empty addresses list".to_string(),
             ));
         }
-        if matches!(options.read_hedge_after, Some(duration) if duration.is_zero()) {
-            return Err(Error::InvalidArgument(
-                "nanocached: read_hedge_after must be a positive duration".to_string(),
-            ));
+        // Duration options are validated up front (issue #1186): a zero
+        // keep-alive interval spins the keep-alive task, a zero request
+        // timeout fails every request, and an extreme value overflows
+        // `Instant::now() + cooldown` and panics.
+        if let Some(duration) = options.read_hedge_after {
+            check_duration_option("read_hedge_after", duration, true)?;
+        }
+        if let Some(duration) = options.keep_alive_interval {
+            check_duration_option("keep_alive_interval", duration, true)?;
+        }
+        if let Some(duration) = options.request_timeout {
+            check_duration_option("request_timeout", duration, true)?;
+        }
+        // `reconnect_cooldown(ZERO)` keeps meaning "use the default".
+        if let ReconnectCooldown::Explicit(duration) = options.reconnect_cooldown {
+            check_duration_option("reconnect_cooldown", duration, false)?;
         }
         // Issue #488: an option that can have no effect in this
         // configuration is a misconfiguration, not something to ignore
