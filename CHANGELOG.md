@@ -33,6 +33,16 @@ framework adapters at one version, whether or not a component changed.
   it; 10 nodes from one source took 27 s to all get in and `L` after the
   grace listed 5. The limit is now a burst of 64 new registrations per
   source, refilled one every 2 seconds (#1148).
+
+- `nanocached-proxy`: one client address could take the proxy far past its
+  in-flight budget with large batched requests. A fully received `m`, `o`
+  or `y` frame was parsed into its per-key lists (32 bytes a key, 64 for
+  `o`) before it waited for admission and was charged for them only once
+  admitted, so a connection parked at the budget held about 13 MB for a
+  1 MiB frame of one-byte keys while being charged about 2 MiB; 40
+  connections from one address took the proxy to about 500 MiB. Such a
+  frame is now admitted from its header, before the lists exist (#1144).
+
 ### Changed
 
 - Container images: `:latest` is now the latest release, moved only by the
@@ -42,14 +52,6 @@ framework adapters at one version, whether or not a component changed.
   images pointed at different code and the quickstarts pulled unreleased
   `main`. Builds of `main` are published as `:main` and `:sha-<commit>` for
   all three images, one publish run at a time (#1149).
-- `nanocached-proxy`: one client address could take the proxy far past its
-  in-flight budget with large batched requests. A fully received `m`, `o`
-  or `y` frame was parsed into its per-key lists (32 bytes a key, 64 for
-  `o`) before it waited for admission and was charged for them only once
-  admitted, so a connection parked at the budget held about 13 MB for a
-  1 MiB frame of one-byte keys while being charged about 2 MiB; 40
-  connections from one address took the proxy to about 500 MiB. Such a
-  frame is now admitted from its header, before the lists exist (#1144).
 
 ## [0.6.0] - 2026-11-01
 
