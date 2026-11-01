@@ -392,7 +392,10 @@ const CLIENT_IN_FLIGHT_BYTES: usize = 3 * MAX_REQUEST_SIZE + 4096;
 /// process's working memory is bounded regardless of how many
 /// connections pipeline at once (1,024 × 64 MiB is not a bound). Half
 /// the 512 MiB the deployment guides size a proxy at; the rest is
-/// connection buffers, the backend reply ledgers and the runtime.
+/// connection buffers, the frames of requests waiting for admission
+/// (bounded to this much again by the parked-frame pool,
+/// `InFlightAdmission::parked`, which a proxy with that much waiting at
+/// once has outgrown), the backend reply ledgers and the runtime.
 const DEFAULT_MAX_IN_FLIGHT_BYTES: usize = 256 * 1024 * 1024;
 
 /// How long a request waits for in-flight bytes (its connection's, its
@@ -6167,24 +6170,20 @@ impl InFlightBudget {
         self.charge_exact(self.clamp(cost)).await
     }
 
-    /// `charge` for a holder that already holds `held` bytes of this
-    /// budget (a connection's receive-buffer charge, when it admits a
-    /// request): the total is clamped, so the holder asks only for the
-    /// rest of the budget and never waits for bytes it holds itself.
-    async fn charge_beyond(
-        &self,
-        held: usize,
-        cost: usize,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let cost = self.clamp(cost.saturating_add(held)).saturating_sub(held);
-        self.charge_exact(cost).await
-    }
-
     async fn charge_exact(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let permits = u32::try_from(cost).unwrap_or(u32::MAX);
         Arc::clone(&self.permits)
             .acquire_many_owned(permits)
             .await
+            .ok()
+    }
+
+    /// `charge` without the wait: reserves `cost` bytes (clamped to the
+    /// budget) if they are free right now, else nothing.
+    fn try_charge(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let permits = u32::try_from(self.clamp(cost)).unwrap_or(u32::MAX);
+        Arc::clone(&self.permits)
+            .try_acquire_many_owned(permits)
             .ok()
     }
 
@@ -6197,16 +6196,25 @@ impl InFlightBudget {
     }
 }
 
+/// One source IP's budgets: its share of the proxy-wide in-flight
+/// budget and, of the same size, its share of the parked-frame pool
+/// (what its connections hold while their requests wait for admission;
+/// see `admit_request`).
+struct IpBudgets {
+    in_flight: InFlightBudget,
+    parked: InFlightBudget,
+}
+
 /// The proxy-wide in-flight budget's per-source-IP shares: one
-/// `InFlightBudget` of `share_bytes` per IP with a live connection
-/// (keyed like the per-IP connection cap, so an IPv6 source counts per
-/// /64), shared by that IP's connections and dropped with the last of
-/// them. A request is charged against its IP's share before the
-/// proxy-wide budget, so an IP at its share waits on itself and never in
-/// the proxy-wide queue ahead of other sources.
+/// `IpBudgets` of `share_bytes` per IP with a live connection (keyed
+/// like the per-IP connection cap, so an IPv6 source counts per /64),
+/// shared by that IP's connections and dropped with the last of them. A
+/// request is charged against its IP's share before the proxy-wide
+/// budget, so an IP at its share waits on itself and never in the
+/// proxy-wide queue ahead of other sources.
 #[derive(Clone)]
 struct IpInFlightShares {
-    budgets: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, Arc<InFlightBudget>>>>,
+    budgets: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, Arc<IpBudgets>>>>,
     share_bytes: usize,
 }
 
@@ -6224,16 +6232,17 @@ impl IpInFlightShares {
             .budgets
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let budget = Arc::clone(
-            budgets
-                .entry(ip)
-                .or_insert_with(|| Arc::new(InFlightBudget::new(self.share_bytes))),
-        );
+        let budget = Arc::clone(budgets.entry(ip).or_insert_with(|| {
+            Arc::new(IpBudgets {
+                in_flight: InFlightBudget::new(self.share_bytes),
+                parked: InFlightBudget::new(self.share_bytes),
+            })
+        }));
         drop(budgets);
         IpInFlightShare {
             shares: Arc::clone(&self.budgets),
             ip,
-            budget,
+            budgets: budget,
         }
     }
 }
@@ -6242,9 +6251,9 @@ impl IpInFlightShares {
 /// entry on drop when no other connection of that IP still holds it, so
 /// the map does not grow with every address that ever connected.
 struct IpInFlightShare {
-    shares: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, Arc<InFlightBudget>>>>,
+    shares: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, Arc<IpBudgets>>>>,
     ip: std::net::IpAddr,
-    budget: Arc<InFlightBudget>,
+    budgets: Arc<IpBudgets>,
 }
 
 impl Drop for IpInFlightShare {
@@ -6254,7 +6263,7 @@ impl Drop for IpInFlightShare {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The map's own reference and this one: nobody else holds it.
-        if Arc::strong_count(&self.budget) <= 2 {
+        if Arc::strong_count(&self.budgets) <= 2 {
             budgets.remove(&self.ip);
         }
     }
@@ -6265,6 +6274,10 @@ impl Drop for IpInFlightShare {
 #[derive(Clone)]
 struct InFlightAdmission {
     proxy: InFlightBudget,
+    /// The parked-frame pool: what connections hold while their requests
+    /// wait for admission, bounded to the in-flight budget's size again
+    /// (`admit_request`).
+    parked: InFlightBudget,
     ip_shares: IpInFlightShares,
     admission_wait: Duration,
 }
@@ -6273,6 +6286,7 @@ impl InFlightAdmission {
     fn new(limits: &ConnectionLimits) -> Self {
         Self {
             proxy: InFlightBudget::new(limits.max_in_flight_bytes),
+            parked: InFlightBudget::new(limits.max_in_flight_bytes),
             ip_shares: IpInFlightShares::new(limits.max_in_flight_bytes_per_ip),
             admission_wait: limits.admission_wait,
         }
@@ -6281,6 +6295,7 @@ impl InFlightAdmission {
     fn for_connection(&self, ip: std::net::IpAddr) -> ClientBudgets {
         ClientBudgets {
             proxy: self.proxy.clone(),
+            parked: self.parked.clone(),
             ip: self.ip_shares.acquire(ip),
             admission_wait: self.admission_wait,
         }
@@ -6288,9 +6303,11 @@ impl InFlightAdmission {
 }
 
 /// The budgets a connection's requests are admitted against besides its
-/// own, and how long it waits for them.
+/// own, the pool what it holds while they wait is charged to, and how
+/// long it waits.
 struct ClientBudgets {
     proxy: InFlightBudget,
+    parked: InFlightBudget,
     ip: IpInFlightShare,
     admission_wait: Duration,
 }
@@ -6412,6 +6429,20 @@ fn shrink_drained_buffer(buf: &mut BytesMut) -> bool {
     false
 }
 
+/// Copies `buf` into a buffer of exactly its length when its allocation
+/// has more than the free threshold of slack, so what a request that is
+/// going to wait for admission parks (`admit_request`) is what its
+/// connection holds, not the growth it was given: a doubling leaves up to
+/// half the buffer empty, and a multi-key header that outgrows the free
+/// 64 KiB is given the largest frame's worth at once.
+fn shrink_to_contents(buf: &mut BytesMut) {
+    if buf.capacity() - buf.len() > REQUEST_BUFFER_SHRINK_THRESHOLD {
+        let mut shrunk = BytesMut::with_capacity(buf.len());
+        shrunk.extend_from_slice(buf);
+        *buf = shrunk;
+    }
+}
+
 /// One entry of a client connection's writer FIFO: the reply to send
 /// and, for a dispatched request, the in-flight bytes it holds until
 /// that reply has been written.
@@ -6440,6 +6471,18 @@ struct InFlightCharge {
 }
 
 impl InFlightCharge {
+    /// The three reservations if every budget has `cost` free right now,
+    /// else none (a budget reserved before the one that had no room is
+    /// released again).
+    fn try_charge(cost: usize, budgets: [&InFlightBudget; 3]) -> Option<InFlightCharge> {
+        let [connection, ip, proxy] = budgets;
+        Some(InFlightCharge {
+            _connection: connection.try_charge(cost)?,
+            _ip: ip.try_charge(cost)?,
+            _proxy: proxy.try_charge(cost)?,
+        })
+    }
+
     /// Folds a further charge on the same three budgets into this one,
     /// so a receive buffer that grew in steps holds one charge.
     fn merge(&mut self, more: InFlightCharge) {
@@ -6466,29 +6509,58 @@ enum Admission {
     Granted(InFlightCharge),
     /// `admission_wait` ran out: nothing was reserved.
     TimedOut,
+    /// The request would have had to wait, and the parked-frame pool (its
+    /// source IP's share of it, or the proxy's) had no room for what its
+    /// connection holds: nothing was reserved, and nothing waited.
+    Refused,
     /// The connection is over (a drain, or the writer is gone).
     Closed,
 }
 
 /// Reserves a request's `cost` on the connection's, its source IP's and
-/// the proxy's budgets (`budgets`, in that order), of which the connection
-/// already holds `held` (its receive buffer's charge). Stops waiting for
-/// the same reasons the read in `handle_client` does, and after
-/// `admission_wait`.
+/// the proxy's budgets (`budgets`, in that order). The caller holds
+/// nothing of them while it waits: see `handle_client` on its receive
+/// buffer's charge. What the connection does hold meanwhile, its receive
+/// buffer (the request's frame, whatever is pipelined behind it, and the
+/// buffer's slack), is outside the in-flight budgets until the request
+/// is admitted, so a request that has to wait charges it to the
+/// parked-frame pool (`parked`: the IP's share, then the proxy's, each
+/// the size of the matching in-flight budget) for as long as it waits.
+/// `held` is asked for those bytes only once the request is going to
+/// wait, so the caller may shrink its buffer to what it holds in there
+/// (`shrink_to_contents`). That pool never waits: a request that would
+/// have to wait while it is full is refused at once (issue #1146: the
+/// pool bounds what waiting requests hold to the in-flight budget's size
+/// again, and refusing beats waiting `admission_wait` for bytes that are
+/// not coming). Stops waiting for the same reasons the read in
+/// `handle_client` does, and after `admission_wait`.
 async fn admit_request(
     cost: usize,
-    held: usize,
+    held: impl FnOnce() -> usize,
     budgets: [&InFlightBudget; 3],
+    parked: [&InFlightBudget; 2],
     admission_wait: Duration,
     drain: &mut watch::Receiver<bool>,
     fifo_tx: &mpsc::Sender<ClientReply>,
 ) -> Admission {
+    // Free right now: nothing waits, so nothing is parked.
+    if let Some(charge) = InFlightCharge::try_charge(cost, budgets) {
+        return Admission::Granted(charge);
+    }
+    let held = held();
+    let [ip_parked, proxy_parked] = parked;
+    let Some(_ip_parked) = ip_parked.try_charge(held) else {
+        return Admission::Refused;
+    };
+    let Some(_proxy_parked) = proxy_parked.try_charge(held) else {
+        return Admission::Refused;
+    };
     let [connection, ip, proxy] = budgets;
     tokio::select! {
         admitted = timeout(admission_wait, async {
-            let connection = connection.charge_beyond(held, cost).await?;
-            let ip = ip.charge_beyond(held, cost).await?;
-            let proxy = proxy.charge_beyond(held, cost).await?;
+            let connection = connection.charge(cost).await?;
+            let ip = ip.charge(cost).await?;
+            let proxy = proxy.charge(cost).await?;
             Some(InFlightCharge {
                 _connection: connection,
                 _ip: ip,
@@ -6527,6 +6599,7 @@ async fn handle_client(
 ) -> io::Result<()> {
     let ClientBudgets {
         proxy: proxy_in_flight_bytes,
+        parked: parked_in_flight_bytes,
         ip: ip_in_flight_share,
         admission_wait,
     } = budgets;
@@ -6633,6 +6706,11 @@ async fn handle_client(
                 PREAUTH_MAX_BYTES
             };
             let buffered = buf.len();
+            // What the connection holds if a parsed request has to wait
+            // for admission: the buffer's whole allocation (the frame,
+            // anything pipelined behind it, and its slack), which the
+            // request's value slices keep alive.
+            let buffered_capacity = buf.capacity();
             match parse_request_limited(&mut buf, tagged, &mut scan, max_frame) {
                 Ok(ParseOutcome::Incomplete) => break,
                 Ok(ParseOutcome::Auth {
@@ -6716,20 +6794,24 @@ async fn handle_client(
                                 replication,
                                 primaries,
                             );
-                            // The connection's receive-buffer charge is part
-                            // of what it already holds on all three budgets:
-                            // a request costing the whole budget asks only
-                            // for the rest, or it would wait on itself
-                            // (until `admission_wait`, then be answered
-                            // `R`/`B` although nothing else was in its way).
+                            // The frame's bytes are part of `cost`, so the
+                            // receive buffer's charge goes before the wait
+                            // (issue #1146); see the same step below. What
+                            // the connection holds meanwhile (its receive
+                            // buffer, `buffered_capacity`) is charged to
+                            // the parked-frame pool for as long as the
+                            // request waits.
+                            receive_charge = None;
+                            receive_charged = 0;
                             let admitted = admit_request(
                                 cost,
-                                receive_charged,
+                                || buffered_capacity,
                                 [
                                     &connection_in_flight_bytes,
-                                    &*ip_in_flight_share.budget,
+                                    &ip_in_flight_share.budgets.in_flight,
                                     &proxy_in_flight_bytes,
                                 ],
+                                [&ip_in_flight_share.budgets.parked, &parked_in_flight_bytes],
                                 admission_wait,
                                 &mut drain,
                                 &fifo_tx,
@@ -6738,7 +6820,7 @@ async fn handle_client(
                             match admitted {
                                 Admission::Granted(charge) => charge,
                                 Admission::Closed => break 'connection Ok(()),
-                                Admission::TimedOut => {
+                                Admission::TimedOut | Admission::Refused => {
                                     // Nothing was dispatched, so the request
                                     // was not applied. The request is done
                                     // with, so the idle deadline starts over
@@ -6794,14 +6876,38 @@ async fn handle_client(
                         replication,
                         primaries,
                     );
+                    // Issue #1146: the connection holds no receive-buffer
+                    // charge while it waits. The frame's bytes are part of
+                    // `cost` (`frame_len`), so it asks for that in full
+                    // and the receive charge, which would otherwise be
+                    // waited on by whoever is ahead of it in the queue
+                    // and wait on whoever is behind, is given back first.
+                    // Two connections of one source IP, one finishing a
+                    // frame over the free threshold while the other's
+                    // request costs the whole share, otherwise each held
+                    // what the other needed until `admission_wait` ran
+                    // out. A pipelined remainder still in the buffer is
+                    // charged again below, as the buffer's growth. What
+                    // the connection holds while the request waits (its
+                    // receive buffer, shrunk to the frame first: nothing
+                    // pins its slack yet) is charged to the parked-frame
+                    // pool instead, which bounds it to the budget's size
+                    // again and refuses, at once, a request that would
+                    // wait while the pool is full.
+                    receive_charge = None;
+                    receive_charged = 0;
                     let admitted = admit_request(
                         cost,
-                        receive_charged,
+                        || {
+                            shrink_to_contents(&mut buf);
+                            buf.capacity()
+                        },
                         [
                             &connection_in_flight_bytes,
-                            &*ip_in_flight_share.budget,
+                            &ip_in_flight_share.budgets.in_flight,
                             &proxy_in_flight_bytes,
                         ],
+                        [&ip_in_flight_share.budgets.parked, &parked_in_flight_bytes],
                         admission_wait,
                         &mut drain,
                         &fifo_tx,
@@ -6813,11 +6919,12 @@ async fn handle_client(
                             scan.frame_charged = true;
                         }
                         Admission::Closed => break 'connection Ok(()),
-                        Admission::TimedOut => {
-                            // As for any request that gives up waiting,
-                            // except that this one is still in the buffer:
-                            // drop its bytes, or the next parse would read
-                            // them as a new frame.
+                        Admission::TimedOut | Admission::Refused => {
+                            // As for any request that gives up waiting (or
+                            // was refused the wait), except that this one
+                            // is still in the buffer: drop its bytes, or
+                            // the next parse would read them as a new
+                            // frame.
                             let _ = buf.split_to(frame.frame_len);
                             scan = RequestScanState::default();
                             deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
@@ -6846,6 +6953,16 @@ async fn handle_client(
         if shrink_drained_buffer(&mut buf) || buf.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
             receive_charge = None;
             receive_charged = 0;
+        } else if receive_charged == 0 {
+            // Admission gave the charge back (above) and the buffer still
+            // holds more than the free threshold of the next frame: copy it
+            // into a buffer of its own size, which the growth below
+            // charges again before reading on, rather than let the old
+            // allocation, which the admitted frame shares, fill up
+            // uncharged.
+            let mut compact = BytesMut::with_capacity(buf.len());
+            compact.extend_from_slice(&buf);
+            buf = compact;
         }
 
         // Issue #124: a drain stops the intake — everything already
@@ -6872,7 +6989,7 @@ async fn handle_client(
             let grown = (buf.capacity() * 2).max(buf.len() + READ_CHUNK);
             let want = [
                 &connection_in_flight_bytes,
-                &*ip_in_flight_share.budget,
+                &ip_in_flight_share.budgets.in_flight,
                 &proxy_in_flight_bytes,
             ]
             .into_iter()
@@ -6885,7 +7002,7 @@ async fn handle_client(
                 let charged = tokio::select! {
                     charged = tokio::time::timeout_at(read_deadline, async {
                         let connection = connection_in_flight_bytes.charge(more).await?;
-                        let ip = ip_in_flight_share.budget.charge(more).await?;
+                        let ip = ip_in_flight_share.budgets.in_flight.charge(more).await?;
                         let proxy = proxy_in_flight_bytes.charge(more).await?;
                         Some(InFlightCharge {
                             _connection: connection,
@@ -8455,6 +8572,53 @@ mod tests {
         drop(node);
     }
 
+    /// An `m` of 1,000 keys of 100 bytes, 104,009 bytes on the wire: over
+    /// the free threshold, and costing a whole test-sized IP share.
+    fn kilokey_multi_get_frame(tag: u8) -> Vec<u8> {
+        let mut frame = b"m 0 1000".to_vec();
+        frame.extend(std::iter::repeat_n(b" 100", 1000).flatten());
+        frame.push(b'\n');
+        for key in 0..1000 {
+            frame.extend(format!("{}{key:05}", tag as char).bytes());
+            frame.extend(std::iter::repeat_n(b'x', 100 - 6));
+        }
+        frame
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_waiting_for_the_whole_share_does_not_wait_on_a_neighbours_receive_charge() {
+        // Issue #1146. Connection B, of the same source IP as A, is part
+        // way through a frame over the free threshold and so holds a
+        // receive charge. A finishes a request that costs the whole share:
+        // it could not have it while B held part, and B, finishing its
+        // frame, then asked for the share behind A while still holding
+        // that part: each waited for the other until `admission_wait`, and
+        // A was answered `B`. A request waits only for what is charged to
+        // requests, never for another connection's receive buffer.
+        let (node, proxy, _context) =
+            slow_single_node(b"k", Duration::ZERO, Some(short_admission_wait_limits())).await;
+        let (mut a, mut a_buf) = connect_and_auth(&proxy).await;
+        let (mut b, mut b_buf) = connect_and_auth(&proxy).await;
+        let (a_frame, b_frame) = (kilokey_multi_get_frame(b'a'), kilokey_multi_get_frame(b'b'));
+        assert_eq!((a_frame.len(), b_frame.len()), (104_009, 104_009));
+
+        b.write_all(&b_frame[..70_000]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        a.write_all(&a_frame).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        b.write_all(&b_frame[70_000..]).await.unwrap();
+
+        // Well inside `admission_wait` (2 s), where they used to end.
+        for (name, stream, buf) in [("a", &mut a, &mut a_buf), ("b", &mut b, &mut b_buf)] {
+            let header = timeout(Duration::from_millis(1200), read_line(stream, buf))
+                .await
+                .unwrap_or_else(|_| panic!("{name} was not answered before admission_wait"))
+                .unwrap();
+            assert!(header.starts_with("M 1000 "), "{name}: {header}");
+        }
+        drop(node);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn an_idle_connection_holds_no_receive_charge_so_a_neighbour_can_take_the_whole_share() {
         // After its over-threshold frame is cut from the buffer, the
@@ -8488,6 +8652,76 @@ mod tests {
         .expect("the neighbour's whole-share batch is admitted while the first connection idles")
         .unwrap();
         assert!(header.starts_with("M 20 "), "{header}");
+        drop(node);
+    }
+
+    /// An `m` of five 10,000-byte keys, 50,037 bytes on the wire: under
+    /// the free receive threshold, so it is buffered without a charge
+    /// (a frame over it could not even be received while the share is
+    /// held), and costing a whole test-sized IP share.
+    fn fifty_kb_multi_get_frame(tag: u8) -> Vec<u8> {
+        let mut frame = b"m 0 5".to_vec();
+        frame.extend(std::iter::repeat_n(b" 10000", 5).flatten());
+        frame.push(b'\n');
+        for key in 0..5u8 {
+            frame.push(tag);
+            frame.push(b'0' + key);
+            frame.extend(std::iter::repeat_n(b'x', 10_000 - 2));
+        }
+        frame
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_that_cannot_park_its_frame_is_answered_at_once_instead_of_waiting() {
+        // Issue #1146. A holds the IP share (one batched read, against a
+        // node that answers after 400 ms). B, C and D, of the same source
+        // IP, each send a 50 KB batch: they wait, their frames (50,037
+        // bytes each; the buffer is shrunk to the frame before it is
+        // parked) parked against the IP's share of the parked-frame pool
+        // (200,000 bytes: three fit). E's frame does not fit: E is answered `B`
+        // at once, well before A's reply, rather than admitted after D
+        // as it was while nothing bounded what waiting requests hold.
+        let limits = ConnectionLimits {
+            max_connections: 8,
+            max_connections_per_ip: 8,
+            max_in_flight_bytes: 8 * MAX_REQUEST_SIZE,
+            max_in_flight_bytes_per_ip: 200_000,
+            admission_wait: Duration::from_secs(5),
+        };
+        let (node, proxy, _context) =
+            slow_single_node(b"k", Duration::from_millis(400), Some(limits)).await;
+        let (mut a, mut a_buf) = connect_and_auth(&proxy).await;
+        a.write_all(&fifty_kb_multi_get_frame(b'a')).await.unwrap();
+        sleep(Duration::from_millis(50)).await;
+        let mut parked = Vec::new();
+        for tag in [b'b', b'c', b'd'] {
+            let (mut stream, buf) = connect_and_auth(&proxy).await;
+            stream
+                .write_all(&fifty_kb_multi_get_frame(tag))
+                .await
+                .unwrap();
+            parked.push((tag, stream, buf));
+        }
+        sleep(Duration::from_millis(50)).await;
+
+        let (mut e, mut e_buf) = connect_and_auth(&proxy).await;
+        e.write_all(&fifty_kb_multi_get_frame(b'e')).await.unwrap();
+        let reply = timeout(Duration::from_millis(300), read_line(&mut e, &mut e_buf))
+            .await
+            .expect("refused at once, not after admission_wait or behind the parked requests")
+            .unwrap();
+        assert_eq!(reply, "B");
+
+        // The parked requests are admitted in turn once A's reply is
+        // out, and E's connection stays usable.
+        let header = read_line(&mut a, &mut a_buf).await.unwrap();
+        assert!(header.starts_with("M 5 "), "a: {header}");
+        for (tag, stream, buf) in parked.iter_mut() {
+            let header = read_line(stream, buf).await.unwrap();
+            assert!(header.starts_with("M 5 "), "{}: {header}", *tag as char);
+        }
+        e.write_all(b"G 1\nk").await.unwrap();
+        assert_eq!(read_line(&mut e, &mut e_buf).await.unwrap(), "V 1");
         drop(node);
     }
 
@@ -8902,7 +9136,8 @@ mod tests {
         let greedy_budgets = admission.for_connection(greedy);
         let _held = greedy_budgets
             .ip
-            .budget
+            .budgets
+            .in_flight
             .charge(MAX_REQUEST_SIZE)
             .await
             .expect("the share is free");
@@ -8911,7 +9146,7 @@ mod tests {
         assert!(
             timeout(
                 Duration::from_millis(100),
-                same_ip_again.ip.budget.charge(1)
+                same_ip_again.ip.budgets.in_flight.charge(1)
             )
             .await
             .is_err(),
@@ -8921,11 +9156,115 @@ mod tests {
         let other_budgets = admission.for_connection(other);
         let _admitted = timeout(
             Duration::from_millis(100),
-            other_budgets.ip.budget.charge(MAX_REQUEST_SIZE),
+            other_budgets.ip.budgets.in_flight.charge(MAX_REQUEST_SIZE),
         )
         .await
         .expect("another source is not blocked by the first")
         .expect("admitted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_waits_parks_what_its_connection_holds_and_is_refused_when_the_pool_is_full()
+     {
+        // Issue #1146. While a request waits for admission, what its
+        // connection holds (its receive buffer: the frame, up to 1 MiB,
+        // and anything pipelined behind it) is charged to no in-flight
+        // budget. The
+        // parked-frame pool, the in-flight budget's size again with the
+        // same per-IP share, bounds it: a request that would wait while
+        // the pool is full is refused at once, not after `admission_wait`.
+        let admission = InFlightAdmission::new(&ConnectionLimits {
+            max_connections: 8,
+            max_connections_per_ip: 8,
+            max_in_flight_bytes: 4 * MAX_REQUEST_SIZE,
+            max_in_flight_bytes_per_ip: MAX_REQUEST_SIZE,
+            admission_wait: Duration::from_secs(1),
+        });
+        let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let budgets = admission.for_connection(ip);
+        let connection = InFlightBudget::new(CLIENT_IN_FLIGHT_BYTES);
+        let (_drain_tx, mut drain) = watch::channel(false);
+        let (_drain_tx_2, mut drain_2) = watch::channel(false);
+        let (fifo_tx, _fifo_rx) = mpsc::channel::<ClientReply>(1);
+        let in_flight = [&connection, &budgets.ip.budgets.in_flight, &budgets.proxy];
+        let parked = [&budgets.ip.budgets.parked, &budgets.parked];
+        let parked_free = || {
+            (
+                budgets.ip.budgets.parked.permits.available_permits(),
+                budgets.parked.permits.available_permits(),
+            )
+        };
+        let wait = Duration::from_secs(1);
+
+        // Free budgets: admitted at once, nothing parked.
+        let granted =
+            admit_request(1000, || 500, in_flight, parked, wait, &mut drain, &fifo_tx).await;
+        assert!(matches!(granted, Admission::Granted(_)));
+        assert_eq!(parked_free(), (MAX_REQUEST_SIZE, 4 * MAX_REQUEST_SIZE));
+        drop(granted);
+
+        // The IP's share is held: the next request waits, with the
+        // 600,000 bytes its connection holds parked against the share of
+        // the pool and the pool itself.
+        let held = budgets
+            .ip
+            .budgets
+            .in_flight
+            .charge(MAX_REQUEST_SIZE)
+            .await
+            .unwrap();
+        let waiting = admit_request(1, || 600_000, in_flight, parked, wait, &mut drain, &fifo_tx);
+        tokio::pin!(waiting);
+        assert!(
+            timeout(Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err(),
+            "the share is held"
+        );
+        assert_eq!(
+            parked_free(),
+            (MAX_REQUEST_SIZE - 600_000, 4 * MAX_REQUEST_SIZE - 600_000)
+        );
+
+        // Another connection of the same IP holds 500,000 bytes: the
+        // share of the pool has 448,576 left, so its request is refused
+        // at once, and nothing of it stays reserved anywhere (the waiting
+        // request holds its one byte of the connection budget, as any
+        // request in the queue does).
+        let connection_free = connection.permits.available_permits();
+        let refused = timeout(
+            Duration::from_millis(100),
+            admit_request(
+                1,
+                || 500_000,
+                in_flight,
+                parked,
+                wait,
+                &mut drain_2,
+                &fifo_tx,
+            ),
+        )
+        .await
+        .expect("refused without waiting");
+        assert!(matches!(refused, Admission::Refused));
+        assert_eq!(
+            parked_free(),
+            (MAX_REQUEST_SIZE - 600_000, 4 * MAX_REQUEST_SIZE - 600_000)
+        );
+        assert_eq!(connection.permits.available_permits(), connection_free);
+        assert_eq!(
+            budgets.proxy.permits.available_permits(),
+            4 * MAX_REQUEST_SIZE
+        );
+
+        // The holder finishes: the waiting request is admitted and its
+        // parked bytes come back.
+        drop(held);
+        let admitted = timeout(Duration::from_millis(100), &mut waiting)
+            .await
+            .expect("admitted once the share is free");
+        assert!(matches!(admitted, Admission::Granted(_)));
+        assert_eq!(parked_free(), (MAX_REQUEST_SIZE, 4 * MAX_REQUEST_SIZE));
     }
 
     #[test]
