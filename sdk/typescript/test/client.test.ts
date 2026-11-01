@@ -1566,6 +1566,40 @@ describe("a redial finishing after close() (issue #1216)", () => {
   it("a single-node client closes the redialed connection", () => closeRightAfterRedial("single"));
   it("a cluster client closes the redialed connection", () => closeRightAfterRedial("cluster"));
   it("a proxy-mode client closes the redialed connection", () => closeRightAfterRedial("proxy"));
+describe("unsolicited response with nothing pending (issue #1177)", () => {
+  it("poisons the connection instead of silently dropping the reply", async () => {
+    // Regression: a parsed response with no pending request was discarded
+    // (`if (waiter === undefined) continue`) and the connection stayed
+    // open, where the Python and Go SDKs poison it. The server here sends
+    // a stored-ack nobody asked for, and never closes its side.
+    const { createServer, connect } = await import("node:net");
+    const { Connection } = await import("../src/connection.js");
+
+    const serverSockets: import("node:net").Socket[] = [];
+    const server = createServer((socket) => {
+      serverSockets.push(socket);
+      socket.write("S\n");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as import("node:net").AddressInfo).port;
+
+    try {
+      const socket = connect(port, "127.0.0.1");
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      const connection = new Connection(socket);
+
+      await waitFor(() => connection.isClosed(), "the unsolicited reply to poison the connection");
+      assert.ok(socket.destroyed, "the client must destroy the socket itself");
+      await assert.rejects(connection.get("k"), (error: unknown) => {
+        assert.ok(error instanceof ConnectionLostError);
+        assert.match((error as Error).message, /unsolicited .* response .*desynced/);
+        return true;
+      });
+    } finally {
+      for (const socket of serverSockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
 });
 
 describe("onData's fatal paths route through poison() (issue #187)", () => {
@@ -4119,6 +4153,38 @@ describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
       await client.set("k", "v");
       primary.mock.answerWrongNodeOnce();
       assert.equal(await client.getAndTouch("k", 40), "v");
+    });
+  });
+
+  it("does not treat a non-connection Node error as a connection loss (issue #1188)", async () => {
+    // Regression: isConnectionError accepted any Error with a string
+    // `code`, so ERR_INVALID_ARG_TYPE (what Buffer.concat throws for a
+    // non-Buffer value passed by a JS caller) made withWrongNodeRetry force
+    // a discovery refresh and run the operation a second time.
+    await withCluster(async (client, cluster) => {
+      const { primary } = cluster.ownerOf("k");
+      await client.set("k", "v");
+      const connection = (client as any).target.members.get(primary.name).connection;
+      const listsBefore = cluster.discovery.listCount();
+      const failure = Object.assign(new TypeError("bad argument"), { code: "ERR_INVALID_ARG_TYPE" });
+      const set = mock.method(connection, "set", () => Promise.reject(failure));
+
+      await assert.rejects(client.set("k", "v2"), (error: unknown) => error === failure);
+      assert.equal(set.mock.callCount(), 1, "the operation must not be retried");
+      assert.equal(cluster.discovery.listCount(), listsBefore, "no forced refresh");
+    });
+  });
+
+  it("still retries a reset connection after a forced refresh (issue #1188)", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary } = cluster.ownerOf("k");
+      await client.set("k", "v");
+      const connection = (client as any).target.members.get(primary.name).connection;
+      const listsBefore = cluster.discovery.listCount();
+      mock.method(connection, "set", () => Promise.reject(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })), { times: 1 });
+
+      await client.set("k", "v2");
+      assert.ok(cluster.discovery.listCount() > listsBefore, "a connection error must still force a refresh");
     });
   });
 
