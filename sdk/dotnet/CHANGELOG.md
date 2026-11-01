@@ -12,6 +12,14 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- A request that `Close()` poisoned while in flight, and then retried, redialed
+  and identified against the node before the closed check rejected it with
+  `AlreadyClosedException`, leaving one extra connection on the node after
+  `Close()` had returned. The redial path now checks for a closed client before
+  dialing. (#1244)
+
+### Fixed
+
 - A connection's read loop only handled I/O-type failures. Any other
   exception (a TLS `AuthenticationException`, an `InvalidOperationException`,
   an unexpected parser error) ended the fire-and-forget loop unobserved: the
