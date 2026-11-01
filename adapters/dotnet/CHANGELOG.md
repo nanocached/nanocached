@@ -9,6 +9,16 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Fixed
+
+- A `NanocachedCacheOptions.Addresses` entry such as `host:99999`, `host:0`,
+  `host:-5` or `host: 80` was accepted: the port was parsed with the default
+  number style and the current culture and never range-checked, so the
+  mistake surfaced later as a socket error from the dial. The port must now
+  be plain digits (invariant culture) within 1..65535, otherwise
+  registration throws an `ArgumentException` naming the entry, as the Spring
+  Boot starter does. (#1228)
+
 ### Changed
 
 - Target framework is now `net10.0`, following the SDK; .NET 8 and .NET 9 reach end of support on 2026-11-10, and 0.6.0 is the last release that targets `net8.0`. `Microsoft.Extensions.*` references move from 8.0.0 to 10.0.14.

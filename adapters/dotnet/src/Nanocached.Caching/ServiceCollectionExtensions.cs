@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
@@ -95,11 +96,28 @@ public static class ServiceCollectionExtensions
     internal static (string Host, int Port) ParseAddress(string address)
     {
         int colon = address.LastIndexOf(':');
-        if (colon <= 0 || colon == address.Length - 1 || !int.TryParse(address.AsSpan(colon + 1), out int port))
+        if (colon <= 0 || colon == address.Length - 1)
         {
             throw new ArgumentException(
                 $"nanocached: invalid address \"{address}\" in NanocachedCacheOptions.Addresses, "
                 + "expected \"host:port\"",
+                nameof(address));
+        }
+        // Issue #1228: digits only (no sign, no whitespace, no culture), and
+        // a real TCP port, so a typo fails here naming the entry instead of
+        // surfacing later as a socket error from the dial.
+        if (!int.TryParse(address.AsSpan(colon + 1), NumberStyles.None, CultureInfo.InvariantCulture, out int port))
+        {
+            throw new ArgumentException(
+                $"nanocached: invalid address \"{address}\" in NanocachedCacheOptions.Addresses, "
+                + "the port is not a number",
+                nameof(address));
+        }
+        if (port < 1 || port > 65535)
+        {
+            throw new ArgumentException(
+                $"nanocached: invalid address \"{address}\" in NanocachedCacheOptions.Addresses, "
+                + "the port must be between 1 and 65535",
                 nameof(address));
         }
         string host = address[..colon];

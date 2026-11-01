@@ -215,6 +215,14 @@ public sealed class ServiceCollectionExtensionsTests
     }
 
     [Theory]
+    [InlineData("host:1", 1)]
+    [InlineData("host:65535", 65535)]
+    public void Ports_at_the_ends_of_the_valid_range_are_accepted(string address, int port)
+    {
+        Assert.Equal(("host", port), ServiceCollectionExtensions.ParseAddress(address));
+    }
+
+    [Theory]
     [InlineData("10.0.0.1:8357", "10.0.0.1", 8357)]
     [InlineData("node.internal:8357", "node.internal", 8357)]
     [InlineData("[::1]:8357", "::1", 8357)]
@@ -230,6 +238,14 @@ public sealed class ServiceCollectionExtensionsTests
     [InlineData(":8357")]
     [InlineData("host:abc")]
     [InlineData("[::1]")]
+    [InlineData("host:99999")]
+    [InlineData("host:65536")]
+    [InlineData("host:0")]
+    [InlineData("host:-5")]
+    [InlineData("host:+80")]
+    [InlineData("host: 80")]
+    [InlineData("host:80 ")]
+    [InlineData("host:٨٠")] // Arabic-Indic digits are not ASCII digits
     public void Malformed_addresses_are_rejected(string address)
     {
         Assert.Throws<ArgumentException>(() => ServiceCollectionExtensions.ParseAddress(address));
