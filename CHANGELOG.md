@@ -33,7 +33,6 @@ framework adapters at one version, whether or not a component changed.
   it; 10 nodes from one source took 27 s to all get in and `L` after the
   grace listed 5. The limit is now a burst of 64 new registrations per
   source, refilled one every 2 seconds (#1148).
-
 - `nanocached-proxy`: one client address could take the proxy far past its
   in-flight budget with large batched requests. A fully received `m`, `o`
   or `y` frame was parsed into its per-key lists (32 bytes a key, 64 for
