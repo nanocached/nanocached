@@ -674,6 +674,12 @@ loud `WARN` if that disagrees with its own configured value.
   source IP (fixed — the node's `--max-connections*` flags don't exist
   here; discovery serves only brief roster fetches and heartbeats; an
   IPv6 source counts per /64 prefix, as on the node)
+- New registrations: a source may register up to 64 new node names at
+  once and one more every 2 seconds after that (a node refreshing its own
+  entry is never counted). The source is the peer address, an IPv6 source
+  counting per /64 prefix, so a fleet behind one NAT address or in one
+  IPv6 subnet shares the allowance — a fleet of more than 64 such nodes
+  re-registers at that pace after a discovery restart.
 - Idle connection timeout: 60 seconds
 
 ## License
