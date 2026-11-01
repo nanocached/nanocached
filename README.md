@@ -694,8 +694,15 @@ loud `WARN` if that disagrees with its own configured value.
   once and one more every 2 seconds after that (a node refreshing its own
   entry is never counted). The source is the peer address, an IPv6 source
   counting per /64 prefix, so a fleet behind one NAT address or in one
-  IPv6 subnet shares the allowance — a fleet of more than 64 such nodes
-  re-registers at that pace after a discovery restart.
+  IPv6 subnet shares the allowance. After a discovery restart the nodes
+  re-register within the startup grace (`--liveness-timeout`), which
+  admits 64 plus one per 2 seconds of grace from one source: 71 nodes at
+  the default 15 seconds. A larger fleet behind one address is still
+  re-registering when the grace ends, so the first join after it is
+  handed off against a partial roster; the rest follow at one node per
+  2 seconds. Set `--liveness-timeout` to 2 seconds for every node beyond
+  64 (72 seconds for 100; a dead node is then evicted that much later
+  too), or spread the nodes over more source addresses.
 - Idle connection timeout: 60 seconds
 
 ## License
