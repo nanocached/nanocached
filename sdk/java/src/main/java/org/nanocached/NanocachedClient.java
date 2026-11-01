@@ -5965,6 +5965,12 @@ public final class NanocachedClient implements AutoCloseable {
                 member = current;
             }
             if (member.connection != null && !member.connection.isClosed()) return member.connection;
+            // Issue #1229: a request whose connection close() just poisoned
+            // retries through here. openNodeConnection only looks at `closed`
+            // after the dial and Identify, so without this check that retry
+            // would connect and authenticate once more (up to the connect
+            // deadline) before throwing the same AlreadyClosed.
+            if (closed) throw new NanocachedException.AlreadyClosed();
             Connection connection = dialWithCooldown(member.address);
             member.connection = connection;
             return connection;

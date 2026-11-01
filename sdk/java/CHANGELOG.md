@@ -13,6 +13,11 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A request retrying while `close()` ran could still dial and authenticate
+  a new connection to the node (up to the 5 s connect deadline) before
+  failing with `AlreadyClosed`, leaving the node with one extra short-lived
+  connection. The redial now checks that the client is closed before
+  dialing (#1229).
 - An `Error` (`OutOfMemoryError`, a `LinkageError`, an `AssertionError`
   under `-ea`) thrown by one of the parallel legs of `getMany`, `setMany`,
   `touchMany`, `clear`, or by a replica leg of a single-key write reached
