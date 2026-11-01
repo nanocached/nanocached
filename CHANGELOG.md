@@ -14,6 +14,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: when a join's transfer failed (the joiner unreachable
+  after three attempts, an abort, or a failed write of the `M` ack), the
+  writes already queued for forwarding to that joiner were not dropped, so
+  each kept being sent to a dead address (up to 10 s apiece, with up to
+  64 MiB held), and to whichever process later took the address. They are
+  now revoked when the unfinished handoff is dropped, as they already were
+  for an abandon, an eviction or a replacement (#1185).
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
