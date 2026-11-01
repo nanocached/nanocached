@@ -1316,7 +1316,11 @@ public final class NanocachedClient implements AutoCloseable {
         private final byte[] namespace;
 
         private Namespace(byte[] namespace) {
-            this.namespace = namespace;
+            // Copied, like the getter below: this array is reused for every
+            // call the handle makes, so a caller who later overwrites the
+            // buffer they passed in would otherwise re-scope the handle
+            // (different HRW owner, different namespace in the frames).
+            this.namespace = namespace.clone();
         }
 
         /** The namespace this handle scopes every call to. A defensive
