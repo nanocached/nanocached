@@ -1166,7 +1166,10 @@ fn parse_with_mode(
                 key_lengths.push(length);
             }
 
-            let mut tail: Vec<&[u8]> = parts.collect();
+            // Issue #1174: at most `[ttl] [G] [tag]` is valid, so collecting
+            // four tokens is enough to reject anything longer without
+            // allocating a slot per token of a header that is up to 1 MiB.
+            let mut tail: Vec<&[u8]> = parts.take(4).collect();
             let tag = if tagged {
                 Some(parse_tag(tail.pop().ok_or(ParseError::InvalidLength)?)?)
             } else {
