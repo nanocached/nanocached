@@ -10,6 +10,10 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Changed
+
+- Minimum Go version is now 1.26 (`go 1.26` in `go.mod`). Go supports only the two most recent release lines, and the previous floor (1.22) and the CI toolchain (1.23) both left that window in 2025. 0.6.0 is the last release that declares a Go 1.22 floor. No code change; CI now tests on `oldstable` and `stable`.
+
 ## [0.6.0] - 2026-11-01
 
 ### Fixed
