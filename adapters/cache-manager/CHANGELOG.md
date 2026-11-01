@@ -9,6 +9,8 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-01
+
 ### Changed
 
 - Built and type-checked with TypeScript 7 (a development dependency only;

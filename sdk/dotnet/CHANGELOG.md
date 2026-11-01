@@ -10,6 +10,8 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-01
+
 ### Fixed
 
 - With `Ca` set, a server certificate issued through an intermediate CA was
@@ -581,7 +583,8 @@ changes ship without a deprecation cycle and are listed below.
   pipeline-validation releases (see the repository release history for
   earlier changes).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.5...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.6.0...HEAD
+[0.6.0]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.5.1...sdk/dotnet/v0.6.0
 [0.5.1]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.5.0...sdk/dotnet/v0.5.1
 [0.5.0]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.8...sdk/dotnet/v0.5.0
 [0.4.8]: https://github.com/nanocached/nanocached/compare/sdk/dotnet/v0.4.7...sdk/dotnet/v0.4.8

@@ -30,14 +30,14 @@ friends run against a nanocached cluster.
 ## Install
 
 ```groovy
-implementation 'org.nanocached:nanocached-spring:0.5.1'
+implementation 'org.nanocached:nanocached-spring:0.6.0'
 ```
 
 ```xml
 <dependency>
   <groupId>org.nanocached</groupId>
   <artifactId>nanocached-spring</artifactId>
-  <version>0.5.1</version>
+  <version>0.6.0</version>
 </dependency>
 ```
 

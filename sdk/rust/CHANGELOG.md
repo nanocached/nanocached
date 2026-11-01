@@ -6,6 +6,8 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-01
+
 ### Changed
 
 - The minimum supported Rust version moves from 1.85 to 1.88 (`rust-version`
