@@ -14,6 +14,7 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a `k` or `x` frame with a digest condition re-hashed the whole stored value with SHA-256 on the cache actor every time, so a 55-byte frame against a 1 MiB value cost about 0.5 ms of actor time (487 us measured in a release build) and a few thousand a second kept every other client waiting. The digest of a value of 4 KiB or more is now kept after the first condition (348 ns per frame afterwards), dropped with the value on any write, removal or eviction, and charged to `--max-memory` (the key plus 128 bytes) while it is kept (#1259).
 - `nanocached-node`: an `o` (multi-set) frame held its whole per-key working charge (288 bytes per key) until its two-bytes-per-key ack had been written, and `o` and `y` (batch touch) held it across the waits for room in a forward queue. A client that pipelined `o` frames and did not read the acks kept 28.8 MB of `--max-in-flight-bytes` per 100,000-key frame for up to 10 s per connection (29.8 MB held with the ack write blocked in a test, 1.8 MB now), starving other connections' buffers and replies. The charge is now narrowed in steps, as `m`'s is: after the forward batches are built to what the waiting pushes still hold (nothing when no key is forwarded), and before the ack write to the ack's own size (#1243).
 - `nanocached-proxy`: the `L` roster parser refused a roster of more than
   4096 nodes, while discovery holds up to 65,536 and the node and every

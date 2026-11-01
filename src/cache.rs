@@ -41,6 +41,27 @@ pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 180;
 /// this and the key's own length are all a mark is charged.
 pub(crate) const MARK_OVERHEAD_BYTES: usize = 80;
 
+/// Issue #1259: values smaller than this are hashed on every digest
+/// condition (`k`/`x`) instead of having their digest kept: hashing 4 KiB
+/// takes a few microseconds, and the kept digest costs
+/// `DIGEST_OVERHEAD_BYTES` plus a copy of the key, a visible share of a
+/// small entry.
+const DIGEST_CACHE_MIN_VALUE_BYTES: usize = 4096;
+
+/// What a kept digest costs beyond the key bytes it copies: the slot in the
+/// namespace's `digests` map (a `Bytes` handle, 32 B, and the 16-byte
+/// digest, at up to twice that at the map's worst load after a resize) and
+/// the heap header of the copied name — about 112 B from the struct sizes,
+/// rounded up, as `MARK_OVERHEAD_BYTES` is.
+const DIGEST_OVERHEAD_BYTES: usize = 128;
+
+#[cfg(test)]
+thread_local! {
+    /// How many times `content_digest` ran on this thread, for the tests
+    /// that pin when a digest is kept rather than recomputed.
+    static DIGESTS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct Entry {
     value: Bytes,
     expires_at: Option<Instant>,
@@ -117,6 +138,15 @@ struct Namespace {
     /// global `HashSet<Key>` so no mark lookup ever hashes the (up to
     /// ~1 MiB) namespace name.
     migrated: HashSet<Bytes, RandomState>,
+    /// Issue #1259: the `content_digest` of this namespace's large values
+    /// (`DIGEST_CACHE_MIN_VALUE_BYTES` and up) that a digest condition has
+    /// asked about, by key name, so a `k`/`x` against a value of up to 1 MiB
+    /// does not hash all of it again on the cache actor every time. Kept
+    /// only while the value it describes is: `release_digest` drops it
+    /// wherever `release_mark` runs — a write, a removal, an eviction — and
+    /// the namespace's `used_bytes` is charged for it (`digest_charge`),
+    /// so `clear` and the namespace budget see it too.
+    digests: HashMap<Bytes, [u8; 16], RandomState>,
 }
 
 /// A removed map holding at least this many entries is freed on a thread
@@ -164,6 +194,7 @@ impl Namespace {
             used_bytes: 0,
             budget,
             migrated: HashSet::with_hasher(RandomState::new()),
+            digests: HashMap::with_hasher(RandomState::new()),
         }
     }
 }
@@ -230,6 +261,12 @@ const MAX_HANDOFF_TOMBSTONES: usize = 65_536;
 /// `MARK_OVERHEAD_BYTES`.
 fn mark_charge(name: &[u8]) -> usize {
     name.len() + MARK_OVERHEAD_BYTES
+}
+
+/// What a kept digest for the key `name` is charged — see
+/// `DIGEST_OVERHEAD_BYTES`.
+fn digest_charge(name: &[u8]) -> usize {
+    name.len() + DIGEST_OVERHEAD_BYTES
 }
 
 /// What a tombstone costs beyond the key bytes it copies (both the
@@ -450,6 +487,8 @@ pub enum CasResult {
 /// keyspace.
 pub(crate) fn content_digest(value: &[u8]) -> [u8; 16] {
     use sha2::{Digest, Sha256};
+    #[cfg(test)]
+    DIGESTS_COMPUTED.with(|count| count.set(count.get() + 1));
     let hash = Sha256::digest(value);
     let mut digest = [0u8; 16];
     digest.copy_from_slice(&hash[..16]);
@@ -1084,23 +1123,26 @@ impl Cache {
             self.expirations += 1;
         }
 
+        if let CasCondition::Digest(expected) = condition {
+            // Issue #336: was a plain `==`. A CAS digest is derived
+            // from the value the caller must already be able to read
+            // (a `G` on the same key, or its own prior write) rather
+            // than a secret this comparison alone protects, but a
+            // byte-at-a-time `==` still leaks, via timing, how many
+            // leading bytes of a guessed digest matched — the same
+            // reasoning `constant_time_eq` already exists for on
+            // every secret/token comparison in `server.rs`.
+            return self
+                .digest_of(key)
+                .is_some_and(|digest| constant_time_eq(&digest, &expected));
+        }
+
         match (condition, self.peek(key)) {
             (CasCondition::Absent, None) => true,
             (CasCondition::Absent, Some(_)) => false,
             (CasCondition::Present, Some(_)) => true,
             (CasCondition::Present, None) => false,
-            (CasCondition::Digest(expected), Some(entry)) => {
-                // Issue #336: was a plain `==`. A CAS digest is derived
-                // from the value the caller must already be able to read
-                // (a `G` on the same key, or its own prior write) rather
-                // than a secret this comparison alone protects, but a
-                // byte-at-a-time `==` still leaks, via timing, how many
-                // leading bytes of a guessed digest matched — the same
-                // reasoning `constant_time_eq` already exists for on
-                // every secret/token comparison in `server.rs`.
-                constant_time_eq(&content_digest(&entry.value), &expected)
-            }
-            (CasCondition::Digest(_), None) => false,
+            (CasCondition::Digest(_), _) => unreachable!("handled above"),
         }
     }
 
@@ -1374,6 +1416,7 @@ impl Cache {
         // `migrated` mark left over from an earlier value must not condemn
         // this one to the next sweep (it would silently delete it).
         Self::release_mark(namespace, &name, &mut self.used_bytes, &mut self.marked);
+        Self::release_digest(namespace, &name, &mut self.used_bytes);
 
         // An overwrite keeps the stored key (`LruCache::put` would too, and
         // discard the copy), so only copy the key for a genuinely new
@@ -1592,6 +1635,7 @@ impl Cache {
             &mut self.used_bytes,
             &mut self.marked,
         );
+        Self::release_digest(namespace, &evicted_name, &mut self.used_bytes);
         if namespace.entries.is_empty() {
             self.drop_namespace(id);
         }
@@ -1676,6 +1720,7 @@ impl Cache {
         // The mark referred to this entry's value; whatever is stored
         // under the key later is a different value.
         Self::release_mark(namespace, name, &mut self.used_bytes, &mut self.marked);
+        Self::release_digest(namespace, name, &mut self.used_bytes);
         if namespace.entries.is_empty() {
             self.drop_namespace(id);
         }
@@ -1701,6 +1746,44 @@ impl Cache {
             *used_bytes -= mark_bytes;
             *marked -= 1;
         }
+    }
+
+    /// Drops the kept digest for `name`, if any, crediting its charge back
+    /// — the value it described is gone or about to be replaced. A no-op,
+    /// accounting included, when the namespace has none.
+    fn release_digest(namespace: &mut Namespace, name: &[u8], used_bytes: &mut usize) {
+        if namespace.digests.is_empty() {
+            return;
+        }
+        if namespace.digests.remove(name).is_some() {
+            let digest_bytes = digest_charge(name);
+            namespace.used_bytes -= digest_bytes;
+            *used_bytes -= digest_bytes;
+        }
+    }
+
+    /// `content_digest` of the value stored under `key`, if there is one.
+    /// For a large value the digest is kept (and charged) after the first
+    /// call and reused until the value changes — see `Namespace::digests`.
+    fn digest_of(&mut self, key: &Key) -> Option<[u8; 16]> {
+        let id = self.find_namespace(&key.namespace)?;
+        let namespace = self.slots.get_mut(&id)?;
+        let value = &namespace.entries.peek(&key.name[..])?.value;
+        if value.len() < DIGEST_CACHE_MIN_VALUE_BYTES {
+            return Some(content_digest(value));
+        }
+        if let Some(digest) = namespace.digests.get(&key.name[..]) {
+            return Some(*digest);
+        }
+        let digest = content_digest(value);
+        // Copied: the key's name is usually a slice of the request frame.
+        namespace
+            .digests
+            .insert(Bytes::copy_from_slice(&key.name), digest);
+        let charge = digest_charge(&key.name);
+        namespace.used_bytes += charge;
+        self.used_bytes += charge;
+        Some(digest)
     }
 
     /// Whether `key` is currently `migrated`-marked.
@@ -3016,6 +3099,93 @@ mod tests {
         let mut cache = Cache::new(UNBOUNDED);
 
         assert!(!cache.cas_delete(&key(b"name"), content_digest(b"Alice")));
+    }
+
+    #[test]
+    fn a_large_values_digest_is_hashed_once_for_any_number_of_digest_conditions() {
+        // Issue #1259: every `x`/`k` against a large value re-hashed all of
+        // it on the cache actor; 1 MiB is half a millisecond per 55-byte
+        // frame. The digest is kept until the value changes.
+        let big = Bytes::from(vec![b'a'; DIGEST_CACHE_MIN_VALUE_BYTES]);
+        let big_digest = content_digest(&big);
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"big"), big.clone());
+        let before = DIGESTS_COMPUTED.with(|count| count.get());
+
+        for _ in 0..5 {
+            assert!(!cache.cas_delete(&key(b"big"), [0; 16]));
+        }
+        assert_eq!(
+            cache.cas_set(
+                &key(b"big"),
+                CasCondition::Digest([1; 16]),
+                Bytes::from_static(b"other"),
+                None
+            ),
+            CasResult::Mismatch
+        );
+        assert_eq!(
+            DIGESTS_COMPUTED.with(|count| count.get()) - before,
+            1,
+            "six digest conditions against one value must hash it once"
+        );
+
+        // A write replaces the value, and the kept digest goes with it.
+        let changed = Bytes::from(vec![b'b'; DIGEST_CACHE_MIN_VALUE_BYTES]);
+        cache.set(key(b"big"), changed.clone());
+        assert!(!cache.cas_delete(&key(b"big"), big_digest));
+        assert!(cache.cas_delete(&key(b"big"), content_digest(&changed)));
+
+        // A small value is cheap to hash and is not given a kept digest.
+        cache.set(key(b"small"), Bytes::from_static(b"Alice"));
+        let before = DIGESTS_COMPUTED.with(|count| count.get());
+        for _ in 0..3 {
+            assert!(!cache.cas_delete(&key(b"small"), [0; 16]));
+        }
+        assert_eq!(DIGESTS_COMPUTED.with(|count| count.get()) - before, 3);
+    }
+
+    #[test]
+    fn a_kept_digest_is_charged_and_given_back_with_the_value_it_describes() {
+        let value = Bytes::from(vec![b'v'; DIGEST_CACHE_MIN_VALUE_BYTES]);
+        let kept = digest_charge(b"k");
+        let entry =
+            |name_len: usize| name_len + DIGEST_CACHE_MIN_VALUE_BYTES + ENTRY_OVERHEAD_BYTES;
+
+        // Charged when kept; replaced and removed with the value.
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"k"), value.clone());
+        assert_eq!(cache.used_bytes, entry(1));
+        assert!(!cache.cas_delete(&key(b"k"), [0; 16]));
+        assert!(!cache.cas_delete(&key(b"k"), [0; 16]));
+        assert_eq!(cache.used_bytes, entry(1) + kept);
+        cache.set(key(b"k"), value.clone());
+        assert_eq!(cache.used_bytes, entry(1), "an overwrite drops the digest");
+        assert!(!cache.cas_delete(&key(b"k"), [0; 16]));
+        assert!(cache.delete(&key(b"k")));
+        assert_eq!(cache.used_bytes, 0, "a delete drops the digest");
+
+        // Evicted with the value: room for two entries, three are written.
+        let mut cache = Cache::new(2 * entry(1) + kept);
+        cache.set(key(b"a"), value.clone());
+        assert!(!cache.cas_delete(&key(b"a"), [0; 16]));
+        cache.set(key(b"b"), value.clone());
+        cache.set(key(b"c"), value.clone());
+        assert!(!cache.contains(&key(b"a")), "the oldest entry was evicted");
+        assert_eq!(cache.used_bytes, 2 * entry(1));
+        let (namespace_total, held): (usize, usize) = (
+            cache.slots.values().map(|n| n.used_bytes).sum(),
+            cache.used_bytes - name_charge(b""),
+        );
+        assert_eq!(namespace_total, held);
+
+        // Cleared with the namespace.
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(namespaced(b"ns", b"k"), value.clone());
+        assert!(!cache.cas_delete(&namespaced(b"ns", b"k"), [0; 16]));
+        assert!(cache.used_bytes > entry(1));
+        assert_eq!(cache.clear(b"ns"), 1);
+        assert_eq!(cache.used_bytes, 0);
     }
 
     #[test]
