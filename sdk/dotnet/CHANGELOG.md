@@ -19,6 +19,9 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
   waiting on a busy or redialing replica made the replica store, delete or
   touch a different key. The namespace, key and value are now copied at call
   time when the option is on. (#1203)
+
+### Fixed
+
 - `NanocachedNamespace` kept the caller's `byte[]` namespace and returned its
   own array from `NamespaceBytes`, so overwriting either buffer later changed
   the HRW input and the namespace of every later call through the handle (keys
