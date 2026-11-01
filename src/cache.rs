@@ -232,9 +232,20 @@ fn mark_charge(name: &[u8]) -> usize {
     name.len() + MARK_OVERHEAD_BYTES
 }
 
-/// What a tombstone is charged: the key it names, as a mark is.
+/// What a tombstone costs beyond the key bytes it copies (both the
+/// namespace and the name, separately): its slot in `handoff_tombstones`
+/// (a `Key` of two `Bytes` handles, 64 B, and an `Instant`, 16 B, at up to
+/// twice that at the map's worst load after a resize), its item in
+/// `tombstone_order` (the same 80 B) and the heap headers of the two
+/// copies — about 250 B, from the struct sizes rather than measured, as
+/// `MARK_OVERHEAD_BYTES` is. Issue #1179: without it a full set of 65,536
+/// tombstones held about 16 MiB that `--max-memory` did not count.
+const TOMBSTONE_OVERHEAD_BYTES: usize = 250;
+
+/// What a tombstone is charged: the key it copies plus
+/// `TOMBSTONE_OVERHEAD_BYTES`, as a mark is charged by `mark_charge`.
 fn tombstone_bytes(key: &Key) -> usize {
-    key.namespace.len() + key.name.len()
+    key.namespace.len() + key.name.len() + TOMBSTONE_OVERHEAD_BYTES
 }
 
 pub struct Cache {
@@ -3930,6 +3941,32 @@ mod tests {
 
         assert_eq!(cache.get(&key(b"a")), None);
         assert_eq!(cache.get(&key(b"b")), Some(Bytes::from_static(b"2")));
+    }
+
+    #[test]
+    fn a_tombstone_is_charged_its_key_and_the_per_entry_overhead() {
+        // Issue #1179: a tombstone used to be charged the bytes of its key
+        // alone, so 1,000 of them under an 8-byte key added 8 KB to
+        // `used_bytes` against the two map/queue slots and two allocations
+        // each one really holds (about 250 B apart from the key).
+        let mut cache = Cache::new(UNBOUNDED);
+        let deleted_at = Instant::now();
+        for index in 0..1_000_u32 {
+            cache.handoff_delete_at(&key(&[b"k", &index.to_be_bytes()[..]].concat()), deleted_at);
+        }
+
+        assert_eq!(cache.handoff_tombstones.len(), 1_000);
+        assert!(
+            cache.used_bytes >= 1_000 * (5 + 200),
+            "1,000 tombstones of 5-byte keys are charged {} bytes; the overhead is about 250 B each",
+            cache.used_bytes
+        );
+        assert_eq!(cache.used_bytes, 1_000 * (5 + TOMBSTONE_OVERHEAD_BYTES));
+
+        // Credited back in full when they expire.
+        cache.sweep_at(deleted_at + HANDOFF_TOMBSTONE_TTL, true, None);
+        assert!(cache.handoff_tombstones.is_empty());
+        assert_eq!(cache.used_bytes, 0);
     }
 
     #[test]
