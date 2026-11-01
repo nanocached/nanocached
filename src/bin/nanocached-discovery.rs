@@ -314,8 +314,9 @@ const MAX_REGISTRY_SIZE: usize = 1 << 16;
 /// once on join start; `abandon_current_join` sending `X` to every ready
 /// member of `PendingJoin::expected` at once on abandon) may have in
 /// flight at the same time. In a no-auth deployment, `P` registers into
-/// `Joined` gated only by `ANNOUNCE_INSERT_COOLDOWN` (a 2s per-source-IP
-/// cooldown), up to `MAX_REGISTRY_SIZE` (65536) entries — nothing stops an
+/// `Joined` gated only by the announce limiter (`ANNOUNCE_INSERT_BURST`
+/// new names per source at once, then one per `ANNOUNCE_INSERT_COOLDOWN`),
+/// up to `MAX_REGISTRY_SIZE` (65536) entries — nothing stops an
 /// attacker rotating source IPs from inflating the registry that far.
 /// Without a bound here, the next legitimate `J`/`V` fans a `JoinSet` out
 /// to every one of those entries concurrently, opening that many
@@ -365,7 +366,10 @@ const MAX_PROXY_ENTRIES: usize = 1024;
 /// oversized `M` is rejected immediately, with a clear log line, rather
 /// than left to time out. See `migrate_message_len`.
 const NODE_MAX_REQUEST_SIZE: usize = 1024 * 1024;
-/// Per-source-IP cooldown between *new* registry insertions via `P`
+/// Refill interval of the per-source token bucket that paces *new*
+/// registry insertions via `P`: one more insertion is allowed per source
+/// (an IPv6 source is its /64, see `per_ip_key`) every this often, on top
+/// of the `ANNOUNCE_INSERT_BURST` it may spend at once
 /// (issue: `MAX_REGISTRY_SIZE`'s own doc comment above — a bare `P` holds
 /// no connection open, so nothing but that hard ceiling used to bound how
 /// fast a single source could approach it; connect -> `A` -> `P` ->
@@ -379,6 +383,19 @@ const NODE_MAX_REQUEST_SIZE: usize = 1024 * 1024;
 /// node's heartbeat loop redials and retries, so this is a rate limit,
 /// not a permanent block. See `announce_insert_allowed`.
 const ANNOUNCE_INSERT_COOLDOWN: Duration = Duration::from_secs(2);
+/// How many *new* registrations one source may make at once before the
+/// `ANNOUNCE_INSERT_COOLDOWN` pacing applies. Issue #1148: with a plain
+/// one-per-cooldown gap, a fleet that shares a source key — IPv4 nodes
+/// behind one NAT address, or every node of one AWS VPC IPv6 subnet, which
+/// is a /64 — re-registered one node per 2 s after a discovery restart or a
+/// partition, so the startup grace (one liveness timeout) ended with a
+/// partial registry and the first join ran against it, the very thing the
+/// grace exists to prevent. A burst lets a whole fleet re-register at once
+/// while a sustained stream of forged names from one source is still paced
+/// to one per cooldown; `MAX_REGISTRY_SIZE` stays the hard ceiling. Sized
+/// like `MAX_LATE_MEMBERS_PER_JOIN`: the most members one join is built
+/// to absorb.
+const ANNOUNCE_INSERT_BURST: u32 = 64;
 /// Bounds `AnnounceLimiter`'s own memory: without this, an attacker who
 /// cycles through source IPs (trivial to spoof/rotate, unlike holding
 /// open `MAX_CONNECTIONS` real connections) could grow the limiter map
@@ -1096,51 +1113,89 @@ fn read_auth_secret() -> Result<Option<Bytes>, String> {
     infra::read_env_secret(AUTH_SECRET_ENV_VAR).map(|secret| secret.map(Bytes::from))
 }
 
-/// Per-source-IP cooldown state guarding new registry insertions via `P`
-/// (see `ANNOUNCE_INSERT_COOLDOWN`). Bounded itself
-/// (`MAX_ANNOUNCE_LIMITER_ENTRIES`, oldest entry evicted to make room) so
-/// an attacker cycling through source addresses can't grow the limiter's
-/// own memory without bound — the same shape of problem this exists to
-/// solve for the registry, one level down.
-type AnnounceLimiter = Arc<Mutex<FxHashMap<std::net::IpAddr, Instant>>>;
+/// One source's token bucket in the announce limiter: `tokens` new
+/// registrations may still be spent now; one token comes back per
+/// `ANNOUNCE_INSERT_COOLDOWN` since `refilled_at`, up to
+/// `ANNOUNCE_INSERT_BURST`. `last_seen` orders eviction when the limiter
+/// is full.
+struct AnnounceBucket {
+    tokens: u32,
+    refilled_at: Instant,
+    last_seen: Instant,
+}
 
-/// Returns whether a new registry insertion from `peer_ip` is allowed
-/// right now, recording `peer_ip` against the current time if so.
-/// `peer_ip` is allowed unless it has a recorded insertion within
-/// `ANNOUNCE_INSERT_COOLDOWN`. Only meant to be called for a genuinely new
-/// name (see the `P` handler) — a refresh of an existing entry must not
+/// Per-source token buckets guarding new registry insertions via `P` (see
+/// `ANNOUNCE_INSERT_BURST` and `ANNOUNCE_INSERT_COOLDOWN`). Bounded itself
+/// (`MAX_ANNOUNCE_LIMITER_ENTRIES`, least recently seen entry evicted to
+/// make room) so an attacker cycling through source addresses can't grow
+/// the limiter's own memory without bound — the same shape of problem this
+/// exists to solve for the registry, one level down.
+type AnnounceLimiter = Arc<Mutex<FxHashMap<std::net::IpAddr, AnnounceBucket>>>;
+
+/// Whether a *new* registration from `peer_ip` may be inserted right
+/// now, spending one of its tokens if so. A source (an IPv6 source is its
+/// /64, see `per_ip_key`) starts with `ANNOUNCE_INSERT_BURST` tokens and
+/// earns one back per `ANNOUNCE_INSERT_COOLDOWN`; with none left it is
+/// refused until the next refill. Only meant to be called for a genuinely
+/// new name (see the `P` handler) — a refresh of an existing entry must not
 /// consume or be gated by this limiter at all.
 fn announce_insert_allowed(limiter: &AnnounceLimiter, peer_ip: std::net::IpAddr) -> bool {
     // Keyed like the join waiting cap and the connection cap: an IPv6
     // source counts as its /64, so rotating addresses inside one prefix
-    // doesn't earn a fresh cooldown each time.
+    // doesn't earn a fresh bucket each time.
     let peer_ip = per_ip_key(peer_ip);
     let now = Instant::now();
     let mut guard = limiter
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    if let Some(last) = guard.get(&peer_ip)
-        && now.duration_since(*last) < ANNOUNCE_INSERT_COOLDOWN
-    {
-        return false;
+    if let Some(bucket) = guard.get_mut(&peer_ip) {
+        // Whole refills only, so the remainder keeps accruing toward the
+        // next one instead of being dropped on every call.
+        let elapsed = now.saturating_duration_since(bucket.refilled_at);
+        let refills = u32::try_from(elapsed.as_nanos() / ANNOUNCE_INSERT_COOLDOWN.as_nanos())
+            .unwrap_or(u32::MAX);
+        if refills > 0 {
+            bucket.tokens = bucket
+                .tokens
+                .saturating_add(refills)
+                .min(ANNOUNCE_INSERT_BURST);
+            bucket.refilled_at = if bucket.tokens == ANNOUNCE_INSERT_BURST {
+                now
+            } else {
+                bucket.refilled_at + ANNOUNCE_INSERT_COOLDOWN * refills
+            };
+        }
+        bucket.last_seen = now;
+        if bucket.tokens == 0 {
+            return false;
+        }
+        bucket.tokens -= 1;
+        return true;
     }
 
-    if guard.len() >= MAX_ANNOUNCE_LIMITER_ENTRIES && !guard.contains_key(&peer_ip) {
-        // Evict the single oldest entry to make room. A linear scan, but
-        // this only runs when the (small, bounded) limiter is already
-        // full and a genuinely new source shows up — not on the common
-        // path of a source that's already tracked.
+    if guard.len() >= MAX_ANNOUNCE_LIMITER_ENTRIES {
+        // Evict the single least recently seen entry to make room. A
+        // linear scan, but this only runs when the (small, bounded)
+        // limiter is already full and a genuinely new source shows up —
+        // not on the common path of a source that's already tracked.
         if let Some(oldest) = guard
             .iter()
-            .min_by_key(|&(_, recorded_at)| *recorded_at)
+            .min_by_key(|&(_, bucket)| bucket.last_seen)
             .map(|(ip, _)| *ip)
         {
             guard.remove(&oldest);
         }
     }
 
-    guard.insert(peer_ip, now);
+    guard.insert(
+        peer_ip,
+        AnnounceBucket {
+            tokens: ANNOUNCE_INSERT_BURST - 1,
+            refilled_at: now,
+            last_seen: now,
+        },
+    );
     true
 }
 
@@ -5214,9 +5269,10 @@ async fn handle_connection(
                     // arm's own comment above).
                     if !announce_insert_allowed(&config.announce_limiter, peer_ip) {
                         eprintln!(
-                            "WARN rejected announce for {name} from {peer_ip}: too many new \
-                             registrations from this source within {}s (see \
-                             ANNOUNCE_INSERT_COOLDOWN)",
+                            "WARN rejected announce for {name} from {peer_ip}: more than \
+                             {ANNOUNCE_INSERT_BURST} new registrations from this source at \
+                             once; one more is allowed every {}s (see \
+                             ANNOUNCE_INSERT_BURST / ANNOUNCE_INSERT_COOLDOWN)",
                             ANNOUNCE_INSERT_COOLDOWN.as_secs()
                         );
                         break 'decide Err("too many new announces from this source; retry \
@@ -5888,18 +5944,62 @@ mod tests {
         let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
         let other_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
 
-        assert!(announce_insert_allowed(&limiter, ip));
-        // A second attempt from the same source within the cooldown is
-        // refused...
+        // A source may spend its whole burst at once...
+        for _ in 0..ANNOUNCE_INSERT_BURST {
+            assert!(announce_insert_allowed(&limiter, ip));
+        }
+        // ...the next attempt within the cooldown is refused...
         assert!(!announce_insert_allowed(&limiter, ip));
         // ...but a different source is entirely unaffected by it.
         assert!(announce_insert_allowed(&limiter, other_ip));
 
         tokio::time::advance(ANNOUNCE_INSERT_COOLDOWN + Duration::from_millis(1)).await;
 
-        // Once the cooldown has elapsed, the original source is allowed
-        // again.
+        // Once the cooldown has elapsed, the original source has earned
+        // exactly one more.
         assert!(announce_insert_allowed(&limiter, ip));
+        assert!(!announce_insert_allowed(&limiter, ip));
+
+        // Refills accrue while the source is quiet, up to the burst and
+        // no further.
+        tokio::time::advance(ANNOUNCE_INSERT_COOLDOWN * (ANNOUNCE_INSERT_BURST + 5)).await;
+        for _ in 0..ANNOUNCE_INSERT_BURST {
+            assert!(announce_insert_allowed(&limiter, ip));
+        }
+        assert!(!announce_insert_allowed(&limiter, ip));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_fleet_sharing_one_source_key_re_registers_at_once() {
+        // Regression (issue #1148): a plain one-per-cooldown gap let a
+        // fleet that shares a source key — IPv4 nodes behind one NAT
+        // address, or every node of one IPv6 /64 subnet — re-register
+        // only one node per 2 s after a discovery restart, so the startup
+        // grace ended with a partial registry. Up to the burst they must
+        // all get in at once; beyond it the pacing still applies.
+        let limiter: AnnounceLimiter = Arc::new(Mutex::new(FxHashMap::default()));
+        for host in 1..=ANNOUNCE_INSERT_BURST {
+            let addr: std::net::IpAddr = format!("2001:db8:1:2::{host:x}").parse().unwrap();
+            assert!(
+                announce_insert_allowed(&limiter, addr),
+                "node {host} of a /64 fleet must register in the same burst"
+            );
+        }
+        let one_more: std::net::IpAddr = "2001:db8:1:2:ffff::1".parse().unwrap();
+        assert!(
+            !announce_insert_allowed(&limiter, one_more),
+            "the /64 is one source: past the burst it is paced"
+        );
+        tokio::time::advance(ANNOUNCE_INSERT_COOLDOWN).await;
+        assert!(announce_insert_allowed(&limiter, one_more));
+        assert_eq!(
+            limiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "the whole /64 is one limiter entry"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -5914,7 +6014,9 @@ mod tests {
         let same_64: std::net::IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
         let other_64: std::net::IpAddr = "2001:db8:1:3::1".parse().unwrap();
 
-        assert!(announce_insert_allowed(&limiter, first));
+        for _ in 0..ANNOUNCE_INSERT_BURST {
+            assert!(announce_insert_allowed(&limiter, first));
+        }
         assert!(
             !announce_insert_allowed(&limiter, same_64),
             "a second address in the same /64 is the same source"
@@ -11511,8 +11613,14 @@ mod tests {
         first.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"R\n");
 
-        // Immediately after: a second, different new name from the same
-        // source is refused — the connection closes with no `R`.
+        // The source may spend the rest of its burst (issue #1148: a fleet
+        // sharing one source must get in at once); spend it here directly.
+        for _ in 1..ANNOUNCE_INSERT_BURST {
+            assert!(announce_insert_allowed(&announce_limiter, peer_ip));
+        }
+
+        // Immediately after: one more new name from the same source is
+        // refused — the connection closes with no `R`.
         let (mut second, server) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
