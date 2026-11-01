@@ -14,6 +14,7 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a handoff tombstone was charged to `--max-memory` for its key bytes only, although each one also holds a map slot, a queue item and two allocation headers (about 250 B), the per-entry cost a `migrated` mark has always been charged. A full set of 65,536 tombstones (a join or drain window with many relayed deletes) held about 16 MiB the limit did not count. They are now charged the same way (#1179).
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
