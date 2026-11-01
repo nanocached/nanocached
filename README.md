@@ -425,7 +425,7 @@ B\n
 - [`sdk/rust`](sdk/rust/README.md) — an async (tokio) Rust client with
   the same feature set (TLS behind the `tls` feature).
 - [`sdk/dotnet`](sdk/dotnet/README.md) — an async .NET client with the
-  same feature set (.NET 8+, no dependencies, NuGet ID `Nanocached`).
+  same feature set (.NET 10+, no dependencies, NuGet ID `Nanocached`).
 - [`sdk/go`](sdk/go/README.md) — a Go client with the same feature set
   (Go 1.22+, standard library only, module
   `github.com/nanocached/nanocached/sdk/go`).

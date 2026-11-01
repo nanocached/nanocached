@@ -9,6 +9,10 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Changed
+
+- Target framework is now `net10.0`, following the SDK; .NET 8 and .NET 9 reach end of support on 2026-11-10, and 0.6.0 is the last release that targets `net8.0`. `Microsoft.Extensions.*` references move from 8.0.0 to 10.0.14.
+
 ## [0.6.0] - 2026-11-01
 
 No changes. Version aligned with the rest of the project: every release
