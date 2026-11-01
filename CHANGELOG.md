@@ -14,6 +14,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a forward to a handoff target that had died but was
+  still in the roster wrote two WARN lines per forwarded write, and
+  re-replication wrote three per key it tried to send to such a target and
+  redialled it for every key. Each line is a synchronous stderr write, so
+  200,000 writes against a killed joiner produced 400,003 lines (47 MB) and
+  took 3.5 times as long, and a re-replication toward a killed peer wrote
+  183,741 lines for 61,248 keys. The first failure against a target is
+  still written in full; repeats are limited to one line per 10 seconds
+  with a count of the rest. Re-replication now skips a target's remaining
+  keys for 30 seconds once one key has used up every attempt (#1161).
 - `nanocached-node`: a connection's receive-buffer charge against
   `--max-in-flight-bytes` was released as soon as the buffer's reported
   capacity fell to the free 64 KiB, but after a large frame that reported
