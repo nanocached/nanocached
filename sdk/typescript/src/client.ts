@@ -4131,6 +4131,7 @@ export class NanocachedClient {
     if (!this.target.connection.isClosed()) return this.target.connection;
 
     const connection = await this.ensureConnected("", this.url);
+    this.discardIfClosed(connection);
     if (this.target.kind === "single" && this.target.connection.isClosed()) {
       this.target.connection = connection;
     }
@@ -4150,6 +4151,7 @@ export class NanocachedClient {
     if (!this.target.connection.isClosed()) return this.target.connection;
 
     const connection = await this.ensureConnected("", this.target.address);
+    this.discardIfClosed(connection);
     if (this.target.kind === "proxy" && this.target.connection.isClosed()) {
       this.target.connection = connection;
     }
@@ -4187,6 +4189,7 @@ export class NanocachedClient {
     if (member.connection !== null && !member.connection.isClosed()) return member.connection;
 
     const connection = await this.ensureConnected(name, member.address);
+    this.discardIfClosed(connection);
 
     // A node-list refresh may have swapped `target` while we dialed; adopt
     // the new connection only into a member still holding the dead (or
@@ -4204,6 +4207,19 @@ export class NanocachedClient {
     }
     if (currentConnection !== connection) connection.close();
     return currentConnection;
+  }
+
+  /** Called right after a redial resolves, before the connection is
+   * installed (issue #1216). `openNodeConnection` checked `this.closed`
+   * when the dial finished, but `close()` can still run in the few
+   * microtasks before the caller installs the result — and `close()` only
+   * closes what is installed at that moment, so installing afterwards
+   * would leave a live connection nothing ever closes. Checked here
+   * synchronously, with no `await` between this and the install. */
+  private discardIfClosed(connection: Connection): void {
+    if (!this.closed) return;
+    connection.close();
+    throw new AlreadyClosedError();
   }
 
   private async ensureConnected(slot: string, address: string): Promise<Connection> {

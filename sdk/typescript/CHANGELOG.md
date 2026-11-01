@@ -11,6 +11,13 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A `close()` that ran in the few microtasks between a redial finishing and
+  its connection being installed (single-node, cluster member or proxy
+  target) closed only the connections installed at that moment, so the new
+  connection stayed open with nothing left to close it, until the server's
+  60-second idle timeout. The redial's result is now checked against the
+  closed flag before it is installed: it is closed, and the interrupted call
+  rejects with `AlreadyClosedError` (#1216).
 - `connect()` with a seed address whose port is not a valid TCP port (`NaN`
   from an unset environment variable, a fraction, a number above 65535)
   rejected at once, as it should, but the dial timer had already been armed
