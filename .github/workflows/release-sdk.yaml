@@ -55,7 +55,7 @@ jobs:
           ver="${GITHUB_REF_NAME#sdk/python/v}"
           grep -q "^version = \"$ver\"$" sdk/python/pyproject.toml
 
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Build
         working-directory: sdk/python
@@ -264,7 +264,7 @@ jobs:
           grep -q "^version = \"$ver\"$" adapters/django/pyproject.toml
           grep -q "\"nanocached>=$ver\"" adapters/django/pyproject.toml
 
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Build
         working-directory: adapters/django
