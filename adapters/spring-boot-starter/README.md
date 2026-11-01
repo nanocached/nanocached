@@ -108,8 +108,11 @@ beyond the two beans; it does not change adapter behavior.
 
 ## Requirements
 
-Java 17+, Spring Boot 3.x, nanocached server 0.4.0 or later (the first
+Java 17+, Spring Boot 4.x, nanocached server 0.4.0 or later (the first
 release with namespaces, `CLEAR` and compare-and-set).
+
+Version 0.5.1 is the last release that supports Spring Boot 3.5;
+open-source support for that line ended on 2026-06-30.
 
 ## Policy note
 

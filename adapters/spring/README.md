@@ -248,9 +248,12 @@ anything is sent, which the error handler sees as a put error.
 
 ## Requirements
 
-Java 17+, Spring Framework 6.x, nanocached server 0.4.0 or later (the
+Java 17+, Spring Framework 7.x, nanocached server 0.4.0 or later (the
 first release with namespaces, `CLEAR` and compare-and-set, which
 `putIfAbsent` uses).
+
+Version 0.5.1 is the last release that supports Spring Framework 6.2;
+open-source support for that line ended on 2026-06-30.
 
 ## Policy note
 

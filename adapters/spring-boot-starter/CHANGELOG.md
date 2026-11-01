@@ -9,6 +9,19 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Changed
+
+- The baseline moves to Spring Boot 4.1 (dependencies platform 4.1.2, managing
+  Spring Framework 7.0) together with `nanocached-spring`; Spring Boot 3.5 is
+  no longer supported. Open-source support for Spring Boot 3.5 and Spring
+  Framework 6.2 ended on 2026-06-30, so 0.5.1 is the last release for them.
+  The auto-configuration is ordered before Boot's cache auto-configuration by
+  name, because Boot 4 moved it to
+  `org.springframework.boot.cache.autoconfigure.CacheAutoConfiguration` in the
+  `spring-boot-cache` module, which an application without
+  `spring-boot-starter-cache` does not have. The `nanocached.*` properties are
+  unchanged.
+
 ### Security
 
 - The Spring Boot dependencies platform moves from 3.5.3 to 3.5.16, the latest
