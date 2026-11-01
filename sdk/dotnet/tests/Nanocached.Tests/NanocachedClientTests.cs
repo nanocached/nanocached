@@ -3321,6 +3321,64 @@ public class NanocachedClientTests
             "the background write to land on the replica");
     }
 
+    // Issue #1203: a background replica leg must not read the caller's
+    // key/value arrays after the call has returned. The replica's
+    // connection is closed and its node stalls the handshake, so the leg
+    // only builds its frame once the redial finishes - well after the
+    // caller has reused its buffers.
+    [Theory]
+    [InlineData("set")]
+    [InlineData("delete")]
+    [InlineData("touch")]
+    public async Task FireAndForgetReplicaLegsDoNotReadTheCallersBuffersAfterTheCallReturns(string op)
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        string replicaName = OwnersOf("k")[1];
+        MockNode replica = cluster.Nodes[replicaName];
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            FireAndForgetReplicas = true,
+        });
+        string stored = MockNode.KeyOf(Bytes("k"));
+        if (op != "set")
+        {
+            await client.SetAsync("k", "v", 100);
+            await WaitForAsync(() => replica.Store.ContainsKey(stored), "the seed to reach the replica");
+        }
+
+        var closed = new Connection(new ThrowingStream());
+        closed.Close();
+        ReplaceMemberConnection(client, replicaName, closed);
+        replica.DelayAuth(400);
+
+        byte[] key = Bytes("k");
+        byte[] value = Bytes("v");
+        switch (op)
+        {
+            case "set": await client.SetAsync(key, value, 100); break;
+            case "delete": await client.DeleteAsync(key); break;
+            default: await client.TouchAsync(key, 77); break;
+        }
+        Array.Clear(key); // the caller reuses its buffers
+        Array.Clear(value);
+
+        switch (op)
+        {
+            case "set":
+                await WaitForAsync(() => replica.Store.Count > 0, "the replica to receive the write");
+                Assert.True(replica.Store.TryGetValue(stored, out byte[]? got), "the replica holds the original key");
+                Assert.Equal(Bytes("v"), got);
+                break;
+            case "delete":
+                await WaitForAsync(() => !replica.Store.ContainsKey(stored), "the replica to delete the key");
+                break;
+            default:
+                await WaitForAsync(() => replica.TtlOf(Array.Empty<byte>(), Bytes("k")) == 77, "the replica to touch the key");
+                break;
+        }
+    }
+
     [Fact]
     public async Task FireAndForgetReplicasFallsBackToSynchronousPastTheCap()
     {
