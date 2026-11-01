@@ -560,8 +560,10 @@ window is the same one the pre-tags protocol always had.</p>
     proxy that cannot reach its node answers it <code>R</code>. A proxy
     also answers <code>R</code> to a request it could not admit within
     60 seconds because the in-flight byte budgets (per connection, per
-    source IP and proxy-wide) stayed full; the request was not
-    dispatched, so any command is safe to retry. Tagged connections receive
+    source IP and proxy-wide) stayed full, and at once to a request that
+    would have to wait while the pool for waiting requests' frames (the
+    budget's size again) is full; the request was not dispatched, so any
+    command is safe to retry. Tagged connections receive
     <code>R &lt;tag&gt;\n</code>. Today the proxy is the only emitter —
     nodes and discovery accept the capability token but have no
     transient per-request failure to report.</td></tr>

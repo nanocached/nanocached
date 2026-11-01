@@ -214,12 +214,21 @@ node's definition. The choices that matter:</p>
   dispatched but answered <code>R</code> (<code>B</code> to a client
   without the retryable-error capability) on the same connection, for
   the client to retry. While a request waits for its bytes the proxy
-  holds its frame, up to 1&nbsp;MiB, outside this budget (a waiting
+  holds its receive buffer, with the frame of up to 1&nbsp;MiB in it,
+  outside this budget (a waiting
   request has not been admitted, and holding the frame's charge while
   waiting is what let two connections from one address stall each
-  other), so allow for that many connections times 1&nbsp;MiB on top of
-  the budget: 256&nbsp;MiB for one source IP at the default per-IP
-  connection cap. Raise the flag together with the task's memory. Watch CPU and
+  other). What waiting requests hold is bounded by a second pool of the
+  budget's size, with the same quarter per source IP: a request that
+  would have to wait while that pool is full is answered <code>R</code>
+  (<code>B</code>) at once rather than after 60&nbsp;seconds. The
+  proxy's ceiling for request bytes is therefore twice the flag: the
+  budget, and as much again for frames waiting on it. Size the task's
+  memory for the budget plus the waiting frames you expect: the
+  512&nbsp;MiB here holds the default budget with room for a queue of
+  waiting frames, while a proxy whose waiting frames approach the
+  budget's size has outgrown both the flag and the task. Raise the flag
+  together with the task's memory. Watch CPU and
   <code>nanocached_proxy_client_connections</code> before sizing up
   or out.</li>
   <li><b>No service registry.</b> Discovery is the proxy roster; nothing
