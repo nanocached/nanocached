@@ -404,7 +404,13 @@ here.</p>
   <li>During a join&rsquo;s or a decommission&rsquo;s forwarding window,
   a key rewritten or invalidated within seconds of a write via an old
   owner may keep the previous value until the next write or TTL expiry
-  (a lagging unconditional forward; relay coalescing). A clear is
+  (a lagging unconditional forward; relay coalescing). Measured on
+  2026-11-01 over 21 chaos cells (join, decommission and kill rounds under
+  load): 2 cells showed it, each on keys acknowledged within seconds of a
+  decommissioning node completing its handoff &mdash; one deleted key was
+  served again, three keys set again after a delete read back as missing,
+  and two keys rewritten with a TTL kept the earlier no-TTL copy, which
+  then never expired. A clear is
   forwarded through every window (a join&rsquo;s, a decommission&rsquo;s,
   and an eviction&rsquo;s re-replication) behind the writes queued before
   it, so a cleared key does not come back from such a forward; the mirror case
