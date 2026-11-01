@@ -13,6 +13,12 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- An `Error` (`OutOfMemoryError`, a `LinkageError`, an `AssertionError`
+  under `-ea`) thrown by one of the parallel legs of `getMany`, `setMany`,
+  `touchMany`, `clear`, or by a replica leg of a single-key write reached
+  the caller as a `CompletionException`. It is now thrown as itself, after
+  the remaining legs have been drained, as a hedged read already did
+  (#1215).
 - With `readHedgeAfter` set, a read could block its calling thread forever
   when a hedge leg threw an `Error` (`OutOfMemoryError`, a `LinkageError`
   after a redeploy, an `AssertionError` under `-ea`): the leg recorded no

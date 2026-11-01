@@ -3865,12 +3865,12 @@ public final class NanocachedClient implements AutoCloseable {
      * documented invariant (issue #413). It's dropped instead.
      * Returns the first bug, or {@code null} if every leg succeeded. */
     RuntimeException drainLegsKeepingFirstBug(List<CompletableFuture<Void>> legs) {
-        RuntimeException legBug = null;
+        Throwable legBug = null;
         for (CompletableFuture<Void> pending : legs) {
             try {
                 pending.join();
             } catch (CompletionException wrapped) {
-                RuntimeException bug = unwrapReplicaBug(wrapped);
+                Throwable bug = unwrapReplicaBug(wrapped);
                 if (legBug == null) {
                     legBug = bug;
                 } else if (!(bug instanceof NanocachedException.DecompressionFailed)) {
@@ -3878,7 +3878,9 @@ public final class NanocachedClient implements AutoCloseable {
                 }
             }
         }
-        return legBug;
+        // An Error (OutOfMemoryError, LinkageError, AssertionError) is thrown
+        // as itself, after every leg has been drained — issue #1215.
+        return asRuntimeOrThrowError(legBug);
     }
 
     /** Dispatches one owner's {@code o} sub-batch (via {@link
@@ -5234,12 +5236,12 @@ public final class NanocachedClient implements AutoCloseable {
         // itself also failed — any other one is still counted/logged via
         // reportBackgroundWriteBug, the same as a fireAndForgetReplicas
         // leg's bug above.
-        RuntimeException replicaBug = null;
+        Throwable replicaBug = null;
         for (CompletableFuture<Void> pending : replicaWrites) {
             try {
                 pending.join();
             } catch (CompletionException wrapped) {
-                RuntimeException bug = unwrapReplicaBug(wrapped);
+                Throwable bug = unwrapReplicaBug(wrapped);
                 if (primaryError != null && replicaBug == null) {
                     replicaBug = bug;
                 } else {
@@ -5249,7 +5251,8 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         if (primaryError != null) {
-            throw replicaBug != null ? replicaBug : primaryError;
+            RuntimeException replicaRuntimeBug = asRuntimeOrThrowError(replicaBug);
+            throw replicaRuntimeBug != null ? replicaRuntimeBug : primaryError;
         }
         return value;
     }
@@ -5612,10 +5615,25 @@ public final class NanocachedClient implements AutoCloseable {
      * a genuine programming bug. Every exception escaping this SDK's
      * public API must extend {@link NanocachedException} or be the raw
      * bug itself — never a {@link CompletionException} (audit
-     * finding, see {@link #write}). */
-    private static RuntimeException unwrapReplicaBug(CompletionException wrapped) {
+     * finding, see {@link #write}).
+     *
+     * <p>An {@link Error} cause (an {@code OutOfMemoryError}, a {@code
+     * LinkageError}, an {@code AssertionError} under {@code -ea}) is
+     * returned as itself too, exactly as {@link #readHedged} rethrows one
+     * (issue #1150); {@link #asRuntimeOrThrowError} is what turns it back
+     * into a throw (issue #1215). */
+    private static Throwable unwrapReplicaBug(CompletionException wrapped) {
         Throwable cause = wrapped.getCause();
-        return cause instanceof RuntimeException runtime ? runtime : wrapped;
+        return cause instanceof RuntimeException || cause instanceof Error ? cause : wrapped;
+    }
+
+    /** The bug {@link #unwrapReplicaBug} returned, as the unchecked value
+     * callers hand back to their own caller: an {@link Error} is thrown
+     * right here instead (so it reaches the caller as itself, never wrapped
+     * in a {@link CompletionException}), {@code null} stays {@code null}. */
+    private static RuntimeException asRuntimeOrThrowError(Throwable bug) {
+        if (bug instanceof Error error) throw error;
+        return (RuntimeException) bug;
     }
 
     /** Submits {@code replicaWrite} to {@link #replicaWriters}, falling

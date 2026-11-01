@@ -4041,6 +4041,33 @@ class NanocachedClientTest {
         }
     }
 
+    @Test
+    void drainLegsKeepingFirstBugThrowsALegErrorAsItselfAfterDrainingEveryLeg() throws Exception {
+        // Issue #1215: CompletableFuture#join wraps a leg's Error
+        // (OutOfMemoryError, LinkageError, AssertionError, ...) in a
+        // CompletionException whose cause is not a RuntimeException, so
+        // unwrapReplicaBug used to hand the wrapper back and getMany /
+        // setMany / touchMany / clear leaked a CompletionException. Like
+        // readHedged (issue #1150), the Error must now reach the caller as
+        // itself -- and only after the remaining legs were drained.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                AssertionError injected = new AssertionError("a leg's Error");
+                RuntimeException later = new IllegalStateException("a later leg's bug");
+                List<CompletableFuture<Void>> legs = List.of(
+                        CompletableFuture.failedFuture(injected),
+                        CompletableFuture.failedFuture(later));
+
+                long before = client.stats().backgroundWriteBugs();
+                Throwable thrown = assertThrows(Throwable.class, () -> client.drainLegsKeepingFirstBug(legs));
+
+                assertSame(injected, thrown, "the leg's Error must reach the caller as itself");
+                assertEquals(before + 1, client.stats().backgroundWriteBugs(),
+                        "the later leg must still have been drained and its bug counted");
+            }
+        }
+    }
+
     // ── クラスタでの INCR/DECR (issue #129) ─────────────────────────
     // The one thing that must never happen: a replica replaying the
     // increment itself. Comparing final stored values between primary and
