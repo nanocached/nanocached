@@ -6,6 +6,19 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+### Fixed
+
+- With `read_hedge_after` set, a `get` whose hedge leg panicked could wait
+  forever. Each leg reported its outcome only at the end of its task, and
+  `read_hedged` held the original sender itself, so once every owner was in
+  flight a leg that ended without reporting left `rx.recv()` pending with no
+  timeout (`resolve_hedge_losers` waited the same way). Every leg now reports
+  through a drop guard that sends an error outcome if the task is dropped
+  unsent, and a panic inside a leg is caught and returned to the caller as an
+  `Error::Protocol("... hedged read leg panicked: <message>")` instead of
+  being hedged around. No panic path in a leg is known today; this removes
+  the hang if one is ever introduced. (#1164)
+
 ## [0.6.0] - 2026-11-01
 
 ### Changed
