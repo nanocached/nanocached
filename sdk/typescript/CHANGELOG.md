@@ -18,6 +18,35 @@ tag: 0.4.3 was a server-only release.
   measured against a stopped node). Only the synchronous legs are waited for
   now; a programming error that a background leg has already raised is still
   reported (#1240).
+- A forced node-list refresh (made after a connection failure or a wrong-node
+  answer) joined a refresh that was already in flight, even when that one had
+  fetched its list from discovery before the failure. If a node died in
+  between, the stale list still contained it, the retried operation failed
+  against it again and the error reached the caller. A forced refresh now
+  waits such a refresh out and is satisfied only by one that started after
+  the failure; callers that arrived during the old refresh share a single
+  follow-up refresh (#1227).
+- A `close()` that ran in the few microtasks between a redial finishing and
+  its connection being installed (single-node, cluster member or proxy
+  target) closed only the connections installed at that moment, so the new
+  connection stayed open with nothing left to close it, until the server's
+  60-second idle timeout. The redial's result is now checked against the
+  closed flag before it is installed: it is closed, and the interrupted call
+  rejects with `AlreadyClosedError` (#1216).
+- Any `Error` carrying a string `code` was treated as a lost connection, so
+  `ERR_INVALID_ARG_TYPE` (what `Buffer.concat` throws when a JavaScript
+  caller passes a non-Buffer value, e.g. `set(k, 123 as any)`) made the
+  client force a discovery refresh and run the operation a second time; in
+  proxy mode the refresh also replaced a healthy connection without closing
+  the old one. Only `ConnectionLostError` and the errno codes of a dead or
+  unreachable peer (`ECONNRESET`, `EPIPE`, `ECONNREFUSED`, `ETIMEDOUT`,
+  `ENOTFOUND`, `EHOSTUNREACH`, `ENETUNREACH`, `ECONNABORTED`) count now
+  (#1188).
+- A response that arrived with no request pending (a server or proxy
+  replying to something nobody asked) was parsed and silently discarded, and
+  the connection kept being used. The Python and Go SDKs treat it as a
+  desynced stream; this SDK now does too: the connection is poisoned with a
+  `ConnectionLostError` at once and later requests redial (#1177).
 - `connect()` with a seed address whose port is not a valid TCP port (`NaN`
   from an unset environment variable, a fraction, a number above 65535)
   rejected at once, as it should, but the dial timer had already been armed
