@@ -14,6 +14,19 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a client that sent `m` or `y` frames and did not read
+  the replies held memory outside `--max-in-flight-bytes`. The frame's
+  per-key charge was released before the reply was written, and the reply
+  was charged only for its values, but the reply's entries (40 bytes a key
+  for a miss as well as a hit), the key hashes and the encoded copy stayed
+  allocated for the whole write — up to 10 seconds, or until the connection
+  closed. A 1 MiB frame of one-byte keys is about 350,000 keys, so about
+  20 MB per connection that the budget did not see; 100 connections
+  pipelining 50,000-key frames took the process from 6 MB to 335 MB of
+  resident memory while the budget showed 18.5 MB held. The reply's entries
+  and encoded copy (64 bytes a key) now stay charged until the write is
+  done, and the hashes and wrong-node flags are dropped before it
+  (#1159).
 - `nanocached-node`: a connection's receive-buffer charge against
   `--max-in-flight-bytes` was released as soon as the buffer's reported
   capacity fell to the free 64 KiB, but after a large frame that reported
