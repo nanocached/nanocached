@@ -11610,6 +11610,7 @@ mod tests {
 
     thread_local! {
         static LIVE_BYTES: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+        static PEAK_BYTES: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
     }
 
     fn live_bytes() -> isize {
@@ -11617,7 +11618,19 @@ mod tests {
     }
 
     fn add_live_bytes(delta: isize) {
-        let _ = LIVE_BYTES.try_with(|live| live.set(live.get() + delta));
+        let _ = LIVE_BYTES.try_with(|live| {
+            live.set(live.get() + delta);
+            let _ = PEAK_BYTES.try_with(|peak| peak.set(peak.get().max(live.get())));
+        });
+    }
+
+    /// The most bytes `work` held live at once, above what the thread held
+    /// when it started.
+    fn peak_live_bytes_during<R>(work: impl FnOnce() -> R) -> (R, isize) {
+        let before = live_bytes();
+        PEAK_BYTES.with(|peak| peak.set(before));
+        let result = work();
+        (result, PEAK_BYTES.with(|peak| peak.get()) - before)
     }
 
     // SAFETY: every method forwards to the system allocator unchanged and
@@ -11660,6 +11673,29 @@ mod tests {
 
     #[global_allocator]
     static TEST_ALLOCATOR: ThreadLiveBytes = ThreadLiveBytes;
+
+    #[test]
+    fn a_batch_touch_header_with_a_long_tail_is_rejected_without_a_slot_per_token() {
+        // Issue #1174: at most `[ttl] [G] [tag]` follows the key lengths, but
+        // the tail used to be collected whole: a header of about 1 MiB of
+        // ` x` tokens made a 500,000-slot vector (8 MB) before it failed.
+        let mut frame = b"y 0 1 1".to_vec();
+        while frame.len() < MAX_REQUEST_SIZE - 64 {
+            frame.extend_from_slice(b" x");
+        }
+        frame.extend_from_slice(b"\nk");
+        let mut input = bytes::BytesMut::from(&frame[..]);
+        let (parsed, peak) = peak_live_bytes_during(|| crate::command::parse(&mut input));
+        assert!(
+            parsed.is_err(),
+            "a tail of {} tokens is invalid",
+            frame.len() / 2
+        );
+        assert!(
+            peak < 64 << 10,
+            "parsing the long tail held {peak} bytes at its peak; a bounded tail needs a few hundred"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_multi_key_frame_waiting_for_the_budget_has_not_built_its_key_vector() {
