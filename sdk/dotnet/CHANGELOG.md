@@ -10,6 +10,16 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- A connection's read loop only handled I/O-type failures. Any other
+  exception (a TLS `AuthenticationException`, an `InvalidOperationException`,
+  an unexpected parser error) ended the fire-and-forget loop unobserved: the
+  connection stayed open with no reader and every pending request waited for
+  the 30 s request watchdog. Such an exception now closes the connection and
+  fails the pending requests at once with a `ConnectionLostException` that
+  carries it. (#1217)
+
 ### Changed
 
 - Target framework is now `net10.0`; .NET 8 and .NET 9 reach end of support on 2026-11-10, and 0.6.0 is the last release that targets `net8.0`. Packages are built with the .NET 10 SDK.
