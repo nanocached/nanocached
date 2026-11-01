@@ -14,6 +14,11 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: the `L` roster parser refused a roster of more than
+  4096 nodes, while discovery holds up to 65,536 and the node and every
+  SDK accept as many, so above that size the proxy alone failed every
+  refresh and kept routing on its last good ring. The bound is now the
+  fleet's 65,536 (#1246).
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
