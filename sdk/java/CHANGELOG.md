@@ -11,6 +11,15 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- With `readHedgeAfter` set, a read could block its calling thread forever
+  when a hedge leg threw an `Error` (`OutOfMemoryError`, a `LinkageError`
+  after a redeploy, an `AssertionError` under `-ea`): the leg recorded no
+  outcome, so the caller kept waiting for an answer that never came. The
+  leg now always reports back and the `Error` is rethrown to the caller as
+  itself (#1150).
+
 ## [0.6.0] - 2026-11-01
 
 ### Fixed

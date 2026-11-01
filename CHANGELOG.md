@@ -14,6 +14,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a connection's receive-buffer charge against
+  `--max-in-flight-bytes` was released as soon as the buffer's reported
+  capacity fell to the free 64 KiB, but after a large frame that reported
+  capacity is only the tail of the allocation the frame was read into — the
+  whole allocation stayed in memory until the connection's next growth or
+  its close. An idle connection could so hold about a frame's worth (up to
+  1 MiB) outside the budget, 30 connections about 30 MiB with a 1 MiB
+  budget. The buffer is now rebuilt before the charge is released, so the
+  old allocation goes with it (#1145; a regression in 0.6.0's #1113 change).
 - `nanocached-discovery`: the limit on new registrations from one source
   was a fixed gap of one every 2 seconds, and 0.6.0 made an IPv6 source
   count per /64 prefix. A fleet that shares a source — nodes behind one NAT
