@@ -14,6 +14,7 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a `k` or `x` frame with a digest condition re-hashed the whole stored value with SHA-256 on the cache actor every time, so a 55-byte frame against a 1 MiB value cost about 0.5 ms of actor time (487 us measured in a release build) and a few thousand a second kept every other client waiting. The digest of a value of 4 KiB or more is now kept after the first condition (348 ns per frame afterwards), dropped with the value on any write, removal or eviction, and charged to `--max-memory` (the key plus 128 bytes) while it is kept (#1259).
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
