@@ -10,6 +10,8 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-01
+
 ### Fixed
 
 - A `TouchMany` or `GetManyAndTouch` with a TTL of 0 whose primary leg for

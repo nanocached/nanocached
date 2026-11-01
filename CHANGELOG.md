@@ -12,6 +12,8 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-01
+
 ### Fixed
 
 - `verify-staged-join`: the tool's log directory, `$TMPDIR/verify-staged-join-<pid>`,
@@ -1305,7 +1307,8 @@ without a deprecation cycle and are listed here.
 - Container images for `nanocached-node` and `nanocached-discovery`
   (separate Dockerfile targets).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/server/v0.4.5...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/server/v0.6.0...HEAD
+[0.6.0]: https://github.com/nanocached/nanocached/compare/server/v0.5.1...server/v0.6.0
 [0.5.1]: https://github.com/nanocached/nanocached/compare/server/v0.5.0...server/v0.5.1
 [0.5.0]: https://github.com/nanocached/nanocached/compare/server/v0.4.8...server/v0.5.0
 [0.4.8]: https://github.com/nanocached/nanocached/compare/server/v0.4.7...server/v0.4.8

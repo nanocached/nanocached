@@ -11,6 +11,12 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-01
+
+No changes. Version aligned with the rest of the project: every release
+ships the server, the six SDKs and the seven framework adapters at one
+version, whether or not a component changed.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release
@@ -562,7 +568,8 @@ without a deprecation cycle and are listed below.
 - First tag-driven release of the aligned SDK line (see the repository
   release history for earlier changes).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.5...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.6.0...HEAD
+[0.6.0]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.5.1...sdk/java/v0.6.0
 [0.5.1]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.5.0...sdk/java/v0.5.1
 [0.5.0]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.8...sdk/java/v0.5.0
 [0.4.8]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.7...sdk/java/v0.4.8

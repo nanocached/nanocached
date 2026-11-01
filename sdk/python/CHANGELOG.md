@@ -9,6 +9,8 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-01
+
 ### Fixed
 
 - `get_many_and_touch` and `get_many` against a single node or the proxy
@@ -539,7 +541,8 @@ without a deprecation cycle and are listed below.
 - First tag-driven release of the aligned SDK line (see the repository
   release history for earlier changes).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.5...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.6.0...HEAD
+[0.6.0]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.5.1...sdk/python/v0.6.0
 [0.5.1]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.5.0...sdk/python/v0.5.1
 [0.5.0]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.8...sdk/python/v0.5.0
 [0.4.8]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.7...sdk/python/v0.4.8
