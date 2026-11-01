@@ -154,11 +154,32 @@ export class ConnectionLostError extends NanocachedError {
   }
 }
 
+/** The Node system error codes a dead, unreachable or reset peer produces.
+ * Deliberately a closed list (issue #1188): Node attaches a string `code` to
+ * many errors that have nothing to do with the connection — an
+ * `ERR_INVALID_ARG_TYPE` from `Buffer.concat` on a bad value, say — and
+ * treating those as connection-shaped made the client force a discovery
+ * refresh and retry a caller's programming error (in proxy mode replacing a
+ * healthy connection without closing the old one). */
+const CONNECTION_ERRNO_CODES: ReadonlySet<string> = new Set([
+  "ECONNRESET",
+  "EPIPE",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ECONNABORTED",
+]);
+
 /** Whether an error is connection-shaped: our own ConnectionLostError, or
- * a Node system error (ECONNREFUSED, ECONNRESET, EPIPE, ...). */
+ * a Node system error for a dead or unreachable peer (ECONNREFUSED,
+ * ECONNRESET, EPIPE, ...). */
 export function isConnectionError(error: unknown): boolean {
   if (error instanceof ConnectionLostError) return true;
-  return error instanceof Error && typeof (error as NodeJS.ErrnoException).code === "string";
+  if (!(error instanceof Error)) return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return typeof code === "string" && CONNECTION_ERRNO_CODES.has(code);
 }
 
 /** Thrown by get/set/delete/clear/clearAll when a request is answered the
@@ -867,7 +888,20 @@ export class Connection {
       }
 
       const waiter = this.pending.shift();
-      if (waiter === undefined) continue;
+      if (waiter === undefined) {
+        // A reply nobody asked for: the peer is not speaking the protocol
+        // this connection believes it is (issue #1177). Dropping it would
+        // keep the pairing intact but leave the client trusting a stream
+        // it can no longer vouch for, so poison like the Python and Go
+        // SDKs do. Nothing is pending, so there is no waiter to reject;
+        // later requests see `lastError`.
+        this.poison(
+          new ConnectionLostError(
+            `nanocached: unsolicited ${parsed.response.kind} response from server (connection desynced)`,
+          ),
+        );
+        return;
+      }
 
       // Progress-based deadline (see send()): a dispatched response is
       // progress, so the next-oldest request gets a fresh window; with
