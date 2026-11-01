@@ -4102,6 +4102,11 @@ class NanocachedClientTest {
                     // Restore so close() runs its real teardown.
                     closedField.setBoolean(client, false);
                 }
+            }
+        }
+    }
+
+    @Test
     void drainLegsKeepingFirstBugThrowsALegErrorAsItselfAfterDrainingEveryLeg() throws Exception {
         // Issue #1215: CompletableFuture#join wraps a leg's Error
         // (OutOfMemoryError, LinkageError, AssertionError, ...) in a
