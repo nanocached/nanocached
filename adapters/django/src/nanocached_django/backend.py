@@ -103,6 +103,13 @@ _RUN_RECONNECT_ATTEMPTS = 3
 # own DEFAULT_TIMEOUT sentinel is compared.
 _DO_NOT_CACHE = object()
 
+# The largest TTL the wire carries (the SDK validates ``0 <= ttl <= 2**64 -
+# 1``). A longer Django timeout is not an error: BaseCache/LocMemCache just
+# add it to time.time() and never expire the entry (``float("inf")``
+# included), and 2**64 seconds is ~5.8e11 years, so get_backend_timeout()
+# sends those as "no expiry" rather than failing in math.ceil()/the SDK.
+_MAX_WIRE_TTL = 2**64 - 1
+
 _ADDRESS_SPLIT_RE = re.compile(r"[;,]")
 
 # Issue #129: INCR needs a real counter on the wire, and a pickled int
@@ -666,6 +673,10 @@ class NanocachedCache(BaseCache):
           (``math.ceil``) — the wire has no sub-second resolution, and
           rounding down could turn a short-but-nonzero timeout into
           wire TTL 0, which means eternal instead of "expires very soon".
+        - A value beyond the wire's range (``float("inf")``, ``10**30``)
+          means never expires, like ``None``: ``LocMemCache`` accepts
+          these and never expires the entry, while ``math.ceil`` and the
+          SDK's range check would raise ``OverflowError``/``ValueError``.
         """
         if timeout is DEFAULT_TIMEOUT:
             timeout = self.default_timeout
@@ -673,6 +684,8 @@ class NanocachedCache(BaseCache):
             return 0
         if timeout <= 0:
             return _DO_NOT_CACHE
+        if timeout > _MAX_WIRE_TTL:
+            return 0
         return max(1, math.ceil(timeout))
 
     # ── BaseCache SPI ────────────────────────────────────────────────

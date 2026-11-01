@@ -9,6 +9,10 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Fixed
+
+- `timeout=float("inf")` raised `OverflowError` and a timeout beyond 2**64-1 seconds (for example `10**30`) raised the SDK's `ValueError`, while Django's `LocMemCache` accepts both and never expires the entry. Such timeouts now mean "never expires", the same as `timeout=None`. (#1187)
+
 ### Changed
 
 - Minimum Django version is now 5.2 LTS (`Django>=5.2`). Django 4.2's extended support ended on 2026-04-07; 0.6.0 is the last release that supports it. CI now tests both the 5.2 floor and the current 6.x line instead of only the newest release. `requires-python` is unchanged (3.11+).

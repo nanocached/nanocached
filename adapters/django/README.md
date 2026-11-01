@@ -164,6 +164,7 @@ Django's `timeout` conventions are translated to nanocached's wire TTL
 | `0` or negative                   | nothing is written; `set()` deletes any existing value instead |
 | positive, sub-second              | rounds **up** to `1` (never down to `0`, which would mean eternal) |
 | positive, ≥ 1s                    | rounds up to the next whole second |
+| `float("inf")`, or more than 2**64-1 seconds | `0` (no expiry), as `LocMemCache` never expires such an entry |
 
 ## Usage
 
