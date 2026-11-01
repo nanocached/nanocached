@@ -10,6 +10,14 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- `NanocachedNamespace` kept the caller's `byte[]` namespace and returned its
+  own array from `NamespaceBytes`, so overwriting either buffer later changed
+  the HRW input and the namespace of every later call through the handle (keys
+  written through one handle landed on different nodes). The handle now copies
+  on the way in and returns a copy from `NamespaceBytes`. (#1182)
+
 ### Changed
 
 - Target framework is now `net10.0`; .NET 8 and .NET 9 reach end of support on 2026-11-10, and 0.6.0 is the last release that targets `net8.0`. Packages are built with the .NET 10 SDK.

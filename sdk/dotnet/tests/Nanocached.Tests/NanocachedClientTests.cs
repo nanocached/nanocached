@@ -1258,6 +1258,26 @@ public class NanocachedClientTests
         Assert.Equal(new Dictionary<string, string> { ["k"] = "default" }, await client.GetManyAsync(new[] { "k" }));
     }
 
+    // Issue #1182: the handle owns a private copy of its namespace, on the
+    // way in and on the way out.
+    [Fact]
+    public async Task NamespaceHandleIsNotAffectedByCallerMutatingItsBytes()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        byte[] input = Encoding.UTF8.GetBytes("tenant-a");
+        NanocachedNamespace ns = client.Namespace(input);
+        Array.Clear(input); // reuse the buffer after handing it over
+        byte[] exposed = ns.NamespaceBytes;
+        Array.Clear(exposed); // scribble on what the getter returned
+
+        Assert.Equal("tenant-a", ns.Namespace);
+        Assert.Equal(Encoding.UTF8.GetBytes("tenant-a"), ns.NamespaceBytes);
+        await ns.SetAsync("k", "v", 0);
+        Assert.Equal("v", await client.Namespace("tenant-a").GetAsync("k"));
+    }
+
     [Fact]
     public async Task WrongNodePropagatesForBatchedOpsInSingleMode()
     {
