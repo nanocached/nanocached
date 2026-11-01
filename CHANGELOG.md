@@ -24,6 +24,27 @@ framework adapters at one version, whether or not a component changed.
   node by 530 MB, so a client could push the node past its memory limit. A
   write is now copied into allocations of its own when it enters the queue
   (#1160).
+- `nanocached-node`: a forward to a handoff target that had died but was
+  still in the roster wrote two WARN lines per forwarded write, and
+  re-replication wrote three per key it tried to send to such a target and
+  redialled it for every key. Each line is a synchronous stderr write, so
+  200,000 writes against a killed joiner produced 400,003 lines (47 MB) and
+  took 3.5 times as long, and a re-replication toward a killed peer wrote
+  183,741 lines for 61,248 keys. The first failure against a target is
+  still written in full; repeats are limited to one line per 10 seconds
+  with a count of the rest. Re-replication now skips a target's remaining
+  keys for 30 seconds once one key has used up every attempt (#1161).
+- `nanocached-proxy`: a replica leg of a write that failed or was refused
+  logged a `WARN` line of its own, so with a node down one `o` or `y` wrote
+  a line for every key that node held a copy of: a 200-key `o` against one
+  dead node wrote 109 lines, and a 1 MiB frame holds about 260,000
+  one-byte keys. `eprintln!` is a blocking write under the stderr lock, so a
+  backed-up log pipe stalled the proxy's workers exactly while a node was
+  failing. A multi-key request now writes one line for its failed legs (with
+  their count and the first reason) and one for the refused ones, and all
+  replica-leg warnings, single-key writes and touches included, go through
+  a limiter of 5 lines per second that reports how many it dropped.
+  `nanocached_proxy_replica_refusals_total` still counts every leg (#1162).
 - `nanocached-node`: a connection's receive-buffer charge against
   `--max-in-flight-bytes` was released as soon as the buffer's reported
   capacity fell to the free 64 KiB, but after a large frame that reported
@@ -88,7 +109,13 @@ framework adapters at one version, whether or not a component changed.
   but not for `nanocached-proxy`, so after a release the three `:latest`
   images pointed at different code and the quickstarts pulled unreleased
   `main`. Builds of `main` are published as `:main` and `:sha-<commit>` for
-  all three images, one publish run at a time (#1149).
+  all three images, one publish run at a time (#1149). `:main` is put only
+  on a build of the commit that is the tip of `main` when the publish runs:
+  CI runs for consecutive commits finish in their own order, and a re-run
+  of an older commit's CI finishes last of all, so without that check a
+  later-finishing run could move `:main` back to an older commit. A build
+  of a commit that is no longer the tip gets its `:sha-<commit>` tag only
+  (#1165).
 
 ## [0.6.0] - 2026-11-01
 

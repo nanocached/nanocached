@@ -7494,6 +7494,82 @@ async fn hedge_losers_fall_back_to_synchronous_past_the_cap() {
     }
 }
 
+/// Disarms the hedge-leg panic hook even if the test fails first, so a
+/// failed assertion cannot leave it armed for another test.
+struct DisarmHedgeLegPanic;
+
+impl Drop for DisarmHedgeLegPanic {
+    fn drop(&mut self) {
+        nanocached::PANIC_HEDGE_LEG_ARMED.store(false, Ordering::SeqCst);
+        *nanocached::PANIC_HEDGE_LEG_FOR.lock().unwrap() = None;
+    }
+}
+
+#[tokio::test]
+async fn a_hedge_leg_that_panics_fails_the_read_instead_of_hanging_it() {
+    // Issue #1164: each leg reported its outcome only at the end of its
+    // task, and read_hedged kept the original sender alive, so a leg that
+    // panicked left the reader in rx.recv() forever once every owner was
+    // in flight (no timeout of its own). Here the primary's leg panics and
+    // the key is on neither owner: before the fix the replica leg answered
+    // with a provisional miss, the panicked primary never reported, and
+    // get() hung. Now the guard reports the panic, which is surfaced as an
+    // error rather than hedged around. This is the only test that touches
+    // the process-wide hook, so it cannot race another test.
+    let _disarm = DisarmHedgeLegPanic;
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(
+        options(discovery.port).read_hedge_after(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+
+    // A key no other test reads: node names are shared by every test's
+    // cluster, so the hook is keyed by key.
+    const KEY: &str = "hedge-leg-panic-1164";
+    *nanocached::PANIC_HEDGE_LEG_FOR.lock().unwrap() = Some((KEY.as_bytes().to_vec(), 0));
+    nanocached::PANIC_HEDGE_LEG_ARMED.store(true, Ordering::SeqCst);
+
+    // Phase 1: the key is absent everywhere.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), client.get(KEY))
+        .await
+        .expect("get() must return when a hedge leg panics, not wait forever");
+    match outcome {
+        Err(Error::Protocol(message)) => {
+            assert!(
+                message.contains("hedged read leg panicked")
+                    && message.contains("injected hedge leg panic"),
+                "the panic's message should reach the caller, got {message:?}"
+            );
+        }
+        other => panic!("expected the leg's panic as an error, got {other:?}"),
+    }
+
+    // Phase 2: a copy exists on the replica. A panicked leg is a bug to
+    // report, not an owner to route around, so the read still fails.
+    nanocached::PANIC_HEDGE_LEG_ARMED.store(false, Ordering::SeqCst);
+    client.set(KEY, "v", 0).await.unwrap();
+    nanocached::PANIC_HEDGE_LEG_ARMED.store(true, Ordering::SeqCst);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), client.get(KEY))
+        .await
+        .expect("get() must return when a hedge leg panics, not wait forever");
+    assert!(
+        matches!(outcome, Err(Error::Protocol(_))),
+        "expected the leg's panic as an error, got {outcome:?}"
+    );
+
+    // The client stays usable: with the hook off, the same read succeeds.
+    nanocached::PANIC_HEDGE_LEG_ARMED.store(false, Ordering::SeqCst);
+    assert_eq!(client.get(KEY).await.unwrap(), Some("v".to_string()));
+
+    // close() drains the legs, including the ones that panicked.
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
 #[tokio::test]
 async fn read_hedge_after_rejects_a_zero_duration() {
     let result = NanocachedClient::connect(
