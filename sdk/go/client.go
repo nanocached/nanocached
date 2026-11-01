@@ -503,6 +503,12 @@ type Client struct {
 	ring          *HashRing
 	replication   int
 	lastFetch     time.Time
+	// When the fetch behind lastFetch began. A forced refresh may reuse a
+	// refresh that completed while it waited for the gate only if that
+	// refresh started after the caller observed its failure: one that was
+	// already in flight fetched the roster from before the failure (issue
+	// #1247).
+	lastFetchStarted time.Time
 }
 
 // ── open-connection tracking (forgotten-close detection) ────────────
@@ -3280,9 +3286,12 @@ func (c *Client) openNodeConnection(address string) (*connection, error) {
 func (c *Client) maybeRefresh(force bool) {
 	c.mu.Lock()
 	skip := c.ring == nil || (!force && time.Since(c.lastFetch) < nodeListStaleAfter)
-	// What the caller saw when it decided to refresh: a forced refresh
-	// that completes while this caller waits for the gate serves it too.
-	observed := c.lastFetch
+	// When the caller decided to refresh: a forced refresh that *started*
+	// after this moment and completes while this caller waits for the
+	// gate serves it too. One that started earlier does not — it fetched
+	// the roster from before the failure this caller is reacting to, so
+	// retrying on it would fail again (issue #1247).
+	observed := time.Now()
 	c.mu.Unlock()
 	if skip {
 		return
@@ -3295,8 +3304,8 @@ func (c *Client) maybeRefresh(force bool) {
 	// used to run N refreshes one after another behind the gate, each a
 	// full fetch against discovery (5 s each when discovery is slow), and
 	// the last caller waited for all of them. A forced caller now reuses
-	// a refresh that finished after it observed its failure.
-	skip = (!force && time.Since(c.lastFetch) < nodeListStaleAfter) || (force && c.lastFetch.After(observed))
+	// a refresh that started after it observed its failure.
+	skip = (!force && time.Since(c.lastFetch) < nodeListStaleAfter) || (force && !c.lastFetchStarted.Before(observed))
 	c.mu.Unlock()
 	if skip {
 		return
@@ -3305,6 +3314,9 @@ func (c *Client) maybeRefresh(force bool) {
 }
 
 func (c *Client) refreshNodeList() {
+	c.mu.Lock()
+	c.lastFetchStarted = time.Now()
+	c.mu.Unlock()
 	nodes, replication, ok := c.fetchNodeList()
 	nodes = dedupeDiscoveredNodes(nodes)
 
