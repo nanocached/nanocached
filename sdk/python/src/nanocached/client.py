@@ -658,6 +658,9 @@ class NanocachedClient:
         self._target_key: str | None = None
         self._last_fetch = time.monotonic()
         self._refresh_task: asyncio.Task[None] | None = None
+        # When _refresh_task began (monotonic): a forced refresh only joins
+        # one that started after the failure it reacts to (_maybe_refresh).
+        self._refresh_started: float = 0.0
         self._redials: dict[str, asyncio.Task[Connection]] = {}
         self._reconnect_cooldown: float = _DEFAULT_RECONNECT_COOLDOWN
         # Per-address reconnect cooldown (see _redial) — keyed by address
@@ -3549,9 +3552,29 @@ class NanocachedClient:
         if not force and time.monotonic() - self._last_fetch < _NODE_LIST_STALE_AFTER:
             return
 
-        if self._refresh_task is None or self._refresh_task.done():
-            self._refresh_task = asyncio.ensure_future(self._refresh_node_list())
-        await asyncio.shield(self._refresh_task)
+        # What the caller saw when it decided to refresh. A forced
+        # refresh exists because an operation just failed against the
+        # current node list, so a fetch that began before that failure
+        # (say, the 30 s stale check's, already past its discovery read
+        # when the node died) would install the very list that failed and
+        # send the retry back to it. Such a refresh is waited out and a
+        # fresh one runs after it — never concurrently, since both write
+        # the member table. Forced callers that arrive while the fresh one
+        # runs share it. (issue #1200)
+        observed = time.monotonic()
+        while True:
+            task = self._refresh_task
+            if task is None or task.done():
+                task = asyncio.ensure_future(self._refresh_node_list())
+                self._refresh_task = task
+                self._refresh_started = time.monotonic()
+            elif force and self._refresh_started < observed:
+                # wait() neither raises the old refresh's error (its own
+                # callers get it) nor cancels it if we are cancelled.
+                await asyncio.wait({task})
+                continue
+            await asyncio.shield(task)
+            return
 
     async def _refresh_node_list(self) -> None:
         cluster = await self._fetch_node_list()

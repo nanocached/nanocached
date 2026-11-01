@@ -6086,6 +6086,67 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
                     pass
 
 
+class ForcedRefreshTests(unittest.IsolatedAsyncioTestCase):
+    """issue #1200: a forced refresh must not be answered by a node-list
+    fetch that began before the failure that forced it."""
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+        self.discovery = await MockDiscovery([(NAMES[0], self.node.address)]).start()
+        self.client = await NanocachedClient.connect([("127.0.0.1", self.discovery.port)])
+        self.fetches = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        original = self.client._fetch_node_list
+
+        async def gated():
+            self.fetches += 1
+            number = self.fetches
+            self.entered.set()
+            if number == 1:
+                # The first fetch has read discovery's answer and is
+                # still in flight when the failure is observed.
+                await self.release.wait()
+            return await original()
+
+        self.client._fetch_node_list = gated
+
+    async def asyncTearDown(self):
+        self.release.set()
+        await self.client.close()
+        await self.discovery.close()
+        await self.node.close()
+
+    async def test_forced_refresh_does_not_join_a_refresh_that_started_earlier(self):
+        earlier = asyncio.ensure_future(self.client._maybe_refresh(force=True))
+        await asyncio.wait_for(self.entered.wait(), 5)
+        forced = asyncio.ensure_future(self.client._maybe_refresh(force=True))
+        await asyncio.sleep(0.05)
+        self.assertFalse(forced.done(), "must wait for a fetch that starts after its failure")
+        self.release.set()
+        await asyncio.wait_for(asyncio.gather(earlier, forced), 5)
+        self.assertEqual(self.fetches, 2)
+
+    async def test_forced_callers_after_the_failure_share_one_fresh_refresh(self):
+        earlier = asyncio.ensure_future(self.client._maybe_refresh(force=True))
+        await asyncio.wait_for(self.entered.wait(), 5)
+        forced = [asyncio.ensure_future(self.client._maybe_refresh(force=True)) for _ in range(3)]
+        await asyncio.sleep(0.05)
+        self.release.set()
+        await asyncio.wait_for(asyncio.gather(earlier, *forced), 5)
+        self.assertEqual(self.fetches, 2)
+
+    async def test_stale_check_still_joins_a_refresh_in_flight(self):
+        earlier = asyncio.ensure_future(self.client._maybe_refresh(force=True))
+        await asyncio.wait_for(self.entered.wait(), 5)
+        self.client._last_fetch = -1e9  # stale: the unforced path wants a refresh too
+        joined = asyncio.ensure_future(self.client._maybe_refresh())
+        await asyncio.sleep(0.05)
+        self.release.set()
+        await asyncio.wait_for(asyncio.gather(earlier, joined), 5)
+        self.assertEqual(self.fetches, 1)
+
+
 class NamespaceTests(unittest.IsolatedAsyncioTestCase):
     # Namespaces (issue #105): NanocachedClient.namespace() and the
     # Namespace handle it returns — single-node coverage. See
