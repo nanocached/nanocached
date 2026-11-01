@@ -1515,6 +1515,59 @@ describe("unsolicited busy response (issue #45)", () => {
   });
 });
 
+describe("a redial finishing after close() (issue #1216)", () => {
+  // close() only closes the connections installed when it runs, so a redial
+  // that resolves after close() must not install its result. The race is a
+  // few microtasks wide; `ensureConnected` is wrapped so close() runs
+  // exactly there, right after the redial resolves.
+  async function closeRightAfterRedial(mode: "single" | "cluster" | "proxy"): Promise<void> {
+    const node = await startMockNode();
+    const discovery =
+      mode === "single"
+        ? null
+        : await startMockDiscovery(mode === "cluster" ? [{ name: "n1", address: node.address }] : []);
+    if (discovery !== null && mode === "proxy") discovery.setProxies([{ name: "p1", address: node.address }]);
+    let redialed: Connection | null = null;
+    try {
+      const client = await NanocachedClient.connect(
+        mode === "single"
+          ? { addresses: [{ host: "127.0.0.1", port: node.port }] }
+          : { addresses: [{ host: "127.0.0.1", port: discovery!.port }], viaProxy: mode === "proxy" },
+      );
+      const current = (): Connection => {
+        const target = (client as any).target;
+        return target.kind === "cluster" ? target.members.get("n1").connection : target.connection;
+      };
+      try {
+        await client.set("k", "v");
+        const dead = current();
+        node.dropConnections();
+        await waitFor(() => dead.isClosed(), "the connection to be dropped");
+
+        const original = (client as any).ensureConnected.bind(client);
+        (client as any).ensureConnected = async (...args: unknown[]) => {
+          redialed = await original(...args);
+          void client.close();
+          return redialed;
+        };
+
+        await assert.rejects(client.get("k"), AlreadyClosedError);
+        assert.ok(redialed !== null, "the get must have redialed");
+        await waitFor(() => (redialed as unknown as Connection).isClosed(), "the redialed connection to be closed");
+      } finally {
+        (redialed as Connection | null)?.close();
+        if (!client.isClosed()) await client.close();
+      }
+    } finally {
+      await Promise.all([discovery?.close(), node.close()]);
+    }
+  }
+
+  it("a single-node client closes the redialed connection", () => closeRightAfterRedial("single"));
+  it("a cluster client closes the redialed connection", () => closeRightAfterRedial("cluster"));
+  it("a proxy-mode client closes the redialed connection", () => closeRightAfterRedial("proxy"));
+});
+
 describe("unsolicited response with nothing pending (issue #1177)", () => {
   it("poisons the connection instead of silently dropping the reply", async () => {
     // Regression: a parsed response with no pending request was discarded
