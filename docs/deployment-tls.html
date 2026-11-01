@@ -697,7 +697,7 @@ and its own stream prefix:</p>
 # td-node.json, with the placeholder replaced by $TLS_INIT_SCRIPT:
 [{
   "name": "tls-init",
-  "image": "public.ecr.aws/docker/library/alpine:3.21",
+  "image": "public.ecr.aws/docker/library/alpine:3.24",
   "essential": false,
   "entryPoint": ["sh", "-c"],
   "command": [TLS_INIT_SCRIPT],
@@ -855,7 +855,7 @@ spec:
             matchLabels: {app: nanocached-node}
       initContainers:
         - name: tls-init
-          image: public.ecr.aws/docker/library/alpine:3.21
+          image: public.ecr.aws/docker/library/alpine:3.24
           command: ["sh", "-c"]
           args:
             - |
@@ -1096,7 +1096,7 @@ spec:
             matchLabels: {app: nanocached-proxy}
       initContainers:
         - name: tls-init
-          image: public.ecr.aws/docker/library/alpine:3.21
+          image: public.ecr.aws/docker/library/alpine:3.24
           command: ["sh", "-c"]
           args:
             - |

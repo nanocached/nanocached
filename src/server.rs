@@ -4185,7 +4185,26 @@ async fn handle_connection(
         // on until the tail itself is dropped or rebuilt. Releasing the
         // charge on that reported capacity alone left up to a frame's
         // worth of memory per idle connection outside the budget.
-        if (received.capacity() > REQUEST_BUFFER_SHRINK_THRESHOLD || receive_charged > 0)
+        //
+        // Issue #1204: a buffer over the threshold is rebuilt only when it
+        // is mostly slack. A rebuild leaves `capacity == len`, and the
+        // growth below then doubles it; for `len` between half the
+        // threshold and the threshold that is over the threshold again, so
+        // a client trickling a frame in that range made every read copy
+        // the buffer twice (about 50 KB of memcpy per byte received).
+        // Growth from an exact-size buffer reaches `2 * len`, never past
+        // `2 * len + threshold`, so it does not trigger the next rebuild.
+        // A charge with the reported capacity at or under the threshold is
+        // the `split_to` case above, whose capacity cannot be trusted:
+        // that rebuilds, and the rebuild releases the charge.
+        let mostly_slack = received.capacity()
+            > received
+                .len()
+                .saturating_mul(2)
+                .saturating_add(REQUEST_BUFFER_SHRINK_THRESHOLD);
+        let charged_under_threshold =
+            received.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD && receive_charged > 0;
+        if (mostly_slack || charged_under_threshold)
             && received.len() <= REQUEST_BUFFER_SHRINK_THRESHOLD
         {
             let mut shrunk = BytesMut::with_capacity(received.len());
@@ -6458,7 +6477,20 @@ impl Drop for MigrationGuard {
             .slot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _ = take_slot_keeping_lingering(&mut slot);
+        //
+        // Issue #1185: revoke the forwards already queued against the slot,
+        // as every other path that ends a handoff before its window runs
+        // out does (abandon, eviction, replacement). The joiner may be
+        // unreachable (the usual reason a transfer fails), and the address
+        // may later belong to another process. Not done for the lazy expiry
+        // (`expired()` clearing the slot): there the joiner is confirmed
+        // and alive and only its window has closed, so what is still
+        // queued are writes accepted inside that window and revoking would
+        // discard them. The remnant shares this flag, but its own window is
+        // zero, so setting it costs nothing.
+        if let Some(taken) = take_slot_keeping_lingering(&mut slot) {
+            taken.forward_revoked.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -7801,7 +7833,10 @@ async fn fetch_roster_once(
     node_context: &NodeContext,
     addr: &str,
 ) -> io::Result<(Vec<(String, String, String)>, usize)> {
-    const MAX_ROSTER_ENTRIES: usize = 4096;
+    // The entry cap is the module-level `MAX_ROSTER_ENTRIES` (discovery's
+    // registry size), shared with the heartbeat ack: `T` returns every
+    // registered node, so a smaller local cap here made any registry above
+    // it fail every fetch and a draining node leave without a handoff.
     const MAX_NAME_ADDR_OR_TOKEN_LENGTH: usize = 1024;
 
     let stream = connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
@@ -11702,6 +11737,7 @@ mod tests {
 
     thread_local! {
         static LIVE_BYTES: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+        static PEAK_BYTES: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
     }
 
     fn live_bytes() -> isize {
@@ -11709,7 +11745,19 @@ mod tests {
     }
 
     fn add_live_bytes(delta: isize) {
-        let _ = LIVE_BYTES.try_with(|live| live.set(live.get() + delta));
+        let _ = LIVE_BYTES.try_with(|live| {
+            live.set(live.get() + delta);
+            let _ = PEAK_BYTES.try_with(|peak| peak.set(peak.get().max(live.get())));
+        });
+    }
+
+    /// The most bytes `work` held live at once, above what the thread held
+    /// when it started.
+    fn peak_live_bytes_during<R>(work: impl FnOnce() -> R) -> (R, isize) {
+        let before = live_bytes();
+        PEAK_BYTES.with(|peak| peak.set(before));
+        let result = work();
+        (result, PEAK_BYTES.with(|peak| peak.get()) - before)
     }
 
     // SAFETY: every method forwards to the system allocator unchanged and
@@ -11752,6 +11800,29 @@ mod tests {
 
     #[global_allocator]
     static TEST_ALLOCATOR: ThreadLiveBytes = ThreadLiveBytes;
+
+    #[test]
+    fn a_batch_touch_header_with_a_long_tail_is_rejected_without_a_slot_per_token() {
+        // Issue #1174: at most `[ttl] [G] [tag]` follows the key lengths, but
+        // the tail used to be collected whole: a header of about 1 MiB of
+        // ` x` tokens made a 500,000-slot vector (8 MB) before it failed.
+        let mut frame = b"y 0 1 1".to_vec();
+        while frame.len() < MAX_REQUEST_SIZE - 64 {
+            frame.extend_from_slice(b" x");
+        }
+        frame.extend_from_slice(b"\nk");
+        let mut input = bytes::BytesMut::from(&frame[..]);
+        let (parsed, peak) = peak_live_bytes_during(|| crate::command::parse(&mut input));
+        assert!(
+            parsed.is_err(),
+            "a tail of {} tokens is invalid",
+            frame.len() / 2
+        );
+        assert!(
+            peak < 64 << 10,
+            "parsing the long tail held {peak} bytes at its peak; a bounded tail needs a few hundred"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_multi_key_frame_waiting_for_the_budget_has_not_built_its_key_vector() {
@@ -11926,6 +11997,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dropping_an_unfinished_guard_revokes_its_queued_forwards() {
+        let slot: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let history = RingHistory::default();
+        let ring = Arc::new(HashRing::new(vec!["a".to_string(), "joiner".to_string()]));
+        let guard = MigrationGuard::new(
+            Arc::clone(&slot),
+            "joiner".to_string(),
+            "127.0.0.1:1".to_string(),
+            "tok".to_string(),
+            ring,
+            1,
+            None,
+            &[],
+            &known_ring,
+            &history,
+        )
+        .unwrap_new();
+        let revoked = Arc::clone(&slot.lock().unwrap().as_ref().unwrap().forward_revoked);
+        drop(guard); // run_migration returned early: transfer to the joiner failed
+        assert!(slot.lock().unwrap().is_none());
+        assert!(
+            revoked.load(Ordering::SeqCst),
+            "slot cleared by an unfinished guard, forwards queued against it not revoked"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn releasing_the_receive_charge_lets_go_of_the_oversized_allocation_too() {
         // Issue #1145: the 200 KB frame grows the buffer to 256 KiB;
         // `split_to` hands the frame its bytes as a view of that same
@@ -11968,6 +12067,77 @@ mod tests {
             1,
             "the charge was released without rebuilding the buffer, so the \
              256 KiB allocation the frame grew it to is still held, uncharged"
+        );
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), connection_task).await;
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_trickled_frame_between_half_and_all_of_the_threshold_does_not_rebuild_the_buffer_per_read()
+     {
+        // Issue #1204: a 100 KB frame grows the buffer past the threshold
+        // and is cut out; the next frame's first 60 KB are already in the
+        // buffer when its remaining bytes start to trickle. A rebuild
+        // leaves the buffer exactly as big as its contents, the next read
+        // grows it to twice that, which is over the threshold again once it
+        // is nearly full, and the following read used to rebuild it again:
+        // 3,000 one-byte writes meant about 1,700 rebuilds, each copying
+        // 60 KB twice.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(4 * MAX_REQUEST_SIZE);
+        let (mut client, server) = tcp_pair().await;
+        client.set_nodelay(true).unwrap();
+        RECEIVE_BUFFER_REBUILDS.with(|n| n.set(0));
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        let mut frame = b"S 1 100000\nk".to_vec();
+        frame.extend(std::iter::repeat_n(b'v', 100_000));
+        frame.extend_from_slice(b"S 1 70000\nk");
+        frame.extend(std::iter::repeat_n(b'v', 60_000));
+        client.write_all(&frame).await.unwrap();
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"S\n");
+        sleep(Duration::from_millis(100)).await;
+        let rebuilds_before = RECEIVE_BUFFER_REBUILDS.with(|n| n.get());
+
+        for _ in 0..3_000 {
+            client.write_all(b"v").await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        sleep(Duration::from_millis(100)).await;
+        let rebuilds = RECEIVE_BUFFER_REBUILDS.with(|n| n.get()) - rebuilds_before;
+        assert!(
+            rebuilds <= 2,
+            "3,000 one-byte writes into a 60 KB partial frame rebuilt the buffer {rebuilds} times"
+        );
+
+        // The frame still completes, and once it is cut out the connection
+        // holds nothing of the budget.
+        client.write_all(&[b'v'; 7_000]).await.unwrap();
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"S\n");
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            budget.available(),
+            4 * MAX_REQUEST_SIZE,
+            "an idle connection must hold nothing of the budget"
         );
 
         drop(client);
@@ -27494,6 +27664,47 @@ mod tests {
         let error = fetch_from(response).await;
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("size cap"), "entry: got {error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_roster_once_accepts_as_many_entries_as_discovery_can_hold() {
+        // Issue #1175: discovery's registry holds up to 65,536 nodes and `T`
+        // returns all of them, but this parser used to stop at 4096, so a
+        // larger registry made every `T` "bad T response" and a draining
+        // node left without a handoff. The limit is the same one the
+        // heartbeat ack uses.
+        async fn fetch_with_count(count: usize) -> io::Result<usize> {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let discovery_addr = listener.local_addr().unwrap().to_string();
+            let fake_discovery = tokio::spawn(async move {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 64];
+                let _ = connection.read(&mut request).await; // "T <n> <t>\n<name><token>"
+                let mut response = format!("N {count} 2\n").into_bytes();
+                // One-byte name, address and token keep the body small.
+                for _ in 0..count.min(MAX_ROSTER_ENTRIES) {
+                    response.extend_from_slice(b"1 1 1\nnat\n");
+                }
+                let _ = connection.write_all(&response).await;
+            });
+            let node_context = test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            );
+            let result = fetch_roster_once(&node_context, &discovery_addr).await;
+            fake_discovery.abort();
+            result.map(|(members, _)| members.len())
+        }
+
+        assert_eq!(fetch_with_count(5000).await.unwrap(), 5000);
+        assert_eq!(
+            fetch_with_count(MAX_ROSTER_ENTRIES).await.unwrap(),
+            MAX_ROSTER_ENTRIES
+        );
+        let error = fetch_with_count(MAX_ROSTER_ENTRIES + 1).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
