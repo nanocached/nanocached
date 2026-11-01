@@ -12,6 +12,7 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A caller that hit a dead node and forced a node-list refresh could reuse a refresh that was already in flight when the node died: only the completion time of the previous fetch was compared, so a fetch that started before the failure and finished after the caller's check counted as fresh, and the caller retried against the roster from before the failure. A forced caller now reuses only a refresh that started after it observed its failure; callers that fail at the same time still share one refresh (#1247).
 - `Close` and a node-list refresh closed connections while holding the client's mutex, which every operation takes to route. A TLS connection's close writes a close_notify alert with a write deadline of up to 5 s, so a node that had stopped reading could stall every operation on the client for that long. Connections are now collected under the lock and closed after it is released. (#1214)
 
 ### Changed

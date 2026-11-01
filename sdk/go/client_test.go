@@ -3804,6 +3804,44 @@ func TestForcedRefreshesAreSingleFlight(t *testing.T) {
 	}
 }
 
+func TestAForcedRefreshDoesNotReuseARefreshThatStartedBeforeItsFailure(t *testing.T) {
+	// A refresh already in flight when a caller hits a dead node fetched
+	// the roster from before that failure. The caller used to reuse it
+	// (it completed after the caller's own check, and only completion
+	// time was compared), retry against the stale roster and fail again;
+	// it now waits for the gate and fetches on its own (issue #1247).
+	node := startMockNode(t, nil)
+	discovery := startMockDiscovery(t, []discoveredNode{{Name: testNames[0], Address: node.address()}}, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	const delay = 400 * time.Millisecond
+	discovery.laterListDelay.Store(int64(delay))
+	node.close()
+
+	// First caller: fails, forces a refresh, and that refresh is in flight
+	// (held by the mock's delay) when the second caller fails.
+	first := make(chan struct{})
+	go func() {
+		defer close(first)
+		_, _, _ = client.Get("k")
+	}()
+	time.Sleep(delay / 4)
+	_, _, _ = client.Get("k")
+	<-first
+
+	// The bootstrap fetch, the first caller's, and the second caller's own.
+	if got := discovery.lCount.Load(); got != 3 {
+		t.Fatalf("discovery saw %d L fetches, want 3: the second caller must not reuse a refresh that started before its failure", got)
+	}
+}
+
 func TestGetManyReadsARepeatedKeyOnce(t *testing.T) {
 	// A repeated key is read once: sending every copy would cost one
 	// `m` frame per 400 copies and retain one reply per frame.
