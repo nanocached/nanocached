@@ -13,9 +13,13 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ## [0.6.0] - 2026-11-01
 
-No changes. Version aligned with the rest of the project: every release
-ships the server, the six SDKs and the seven framework adapters at one
-version, whether or not a component changed.
+### Fixed
+
+- The Javadoc build failed with `reference not found` on a `{@link}` to a
+  private comparator in `HashRing`, which stopped the Maven Central publish of
+  this release: the publishing plugin stopped disabling DocLint in its 0.35
+  release, so the broken reference became an error. The comment now names
+  the comparator in plain code font. No API or behaviour change.
 
 ## [0.5.1] - 2026-10-27
 

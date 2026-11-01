@@ -136,7 +136,7 @@ public final class HashRing {
      * small constant (2-5) while a cluster can have many nodes, so this
      * avoids paying for a full ranking this call only ever uses the front
      * of. Produces the identical ordering a full sort would (same
-     * comparator, {@link #order}), just without sorting the nodes this
+     * comparator, {@code ORDER}), just without sorting the nodes this
      * call discards.
      */
     public List<String> owners(byte[] key, int replicas) {
