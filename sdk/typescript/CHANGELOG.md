@@ -11,6 +11,15 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- Any `Error` carrying a string `code` was treated as a lost connection, so
+  `ERR_INVALID_ARG_TYPE` (what `Buffer.concat` throws when a JavaScript
+  caller passes a non-Buffer value, e.g. `set(k, 123 as any)`) made the
+  client force a discovery refresh and run the operation a second time; in
+  proxy mode the refresh also replaced a healthy connection without closing
+  the old one. Only `ConnectionLostError` and the errno codes of a dead or
+  unreachable peer (`ECONNRESET`, `EPIPE`, `ECONNREFUSED`, `ETIMEDOUT`,
+  `ENOTFOUND`, `EHOSTUNREACH`, `ENETUNREACH`, `ECONNABORTED`) count now
+  (#1188).
 - A response that arrived with no request pending (a server or proxy
   replying to something nobody asked) was parsed and silently discarded, and
   the connection kept being used. The Python and Go SDKs treat it as a
