@@ -103,8 +103,11 @@ reclaim all get the graceful path with no extra hooks.</p>
   <li>It hands every key it owns to the node that becomes the new owner
   once it's gone — so even at R=1 the only copy <em>moves</em> rather
   than dies.</li>
-  <li>It leaves the cluster membership immediately (no liveness timeout
-  to wait out), so clients refresh onto the surviving nodes.</li>
+  <li>It leaves the cluster membership immediately once the handoff is
+  done (no liveness timeout to wait out), so clients refresh onto the
+  surviving nodes. Until then it stays a member and keeps heartbeating, so
+  a handoff longer than the discovery's liveness timeout does not get the
+  node evicted halfway through.</li>
   <li>It keeps serving and forwards writes it no longer owns for the
   rest of the budget while clients catch up, then exits 0.</li>
 </ol>

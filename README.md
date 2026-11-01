@@ -124,7 +124,8 @@ it is fixed or removed; `fire_and_forget_replicas` keeps only the replica
 legs off the caller's path.
 
 Leaving is graceful: on SIGTERM a clustered node hands every key it owns
-to the node that inherits it, leaves membership immediately, and keeps
+to the node that inherits it (staying a member, and heartbeating, until
+the handoff is done), leaves membership immediately after, and keeps
 forwarding concurrent writes while clients catch up — all within
 `--drain-timeout` seconds (default 25; `0` skips the handoff; at most
 604800). The proxy
