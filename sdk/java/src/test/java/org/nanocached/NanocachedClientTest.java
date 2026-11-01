@@ -4925,6 +4925,67 @@ class NanocachedClientTest {
     }
 
     @Test
+    void anErrorInAHedgeLegSettlesTheReadInsteadOfParkingTheCallerForever() throws Exception {
+        // Issue #1150: a hedge leg that threw an Error (OutOfMemoryError,
+        // LinkageError, AssertionError under -ea, ...) used to record no
+        // outcome and never signal the caller, which then parked in
+        // completions.take() with no timeout. The leg must always settle, and
+        // the Error must reach the caller as itself -- neither wrapped nor
+        // swallowed. readHedged/ConnectionOp are private, so as in
+        // aHedgeLegRacingCloseIsRefusedNotRegistered the path is driven
+        // reflectively.
+        try (Cluster cluster = startCluster(2)) {
+            NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50);
+            try {
+                client.set("k", "v");
+
+                Class<?> opInterface = Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
+                AssertionError injected = new AssertionError("injected hedge-leg error");
+                Object op = Proxy.newProxyInstance(
+                        opInterface.getClassLoader(), new Class<?>[] {opInterface},
+                        (proxy, method, args) -> {
+                            throw injected;
+                        });
+                Method readHedged =
+                        NanocachedClient.class.getDeclaredMethod("readHedged", opInterface, List.class);
+                readHedged.setAccessible(true);
+
+                // Run on a separate daemon thread so a regression shows up as a
+                // bounded assertion failure instead of a hung test run.
+                java.util.concurrent.atomic.AtomicReference<Throwable> thrown =
+                        new java.util.concurrent.atomic.AtomicReference<>();
+                Thread caller = new Thread(() -> {
+                    try {
+                        readHedged.invoke(client, op, List.of(NAMES.get(0), NAMES.get(1)));
+                    } catch (InvocationTargetException e) {
+                        thrown.set(e.getCause());
+                    } catch (Throwable e) {
+                        thrown.set(e);
+                    }
+                }, "hedge-error-caller");
+                caller.setDaemon(true);
+                caller.start();
+                caller.join(5_000);
+                boolean parked = caller.isAlive();
+                if (parked) {
+                    caller.interrupt();
+                    caller.join(2_000);
+                }
+                assertFalse(parked, "readHedged must not park forever after a leg threw an Error");
+                assertSame(injected, thrown.get(), "the leg's Error must reach the caller unchanged");
+            } finally {
+                // close() must still complete: the failed legs were drained.
+                Thread closer = new Thread(client::close, "hedge-error-closer");
+                closer.setDaemon(true);
+                closer.start();
+                closer.join(5_000);
+                boolean closeHung = closer.isAlive();
+                assertFalse(closeHung, "close() must complete after a hedge leg threw an Error");
+            }
+        }
+    }
+
+    @Test
     void aHedgeLegRacingCloseIsRefusedNotRegistered() throws Exception {
         // Issue #91: a read that passed its own closed-check can reach
         // hedge-leg registration only after close() set `closed` and drained

@@ -4812,29 +4812,38 @@ public final class NanocachedClient implements AutoCloseable {
         final NanocachedException.WrongNode wrongNode;
         final NanocachedException failure;
         final RuntimeException bug;
+        /** An {@link Error} (OutOfMemoryError, LinkageError, AssertionError, ...)
+         * thrown by the leg: rethrown as itself on the caller's thread
+         * (issue #1150). */
+        final Error fatal;
 
         private LegOutcome(T value, NanocachedException.WrongNode wrongNode,
-                NanocachedException failure, RuntimeException bug) {
+                NanocachedException failure, RuntimeException bug, Error fatal) {
             this.value = value;
             this.wrongNode = wrongNode;
             this.failure = failure;
             this.bug = bug;
+            this.fatal = fatal;
         }
 
         static <T> LegOutcome<T> hit(T value) {
-            return new LegOutcome<>(value, null, null, null);
+            return new LegOutcome<>(value, null, null, null, null);
         }
 
         static <T> LegOutcome<T> wrongNode(NanocachedException.WrongNode error) {
-            return new LegOutcome<>(null, error, null, null);
+            return new LegOutcome<>(null, error, null, null, null);
         }
 
         static <T> LegOutcome<T> failure(NanocachedException error) {
-            return new LegOutcome<>(null, null, error, null);
+            return new LegOutcome<>(null, null, error, null, null);
         }
 
         static <T> LegOutcome<T> bug(RuntimeException error) {
-            return new LegOutcome<>(null, null, null, error);
+            return new LegOutcome<>(null, null, null, error, null);
+        }
+
+        static <T> LegOutcome<T> fatal(Error error) {
+            return new LegOutcome<>(null, null, null, null, error);
         }
     }
 
@@ -4859,7 +4868,9 @@ public final class NanocachedClient implements AutoCloseable {
      * onward immediately — the moment nothing else is still in flight,
      * not after waiting out another full interval;
      * <li>{@link NanocachedException.WrongNode} propagates exactly as the
-     * sequential path's does.
+     * sequential path's does;
+     * <li>an {@link Error} thrown by a leg is rethrown as itself on the
+     * calling thread (issue #1150).
      * </ul>
      *
      * A losing leg is never cancelled (interrupting a request mid-write
@@ -4922,6 +4933,10 @@ public final class NanocachedClient implements AutoCloseable {
             } else if (outcome.bug != null) {
                 resolveLosers(legFutures.values());
                 throw outcome.bug;
+            } else if (outcome.fatal != null) {
+                // Issue #1150: an Error is not ours to wrap or swallow.
+                resolveLosers(legFutures.values());
+                throw outcome.fatal;
             } else if (outcome.failure != null) {
                 lastError = outcome.failure;
             } else if (outcome.value != null || index == 0) {
@@ -4995,7 +5010,11 @@ public final class NanocachedClient implements AutoCloseable {
     private <T> CompletableFuture<Void> startHedgeLeg(int index, String name, ConnectionOp<T> op,
             BlockingQueue<Integer> completions, Map<Integer, LegOutcome<T>> results) {
         Runnable task = () -> {
-            LegOutcome<T> outcome;
+            // Issue #1150: whatever happens, record an outcome and signal the
+            // reader -- it waits on `completions` with no timeout once every
+            // owner is in flight, so a leg that ended without signalling (an
+            // Error used to) parked the caller thread forever.
+            LegOutcome<T> outcome = null;
             try {
                 T value = applyReconnecting(() -> memberConnection(name), op);
                 outcome = LegOutcome.hit(value);
@@ -5005,9 +5024,20 @@ public final class NanocachedClient implements AutoCloseable {
                 outcome = LegOutcome.failure(error);
             } catch (RuntimeException error) {
                 outcome = LegOutcome.bug(error);
+            } catch (Error error) {
+                outcome = LegOutcome.fatal(error);
+            } catch (Throwable error) {
+                // Not reachable without a sneaky throw, but must still settle.
+                outcome = LegOutcome.bug(new NanocachedException(
+                        "nanocached: hedged read leg failed unexpectedly", error));
+            } finally {
+                if (outcome == null) {
+                    outcome = LegOutcome.bug(new NanocachedException(
+                            "nanocached: hedged read leg ended without an outcome"));
+                }
+                results.put(index, outcome);
+                completions.add(index);
             }
-            results.put(index, outcome);
-            completions.add(index);
         };
 
         // Check closed and register under hedgedReadsLock so this can't
