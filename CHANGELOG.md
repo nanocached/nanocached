@@ -26,6 +26,33 @@ framework adapters at one version, whether or not a component changed.
   redials. A request queued behind a stalled write failed after 906 ms
   with a 600 ms I/O timeout (the reader's 900 ms) and now fails at the
   writer's 600 ms. (#1191)
+- `nanocached-node`: when a join's transfer failed (the joiner unreachable
+  after three attempts, an abort, or a failed write of the `M` ack), the
+  writes already queued for forwarding to that joiner were not dropped, so
+  each kept being sent to a dead address (up to 10 s apiece, with up to
+  64 MiB held), and to whichever process later took the address. They are
+  now revoked when the unfinished handoff is dropped, as they already were
+  for an abandon, an eviction or a replacement (#1185).
+- `nanocached-node`: a handoff tombstone was charged to `--max-memory` for its key bytes only, although each one also holds a map slot, a queue item and two allocation headers (about 250 B), the per-entry cost a `migrated` mark has always been charged. A full set of 65,536 tombstones (a join or drain window with many relayed deletes) held about 16 MiB the limit did not count. They are now charged the same way (#1179).
+- `nanocached-proxy`: a large frame's receive buffer was shrunk and
+  allocated again on every read until 64 KiB of its body had arrived. With
+  the header in, the buffer is sized to the whole frame and charged in one
+  step, but the next read left it with more capacity than 64 KiB and less
+  content than 64 KiB, which the drained-buffer check took for an emptied
+  buffer: it was copied down, its charge given back, and the next iteration
+  allocated and charged the whole frame again at the back of the budgets'
+  queues. A 1 MB `S` went through 17 allocations and charges (about 16
+  malloc/free pairs and semaphore rounds of the frame's length, each losing
+  the connection its place in line); it now takes 2. A buffer already
+  grown to the frame it is filling is no longer shrunk. (#1176)
+- `nanocached-node`: the roster fetch a draining node (and eviction-triggered
+  re-replication) uses accepted at most 4,096 entries, while discovery's
+  registry holds up to 65,536 and returns all of them. Above 4,096
+  registered nodes every fetch failed with "bad T response", so a draining
+  node logged "leaving without a handoff" and exited without handing off
+  its keys. The fetch now uses the same 65,536 limit as the heartbeat ack
+  (#1175).
+- `nanocached-node`: the `y` (batch touch) header parser collected every token after the key lengths into a vector, so a header of about 1 MiB of extra tokens allocated 8 MB for one parse before being rejected. At most three tokens (`[ttl] [G] [tag]`) are valid, so it now collects four and rejects the rest, as `t` does (#1174).
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
