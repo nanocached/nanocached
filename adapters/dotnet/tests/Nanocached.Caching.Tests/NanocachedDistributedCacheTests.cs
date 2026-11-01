@@ -163,6 +163,41 @@ public sealed class NanocachedDistributedCacheTests
         Assert.Equal(60, entry!.TtlSeconds);
     }
 
+    // Issue #1234: the read succeeded, the renewal could not reach the node
+    // (it went away right after serving the read). The hit must still be
+    // returned, and the skipped renewal must be visible.
+    [Fact]
+    public async Task A_failed_sliding_renewal_still_returns_the_value_and_is_counted()
+    {
+        var node = new MockNode();
+        try
+        {
+            var services = new ServiceCollection();
+            services.AddNanocachedDistributedCache(options => options.Addresses.Add($"127.0.0.1:{node.Port}"));
+            await using ServiceProvider provider = services.BuildServiceProvider();
+            var cache = (NanocachedDistributedCache)provider.GetRequiredService<IDistributedCache>();
+
+            await cache.SetAsync(
+                "session", new byte[] { 7 },
+                new DistributedCacheEntryOptions { SlidingExpiration = TimeSpan.FromSeconds(30) });
+
+            node.AfterGet = (_, _) =>
+            {
+                node.AfterGet = null;
+                node.StopAccepting(); // no redial can succeed
+                throw new IOException("synthetic: the connection drops after the read was served");
+            };
+
+            Assert.Equal(0, cache.SlidingRenewalFailures);
+            Assert.Equal(new byte[] { 7 }, await cache.GetAsync("session"));
+            Assert.Equal(1, cache.SlidingRenewalFailures);
+        }
+        finally
+        {
+            node.Dispose();
+        }
+    }
+
     [Fact]
     public async Task Sliding_expiration_writes_the_configured_TTL_and_is_renewed_on_Get()
     {

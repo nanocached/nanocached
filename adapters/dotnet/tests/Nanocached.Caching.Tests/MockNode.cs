@@ -98,6 +98,15 @@ internal sealed class MockNode : IDisposable
     private ConcurrentDictionary<string, Entry> Store(string ns) =>
         _stores.GetOrAdd(ns, static _ => new ConcurrentDictionary<string, Entry>());
 
+    /// <summary>Stops accepting new connections (a redial then fails)
+    /// while the ones already open keep being served - the node "going
+    /// away" between two requests of one client.</summary>
+    internal void StopAccepting()
+    {
+        _cts.Cancel();
+        _listener.Stop();
+    }
+
     public void Dispose()
     {
         _cts.Cancel();

@@ -9,6 +9,15 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Fixed
+
+- `GetAsync` on an entry with a sliding window threw when the renewal write
+  failed (the node reachable for the read and gone for the next request),
+  discarding a value it had already read. The renewal is now skipped and the
+  value returned; the skip is counted in the new
+  `NanocachedDistributedCache.SlidingRenewalFailures` and the first one is
+  written to stderr. `RefreshAsync` still throws. (#1234)
+
 ### Changed
 
 - Target framework is now `net10.0`, following the SDK; .NET 8 and .NET 9 reach end of support on 2026-11-10, and 0.6.0 is the last release that targets `net8.0`. `Microsoft.Extensions.*` references move from 8.0.0 to 10.0.14.
