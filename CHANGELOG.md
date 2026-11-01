@@ -134,7 +134,10 @@ framework adapters at one version, whether or not a component changed.
   but not for `nanocached-proxy`, so after a release the three `:latest`
   images pointed at different code and the quickstarts pulled unreleased
   `main`. Builds of `main` are published as `:main` and `:sha-<commit>` for
-  all three images, one publish run at a time (#1149). `:main` is put only
+  all three images, one publish run at a time (#1149). The release workflow
+  moves `:latest` in one step for the three images after all three builds
+  have succeeded, and leaves it alone for a pre-release version or when it
+  already points at a newer release (#1195). `:main` is put only
   on a build of the commit that is the tip of `main` when the publish runs:
   CI runs for consecutive commits finish in their own order, and a re-run
   of an older commit's CI finishes last of all, so without that check a
