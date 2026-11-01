@@ -8805,6 +8805,8 @@ async fn requests_in_flight_at_close_do_not_dial_the_node_again() {
         "no dial may start once the client is closed"
     );
     acceptor.abort();
+}
+
 /// Issue #1186: a zero keep-alive interval spun the keep-alive task, a zero
 /// request timeout failed every request, and `reconnect_cooldown(MAX)`
 /// overflowed `Instant + Duration` and panicked on the first failed dial.

@@ -14,6 +14,7 @@ follow the `sdk/rust/vX.Y.Z` tags.
   the client was closed only after the dial. `slot_connection` now checks
   before dialing, after taking the per-slot redial lock, so the node no
   longer sees a connection from a client that is already closed. (#1231)
+
 - `keep_alive_interval(Duration::ZERO)` turned the keep-alive task into a
   `sleep(0)` loop that pinged continuously, `request_timeout(Duration::ZERO)`
   made every request time out and close its connection, and
