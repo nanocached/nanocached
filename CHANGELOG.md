@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-discovery`: remembering a departed node (an eviction, a `V`, an
+  abandoned join) scanned the whole departed table, up to 4,096 names, on
+  every call, so a sweep that expired many nodes at once held the
+  single-threaded runtime for seconds (3.3 s for 65,536 consecutive
+  evictions on a release build, with no connection served meanwhile). The
+  table now keeps its names in time order and prunes and evicts from the
+  front, so each call costs constant time on average; 65,536 evictions take
+  12 ms (#1201).
 - `nanocached-proxy`: a shared backend connection whose writer had left on
   a write error or write timeout went on accepting requests until its
   reader finished, up to `UPSTREAM_IO_TIMEOUT` (5 s) later. The queue's
