@@ -5491,9 +5491,12 @@ impl PendingClears {
         match scope {
             ClearScope::All => self.collapse_to_all(),
             ClearScope::Namespace(namespace) => {
-                let length = namespace.len();
-                if self.namespaces.insert(namespace) {
-                    self.bytes += length;
+                // Copied into an allocation of its own: the slice off the
+                // `c` frame would keep the frame's whole buffer alive, and
+                // `bytes` counts only the name (issue #1160).
+                if !self.namespaces.contains(&namespace) {
+                    self.bytes += namespace.len();
+                    self.namespaces.insert(Bytes::copy_from_slice(&namespace));
                 }
                 if self.namespaces.len() > MAX_PENDING_CLEAR_NAMESPACES
                     || self.bytes > MAX_PENDING_CLEAR_BYTES
@@ -9106,6 +9109,74 @@ enum OwnedForwardedWrite {
 }
 
 impl OwnedForwardedWrite {
+    /// This write with its key, value and namespace copied into
+    /// right-sized allocations of their own.
+    ///
+    /// A write parsed off a connection holds `Bytes` slices of that
+    /// connection's receive buffer, and a slice keeps the buffer's whole
+    /// allocation alive — a 17-byte write behind a 1 MiB frame pins 1 MiB,
+    /// which `TargetQueue`'s accounting (key + value + overhead) never
+    /// counts. A queued write can wait a long time (a forward target that
+    /// does not drain until it is evicted), so it must not hold the buffer
+    /// (issue #1160; the cache does the same in `insert_into`).
+    ///
+    /// `namespaces` carries a batch's copies, so the writes of one batch
+    /// that shared a namespace allocation still share one (the queue
+    /// charges a shared allocation once); it also keeps each original
+    /// alive for the batch, so its address cannot be reused by a later
+    /// copy and mistaken for it.
+    fn detached(self, namespaces: &mut HashMap<(usize, usize), (Bytes, Bytes)>) -> Self {
+        fn key(key: Key, namespaces: &mut HashMap<(usize, usize), (Bytes, Bytes)>) -> Key {
+            let namespace = if key.namespace.is_empty() {
+                Bytes::new()
+            } else {
+                namespaces
+                    .entry((key.namespace.as_ptr() as usize, key.namespace.len()))
+                    .or_insert_with(|| {
+                        (
+                            key.namespace.clone(),
+                            Bytes::copy_from_slice(&key.namespace),
+                        )
+                    })
+                    .1
+                    .clone()
+            };
+            Key::new(namespace, Bytes::copy_from_slice(&key.name))
+        }
+        match self {
+            OwnedForwardedWrite::Set { key: k, value, ttl } => OwnedForwardedWrite::Set {
+                key: key(k, namespaces),
+                value: Bytes::copy_from_slice(&value),
+                ttl,
+            },
+            OwnedForwardedWrite::Delete { key: k } => OwnedForwardedWrite::Delete {
+                key: key(k, namespaces),
+            },
+            OwnedForwardedWrite::HandoffSet {
+                key: k,
+                value,
+                ttl,
+                if_absent,
+            } => OwnedForwardedWrite::HandoffSet {
+                key: key(k, namespaces),
+                value: Bytes::copy_from_slice(&value),
+                ttl,
+                if_absent,
+            },
+            OwnedForwardedWrite::HandoffDelete { key: k } => OwnedForwardedWrite::HandoffDelete {
+                key: key(k, namespaces),
+            },
+            OwnedForwardedWrite::Clear(ClearScope::Namespace(namespace)) => {
+                OwnedForwardedWrite::Clear(ClearScope::Namespace(Bytes::copy_from_slice(
+                    &namespace,
+                )))
+            }
+            OwnedForwardedWrite::Clear(ClearScope::All) => {
+                OwnedForwardedWrite::Clear(ClearScope::All)
+            }
+        }
+    }
+
     /// Attempts this write once via `forward_on_locked_connection`, on a
     /// connection guard the caller (`forward_with_retries`) already
     /// holds — see that function's own doc comment and
@@ -9543,16 +9614,21 @@ impl ForwardQueues {
         // was created with: the same connection serves a joiner first as
         // the slot's own and later as a lingering one.
         let as_handoff = target.as_handoff;
+        // Copied before the wait for room below, so a push that waits
+        // holds right-sized copies, not the receive buffers it came from.
+        let mut copied_namespaces = HashMap::new();
         let writes: Vec<OwnedForwardedWrite> = writes
             .into_iter()
             .map(|write| {
-                if as_handoff {
+                let write = if as_handoff {
                     write.into_handoff_frame()
                 } else {
                     write
-                }
+                };
+                write.detached(&mut copied_namespaces)
             })
             .collect();
+        drop(copied_namespaces);
         let wanted = batch_bytes(&writes);
         let mut target = Some(target);
         loop {
@@ -16824,6 +16900,129 @@ mod tests {
         );
         let sent = drain_all(queues.targets.lock().unwrap().get_mut(&id).unwrap());
         assert_eq!(sent, ["set a 1", "pia(overwrite) b 1"]);
+    }
+
+    /// A receive buffer of `len` bytes whose release is observable:
+    /// `Bytes::from_owner` drops the owner when the last slice goes.
+    struct WatchedBuffer {
+        bytes: Vec<u8>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl AsRef<[u8]> for WatchedBuffer {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for WatchedBuffer {
+        fn drop(&mut self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn watched_buffer(len: usize) -> (Bytes, Arc<AtomicBool>) {
+        let released = Arc::new(AtomicBool::new(false));
+        let buffer = Bytes::from_owner(WatchedBuffer {
+            bytes: (0..len).map(|index| (index % 251) as u8).collect(),
+            released: Arc::clone(&released),
+        });
+        (buffer, released)
+    }
+
+    /// Issue #1160: a write parsed from a large receive buffer is a few
+    /// slices of it, and a slice keeps the whole allocation alive; the
+    /// queue charges only the slices' lengths, so it must not hold the
+    /// buffer. Pushing the write copies it, and the buffer is released
+    /// while the write still waits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_write_does_not_keep_the_receive_buffer_alive() {
+        let node_context = test_node_context(
+            "ready-node",
+            "tk-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let queues = ForwardQueues::default();
+        let (buffer, released) = watched_buffer(900_000);
+        let writes = vec![
+            OwnedForwardedWrite::Set {
+                key: Key::new(buffer.slice(0..2), buffer.slice(10..19)),
+                value: buffer.slice(100..108),
+                ttl: None,
+            },
+            OwnedForwardedWrite::Set {
+                key: Key::new(buffer.slice(0..2), buffer.slice(30..39)),
+                value: buffer.slice(100..108),
+                ttl: None,
+            },
+            OwnedForwardedWrite::Delete {
+                key: Key::unnamespaced(buffer.slice(50..59)),
+            },
+            OwnedForwardedWrite::HandoffSet {
+                key: Key::new(buffer.slice(0..2), buffer.slice(60..69)),
+                value: buffer.slice(100..108),
+                ttl: None,
+                if_absent: true,
+            },
+            OwnedForwardedWrite::HandoffDelete {
+                key: Key::new(buffer.slice(0..2), buffer.slice(70..79)),
+            },
+            OwnedForwardedWrite::Clear(ClearScope::Namespace(buffer.slice(200..205))),
+        ];
+        let id = queues
+            .push(&node_context, test_forward_target("127.0.0.1:9"), writes)
+            .await
+            .expect("first push starts a drainer");
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the test's own handle is still alive"
+        );
+        drop(buffer);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the queued writes must not keep the receive buffer's allocation alive"
+        );
+
+        // The copies are what was written, and the four keys that shared
+        // one namespace slice still share one copy: it is charged once.
+        let targets = queues.targets.lock().unwrap();
+        let queue = &targets[&id];
+        assert_eq!(queue.ops.len(), 6);
+        assert_eq!(queue.namespaces.len(), 1);
+        let entry = |name: usize, value: usize| name + value + FORWARD_ENTRY_OVERHEAD_BYTES;
+        assert_eq!(
+            queue.bytes,
+            2 * entry(9, 8) // the two sets
+                + entry(9, 0) // the delete
+                + entry(9, 8) // the handoff set
+                + entry(9, 0) // the handoff delete
+                + entry(5, 0) // the clear
+                + 2 // the shared namespace, once
+        );
+    }
+
+    /// Issue #1160: `PendingClears` keeps a namespace name for the whole
+    /// handoff and counts only its length, so it copies the name off the
+    /// `c` frame it was parsed from.
+    #[test]
+    fn a_pending_clear_does_not_keep_the_frame_alive() {
+        let mut pending = PendingClears::default();
+        let (frame, released) = watched_buffer(1_000_000);
+        pending.push(ClearScope::Namespace(frame.slice(0..5)));
+        // A repeat of a queued name is collapsed, and does not retain the
+        // frame it came in either.
+        let (second, second_released) = watched_buffer(1_000_000);
+        pending.push(ClearScope::Namespace(second.slice(0..5)));
+        drop(frame);
+        drop(second);
+        assert!(released.load(Ordering::SeqCst));
+        assert!(second_released.load(Ordering::SeqCst));
+        assert_eq!(pending.bytes, 5);
+        assert_eq!(
+            pending.take(),
+            vec![ClearScope::Namespace(Bytes::from_static(&[0, 1, 2, 3, 4]))]
+        );
     }
 
     #[test]
