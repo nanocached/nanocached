@@ -10,6 +10,10 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- `Close` and a node-list refresh closed connections while holding the client's mutex, which every operation takes to route. A TLS connection's close writes a close_notify alert with a write deadline of up to 5 s, so a node that had stopped reading could stall every operation on the client for that long. Connections are now collected under the lock and closed after it is released. (#1214)
+
 ### Changed
 
 - Minimum Go version is now 1.26 (`go 1.26` in `go.mod`). Go supports only the two most recent release lines, and the previous floor (1.22) and the CI toolchain (1.23) both left that window in 2025. 0.6.0 is the last release that declares a Go 1.22 floor. No code change; CI now tests on `oldstable` and `stable`.

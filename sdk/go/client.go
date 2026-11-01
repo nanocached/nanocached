@@ -2485,13 +2485,21 @@ func (c *Client) Close() {
 }
 
 func (c *Client) teardown() {
+	// Issue #1214: close outside c.mu. A TLS connection's close sends a
+	// close_notify alert with a write deadline of up to 5 s, so a peer
+	// that stopped reading would otherwise hold every Client operation
+	// (all of which take c.mu to route) for that long.
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	toClose := make([]*connection, 0, len(c.members)+1)
 	if c.single != nil {
-		c.single.close()
+		toClose = append(toClose, c.single)
 	}
 	for _, m := range c.members {
-		m.connection.close()
+		toClose = append(toClose, m.connection)
+	}
+	c.mu.Unlock()
+	for _, open := range toClose {
+		open.close()
 	}
 }
 
@@ -3308,6 +3316,17 @@ func (c *Client) refreshNodeList() {
 	nodes, replication, ok := c.fetchNodeList()
 	nodes = dedupeDiscoveredNodes(nodes)
 
+	// Issue #1214: connections of nodes that left the roster are closed
+	// after c.mu is released (this defer is registered first, so it runs
+	// last): a TLS close can block for up to 5 s writing close_notify to a
+	// peer that stopped reading, and every Client operation needs c.mu.
+	var dropped []*connection
+	defer func() {
+		for _, stale := range dropped {
+			stale.close()
+		}
+	}()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.lastFetch = time.Now()
@@ -3341,8 +3360,8 @@ func (c *Client) refreshNodeList() {
 		fresh[node.Name] = &member{address: node.Address, connection: deadConnection()}
 	}
 	// Nodes no longer listed: close their connections.
-	for _, dropped := range c.members {
-		dropped.connection.close()
+	for _, gone := range c.members {
+		dropped = append(dropped, gone.connection)
 	}
 
 	c.members = fresh

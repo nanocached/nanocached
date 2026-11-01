@@ -7229,3 +7229,79 @@ func TestConnectReportsANodeAtItsConnectionLimitAsBusyOnTheFirstDial(t *testing.
 		t.Fatalf("dials = %d, want 1 (a busy reply is not a legacy door-slam to retry)", got)
 	}
 }
+
+// holdsClientMu makes conn's onClose hook (it fires from inside close(),
+// after the socket is closed) record whether the client's mutex was held
+// at that moment: a TLS close can block for seconds writing close_notify,
+// so it must never happen under c.mu (issue #1214).
+func holdsClientMu(client *Client, conn *connection) *atomic.Bool {
+	held := &atomic.Bool{}
+	conn.mu.Lock()
+	conn.onClose = func() {
+		if client.mu.TryLock() {
+			client.mu.Unlock()
+			return
+		}
+		held.Store(true)
+	}
+	conn.mu.Unlock()
+	return held
+}
+
+func TestRefreshClosesDroppedConnectionsOutsideTheClientLock(t *testing.T) {
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	gone, kept := testNames[0], testNames[1]
+	client.mu.Lock()
+	dropped := client.members[gone].connection
+	client.mu.Unlock()
+	held := holdsClientMu(client, dropped)
+
+	discovery.setNodes([]discoveredNode{{Name: kept, Address: nodes[kept].address()}})
+	client.maybeRefresh(true)
+
+	dropped.mu.Lock()
+	closed := dropped.closed
+	dropped.mu.Unlock()
+	if !closed {
+		t.Fatalf("the connection of the node that left the roster was not closed")
+	}
+	if held.Load() {
+		t.Fatalf("refreshNodeList closed a dropped connection while holding Client.mu")
+	}
+}
+
+func TestCloseTearsDownConnectionsOutsideTheClientLock(t *testing.T) {
+	_, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.mu.Lock()
+	var conns []*connection
+	for _, m := range client.members {
+		conns = append(conns, m.connection)
+	}
+	client.mu.Unlock()
+	if len(conns) == 0 {
+		t.Fatalf("no member connections to tear down")
+	}
+	var helds []*atomic.Bool
+	for _, conn := range conns {
+		helds = append(helds, holdsClientMu(client, conn))
+	}
+
+	client.Close()
+
+	for i, held := range helds {
+		if held.Load() {
+			t.Fatalf("teardown closed member connection %d while holding Client.mu", i)
+		}
+	}
+}
