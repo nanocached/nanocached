@@ -10,6 +10,10 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Changed
+
+- Target framework is now `net10.0`; .NET 8 and .NET 9 reach end of support on 2026-11-10, and 0.6.0 is the last release that targets `net8.0`. Packages are built with the .NET 10 SDK.
+
 ## [0.6.0] - 2026-11-01
 
 ### Fixed
