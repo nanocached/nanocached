@@ -57,6 +57,18 @@ framework adapters at one version, whether or not a component changed.
   to wait while that pool is full is answered `B`/`R` at once instead of
   after 60 seconds; the proxy's ceiling for request bytes is twice
   `--max-in-flight-bytes` (#1146).
+- `nanocached-proxy`: enough large uploads at once from one address could
+  deadlock that address's in-flight share for 60 seconds. A request's
+  receive buffer was charged in doublings (64 KiB, then 192, 448, 960 KiB,
+  and 1.94 MiB for a frame within 4 KiB of 1 MiB), and a connection kept
+  every earlier step while it waited for the next, so about 35 to 70
+  concurrent uploads of 0.5 to 1 MiB (a fleet behind one NAT writing 1 MiB
+  values) each held part of the 64 MiB share, none could finish to give any
+  back, and the rest were disconnected when the frame deadline passed. Once
+  a frame's header is in, its whole buffer is now charged in a single step
+  (and a multi-key header that outgrows the free 64 KiB takes the largest
+  frame's worth at once), so uploads queue for the share and take their
+  turns (#1147).
 
 ### Changed
 

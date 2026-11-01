@@ -6977,16 +6977,41 @@ async fn handle_client(
             auth_deadline
         };
 
-        // Grow the buffer under control (issue #1034): a doubling, charged
-        // against the in-flight budgets *before* it is allocated, so what
-        // a thousand connections mid-frame hold is bounded by the budgets
+        // Grow the buffer under control (issue #1034): charged against
+        // the in-flight budgets *before* it is allocated, so what a
+        // thousand connections mid-frame hold is bounded by the budgets
         // rather than by the connection count. The first 64 KiB of every
         // connection are free (a pre-handshake buffer never gets past
         // them); a connection that cannot get the growth by its frame
         // deadline is closed, like one that trickled.
+        //
+        // Once a frame's header is in, its length is known, and the buffer
+        // is grown to exactly that in one step (issue #1147): in
+        // doublings a connection kept every earlier step while it waited
+        // for the next, so enough uploads at once (about 66 of 1 MiB
+        // against a 64 MiB share) each held part of the share and waited
+        // for more, none finishing to give any back, until the frame
+        // deadline closed them. A connection waiting for its one step
+        // holds nothing it could be waited on for. A header that is still
+        // arriving doubles the buffer within the free 64 KiB and, if it
+        // outgrows them (a multi-key header of tens of thousands of keys),
+        // takes the largest frame's worth in one step for the same reason.
         const READ_CHUNK: usize = 4096;
-        if buf.capacity() - buf.len() < READ_CHUNK {
-            let grown = (buf.capacity() * 2).max(buf.len() + READ_CHUNK);
+        let frame_end = scan.frame_end.filter(|end| *end > buf.len());
+        let grown = match frame_end {
+            Some(end) => (end > buf.capacity()).then_some(end),
+            None if buf.capacity() - buf.len() >= READ_CHUNK => None,
+            None if buf.capacity() >= REQUEST_BUFFER_SHRINK_THRESHOLD => {
+                let max_frame = if authenticated {
+                    MAX_CLIENT_FRAME_SIZE
+                } else {
+                    PREAUTH_MAX_BYTES
+                };
+                Some(max_frame.max(buf.len() + READ_CHUNK))
+            }
+            None => Some((buf.capacity() * 2).max(buf.len() + READ_CHUNK)),
+        };
+        if let Some(grown) = grown {
             let want = [
                 &connection_in_flight_bytes,
                 &ip_in_flight_share.budgets.in_flight,
@@ -7030,12 +7055,17 @@ async fn handle_client(
                     }
                 }
             }
-            buf.reserve(grown - buf.len());
+            // Exactly what was charged: `reserve` may round up past it.
+            let mut grown_buf = BytesMut::with_capacity(grown);
+            grown_buf.extend_from_slice(&buf);
+            buf = grown_buf;
         }
 
+        // Not past the end of a frame whose buffer was sized to it.
+        let room = frame_end.map_or(READ_CHUNK, |end| (end - buf.len()).min(READ_CHUNK));
         let mut chunk = [0u8; READ_CHUNK];
         let read = tokio::select! {
-            read = tokio::time::timeout_at(read_deadline, read_half.read(&mut chunk)) => read,
+            read = tokio::time::timeout_at(read_deadline, read_half.read(&mut chunk[..room])) => read,
             () = drained(&mut drain) => break 'connection Ok(()),
             // The writer returning drops the FIFO's receiver: stop at once
             // instead of sitting in `read` for `IDLE_TIMEOUT` holding the
@@ -8616,6 +8646,161 @@ mod tests {
                 .unwrap();
             assert!(header.starts_with("M 1000 "), "{name}: {header}");
         }
+        drop(node);
+    }
+
+    /// An untagged `S` of a 300,000-byte value: a frame whose buffer takes
+    /// three steps past the free threshold when it grows by doubling.
+    fn big_set_frame(key: &str) -> Vec<u8> {
+        let mut frame = format!("S {} 300000\n{key}", key.len()).into_bytes();
+        frame.extend(std::iter::repeat_n(b'v', 300_000));
+        frame
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn uploads_that_together_outgrow_their_ip_share_queue_for_it_instead_of_deadlocking() {
+        // Issue #1147. Six uploads of ~300 KB from one address against a
+        // 1 MiB share. Charged in doublings, the buffer of each took
+        // 64 KiB, then 192 KiB, then 448 KiB, keeping every step while it
+        // waited for the next: five of them held 192 KiB each and all
+        // needed 256 KiB more with 64 KiB free, the sixth queued behind,
+        // and nothing finished until the frame deadline closed them. The
+        // header gives the frame's length, so the charge is taken in one
+        // step and the uploads take their turns.
+        let (node, proxy, _context) = slow_single_node(
+            b"k",
+            Duration::ZERO,
+            Some(ConnectionLimits {
+                max_connections: 16,
+                max_connections_per_ip: 16,
+                max_in_flight_bytes: 8 * MAX_REQUEST_SIZE,
+                max_in_flight_bytes_per_ip: MAX_REQUEST_SIZE,
+                admission_wait: Duration::from_secs(30),
+            }),
+        )
+        .await;
+
+        let mut uploads = Vec::new();
+        for upload in 0..6 {
+            let proxy = proxy.clone();
+            uploads.push(tokio::spawn(async move {
+                let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+                let frame = big_set_frame(&format!("up{upload}"));
+                // Every upload gets well into its frame, then the rest.
+                stream.write_all(&frame[..200_000]).await.unwrap();
+                sleep(Duration::from_millis(300)).await;
+                stream.write_all(&frame[200_000..]).await.unwrap();
+                read_line(&mut stream, &mut buf).await.unwrap()
+            }));
+        }
+        // Each upload is served, or answered `B` at once: the share holds
+        // four receive charges, so the uploads complete their frames in
+        // turns while nothing can be admitted (the share's freed bytes go
+        // to the next growth in the queue), and the ones that complete
+        // while the IP's share of the parked-frame pool (1 MiB: three of
+        // these frames) is full are refused the wait (issue #1146). None
+        // waits out the frame deadline.
+        let mut served = 0;
+        for (upload, handle) in uploads.into_iter().enumerate() {
+            let reply = timeout(Duration::from_secs(10), handle)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("upload {upload} was not answered: the share deadlocked")
+                })
+                .unwrap();
+            assert!(reply == "S" || reply == "B", "upload {upload}: {reply}");
+            served += usize::from(reply == "S");
+        }
+        assert!(
+            served >= 1,
+            "the first upload to complete parks its frame and is served"
+        );
+        drop(node);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batches_whose_headers_outgrow_the_free_buffer_queue_for_their_ip_share() {
+        // The same deadlock through the header: an `m` of 60,000 one-byte
+        // keys has a 120 KB header, which doubled the buffer to 128 KiB
+        // (64 KiB charged) and then to 256 KiB before the frame's length
+        // was known. Sixteen of them against a 1 MiB share each held 64 KiB
+        // (all of it) and waited for 128 KiB more. A header that outgrows
+        // the free 64 KiB now takes the largest frame's worth in one step.
+        let (node, proxy, _context) = slow_single_node(
+            b"k",
+            Duration::ZERO,
+            Some(ConnectionLimits {
+                max_connections: 32,
+                max_connections_per_ip: 32,
+                max_in_flight_bytes: 8 * MAX_REQUEST_SIZE,
+                max_in_flight_bytes_per_ip: MAX_REQUEST_SIZE,
+                admission_wait: Duration::from_secs(30),
+            }),
+        )
+        .await;
+
+        let mut batches = Vec::new();
+        for _ in 0..16 {
+            let proxy = proxy.clone();
+            batches.push(tokio::spawn(async move {
+                let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+                let frame = multi_get_frame(60_000, None);
+                stream.write_all(&frame[..100_000]).await.unwrap();
+                sleep(Duration::from_millis(300)).await;
+                stream.write_all(&frame[100_000..]).await.unwrap();
+                read_line(&mut stream, &mut buf).await.unwrap()
+            }));
+        }
+        // Each batch is served, or answered `B` at once: the largest
+        // frame's worth is the whole share, so the batches complete their
+        // frames one at a time while nothing can be admitted (the share's
+        // freed bytes go to the next growth in the queue), and the ones
+        // that complete while the IP's share of the parked-frame pool
+        // (1 MiB: five of these 180 KB frames) is full are refused the
+        // wait (issue #1146). None waits out the frame deadline.
+        let mut served = 0;
+        for (batch, handle) in batches.into_iter().enumerate() {
+            let header = timeout(Duration::from_secs(20), handle)
+                .await
+                .unwrap_or_else(|_| panic!("batch {batch} was not answered: the share deadlocked"))
+                .unwrap();
+            assert!(
+                header.starts_with("M 60000 ") || header == "B",
+                "batch {batch}: {header}"
+            );
+            served += usize::from(header != "B");
+        }
+        assert!(
+            served >= 1,
+            "the first batch to complete parks its frame and is served"
+        );
+        drop(node);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn large_frames_pipelined_in_one_write_are_each_read_to_their_own_end() {
+        // The buffer for a frame is sized to it, and the read stops at its
+        // end: the frame behind it, already on the wire, is read into the
+        // next buffer, not past the end of this one.
+        let (node, proxy, _context) = slow_single_node(b"k", Duration::ZERO, None).await;
+        let (stream, mut buf) = connect_and_auth(&proxy).await;
+        let mut wire = Vec::new();
+        for upload in 0..3 {
+            wire.extend(big_set_frame(&format!("pipe{upload}")));
+            wire.extend(b"G 1\nk");
+        }
+        let writer = {
+            let (mut read_half, mut write_half) = tokio::io::split(stream);
+            let write = tokio::spawn(async move { write_half.write_all(&wire).await.unwrap() });
+            for _ in 0..3 {
+                assert_eq!(read_line(&mut read_half, &mut buf).await.unwrap(), "S");
+                assert_eq!(read_line(&mut read_half, &mut buf).await.unwrap(), "V 1");
+                read_exact_into(&mut read_half, &mut buf, 1).await.unwrap();
+                let _ = buf.split_to(1);
+            }
+            write
+        };
+        writer.await.unwrap();
         drop(node);
     }
 
