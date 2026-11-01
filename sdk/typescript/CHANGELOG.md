@@ -23,6 +23,14 @@ tag: 0.4.3 was a server-only release.
   (Node 22, the package's minimum, has it), about forty times faster, with the
   same result.
 
+### Changed
+
+- The SDK is built and type-checked with TypeScript 7 (`typescript` is a
+  development dependency only). The emitted `.d.ts` files are byte-for-byte
+  identical to the TypeScript 5.9 output, so nothing changes for consumers.
+  `tsconfig.json` now names `node` in `types`, which TypeScript 7 no longer
+  includes implicitly.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release

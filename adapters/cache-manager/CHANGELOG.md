@@ -9,6 +9,12 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Changed
+
+- Built and type-checked with TypeScript 7 (a development dependency only;
+  no change to the published package). `tsconfig.json` now names `node` in
+  `types`, which TypeScript 7 no longer includes implicitly.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release
