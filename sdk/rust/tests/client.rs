@@ -8805,6 +8805,76 @@ async fn requests_in_flight_at_close_do_not_dial_the_node_again() {
         "no dial may start once the client is closed"
     );
     acceptor.abort();
+/// Issue #1186: a zero keep-alive interval spun the keep-alive task, a zero
+/// request timeout failed every request, and `reconnect_cooldown(MAX)`
+/// overflowed `Instant + Duration` and panicked on the first failed dial.
+/// Each is now rejected at connect() time.
+#[tokio::test]
+async fn connect_rejects_zero_and_overflowing_duration_options() {
+    let node = MockNode::start().await;
+    let base = || Options::new().addresses([("127.0.0.1", node.port)]);
+    let day_plus = Duration::from_secs(24 * 60 * 60 + 1);
+    let cases: Vec<(&str, Options)> = vec![
+        (
+            "keep_alive_interval",
+            base().keep_alive_interval(Duration::ZERO),
+        ),
+        (
+            "keep_alive_interval",
+            base().keep_alive_interval(Duration::MAX),
+        ),
+        ("keep_alive_interval", base().keep_alive_interval(day_plus)),
+        ("request_timeout", base().request_timeout(Duration::ZERO)),
+        ("request_timeout", base().request_timeout(Duration::MAX)),
+        (
+            "reconnect_cooldown",
+            base().reconnect_cooldown(Duration::MAX),
+        ),
+        ("reconnect_cooldown", base().reconnect_cooldown(day_plus)),
+        ("read_hedge_after", base().read_hedge_after(Duration::ZERO)),
+        ("read_hedge_after", base().read_hedge_after(Duration::MAX)),
+    ];
+    for (name, options) in cases {
+        match NanocachedClient::connect(options).await {
+            Err(Error::InvalidArgument(message)) => {
+                assert!(message.contains(name), "{name}: {message}")
+            }
+            Err(other) => panic!("{name}: expected InvalidArgument, got {other:?}"),
+            Ok(client) => {
+                client.close().await;
+                panic!("{name}: expected InvalidArgument, got a connected client");
+            }
+        }
+    }
+    node.stop();
+}
+
+/// The boundary values stay valid: 24 hours itself, and a zero
+/// `reconnect_cooldown` (documented as "use the default").
+#[tokio::test]
+async fn connect_accepts_duration_options_at_the_bounds() {
+    let node = MockNode::start().await;
+    let day = Duration::from_secs(24 * 60 * 60);
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", node.port)])
+            .keep_alive_interval(day)
+            .request_timeout(day)
+            .reconnect_cooldown(Duration::ZERO)
+            .read_hedge_after(day),
+    )
+    .await
+    .expect("bounds are valid");
+    client.close().await;
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", node.port)])
+            .reconnect_cooldown(day),
+    )
+    .await
+    .expect("24h cooldown is valid");
+    client.close().await;
+    node.stop();
 }
 
 /// The keep-alive loop used to await each connection's ping in turn: a
