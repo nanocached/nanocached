@@ -183,11 +183,11 @@ Requires=docker.service
 
 [Service]
 ExecStartPre=-/usr/bin/docker rm -f nanocached-discovery
-ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-discovery@sha256:d4fd3fdd1158b482f6c4b8b76cb99eaa525b0580e6fdb87ca06e454a083356a8
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-discovery@sha256:d6f31da376dcf06a4e2c69cf4cea39b9921b4b39a9fbdd32a294eb499f89e9ee
 ExecStart=/usr/bin/docker run --rm --name nanocached-discovery \
   --network host \
   --env-file /etc/nanocached/env \
-  ghcr.io/nanocached/nanocached-discovery@sha256:d4fd3fdd1158b482f6c4b8b76cb99eaa525b0580e6fdb87ca06e454a083356a8 \
+  ghcr.io/nanocached/nanocached-discovery@sha256:d6f31da376dcf06a4e2c69cf4cea39b9921b4b39a9fbdd32a294eb499f89e9ee \
   --host 0.0.0.0 --port 8357 --metrics-port 9357 \
   --replication-factor 2
 ExecStop=/usr/bin/docker stop -t 30 nanocached-discovery
@@ -206,11 +206,11 @@ Requires=docker.service
 
 [Service]
 ExecStartPre=-/usr/bin/docker rm -f nanocached-node
-ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:f82e89a350ef059c1d7651bb7f214ea9dcfb3cd93df3bcebe4fdd6cebbd6561c
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:38d6d25baa36c9a941d423b6965c84a637a288f437ce3e34d9626171e484c65e
 ExecStart=/usr/bin/docker run --rm --name nanocached-node \
   --network host \
   --env-file /etc/nanocached/env \
-  ghcr.io/nanocached/nanocached-node@sha256:f82e89a350ef059c1d7651bb7f214ea9dcfb3cd93df3bcebe4fdd6cebbd6561c \
+  ghcr.io/nanocached/nanocached-node@sha256:38d6d25baa36c9a941d423b6965c84a637a288f437ce3e34d9626171e484c65e \
   --host 0.0.0.0 --port 8356 --metrics-port 9356 \
   --discovery 10.0.0.11:8357 --drain-timeout 20 \
   --max-memory 1073741824
@@ -254,11 +254,11 @@ Requires=docker.service
 
 [Service]
 ExecStartPre=-/usr/bin/docker rm -f nanocached-node
-ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:f82e89a350ef059c1d7651bb7f214ea9dcfb3cd93df3bcebe4fdd6cebbd6561c
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:38d6d25baa36c9a941d423b6965c84a637a288f437ce3e34d9626171e484c65e
 ExecStart=/usr/bin/docker run --rm --name nanocached-node \
   --network host \
   --env-file /etc/nanocached/env \
-  ghcr.io/nanocached/nanocached-node@sha256:f82e89a350ef059c1d7651bb7f214ea9dcfb3cd93df3bcebe4fdd6cebbd6561c \
+  ghcr.io/nanocached/nanocached-node@sha256:38d6d25baa36c9a941d423b6965c84a637a288f437ce3e34d9626171e484c65e \
   --host 0.0.0.0 --port 8356 --metrics-port 9356 \
   --discovery 10.0.0.11:8357 --drain-timeout 20 \
   --max-memory 1073741824
