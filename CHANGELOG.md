@@ -14,6 +14,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: the roster fetch a draining node (and eviction-triggered
+  re-replication) uses accepted at most 4,096 entries, while discovery's
+  registry holds up to 65,536 and returns all of them. Above 4,096
+  registered nodes every fetch failed with "bad T response", so a draining
+  node logged "leaving without a handoff" and exited without handing off
+  its keys. The fetch now uses the same 65,536 limit as the heartbeat ack
+  (#1175).
 - `nanocached-node`: the `y` (batch touch) header parser collected every token after the key lengths into a vector, so a header of about 1 MiB of extra tokens allocated 8 MB for one parse before being rejected. At most three tokens (`[ttl] [G] [tag]`) are valid, so it now collects four and rejects the rest, as `t` does (#1174).
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
