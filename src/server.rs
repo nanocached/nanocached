@@ -454,6 +454,13 @@ const MIGRATION_ABANDON_DRAIN_WAIT: Duration = Duration::from_secs(8);
 /// another large request. Well above ordinary command sizes so typical
 /// traffic never churns an allocation on every drained buffer.
 const REQUEST_BUFFER_SHRINK_THRESHOLD: usize = 64 * 1024;
+#[cfg(test)]
+thread_local! {
+    /// How many times `handle_connection` on this thread rebuilt its
+    /// receive buffer to let go of an oversized allocation (issue #1145).
+    /// Thread-local so `current_thread` tests don't see each other's.
+    static RECEIVE_BUFFER_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 /// Tenth-pass audit (2026-09-02): once `ActiveMigration::pending_clears`
 /// would hold more distinct namespaces than this, it degrades to a single
 /// clear-all instead — see `PendingClears`.
@@ -3911,20 +3918,30 @@ async fn handle_connection(
         // byte always lands in the same read as the previous command's
         // tail would otherwise never hit an exact-empty check and carry
         // the oversized allocation for the rest of the connection's life.
-        if received.capacity() > REQUEST_BUFFER_SHRINK_THRESHOLD
+        //
+        // Issue #1145: a buffer still holding a charge is rebuilt even
+        // when its own `capacity()` is already at or under the threshold.
+        // `split_to` hands a frame its bytes as a view of the *same*
+        // allocation, so once the frame is dropped the tail's `capacity()`
+        // is only what lies past the split (a 256 KiB buffer that gave up
+        // a 200 KB frame reports 56 KiB) while the whole allocation lives
+        // on until the tail itself is dropped or rebuilt. Releasing the
+        // charge on that reported capacity alone left up to a frame's
+        // worth of memory per idle connection outside the budget.
+        if (received.capacity() > REQUEST_BUFFER_SHRINK_THRESHOLD || receive_charged > 0)
             && received.len() <= REQUEST_BUFFER_SHRINK_THRESHOLD
         {
             let mut shrunk = BytesMut::with_capacity(received.len());
             shrunk.extend_from_slice(&received);
             received = shrunk;
+            #[cfg(test)]
+            RECEIVE_BUFFER_REBUILDS.with(|n| n.set(n.get() + 1));
         }
-        // The released capacity is released from the budget too. A buffer
-        // whose capacity fell to the free threshold on its own is not
-        // shrunk but holds nothing chargeable either: `split_to` leaves a
-        // frame's bytes with the frame, so a 256 KiB buffer that gave up
-        // a 200 KB frame has 56 KiB left. Its charge goes as well, or an
-        // idle connection would pin up to a frame's worth of the shared
-        // budget until it closed.
+        // The released capacity is released from the budget too: after
+        // the rebuild above, a buffer at or under the threshold holds
+        // nothing chargeable, and one that never grew past it was never
+        // charged. Without this an idle connection would pin up to a
+        // frame's worth of the shared budget until it closed.
         if received.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
             receive_charge = None;
             receive_charged = 0;
@@ -11445,6 +11462,57 @@ mod tests {
             budget.available(),
             4 * MAX_REQUEST_SIZE,
             "an idle connection must hold nothing of the budget"
+        );
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), connection_task).await;
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn releasing_the_receive_charge_lets_go_of_the_oversized_allocation_too() {
+        // Issue #1145: the 200 KB frame grows the buffer to 256 KiB;
+        // `split_to` hands the frame its bytes as a view of that same
+        // allocation, so the tail left behind reports 56 KiB of capacity
+        // while the whole 256 KiB stays allocated until the tail itself is
+        // dropped or rebuilt. Releasing the charge on the tail's reported
+        // capacity alone (the #1113 fix) left the allocation in place,
+        // uncharged. The charge may only go once the buffer has been
+        // rebuilt — so the rebuild must have run exactly once here.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(4 * MAX_REQUEST_SIZE);
+        let (mut client, server) = tcp_pair().await;
+        RECEIVE_BUFFER_REBUILDS.with(|n| n.set(0));
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        let mut frame = b"S 1 200000\nk".to_vec();
+        frame.extend(std::iter::repeat_n(b'v', 200_000));
+        client.write_all(&frame).await.unwrap();
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"S\n");
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            budget.available(),
+            4 * MAX_REQUEST_SIZE,
+            "an idle connection must hold nothing of the budget"
+        );
+        assert_eq!(
+            RECEIVE_BUFFER_REBUILDS.with(|n| n.get()),
+            1,
+            "the charge was released without rebuilding the buffer, so the \
+             256 KiB allocation the frame grew it to is still held, uncharged"
         );
 
         drop(client);
