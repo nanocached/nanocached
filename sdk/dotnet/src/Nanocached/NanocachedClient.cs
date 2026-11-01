@@ -1759,6 +1759,11 @@ public sealed class NanocachedClient : IDisposable
         }
         ValidateKeyAndValue(namespaceBytes, key, value);
         byte[] outgoing = _compress ? Compression.CompressValue(value, _compressionThreshold) : value;
+        namespaceBytes = OwnedForBackgroundLegs(namespaceBytes);
+        key = OwnedForBackgroundLegs(key);
+        // Compression may hand the caller's array back (a value below the
+        // threshold is sent as is), so the copy is by identity, not by option.
+        if (ReferenceEquals(outgoing, value)) outgoing = OwnedForBackgroundLegs(outgoing);
         await BeforeOperationAsync().ConfigureAwait(false);
         await WithClusterRetryAsync<object?>(async () =>
         {
@@ -1788,6 +1793,8 @@ public sealed class NanocachedClient : IDisposable
     internal async Task<bool> DeleteAsync(byte[] namespaceBytes, byte[] key)
     {
         ValidateKey(namespaceBytes, key);
+        namespaceBytes = OwnedForBackgroundLegs(namespaceBytes);
+        key = OwnedForBackgroundLegs(key);
         await BeforeOperationAsync().ConfigureAwait(false);
         return await WithClusterRetryAsync(
             () => WriteAsync(namespaceBytes, key, connection => connection.DeleteAsync(namespaceBytes, key)))
@@ -1842,6 +1849,8 @@ public sealed class NanocachedClient : IDisposable
     {
         ValidateTouchTtl(ttlSeconds);
         ValidateKey(namespaceBytes, key);
+        namespaceBytes = OwnedForBackgroundLegs(namespaceBytes);
+        key = OwnedForBackgroundLegs(key);
         await BeforeOperationAsync().ConfigureAwait(false);
         bool replaySafe = ttlSeconds != 0;
         try
@@ -1910,6 +1919,8 @@ public sealed class NanocachedClient : IDisposable
     {
         ValidateTouchTtl(ttlSeconds);
         ValidateKey(namespaceBytes, key);
+        namespaceBytes = OwnedForBackgroundLegs(namespaceBytes);
+        key = OwnedForBackgroundLegs(key);
         await BeforeOperationAsync().ConfigureAwait(false);
         bool replaySafe = ttlSeconds != 0;
         byte[]? raw;
@@ -4308,6 +4319,17 @@ public sealed class NanocachedClient : IDisposable
             }
         })).ConfigureAwait(false);
     }
+
+    /// <summary>Issue #1203: with <c>FireAndForgetReplicas</c>, a replica
+    /// leg of <see cref="WriteAsync{T}"/> runs after the call has returned
+    /// and reads the arrays its operation captured. A byte[] caller that
+    /// reuses or overwrites its buffers by then would make the replica
+    /// store (or delete, or touch) a different key or value, so the arrays
+    /// are copied once, at call time, before the first await. Without
+    /// fire-and-forget every leg is awaited inside the call, and nothing is
+    /// copied.</summary>
+    private byte[] OwnedForBackgroundLegs(byte[] array) =>
+        _fireAndForgetReplicas ? (byte[])array.Clone() : array;
 
     /// <summary><paramref name="replicaOp"/> (issue #825) — when non-null —
     /// is sent to every non-primary owner, fire-and-forget legs included,

@@ -1051,7 +1051,27 @@ internal sealed class Connection
     /// already be true. Null outside tests.</summary>
     internal static Action<Connection>? BeforeFailingWaiterForTest;
 
+    // Issue #1217: ReadLoopAsync runs fire-and-forget, so an exception that
+    // escaped it (a TLS AuthenticationException, an InvalidOperationException,
+    // a parser bug - anything the loop's own I/O-failure handler does not
+    // name) was observed by nobody: the connection stayed open with no
+    // reader and every pending request waited for the request watchdog.
+    // Whatever escapes the loop now poisons the connection, which fails
+    // every pending request with the cause attached.
     private async Task ReadLoopAsync()
+    {
+        try
+        {
+            await ReadLoopCoreAsync().ConfigureAwait(false);
+        }
+        catch (Exception error)
+        {
+            CloseWithReason(new ConnectionLostException(
+                $"nanocached: connection failed: {error.Message}", error));
+        }
+    }
+
+    private async Task ReadLoopCoreAsync()
     {
         while (true)
         {
