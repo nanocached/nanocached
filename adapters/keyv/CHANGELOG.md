@@ -9,6 +9,26 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Added
+
+- keyv 6 support: the adapter type-checks and works against keyv 6.1 as well
+  as keyv 5 (`peerDependencies.keyv` is `^5.0.0 || ^6.0.0`). It stays a
+  relative-`ttl` adapter, which keyv 6 wraps in its own bridge that converts
+  its absolute expiry back to the remaining milliseconds, so TTL rounding is
+  the same on both versions and behaviour under keyv 5 does not change. On
+  keyv 6, a `Keyv` with a `namespace` prefixes keys itself and its `clear()`
+  reports an error and deletes nothing (the wire cannot enumerate keys); a
+  `Keyv` without one clears the nanocached namespace as before. See the
+  README. keyv 6 itself needs Node.js 22.19 or later.
+
+### Changed
+
+- `NanocachedKeyvStore` no longer declares `implements KeyvStoreAdapter`
+  (that interface is keyv 6's `KeyvStorageAdapter`, which makes
+  `has`/`getMany`/`setMany`/`deleteMany` mandatory, and keyv 5's is a
+  different shape). Runtime behaviour is unchanged; the type is still accepted
+  by `new Keyv(store)` under both versions.
+
 ## [0.5.1] - 2026-10-27
 
 No changes. Version aligned with the rest of the project: every release

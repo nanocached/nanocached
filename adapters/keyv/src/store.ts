@@ -1,5 +1,4 @@
 import { NanocachedClient, type NanocachedAddress, type NanocachedNamespace } from "nanocached";
-import type { KeyvStoreAdapter } from "keyv";
 
 // cache-manager v5's own store convention (see the sibling
 // `nanocached-cache-manager` package) binds one store to one namespace by
@@ -16,8 +15,8 @@ const DEFAULT_NAMESPACE = "keyv";
  * v5 store's `NanocachedStoreConfig` (`secret` renamed from that type's
  * `authSecret`, everything else passed straight through).
  *
- * **`namespace` here is unrelated to Keyv's own `namespace`/`useKeyPrefix`
- * options** — see the module README's "Namespace vs. Keyv's own prefixing"
+ * **`namespace` here is unrelated to Keyv's own `namespace` (and keyv 5's
+ * `useKeyPrefix`) options** — see the module README's "Namespace vs. Keyv's own prefixing"
  * section. Conflating the two is the classic mistake this note exists to
  * head off.
  */
@@ -28,7 +27,8 @@ export interface NanocachedKeyvStoreConfig {
   addresses: NanocachedAddress[];
   /** The nanocached namespace this store reads and writes — **not** the
    * same thing as Keyv's own `namespace` option (an in-band key-prefix
-   * string Keyv applies before ever calling this store). Default
+   * string Keyv, or keyv 6's bridge around this store, applies before
+   * ever calling it). Default
    * `"keyv"`. */
   namespace?: string;
   /** Shared secret to authenticate with (`NanocachedClientOptions.authSecret`).
@@ -53,7 +53,11 @@ export interface NanocachedKeyvStoreConfig {
 }
 
 // Keyv's own unit is milliseconds throughout (`Keyv`'s `ttl` option and
-// `.set()`'s `ttl` parameter); the wire's is whole seconds. A positive
+// `.set()`'s `ttl` parameter); the wire's is whole seconds. keyv 6's
+// `KeyvBridgeAdapter` hands this adapter the *remaining* milliseconds
+// (absolute expiry minus its own `Date.now()`), so under keyv 6 the value
+// can be a few milliseconds shorter than the caller's ttl; a deadline that
+// has already passed never reaches `set()` at all (the bridge deletes). A positive
 // sub-second value rounds UP, never down to 0 ("no expiry") — same policy
 // as the cache-manager v5 store's `resolveTtlSeconds`. `ttl` arrives here
 // as `undefined` when the caller passed none at all, or `null` when Keyv
@@ -81,16 +85,27 @@ function wireTtlSeconds(ttlMs: number | null | undefined): number | typeof DO_NO
 }
 
 /**
- * A Keyv `KeyvStoreAdapter` (keyv ^5, the version real `cache-manager` v6+
- * and `@nestjs/cache-manager` 3.x currently depend on) backed by one
- * nanocached namespace — issue #120's follow-up to `nanocached-cache-manager`
- * (issue #108/#118's sibling), which targets cache-manager v5's older
- * `Store` API instead.
+ * A Keyv storage adapter backed by one nanocached namespace, for keyv 5 and
+ * keyv 6 (the versions `cache-manager` v6+ and `@nestjs/cache-manager`
+ * depend on) — the follow-up to `nanocached-cache-manager`, which targets
+ * cache-manager v5's older `Store` API instead.
+ *
+ * **A "legacy" adapter on purpose, under both Keyv versions.** `set(key,
+ * value, ttl)` takes a *relative* TTL in milliseconds, which is keyv 5's
+ * contract. keyv 6 recognises such an adapter (it does not advertise
+ * `capabilities.expires`) and wraps it in its own `KeyvBridgeAdapter`,
+ * which converts keyv 6's absolute expiry back into exactly that relative
+ * TTL before calling `set()`. So one `set()` serves both Keyv versions, with
+ * no way to misread an absolute timestamp as a TTL. The class deliberately
+ * does not declare `implements KeyvStorageAdapter`: that interface (keyv 6)
+ * makes `has`/`getMany`/`setMany`/`deleteMany` mandatory, which this adapter
+ * leaves out on purpose (below), and keyv 5's `KeyvStoreAdapter` has a
+ * different shape again.
  *
  * **Values pass through opaque.** Keyv itself JSON-encodes `{value,
  * expires}` before ever calling `set()`, and decodes whatever `get()`
- * returns — confirmed directly against keyv 5.6.0. This store never
- * touches that envelope; it just persists and returns the raw string
+ * returns — confirmed directly against keyv 5.6.0 and 6.1.0. This store
+ * never touches that envelope; it just persists and returns the raw string
  * byte-for-byte.
  *
  * **Deliberately minimal surface — `has`/`hasMany`, `getMany`/`setMany`/
@@ -101,21 +116,22 @@ function wireTtlSeconds(ttlMs: number | null | undefined): number | typeof DO_NO
  * built on this wire is subtly wrong (it would misreport a key as present
  * past Keyv's own precise millisecond expiry, before the wire's coarser
  * whole-second TTL sweeps it), and defining `iterator` at all — even one
- * that only throws — trips a crash in Keyv's own constructor for any
+ * that only throws — trips a crash in keyv 5's own constructor for any
  * adapter whose `opts` lacks a `url` string.
  */
-export class NanocachedKeyvStore implements KeyvStoreAdapter {
-  /** Required by the `KeyvStoreAdapter` type; Keyv never reads anything
-   * out of it for a custom adapter beyond checking it's present (its
+export class NanocachedKeyvStore {
+  /** keyv 5's `KeyvStoreAdapter` type requires it; Keyv never reads anything
+   * out of it for a custom adapter beyond checking it's present (keyv 5's
    * `_checkIterableAdapter` gate, which inspects `opts.url`/`opts.dialect`,
    * only runs when the adapter also defines `iterator` — this one
-   * doesn't). Left empty. */
+   * doesn't), and keyv 6 dropped it. Left empty. */
   readonly opts: Record<string, never> = {};
 
-  /** Set by Keyv itself after construction (`new Keyv({ store })` assigns
+  /** Set by keyv 5 itself after construction (`new Keyv({ store })` assigns
    * `store.namespace = <keyv's own namespace option>`) — this adapter
-   * never reads it, since key prefixing is entirely Keyv's own concern.
-   * Present only to satisfy the `KeyvStoreAdapter` type. */
+   * never reads it, since key prefixing is entirely Keyv's own concern
+   * (keyv 5's own prefix; with keyv 6, the `KeyvBridgeAdapter` it wraps
+   * this adapter in). */
   namespace?: string;
 
   private readonly ns: NanocachedNamespace;
@@ -160,12 +176,11 @@ export class NanocachedKeyvStore implements KeyvStoreAdapter {
     await this.ns.clear();
   }
 
-  /** Part of `KeyvStoreAdapter`'s `IEventEmitter` requirement — Keyv
-   * conditionally calls `store.on("error", ...)` if the method exists, to
-   * re-emit a store's out-of-band errors through its own `error` event.
-   * This store has none: every operation already surfaces its errors
-   * through the returned `Promise`'s rejection, so there is nothing to
-   * emit out of band. A no-op, kept only to satisfy the type. */
+  /** Keyv conditionally calls `store.on("error", ...)` if the method exists
+   * (keyv 6 via its `KeyvBridgeAdapter`), to re-emit a store's out-of-band
+   * errors through its own `error` event. This store has none: every
+   * operation already surfaces its errors through the returned `Promise`'s
+   * rejection, so there is nothing to emit out of band. A no-op. */
   on(): this {
     return this;
   }
@@ -182,9 +197,9 @@ export class NanocachedKeyvStore implements KeyvStoreAdapter {
 
 /**
  * Connects a fresh `NanocachedClient` and returns a `NanocachedKeyvStore`
- * ready to hand to `new Keyv({ store, useKeyPrefix: false })` — see the
- * module README for why `useKeyPrefix: false` is recommended (not
- * required) here.
+ * ready to hand to `new Keyv({ store, useKeyPrefix: false })` under keyv 5
+ * or plain `new Keyv(store)` under keyv 6 — see the module README for why
+ * `useKeyPrefix: false` is recommended (not required) with keyv 5.
  */
 export async function nanocachedKeyvStore(config: NanocachedKeyvStoreConfig): Promise<NanocachedKeyvStore> {
   if (config.addresses === undefined) {

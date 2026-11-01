@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import Keyv from "keyv";
+import Keyv from "keyv5";
 import { createCache } from "cache-manager";
 import { AlreadyClosedError, ConnectionLostError } from "nanocached";
 import { nanocachedKeyvStore, NanocachedKeyvStore } from "../src/index.js";
