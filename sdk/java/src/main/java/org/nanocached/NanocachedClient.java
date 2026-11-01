@@ -2560,8 +2560,14 @@ public final class NanocachedClient implements AutoCloseable {
                 // the uncopied `outgoing` above, since it always finishes before
                 // this method returns and so can never observe a later mutation.
                 byte[] backgroundSafe = compress ? outgoing : Arrays.copyOf(outgoing, outgoing.length);
+                // Issue #1199: the same holds for the key and the namespace —
+                // the leg frames them only once it runs, so a caller that
+                // reuses those buffers must not change where the replica
+                // stores the value.
+                byte[] backgroundKey = key.clone();
+                byte[] backgroundNamespace = namespace.clone();
                 return connection -> {
-                    connection.set(namespace, key, backgroundSafe, wireTtlSeconds);
+                    connection.set(backgroundNamespace, backgroundKey, backgroundSafe, wireTtlSeconds);
                     return null;
                 };
             });
@@ -3803,11 +3809,17 @@ public final class NanocachedClient implements AutoCloseable {
                 // instead of the shared, still-mutable one. Only the entries
                 // this leg actually touches are copied, not the whole batch.
                 byte[][] backgroundValues = compress ? valueBytes : copyValuesForBackground(valueBytes, batch.indices);
+                // Issue #1199: the leg frames the keys and the namespace
+                // only once it runs, so copy those too (the keys this leg
+                // touches; a Map-based call built its own key arrays, a
+                // positional byte[][] call hands us the caller's).
+                byte[][] backgroundKeys = copyValuesForBackground(keyBytes, batch.indices);
+                byte[] backgroundNamespace = namespace.clone();
                 // Its outcome is never waited for, so it records nothing
                 // in the tracker: the retry pass (if any) sends this
                 // owner its positions again, as before.
                 Runnable backgroundLeg = () -> runMultiSetLeg(
-                        namespace, name, batch, keyBytes, backgroundValues, ttlSeconds, retry, null);
+                        backgroundNamespace, name, batch, backgroundKeys, backgroundValues, ttlSeconds, retry, null);
                 try {
                     CompletableFuture.runAsync(backgroundLeg, backgroundLegs)
                             .whenComplete((ignoredResult, error) -> {
@@ -3910,9 +3922,11 @@ public final class NanocachedClient implements AutoCloseable {
      * background — copies only the entries {@code indices} (this leg's
      * own {@link OwnerBatch#indices}) actually reads, leaving every other
      * slot {@code null} since {@link #runMultiSetLeg} never looks at
-     * them. Only called when {@code compress} is off for the whole batch
-     * (see the caller) — when it's on, every element is already a fresh
-     * array from {@link Compression#compressValue} and needs no copy.
+     * them. Only called for values when {@code compress} is off for the
+     * whole batch (see the caller) — when it's on, every element is
+     * already a fresh array from {@link Compression#compressValue} and
+     * needs no copy. Also used for the key arrays (issue #1199), which
+     * are never compressed and so always need the copy.
      */
     private static byte[][] copyValuesForBackground(byte[][] valueBytes, List<Integer> indices) {
         byte[][] copy = new byte[valueBytes.length][];
