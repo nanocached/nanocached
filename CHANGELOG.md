@@ -14,6 +14,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: when a join's transfer failed (the joiner unreachable
+  after three attempts, an abort, or a failed write of the `M` ack), the
+  writes already queued for forwarding to that joiner were not dropped, so
+  each kept being sent to a dead address (up to 10 s apiece, with up to
+  64 MiB held), and to whichever process later took the address. They are
+  now revoked when the unfinished handoff is dropped, as they already were
+  for an abandon, an eviction or a replacement (#1185).
 - `nanocached-node`: a handoff tombstone was charged to `--max-memory` for its key bytes only, although each one also holds a map slot, a queue item and two allocation headers (about 250 B), the per-entry cost a `migrated` mark has always been charged. A full set of 65,536 tombstones (a join or drain window with many relayed deletes) held about 16 MiB the limit did not count. They are now charged the same way (#1179).
 - `nanocached-proxy`: a large frame's receive buffer was shrunk and
   allocated again on every read until 64 KiB of its body had arrived. With

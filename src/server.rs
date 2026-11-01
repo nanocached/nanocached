@@ -6363,7 +6363,20 @@ impl Drop for MigrationGuard {
             .slot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _ = take_slot_keeping_lingering(&mut slot);
+        //
+        // Issue #1185: revoke the forwards already queued against the slot,
+        // as every other path that ends a handoff before its window runs
+        // out does (abandon, eviction, replacement). The joiner may be
+        // unreachable (the usual reason a transfer fails), and the address
+        // may later belong to another process. Not done for the lazy expiry
+        // (`expired()` clearing the slot): there the joiner is confirmed
+        // and alive and only its window has closed, so what is still
+        // queued are writes accepted inside that window and revoking would
+        // discard them. The remnant shares this flag, but its own window is
+        // zero, so setting it costs nothing.
+        if let Some(taken) = take_slot_keeping_lingering(&mut slot) {
+            taken.forward_revoked.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -11867,6 +11880,34 @@ mod tests {
         let _ = timeout(Duration::from_secs(5), connection_task).await;
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_an_unfinished_guard_revokes_its_queued_forwards() {
+        let slot: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let history = RingHistory::default();
+        let ring = Arc::new(HashRing::new(vec!["a".to_string(), "joiner".to_string()]));
+        let guard = MigrationGuard::new(
+            Arc::clone(&slot),
+            "joiner".to_string(),
+            "127.0.0.1:1".to_string(),
+            "tok".to_string(),
+            ring,
+            1,
+            None,
+            &[],
+            &known_ring,
+            &history,
+        )
+        .unwrap_new();
+        let revoked = Arc::clone(&slot.lock().unwrap().as_ref().unwrap().forward_revoked);
+        drop(guard); // run_migration returned early: transfer to the joiner failed
+        assert!(slot.lock().unwrap().is_none());
+        assert!(
+            revoked.load(Ordering::SeqCst),
+            "slot cleared by an unfinished guard, forwards queued against it not revoked"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
