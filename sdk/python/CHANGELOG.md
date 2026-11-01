@@ -9,6 +9,10 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- A forced node-list refresh (after a connection failure or a `W` reply) joined a refresh that was already in flight, even one that had read discovery's list before the failure, so the retry could go back to the node that had just failed. A forced refresh now waits out a refresh that started earlier and then runs a fresh one (forced callers arriving meanwhile share it); the periodic stale check still joins an in-flight refresh. (#1200)
+
 ## [0.6.0] - 2026-11-01
 
 ### Fixed
