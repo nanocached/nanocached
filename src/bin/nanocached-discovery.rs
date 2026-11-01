@@ -254,6 +254,7 @@ use nanocached::infra::{
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
@@ -821,7 +822,7 @@ struct RegistryState {
     /// its own name is not reported gone. Pruned by age
     /// (`DEPARTED_RETENTION`) on every insert and capped
     /// (`MAX_DEPARTED`).
-    departed: Mutex<FxHashMap<String, Instant>>,
+    departed: Mutex<Departed>,
 }
 
 /// How long a departure stays answerable — comfortably past the longest
@@ -830,6 +831,68 @@ struct RegistryState {
 const DEPARTED_RETENTION: Duration = Duration::from_secs(3600);
 /// Upper bound on remembered departures; the oldest goes first.
 const MAX_DEPARTED: usize = 4096;
+
+/// `RegistryState::departed`'s storage (issue #1201). `at` answers lookups;
+/// `order` holds the same records oldest first so that both the age prune
+/// and the over-cap eviction work from the front in amortised O(1) — they
+/// used to scan the whole map per call, 3.3 s for the 65,536 evictions of a
+/// mass expiry, all of it on the single-threaded runtime. An `order` entry
+/// is current only while `at` still holds that exact instant for the name;
+/// a name forgotten or recorded again leaves a stale entry behind, skipped
+/// when it reaches the front and swept out wholesale once `order` outgrows
+/// twice the cap (so a repeating name cannot grow it without bound).
+/// Recording happens under the lock with `Instant::now()`, so `order` is
+/// sorted by time.
+#[derive(Default)]
+struct Departed {
+    at: FxHashMap<String, Instant>,
+    order: VecDeque<(Instant, String)>,
+}
+
+impl Departed {
+    fn is_current(&self, at: Instant, name: &str) -> bool {
+        self.at.get(name) == Some(&at)
+    }
+
+    fn record(&mut self, name: &str, now: Instant) {
+        // Age prune: only the front can be expired, since `order` is in
+        // time order.
+        while let Some((at, front)) = self.order.front() {
+            if now.duration_since(*at) < DEPARTED_RETENTION {
+                break;
+            }
+            if self.is_current(*at, front) {
+                self.at.remove(front);
+            }
+            self.order.pop_front();
+        }
+        // Over the cap and not merely refreshing a known name: the oldest
+        // current record goes (stale entries in front of it are dropped on
+        // the way).
+        if self.at.len() >= MAX_DEPARTED && !self.at.contains_key(name) {
+            while let Some((at, front)) = self.order.pop_front() {
+                if self.is_current(at, &front) {
+                    self.at.remove(&front);
+                    break;
+                }
+            }
+        }
+        self.at.insert(name.to_string(), now);
+        self.order.push_back((now, name.to_string()));
+        if self.order.len() > 2 * MAX_DEPARTED {
+            let at = &self.at;
+            self.order.retain(|(when, n)| at.get(n) == Some(when));
+        }
+    }
+
+    fn forget(&mut self, name: &str) {
+        self.at.remove(name);
+    }
+
+    fn departed_at(&self, name: &str) -> Option<Instant> {
+        self.at.get(name).copied()
+    }
+}
 
 impl Default for RegistryState {
     fn default() -> Self {
@@ -844,7 +907,7 @@ impl Default for RegistryState {
             heartbeat_ack: Mutex::new(None),
             list_cache: Mutex::new(None),
             roster_cache: Mutex::new(None),
-            departed: Mutex::new(FxHashMap::default()),
+            departed: Mutex::new(Departed::default()),
         }
     }
 }
@@ -2042,22 +2105,11 @@ async fn serve_metrics_connection(
 /// Issue #571: remembers that `name` left the cluster, was evicted, or
 /// had its join abandoned — see `RegistryState::departed`.
 fn record_departed(registry: &Registry, name: &str) {
-    let mut departed = registry
+    registry
         .departed
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = Instant::now();
-    departed.retain(|_, at| now.duration_since(*at) < DEPARTED_RETENTION);
-    if departed.len() >= MAX_DEPARTED
-        && !departed.contains_key(name)
-        && let Some(oldest) = departed
-            .iter()
-            .min_by_key(|(_, at)| **at)
-            .map(|(name, _)| name.clone())
-    {
-        departed.remove(&oldest);
-    }
-    departed.insert(name.to_string(), now);
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record(name, Instant::now());
 }
 
 /// Issue #571: `name` registered (again) — it is no longer gone.
@@ -2066,7 +2118,7 @@ fn forget_departed(registry: &Registry, name: &str) {
         .departed
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(name);
+        .forget(name);
 }
 
 /// Issue #571: the answer to a heartbeat's pending-joiner question —
@@ -2079,7 +2131,7 @@ fn pending_joiner_verdict(registry: &Registry, joiner: &str) -> &'static [u8] {
         .departed
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(joiner)
+        .departed_at(joiner)
         .is_some_and(|at| at.elapsed() < DEPARTED_RETENTION);
     if departed && !registered {
         b"G\n"
@@ -5723,6 +5775,87 @@ mod tests {
         forget_departed(&registry, "joiner-0");
         lock(&registry).remove("joiner-0");
         assert_eq!(pending_joiner_verdict(&registry, "joiner-0"), b"K\n");
+    }
+
+    #[test]
+    fn recording_many_departures_back_to_back_stays_cheap() {
+        // Issue #1201: every call used to scan the whole departed map
+        // (age prune, then an oldest search once full), so recording the
+        // 65,536 evictions of a mass expiry in one sweep tick took 3.3 s on
+        // a release build, with the runtime unable to serve anything
+        // meanwhile. Amortised O(1) per call finishes in milliseconds;
+        // the bound leaves a wide margin for a slow CI debug build.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let started = Instant::now();
+        for index in 0..MAX_REGISTRY_SIZE {
+            record_departed(&registry, &format!("node-{index}"));
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "recording {MAX_REGISTRY_SIZE} departures took {elapsed:?}"
+        );
+        // The cap still holds, and it is the newest names that are kept.
+        assert_eq!(pending_joiner_verdict(&registry, "node-0"), b"K\n");
+        let newest = format!("node-{}", MAX_REGISTRY_SIZE - 1);
+        assert_eq!(pending_joiner_verdict(&registry, &newest), b"G\n");
+    }
+
+    #[test]
+    fn departed_keeps_the_newest_names_and_drops_expired_and_forgotten_ones() {
+        let base = Instant::now();
+        let at = |millis: u64| base + Duration::from_millis(millis);
+        let mut departed = Departed::default();
+
+        // Over the cap, the oldest record goes first; a name recorded
+        // again counts as new, so it outlives names recorded after its
+        // first record.
+        for index in 0..MAX_DEPARTED {
+            departed.record(&format!("n{index}"), at(index as u64));
+        }
+        departed.record("n0", at(MAX_DEPARTED as u64));
+        departed.record("extra", at(MAX_DEPARTED as u64 + 1));
+        assert!(
+            departed.departed_at("n0").is_some(),
+            "refreshed, not oldest"
+        );
+        assert!(
+            departed.departed_at("n1").is_none(),
+            "oldest current record"
+        );
+        assert!(departed.departed_at("n2").is_some());
+        assert!(departed.departed_at("extra").is_some());
+        assert_eq!(departed.at.len(), MAX_DEPARTED);
+
+        // A forgotten name frees its place without leaving a record, and
+        // its stale queue entry is skipped rather than evicting a live one.
+        departed.forget("n2");
+        departed.record("again", at(MAX_DEPARTED as u64 + 2));
+        assert!(departed.departed_at("n3").is_some());
+        assert!(departed.departed_at("n2").is_none());
+        assert_eq!(departed.at.len(), MAX_DEPARTED);
+
+        // Everything older than the retention is gone on the next record.
+        let later = at(MAX_DEPARTED as u64 + 2) + DEPARTED_RETENTION - Duration::from_millis(1);
+        departed.record("fresh", later);
+        assert_eq!(
+            departed.at.len(),
+            2,
+            "only `again` (just inside) and `fresh`"
+        );
+        assert!(departed.departed_at("again").is_some());
+        assert!(departed.departed_at("fresh").is_some());
+    }
+
+    #[test]
+    fn departed_queue_stays_bounded_when_one_name_is_recorded_repeatedly() {
+        let base = Instant::now();
+        let mut departed = Departed::default();
+        for tick in 0..(10 * MAX_DEPARTED) {
+            departed.record("flapping", base + Duration::from_nanos(tick as u64));
+            assert!(departed.order.len() <= 2 * MAX_DEPARTED + 1);
+        }
+        assert_eq!(departed.at.len(), 1);
     }
 
     #[test]
