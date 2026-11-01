@@ -153,6 +153,23 @@ function describe(value: unknown): string {
 }
 
 /**
+ * Decodes one stored value, answering `undefined` (a miss) for text that
+ * is not valid JSON (issue #1205). The namespace can hold an entry this
+ * adapter did not write — another application, or a value written with a
+ * different serialization — and for a cache an unreadable entry is a miss
+ * the caller recomputes and overwrites, not an exception; in `mget` one
+ * such entry would otherwise throw away every good value in the batch. The
+ * Django adapter degrades per key the same way. The entry is left in place.
+ */
+function parseStored(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * A cache-manager v5 `Store` backed by a nanocached namespace. Returned by
  * `nanocachedStore` (the factory `caching()` expects); see that function
  * and the module README for how the two fit together.
@@ -185,7 +202,7 @@ export class NanocachedStore implements Store {
 
   async get<T>(key: string): Promise<T | undefined> {
     const raw = await this.ns.get(key);
-    return raw === null ? undefined : (JSON.parse(raw) as T);
+    return raw === null ? undefined : (parseStored(raw) as T | undefined);
   }
 
   async set<T>(key: string, data: T, ttl?: Milliseconds): Promise<void> {
@@ -241,7 +258,7 @@ export class NanocachedStore implements Store {
     const raw = await this.mgetResolved(keys);
     return keys.map((key) => {
       const value = raw.get(key);
-      return value === undefined ? undefined : (JSON.parse(value) as unknown);
+      return value === undefined ? undefined : parseStored(value);
     });
   }
 

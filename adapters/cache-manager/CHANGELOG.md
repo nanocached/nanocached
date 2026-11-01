@@ -9,6 +9,15 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Fixed
+
+- A stored value that is not valid JSON (an entry another application left in
+  the same namespace, or one written with a different serialization) made
+  `get` throw a `SyntaxError` and made `mget` throw for the whole batch,
+  losing every good value next to it. Each entry is now decoded on its own and
+  one that does not parse is a miss (`undefined`), like the Django adapter's
+  `get_many` (#1205).
+
 ## [0.6.0] - 2026-11-01
 
 ### Changed
