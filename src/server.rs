@@ -26856,6 +26856,71 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_draining_node_keeps_heartbeating_but_does_not_adopt_the_roster_in_the_ack() {
+        // Issue #1158: heartbeats now run through the decommission drain, and
+        // their acks keep carrying rosters. The handoff works from the rings
+        // fixed when it began (`LeaveState`); adopting a later roster would
+        // change what the node serves mid-drain and could start a
+        // re-replication for a node that is leaving cleanly. The test
+        // before this one is the control: the same ack, the node not
+        // draining, and the ring is adopted.
+        let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap().to_string();
+        let received = fake_discovery_acking_with(
+            primary,
+            b"A 2 3\n9 14\ntest-node127.0.0.1:8356\n6 14\nnode-b127.0.0.1:9002\n",
+        );
+
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let node_context = test_node_context(
+            "test-node",
+            "tk-test-node",
+            Arc::clone(&known_ring),
+            Arc::new(Mutex::new(None)),
+        );
+        let ring = Arc::new(HashRing::new(vec![
+            "test-node".to_string(),
+            "node-b".to_string(),
+        ]));
+        *node_context.leaving.lock().unwrap() = Some(LeaveState {
+            before_ring: Arc::clone(&ring),
+            after_ring: Arc::clone(&ring),
+            replication: 1,
+            addresses: HashMap::new(),
+            tokens: HashMap::new(),
+            connections: Mutex::new(HashMap::new()),
+        });
+        let (rereplication_tx, rereplication_rx) = mpsc::channel::<RereplicationTask>(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![primary_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            NodeContext {
+                rereplication_tx,
+                ..node_context
+            },
+            rereplication_rx,
+            shutdown_rx,
+            mpsc::channel(1).0,
+        ));
+        sleep(Duration::from_millis(150)).await;
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+
+        assert_eq!(member_names(&known_ring), None);
+        let received = received.lock().unwrap().clone();
+        assert!(
+            received.len() >= 4,
+            "the node must keep heartbeating while it drains, got {received:?}"
+        );
+    }
+
     /// Issue #266: a fake discovery server serving both protocols
     /// `spawn_or_supersede_rereplication` needs on the same listener — the
     /// persistent `J`-then-`H` heartbeat connection (first ack names all

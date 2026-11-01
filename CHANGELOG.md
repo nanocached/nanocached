@@ -17,7 +17,7 @@ framework adapters at one version, whether or not a component changed.
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
-  a node with about 50,000 keys or more on a LAN) had the node evicted
+  an estimated 50,000 keys or more per node on a LAN) had the node evicted
   halfway through. Survivors adopted a roster without it, clients wrote
   straight to the new owner, and the drain's unconditional `U`s then
   overwrote those acknowledged writes with the old values: with two nodes at
