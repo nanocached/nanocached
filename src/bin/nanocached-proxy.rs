@@ -1871,6 +1871,24 @@ thread_local! {
     static KEY_HANDLES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// How many times `handle_client` has allocated a bigger read buffer on the
+// current thread, for the test that checks a large frame's buffer is
+// allocated and charged once, not again on every read.
+#[cfg(test)]
+thread_local! {
+    static READ_BUFFER_GROWTHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_read_buffer_growth() {
+    READ_BUFFER_GROWTHS.with(|growths| growths.set(growths.get() + 1));
+}
+
+#[cfg(test)]
+fn read_buffer_growths() -> usize {
+    READ_BUFFER_GROWTHS.with(|growths| growths.get())
+}
+
 #[cfg(test)]
 fn count_key_handles(handles: usize) {
     KEY_HANDLES_BUILT.with(|built| built.set(built.get() + handles));
@@ -2941,6 +2959,19 @@ async fn run_backend(
         }
         last_write = tokio::time::Instant::now();
     }
+
+    // The writer is done, whatever the reason, but the receiver would
+    // live until `reader.await` below returns: up to a whole
+    // `UPSTREAM_IO_TIMEOUT` when the reader is only now waiting for a
+    // reply the node was late with. For that long `enqueue`'s send would
+    // go on succeeding into a queue nobody serves, and the requests
+    // already in it would wait. Close it, so a later send fails at once
+    // (`enqueue` clears the slot and redials), and drop what was queued
+    // so those requests resolve now. None of them was reserved on the
+    // reader's queue or written, so each resolves as `RecvError`, which
+    // `enqueue` maps to `not_sent` (safe to replay).
+    receiver.close();
+    while receiver.try_recv().is_ok() {}
 
     // Queue closed (handle dropped or poisoned): let the reader drain
     // what is still pending, then stop.
@@ -6716,11 +6747,34 @@ async fn admit_request(
     }
     let held = held();
     let [ip_parked, proxy_parked] = parked;
-    let Some(_ip_parked) = ip_parked.try_charge(held) else {
-        return Admission::Refused;
+    let park = || {
+        let ip = ip_parked.try_charge(held)?;
+        let proxy = proxy_parked.try_charge(held)?;
+        Some((ip, proxy))
     };
-    let Some(_proxy_parked) = proxy_parked.try_charge(held) else {
-        return Admission::Refused;
+    let _parked = match park() {
+        Some(parked) => parked,
+        None => {
+            // A full pool is not always a pool of requests that are
+            // still waiting. The bytes this request just waited on may
+            // have been handed to another waiting request (the semaphore
+            // assigns them as they are released), which has not run yet
+            // and so still holds what it parked: the request that
+            // released them gets here in the same poll, before that one
+            // can give its parked bytes back, and would be refused for
+            // room that is about to be there. One turn of the scheduler
+            // lets it run; then look again, at the in-flight budgets as
+            // well, which may be free by now. A pool that is really full
+            // refuses as before, one turn later.
+            tokio::task::yield_now().await;
+            if let Some(charge) = InFlightCharge::try_charge(cost, budgets) {
+                return Admission::Granted(charge);
+            }
+            match park() {
+                Some(parked) => parked,
+                None => return Admission::Refused,
+            }
+        }
     };
     let [connection, ip, proxy] = budgets;
     tokio::select! {
@@ -7117,7 +7171,19 @@ async fn handle_client(
         // or an idle connection would keep part of its source IP's share
         // until it closed, and a neighbour asking for the whole share
         // would wait for it.
-        if shrink_drained_buffer(&mut buf) || buf.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
+        //
+        // A buffer already grown to the length of the frame it is filling
+        // is neither: with the header in, it holds 4 KiB of a 1 MB frame
+        // and is exactly as big as the frame needs. Shrinking it there
+        // would give the charge back and make the growth below allocate
+        // and charge the whole frame again, on every read until 64 KiB had
+        // arrived, each time at the back of the budgets' queues.
+        let sized_to_pending_frame = scan
+            .frame_end
+            .is_some_and(|end| end > buf.len() && end <= buf.capacity());
+        if (!sized_to_pending_frame && shrink_drained_buffer(&mut buf))
+            || buf.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD
+        {
             receive_charge = None;
             receive_charged = 0;
         } else if receive_charged == 0 {
@@ -7179,6 +7245,8 @@ async fn handle_client(
             None => Some((buf.capacity() * 2).max(buf.len() + READ_CHUNK)),
         };
         if let Some(grown) = grown {
+            #[cfg(test)]
+            count_read_buffer_growth();
             let want = [
                 &connection_in_flight_bytes,
                 &ip_in_flight_share.budgets.in_flight,
@@ -8945,6 +9013,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_large_frames_buffer_is_allocated_once_not_on_every_read() {
+        // With the header of a 1 MB `S` in, the buffer is grown to the
+        // whole frame and charged in one step. The first 64 KiB of the
+        // body used to look like a drained buffer (capacity over the
+        // threshold, contents under it): it was shrunk, its charge given
+        // back and the whole frame allocated and charged again, about 16
+        // times.
+        let (node, proxy, _context) = slow_single_node(b"k", Duration::ZERO, None).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let mut frame = b"S 1 1000000\nk".to_vec();
+        frame.extend(std::iter::repeat_n(b'v', 1_000_000));
+        let before = read_buffer_growths();
+        stream.write_all(&frame).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        let growths = read_buffer_growths() - before;
+        assert!(
+            growths <= 3,
+            "one 1 MB frame must take a few buffer growths, not one per read: {growths}"
+        );
+        drop(node);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn large_frames_pipelined_in_one_write_are_each_read_to_their_own_end() {
         // The buffer for a frame is sized to it, and the read stops at its
         // end: the frame behind it, already on the wire, is read into the
@@ -9617,6 +9708,103 @@ mod tests {
             .expect("admitted once the share is free");
         assert!(matches!(admitted, Admission::Granted(_)));
         assert_eq!(parked_free(), (MAX_REQUEST_SIZE, 4 * MAX_REQUEST_SIZE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_is_not_refused_for_parked_bytes_of_one_that_was_just_admitted() {
+        // Issue #1218. The IP's share of the pool holds one 600,000-byte
+        // frame, not two. A waits for the share with its frame parked;
+        // the holder releases the share, which the semaphore hands to A's
+        // waiter, and B, a second connection of the IP, goes on in the
+        // same poll to ask for the share and for room in the pool before A
+        // has run to give its parked bytes back. B used to be refused
+        // there, although A is admitted a moment later and B would have
+        // been the next to wait; it now looks once more after a turn of
+        // the scheduler and waits behind A.
+        let admission = InFlightAdmission::new(&ConnectionLimits {
+            max_connections: 8,
+            max_connections_per_ip: 8,
+            max_in_flight_bytes: 4 * MAX_REQUEST_SIZE,
+            max_in_flight_bytes_per_ip: MAX_REQUEST_SIZE,
+            admission_wait: Duration::from_secs(5),
+        });
+        let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let budgets = admission.for_connection(ip);
+        let wait = Duration::from_secs(5);
+        let (_drain_tx, drain) = watch::channel(false);
+        let (fifo_tx, _fifo_rx) = mpsc::channel::<ClientReply>(1);
+        let ip_in_flight = budgets.ip.budgets.in_flight.clone();
+        let ip_parked = budgets.ip.budgets.parked.clone();
+        let proxy = budgets.proxy.clone();
+        let proxy_parked = budgets.parked.clone();
+
+        // The holder: the share's whole in-flight budget.
+        let held = ip_in_flight.charge(MAX_REQUEST_SIZE).await.unwrap();
+
+        let a = {
+            let (ip_in_flight, ip_parked, proxy, proxy_parked) = (
+                ip_in_flight.clone(),
+                ip_parked.clone(),
+                proxy.clone(),
+                proxy_parked.clone(),
+            );
+            let (mut drain, fifo_tx) = (drain.clone(), fifo_tx.clone());
+            tokio::spawn(async move {
+                let connection = InFlightBudget::new(CLIENT_IN_FLIGHT_BYTES);
+                admit_request(
+                    MAX_REQUEST_SIZE,
+                    || 600_000,
+                    [&connection, &ip_in_flight, &proxy],
+                    [&ip_parked, &proxy_parked],
+                    wait,
+                    &mut drain,
+                    &fifo_tx,
+                )
+                .await
+            })
+        };
+        // A is waiting, its frame parked.
+        sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            ip_parked.permits.available_permits(),
+            MAX_REQUEST_SIZE - 600_000
+        );
+
+        // The holder gives the share up and B asks, with no await between.
+        drop(held);
+        let connection = InFlightBudget::new(CLIENT_IN_FLIGHT_BYTES);
+        let mut drain_b = drain.clone();
+        let b = admit_request(
+            MAX_REQUEST_SIZE,
+            || 600_000,
+            [&connection, &ip_in_flight, &proxy],
+            [&ip_parked, &proxy_parked],
+            wait,
+            &mut drain_b,
+            &fifo_tx,
+        );
+        tokio::pin!(b);
+        assert!(
+            timeout(Duration::from_millis(100), &mut b).await.is_err(),
+            "B waits behind A: it was not refused for A's parked bytes"
+        );
+        let Admission::Granted(a_charge) = a.await.unwrap() else {
+            panic!("A is admitted");
+        };
+        assert_eq!(
+            ip_parked.permits.available_permits(),
+            MAX_REQUEST_SIZE - 600_000,
+            "only B's frame is parked now"
+        );
+
+        // A finishes: B is admitted.
+        drop(a_charge);
+        assert!(matches!(
+            timeout(Duration::from_millis(100), &mut b)
+                .await
+                .expect("admitted once A's share is free"),
+            Admission::Granted(_)
+        ));
     }
 
     #[test]
@@ -11179,6 +11367,48 @@ mod tests {
         // Never read (or write) again.
         let _stream = stream;
         std::future::pending::<()>().await;
+    }
+
+    /// Issue #1191: a node that completes the tagged handshake, answers
+    /// the first request (a `G` for a missing key) only after `delay`,
+    /// and never reads again. The late reply is what lets the proxy's
+    /// reader start waiting for the next one *after* the writer's own
+    /// write timeout has begun.
+    async fn start_node_late_first_reply_then_silent(delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = BytesMut::new();
+                    let Ok(line) = read_line(&mut stream, &mut buf).await else {
+                        return;
+                    };
+                    let length = line
+                        .split(' ')
+                        .nth(1)
+                        .and_then(|field| field.parse::<usize>().ok())
+                        .unwrap();
+                    read_exact_into(&mut stream, &mut buf, length)
+                        .await
+                        .unwrap();
+                    stream.write_all(b"OnT\n").await.unwrap();
+                    let get = read_line(&mut stream, &mut buf).await.unwrap();
+                    let tag = get.split(' ').nth(2).unwrap().to_string();
+                    sleep(delay).await;
+                    stream
+                        .write_all(format!("N {tag}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    // Never read (or write) again.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        addr
     }
 
     async fn start_silent_after_handshake_node() -> String {
@@ -15604,6 +15834,54 @@ mod tests {
         })
         .await
         .expect("the stalled writer must time out and release its dialed-gauge slot");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_queued_behind_a_writer_that_timed_out_fails_at_once() {
+        // Issue #1191: a writer that left on a write timeout used to leave
+        // its queue open until the reader had finished, so a request
+        // queued behind the stalled write waited for the reader's own
+        // timeout as well. The node answers the first request half an I/O
+        // timeout late, so the reader starts waiting for the second
+        // reply half a timeout after the writer started its blocked
+        // write: the writer leaves at one timeout, the reader at one and
+        // a half. The queued request must fail with the writer, not with
+        // the reader.
+        let node = start_node_late_first_reply_then_silent(UPSTREAM_IO_TIMEOUT / 2).await;
+        let context = bare_context();
+        let started = tokio::time::Instant::now();
+        let first = context
+            .backends
+            .enqueue(&context, &node, frame_get(b"", b"a"), Expect::Value)
+            .await;
+        // Larger than any socket buffer pair, so the write blocks.
+        let big_value = vec![b'x'; 5_000_000];
+        let _stalled = context
+            .backends
+            .enqueue(
+                &context,
+                &node,
+                frame_set(b"", b"key", &big_value, None),
+                Expect::Stored,
+            )
+            .await;
+        let queued = context
+            .backends
+            .enqueue(&context, &node, frame_get(b"", b"b"), Expect::Value)
+            .await;
+        let result = queued.await;
+        let elapsed = started.elapsed();
+        assert!(first.await.is_ok(), "the first request is answered");
+        let error = result.expect_err("a request queued behind a dead writer cannot be served");
+        assert!(request_not_sent(&error), "never written, so safe to replay");
+        assert!(
+            elapsed >= UPSTREAM_IO_TIMEOUT,
+            "it cannot fail before the write timed out: {elapsed:?}"
+        );
+        assert!(
+            elapsed < UPSTREAM_IO_TIMEOUT + UPSTREAM_IO_TIMEOUT / 4,
+            "it failed with the reader's timeout ({elapsed:?}), not the writer's"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

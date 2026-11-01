@@ -24,6 +24,66 @@ framework adapters at one version, whether or not a component changed.
   a refresh request is served at once; an announce still pending when the
   cycle ends is dropped, which also keeps one from landing after the
   shutdown's deregistration. (#1241)
+- `nanocached-proxy`: when a source IP's share of the parked-frame pool held
+  one frame but not two, a second request could be refused at once (`B`,
+  or `R` for a retry-capable client) although the first was already
+  admitted. The share of in-flight bytes the second request had just
+  released is handed to the first one's waiter, which has not run yet and
+  so still holds its parked bytes; the second request asked for the pool in
+  the same poll and found it full. The refusal now waits one turn of the
+  scheduler and looks again, at the in-flight budgets as well, so the
+  second request waits behind the first. Two 900 KB uploads from one IP
+  against a 256 KiB share: 26 of 240 were answered `B` before (multi-thread
+  runtime), none after. A pool that is really full still refuses at once.
+  (#1218)
+- `nanocached-node`: a client trickling a large frame into a receive buffer holding between 32 KiB and 64 KiB made the node copy that buffer twice on every read (about 50 KB of memcpy per byte received; 3,000 one-byte writes gave 1,735 rebuilds in a debug test). The buffer is rebuilt to release memory, the next read doubled it back over the 64 KiB threshold, and the read after that rebuilt it again. A buffer over the threshold is now rebuilt only when it is mostly slack (`capacity > 2 * len + 64 KiB`), and the receive charge still goes only after a rebuild (#1204).
+- `nanocached-discovery`: remembering a departed node (an eviction, a `V`, an
+  abandoned join) scanned the whole departed table, up to 4,096 names, on
+  every call, so a sweep that expired many nodes at once held the
+  single-threaded runtime for seconds (3.3 s for 65,536 consecutive
+  evictions on a release build, with no connection served meanwhile). The
+  table now keeps its names in time order and prunes and evicts from the
+  front, so each call costs constant time on average; 65,536 evictions take
+  12 ms (#1201).
+- `nanocached-proxy`: a shared backend connection whose writer had left on
+  a write error or write timeout went on accepting requests until its
+  reader finished, up to `UPSTREAM_IO_TIMEOUT` (5 s) later. The queue's
+  receiver lived until the reader was done, so a request sent in the
+  meantime was queued behind nobody, and one already queued waited for the
+  reader's own timeout (which starts late when the node answered the
+  previous request late) before failing. The writer now closes the queue
+  when it leaves and drops what was in it: the queued requests, never
+  written, fail at once as not sent and are retried, and the next request
+  redials. A request queued behind a stalled write failed after 906 ms
+  with a 600 ms I/O timeout (the reader's 900 ms) and now fails at the
+  writer's 600 ms. (#1191)
+- `nanocached-node`: when a join's transfer failed (the joiner unreachable
+  after three attempts, an abort, or a failed write of the `M` ack), the
+  writes already queued for forwarding to that joiner were not dropped, so
+  each kept being sent to a dead address (up to 10 s apiece, with up to
+  64 MiB held), and to whichever process later took the address. They are
+  now revoked when the unfinished handoff is dropped, as they already were
+  for an abandon, an eviction or a replacement (#1185).
+- `nanocached-node`: a handoff tombstone was charged to `--max-memory` for its key bytes only, although each one also holds a map slot, a queue item and two allocation headers (about 250 B), the per-entry cost a `migrated` mark has always been charged. A full set of 65,536 tombstones (a join or drain window with many relayed deletes) held about 16 MiB the limit did not count. They are now charged the same way (#1179).
+- `nanocached-proxy`: a large frame's receive buffer was shrunk and
+  allocated again on every read until 64 KiB of its body had arrived. With
+  the header in, the buffer is sized to the whole frame and charged in one
+  step, but the next read left it with more capacity than 64 KiB and less
+  content than 64 KiB, which the drained-buffer check took for an emptied
+  buffer: it was copied down, its charge given back, and the next iteration
+  allocated and charged the whole frame again at the back of the budgets'
+  queues. A 1 MB `S` went through 17 allocations and charges (about 16
+  malloc/free pairs and semaphore rounds of the frame's length, each losing
+  the connection its place in line); it now takes 2. A buffer already
+  grown to the frame it is filling is no longer shrunk. (#1176)
+- `nanocached-node`: the roster fetch a draining node (and eviction-triggered
+  re-replication) uses accepted at most 4,096 entries, while discovery's
+  registry holds up to 65,536 and returns all of them. Above 4,096
+  registered nodes every fetch failed with "bad T response", so a draining
+  node logged "leaving without a handoff" and exited without handing off
+  its keys. The fetch now uses the same 65,536 limit as the heartbeat ack
+  (#1175).
+- `nanocached-node`: the `y` (batch touch) header parser collected every token after the key lengths into a vector, so a header of about 1 MiB of extra tokens allocated 8 MB for one parse before being rejected. At most three tokens (`[ttl] [G] [tag]`) are valid, so it now collects four and rejects the rest, as `t` does (#1174).
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
@@ -138,13 +198,21 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Container images are built from `rust:1.96.0-alpine3.24` and run on
+  `alpine:3.24`. Alpine 3.21, the previous base, reached its end of support
+  on 2026-11-01, after which its musl, busybox and apk get no security
+  fixes; 3.24 is supported until 2028-06-01. Dependabot now watches the
+  `Dockerfile` as well (#1196).
 - Container images: `:latest` is now the latest release, moved only by the
   release workflow for all three images at once. It used to be rebuilt
   from every `main` commit for `nanocached-node` and `nanocached-discovery`
   but not for `nanocached-proxy`, so after a release the three `:latest`
   images pointed at different code and the quickstarts pulled unreleased
   `main`. Builds of `main` are published as `:main` and `:sha-<commit>` for
-  all three images, one publish run at a time (#1149). `:main` is put only
+  all three images, one publish run at a time (#1149). The release workflow
+  moves `:latest` in one step for the three images after all three builds
+  have succeeded, and leaves it alone for a pre-release version or when it
+  already points at a newer release (#1195). `:main` is put only
   on a build of the commit that is the tip of `main` when the publish runs:
   CI runs for consecutive commits finish in their own order, and a re-run
   of an older commit's CI finishes last of all, so without that check a
