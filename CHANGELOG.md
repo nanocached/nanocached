@@ -14,6 +14,7 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: two multi-key frames that each cost more than `--max-in-flight-bytes` (250,000 keys at the 64 MiB setting, 350,000 at any setting; 256 bytes per key) waited for each other's receive buffers for the full 10 s and were both closed with "in-flight byte budget exhausted": a frame asked for the budget less its own buffer, so it could only be served once every other connection's buffer was gone, and a buffer is only gone once its frame has been served. A frame now asks for what the budget has left after every connection's receive buffer (tracked node-wide), so it is always satisfiable once the other frames and replies are done. Two 40,000-key frames against a 1 MiB budget, each already holding its buffer's charge, used to hit the timeout and are now both served in well under a second (#1262).
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;

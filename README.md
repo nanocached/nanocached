@@ -613,8 +613,8 @@ loud `WARN` if that disagrees with its own configured value.
   Once the reply is built, 64 bytes per key of that stay charged until
   the reply is written — the reply's entries and its encoded copy, which
   a client that does not read keeps alive — and the rest is released. A
-  frame that costs more than the whole budget waits for it to be free and
-  then runs alone. A connection that cannot get its
+  frame that costs more than the budget waits for what the receive
+  buffers leave of it to be free and then runs alone with them. A connection that cannot get its
   share in time is closed, like a stalled one. Size a process at
   `--max-memory` plus this plus headroom
 - Per-namespace caps: `--namespace-budget <ns>=<bytes>` (repeatable)
