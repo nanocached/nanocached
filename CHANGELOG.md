@@ -14,6 +14,34 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a connection's receive-buffer charge against
+  `--max-in-flight-bytes` was released as soon as the buffer's reported
+  capacity fell to the free 64 KiB, but after a large frame that reported
+  capacity is only the tail of the allocation the frame was read into — the
+  whole allocation stayed in memory until the connection's next growth or
+  its close. An idle connection could so hold about a frame's worth (up to
+  1 MiB) outside the budget, 30 connections about 30 MiB with a 1 MiB
+  budget. The buffer is now rebuilt before the charge is released, so the
+  old allocation goes with it (#1145; a regression in 0.6.0's #1113 change).
+- `nanocached-discovery`: the limit on new registrations from one source
+  was a fixed gap of one every 2 seconds, and 0.6.0 made an IPv6 source
+  count per /64 prefix. A fleet that shares a source — nodes behind one NAT
+  address, or every node of one AWS VPC IPv6 subnet, which is a /64 — could
+  therefore re-register only one node per 2 seconds after a discovery
+  restart or a partition, so the startup grace (one liveness timeout, 15 s
+  by default) ended with a partial registry and the first join ran against
+  it; 10 nodes from one source took 27 s to all get in and `L` after the
+  grace listed 5. The limit is now a burst of 64 new registrations per
+  source, refilled one every 2 seconds (#1148).
+### Changed
+
+- Container images: `:latest` is now the latest release, moved only by the
+  release workflow for all three images at once. It used to be rebuilt
+  from every `main` commit for `nanocached-node` and `nanocached-discovery`
+  but not for `nanocached-proxy`, so after a release the three `:latest`
+  images pointed at different code and the quickstarts pulled unreleased
+  `main`. Builds of `main` are published as `:main` and `:sha-<commit>` for
+  all three images, one publish run at a time (#1149).
 - `nanocached-proxy`: one client address could take the proxy far past its
   in-flight budget with large batched requests. A fully received `m`, `o`
   or `y` frame was parsed into its per-key lists (32 bytes a key, 64 for
