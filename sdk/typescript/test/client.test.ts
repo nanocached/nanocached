@@ -1566,6 +1566,8 @@ describe("a redial finishing after close() (issue #1216)", () => {
   it("a single-node client closes the redialed connection", () => closeRightAfterRedial("single"));
   it("a cluster client closes the redialed connection", () => closeRightAfterRedial("cluster"));
   it("a proxy-mode client closes the redialed connection", () => closeRightAfterRedial("proxy"));
+});
+
 describe("unsolicited response with nothing pending (issue #1177)", () => {
   it("poisons the connection instead of silently dropping the reply", async () => {
     // Regression: a parsed response with no pending request was discarded
