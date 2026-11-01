@@ -976,6 +976,71 @@ public class NanocachedClientTests
         Assert.Equal(1, closedCount);
     }
 
+    // Issue #1217: a read that fails with something other than an I/O error
+    // must poison the connection and fail the waiting request at once, not
+    // leave it for the 30 s request watchdog.
+    [Fact]
+    public async Task AnUnexpectedExceptionInTheReadLoopFailsThePendingRequestAndClosesTheConnection()
+    {
+        var stream = new FailingReadStream();
+        var connection = new Connection(stream);
+
+        Task<byte[]?> pending = connection.GetAsync(Bytes("k"));
+        stream.FailReads(new InvalidOperationException("synthetic parser bug"));
+
+        Task finished = await Task.WhenAny(pending, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(pending, finished);
+        ConnectionLostException lost = await Assert.ThrowsAsync<ConnectionLostException>(() => pending);
+        Assert.IsType<InvalidOperationException>(lost.InnerException);
+        Assert.True(connection.IsClosed);
+    }
+
+    [Fact]
+    public async Task AnUnexpectedExceptionInTheReadLoopClosesAnIdleConnection()
+    {
+        var stream = new FailingReadStream();
+        var connection = new Connection(stream);
+
+        stream.FailReads(new InvalidOperationException("synthetic parser bug"));
+
+        await WaitForAsync(() => connection.IsClosed, "the connection to be poisoned");
+    }
+
+    // Accepts writes, blocks reads until told to fail them.
+    private sealed class FailingReadStream : Stream
+    {
+        private readonly TaskCompletionSource _failure = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private Exception? _error;
+
+        public void FailReads(Exception error)
+        {
+            _error = error;
+            _failure.TrySetResult();
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            await _failure.Task.ConfigureAwait(false);
+            throw _error!;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) { }
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
+            ValueTask.CompletedTask;
+    }
+
     // ── addresses ─────────────────────────────────────────────────
 
     [Fact]

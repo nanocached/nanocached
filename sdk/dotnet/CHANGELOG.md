@@ -12,6 +12,16 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- A connection's read loop only handled I/O-type failures. Any other
+  exception (a TLS `AuthenticationException`, an `InvalidOperationException`,
+  an unexpected parser error) ended the fire-and-forget loop unobserved: the
+  connection stayed open with no reader and every pending request waited for
+  the 30 s request watchdog. Such an exception now closes the connection and
+  fails the pending requests at once with a `ConnectionLostException` that
+  carries it. (#1217)
+
+### Fixed
+
 - With `FireAndForgetReplicas`, the replica legs of `SetAsync`, `DeleteAsync`,
   `TouchAsync` and `GetAndTouchBytesAsync` kept reading the caller's `key`
   (and, for `SetAsync` without compression, `value`) arrays after the call had
