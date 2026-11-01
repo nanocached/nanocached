@@ -9,6 +9,14 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Changed
+
+- The baseline moves to Spring Framework 7.0 (`spring-context` 7.0.10, as an
+  `api` dependency) and the Spring Boot version the tests run against to 4.1.2;
+  Spring Framework 6.2 is no longer supported. Open-source support for Spring
+  Framework 6.2 and Spring Boot 3.5 ended on 2026-06-30, so 0.5.1 is the last
+  release for them. The adapter's own API is unchanged.
+
 ### Security
 
 - The `api` dependency on Spring Framework moves from 6.2.8 to 6.2.19, the

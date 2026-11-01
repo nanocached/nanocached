@@ -23,6 +23,7 @@ import org.nanocached.spring.NanocachedCacheManager;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
+import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.context.properties.bind.Bindable;
@@ -353,6 +354,23 @@ class NanocachedCacheAutoConfigurationTest {
         assertFalse(
                 reconnectCooldownDisabled(context.getBean(NanocachedClient.class)),
                 "a non-zero reconnect-cooldown must not disable the cooldown");
+    }
+
+    @Test
+    void orderedBeforeBootsCacheAutoConfigurationByANameThatResolves() throws Exception {
+        // The ordering is declared by string (so the starter still loads
+        // without spring-boot-starter-cache on the classpath), which means
+        // the compiler cannot catch a name that stopped resolving — the
+        // exact way the Boot 3 -> 4 package move would have gone unnoticed.
+        // Boot only sorts alphabetically as a fallback, so a stale name
+        // would not fail the context tests above; check it here.
+        String[] before =
+                NanocachedCacheAutoConfiguration.class.getAnnotation(AutoConfiguration.class).beforeName();
+
+        assertEquals(1, before.length);
+        assertEquals(
+                "org.springframework.boot.cache.autoconfigure.CacheAutoConfiguration",
+                Class.forName(before[0]).getName());
     }
 
     private static boolean reconnectCooldownDisabled(NanocachedClient client) throws Exception {
