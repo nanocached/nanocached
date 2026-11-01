@@ -14,6 +14,7 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: the `y` (batch touch) header parser collected every token after the key lengths into a vector, so a header of about 1 MiB of extra tokens allocated 8 MB for one parse before being rejected. At most three tokens (`[ttl] [G] [tag]`) are valid, so it now collects four and rejects the rest, as `t` does (#1174).
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
