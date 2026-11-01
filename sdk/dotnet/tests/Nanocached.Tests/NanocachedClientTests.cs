@@ -3425,6 +3425,8 @@ public class NanocachedClientTests
         // give a (wrongly) dialed one time to arrive.
         await Task.Delay(200);
         Assert.Equal(connectionsBefore, node.ConnectionCount);
+    }
+
     // Issue #1203: a background replica leg must not read the caller's
     // key/value arrays after the call has returned. The replica's
     // connection is closed and its node stalls the handshake, so the leg
