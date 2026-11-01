@@ -104,8 +104,10 @@ pub(crate) const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
 /// before allocating it (an unfinished frame is held until the frame
 /// deadline), and releases both as soon as the bytes are gone. A
 /// multi-key frame also charges `MULTI_KEY_FRAME_BYTES_PER_KEY` for each
-/// of its keys, held until its reply entries are built and released
-/// before the reply's own bytes are charged. A cost above the budget is
+/// of its keys, held until its reply entries are built; what the reply
+/// entries themselves keep (`MULTI_KEY_REPLY_BYTES_PER_KEY` per key) stays
+/// charged until the reply is written, and the rest is released before the
+/// reply's own bytes are charged. A cost above the budget is
 /// clamped to it, so such a request takes the whole budget and runs
 /// alone rather than waiting forever; a holder never waits for bytes it
 /// holds itself (a charge taken while another is held asks only for the
@@ -158,6 +160,53 @@ impl InFlightBudget {
     }
 }
 
+/// What a multi-key frame holds against the in-flight budget while it is
+/// served: `MULTI_KEY_FRAME_BYTES_PER_KEY` per key to start with, shrunk
+/// by `keep_reply_phase` to what the reply entries still occupy once they
+/// are built. A semaphore permit cannot give back part of itself, so this
+/// holds the permits itself and returns them to the budget as they go.
+#[derive(Debug)]
+struct FrameCharge {
+    permits: Arc<Semaphore>,
+    held: u32,
+}
+
+impl FrameCharge {
+    /// Gives back everything above `keep` bytes; returns what is still held.
+    fn shrink_to(&mut self, keep: usize) -> usize {
+        let keep = u32::try_from(keep).unwrap_or(u32::MAX).min(self.held);
+        let released = self.held - keep;
+        if released > 0 {
+            self.permits.add_permits(released as usize);
+            self.held = keep;
+        }
+        self.held as usize
+    }
+}
+
+impl Drop for FrameCharge {
+    fn drop(&mut self) {
+        if self.held > 0 {
+            self.permits.add_permits(self.held as usize);
+        }
+    }
+}
+
+/// Narrows a multi-key frame's charge to what its reply entries keep until
+/// the reply is written, and returns the bytes it still holds (to count
+/// with the receive buffer's as `write_reply`'s `held`). The per-key
+/// vectors are gone by now, but the `entries` (a `MultiEntry` is 40 bytes
+/// whether it carries a value or is a miss) and the encoded copy built
+/// from them (a few bytes per key plus the values `write_reply` charges)
+/// stay alive for the whole write — up to `WRITE_TIMEOUT`, or until the
+/// connection is closed for a client that does not read.
+/// `MULTI_KEY_REPLY_BYTES_PER_KEY` covers them with room for the allocator.
+fn keep_reply_phase(frame_charge: &mut Option<FrameCharge>, keys: usize) -> usize {
+    frame_charge.as_mut().map_or(0, |charge| {
+        charge.shrink_to(keys.saturating_mul(MULTI_KEY_REPLY_BYTES_PER_KEY))
+    })
+}
+
 /// The bytes a reply's encoded copy will hold: the values of a `V` (a
 /// `G`'s or a get-and-touch's) or `M`; every other reply is a short header
 /// and is not charged.
@@ -187,14 +236,20 @@ fn reply_bytes(response: &Response) -> usize {
 /// with room for the allocator.
 const MULTI_KEY_FRAME_BYTES_PER_KEY: usize = 256;
 
+/// The part of `MULTI_KEY_FRAME_BYTES_PER_KEY` a multi-key frame keeps
+/// charged until its reply has been written: the reply's `MultiEntry`
+/// vector (40 bytes per key) and the encoded copy's per-key framing
+/// (2 to about 20 bytes), rounded up to a cache line.
+const MULTI_KEY_REPLY_BYTES_PER_KEY: usize = 64;
+
 /// What an `o` frame adds to `MULTI_KEY_FRAME_BYTES_PER_KEY` for each key:
 /// the second vector of handles, one per value.
 const MULTI_SET_VALUE_BYTES_PER_KEY: usize = 32;
 
 /// Charges a multi-key frame's per-key working memory against the
-/// in-flight budget; the caller holds the permit until the reply entries
-/// are built and drops it before the reply itself is charged
-/// (`write_reply`). It is called before the parser builds the frame's key
+/// in-flight budget; the caller holds the charge until the reply entries
+/// are built, then narrows it to what they keep (`keep_reply_phase`)
+/// before the reply itself is charged (`write_reply`). It is called before the parser builds the frame's key
 /// vectors (`parse_resumable`'s `ParseError::ChargeRequired`), so a
 /// connection waiting here holds no uncharged per-key memory. A frame
 /// costing more than the whole budget takes all of it and runs alone — the
@@ -207,7 +262,7 @@ async fn charge_multi_key_frame(
     receive_charged: usize,
     keys: usize,
     values: bool,
-) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
+) -> io::Result<FrameCharge> {
     let per_key = MULTI_KEY_FRAME_BYTES_PER_KEY
         + if values {
             MULTI_SET_VALUE_BYTES_PER_KEY
@@ -219,24 +274,31 @@ async fn charge_multi_key_frame(
         .in_flight_bytes
         .clamp(cost.saturating_add(receive_charged))
         .saturating_sub(receive_charged);
-    timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge_exact(cost))
+    let permit = timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge_exact(cost))
         .await
         .map_err(|_| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
                 "in-flight byte budget exhausted while serving a request",
             )
-        })
+        })?;
+    let held = u32::try_from(permit.num_permits()).unwrap_or(u32::MAX);
+    permit.forget();
+    Ok(FrameCharge {
+        permits: Arc::clone(&config.in_flight_bytes.permits),
+        held,
+    })
 }
 
 /// Encodes and writes a reply that may carry values, holding its bytes
 /// against the in-flight budget from before the encoded copy exists
 /// until it has been written. `held` is what the connection already
-/// holds (its receive buffer's charge): a reply that would take more
-/// than the budget takes only the rest of it, so the connection ends up
-/// holding the whole budget rather than waiting on its own permit. The
-/// caller holds nothing else by then — a multi-key frame's per-key
-/// charge is released before its reply is charged, for the same reason.
+/// holds (its receive buffer's charge, and for a multi-key frame what
+/// `keep_reply_phase` left): a reply that would take more than the budget
+/// takes only the rest of it, so the connection ends up holding the whole
+/// budget rather than waiting on its own permit. The caller holds nothing
+/// else by then — a multi-key frame's per-key working charge is released
+/// before its reply is charged, for the same reason.
 /// Waits at most `WRITE_TIMEOUT` for the budget — the same bound a
 /// stalled write gets — and fails the connection like one if it runs out.
 async fn write_reply(
@@ -653,6 +715,52 @@ fn clear_forward_failure(addr: &str, token: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(&(addr.to_string(), token.to_string()));
+}
+
+/// Issue #1161: the WARN lines for a forward or a re-replication send that
+/// failed against a target already known to be unreachable. The first
+/// failure against a target — its full retry budget, or the first key a
+/// re-replication tries — is always written; the repeats go through this
+/// limiter, which admits one line per window and counts the rest into a
+/// summary line. Without it a dead target still in the roster produced two
+/// lines per forwarded write (400,000 lines for 200,000 writes) and three
+/// per key per re-replication target, each a synchronous write under the
+/// stderr lock that stalls every request once the log pipe pushes back
+/// (the same hazard as issue #1028).
+const REPEATED_FAILURE_LOG_WINDOW: Duration = Duration::from_secs(10);
+static REPEATED_FAILURE_LOG: LogLimiter = LogLimiter::new(1, REPEATED_FAILURE_LOG_WINDOW);
+
+#[cfg(test)]
+thread_local! {
+    /// Lines `log_failure` wrote on this thread. Thread-local so
+    /// `current_thread` tests don't see each other's.
+    static LOGGED_FAILURES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn write_failure_line(line: String) {
+    #[cfg(test)]
+    LOGGED_FAILURES.with(|lines| lines.borrow_mut().push(line.clone()));
+    eprintln!("{line}");
+}
+
+/// Writes `line`. `repeat` marks a failure against a target that has
+/// already failed (a forward under `RECENT_FORWARD_FAILURES`' fail-fast, a
+/// later re-replication attempt): those are admitted by
+/// `REPEATED_FAILURE_LOG` and counted otherwise.
+fn log_failure(repeat: bool, line: std::fmt::Arguments<'_>) {
+    if repeat {
+        let Some(suppressed) = REPEATED_FAILURE_LOG.admit() else {
+            return;
+        };
+        if suppressed > 0 {
+            write_failure_line(format!(
+                "WARN {suppressed} more failures against unreachable targets (not logged \
+                 individually)"
+            ));
+        }
+    }
+    write_failure_line(line.to_string());
 }
 
 /// Queues a per-write forward (a `Set`/`Delete`/`Clear` racing a migration
@@ -2950,7 +3058,7 @@ async fn handle_connection(
             // order before replying — the client never sees the owned/
             // not-owned split.
             Ok((Command::MultiGet { namespace, keys }, tag)) => {
-                let frame_charge = frame_charge;
+                let mut frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -2966,6 +3074,7 @@ async fn handle_connection(
                     Some(node_context) => wrong_nodes_refreshed(node_context, &hashes).await,
                     None => vec![false; keys.len()],
                 };
+                drop(hashes);
 
                 for (position, name) in keys.into_iter().enumerate() {
                     if wrong[position] {
@@ -2975,6 +3084,7 @@ async fn handle_connection(
                         owned_keys.push(name);
                     }
                 }
+                drop(wrong);
 
                 if !owned_keys.is_empty() {
                     let response = execute_command(
@@ -2995,22 +3105,27 @@ async fn handle_connection(
                     }
                 }
 
-                let entries = entries
+                let entries: Vec<MultiEntry> = entries
                     .into_iter()
                     .map(|entry| entry.expect("every position filled by one of the two branches"))
                     .collect();
-                // The per-key vectors are gone; release their charge before
-                // charging the reply, or this connection would wait on its
-                // own permit (and, through the budget's FIFO, on every other
-                // connection doing the same) when the two together exceed
-                // what is free.
-                drop(frame_charge);
+                // The key vectors, the hashes and the wrong-node flags are
+                // gone; what is left is the reply's entries and the encoded
+                // copy, which live until the write is done. Narrow the frame
+                // charge to those (`keep_reply_phase`) and give the rest back
+                // before charging the reply, or this connection would wait
+                // on its own permit (and, through the budget's FIFO, on every
+                // other connection doing the same) when the two together
+                // exceed what is free. The reply then asks only for the
+                // values on top of what is held, as `write_reply` does for
+                // the receive buffer's charge.
+                let kept = keep_reply_phase(&mut frame_charge, entries.len());
                 write_reply(
                     &mut stream,
                     &config,
                     &Response::Multi(entries),
                     tag,
-                    receive_charged,
+                    receive_charged + kept,
                 )
                 .await?;
 
@@ -3609,7 +3724,7 @@ async fn handle_connection(
                 },
                 tag,
             )) => {
-                let frame_charge = frame_charge;
+                let mut frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -3622,6 +3737,7 @@ async fn handle_connection(
                     Some(node_context) => wrong_nodes_refreshed(node_context, &hashes).await,
                     None => vec![false; keys.len()],
                 };
+                drop(hashes);
 
                 for (position, name) in keys.into_iter().enumerate() {
                     if wrong[position] {
@@ -3631,6 +3747,7 @@ async fn handle_connection(
                         owned_keys.push(name);
                     }
                 }
+                drop(wrong);
 
                 if !owned_keys.is_empty() {
                     // Kept for the forwarding loop below, which looks for
@@ -3720,15 +3837,17 @@ async fn handle_connection(
                     .into_iter()
                     .map(|entry| entry.expect("every position filled by one of the two branches"))
                     .collect();
-                // Released before the reply is charged, like an `m`'s.
-                drop(frame_charge);
+                // Narrowed to what the reply keeps before it is charged, like
+                // an `m`'s; an ack (`get` false) holds its roster and encoded
+                // copy for the write the same way, so it keeps the same.
+                let kept = keep_reply_phase(&mut frame_charge, entries.len());
                 if get {
                     write_reply(
                         &mut stream,
                         &config,
                         &Response::Multi(entries),
                         tag,
-                        receive_charged,
+                        receive_charged + kept,
                     )
                     .await?;
                 } else {
@@ -5561,9 +5680,12 @@ impl PendingClears {
         match scope {
             ClearScope::All => self.collapse_to_all(),
             ClearScope::Namespace(namespace) => {
-                let length = namespace.len();
-                if self.namespaces.insert(namespace) {
-                    self.bytes += length;
+                // Copied into an allocation of its own: the slice off the
+                // `c` frame would keep the frame's whole buffer alive, and
+                // `bytes` counts only the name (issue #1160).
+                if !self.namespaces.contains(&namespace) {
+                    self.bytes += namespace.len();
+                    self.namespaces.insert(Bytes::copy_from_slice(&namespace));
                 }
                 if self.namespaces.len() > MAX_PENDING_CLEAR_NAMESPACES
                     || self.bytes > MAX_PENDING_CLEAR_BYTES
@@ -8140,6 +8262,14 @@ async fn run_rereplication(
     let mut sent = 0usize;
     let mut skipped = 0usize;
     let mut owners_reached: HashSet<String> = HashSet::new();
+    // Issue #1161: when each target address last used up every attempt on
+    // one key, the same idea as `RECENT_FORWARD_FAILURES`. A target that
+    // is down (killed, but still in the roster until its own eviction)
+    // otherwise cost every one of its keys a full round of dials and
+    // WARN lines — 61,248 keys made 183,741 lines. While the entry is
+    // fresh the target's keys are counted as skipped without a dial; once
+    // `FORWARD_FAIL_FAST_WINDOW` has passed it gets a full budget again.
+    let mut failed_targets: HashMap<String, Instant> = HashMap::new();
 
     // `keys` arrive grouped by namespace, and a namespace can be ~1 MiB:
     // hash each distinct one once rather than per key.
@@ -8192,8 +8322,19 @@ async fn run_rereplication(
             if *shutdown_rx.borrow() {
                 break;
             }
+            if failed_targets
+                .get(addr)
+                .is_some_and(|failed_at| failed_at.elapsed() < FORWARD_FAIL_FAST_WINDOW)
+            {
+                skipped += 1;
+                continue;
+            }
+            // A target that failed before, whose window has since passed:
+            // its failure lines are repeats (see `log_failure`).
+            let repeat = failed_targets.contains_key(addr);
 
             let mut delivered = false;
+            let mut failed_attempts = 0u32;
             for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
                 if abort_requested.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
                     break;
@@ -8217,9 +8358,13 @@ async fn run_rereplication(
                             streams.insert(addr.clone(), stream);
                         }
                         Err(error) => {
-                            eprintln!(
-                                "WARN re-replication: connecting to {addr} failed (attempt \
-                                 {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                            failed_attempts += 1;
+                            log_failure(
+                                repeat,
+                                format_args!(
+                                    "WARN re-replication: connecting to {addr} failed (attempt \
+                                     {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                                ),
                             );
                             continue;
                         }
@@ -8248,9 +8393,13 @@ async fn run_rereplication(
                         break;
                     }
                     Some(Err(error)) => {
-                        eprintln!(
-                            "WARN re-replication: transfer to {addr} failed (attempt \
-                             {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                        failed_attempts += 1;
+                        log_failure(
+                            repeat,
+                            format_args!(
+                                "WARN re-replication: transfer to {addr} failed (attempt \
+                                 {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                            ),
                         );
                         streams.remove(addr);
                     }
@@ -8262,6 +8411,19 @@ async fn run_rereplication(
                 owners_reached.insert(target);
             } else {
                 skipped += 1;
+                // Only a target that failed every attempt (not one the loop
+                // left because of shutdown or an abort) is written off.
+                if failed_attempts == KEY_TRANSFER_ATTEMPTS {
+                    failed_targets.insert(addr.clone(), Instant::now());
+                    log_failure(
+                        repeat,
+                        format_args!(
+                            "WARN re-replication: giving up on {addr} for {}s; its remaining \
+                             keys are skipped",
+                            FORWARD_FAIL_FAST_WINDOW.as_secs()
+                        ),
+                    );
+                }
             }
         }
     }
@@ -9221,6 +9383,74 @@ enum OwnedForwardedWrite {
 }
 
 impl OwnedForwardedWrite {
+    /// This write with its key, value and namespace copied into
+    /// right-sized allocations of their own.
+    ///
+    /// A write parsed off a connection holds `Bytes` slices of that
+    /// connection's receive buffer, and a slice keeps the buffer's whole
+    /// allocation alive — a 17-byte write behind a 1 MiB frame pins 1 MiB,
+    /// which `TargetQueue`'s accounting (key + value + overhead) never
+    /// counts. A queued write can wait a long time (a forward target that
+    /// does not drain until it is evicted), so it must not hold the buffer
+    /// (issue #1160; the cache does the same in `insert_into`).
+    ///
+    /// `namespaces` carries a batch's copies, so the writes of one batch
+    /// that shared a namespace allocation still share one (the queue
+    /// charges a shared allocation once); it also keeps each original
+    /// alive for the batch, so its address cannot be reused by a later
+    /// copy and mistaken for it.
+    fn detached(self, namespaces: &mut HashMap<(usize, usize), (Bytes, Bytes)>) -> Self {
+        fn key(key: Key, namespaces: &mut HashMap<(usize, usize), (Bytes, Bytes)>) -> Key {
+            let namespace = if key.namespace.is_empty() {
+                Bytes::new()
+            } else {
+                namespaces
+                    .entry((key.namespace.as_ptr() as usize, key.namespace.len()))
+                    .or_insert_with(|| {
+                        (
+                            key.namespace.clone(),
+                            Bytes::copy_from_slice(&key.namespace),
+                        )
+                    })
+                    .1
+                    .clone()
+            };
+            Key::new(namespace, Bytes::copy_from_slice(&key.name))
+        }
+        match self {
+            OwnedForwardedWrite::Set { key: k, value, ttl } => OwnedForwardedWrite::Set {
+                key: key(k, namespaces),
+                value: Bytes::copy_from_slice(&value),
+                ttl,
+            },
+            OwnedForwardedWrite::Delete { key: k } => OwnedForwardedWrite::Delete {
+                key: key(k, namespaces),
+            },
+            OwnedForwardedWrite::HandoffSet {
+                key: k,
+                value,
+                ttl,
+                if_absent,
+            } => OwnedForwardedWrite::HandoffSet {
+                key: key(k, namespaces),
+                value: Bytes::copy_from_slice(&value),
+                ttl,
+                if_absent,
+            },
+            OwnedForwardedWrite::HandoffDelete { key: k } => OwnedForwardedWrite::HandoffDelete {
+                key: key(k, namespaces),
+            },
+            OwnedForwardedWrite::Clear(ClearScope::Namespace(namespace)) => {
+                OwnedForwardedWrite::Clear(ClearScope::Namespace(Bytes::copy_from_slice(
+                    &namespace,
+                )))
+            }
+            OwnedForwardedWrite::Clear(ClearScope::All) => {
+                OwnedForwardedWrite::Clear(ClearScope::All)
+            }
+        }
+    }
+
     /// Attempts this write once via `forward_on_locked_connection`, on a
     /// connection guard the caller (`forward_with_retries`) already
     /// holds — see that function's own doc comment and
@@ -9658,16 +9888,21 @@ impl ForwardQueues {
         // was created with: the same connection serves a joiner first as
         // the slot's own and later as a lingering one.
         let as_handoff = target.as_handoff;
+        // Copied before the wait for room below, so a push that waits
+        // holds right-sized copies, not the receive buffers it came from.
+        let mut copied_namespaces = HashMap::new();
         let writes: Vec<OwnedForwardedWrite> = writes
             .into_iter()
             .map(|write| {
-                if as_handoff {
+                let write = if as_handoff {
                     write.into_handoff_frame()
                 } else {
                     write
-                }
+                };
+                write.detached(&mut copied_namespaces)
             })
             .collect();
+        drop(copied_namespaces);
         let wanted = batch_bytes(&writes);
         let mut target = Some(target);
         loop {
@@ -9950,6 +10185,9 @@ async fn forward_with_retries(
 ) {
     let mut connection = target.connection.lock().await;
     let attempts = forward_attempts_for(&target.addr, &target.token);
+    // Issue #1161: fewer attempts than the full budget means this target
+    // already failed permanently recently, so a failure here is a repeat.
+    let repeat = attempts < KEY_TRANSFER_ATTEMPTS;
 
     for attempt in 1..=attempts {
         // Issue #474: re-checked before every attempt, not just once —
@@ -9964,22 +10202,28 @@ async fn forward_with_retries(
                 return;
             }
             Err(error) => {
-                eprintln!(
-                    "WARN failed to forward a concurrent {} for a migrating key to {} \
-                     (attempt {attempt}/{attempts}): {error}",
-                    write.kind(),
-                    target.addr
+                log_failure(
+                    repeat,
+                    format_args!(
+                        "WARN failed to forward a concurrent {} for a migrating key to {} \
+                         (attempt {attempt}/{attempts}): {error}",
+                        write.kind(),
+                        target.addr
+                    ),
                 );
             }
         }
     }
 
     record_forward_failure(&target.addr, &target.token);
-    eprintln!(
-        "WARN permanently failed to forward a concurrent {} for a migrating key to {} after \
-         {attempts} attempt(s)",
-        write.kind(),
-        target.addr
+    log_failure(
+        repeat,
+        format_args!(
+            "WARN permanently failed to forward a concurrent {} for a migrating key to {} after \
+             {attempts} attempt(s)",
+            write.kind(),
+            target.addr
+        ),
     );
 }
 
@@ -11118,9 +11362,10 @@ mod tests {
             },
         )
         .await;
-        // The 16-key batch's per-key charge is released before its reply
-        // is charged, so the reply alone is what the budget sees.
-        let total = 17 * MIB;
+        // The 16-key batch's working charge is released before its reply
+        // is charged; what its reply entries keep stays held with the
+        // reply's bytes, so the budget is sized for both.
+        let total = 17 * MIB + 16 * MULTI_KEY_REPLY_BYTES_PER_KEY;
         let budget = InFlightBudget::new(total);
         let mut batch = b"m 0 16".to_vec();
         batch.extend(std::iter::repeat_n(b" 5", 16).flatten());
@@ -11756,6 +12001,98 @@ mod tests {
         assert_eq!(budget.available(), MAX_REQUEST_SIZE);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_charge_gives_back_what_it_shrinks_by_and_the_rest_when_dropped() {
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let config = connection_config_with_budget(&budget, IDLE_TIMEOUT);
+        let mut charge = Some(
+            charge_multi_key_frame(&config, 0, 100, false)
+                .await
+                .unwrap(),
+        );
+        let cost = 100 * MULTI_KEY_FRAME_BYTES_PER_KEY;
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE - cost);
+
+        let kept = keep_reply_phase(&mut charge, 100);
+        assert_eq!(kept, 100 * MULTI_KEY_REPLY_BYTES_PER_KEY);
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE - kept);
+        // Shrinking never grows the charge back.
+        assert_eq!(keep_reply_phase(&mut charge, 1_000), kept);
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE - kept);
+
+        drop(charge);
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_reply_keeps_its_entries_charged_while_the_write_is_blocked() {
+        // A reply that is a few values and 300,000 misses: the misses add
+        // nothing to `reply_bytes`, but the `MultiEntry` vector and the
+        // encoded copy built from it (about 50 bytes per key) are alive
+        // for as long as the client does not read, so the budget must see
+        // them. Before they were charged only the values and the receive
+        // buffer showed: a client that connects and never reads held
+        // megabytes per connection outside `--max-in-flight-bytes`.
+        // The values make the write block whatever the socket buffers are.
+        const KEYS: usize = 300_000;
+        const HITS: usize = 10;
+        const VALUE: usize = MAX_REQUEST_SIZE;
+        let multi_touch_frame = {
+            let mut frame = format!("y 0 {KEYS}").into_bytes();
+            frame.extend(std::iter::repeat_n(b" 1", KEYS).flatten());
+            frame.extend_from_slice(b" G\n");
+            frame.extend(std::iter::repeat_n(b'k', KEYS));
+            frame
+        };
+        for (name, frame) in [("m", multi_get_frame(KEYS)), ("y", multi_touch_frame)] {
+            let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(8);
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let total = 256 * MAX_REQUEST_SIZE;
+            let budget = InFlightBudget::new(total);
+            let (mut client, server) = tcp_pair_with_small_client_buffer().await;
+            let connection_task = tokio::spawn(handle_connection(
+                ServerStream::Plain(server),
+                test_client_addr(),
+                request_tx.clone(),
+                connection_config_with_budget(&budget, IDLE_TIMEOUT),
+                shutdown_rx.clone(),
+            ));
+            client.write_all(&frame).await.unwrap();
+            let request = timeout(Duration::from_secs(5), request_rx.recv())
+                .await
+                .expect("the frame reaches the cache")
+                .unwrap();
+            let value = Bytes::from(vec![b'v'; VALUE]);
+            let mut results = vec![MultiEntry::Value(value); HITS];
+            results.resize(KEYS, MultiEntry::Miss);
+            request
+                .response_tx
+                .send(Response::Multi(results))
+                .ok()
+                .unwrap();
+
+            // The client reads nothing, so the write blocks on the values.
+            sleep(Duration::from_millis(500)).await;
+            let held = total - budget.available();
+            assert!(
+                held >= HITS * VALUE + KEYS * MULTI_KEY_REPLY_BYTES_PER_KEY,
+                "{name}: while the reply write is blocked the budget holds {held} bytes; the \
+                 {HITS} values are {} and the {KEYS} entries must be charged on top",
+                HITS * VALUE
+            );
+            assert!(
+                held < HITS * VALUE + KEYS * MULTI_KEY_REPLY_BYTES_PER_KEY + 4 * MAX_REQUEST_SIZE,
+                "{name}: the frame's working charge ({} bytes) must have been given back, \
+                 but the budget holds {held}",
+                KEYS * MULTI_KEY_FRAME_BYTES_PER_KEY
+            );
+
+            drop(client);
+            let _ = timeout(Duration::from_secs(5), connection_task).await;
+            assert_eq!(budget.available(), total, "{name}: everything is released");
+        }
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn the_multi_key_charge_is_bounded_and_fails_like_a_reply_that_cannot_be_charged() {
         let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
@@ -12322,6 +12659,69 @@ mod tests {
             3 * KEY_TRANSFER_ATTEMPTS as usize + 1,
             "after the marker clears, the full budget is back"
         );
+
+        peer_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forwards_to_a_dead_target_log_a_bounded_number_of_warnings() {
+        // Issue #1161: against a target that stays unreachable, every
+        // forwarded write used to print an attempt line and a "permanently
+        // failed" line (400,000 lines for 200,000 writes), each a
+        // synchronous stderr write on the runtime thread. The first
+        // failure per target is still written in full; the repeats are
+        // limited and counted.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer_task = tokio::spawn(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                drop(connection);
+            }
+        });
+        let node_context = test_node_context(
+            "ready-node",
+            "tk-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let connection = Arc::new(AsyncMutex::new(None));
+        let target = |token: &str| ForwardTarget {
+            addr: addr.clone(),
+            connection: Arc::clone(&connection),
+            token: token.to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
+        };
+        let write = || OwnedForwardedWrite::Set {
+            key: key(b"name"),
+            value: Bytes::from_static(b"v"),
+            ttl: None,
+        };
+        let logged = || LOGGED_FAILURES.with(|lines| lines.borrow().len());
+        LOGGED_FAILURES.with(|lines| lines.borrow_mut().clear());
+
+        for _ in 0..50 {
+            forward_with_retries(node_context.clone(), target("tok-dead-1161"), write()).await;
+        }
+        let full_budget_lines = KEY_TRANSFER_ATTEMPTS as usize + 1;
+        assert!(
+            logged() >= full_budget_lines,
+            "the first failure against a target is written in full, got {} lines",
+            logged()
+        );
+        // The first forward's lines, plus at most one admitted repeat and the
+        // summary line ahead of it; 49 more forwards used to add 98.
+        assert!(
+            logged() <= full_budget_lines + 2,
+            "50 failed forwards to one dead target wrote {} lines",
+            logged()
+        );
+
+        // Another incarnation of the target is a new target: its first
+        // failure is written in full even though the limiter is spent.
+        let before = logged();
+        forward_with_retries(node_context, target("tok-dead-1161-restarted"), write()).await;
+        assert_eq!(logged() - before, full_budget_lines);
 
         peer_task.abort();
     }
@@ -16939,6 +17339,129 @@ mod tests {
         );
         let sent = drain_all(queues.targets.lock().unwrap().get_mut(&id).unwrap());
         assert_eq!(sent, ["set a 1", "pia(overwrite) b 1"]);
+    }
+
+    /// A receive buffer of `len` bytes whose release is observable:
+    /// `Bytes::from_owner` drops the owner when the last slice goes.
+    struct WatchedBuffer {
+        bytes: Vec<u8>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl AsRef<[u8]> for WatchedBuffer {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for WatchedBuffer {
+        fn drop(&mut self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn watched_buffer(len: usize) -> (Bytes, Arc<AtomicBool>) {
+        let released = Arc::new(AtomicBool::new(false));
+        let buffer = Bytes::from_owner(WatchedBuffer {
+            bytes: (0..len).map(|index| (index % 251) as u8).collect(),
+            released: Arc::clone(&released),
+        });
+        (buffer, released)
+    }
+
+    /// Issue #1160: a write parsed from a large receive buffer is a few
+    /// slices of it, and a slice keeps the whole allocation alive; the
+    /// queue charges only the slices' lengths, so it must not hold the
+    /// buffer. Pushing the write copies it, and the buffer is released
+    /// while the write still waits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_write_does_not_keep_the_receive_buffer_alive() {
+        let node_context = test_node_context(
+            "ready-node",
+            "tk-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let queues = ForwardQueues::default();
+        let (buffer, released) = watched_buffer(900_000);
+        let writes = vec![
+            OwnedForwardedWrite::Set {
+                key: Key::new(buffer.slice(0..2), buffer.slice(10..19)),
+                value: buffer.slice(100..108),
+                ttl: None,
+            },
+            OwnedForwardedWrite::Set {
+                key: Key::new(buffer.slice(0..2), buffer.slice(30..39)),
+                value: buffer.slice(100..108),
+                ttl: None,
+            },
+            OwnedForwardedWrite::Delete {
+                key: Key::unnamespaced(buffer.slice(50..59)),
+            },
+            OwnedForwardedWrite::HandoffSet {
+                key: Key::new(buffer.slice(0..2), buffer.slice(60..69)),
+                value: buffer.slice(100..108),
+                ttl: None,
+                if_absent: true,
+            },
+            OwnedForwardedWrite::HandoffDelete {
+                key: Key::new(buffer.slice(0..2), buffer.slice(70..79)),
+            },
+            OwnedForwardedWrite::Clear(ClearScope::Namespace(buffer.slice(200..205))),
+        ];
+        let id = queues
+            .push(&node_context, test_forward_target("127.0.0.1:9"), writes)
+            .await
+            .expect("first push starts a drainer");
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the test's own handle is still alive"
+        );
+        drop(buffer);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the queued writes must not keep the receive buffer's allocation alive"
+        );
+
+        // The copies are what was written, and the four keys that shared
+        // one namespace slice still share one copy: it is charged once.
+        let targets = queues.targets.lock().unwrap();
+        let queue = &targets[&id];
+        assert_eq!(queue.ops.len(), 6);
+        assert_eq!(queue.namespaces.len(), 1);
+        let entry = |name: usize, value: usize| name + value + FORWARD_ENTRY_OVERHEAD_BYTES;
+        assert_eq!(
+            queue.bytes,
+            2 * entry(9, 8) // the two sets
+                + entry(9, 0) // the delete
+                + entry(9, 8) // the handoff set
+                + entry(9, 0) // the handoff delete
+                + entry(5, 0) // the clear
+                + 2 // the shared namespace, once
+        );
+    }
+
+    /// Issue #1160: `PendingClears` keeps a namespace name for the whole
+    /// handoff and counts only its length, so it copies the name off the
+    /// `c` frame it was parsed from.
+    #[test]
+    fn a_pending_clear_does_not_keep_the_frame_alive() {
+        let mut pending = PendingClears::default();
+        let (frame, released) = watched_buffer(1_000_000);
+        pending.push(ClearScope::Namespace(frame.slice(0..5)));
+        // A repeat of a queued name is collapsed, and does not retain the
+        // frame it came in either.
+        let (second, second_released) = watched_buffer(1_000_000);
+        pending.push(ClearScope::Namespace(second.slice(0..5)));
+        drop(frame);
+        drop(second);
+        assert!(released.load(Ordering::SeqCst));
+        assert!(second_released.load(Ordering::SeqCst));
+        assert_eq!(pending.bytes, 5);
+        assert_eq!(
+            pending.take(),
+            vec![ClearScope::Namespace(Bytes::from_static(&[0, 1, 2, 3, 4]))]
+        );
     }
 
     #[test]
@@ -26203,6 +26726,113 @@ mod tests {
             drop(request_tx);
             cache_task.await.unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_rereplication_stops_redialling_a_target_that_used_up_its_attempts() {
+        // Issue #1161: a target that is down but still in the roster used
+        // to get a full round of dials (and WARN lines) for every key
+        // bound for it — 61,248 keys made 183,741 lines and the same
+        // number of failed sends. Once one key has used up every attempt,
+        // the target's other keys are skipped without a dial.
+        let (request_tx, request_rx) = mpsc::channel(64);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        // R=2, node-c evicted: keys whose old top-2 is {node-a, node-c}
+        // go from node-a to node-b.
+        let before_ring = HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ]);
+        let after_ring = HashRing::new(vec!["node-a".to_string(), "node-b".to_string()]);
+        let replication = 2;
+        let stored: Vec<Key> = (0..2000)
+            .map(|index| key(format!("key-{index}").as_bytes()))
+            .filter(|candidate| {
+                rereplication_targets(
+                    &before_ring,
+                    &after_ring,
+                    KeyHash::of(candidate),
+                    replication,
+                    "node-a",
+                ) == vec!["node-b".to_string()]
+            })
+            .take(40)
+            .collect();
+        assert_eq!(stored.len(), 40);
+        for stored_key in stored {
+            let (response_tx, response_rx) = oneshot::channel();
+            request_tx
+                .send(CacheRequest {
+                    command: Command::Set {
+                        key: stored_key,
+                        value: Bytes::from_static(b"v"),
+                        ttl: None,
+                    },
+                    response_tx,
+                })
+                .await
+                .unwrap();
+            response_rx.await.unwrap();
+        }
+
+        // A peer that accepts and closes: every attempt fails, and the
+        // accepts count the dials.
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let peer_task = tokio::spawn({
+            let accepts = Arc::clone(&accepts);
+            async move {
+                while let Ok((connection, _)) = peer_listener.accept().await {
+                    accepts.fetch_add(1, Ordering::SeqCst);
+                    drop(connection);
+                }
+            }
+        });
+
+        let mut node_context = test_node_context(
+            "node-a",
+            "tok-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        let addresses = HashMap::from([("node-b".to_string(), peer_addr)]);
+        let tokens = HashMap::from([("node-b".to_string(), "tok-b".to_string())]);
+        let abort_requested = Arc::new(AtomicBool::new(false));
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        LOGGED_FAILURES.with(|lines| lines.borrow_mut().clear());
+
+        run_rereplication(
+            &node_context,
+            &before_ring,
+            &after_ring,
+            replication,
+            &addresses,
+            &tokens,
+            &abort_requested,
+            &mut shutdown_rx,
+        )
+        .await;
+
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            KEY_TRANSFER_ATTEMPTS as usize,
+            "only the first key may spend attempts on the dead target"
+        );
+        // The first key's attempt lines and the give-up line, nothing per
+        // later key.
+        assert_eq!(
+            LOGGED_FAILURES.with(|lines| lines.borrow().len()),
+            KEY_TRANSFER_ATTEMPTS as usize + 1
+        );
+
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

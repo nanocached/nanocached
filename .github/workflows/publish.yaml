@@ -10,9 +10,10 @@ permissions:
   contents: read
   packages: write
 
-# One publish at a time, newest pending run wins: without this, two runs
-# for consecutive main commits could finish out of order and leave `:main`
-# on the older commit.
+# One publish at a time. This serialises the pushes; it does not order
+# them — CI runs finish in their own order (and a re-run of an older
+# commit's CI finishes last of all), so the "is this commit still the
+# tip of main?" check below is what keeps `:main` from moving back.
 concurrency:
   group: publish-image
   cancel-in-progress: false
@@ -50,15 +51,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Short commit id
-        id: sha
-        run: echo "short=${HEAD_SHA:0:12}" >> "$GITHUB_OUTPUT"
-        env:
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-
       # `:main` is the tip of main as of the last green CI run; `:sha-<id>`
       # pins one such build. `:latest` is the last release and is moved
       # only by the release workflow, for all three images at once.
+      #
+      # `:main` goes only on a build of the commit that is the tip of main
+      # *now*, asked of the API at this moment rather than read from the
+      # event: CI runs for consecutive commits can finish out of order,
+      # and a re-run of an older commit's flaky CI finishes after the
+      # newer commit was already published — both arrive here as a green
+      # `push` run and would otherwise move `:main` back to the older
+      # commit (#1165). A build of a commit that is no longer the tip gets
+      # its `:sha-<id>` tag and nothing else.
+      - name: Image tags
+        id: tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          IMAGE: ghcr.io/${{ github.repository }}-${{ matrix.component }}
+        run: |
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq .commit.sha)
+          tags="${IMAGE}:sha-${HEAD_SHA:0:12}"
+          if [ "$tip" = "$HEAD_SHA" ]; then
+            tags="${IMAGE}:main"$'\n'"$tags"
+          else
+            echo "::notice::${HEAD_SHA:0:12} is no longer the tip of main (${tip:0:12}); publishing :sha-${HEAD_SHA:0:12} only"
+          fi
+          {
+            echo "list<<EOF"
+            echo "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and push image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -66,9 +90,7 @@ jobs:
           target: ${{ matrix.component }}
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}-${{ matrix.component }}:main
-            ghcr.io/${{ github.repository }}-${{ matrix.component }}:sha-${{ steps.sha.outputs.short }}
+          tags: ${{ steps.tags.outputs.list }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}

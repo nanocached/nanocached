@@ -25,6 +25,8 @@ pub use client::MAX_INFLIGHT_HEDGE_LOSER_LEGS;
 pub use client::NODE_LIST_STALE_AFTER_MS;
 pub use client::{Namespace, NanocachedClient, Options, Stats};
 #[doc(hidden)]
+pub use client::{PANIC_HEDGE_LEG_ARMED, PANIC_HEDGE_LEG_FOR};
+#[doc(hidden)]
 pub use connection::MAX_MULTI_GET_RESPONSE_BYTES;
 #[doc(hidden)]
 pub use connection::REQUEST_TIMEOUT_MS;
