@@ -10,6 +10,16 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- With `FireAndForgetReplicas`, the replica legs of `SetManyBytesAsync`,
+  `IncrAsync` / `DecrAsync`, `PutIfAbsentAsync`, `ReplaceIfPresentAsync`,
+  `ReplaceAsync` and `DeleteIfMatchesAsync` kept reading the caller's `byte[]`
+  key and value arrays after the call had returned, so a caller that reused its
+  buffers while a leg waited on a busy or redialing replica made the replica
+  store a different value or address a different key. The arrays are now copied
+  at call time when the option is on. (#1256)
+
 ### Changed
 
 - Target framework is now `net10.0`; .NET 8 and .NET 9 reach end of support on 2026-11-10, and 0.6.0 is the last release that targets `net8.0`. Packages are built with the .NET 10 SDK.
