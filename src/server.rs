@@ -108,8 +108,9 @@ pub(crate) const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
 /// entries themselves keep (`MULTI_KEY_REPLY_BYTES_PER_KEY` per key) stays
 /// charged until the reply is written, and the rest is released before the
 /// reply's own bytes are charged. A cost above the budget is
-/// clamped to it, so such a request takes the whole budget and runs
-/// alone rather than waiting forever; a holder never waits for bytes it
+/// clamped to it (a multi-key frame, to what the receive buffers leave
+/// of it), so such a request takes the budget and runs alone rather than
+/// waiting forever; a holder never waits for bytes it
 /// holds itself (a charge taken while another is held asks only for the
 /// rest of the budget), and a connection that cannot get its charge in
 /// time is closed, the way a stalled write or a trickled frame is.
@@ -117,6 +118,10 @@ pub(crate) const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
 pub(crate) struct InFlightBudget {
     permits: Arc<Semaphore>,
     bytes: usize,
+    /// How much of the budget connections currently hold as receive
+    /// buffers (`ReceiveTally`): bytes no waiter can expect to see freed
+    /// by waiting, because their holders are waiting too.
+    receiving: Arc<AtomicUsize>,
 }
 
 impl InFlightBudget {
@@ -124,7 +129,21 @@ impl InFlightBudget {
         Self {
             permits: Arc::new(Semaphore::new(bytes)),
             bytes,
+            receiving: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// The most a multi-key frame can charge on top of the receive buffer
+    /// its connection holds (`own_receive`): what is left of the budget
+    /// once every connection's receive buffer is counted, not only its
+    /// own. A frame that costs more than that is clamped to it. Issue
+    /// #1262: clamping to "the budget less my own buffer" let two frames
+    /// that each cost more than the budget wait for each other for good,
+    /// since each request needed the other's receive buffer to be gone,
+    /// and a receive buffer is only gone once its frame has been served.
+    fn frame_room(&self, own_receive: usize) -> usize {
+        let receiving = self.receiving.load(Ordering::Relaxed).max(own_receive);
+        self.bytes.saturating_sub(receiving)
     }
 
     /// Reserves `cost` bytes (clamped to the budget), waiting for them.
@@ -157,6 +176,41 @@ impl InFlightBudget {
     #[cfg(test)]
     fn available(&self) -> usize {
         self.permits.available_permits()
+    }
+}
+
+/// A connection's share of `InFlightBudget::receiving`: what its receive
+/// buffer is charged, mirrored into the budget's tally and taken back when
+/// the connection ends, whichever way it does.
+struct ReceiveTally {
+    receiving: Arc<AtomicUsize>,
+    mine: usize,
+}
+
+impl ReceiveTally {
+    fn new(budget: &InFlightBudget) -> Self {
+        Self {
+            receiving: Arc::clone(&budget.receiving),
+            mine: 0,
+        }
+    }
+
+    /// Records that the connection's receive buffer is now charged `bytes`.
+    fn set(&mut self, bytes: usize) {
+        if bytes >= self.mine {
+            self.receiving
+                .fetch_add(bytes - self.mine, Ordering::Relaxed);
+        } else {
+            self.receiving
+                .fetch_sub(self.mine - bytes, Ordering::Relaxed);
+        }
+        self.mine = bytes;
+    }
+}
+
+impl Drop for ReceiveTally {
+    fn drop(&mut self) {
+        self.set(0);
     }
 }
 
@@ -322,9 +376,10 @@ const MULTI_SET_VALUE_BYTES_PER_KEY: usize = 32;
 /// before the reply itself is charged (`write_reply`). It is called before the parser builds the frame's key
 /// vectors (`parse_resumable`'s `ParseError::ChargeRequired`), so a
 /// connection waiting here holds no uncharged per-key memory. A frame
-/// costing more than the whole budget takes all of it and runs alone — the
-/// connection's own receive-buffer charge is part of what it already holds,
-/// so it asks only for the rest and does not wait for itself. Waits at most
+/// costing more than the budget takes what the receive buffers (its own
+/// and every other connection's) leave of it and runs alone with them
+/// (`InFlightBudget::frame_room`), so it neither waits for its own buffer
+/// nor for buffers whose holders are waiting for it. Waits at most
 /// `WRITE_TIMEOUT`, like a reply, and fails the connection if the budget
 /// does not free in that time.
 async fn charge_multi_key_frame(
@@ -339,11 +394,11 @@ async fn charge_multi_key_frame(
         } else {
             0
         };
-    let cost = keys.saturating_mul(per_key);
-    let cost = config
-        .in_flight_bytes
-        .clamp(cost.saturating_add(receive_charged))
-        .saturating_sub(receive_charged);
+    // A frame costing more than the budget takes what the receive buffers
+    // leave of it (`InFlightBudget::frame_room`) and runs alone with them.
+    let cost = keys
+        .saturating_mul(per_key)
+        .min(config.in_flight_bytes.frame_room(receive_charged));
     let permit = timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge_exact(cost))
         .await
         .map_err(|_| {
@@ -2731,6 +2786,7 @@ async fn handle_connection(
     // (see `InFlightBudget`): grown before the buffer is, shrunk with it.
     let mut receive_charge: Option<tokio::sync::OwnedSemaphorePermit> = None;
     let mut receive_charged = 0usize;
+    let mut receive_tally = ReceiveTally::new(&config.in_flight_bytes);
     // No secret configured means auth isn't required, so every connection
     // starts already authenticated.
     let mut authenticated = config.auth_secret.is_none();
@@ -4221,6 +4277,7 @@ async fn handle_connection(
         if received.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
             receive_charge = None;
             receive_charged = 0;
+            receive_tally.set(0);
         }
 
         // Bounded by time remaining until `deadline`, not by a fresh
@@ -4254,6 +4311,7 @@ async fn handle_connection(
                     )
                 })?;
                 receive_charged = want;
+                receive_tally.set(want);
                 receive_charge = Some(match receive_charge.take() {
                     Some(mut held) => {
                         held.merge(more);
@@ -12356,6 +12414,74 @@ mod tests {
             let _ = timeout(Duration::from_secs(5), connection_task).await;
             assert_eq!(budget.available(), total, "{name}: everything is released");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frames_that_each_cost_more_than_the_budget_do_not_wait_on_each_others_receive_buffers()
+    {
+        // Issue #1262: a 40,000-key frame costs 10 MB, ten times the 1 MiB
+        // budget, and used to ask for "the budget less my own receive
+        // buffer". With two connections each holding the charge of the
+        // 128 KiB buffer their frame arrived in, neither request could be
+        // satisfied while the other buffer was there, and the buffer is
+        // there until its frame is served: both waited for WRITE_TIMEOUT
+        // and were closed.
+        const KEYS: usize = 40_000;
+        let frame = multi_get_frame(KEYS);
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+
+        let mut clients = Vec::new();
+        let mut connection_tasks = Vec::new();
+        for _ in 0..2 {
+            let (client, server) = tcp_pair().await;
+            connection_tasks.push(tokio::spawn(handle_connection(
+                ServerStream::Plain(server),
+                test_client_addr(),
+                request_tx.clone(),
+                connection_config_with_budget(&budget, IDLE_TIMEOUT),
+                shutdown_rx.clone(),
+            )));
+            clients.push(client);
+        }
+        // Both frames arrive up to their last bytes, so that both buffers
+        // are charged before either connection asks for its frame.
+        let split = frame.len() - 10;
+        for client in &mut clients {
+            client.write_all(&frame[..split]).await.unwrap();
+        }
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            MAX_REQUEST_SIZE - budget.available() > 0,
+            "the receive buffers must be charged for the test to mean anything"
+        );
+        for client in &mut clients {
+            client.write_all(&frame[split..]).await.unwrap();
+        }
+
+        for client in &mut clients {
+            let mut header = [0u8; 8];
+            timeout(Duration::from_secs(4), client.read_exact(&mut header))
+                .await
+                .expect("both frames are served, not left waiting for each other's buffers")
+                .unwrap();
+            assert_eq!(&header, b"M 40000 ");
+        }
+
+        drop(clients);
+        for task in connection_tasks {
+            let _ = timeout(Duration::from_secs(5), task).await;
+        }
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+        assert_eq!(
+            budget.receiving.load(Ordering::Relaxed),
+            0,
+            "a closed connection takes its share back out of the receive tally"
+        );
+        drop(request_tx);
+        cache_task.await.unwrap();
     }
 
     #[test]
