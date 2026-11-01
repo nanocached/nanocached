@@ -4925,6 +4925,26 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aHedgeLegWithoutAnOutcomeIsSettledWithAPreallocatedOne() throws Exception {
+        // Issue #1248: the fallback outcome startHedgeLeg's finally records
+        // is reached exactly when an OutOfMemoryError stopped a catch arm
+        // from building its own, so it must not be built there. An
+        // allocation failure cannot be injected deterministically; this
+        // pins the property that makes the fallback safe -- the same
+        // instance every time, already a bug outcome.
+        Class<?> legOutcome = Class.forName("org.nanocached.NanocachedClient$LegOutcome");
+        Method endedWithoutOutcome = legOutcome.getDeclaredMethod("endedWithoutOutcome");
+        endedWithoutOutcome.setAccessible(true);
+        Object first = endedWithoutOutcome.invoke(null);
+        Object second = endedWithoutOutcome.invoke(null);
+        assertSame(first, second, "the fallback outcome must be preallocated, not built per leg");
+        Field bug = legOutcome.getDeclaredField("bug");
+        bug.setAccessible(true);
+        assertTrue(bug.get(first) instanceof NanocachedException,
+                "the fallback must be a bug outcome, so the reader throws instead of returning a value");
+    }
+
+    @Test
     void anErrorInAHedgeLegSettlesTheReadInsteadOfParkingTheCallerForever() throws Exception {
         // Issue #1150: a hedge leg that threw an Error (OutOfMemoryError,
         // LinkageError, AssertionError under -ea, ...) used to record no
