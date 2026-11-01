@@ -1629,11 +1629,45 @@ enum CasCondition {
     Digest([u8; 16]),
 }
 
+/// Which multi-key command a `MultiFrame` is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MultiKind {
+    /// `m`
+    Get,
+    /// `o`
+    Set,
+    /// `y`, with `get` when it carries `G`
+    Touch { get: bool },
+}
+
+/// What admission needs to know about a fully buffered `m`/`o`/`y` frame
+/// before the parser builds its key vectors (`ParseOutcome::ChargeRequired`):
+/// all of it comes from the header, so the request can be admitted for what
+/// it will cost while nothing per-key exists yet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MultiFrame {
+    kind: MultiKind,
+    /// The number of keys the header declares.
+    keys: usize,
+    /// The frame's length in bytes (header and body), from the start of the
+    /// buffer.
+    frame_len: usize,
+}
+
 #[derive(Debug, PartialEq)]
 enum ParseOutcome {
     /// A full request (plus the client's tag in tagged mode) was
     /// consumed from the buffer.
     Ready(Request, Option<u32>),
+    /// A fully buffered `m`/`o`/`y` frame that has not been admitted yet
+    /// (`RequestScanState::frame_charged`). Like `Incomplete` it leaves
+    /// the buffer untouched and keeps the scan state: the vectors of key
+    /// handles it would build (32 bytes per key, 64 for `o`; 11 MB for a
+    /// 1 MiB frame of one-byte keys) are charged by nothing but the
+    /// request's admission, which can wait for `admission_wait`, so the
+    /// caller admits the frame first and parses it again afterwards. The
+    /// tag is the client's, for the reply if admission gives up.
+    ChargeRequired(MultiFrame, Option<u32>),
     /// More bytes are needed; the buffer is untouched.
     Incomplete,
     /// `A <len> [T] [R]` — handled by the caller (auth state lives
@@ -1754,6 +1788,10 @@ struct RequestScanState {
     /// (pre-auth): until the buffer reaches this length the answer is
     /// `Incomplete` without looking at the header again.
     frame_end: Option<usize>,
+    /// Whether the caller has admitted the multi-key frame at the front
+    /// of the buffer (`ParseOutcome::ChargeRequired`); until it has, such
+    /// a frame is not parsed. Reset with the rest on a parsed frame.
+    frame_charged: bool,
 }
 
 /// Finds the header-terminating `\n`, resuming `scan`'s prior progress
@@ -1791,6 +1829,24 @@ thread_local! {
     static LF_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// How many per-key `Bytes` handles the parser has built on the current
+// thread, for the tests that check a frame still waiting for admission
+// has none.
+#[cfg(test)]
+thread_local! {
+    static KEY_HANDLES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_key_handles(handles: usize) {
+    KEY_HANDLES_BUILT.with(|built| built.set(built.get() + handles));
+}
+
+#[cfg(test)]
+fn key_handles_built() -> usize {
+    KEY_HANDLES_BUILT.with(|built| built.get())
+}
+
 #[cfg(test)]
 fn reset_lf_scan_counter() {
     LF_SCAN_BYTES.with(|scanned| scanned.set(0));
@@ -1814,6 +1870,9 @@ fn parse_request(
     tagged: bool,
     scan: &mut RequestScanState,
 ) -> io::Result<ParseOutcome> {
+    // The unit tests parse multi-key frames outright; the admission gate
+    // is `handle_client`'s business.
+    scan.frame_charged = true;
     parse_request_limited(input, tagged, scan, MAX_CLIENT_FRAME_SIZE)
 }
 
@@ -1828,7 +1887,10 @@ fn parse_request_limited(
     max_frame: usize,
 ) -> io::Result<ParseOutcome> {
     let result = parse_request_body(input, tagged, scan, max_frame);
-    if !matches!(result, Ok(ParseOutcome::Incomplete)) {
+    if !matches!(
+        result,
+        Ok(ParseOutcome::Incomplete | ParseOutcome::ChargeRequired(..))
+    ) {
         *scan = RequestScanState::default();
     }
     result
@@ -1877,8 +1939,9 @@ fn parse_request_body(
         Ok((lengths, Some(tag)))
     };
 
-    // Consumes header + `body_length` bytes once fully buffered.
-    macro_rules! body {
+    // The length of the frame whose body is `body_length` bytes, once it
+    // is fully buffered; `Incomplete` until then.
+    macro_rules! frame_end {
         ($body_length:expr) => {{
             let body_length: usize = $body_length;
             let frame_end = header_end
@@ -1891,6 +1954,33 @@ fn parse_request_body(
             if input.len() < frame_end {
                 scan.frame_end = Some(frame_end);
                 return Ok(ParseOutcome::Incomplete);
+            }
+            frame_end
+        }};
+    }
+
+    // Consumes header + `body_length` bytes once fully buffered.
+    macro_rules! body {
+        ($body_length:expr) => {{
+            let frame_end = frame_end!($body_length);
+            input.split_to(frame_end).freeze().slice(header_end + 1..)
+        }};
+    }
+
+    // `body!` for an `m`/`o`/`y` frame of `keys` keys: once the frame is
+    // fully buffered it is handed back unparsed (`ChargeRequired`) until
+    // the caller has admitted it, so the key vectors it is parsed into
+    // exist only for an admitted request.
+    macro_rules! multi_body {
+        ($body_length:expr, $kind:expr, $keys:expr, $tag:expr) => {{
+            let frame_end = frame_end!($body_length);
+            if !scan.frame_charged {
+                let frame = MultiFrame {
+                    kind: $kind,
+                    keys: $keys,
+                    frame_len: frame_end,
+                };
+                return Ok(ParseOutcome::ChargeRequired(frame, $tag));
             }
             input.split_to(frame_end).freeze().slice(header_end + 1..)
         }};
@@ -1967,7 +2057,7 @@ fn parse_request_body(
                 .iter()
                 .try_fold(*namespace_length, |sum, &length| sum.checked_add(length))
                 .ok_or_else(|| invalid("frame length overflow"))?;
-            let body = body!(body_length);
+            let body = multi_body!(body_length, MultiKind::Get, key_lengths.len(), tag);
             let namespace = body.slice(..*namespace_length);
             let mut cursor = *namespace_length;
             let mut keys = Vec::with_capacity(key_lengths.len());
@@ -1975,6 +2065,8 @@ fn parse_request_body(
                 keys.push(body.slice(cursor..cursor + length));
                 cursor += length;
             }
+            #[cfg(test)]
+            count_key_handles(keys.len());
             Ok(ParseOutcome::Ready(
                 Request::MultiGet { namespace, keys },
                 tag,
@@ -2021,7 +2113,7 @@ fn parse_request_body(
                         .and_then(|sum| sum.checked_add(value_length))
                 })
                 .ok_or_else(|| invalid("frame length overflow"))?;
-            let body = body!(body_length);
+            let body = multi_body!(body_length, MultiKind::Set, count, tag);
             let namespace = body.slice(..*namespace_length);
             let mut cursor = *namespace_length;
             let mut keys = Vec::with_capacity(count);
@@ -2032,6 +2124,8 @@ fn parse_request_body(
                 values.push(body.slice(cursor..cursor + value_length));
                 cursor += value_length;
             }
+            #[cfg(test)]
+            count_key_handles(2 * count);
 
             Ok(ParseOutcome::Ready(
                 Request::MultiSet {
@@ -2317,7 +2411,12 @@ fn parse_request_body(
                 .iter()
                 .try_fold(namespace_length, |sum, &length| sum.checked_add(length))
                 .ok_or_else(|| invalid("frame length overflow"))?;
-            let body = body!(body_length);
+            let body = multi_body!(
+                body_length,
+                MultiKind::Touch { get },
+                key_lengths.len(),
+                tag
+            );
             let namespace = body.slice(..namespace_length);
             let mut cursor = namespace_length;
             let mut keys = Vec::with_capacity(key_lengths.len());
@@ -2325,6 +2424,8 @@ fn parse_request_body(
                 keys.push(body.slice(cursor..cursor + length));
                 cursor += length;
             }
+            #[cfg(test)]
+            count_key_handles(keys.len());
             Ok(ParseOutcome::Ready(
                 Request::MultiTouch {
                     namespace,
@@ -6216,14 +6317,6 @@ fn request_cost(
     primaries: usize,
 ) -> usize {
     let legs = replication.max(1) + 1;
-    // What a batched read can be answered with: one value per key, and at
-    // most one `MAX_MULTI_REPLY_VALUE_BYTES` reply per primary it reaches
-    // (each node caps its own group's reply; nothing caps the replies of
-    // different groups against each other until they are merged).
-    let batch_reply = |keys: usize| {
-        keys.saturating_mul(MAX_REQUEST_SIZE)
-            .min(primaries.saturating_mul(MAX_MULTI_REPLY_VALUE_BYTES))
-    };
     match request {
         Request::Get { .. } => frame_bytes.saturating_add(MAX_REQUEST_SIZE),
         // A get-and-touch is answered with up to one full value, like `G`,
@@ -6239,20 +6332,60 @@ fn request_cost(
         | Request::CasDelete { .. }
         | Request::Clear { .. }
         | Request::ClearAll => frame_bytes.saturating_mul(legs),
-        Request::MultiGet { keys, .. } => frame_bytes
-            .saturating_add(keys.len().saturating_mul(MULTI_KEY_OVERHEAD_BYTES))
-            .saturating_add(batch_reply(keys.len())),
-        Request::MultiSet { keys, .. } => frame_bytes
-            .saturating_mul(legs)
-            .saturating_add(keys.len().saturating_mul(MULTI_KEY_OVERHEAD_BYTES)),
+        Request::MultiGet { keys, .. } => multi_request_cost(
+            MultiKind::Get,
+            keys.len(),
+            frame_bytes,
+            replication,
+            primaries,
+        ),
+        Request::MultiSet { keys, .. } => multi_request_cost(
+            MultiKind::Set,
+            keys.len(),
+            frame_bytes,
+            replication,
+            primaries,
+        ),
+        Request::MultiTouch { keys, get, .. } => multi_request_cost(
+            MultiKind::Touch { get: *get },
+            keys.len(),
+            frame_bytes,
+            replication,
+            primaries,
+        ),
+    }
+}
+
+/// `request_cost` of an `m`/`o`/`y` frame from what its header says
+/// (`keys`, `frame_bytes`), so that it can be admitted before its key
+/// vectors are built; `request_cost` itself prices a parsed one with this.
+fn multi_request_cost(
+    kind: MultiKind,
+    keys: usize,
+    frame_bytes: usize,
+    replication: usize,
+    primaries: usize,
+) -> usize {
+    let legs = replication.max(1) + 1;
+    // What a batched read can be answered with: one value per key, and at
+    // most one `MAX_MULTI_REPLY_VALUE_BYTES` reply per primary it reaches
+    // (each node caps its own group's reply; nothing caps the replies of
+    // different groups against each other until they are merged).
+    let batch_reply = keys
+        .saturating_mul(MAX_REQUEST_SIZE)
+        .min(primaries.saturating_mul(MAX_MULTI_REPLY_VALUE_BYTES));
+    let overhead = keys.saturating_mul(MULTI_KEY_OVERHEAD_BYTES);
+    match kind {
+        MultiKind::Get => frame_bytes
+            .saturating_add(overhead)
+            .saturating_add(batch_reply),
+        MultiKind::Set => frame_bytes.saturating_mul(legs).saturating_add(overhead),
         // Re-framed once per owner leg like a write; with `G` also answered
         // with up to what an `m` is.
-        Request::MultiTouch { keys, get, .. } => {
-            let framed = frame_bytes
-                .saturating_mul(legs)
-                .saturating_add(keys.len().saturating_mul(MULTI_KEY_OVERHEAD_BYTES));
-            if *get {
-                framed.saturating_add(batch_reply(keys.len()))
+        MultiKind::Touch { get } => {
+            let framed = frame_bytes.saturating_mul(legs).saturating_add(overhead);
+            if get {
+                framed.saturating_add(batch_reply)
             } else {
                 framed
             }
@@ -6314,6 +6447,77 @@ impl InFlightCharge {
         self._ip.merge(more._ip);
         self._proxy.merge(more._proxy);
     }
+}
+
+/// The ring's owner count and the most primaries a batch can spread over,
+/// for pricing a request (`request_cost`).
+fn admission_shape(context: &ProxyContext) -> (usize, usize) {
+    let ring = current_ring(context);
+    let replication = ring.as_ref().map_or(1, |ring| ring.replication);
+    let primaries = ring
+        .as_ref()
+        .map_or(1, |ring| ring.distinct_addresses().max(1));
+    (replication, primaries)
+}
+
+/// How a request's admission ended.
+enum Admission {
+    /// The bytes are reserved; the charge holds them.
+    Granted(InFlightCharge),
+    /// `admission_wait` ran out: nothing was reserved.
+    TimedOut,
+    /// The connection is over (a drain, or the writer is gone).
+    Closed,
+}
+
+/// Reserves a request's `cost` on the connection's, its source IP's and
+/// the proxy's budgets (`budgets`, in that order), of which the connection
+/// already holds `held` (its receive buffer's charge). Stops waiting for
+/// the same reasons the read in `handle_client` does, and after
+/// `admission_wait`.
+async fn admit_request(
+    cost: usize,
+    held: usize,
+    budgets: [&InFlightBudget; 3],
+    admission_wait: Duration,
+    drain: &mut watch::Receiver<bool>,
+    fifo_tx: &mpsc::Sender<ClientReply>,
+) -> Admission {
+    let [connection, ip, proxy] = budgets;
+    tokio::select! {
+        admitted = timeout(admission_wait, async {
+            let connection = connection.charge_beyond(held, cost).await?;
+            let ip = ip.charge_beyond(held, cost).await?;
+            let proxy = proxy.charge_beyond(held, cost).await?;
+            Some(InFlightCharge {
+                _connection: connection,
+                _ip: ip,
+                _proxy: proxy,
+            })
+        }) => match admitted {
+            Ok(Some(charge)) => Admission::Granted(charge),
+            Ok(None) => Admission::Closed,
+            Err(_) => Admission::TimedOut,
+        },
+        () = drained(drain) => Admission::Closed,
+        () = fifo_tx.closed() => Admission::Closed,
+    }
+}
+
+/// Queues the transient reply for a request that gave up waiting for its
+/// bytes (`R` for a retry-capable client, else `B`); `false` if the
+/// connection's writer is gone.
+async fn send_transient(
+    fifo_tx: &mpsc::Sender<ClientReply>,
+    retry_capable: bool,
+    tag: Option<u32>,
+) -> bool {
+    let (response_tx, response_rx) = oneshot::channel();
+    let _ = response_tx.send(Ok(transient_reply(retry_capable, tag)));
+    fifo_tx
+        .send(ClientReply::uncharged(response_rx))
+        .await
+        .is_ok()
 }
 
 async fn handle_client(
@@ -6386,6 +6590,10 @@ async fn handle_client(
     // receive buffer the same way.
     let mut receive_charge: Option<InFlightCharge> = None;
     let mut receive_charged = 0usize;
+    // The admission of the `m`/`o`/`y` frame at the front of `buf`, taken
+    // before the frame was parsed (`ParseOutcome::ChargeRequired`) and
+    // handed to the request that parse then yields.
+    let mut frame_charge: Option<InFlightCharge> = None;
     let mut authenticated = context.secret.is_none();
     // Whether an `A` handshake has already been processed on this
     // connection. Distinct from `authenticated` (true from the start in
@@ -6495,52 +6703,53 @@ async fn handle_client(
                     // does, and after `admission_wait`: a request that
                     // cannot get its bytes by then is answered with the
                     // transient reply and the connection goes on.
-                    let ring = current_ring(&context);
-                    let replication = ring.as_ref().map_or(1, |ring| ring.replication);
-                    let primaries = ring
-                        .as_ref()
-                        .map_or(1, |ring| ring.distinct_addresses().max(1));
-                    let cost = request_cost(&request, buffered - buf.len(), replication, primaries);
-                    // The connection's receive-buffer charge is part of
-                    // what it already holds on all three budgets: a
-                    // request costing the whole budget asks only for the
-                    // rest, or it would wait on itself (until
-                    // `admission_wait`, then be answered `R`/`B` although
-                    // nothing else was in its way).
-                    let held = receive_charged;
-                    let admitted = tokio::select! {
-                        admitted = timeout(admission_wait, async {
-                            let connection = connection_in_flight_bytes.charge_beyond(held, cost).await?;
-                            let ip = ip_in_flight_share.budget.charge_beyond(held, cost).await?;
-                            let proxy = proxy_in_flight_bytes.charge_beyond(held, cost).await?;
-                            Some(InFlightCharge {
-                                _connection: connection,
-                                _ip: ip,
-                                _proxy: proxy,
-                            })
-                        }) => admitted,
-                        () = drained(&mut drain) => break 'connection Ok(()),
-                        () = fifo_tx.closed() => break 'connection Ok(()),
-                    };
-                    let charge = match admitted {
-                        Ok(Some(charge)) => charge,
-                        Ok(None) => break 'connection Ok(()),
-                        Err(_) => {
-                            // Nothing was dispatched, so the request was
-                            // not applied. The request is done with, so
-                            // the idle deadline starts over like after
-                            // any completed frame.
-                            deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
-                            let (response_tx, response_rx) = oneshot::channel();
-                            let _ = response_tx.send(Ok(transient_reply(retry_capable, tag)));
-                            if fifo_tx
-                                .send(ClientReply::uncharged(response_rx))
-                                .await
-                                .is_err()
-                            {
-                                break 'connection Ok(());
+                    let charge = match frame_charge.take() {
+                        // An `m`/`o`/`y` frame was admitted before it was
+                        // parsed (`ChargeRequired` below): that is this
+                        // request's charge.
+                        Some(charge) => charge,
+                        None => {
+                            let (replication, primaries) = admission_shape(&context);
+                            let cost = request_cost(
+                                &request,
+                                buffered - buf.len(),
+                                replication,
+                                primaries,
+                            );
+                            // The connection's receive-buffer charge is part
+                            // of what it already holds on all three budgets:
+                            // a request costing the whole budget asks only
+                            // for the rest, or it would wait on itself
+                            // (until `admission_wait`, then be answered
+                            // `R`/`B` although nothing else was in its way).
+                            let admitted = admit_request(
+                                cost,
+                                receive_charged,
+                                [
+                                    &connection_in_flight_bytes,
+                                    &*ip_in_flight_share.budget,
+                                    &proxy_in_flight_bytes,
+                                ],
+                                admission_wait,
+                                &mut drain,
+                                &fifo_tx,
+                            )
+                            .await;
+                            match admitted {
+                                Admission::Granted(charge) => charge,
+                                Admission::Closed => break 'connection Ok(()),
+                                Admission::TimedOut => {
+                                    // Nothing was dispatched, so the request
+                                    // was not applied. The request is done
+                                    // with, so the idle deadline starts over
+                                    // like after any completed frame.
+                                    deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                                    if !send_transient(&fifo_tx, retry_capable, tag).await {
+                                        break 'connection Ok(());
+                                    }
+                                    continue;
+                                }
                             }
-                            continue;
                         }
                     };
                     deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
@@ -6558,6 +6767,64 @@ async fn handle_client(
                         .is_err()
                     {
                         break 'connection Ok(());
+                    }
+                }
+                Ok(ParseOutcome::ChargeRequired(frame, tag)) => {
+                    // An `m`/`o`/`y` frame is admitted before it is
+                    // parsed: its key vectors are 32 bytes per key (64
+                    // for `o`) that nothing charges but the admission,
+                    // which can wait for `admission_wait` (issue #1144).
+                    // The cost is known from the header alone, so it is
+                    // charged now, while no per-key memory exists, and the
+                    // parse that follows hands the request this charge.
+                    if !authenticated {
+                        let (response_tx, response_rx) = oneshot::channel();
+                        let _ = response_tx.send(Err(Fatal::Transient));
+                        let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
+                        break 'connection Ok(());
+                    }
+                    if fifo_tx.is_closed() {
+                        break 'connection Ok(());
+                    }
+                    let (replication, primaries) = admission_shape(&context);
+                    let cost = multi_request_cost(
+                        frame.kind,
+                        frame.keys,
+                        frame.frame_len,
+                        replication,
+                        primaries,
+                    );
+                    let admitted = admit_request(
+                        cost,
+                        receive_charged,
+                        [
+                            &connection_in_flight_bytes,
+                            &*ip_in_flight_share.budget,
+                            &proxy_in_flight_bytes,
+                        ],
+                        admission_wait,
+                        &mut drain,
+                        &fifo_tx,
+                    )
+                    .await;
+                    match admitted {
+                        Admission::Granted(charge) => {
+                            frame_charge = Some(charge);
+                            scan.frame_charged = true;
+                        }
+                        Admission::Closed => break 'connection Ok(()),
+                        Admission::TimedOut => {
+                            // As for any request that gives up waiting,
+                            // except that this one is still in the buffer:
+                            // drop its bytes, or the next parse would read
+                            // them as a new frame.
+                            let _ = buf.split_to(frame.frame_len);
+                            scan = RequestScanState::default();
+                            deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                            if !send_transient(&fifo_tx, retry_capable, tag).await {
+                                break 'connection Ok(());
+                            }
+                        }
                     }
                 }
                 Err(_) => {
@@ -8420,6 +8687,154 @@ mod tests {
             "V 1"
         );
         drop(node);
+    }
+
+    /// An `m` of `keys` one-byte keys, tagged when `tag` is given.
+    fn multi_get_frame(keys: usize, tag: Option<u32>) -> Vec<u8> {
+        let mut frame = format!("m 0 {keys}").into_bytes();
+        frame.extend(std::iter::repeat_n(b" 1", keys).flatten());
+        if let Some(tag) = tag {
+            frame.extend(format!(" {tag}").bytes());
+        }
+        frame.push(b'\n');
+        frame.extend(std::iter::repeat_n(b'k', keys));
+        frame
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_waiting_for_in_flight_bytes_has_no_key_vectors() {
+        // Issue #1144. An `m` used to be parsed, key vector and all (32
+        // bytes a key, 64 for `o`: 11 MB for a 1 MiB frame of one-byte
+        // keys), before it waited for admission, and charged for them only
+        // once admitted: a parked connection held them for up to
+        // `admission_wait` for nothing. Here the budget is held by a slow
+        // read, so the `m` waits; no key handle may exist meanwhile.
+        let (node, proxy, context) =
+            slow_single_node(b"k", Duration::from_millis(400), Some(one_read_limits())).await;
+        let (mut holder, mut holder_buf) = connect_and_auth(&proxy).await;
+        holder.write_all(b"G 1\nk").await.unwrap();
+        sleep(Duration::from_millis(40)).await;
+        assert_eq!(context.requests_total.load(Ordering::Relaxed), 1);
+
+        let (mut waiter, mut waiter_buf) = connect_and_auth_tagged(&proxy).await;
+        let before = key_handles_built();
+        waiter
+            .write_all(&multi_get_frame(500, Some(5)))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            key_handles_built() - before,
+            0,
+            "a frame waiting for admission must not have been parsed into key handles"
+        );
+
+        // Giving up drops the frame whole: it is answered `R` with its tag,
+        // never parsed, and the next frame on the connection is read as a
+        // frame, not as the tail of this one.
+        assert_eq!(
+            read_line(&mut waiter, &mut waiter_buf).await.unwrap(),
+            "R 5"
+        );
+        assert_eq!(key_handles_built() - before, 0);
+        assert_eq!(
+            read_line(&mut holder, &mut holder_buf).await.unwrap(),
+            "V 1"
+        );
+        waiter
+            .write_all(&multi_get_frame(500, Some(6)))
+            .await
+            .unwrap();
+        let header = read_line(&mut waiter, &mut waiter_buf).await.unwrap();
+        assert!(header.starts_with("M 500 "), "{header}");
+        assert_eq!(
+            key_handles_built() - before,
+            500,
+            "an admitted frame is parsed once"
+        );
+        drop(node);
+    }
+
+    #[test]
+    fn a_multi_key_frame_is_handed_back_unparsed_until_it_is_admitted() {
+        let frames: [(&[u8], MultiKind, usize); 5] = [
+            (b"m 0 3 1 2 3\nabbccc", MultiKind::Get, 3),
+            (b"o 0 2 1 1 2 2\nkvkkvv", MultiKind::Set, 2),
+            (b"o 0 2 1 1 2 2 30\nkvkkvv", MultiKind::Set, 2),
+            (b"y 0 2 1 1\nab", MultiKind::Touch { get: false }, 2),
+            (b"y 0 2 1 1 30 G\nab", MultiKind::Touch { get: true }, 2),
+        ];
+        for (tagged, tag) in [(false, None), (true, Some(7u32))] {
+            for (frame, kind, keys) in frames {
+                let mut wire = frame.to_vec();
+                if tagged {
+                    let newline = wire.iter().position(|byte| *byte == b'\n').unwrap();
+                    wire.splice(newline..newline, b" 7".iter().copied());
+                }
+                let mut input = BytesMut::from(&wire[..]);
+                let mut scan = RequestScanState::default();
+
+                // Not all there yet: incomplete, as before.
+                let mut partial = BytesMut::from(&wire[..wire.len() - 1]);
+                assert_eq!(
+                    parse_request_limited(&mut partial, tagged, &mut scan, MAX_CLIENT_FRAME_SIZE)
+                        .unwrap(),
+                    ParseOutcome::Incomplete
+                );
+
+                let before = key_handles_built();
+                let outcome =
+                    parse_request_limited(&mut input, tagged, &mut scan, MAX_CLIENT_FRAME_SIZE)
+                        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&wire)));
+                let ParseOutcome::ChargeRequired(multi, outcome_tag) = outcome else {
+                    panic!(
+                        "{}: expected the admission gate",
+                        String::from_utf8_lossy(&wire)
+                    );
+                };
+                assert_eq!((multi.kind, multi.keys, outcome_tag), (kind, keys, tag));
+                assert_eq!(multi.frame_len, wire.len());
+                assert_eq!(
+                    &input[..],
+                    &wire[..],
+                    "the gate must leave the buffer alone"
+                );
+                assert_eq!(key_handles_built(), before, "and build nothing per key");
+
+                // Asked again before it is admitted: the same answer.
+                assert!(matches!(
+                    parse_request_limited(&mut input, tagged, &mut scan, MAX_CLIENT_FRAME_SIZE),
+                    Ok(ParseOutcome::ChargeRequired(..))
+                ));
+
+                // Admitted: parsed, and priced exactly as the gate priced it.
+                scan.frame_charged = true;
+                let Ok(ParseOutcome::Ready(request, ready_tag)) =
+                    parse_request_limited(&mut input, tagged, &mut scan, MAX_CLIENT_FRAME_SIZE)
+                else {
+                    panic!("{}: expected a request", String::from_utf8_lossy(&wire));
+                };
+                assert_eq!(ready_tag, tag);
+                assert!(input.is_empty());
+                assert!(!scan.frame_charged, "the next frame is gated again");
+                for replication in [1, 2, 3] {
+                    for primaries in [1, 4] {
+                        assert_eq!(
+                            multi_request_cost(
+                                multi.kind,
+                                multi.keys,
+                                multi.frame_len,
+                                replication,
+                                primaries
+                            ),
+                            request_cost(&request, multi.frame_len, replication, primaries),
+                            "{}",
+                            String::from_utf8_lossy(&wire)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
