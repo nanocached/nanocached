@@ -207,6 +207,76 @@ fn keep_reply_phase(frame_charge: &mut Option<FrameCharge>, keys: usize) -> usiz
     })
 }
 
+/// Issue #1243: what an `o` ack keeps charged while it is written: its
+/// roster (a `MultiAckEntry` is one byte) and the encoded copy (2 to about
+/// 4 bytes per key with the `String`'s growth), rounded up. A plain `y`
+/// ack keeps `keep_reply_phase`'s figure, as its entries are `MultiEntry`s.
+const MULTI_ACK_BYTES_PER_KEY: usize = 8;
+
+/// Issue #1243: what a multi-key write or touch keeps charged per key while
+/// it waits to queue its forwards: the position list (8 bytes), the result
+/// and entry vectors (`MultiEntry` is 40 bytes, twice) and the hashes of a
+/// `y`, rounded up. The forwarded items are counted on top
+/// (`forward_batches_bytes`).
+const MULTI_KEY_FORWARD_BYTES_PER_KEY: usize = 96;
+
+/// What one item of a forward batch holds while its push waits for room: its
+/// slot in the batch (two `Bytes` handles, up to twice that with the
+/// vector's growth) and the queue entry `push` copies it into, for which
+/// `FORWARD_ENTRY_OVERHEAD_BYTES` is the figure the queue itself counts.
+const FORWARD_BATCH_ITEM_BYTES: usize = 128 + FORWARD_ENTRY_OVERHEAD_BYTES;
+
+/// What the forward batches of a frame hold until `enqueue_forwards` has
+/// queued them: per item the figure above plus the key and value the push
+/// copies out of the receive buffer, and per batch the copy of the
+/// namespace.
+fn forward_batches_bytes(namespace: &Bytes, batches: &[&[ForwardBatch]]) -> usize {
+    batches
+        .iter()
+        .flat_map(|batches| batches.iter())
+        .map(|batch| {
+            namespace.len()
+                + batch
+                    .items
+                    .iter()
+                    .map(|(name, value)| FORWARD_BATCH_ITEM_BYTES + name.len() + value.len())
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+/// Narrows a multi-key frame's charge to what it holds across the forward
+/// waits: `enqueue_forwards` can wait for room in a target's queue without
+/// a bound, and by then the per-key working vectors are mostly gone (the
+/// batches are built, the keys and values are with the cache). The charge
+/// is not simply dropped: a push that waits already holds copies of its
+/// items (#1160), and those must stay in the budget. No key to forward, the
+/// usual case, leaves only the per-key figure. Returns what is still held.
+fn keep_forward_phase(
+    frame_charge: &mut Option<FrameCharge>,
+    keys: usize,
+    namespace: &Bytes,
+    batches: &[&[ForwardBatch]],
+) -> usize {
+    frame_charge.as_mut().map_or(0, |charge| {
+        charge.shrink_to(
+            keys.saturating_mul(MULTI_KEY_FORWARD_BYTES_PER_KEY)
+                .saturating_add(forward_batches_bytes(namespace, batches)),
+        )
+    })
+}
+
+/// Narrows an `o` frame's charge to what its ack keeps until it is
+/// written (`MULTI_ACK_BYTES_PER_KEY`), before the ack is: the write can
+/// block for `WRITE_TIMEOUT`, or until the connection is closed for a
+/// client that does not read, and the working charge must not be held
+/// through it.
+fn keep_ack_phase(frame_charge: &mut Option<FrameCharge>, keys: usize) -> usize {
+    frame_charge.as_mut().map_or(0, |charge| {
+        charge.shrink_to(keys.saturating_mul(MULTI_ACK_BYTES_PER_KEY))
+    })
+}
+
 /// The bytes a reply's encoded copy will hold: the values of a `V` (a
 /// `G`'s or a get-and-touch's) or `M`; every other reply is a short header
 /// and is not charged.
@@ -3145,7 +3215,7 @@ async fn handle_connection(
                 },
                 tag,
             )) => {
-                let _frame_charge = frame_charge;
+                let mut frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiAckEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -3161,6 +3231,7 @@ async fn handle_connection(
                     Some(node_context) => wrong_nodes_refreshed(node_context, &hashes).await,
                     None => vec![false; keys.len()],
                 };
+                drop(hashes);
 
                 for (position, (name, value)) in keys.into_iter().zip(values).enumerate() {
                     if wrong[position] {
@@ -3171,6 +3242,7 @@ async fn handle_connection(
                         owned_values.push(value);
                     }
                 }
+                drop(wrong);
 
                 if !owned_keys.is_empty() {
                     // Kept for the forwarding loop below — `owned_keys`/
@@ -3272,6 +3344,16 @@ async fn handle_connection(
                             }
                         }
 
+                        // Issue #1243: the batches are built and the cache is
+                        // done with the frame; hold only what the waits for
+                        // room in the targets' queues still need.
+                        keep_forward_phase(
+                            &mut frame_charge,
+                            entries.len(),
+                            &namespace,
+                            &[&join_batches, &leave_batches],
+                        );
+
                         for (batches, handoff) in [(join_batches, false), (leave_batches, true)] {
                             for batch in batches {
                                 let writes = batch.items.into_iter().map(|(name, value)| {
@@ -3303,10 +3385,13 @@ async fn handle_connection(
                     }
                 }
 
-                let entries = entries
+                let entries: Vec<MultiAckEntry> = entries
                     .into_iter()
                     .map(|entry| entry.expect("every position filled by one of the two branches"))
                     .collect();
+                // Issue #1243: the ack is a few bytes per key; the working
+                // charge is not held through a write that can block.
+                keep_ack_phase(&mut frame_charge, entries.len());
                 write_response(
                     &mut stream,
                     &encode_response(&Response::MultiAck(entries), tag),
@@ -3801,6 +3886,16 @@ async fn handle_connection(
                                 );
                             }
                         }
+
+                        // Issue #1243: the batches are built and the cache is
+                        // done with the frame; hold only what the waits for
+                        // room in the targets' queues still need.
+                        keep_forward_phase(
+                            &mut frame_charge,
+                            entries.len(),
+                            &namespace,
+                            &[&join_batches, &leave_batches],
+                        );
 
                         for (batches, handoff) in [(join_batches, false), (leave_batches, true)] {
                             for batch in batches {
@@ -12091,6 +12186,111 @@ mod tests {
             let _ = timeout(Duration::from_secs(5), connection_task).await;
             assert_eq!(budget.available(), total, "{name}: everything is released");
         }
+    }
+
+    #[test]
+    fn the_forward_phase_keeps_what_the_batches_hold_and_nothing_when_there_are_none() {
+        let namespace = Bytes::from_static(b"ns");
+        let target = || ForwardTarget {
+            addr: "127.0.0.1:1".to_string(),
+            connection: Arc::new(AsyncMutex::new(None)),
+            token: String::new(),
+            revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
+        };
+        let mut batches = Vec::new();
+        for _ in 0..3 {
+            ForwardBatch::add(
+                &mut batches,
+                target(),
+                Bytes::from_static(b"name"),
+                Bytes::from_static(b"value"),
+            );
+        }
+        assert_eq!(
+            forward_batches_bytes(&namespace, &[&batches, &[]]),
+            2 + 3 * (FORWARD_BATCH_ITEM_BYTES + 4 + 5)
+        );
+        assert_eq!(forward_batches_bytes(&namespace, &[&[], &[]]), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_set_ack_does_not_hold_the_frame_charge_while_the_write_is_blocked() {
+        // Issue #1243: an `o` frame is charged 288 bytes per key while it is
+        // served, but its ack is two bytes per key. The charge used to be
+        // held until the ack was written, which for a client that pipelines
+        // frames and does not read is up to WRITE_TIMEOUT per connection:
+        // 100,000 keys held 28.8 MB while the 200 KB ack sat unwritten.
+        const KEYS: usize = 100_000;
+        let frame = {
+            let mut frame = format!("o 0 {KEYS}").into_bytes();
+            frame.extend(std::iter::repeat_n(b" 1 1", KEYS).flatten());
+            frame.push(b'\n');
+            frame.extend(std::iter::repeat_n(b"kv", KEYS).flatten());
+            frame
+        };
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let total = 256 * MAX_REQUEST_SIZE;
+        let budget = InFlightBudget::new(total);
+        let (client, server) = tcp_pair_with_small_client_buffer().await;
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        // Enough frames that their acks outgrow any socket buffer; the
+        // client never reads one.
+        let (unread, mut writer) = client.into_split();
+        let writer_task = tokio::spawn(async move {
+            for _ in 0..100 {
+                if writer.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+            writer
+        });
+
+        // The first acks are absorbed by the socket buffers (more of them
+        // on Linux than elsewhere); the write blocks once they are full,
+        // and the budget then stops changing.
+        let mut held = 0;
+        let mut steady = 0;
+        for _ in 0..40 {
+            sleep(Duration::from_millis(250)).await;
+            let now = total - budget.available();
+            steady = if now == held && now > 0 {
+                steady + 1
+            } else {
+                0
+            };
+            held = now;
+            if steady == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            steady, 3,
+            "the budget never settled: the ack write did not block"
+        );
+        assert!(
+            held < KEYS * MULTI_KEY_FRAME_BYTES_PER_KEY / 2,
+            "while an ack write is blocked the budget holds {held} bytes; the frame's \
+             working charge is {} and must have been given back",
+            KEYS * (MULTI_KEY_FRAME_BYTES_PER_KEY + MULTI_SET_VALUE_BYTES_PER_KEY)
+        );
+
+        writer_task.abort();
+        let writer = writer_task.await;
+        drop(writer);
+        drop(unread);
+        let _ = timeout(Duration::from_secs(5), connection_task).await;
+        assert_eq!(budget.available(), total, "everything is released");
+        drop(request_tx);
+        cache_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

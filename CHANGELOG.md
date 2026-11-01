@@ -14,6 +14,7 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: an `o` (multi-set) frame held its whole per-key working charge (288 bytes per key) until its two-bytes-per-key ack had been written, and `o` and `y` (batch touch) held it across the waits for room in a forward queue. A client that pipelined `o` frames and did not read the acks kept 28.8 MB of `--max-in-flight-bytes` per 100,000-key frame for up to 10 s per connection (29.8 MB held with the ack write blocked in a test, 1.8 MB now), starving other connections' buffers and replies. The charge is now narrowed in steps, as `m`'s is: after the forward batches are built to what the waiting pushes still hold (nothing when no key is forwarded), and before the ack write to the ack's own size (#1243).
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
