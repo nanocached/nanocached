@@ -1323,6 +1323,26 @@ public class NanocachedClientTests
         Assert.Equal(new Dictionary<string, string> { ["k"] = "default" }, await client.GetManyAsync(new[] { "k" }));
     }
 
+    // Issue #1182: the handle owns a private copy of its namespace, on the
+    // way in and on the way out.
+    [Fact]
+    public async Task NamespaceHandleIsNotAffectedByCallerMutatingItsBytes()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        byte[] input = Encoding.UTF8.GetBytes("tenant-a");
+        NanocachedNamespace ns = client.Namespace(input);
+        Array.Clear(input); // reuse the buffer after handing it over
+        byte[] exposed = ns.NamespaceBytes;
+        Array.Clear(exposed); // scribble on what the getter returned
+
+        Assert.Equal("tenant-a", ns.Namespace);
+        Assert.Equal(Encoding.UTF8.GetBytes("tenant-a"), ns.NamespaceBytes);
+        await ns.SetAsync("k", "v", 0);
+        Assert.Equal("v", await client.Namespace("tenant-a").GetAsync("k"));
+    }
+
     [Fact]
     public async Task WrongNodePropagatesForBatchedOpsInSingleMode()
     {
@@ -3384,6 +3404,64 @@ public class NanocachedClientTests
         await WaitForAsync(
             () => cluster.Nodes[owners[1]].Store.ContainsKey(stored),
             "the background write to land on the replica");
+    }
+
+    // Issue #1203: a background replica leg must not read the caller's
+    // key/value arrays after the call has returned. The replica's
+    // connection is closed and its node stalls the handshake, so the leg
+    // only builds its frame once the redial finishes - well after the
+    // caller has reused its buffers.
+    [Theory]
+    [InlineData("set")]
+    [InlineData("delete")]
+    [InlineData("touch")]
+    public async Task FireAndForgetReplicaLegsDoNotReadTheCallersBuffersAfterTheCallReturns(string op)
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        string replicaName = OwnersOf("k")[1];
+        MockNode replica = cluster.Nodes[replicaName];
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            FireAndForgetReplicas = true,
+        });
+        string stored = MockNode.KeyOf(Bytes("k"));
+        if (op != "set")
+        {
+            await client.SetAsync("k", "v", 100);
+            await WaitForAsync(() => replica.Store.ContainsKey(stored), "the seed to reach the replica");
+        }
+
+        var closed = new Connection(new ThrowingStream());
+        closed.Close();
+        ReplaceMemberConnection(client, replicaName, closed);
+        replica.DelayAuth(400);
+
+        byte[] key = Bytes("k");
+        byte[] value = Bytes("v");
+        switch (op)
+        {
+            case "set": await client.SetAsync(key, value, 100); break;
+            case "delete": await client.DeleteAsync(key); break;
+            default: await client.TouchAsync(key, 77); break;
+        }
+        Array.Clear(key); // the caller reuses its buffers
+        Array.Clear(value);
+
+        switch (op)
+        {
+            case "set":
+                await WaitForAsync(() => replica.Store.Count > 0, "the replica to receive the write");
+                Assert.True(replica.Store.TryGetValue(stored, out byte[]? got), "the replica holds the original key");
+                Assert.Equal(Bytes("v"), got);
+                break;
+            case "delete":
+                await WaitForAsync(() => !replica.Store.ContainsKey(stored), "the replica to delete the key");
+                break;
+            default:
+                await WaitForAsync(() => replica.TtlOf(Array.Empty<byte>(), Bytes("k")) == 77, "the replica to touch the key");
+                break;
+        }
     }
 
     [Fact]
