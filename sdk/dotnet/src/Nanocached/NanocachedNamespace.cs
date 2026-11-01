@@ -39,8 +39,12 @@ public sealed class NanocachedNamespace
 
     internal NanocachedNamespace(NanocachedClient client, byte[] namespaceBytes)
     {
+        ArgumentNullException.ThrowIfNull(namespaceBytes);
         _client = client;
-        _namespace = namespaceBytes;
+        // Issue #1182: copy, so a caller that reuses or overwrites the
+        // buffer it passed in cannot change the HRW input and the
+        // namespace of every later call through this handle.
+        _namespace = (byte[])namespaceBytes.Clone();
     }
 
     /// <summary>This handle's namespace, decoded as UTF-8. Exposed for the
@@ -53,8 +57,9 @@ public sealed class NanocachedNamespace
     /// case.</summary>
     public string Namespace => Encoding.UTF8.GetString(_namespace);
 
-    /// <summary>This handle's namespace as the raw bytes sent on the wire.</summary>
-    public byte[] NamespaceBytes => _namespace;
+    /// <summary>This handle's namespace as the raw bytes sent on the wire.
+    /// A copy: changing the returned array does not change the handle.</summary>
+    public byte[] NamespaceBytes => (byte[])_namespace.Clone();
 
     public Task<string?> GetAsync(string key) => _client.GetAsync(_namespace, key);
 
