@@ -1759,6 +1759,11 @@ public sealed class NanocachedClient : IDisposable
         }
         ValidateKeyAndValue(namespaceBytes, key, value);
         byte[] outgoing = _compress ? Compression.CompressValue(value, _compressionThreshold) : value;
+        namespaceBytes = OwnedForBackgroundLegs(namespaceBytes);
+        key = OwnedForBackgroundLegs(key);
+        // Compression may hand the caller's array back (a value below the
+        // threshold is sent as is), so the copy is by identity, not by option.
+        if (ReferenceEquals(outgoing, value)) outgoing = OwnedForBackgroundLegs(outgoing);
         await BeforeOperationAsync().ConfigureAwait(false);
         await WithClusterRetryAsync<object?>(async () =>
         {
@@ -1788,6 +1793,8 @@ public sealed class NanocachedClient : IDisposable
     internal async Task<bool> DeleteAsync(byte[] namespaceBytes, byte[] key)
     {
         ValidateKey(namespaceBytes, key);
+        namespaceBytes = OwnedForBackgroundLegs(namespaceBytes);
+        key = OwnedForBackgroundLegs(key);
         await BeforeOperationAsync().ConfigureAwait(false);
         return await WithClusterRetryAsync(
             () => WriteAsync(namespaceBytes, key, connection => connection.DeleteAsync(namespaceBytes, key)))
@@ -1842,6 +1849,8 @@ public sealed class NanocachedClient : IDisposable
     {
         ValidateTouchTtl(ttlSeconds);
         ValidateKey(namespaceBytes, key);
+        namespaceBytes = OwnedForBackgroundLegs(namespaceBytes);
+        key = OwnedForBackgroundLegs(key);
         await BeforeOperationAsync().ConfigureAwait(false);
         bool replaySafe = ttlSeconds != 0;
         try
@@ -1910,6 +1919,8 @@ public sealed class NanocachedClient : IDisposable
     {
         ValidateTouchTtl(ttlSeconds);
         ValidateKey(namespaceBytes, key);
+        namespaceBytes = OwnedForBackgroundLegs(namespaceBytes);
+        key = OwnedForBackgroundLegs(key);
         await BeforeOperationAsync().ConfigureAwait(false);
         bool replaySafe = ttlSeconds != 0;
         byte[]? raw;
@@ -4566,6 +4577,13 @@ public sealed class NanocachedClient : IDisposable
         {
             (_, address, current) = SnapshotSlot(slot);
             if (current is not null && !current.IsClosed) return current;
+
+            // Issue #1244: a request Close() poisoned in flight comes here
+            // to redial; the closed checks after the dial would only drop
+            // the new connection, after it had already been dialed and
+            // identified against the node. Checked here, past the gate,
+            // because the wait for the gate may have spanned a Close().
+            if (_closed) throw new AlreadyClosedException();
 
             // SDK proxy mode (issue #122): the single connection's redial
             // gets an extra fallback a cluster member's never needs — see
