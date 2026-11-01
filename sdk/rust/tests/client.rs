@@ -8712,6 +8712,101 @@ async fn connect_rejects_ca_without_tls() {
     node.stop();
 }
 
+/// Issue #1231: a request poisoned by close() and retrying used to dial
+/// (and authenticate against) the node once more before noticing the client
+/// was closed — `open_node_stream` only checked after the handshake. The
+/// first connection here is served normally and then killed; the redial
+/// that follows is held open without a reply, so a second request queues
+/// behind it on the slot lock while close() runs.
+#[tokio::test]
+async fn requests_in_flight_at_close_do_not_dial_the_node_again() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel::<tokio::task::JoinHandle<()>>();
+    let accept_count = Arc::clone(&accepted);
+    let acceptor = tokio::spawn(async move {
+        let mut release_rx = Some(release_rx);
+        let mut first_tx = Some(first_tx);
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let n = accept_count.fetch_add(1, Ordering::SeqCst) + 1;
+            match n {
+                // The initial connection: a normal node, killable.
+                1 => {
+                    let node = tokio::spawn(serve_node(socket, Arc::new(NodeState::default())));
+                    let _ = first_tx.take().unwrap().send(node);
+                }
+                // The first redial: held without a reply until released.
+                2 => {
+                    let release = release_rx.take().unwrap();
+                    tokio::spawn(async move {
+                        let mut socket = socket;
+                        let _ = release.await;
+                        // Reject the handshake: an EOF would make the SDK's
+                        // identify fall back to older handshake forms and
+                        // dial twice more as part of this one dial.
+                        let _ = socket.write_all(b"En\n").await;
+                    });
+                }
+                // Any further dial is dropped at once.
+                _ => drop(socket),
+            }
+        }
+    });
+
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", port)])
+            .disable_reconnect_cooldown(),
+    )
+    .await
+    .unwrap();
+    // Kill the node's side of the connection and wait until the client has
+    // noticed, so the next requests must redial.
+    first_rx.await.unwrap().abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let first = {
+        let client = client.clone();
+        tokio::spawn(async move { client.get("a").await })
+    };
+    while accepted.load(Ordering::SeqCst) < 2 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let second = {
+        let client = client.clone();
+        tokio::spawn(async move { client.get("b").await })
+    };
+    // Let the second request reach the slot lock behind the held dial.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.close().await;
+    release_tx.send(()).unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(8), first)
+        .await
+        .expect("first request finishes")
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(8), second)
+        .await
+        .expect("second request finishes")
+        .unwrap();
+    assert!(first.is_err(), "first: {first:?}");
+    assert!(
+        matches!(second, Err(Error::AlreadyClosed)),
+        "second: {second:?}"
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "no dial may start once the client is closed"
+    );
+    acceptor.abort();
+}
+
 /// Issue #1186: a zero keep-alive interval spun the keep-alive task, a zero
 /// request timeout failed every request, and `reconnect_cooldown(MAX)`
 /// overflowed `Instant + Duration` and panicked on the first failed dial.

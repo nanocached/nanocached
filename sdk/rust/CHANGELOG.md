@@ -8,6 +8,13 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Fixed
 
+- A request in flight when `close()` ran could still dial and authenticate
+  against the node (up to the 5 s connect deadline) before failing with
+  `AlreadyClosed`: `slot_connection` and `open_node_stream` checked whether
+  the client was closed only after the dial. `slot_connection` now checks
+  before dialing, after taking the per-slot redial lock, so the node no
+  longer sees a connection from a client that is already closed. (#1231)
+
 - `keep_alive_interval(Duration::ZERO)` turned the keep-alive task into a
   `sleep(0)` loop that pinged continuously, `request_timeout(Duration::ZERO)`
   made every request time out and close its connection, and

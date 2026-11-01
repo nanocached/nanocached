@@ -5138,6 +5138,17 @@ impl NanocachedClient {
             }
         }
 
+        // close() may have run while this task waited for the slot lock (or
+        // for a previous holder's dial): a request poisoned by close() and
+        // retrying would otherwise dial and authenticate a node — up to
+        // CONNECT_DEADLINE — only to be refused afterwards (the checks in
+        // `open_node_stream` and below run after the dial). Check before
+        // the cooldown too, so a closed client reports AlreadyClosed rather
+        // than a cached dial failure.
+        if self.is_closed() {
+            return Err(Error::AlreadyClosed);
+        }
+
         // Per-address reconnect cooldown (see `Inner::reconnect_cooldowns`'
         // own doc comment): an address whose dial just failed stays "down"
         // for `reconnect_cooldown`, so a burst of requests routed to it —
