@@ -249,8 +249,10 @@ docker run --rm --publish 8358:8358 nanocached-proxy --discovery disc:8357
 
 `--target` is required; the Dockerfile has no default final stage.
 
-The latest images built from the `main` branch are also available from
-GitHub Container Registry:
+Images of the latest release are available from GitHub Container
+Registry as `:latest` (and as `:<version>`; the deployment guides pin a
+digest). Every `main` commit that passes CI is also published as `:main`
+and `:sha-<commit>` for trying unreleased changes:
 
 ```sh
 docker pull ghcr.io/nanocached/nanocached-node:latest

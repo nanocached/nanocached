@@ -10,6 +10,13 @@ permissions:
   contents: read
   packages: write
 
+# One publish at a time, newest pending run wins: without this, two runs
+# for consecutive main commits could finish out of order and leave `:main`
+# on the older commit.
+concurrency:
+  group: publish-image
+  cancel-in-progress: false
+
 jobs:
   publish:
     if: >-
@@ -20,7 +27,7 @@ jobs:
 
     strategy:
       matrix:
-        component: [node, discovery]
+        component: [node, discovery, proxy]
 
     steps:
       - name: Check out tested commit
@@ -43,6 +50,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Short commit id
+        id: sha
+        run: echo "short=${HEAD_SHA:0:12}" >> "$GITHUB_OUTPUT"
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+
+      # `:main` is the tip of main as of the last green CI run; `:sha-<id>`
+      # pins one such build. `:latest` is the last release and is moved
+      # only by the release workflow, for all three images at once.
       - name: Build and push image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -50,7 +66,9 @@ jobs:
           target: ${{ matrix.component }}
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/${{ github.repository }}-${{ matrix.component }}:latest
+          tags: |
+            ghcr.io/${{ github.repository }}-${{ matrix.component }}:main
+            ghcr.io/${{ github.repository }}-${{ matrix.component }}:sha-${{ steps.sha.outputs.short }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}

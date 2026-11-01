@@ -12,6 +12,16 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Changed
+
+- Container images: `:latest` is now the latest release, moved only by the
+  release workflow for all three images at once. It used to be rebuilt
+  from every `main` commit for `nanocached-node` and `nanocached-discovery`
+  but not for `nanocached-proxy`, so after a release the three `:latest`
+  images pointed at different code and the quickstarts pulled unreleased
+  `main`. Builds of `main` are published as `:main` and `:sha-<commit>` for
+  all three images, one publish run at a time (#1149).
+
 ## [0.6.0] - 2026-11-01
 
 ### Fixed
