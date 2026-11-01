@@ -11,6 +11,13 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- With `fireAndForgetReplicas`, a write whose primary failed (a refused
+  connection, say) still waited for every background replica write to settle
+  before reporting the failure, so one slow or hung replica delayed the error
+  and the refresh-and-retry behind it by up to its request timeout (35 s
+  measured against a stopped node). Only the synchronous legs are waited for
+  now; a programming error that a background leg has already raised is still
+  reported (#1240).
 - A forced node-list refresh (made after a connection failure or a wrong-node
   answer) joined a refresh that was already in flight, even when that one had
   fetched its list from discovery before the failure. If a node died in

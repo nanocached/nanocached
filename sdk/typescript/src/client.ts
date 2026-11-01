@@ -3260,7 +3260,12 @@ export class NanocachedClient {
       throw new ConnectionLostError("nanocached: no owner is reachable for this key", primaryNotResendable ? { requestWasSent: false } : undefined);
     }
 
-    const replicaWrite = async (name: string): Promise<void> => {
+    // Genuine programming errors (non-swallowable) raised by background
+    // legs, recorded the moment they happen (issue #1240) so a failed
+    // primary can report one that has already occurred without waiting
+    // for legs that have not settled.
+    const backgroundBugs: unknown[] = [];
+    const replicaWrite = async (name: string, background = false): Promise<void> => {
       try {
         const connection = await this.memberConnection(name);
         await replicaOp(connection);
@@ -3270,7 +3275,10 @@ export class NanocachedClient {
         // synchronously or as a fireAndForgetReplicas background write —
         // both paths share this function. An actual programming bug
         // (isSwallowable) still propagates.
-        if (!isSwallowable(error)) throw error;
+        if (!isSwallowable(error)) {
+          if (background) backgroundBugs.push(error);
+          throw error;
+        }
         this.replicaWriteFailures++;
       }
     };
@@ -3280,19 +3288,21 @@ export class NanocachedClient {
     // background instead of being waited for below — past that cap,
     // further legs fall back to the synchronous path exactly as with the
     // option off. `synchronousReplicaWrites` holds only the legs this
-    // call always waits for; `backgroundLegs` holds the real fire-and-
-    // forget leg promises (issue #188) — replicaWrite already maps a
+    // call always waits for; the fire-and-forget legs are tracked in
+    // backgroundReplicaWrites (for close()'s drain) and their genuine
+    // bugs in `backgroundBugs` (issue #188) — replicaWrite already maps a
     // swallowable failure to a resolve and only rejects on a genuine
-    // programming bug, so no separate mapping is needed here. These are
+    // programming bug. These are
     // deliberately kept OUT of synchronousReplicaWrites: awaiting them
     // unconditionally would delay every fireAndForgetReplicas write by
     // however long its slowest replica takes, defeating the option's
     // entire point (see "returns as soon as the primary acks" below).
-    // They're only drained if the primary itself fails, at which point
-    // the call is already failing and there's no success path left to
-    // protect from delay.
+    // If the primary itself fails, a genuine bug a background leg has
+    // already raised is reported (issue #188), but the legs still running
+    // are not waited for (issue #1240): the call is failing anyway, and a
+    // slow or hung replica must not delay that report and the
+    // refresh-and-retry behind it.
     const synchronousReplicaWrites: Promise<void>[] = [];
-    const backgroundLegs: Promise<void>[] = [];
     const launchReplicaLegs = (names: string[]): void => {
       for (const name of names) {
         // `!this.closed` is rechecked here, synchronously and immediately
@@ -3305,7 +3315,7 @@ export class NanocachedClient {
         // by this very call via Promise.allSettled below, so it can't outlive
         // close()'s teardown either.
         if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
-          const background = replicaWrite(name);
+          const background = replicaWrite(name, true);
           // Now that replicaWrite can legitimately reject (a programming bug
           // — see isSwallowable), attach a rejection handler synchronously,
           // in the same tick this promise is created: without it, Node
@@ -3317,7 +3327,6 @@ export class NanocachedClient {
           const settled = background.catch(() => {});
           this.backgroundReplicaWrites.add(background);
           settled.finally(() => this.backgroundReplicaWrites.delete(background));
-          backgroundLegs.push(background);
           continue;
         }
         const write = replicaWrite(name);
@@ -3363,15 +3372,15 @@ export class NanocachedClient {
 
     if (primary.ok) return primary.value;
 
-    // The primary failed anyway, so there's nothing left to protect from
-    // delay — drain the fire-and-forget legs here too (issue #188) so a
-    // genuine bug on one of them surfaces instead of silently vanishing
-    // just because it happened to run in the background.
-    const backgroundResults = await Promise.allSettled(backgroundLegs);
-    const replicaBug = [...replicaResults, ...backgroundResults].find(
-      (result): result is PromiseRejectedResult => result.status === "rejected",
-    );
-    throw replicaBug ? replicaBug.reason : primary.error;
+    // The primary failed. A genuine bug on a fire-and-forget leg that has
+    // already surfaced is reported too (issue #188) instead of silently
+    // vanishing just because it ran in the background — but only one that
+    // has already happened: waiting for the rest would hold this failure
+    // back by up to a replica's whole request timeout (issue #1240).
+    const syncBug = replicaResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (syncBug) throw syncBug.reason;
+    if (backgroundBugs.length > 0) throw backgroundBugs[0];
+    throw primary.error;
   }
 
   /** Cluster INCR/DECR (issue #129) — deliberately **not**

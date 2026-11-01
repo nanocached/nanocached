@@ -5753,6 +5753,43 @@ describe("fire-and-forget replica leg errors surface when the primary also fails
     }
   });
 
+  it("set(): a failed primary is reported without waiting for a hung fire-and-forget replica leg (issue #1240)", async () => {
+    // Regression: writeToOwners awaited every background replica leg
+    // before reporting a failed primary, so a hung replica delayed the
+    // failure (and the refresh-and-retry behind it) by its whole request
+    // timeout.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    const hung: Array<() => void> = [];
+    try {
+      const key = "hung-replica-key";
+      const { primary, replica } = cluster.ownerOf(key);
+      await client.set(key, "v");
+
+      const primaryConnection = (client as any).target.members.get(primary.name).connection;
+      const replicaConnection = (client as any).target.members.get(replica.name).connection;
+      mock.method(primaryConnection, "set", () => Promise.reject(new ConnectionLostError("primary connection lost")));
+      mock.method(replicaConnection, "set", () => new Promise<void>((resolve) => hung.push(resolve)));
+
+      const outcome = await Promise.race([
+        client.set(key, "v2").then(
+          () => "resolved",
+          (error: unknown) => (error instanceof ConnectionLostError ? "ConnectionLostError" : `other: ${error}`),
+        ),
+        delay(2_000).then(() => "still waiting after 2s"),
+      ]);
+      assert.equal(outcome, "ConnectionLostError");
+      assert.ok(hung.length > 0, "the replica leg must have been started");
+    } finally {
+      for (const release of hung) release();
+      await client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
   it("set(): an ordinary connection failure on the fire-and-forget replica leg stays silent, even when the primary fails too", async () => {
     const cluster = await startReplicatedCluster();
     const client = await NanocachedClient.connect({
