@@ -5,7 +5,10 @@ a tiny distributed cache. Talks to either a single `nanocached-node` or a
 `nanocached-discovery`-fronted cluster — the SDK figures out which from
 the server's own handshake, so the calling code is identical either way.
 
-Requires Go 1.22+. No dependencies outside the standard library.
+Requires Go 1.26+. No dependencies outside the standard library.
+Version 0.6.0 is the last release that declares a Go 1.22 floor; Go
+supports only the two most recent release lines, and 1.22 left that
+window in February 2025.
 
 ## Install
 

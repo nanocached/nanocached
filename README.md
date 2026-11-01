@@ -427,7 +427,7 @@ B\n
 - [`sdk/dotnet`](sdk/dotnet/README.md) — an async .NET client with the
   same feature set (.NET 10+, no dependencies, NuGet ID `Nanocached`).
 - [`sdk/go`](sdk/go/README.md) — a Go client with the same feature set
-  (Go 1.22+, standard library only, module
+  (Go 1.26+, standard library only, module
   `github.com/nanocached/nanocached/sdk/go`).
 
 ## Compatibility

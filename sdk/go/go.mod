@@ -1,3 +1,3 @@
 module github.com/nanocached/nanocached/sdk/go
 
-go 1.22
+go 1.26
