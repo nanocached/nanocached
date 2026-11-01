@@ -213,7 +213,13 @@ node's definition. The choices that matter:</p>
   request that cannot get its bytes within 60&nbsp;seconds is not
   dispatched but answered <code>R</code> (<code>B</code> to a client
   without the retryable-error capability) on the same connection, for
-  the client to retry. Raise the flag together with the task's memory. Watch CPU and
+  the client to retry. While a request waits for its bytes the proxy
+  holds its frame, up to 1&nbsp;MiB, outside this budget (a waiting
+  request has not been admitted, and holding the frame's charge while
+  waiting is what let two connections from one address stall each
+  other), so allow for that many connections times 1&nbsp;MiB on top of
+  the budget: 256&nbsp;MiB for one source IP at the default per-IP
+  connection cap. Raise the flag together with the task's memory. Watch CPU and
   <code>nanocached_proxy_client_connections</code> before sizing up
   or out.</li>
   <li><b>No service registry.</b> Discovery is the proxy roster; nothing

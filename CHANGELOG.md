@@ -22,6 +22,17 @@ framework adapters at one version, whether or not a component changed.
   1 MiB frame of one-byte keys while being charged about 2 MiB; 40
   connections from one address took the proxy to about 500 MiB. Such a
   frame is now admitted from its header, before the lists exist (#1144).
+- `nanocached-proxy`: two connections from one address could stall each
+  other for 60 seconds. A connection still receiving a frame over 64 KiB
+  holds part of its address's in-flight share as its receive buffer's
+  charge, and a request that completed on another connection and cost the
+  whole share (a batched read of 64 keys or more on four or more nodes, at
+  the defaults) waited for it, while the first connection, finishing its
+  frame, queued for the whole share behind that request and kept the charge
+  until then. After the 60-second admission wait one of the two was
+  answered `B`/`R` with nothing else running. A request now gives back its
+  receive buffer's charge before it waits, so it waits only for requests
+  (#1146).
 
 ## [0.6.0] - 2026-11-01
 

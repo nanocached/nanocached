@@ -6167,19 +6167,6 @@ impl InFlightBudget {
         self.charge_exact(self.clamp(cost)).await
     }
 
-    /// `charge` for a holder that already holds `held` bytes of this
-    /// budget (a connection's receive-buffer charge, when it admits a
-    /// request): the total is clamped, so the holder asks only for the
-    /// rest of the budget and never waits for bytes it holds itself.
-    async fn charge_beyond(
-        &self,
-        held: usize,
-        cost: usize,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let cost = self.clamp(cost.saturating_add(held)).saturating_sub(held);
-        self.charge_exact(cost).await
-    }
-
     async fn charge_exact(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let permits = u32::try_from(cost).unwrap_or(u32::MAX);
         Arc::clone(&self.permits)
@@ -6471,13 +6458,12 @@ enum Admission {
 }
 
 /// Reserves a request's `cost` on the connection's, its source IP's and
-/// the proxy's budgets (`budgets`, in that order), of which the connection
-/// already holds `held` (its receive buffer's charge). Stops waiting for
-/// the same reasons the read in `handle_client` does, and after
-/// `admission_wait`.
+/// the proxy's budgets (`budgets`, in that order). The caller holds
+/// nothing of them while it waits: see `handle_client` on its receive
+/// buffer's charge. Stops waiting for the same reasons the read in
+/// `handle_client` does, and after `admission_wait`.
 async fn admit_request(
     cost: usize,
-    held: usize,
     budgets: [&InFlightBudget; 3],
     admission_wait: Duration,
     drain: &mut watch::Receiver<bool>,
@@ -6486,9 +6472,9 @@ async fn admit_request(
     let [connection, ip, proxy] = budgets;
     tokio::select! {
         admitted = timeout(admission_wait, async {
-            let connection = connection.charge_beyond(held, cost).await?;
-            let ip = ip.charge_beyond(held, cost).await?;
-            let proxy = proxy.charge_beyond(held, cost).await?;
+            let connection = connection.charge(cost).await?;
+            let ip = ip.charge(cost).await?;
+            let proxy = proxy.charge(cost).await?;
             Some(InFlightCharge {
                 _connection: connection,
                 _ip: ip,
@@ -6716,15 +6702,13 @@ async fn handle_client(
                                 replication,
                                 primaries,
                             );
-                            // The connection's receive-buffer charge is part
-                            // of what it already holds on all three budgets:
-                            // a request costing the whole budget asks only
-                            // for the rest, or it would wait on itself
-                            // (until `admission_wait`, then be answered
-                            // `R`/`B` although nothing else was in its way).
+                            // The frame's bytes are part of `cost`, so the
+                            // receive buffer's charge goes before the wait
+                            // (issue #1146); see the same step below.
+                            receive_charge = None;
+                            receive_charged = 0;
                             let admitted = admit_request(
                                 cost,
-                                receive_charged,
                                 [
                                     &connection_in_flight_bytes,
                                     &*ip_in_flight_share.budget,
@@ -6794,9 +6778,22 @@ async fn handle_client(
                         replication,
                         primaries,
                     );
+                    // Issue #1146: the connection holds no receive-buffer
+                    // charge while it waits. The frame's bytes are part of
+                    // `cost` (`frame_len`), so it asks for that in full
+                    // and the receive charge, which would otherwise be
+                    // waited on by whoever is ahead of it in the queue
+                    // and wait on whoever is behind, is given back first.
+                    // Two connections of one source IP, one finishing a
+                    // frame over the free threshold while the other's
+                    // request costs the whole share, otherwise each held
+                    // what the other needed until `admission_wait` ran
+                    // out. A pipelined remainder still in the buffer is
+                    // charged again below, as the buffer's growth.
+                    receive_charge = None;
+                    receive_charged = 0;
                     let admitted = admit_request(
                         cost,
-                        receive_charged,
                         [
                             &connection_in_flight_bytes,
                             &*ip_in_flight_share.budget,
@@ -6846,6 +6843,16 @@ async fn handle_client(
         if shrink_drained_buffer(&mut buf) || buf.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
             receive_charge = None;
             receive_charged = 0;
+        } else if receive_charged == 0 {
+            // Admission gave the charge back (above) and the buffer still
+            // holds more than the free threshold of the next frame: copy it
+            // into a buffer of its own size, which the growth below
+            // charges again before reading on, rather than let the old
+            // allocation, which the admitted frame shares, fill up
+            // uncharged.
+            let mut compact = BytesMut::with_capacity(buf.len());
+            compact.extend_from_slice(&buf);
+            buf = compact;
         }
 
         // Issue #124: a drain stops the intake — everything already
@@ -8452,6 +8459,53 @@ mod tests {
         .expect("an over-threshold batch is admitted at once, not after admission_wait")
         .unwrap();
         assert!(header.starts_with("M 400 "), "{header}");
+        drop(node);
+    }
+
+    /// An `m` of 1,000 keys of 100 bytes, 104,009 bytes on the wire: over
+    /// the free threshold, and costing a whole test-sized IP share.
+    fn kilokey_multi_get_frame(tag: u8) -> Vec<u8> {
+        let mut frame = b"m 0 1000".to_vec();
+        frame.extend(std::iter::repeat_n(b" 100", 1000).flatten());
+        frame.push(b'\n');
+        for key in 0..1000 {
+            frame.extend(format!("{}{key:05}", tag as char).bytes());
+            frame.extend(std::iter::repeat_n(b'x', 100 - 6));
+        }
+        frame
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_waiting_for_the_whole_share_does_not_wait_on_a_neighbours_receive_charge() {
+        // Issue #1146. Connection B, of the same source IP as A, is part
+        // way through a frame over the free threshold and so holds a
+        // receive charge. A finishes a request that costs the whole share:
+        // it could not have it while B held part, and B, finishing its
+        // frame, then asked for the share behind A while still holding
+        // that part: each waited for the other until `admission_wait`, and
+        // A was answered `B`. A request waits only for what is charged to
+        // requests, never for another connection's receive buffer.
+        let (node, proxy, _context) =
+            slow_single_node(b"k", Duration::ZERO, Some(short_admission_wait_limits())).await;
+        let (mut a, mut a_buf) = connect_and_auth(&proxy).await;
+        let (mut b, mut b_buf) = connect_and_auth(&proxy).await;
+        let (a_frame, b_frame) = (kilokey_multi_get_frame(b'a'), kilokey_multi_get_frame(b'b'));
+        assert_eq!((a_frame.len(), b_frame.len()), (104_009, 104_009));
+
+        b.write_all(&b_frame[..70_000]).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        a.write_all(&a_frame).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        b.write_all(&b_frame[70_000..]).await.unwrap();
+
+        // Well inside `admission_wait` (2 s), where they used to end.
+        for (name, stream, buf) in [("a", &mut a, &mut a_buf), ("b", &mut b, &mut b_buf)] {
+            let header = timeout(Duration::from_millis(1200), read_line(stream, buf))
+                .await
+                .unwrap_or_else(|_| panic!("{name} was not answered before admission_wait"))
+                .unwrap();
+            assert!(header.starts_with("M 1000 "), "{name}: {header}");
+        }
         drop(node);
     }
 

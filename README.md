@@ -662,7 +662,12 @@ loud `WARN` if that disagrees with its own configured value.
   replies have been written. A request that cannot get its bytes within
   60 seconds is not dispatched: it is answered `R` (`B` to a client that
   did not declare the retryable-error capability), the connection stays
-  open and the client may retry
+  open and the client may retry. While a request waits for its bytes the
+  proxy holds its frame, up to 1 MiB, outside this budget (a waiting
+  request has not been admitted, and holding the frame's charge while
+  waiting is what let two connections of one source IP stall each other),
+  so allow for that many connections times 1 MiB on top of the budget: 256
+  MiB for one source IP at the default per-IP connection cap
 - Idle connection timeout: 60 seconds, measured from the last complete
   frame (a frame trickled in a byte at a time does not extend it), the
   node's own rule
