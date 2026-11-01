@@ -4,8 +4,6 @@ import java.util.List;
 import org.nanocached.NanocachedClient;
 import org.nanocached.spring.NanocachedCacheManager;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
-import org.springframework.boot.autoconfigure.AutoConfigureBefore;
-import org.springframework.boot.autoconfigure.cache.CacheAutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -29,8 +27,11 @@ import org.springframework.context.annotation.Conditional;
  * individually ({@link ConditionalOnMissingBean}) so an app can supply
  * its own client or manager and keep the other.
  *
- * <p>{@link AutoConfigureBefore} Boot's own {@link CacheAutoConfiguration}
- * so this configuration's {@code CacheManager} exists by the time Boot's
+ * <p>Ordered before Boot's own {@code CacheAutoConfiguration} (named by
+ * string via {@code beforeName}, not a class literal: the class lives in
+ * Boot's {@code spring-boot-cache} module, which an app without {@code
+ * spring-boot-starter-cache} does not have, and this starter must still load
+ * there) so this configuration's {@code CacheManager} exists by the time Boot's
  * runs — otherwise {@code @ConditionalOnMissingBean(CacheManager.class)}
  * would race the other way and Boot's default manager would win instead
  * (the same ordering {@code nanocached-spring}'s manual two-bean setup gets
@@ -43,8 +44,7 @@ import org.springframework.context.annotation.Conditional;
  * Options.reconnectCooldown(Duration.ZERO)} call means — see {@link
  * NanocachedProperties#getReconnectCooldown()}.
  */
-@AutoConfiguration
-@AutoConfigureBefore(CacheAutoConfiguration.class)
+@AutoConfiguration(beforeName = "org.springframework.boot.cache.autoconfigure.CacheAutoConfiguration")
 @EnableConfigurationProperties(NanocachedProperties.class)
 @ConditionalOnClass({NanocachedClient.class, CacheManager.class})
 @Conditional(OnNanocachedAddressesCondition.class)

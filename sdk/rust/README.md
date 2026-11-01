@@ -699,7 +699,7 @@ plain integer on the wire.
 
 ## Notes
 
-- Requires Rust 1.85 or newer (`rust-version` in `Cargo.toml`; checked in
+- Requires Rust 1.88 or newer (`rust-version` in `Cargo.toml`; checked in
   CI). See [CHANGELOG.md](CHANGELOG.md) for release notes.
 - This SDK speaks the current wire protocol (rendezvous hashing,
   replication-aware `L`/`W`); it requires an up-to-date server. Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.

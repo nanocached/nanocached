@@ -6,6 +6,14 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ## [Unreleased]
 
+### Changed
+
+- The minimum supported Rust version moves from 1.85 to 1.88 (`rust-version`
+  in `Cargo.toml`, checked in CI). The `sha2` dependency moves from 0.10 to
+  0.11, whose current release requires rustc 1.88; the server already uses
+  sha2 0.11, so the CAS digest code on both sides now builds on the same
+  `digest` generation.
+
 ### Fixed
 
 - A large request over TLS could stall until `request_timeout` and fail with

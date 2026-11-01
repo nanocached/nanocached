@@ -28,6 +28,9 @@ changed. What 1.0.0 will promise is described on the
   `has`/`getMany`/`setMany`/`deleteMany` mandatory, and keyv 5's is a
   different shape). Runtime behaviour is unchanged; the type is still accepted
   by `new Keyv(store)` under both versions.
+- Built and type-checked with TypeScript 7 (a development dependency only;
+  no change to the published package). `tsconfig.json` now names `node` in
+  `types`, which TypeScript 7 no longer includes implicitly.
 
 ## [0.5.1] - 2026-10-27
 
