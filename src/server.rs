@@ -7706,7 +7706,10 @@ async fn fetch_roster_once(
     node_context: &NodeContext,
     addr: &str,
 ) -> io::Result<(Vec<(String, String, String)>, usize)> {
-    const MAX_ROSTER_ENTRIES: usize = 4096;
+    // The entry cap is the module-level `MAX_ROSTER_ENTRIES` (discovery's
+    // registry size), shared with the heartbeat ack: `T` returns every
+    // registered node, so a smaller local cap here made any registry above
+    // it fail every fetch and a draining node leave without a handoff.
     const MAX_NAME_ADDR_OR_TOKEN_LENGTH: usize = 1024;
 
     let stream = connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
@@ -27294,6 +27297,47 @@ mod tests {
         let error = fetch_from(response).await;
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("size cap"), "entry: got {error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_roster_once_accepts_as_many_entries_as_discovery_can_hold() {
+        // Issue #1175: discovery's registry holds up to 65,536 nodes and `T`
+        // returns all of them, but this parser used to stop at 4096, so a
+        // larger registry made every `T` "bad T response" and a draining
+        // node left without a handoff. The limit is the same one the
+        // heartbeat ack uses.
+        async fn fetch_with_count(count: usize) -> io::Result<usize> {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let discovery_addr = listener.local_addr().unwrap().to_string();
+            let fake_discovery = tokio::spawn(async move {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 64];
+                let _ = connection.read(&mut request).await; // "T <n> <t>\n<name><token>"
+                let mut response = format!("N {count} 2\n").into_bytes();
+                // One-byte name, address and token keep the body small.
+                for _ in 0..count.min(MAX_ROSTER_ENTRIES) {
+                    response.extend_from_slice(b"1 1 1\nnat\n");
+                }
+                let _ = connection.write_all(&response).await;
+            });
+            let node_context = test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            );
+            let result = fetch_roster_once(&node_context, &discovery_addr).await;
+            fake_discovery.abort();
+            result.map(|(members, _)| members.len())
+        }
+
+        assert_eq!(fetch_with_count(5000).await.unwrap(), 5000);
+        assert_eq!(
+            fetch_with_count(MAX_ROSTER_ENTRIES).await.unwrap(),
+            MAX_ROSTER_ENTRIES
+        );
+        let error = fetch_with_count(MAX_ROSTER_ENTRIES + 1).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
