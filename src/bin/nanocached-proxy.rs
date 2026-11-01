@@ -8693,6 +8693,14 @@ mod tests {
                 read_line(&mut stream, &mut buf).await.unwrap()
             }));
         }
+        // Each upload is served, or answered `B` at once: the share holds
+        // four receive charges, so the uploads complete their frames in
+        // turns while nothing can be admitted (the share's freed bytes go
+        // to the next growth in the queue), and the ones that complete
+        // while the IP's share of the parked-frame pool (1 MiB: three of
+        // these frames) is full are refused the wait (issue #1146). None
+        // waits out the frame deadline.
+        let mut served = 0;
         for (upload, handle) in uploads.into_iter().enumerate() {
             let reply = timeout(Duration::from_secs(10), handle)
                 .await
@@ -8700,8 +8708,13 @@ mod tests {
                     panic!("upload {upload} was not answered: the share deadlocked")
                 })
                 .unwrap();
-            assert_eq!(reply, "S", "upload {upload}");
+            assert!(reply == "S" || reply == "B", "upload {upload}: {reply}");
+            served += usize::from(reply == "S");
         }
+        assert!(
+            served >= 1,
+            "the first upload to complete parks its frame and is served"
+        );
         drop(node);
     }
 
@@ -8738,13 +8751,29 @@ mod tests {
                 read_line(&mut stream, &mut buf).await.unwrap()
             }));
         }
+        // Each batch is served, or answered `B` at once: the largest
+        // frame's worth is the whole share, so the batches complete their
+        // frames one at a time while nothing can be admitted (the share's
+        // freed bytes go to the next growth in the queue), and the ones
+        // that complete while the IP's share of the parked-frame pool
+        // (1 MiB: five of these 180 KB frames) is full are refused the
+        // wait (issue #1146). None waits out the frame deadline.
+        let mut served = 0;
         for (batch, handle) in batches.into_iter().enumerate() {
             let header = timeout(Duration::from_secs(20), handle)
                 .await
                 .unwrap_or_else(|_| panic!("batch {batch} was not answered: the share deadlocked"))
                 .unwrap();
-            assert!(header.starts_with("M 60000 "), "batch {batch}: {header}");
+            assert!(
+                header.starts_with("M 60000 ") || header == "B",
+                "batch {batch}: {header}"
+            );
+            served += usize::from(header != "B");
         }
+        assert!(
+            served >= 1,
+            "the first batch to complete parks its frame and is served"
+        );
         drop(node);
     }
 
