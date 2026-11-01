@@ -888,7 +888,20 @@ export class Connection {
       }
 
       const waiter = this.pending.shift();
-      if (waiter === undefined) continue;
+      if (waiter === undefined) {
+        // A reply nobody asked for: the peer is not speaking the protocol
+        // this connection believes it is (issue #1177). Dropping it would
+        // keep the pairing intact but leave the client trusting a stream
+        // it can no longer vouch for, so poison like the Python and Go
+        // SDKs do. Nothing is pending, so there is no waiter to reject;
+        // later requests see `lastError`.
+        this.poison(
+          new ConnectionLostError(
+            `nanocached: unsolicited ${parsed.response.kind} response from server (connection desynced)`,
+          ),
+        );
+        return;
+      }
 
       // Progress-based deadline (see send()): a dispatched response is
       // progress, so the next-oldest request gets a fresh window; with
