@@ -322,6 +322,23 @@ class NanocachedClientTest {
         }
     }
 
+    // The handle keeps its own copy of the namespace: a caller who reuses the
+    // buffer after creating the handle must not re-scope it (issue #1181).
+    @Test
+    void namespaceHandleCopiesTheCallersBuffer() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                byte[] buf = "tenant-a".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                NanocachedClient.Namespace ns = client.namespace(buf);
+                ns.set("k", "v");
+                java.util.Arrays.fill(buf, (byte) 'x');
+                assertEquals(Optional.of("v"), ns.get("k"));
+                assertArrayEquals("tenant-a".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                        ns.namespace());
+            }
+        }
+    }
+
     @Test
     void wrongNodePropagatesForBatchedOpsInSingleMode() throws Exception {
         try (MockNode node = new MockNode()) {
