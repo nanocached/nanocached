@@ -104,8 +104,10 @@ pub(crate) const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
 /// before allocating it (an unfinished frame is held until the frame
 /// deadline), and releases both as soon as the bytes are gone. A
 /// multi-key frame also charges `MULTI_KEY_FRAME_BYTES_PER_KEY` for each
-/// of its keys, held until its reply entries are built and released
-/// before the reply's own bytes are charged. A cost above the budget is
+/// of its keys, held until its reply entries are built; what the reply
+/// entries themselves keep (`MULTI_KEY_REPLY_BYTES_PER_KEY` per key) stays
+/// charged until the reply is written, and the rest is released before the
+/// reply's own bytes are charged. A cost above the budget is
 /// clamped to it, so such a request takes the whole budget and runs
 /// alone rather than waiting forever; a holder never waits for bytes it
 /// holds itself (a charge taken while another is held asks only for the
@@ -158,6 +160,53 @@ impl InFlightBudget {
     }
 }
 
+/// What a multi-key frame holds against the in-flight budget while it is
+/// served: `MULTI_KEY_FRAME_BYTES_PER_KEY` per key to start with, shrunk
+/// by `keep_reply_phase` to what the reply entries still occupy once they
+/// are built. A semaphore permit cannot give back part of itself, so this
+/// holds the permits itself and returns them to the budget as they go.
+#[derive(Debug)]
+struct FrameCharge {
+    permits: Arc<Semaphore>,
+    held: u32,
+}
+
+impl FrameCharge {
+    /// Gives back everything above `keep` bytes; returns what is still held.
+    fn shrink_to(&mut self, keep: usize) -> usize {
+        let keep = u32::try_from(keep).unwrap_or(u32::MAX).min(self.held);
+        let released = self.held - keep;
+        if released > 0 {
+            self.permits.add_permits(released as usize);
+            self.held = keep;
+        }
+        self.held as usize
+    }
+}
+
+impl Drop for FrameCharge {
+    fn drop(&mut self) {
+        if self.held > 0 {
+            self.permits.add_permits(self.held as usize);
+        }
+    }
+}
+
+/// Narrows a multi-key frame's charge to what its reply entries keep until
+/// the reply is written, and returns the bytes it still holds (to count
+/// with the receive buffer's as `write_reply`'s `held`). The per-key
+/// vectors are gone by now, but the `entries` (a `MultiEntry` is 40 bytes
+/// whether it carries a value or is a miss) and the encoded copy built
+/// from them (a few bytes per key plus the values `write_reply` charges)
+/// stay alive for the whole write — up to `WRITE_TIMEOUT`, or until the
+/// connection is closed for a client that does not read.
+/// `MULTI_KEY_REPLY_BYTES_PER_KEY` covers them with room for the allocator.
+fn keep_reply_phase(frame_charge: &mut Option<FrameCharge>, keys: usize) -> usize {
+    frame_charge.as_mut().map_or(0, |charge| {
+        charge.shrink_to(keys.saturating_mul(MULTI_KEY_REPLY_BYTES_PER_KEY))
+    })
+}
+
 /// The bytes a reply's encoded copy will hold: the values of a `V` (a
 /// `G`'s or a get-and-touch's) or `M`; every other reply is a short header
 /// and is not charged.
@@ -187,14 +236,20 @@ fn reply_bytes(response: &Response) -> usize {
 /// with room for the allocator.
 const MULTI_KEY_FRAME_BYTES_PER_KEY: usize = 256;
 
+/// The part of `MULTI_KEY_FRAME_BYTES_PER_KEY` a multi-key frame keeps
+/// charged until its reply has been written: the reply's `MultiEntry`
+/// vector (40 bytes per key) and the encoded copy's per-key framing
+/// (2 to about 20 bytes), rounded up to a cache line.
+const MULTI_KEY_REPLY_BYTES_PER_KEY: usize = 64;
+
 /// What an `o` frame adds to `MULTI_KEY_FRAME_BYTES_PER_KEY` for each key:
 /// the second vector of handles, one per value.
 const MULTI_SET_VALUE_BYTES_PER_KEY: usize = 32;
 
 /// Charges a multi-key frame's per-key working memory against the
-/// in-flight budget; the caller holds the permit until the reply entries
-/// are built and drops it before the reply itself is charged
-/// (`write_reply`). It is called before the parser builds the frame's key
+/// in-flight budget; the caller holds the charge until the reply entries
+/// are built, then narrows it to what they keep (`keep_reply_phase`)
+/// before the reply itself is charged (`write_reply`). It is called before the parser builds the frame's key
 /// vectors (`parse_resumable`'s `ParseError::ChargeRequired`), so a
 /// connection waiting here holds no uncharged per-key memory. A frame
 /// costing more than the whole budget takes all of it and runs alone — the
@@ -207,7 +262,7 @@ async fn charge_multi_key_frame(
     receive_charged: usize,
     keys: usize,
     values: bool,
-) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
+) -> io::Result<FrameCharge> {
     let per_key = MULTI_KEY_FRAME_BYTES_PER_KEY
         + if values {
             MULTI_SET_VALUE_BYTES_PER_KEY
@@ -219,24 +274,31 @@ async fn charge_multi_key_frame(
         .in_flight_bytes
         .clamp(cost.saturating_add(receive_charged))
         .saturating_sub(receive_charged);
-    timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge_exact(cost))
+    let permit = timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge_exact(cost))
         .await
         .map_err(|_| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
                 "in-flight byte budget exhausted while serving a request",
             )
-        })
+        })?;
+    let held = u32::try_from(permit.num_permits()).unwrap_or(u32::MAX);
+    permit.forget();
+    Ok(FrameCharge {
+        permits: Arc::clone(&config.in_flight_bytes.permits),
+        held,
+    })
 }
 
 /// Encodes and writes a reply that may carry values, holding its bytes
 /// against the in-flight budget from before the encoded copy exists
 /// until it has been written. `held` is what the connection already
-/// holds (its receive buffer's charge): a reply that would take more
-/// than the budget takes only the rest of it, so the connection ends up
-/// holding the whole budget rather than waiting on its own permit. The
-/// caller holds nothing else by then — a multi-key frame's per-key
-/// charge is released before its reply is charged, for the same reason.
+/// holds (its receive buffer's charge, and for a multi-key frame what
+/// `keep_reply_phase` left): a reply that would take more than the budget
+/// takes only the rest of it, so the connection ends up holding the whole
+/// budget rather than waiting on its own permit. The caller holds nothing
+/// else by then — a multi-key frame's per-key working charge is released
+/// before its reply is charged, for the same reason.
 /// Waits at most `WRITE_TIMEOUT` for the budget — the same bound a
 /// stalled write gets — and fails the connection like one if it runs out.
 async fn write_reply(
@@ -2953,7 +3015,7 @@ async fn handle_connection(
             // order before replying — the client never sees the owned/
             // not-owned split.
             Ok((Command::MultiGet { namespace, keys }, tag)) => {
-                let frame_charge = frame_charge;
+                let mut frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -2969,6 +3031,7 @@ async fn handle_connection(
                     Some(node_context) => wrong_nodes_refreshed(node_context, &hashes).await,
                     None => vec![false; keys.len()],
                 };
+                drop(hashes);
 
                 for (position, name) in keys.into_iter().enumerate() {
                     if wrong[position] {
@@ -2978,6 +3041,7 @@ async fn handle_connection(
                         owned_keys.push(name);
                     }
                 }
+                drop(wrong);
 
                 if !owned_keys.is_empty() {
                     let response = execute_command(
@@ -2998,22 +3062,27 @@ async fn handle_connection(
                     }
                 }
 
-                let entries = entries
+                let entries: Vec<MultiEntry> = entries
                     .into_iter()
                     .map(|entry| entry.expect("every position filled by one of the two branches"))
                     .collect();
-                // The per-key vectors are gone; release their charge before
-                // charging the reply, or this connection would wait on its
-                // own permit (and, through the budget's FIFO, on every other
-                // connection doing the same) when the two together exceed
-                // what is free.
-                drop(frame_charge);
+                // The key vectors, the hashes and the wrong-node flags are
+                // gone; what is left is the reply's entries and the encoded
+                // copy, which live until the write is done. Narrow the frame
+                // charge to those (`keep_reply_phase`) and give the rest back
+                // before charging the reply, or this connection would wait
+                // on its own permit (and, through the budget's FIFO, on every
+                // other connection doing the same) when the two together
+                // exceed what is free. The reply then asks only for the
+                // values on top of what is held, as `write_reply` does for
+                // the receive buffer's charge.
+                let kept = keep_reply_phase(&mut frame_charge, entries.len());
                 write_reply(
                     &mut stream,
                     &config,
                     &Response::Multi(entries),
                     tag,
-                    receive_charged,
+                    receive_charged + kept,
                 )
                 .await?;
 
@@ -3612,7 +3681,7 @@ async fn handle_connection(
                 },
                 tag,
             )) => {
-                let frame_charge = frame_charge;
+                let mut frame_charge = frame_charge;
                 let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
                 let mut owned_positions = Vec::with_capacity(keys.len());
                 let mut owned_keys = Vec::with_capacity(keys.len());
@@ -3625,6 +3694,7 @@ async fn handle_connection(
                     Some(node_context) => wrong_nodes_refreshed(node_context, &hashes).await,
                     None => vec![false; keys.len()],
                 };
+                drop(hashes);
 
                 for (position, name) in keys.into_iter().enumerate() {
                     if wrong[position] {
@@ -3634,6 +3704,7 @@ async fn handle_connection(
                         owned_keys.push(name);
                     }
                 }
+                drop(wrong);
 
                 if !owned_keys.is_empty() {
                     // Kept for the forwarding loop below, which looks for
@@ -3723,15 +3794,17 @@ async fn handle_connection(
                     .into_iter()
                     .map(|entry| entry.expect("every position filled by one of the two branches"))
                     .collect();
-                // Released before the reply is charged, like an `m`'s.
-                drop(frame_charge);
+                // Narrowed to what the reply keeps before it is charged, like
+                // an `m`'s; an ack (`get` false) holds its roster and encoded
+                // copy for the write the same way, so it keeps the same.
+                let kept = keep_reply_phase(&mut frame_charge, entries.len());
                 if get {
                     write_reply(
                         &mut stream,
                         &config,
                         &Response::Multi(entries),
                         tag,
-                        receive_charged,
+                        receive_charged + kept,
                     )
                     .await?;
                 } else {
@@ -11174,9 +11247,10 @@ mod tests {
             },
         )
         .await;
-        // The 16-key batch's per-key charge is released before its reply
-        // is charged, so the reply alone is what the budget sees.
-        let total = 17 * MIB;
+        // The 16-key batch's working charge is released before its reply
+        // is charged; what its reply entries keep stays held with the
+        // reply's bytes, so the budget is sized for both.
+        let total = 17 * MIB + 16 * MULTI_KEY_REPLY_BYTES_PER_KEY;
         let budget = InFlightBudget::new(total);
         let mut batch = b"m 0 16".to_vec();
         batch.extend(std::iter::repeat_n(b" 5", 16).flatten());
@@ -11810,6 +11884,98 @@ mod tests {
         let _ = timeout(Duration::from_secs(5), first_task).await;
         let _ = timeout(Duration::from_secs(5), second_task).await;
         assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_charge_gives_back_what_it_shrinks_by_and_the_rest_when_dropped() {
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let config = connection_config_with_budget(&budget, IDLE_TIMEOUT);
+        let mut charge = Some(
+            charge_multi_key_frame(&config, 0, 100, false)
+                .await
+                .unwrap(),
+        );
+        let cost = 100 * MULTI_KEY_FRAME_BYTES_PER_KEY;
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE - cost);
+
+        let kept = keep_reply_phase(&mut charge, 100);
+        assert_eq!(kept, 100 * MULTI_KEY_REPLY_BYTES_PER_KEY);
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE - kept);
+        // Shrinking never grows the charge back.
+        assert_eq!(keep_reply_phase(&mut charge, 1_000), kept);
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE - kept);
+
+        drop(charge);
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_reply_keeps_its_entries_charged_while_the_write_is_blocked() {
+        // A reply that is a few values and 300,000 misses: the misses add
+        // nothing to `reply_bytes`, but the `MultiEntry` vector and the
+        // encoded copy built from it (about 50 bytes per key) are alive
+        // for as long as the client does not read, so the budget must see
+        // them. Before they were charged only the values and the receive
+        // buffer showed: a client that connects and never reads held
+        // megabytes per connection outside `--max-in-flight-bytes`.
+        // The values make the write block whatever the socket buffers are.
+        const KEYS: usize = 300_000;
+        const HITS: usize = 10;
+        const VALUE: usize = MAX_REQUEST_SIZE;
+        let multi_touch_frame = {
+            let mut frame = format!("y 0 {KEYS}").into_bytes();
+            frame.extend(std::iter::repeat_n(b" 1", KEYS).flatten());
+            frame.extend_from_slice(b" G\n");
+            frame.extend(std::iter::repeat_n(b'k', KEYS));
+            frame
+        };
+        for (name, frame) in [("m", multi_get_frame(KEYS)), ("y", multi_touch_frame)] {
+            let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(8);
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let total = 256 * MAX_REQUEST_SIZE;
+            let budget = InFlightBudget::new(total);
+            let (mut client, server) = tcp_pair_with_small_client_buffer().await;
+            let connection_task = tokio::spawn(handle_connection(
+                ServerStream::Plain(server),
+                test_client_addr(),
+                request_tx.clone(),
+                connection_config_with_budget(&budget, IDLE_TIMEOUT),
+                shutdown_rx.clone(),
+            ));
+            client.write_all(&frame).await.unwrap();
+            let request = timeout(Duration::from_secs(5), request_rx.recv())
+                .await
+                .expect("the frame reaches the cache")
+                .unwrap();
+            let value = Bytes::from(vec![b'v'; VALUE]);
+            let mut results = vec![MultiEntry::Value(value); HITS];
+            results.resize(KEYS, MultiEntry::Miss);
+            request
+                .response_tx
+                .send(Response::Multi(results))
+                .ok()
+                .unwrap();
+
+            // The client reads nothing, so the write blocks on the values.
+            sleep(Duration::from_millis(500)).await;
+            let held = total - budget.available();
+            assert!(
+                held >= HITS * VALUE + KEYS * MULTI_KEY_REPLY_BYTES_PER_KEY,
+                "{name}: while the reply write is blocked the budget holds {held} bytes; the \
+                 {HITS} values are {} and the {KEYS} entries must be charged on top",
+                HITS * VALUE
+            );
+            assert!(
+                held < HITS * VALUE + KEYS * MULTI_KEY_REPLY_BYTES_PER_KEY + 4 * MAX_REQUEST_SIZE,
+                "{name}: the frame's working charge ({} bytes) must have been given back, \
+                 but the budget holds {held}",
+                KEYS * MULTI_KEY_FRAME_BYTES_PER_KEY
+            );
+
+            drop(client);
+            let _ = timeout(Duration::from_secs(5), connection_task).await;
+            assert_eq!(budget.available(), total, "{name}: everything is released");
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

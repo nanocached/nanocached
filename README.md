@@ -607,10 +607,13 @@ loud `WARN` if that disagrees with its own configured value.
   buffer's growth past 64 KiB is charged before it is allocated; and a
   multi-key frame (`m`, `o` or `y`) is charged 256 bytes per key (288
   for `o`) for the per-key lists the node builds while it runs, taken as
-  soon as the frame is fully received and before those lists exist, and
-  held until the reply is written (a frame of one-byte keys can carry
-  about 350,000 keys, so about 85 MiB). A frame that costs more than the whole budget waits for
-  it to be free and then runs alone. A connection that cannot get its
+  soon as the frame is fully received and before those lists exist (a
+  frame of one-byte keys can carry about 350,000 keys, so about 85 MiB).
+  Once the reply is built, 64 bytes per key of that stay charged until
+  the reply is written — the reply's entries and its encoded copy, which
+  a client that does not read keeps alive — and the rest is released. A
+  frame that costs more than the whole budget waits for it to be free and
+  then runs alone. A connection that cannot get its
   share in time is closed, like a stalled one. Size a process at
   `--max-memory` plus this plus headroom
 - Per-namespace caps: `--namespace-budget <ns>=<bytes>` (repeatable)
