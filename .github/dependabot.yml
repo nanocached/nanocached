@@ -77,3 +77,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # The container images' base images (Dockerfile): an Alpine branch is
+  # supported for two years, and 3.21 ran out on 2026-11-01 with nothing
+  # here to say so.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

@@ -128,6 +128,11 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Container images are built from `rust:1.96.0-alpine3.24` and run on
+  `alpine:3.24`. Alpine 3.21, the previous base, reached its end of support
+  on 2026-11-01, after which its musl, busybox and apk get no security
+  fixes; 3.24 is supported until 2028-06-01. Dependabot now watches the
+  `Dockerfile` as well (#1196).
 - Container images: `:latest` is now the latest release, moved only by the
   release workflow for all three images at once. It used to be rebuilt
   from every `main` commit for `nanocached-node` and `nanocached-discovery`
