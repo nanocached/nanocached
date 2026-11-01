@@ -14,6 +14,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: with one discovery replica black-holed (accepting
+  connections and never answering), every refresh cycle spent up to
+  `UPSTREAM_IO_TIMEOUT` (5 s) in the announce to it without reading
+  forced-refresh requests, so the roster refresh a `W` asks for before it
+  retries waited for the announce to time out, up to about 5 s instead of
+  the usual at most 1 s. The announce now runs alongside the wait for the
+  next cycle (and through the minimum interval between forced fetches), so
+  a refresh request is served at once; an announce still pending when the
+  cycle ends is dropped, which also keeps one from landing after the
+  shutdown's deregistration. (#1241)
 - `nanocached-proxy`: when a source IP's share of the parked-frame pool held
   one frame but not two, a second request could be refused at once (`B`,
   or `R` for a retry-capable client) although the first was already

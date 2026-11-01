@@ -1415,6 +1415,18 @@ async fn run_refresher(
         // multi-replica path here) rather than serially, so one slow or
         // unreachable replica can't stretch a cycle to the sum of all
         // replicas' round-trips.
+        //
+        // The fan-out is polled by the wait below rather than awaited on
+        // its own: it only ends when the slowest replica has answered or
+        // timed out, so with one replica black-holed it kept the refresher
+        // from reading `refresh_rx` for up to `UPSTREAM_IO_TIMEOUT` of
+        // every cycle, and a `W`'s forced refresh waited for it. An
+        // announce still running when the cycle ends is dropped with the
+        // cycle (the next one sends it again), so none is left to land
+        // after the deregistration below.
+        let mut announce_done = true;
+        let mut announcing: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+            Box::pin(std::future::ready(()));
         if let Some((identity, port)) = &announce
             && !*drain.borrow()
         {
@@ -1433,27 +1445,45 @@ async fn run_refresher(
                     }) as Pin<Box<dyn Future<Output = ()> + Send>>
                 })
                 .collect();
-            join_all(futs).await;
+            announcing = Box::pin(async move {
+                join_all(futs).await;
+            });
+            announce_done = false;
         }
 
-        let nudged = tokio::select! {
-            _ = sleep(REFRESH_INTERVAL) => false,
-            () = drained(&mut drain) => false,
-            received = refresh_rx.recv() => match received {
-                None => return,
-                Some(waiter) => {
-                    waiters.push(waiter);
-                    true
-                }
-            },
+        let refresh_sleep = sleep(REFRESH_INTERVAL);
+        tokio::pin!(refresh_sleep);
+        let nudged = loop {
+            tokio::select! {
+                _ = &mut refresh_sleep => break false,
+                () = drained(&mut drain) => break false,
+                received = refresh_rx.recv() => match received {
+                    None => return,
+                    Some(waiter) => {
+                        waiters.push(waiter);
+                        break true;
+                    }
+                },
+                () = &mut announcing, if !announce_done => announce_done = true,
+            }
         };
         if nudged {
             // Coalesce a burst of W-triggered nudges into one fetch, and
             // hold it to `MIN_FORCED_REFRESH_INTERVAL` after the last one
             // — a nudge arriving later than that is served at once.
-            tokio::select! {
-                () = tokio::time::sleep_until(fetched_at + MIN_FORCED_REFRESH_INTERVAL) => {}
-                () = drained(&mut drain) => {}
+            //
+            // The announce goes on in the meantime: a burst of nudges
+            // (a node mid-handoff) must not keep a healthy replica from
+            // ever hearing from this proxy. Whatever is still pending when
+            // the wait ends is dropped with the cycle.
+            let floor = tokio::time::sleep_until(fetched_at + MIN_FORCED_REFRESH_INTERVAL);
+            tokio::pin!(floor);
+            loop {
+                tokio::select! {
+                    () = &mut floor => break,
+                    () = drained(&mut drain) => break,
+                    () = &mut announcing, if !announce_done => announce_done = true,
+                }
             }
             while let Ok(waiter) = refresh_rx.try_recv() {
                 waiters.push(waiter);
@@ -10884,6 +10914,8 @@ mod tests {
         addr: String,
         deregistered: Arc<StdMutex<Vec<String>>>,
         roster_fetches: Arc<AtomicUsize>,
+        /// How many `Y` announces it has answered.
+        announces: Arc<AtomicUsize>,
         roster: Arc<StdMutex<Vec<(String, String)>>>,
     }
 
@@ -10899,6 +10931,8 @@ mod tests {
         let record = Arc::clone(&deregistered);
         let roster_fetches = Arc::new(AtomicUsize::new(0));
         let fetch_counter = Arc::clone(&roster_fetches);
+        let announces = Arc::new(AtomicUsize::new(0));
+        let announce_counter = Arc::clone(&announces);
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -10907,6 +10941,7 @@ mod tests {
                 let roster_cell = Arc::clone(&roster_cell);
                 let record = Arc::clone(&record);
                 let fetch_counter = Arc::clone(&fetch_counter);
+                let announce_counter = Arc::clone(&announce_counter);
                 tokio::spawn(async move {
                     let mut buf = BytesMut::new();
                     loop {
@@ -10952,6 +10987,7 @@ mod tests {
                                     return;
                                 }
                                 let _ = buf.split_to(body);
+                                announce_counter.fetch_add(1, Ordering::SeqCst);
                                 let _ = stream.write_all(b"R\n").await;
                             }
                             // `Z <name-len> <token-len>`: record the name.
@@ -10976,6 +11012,7 @@ mod tests {
             addr,
             deregistered,
             roster_fetches,
+            announces,
             roster: live_roster,
         }
     }
@@ -12484,6 +12521,68 @@ mod tests {
         );
         assert_eq!(current_ring(&context).unwrap().nodes.len(), 2);
         assert!(ring.has_changed().unwrap());
+    }
+
+    /// Issue #1241: the announce fan-out ends only when the slowest
+    /// replica has answered or timed out, and the refresher used to await
+    /// it before it read a forced-refresh request. With one of the two
+    /// discovery replicas black-holed, a refresh requested while that
+    /// announce was pending waited for it to time out; it now waits only
+    /// for the minimum interval between forced fetches, and the live
+    /// replica is still announced to.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_black_holed_discovery_replica_does_not_hold_up_a_forced_refresh() {
+        let node = MockNode::start().await;
+        let live =
+            start_mock_discovery_handle(vec![("node-a".to_string(), node.addr.clone())], 1).await;
+        let black_hole = start_black_hole_node().await;
+        let (ring_tx, ring_rx) = watch::channel(None);
+        let (refresh_tx, refresh_rx) = mpsc::channel(16);
+        let (_drain_tx, drain_rx) = watch::channel(false);
+        tokio::spawn(run_refresher(
+            RefresherConfig {
+                // The black hole first: its announce is the one pending.
+                discovery: vec![black_hole, live.addr.clone()],
+                secret: None,
+                tls_connector: None,
+                announce: Some((
+                    ProxyIdentity {
+                        name: "proxy-under-test".to_string(),
+                        token: "tk-announce".to_string(),
+                    },
+                    0,
+                )),
+                drain: drain_rx,
+                ip_in_flight_share: ip_in_flight_share(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            ring_tx,
+            refresh_rx,
+            Arc::new(SharedBackends::new()),
+        ));
+        let mut ring = ring_rx;
+        timeout(UPSTREAM_IO_TIMEOUT, ring.wait_for(Option::is_some))
+            .await
+            .expect("the first fetch lands")
+            .unwrap();
+
+        // The first fetch is in; the announce to the black hole is now
+        // pending for a whole `UPSTREAM_IO_TIMEOUT`.
+        let (waiter, done) = oneshot::channel();
+        let started = std::time::Instant::now();
+        refresh_tx.send(waiter).await.unwrap();
+        timeout(UPSTREAM_IO_TIMEOUT, done)
+            .await
+            .expect("the forced refresh completes")
+            .unwrap();
+        assert!(
+            started.elapsed() < UPSTREAM_IO_TIMEOUT / 2,
+            "the forced refresh waited {:?} for the announce",
+            started.elapsed()
+        );
+        assert!(
+            live.announces.load(Ordering::SeqCst) >= 1,
+            "the live replica is announced to all the same"
+        );
     }
 
     /// No-secret mode is untouched by the pre-auth bounds: a connection
