@@ -12,6 +12,16 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- With `FireAndForgetReplicas`, the replica legs of `SetAsync`, `DeleteAsync`,
+  `TouchAsync` and `GetAndTouchBytesAsync` kept reading the caller's `key`
+  (and, for `SetAsync` without compression, `value`) arrays after the call had
+  returned. A byte[] caller that reused its buffers while a leg was still
+  waiting on a busy or redialing replica made the replica store, delete or
+  touch a different key. The namespace, key and value are now copied at call
+  time when the option is on. (#1203)
+
+### Fixed
+
 - `NanocachedNamespace` kept the caller's `byte[]` namespace and returned its
   own array from `NamespaceBytes`, so overwriting either buffer later changed
   the HRW input and the namespace of every later call through the handle (keys
