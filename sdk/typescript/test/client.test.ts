@@ -4069,6 +4069,38 @@ describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
     });
   });
 
+  it("does not treat a non-connection Node error as a connection loss (issue #1188)", async () => {
+    // Regression: isConnectionError accepted any Error with a string
+    // `code`, so ERR_INVALID_ARG_TYPE (what Buffer.concat throws for a
+    // non-Buffer value passed by a JS caller) made withWrongNodeRetry force
+    // a discovery refresh and run the operation a second time.
+    await withCluster(async (client, cluster) => {
+      const { primary } = cluster.ownerOf("k");
+      await client.set("k", "v");
+      const connection = (client as any).target.members.get(primary.name).connection;
+      const listsBefore = cluster.discovery.listCount();
+      const failure = Object.assign(new TypeError("bad argument"), { code: "ERR_INVALID_ARG_TYPE" });
+      const set = mock.method(connection, "set", () => Promise.reject(failure));
+
+      await assert.rejects(client.set("k", "v2"), (error: unknown) => error === failure);
+      assert.equal(set.mock.callCount(), 1, "the operation must not be retried");
+      assert.equal(cluster.discovery.listCount(), listsBefore, "no forced refresh");
+    });
+  });
+
+  it("still retries a reset connection after a forced refresh (issue #1188)", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary } = cluster.ownerOf("k");
+      await client.set("k", "v");
+      const connection = (client as any).target.members.get(primary.name).connection;
+      const listsBefore = cluster.discovery.listCount();
+      mock.method(connection, "set", () => Promise.reject(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })), { times: 1 });
+
+      await client.set("k", "v2");
+      assert.ok(cluster.discovery.listCount() > listsBefore, "a connection error must still force a refresh");
+    });
+  });
+
   it("resends a touch whose reply was lost, unlike an incr", async () => {
     await withCluster(async (client, cluster) => {
       const { primary } = cluster.ownerOf("k");
