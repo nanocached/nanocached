@@ -12,6 +12,16 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- With `FireAndForgetReplicas`, the replica legs of `SetManyBytesAsync`,
+  `IncrAsync` / `DecrAsync`, `PutIfAbsentAsync`, `ReplaceIfPresentAsync`,
+  `ReplaceAsync` and `DeleteIfMatchesAsync` kept reading the caller's `byte[]`
+  key and value arrays after the call had returned, so a caller that reused its
+  buffers while a leg waited on a busy or redialing replica made the replica
+  store a different value or address a different key. The arrays are now copied
+  at call time when the option is on. (#1256)
+
+### Fixed
+
 - A request that `Close()` poisoned while in flight, and then retried, redialed
   and identified against the node before the closed check rejected it with
   `AlreadyClosedException`, leaving one extra connection on the node after

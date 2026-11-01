@@ -3870,6 +3870,69 @@ public class NanocachedClientTests
         Assert.Empty(unobserved);
     }
 
+    // Issue #1256: as for the single-key writes, the background replica leg
+    // of a batched set and of the primary-then-replicate operations (incr,
+    // the CAS family) must not read the caller's arrays after the call has
+    // returned. The replica's connection is closed and its node stalls the
+    // handshake, so the leg builds its frame only after the caller has
+    // zeroed its buffers.
+    [Theory]
+    [InlineData("setmany")]
+    [InlineData("incr")]
+    [InlineData("putifabsent")]
+    [InlineData("deleteifmatches")]
+    public async Task FireAndForgetReplicaLegsOfBatchAndCasOpsDoNotReadTheCallersBuffersAfterTheCallReturns(string op)
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        string replicaName = OwnersOf("k")[1];
+        MockNode replica = cluster.Nodes[replicaName];
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            FireAndForgetReplicas = true,
+        });
+        string stored = MockNode.KeyOf(Bytes("k"));
+        string token = "";
+        if (op is "incr" or "deleteifmatches")
+        {
+            await client.SetAsync("k", "5");
+            await WaitForAsync(() => replica.Store.ContainsKey(stored), "the seed to reach the replica");
+            token = (await client.GetBytesWithTokenAsync("k"))!.Value.Token;
+        }
+
+        var closed = new Connection(new ThrowingStream());
+        closed.Close();
+        ReplaceMemberConnection(client, replicaName, closed);
+        replica.DelayAuth(400);
+
+        byte[] key = Bytes("k");
+        byte[] value = Bytes("v");
+        switch (op)
+        {
+            case "setmany":
+                await client.SetManyBytesAsync(new Dictionary<string, byte[]> { ["k"] = value }, 100);
+                break;
+            case "incr": Assert.Equal(6L, await client.IncrAsync(key, 1)); break;
+            case "putifabsent": Assert.True(await client.PutIfAbsentAsync(key, value, 100)); break;
+            default: Assert.True(await client.DeleteIfMatchesAsync(key, token)); break;
+        }
+        Array.Clear(key); // the caller reuses its buffers
+        Array.Clear(value);
+
+        switch (op)
+        {
+            case "deleteifmatches":
+                await WaitForAsync(() => !replica.Store.ContainsKey(stored), "the replica to delete the key");
+                break;
+            default:
+                byte[] expected = Bytes(op == "incr" ? "6" : "v");
+                await WaitForAsync(
+                    () => replica.Store.TryGetValue(stored, out byte[]? got) && got.AsSpan().SequenceEqual(expected),
+                    "the replica to receive the write under the original key");
+                break;
+        }
+    }
+
     // ── Touch / get-and-touch (issue #825) ──────────────────────────
 
     [Fact]
