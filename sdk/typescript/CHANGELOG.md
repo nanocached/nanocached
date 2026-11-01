@@ -9,6 +9,17 @@ tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- `connect()` with a seed address whose port is not a valid TCP port (`NaN`
+  from an unset environment variable, a fraction, a number above 65535)
+  rejected at once, as it should, but the dial timer had already been armed
+  and stayed armed: five seconds later it fired, touched the socket binding
+  that was never initialised and threw a `ReferenceError` out of a timer
+  callback — an uncaught exception that ended the process after the caller
+  had handled the rejection. The socket is now created before the timer is
+  armed, so a synchronous dial failure leaves nothing behind (#1163).
+
 ## [0.6.0] - 2026-11-01
 
 ### Fixed
