@@ -860,7 +860,97 @@ fn no_owner_reachable() -> Error {
 struct HedgeOutcome {
     index: usize,
     result: Result<Option<Vec<u8>>>,
+    /// The leg's task panicked (issue #1164): `result` is then an `Err`
+    /// carrying the panic message, and `read_hedged` returns it as is
+    /// instead of hedging onward — a panic is a bug to surface, not an
+    /// owner to route around (the Java SDK rethrows an `Error` the same
+    /// way, issue #1150).
+    panicked: bool,
 }
+
+/// Issue #1164: makes sure a hedge leg always reports back. `read_hedged`
+/// keeps its own sender alive until it returns, so `rx.recv()` never yields
+/// `None` while a leg is outstanding: a leg that ended without sending —
+/// its task panicked, or the runtime dropped it mid-flight — left the
+/// reader waiting forever, with no timeout of its own once every owner was
+/// in flight (and `resolve_hedge_losers` waits the same way). The guard
+/// sends the outcome on the normal path (`send`) and, if it is dropped
+/// unsent, an error outcome instead, so the reader is always woken.
+struct HedgeLegGuard {
+    tx: mpsc::UnboundedSender<HedgeOutcome>,
+    index: usize,
+    sent: bool,
+}
+
+impl HedgeLegGuard {
+    fn send(mut self, result: Result<Option<Vec<u8>>>, panicked: bool) {
+        self.sent = true;
+        let _ = self.tx.send(HedgeOutcome {
+            index: self.index,
+            result,
+            panicked,
+        });
+    }
+}
+
+impl Drop for HedgeLegGuard {
+    fn drop(&mut self) {
+        if !self.sent {
+            // Dropped without a result and not by `catch_unwind`'s path
+            // (that one sends): the task was cancelled, e.g. by the runtime
+            // shutting down. An ordinary failure of this owner.
+            let _ = self.tx.send(HedgeOutcome {
+                index: self.index,
+                result: Err(Error::ConnectionLost(
+                    "nanocached: hedged read leg was cancelled before it answered".to_string(),
+                )),
+                panicked: false,
+            });
+        }
+    }
+}
+
+/// Runs `future`, turning a panic raised while polling it into `Err`
+/// carrying the panic payload (the `FutureExt::catch_unwind` shape, without
+/// pulling in futures-util's `std` feature for one adapter).
+async fn catch_panic<F: std::future::Future>(
+    future: F,
+) -> std::result::Result<F::Output, Box<dyn std::any::Any + Send>> {
+    let mut future = Box::pin(future);
+    std::future::poll_fn(move |cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    })
+    .await
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Test hook (issue #1164): the hedge leg with this index (0 is the
+/// primary) of a read of this key panics instead of querying its owner, so
+/// a test can drive the "leg task panicked" path end to end. Keyed by key
+/// because integration tests share fixed node names and run in parallel;
+/// a test picks a key no other test reads. `ARMED` false (the default) is
+/// inert — one atomic load per leg. Public-but-hidden purely as a test
+/// hook, like the other statics above; integration tests cannot see
+/// `cfg(test)` items.
+#[doc(hidden)]
+pub static PANIC_HEDGE_LEG_FOR: std::sync::Mutex<Option<(Vec<u8>, usize)>> =
+    std::sync::Mutex::new(None);
+#[doc(hidden)]
+pub static PANIC_HEDGE_LEG_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 enum Target {
     Single {
@@ -4378,6 +4468,12 @@ impl NanocachedClient {
             in_flight -= 1;
 
             match outcome.result {
+                // Issue #1164: a leg that panicked is surfaced to the
+                // caller, not hedged around.
+                Err(error) if outcome.panicked => {
+                    self.resolve_hedge_losers(&mut rx, in_flight).await;
+                    return Err(error);
+                }
                 Ok(Some(value)) => {
                     self.resolve_hedge_losers(&mut rx, in_flight).await;
                     return Ok(Some(value));
@@ -4498,13 +4594,44 @@ impl NanocachedClient {
             return Err(Error::AlreadyClosed);
         }
         hedged.spawn(async move {
-            let op = move |connection: Arc<Connection>| {
-                let namespace = Arc::clone(&namespace);
-                let key = Arc::clone(&key);
-                async move { connection.get(&namespace, &key).await }
+            // Issue #1164: whatever happens to this task, the reader gets
+            // an outcome (see `HedgeLegGuard`).
+            let guard = HedgeLegGuard {
+                tx,
+                index,
+                sent: false,
             };
-            let result = client.apply_reconnecting(Some(&name), &op).await;
-            let _ = tx.send(HedgeOutcome { index, result });
+            let leg = async {
+                if PANIC_HEDGE_LEG_ARMED.load(Ordering::SeqCst)
+                    && PANIC_HEDGE_LEG_FOR.lock().is_ok_and(|hook| {
+                        hook.as_ref()
+                            .is_some_and(|(k, i)| k.as_slice() == &*key && *i == index)
+                    })
+                {
+                    panic!("injected hedge leg panic (test hook)");
+                }
+                let op = move |connection: Arc<Connection>| {
+                    let namespace = Arc::clone(&namespace);
+                    let key = Arc::clone(&key);
+                    async move { connection.get(&namespace, &key).await }
+                };
+                client.apply_reconnecting(Some(&name), &op).await
+            };
+            // The panic is caught here rather than left to the JoinSet:
+            // its `JoinError` is only ever seen by whoever reaps the set
+            // (`try_join_next` above, `close()`), neither of which is the
+            // caller waiting on this leg. The panic hook has already
+            // printed the message and location to stderr.
+            match catch_panic(leg).await {
+                Ok(result) => guard.send(result, false),
+                Err(payload) => guard.send(
+                    Err(Error::Protocol(format!(
+                        "nanocached: hedged read leg panicked: {}",
+                        panic_message(payload.as_ref())
+                    ))),
+                    true,
+                ),
+            }
         });
         Ok(())
     }
@@ -5595,6 +5722,48 @@ impl Namespace {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU64;
+
+    // issue #1164: a hedge leg whose task is dropped before it answers
+    // (cancelled) still reports, as an ordinary failure of its owner, so
+    // read_hedged's rx.recv() cannot wait for it forever.
+    #[tokio::test]
+    async fn a_dropped_hedge_leg_guard_reports_a_cancelled_leg() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<HedgeOutcome>();
+        let guard = HedgeLegGuard {
+            tx,
+            index: 3,
+            sent: false,
+        };
+        drop(guard);
+        let outcome = rx.recv().await.expect("the guard must send on drop");
+        assert_eq!(outcome.index, 3);
+        assert!(!outcome.panicked);
+        assert!(matches!(outcome.result, Err(Error::ConnectionLost(_))));
+        // Nothing else was sent, and the channel is now closed.
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_hedge_leg_guard_that_sent_does_not_send_again() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<HedgeOutcome>();
+        HedgeLegGuard {
+            tx,
+            index: 0,
+            sent: false,
+        }
+        .send(Ok(None), false);
+        assert!(matches!(rx.recv().await.unwrap().result, Ok(None)));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn catch_panic_returns_the_panic_message() {
+        let payload = catch_panic(async { panic!("boom {}", 7) })
+            .await
+            .unwrap_err();
+        assert_eq!(panic_message(payload.as_ref()), "boom 7");
+        assert_eq!(catch_panic(async { 5 }).await.unwrap(), 5);
+    }
 
     // issue #386: the per-value decompression cap alone lets a batch
     // amplify it by the key count (batch × 64 MiB from one small wire
