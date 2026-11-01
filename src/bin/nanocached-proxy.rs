@@ -2912,6 +2912,19 @@ async fn run_backend(
         last_write = tokio::time::Instant::now();
     }
 
+    // The writer is done, whatever the reason, but the receiver would
+    // live until `reader.await` below returns: up to a whole
+    // `UPSTREAM_IO_TIMEOUT` when the reader is only now waiting for a
+    // reply the node was late with. For that long `enqueue`'s send would
+    // go on succeeding into a queue nobody serves, and the requests
+    // already in it would wait. Close it, so a later send fails at once
+    // (`enqueue` clears the slot and redials), and drop what was queued
+    // so those requests resolve now. None of them was reserved on the
+    // reader's queue or written, so each resolves as `RecvError`, which
+    // `enqueue` maps to `not_sent` (safe to replay).
+    receiver.close();
+    while receiver.try_recv().is_ok() {}
+
     // Queue closed (handle dropped or poisoned): let the reader drain
     // what is still pending, then stop.
     drop(pending_tx);
@@ -11144,6 +11157,48 @@ mod tests {
         std::future::pending::<()>().await;
     }
 
+    /// Issue #1191: a node that completes the tagged handshake, answers
+    /// the first request (a `G` for a missing key) only after `delay`,
+    /// and never reads again. The late reply is what lets the proxy's
+    /// reader start waiting for the next one *after* the writer's own
+    /// write timeout has begun.
+    async fn start_node_late_first_reply_then_silent(delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = BytesMut::new();
+                    let Ok(line) = read_line(&mut stream, &mut buf).await else {
+                        return;
+                    };
+                    let length = line
+                        .split(' ')
+                        .nth(1)
+                        .and_then(|field| field.parse::<usize>().ok())
+                        .unwrap();
+                    read_exact_into(&mut stream, &mut buf, length)
+                        .await
+                        .unwrap();
+                    stream.write_all(b"OnT\n").await.unwrap();
+                    let get = read_line(&mut stream, &mut buf).await.unwrap();
+                    let tag = get.split(' ').nth(2).unwrap().to_string();
+                    sleep(delay).await;
+                    stream
+                        .write_all(format!("N {tag}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    // Never read (or write) again.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        addr
+    }
+
     async fn start_silent_after_handshake_node() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -15505,6 +15560,54 @@ mod tests {
         })
         .await
         .expect("the stalled writer must time out and release its dialed-gauge slot");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_queued_behind_a_writer_that_timed_out_fails_at_once() {
+        // Issue #1191: a writer that left on a write timeout used to leave
+        // its queue open until the reader had finished, so a request
+        // queued behind the stalled write waited for the reader's own
+        // timeout as well. The node answers the first request half an I/O
+        // timeout late, so the reader starts waiting for the second
+        // reply half a timeout after the writer started its blocked
+        // write: the writer leaves at one timeout, the reader at one and
+        // a half. The queued request must fail with the writer, not with
+        // the reader.
+        let node = start_node_late_first_reply_then_silent(UPSTREAM_IO_TIMEOUT / 2).await;
+        let context = bare_context();
+        let started = tokio::time::Instant::now();
+        let first = context
+            .backends
+            .enqueue(&context, &node, frame_get(b"", b"a"), Expect::Value)
+            .await;
+        // Larger than any socket buffer pair, so the write blocks.
+        let big_value = vec![b'x'; 5_000_000];
+        let _stalled = context
+            .backends
+            .enqueue(
+                &context,
+                &node,
+                frame_set(b"", b"key", &big_value, None),
+                Expect::Stored,
+            )
+            .await;
+        let queued = context
+            .backends
+            .enqueue(&context, &node, frame_get(b"", b"b"), Expect::Value)
+            .await;
+        let result = queued.await;
+        let elapsed = started.elapsed();
+        assert!(first.await.is_ok(), "the first request is answered");
+        let error = result.expect_err("a request queued behind a dead writer cannot be served");
+        assert!(request_not_sent(&error), "never written, so safe to replay");
+        assert!(
+            elapsed >= UPSTREAM_IO_TIMEOUT,
+            "it cannot fail before the write timed out: {elapsed:?}"
+        );
+        assert!(
+            elapsed < UPSTREAM_IO_TIMEOUT + UPSTREAM_IO_TIMEOUT / 4,
+            "it failed with the reader's timeout ({elapsed:?}), not the writer's"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

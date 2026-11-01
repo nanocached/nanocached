@@ -14,6 +14,18 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a shared backend connection whose writer had left on
+  a write error or write timeout went on accepting requests until its
+  reader finished, up to `UPSTREAM_IO_TIMEOUT` (5 s) later. The queue's
+  receiver lived until the reader was done, so a request sent in the
+  meantime was queued behind nobody, and one already queued waited for the
+  reader's own timeout (which starts late when the node answered the
+  previous request late) before failing. The writer now closes the queue
+  when it leaves and drops what was in it: the queued requests, never
+  written, fail at once as not sent and are retried, and the next request
+  redials. A request queued behind a stalled write failed after 906 ms
+  with a 600 ms I/O timeout (the reader's 900 ms) and now fails at the
+  writer's 600 ms. (#1191)
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
