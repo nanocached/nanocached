@@ -38,6 +38,13 @@ updates:
     directory: /adapters/cache-manager
     schedule:
       interval: weekly
+    ignore:
+      # nanocached-cache-manager is a cache-manager v5 `Store` on purpose:
+      # v6 and later dropped the Store interface for Keyv storage adapters,
+      # which nanocached-keyv (adapters/keyv) provides. Patch and minor
+      # updates of cache-manager 5.x are still proposed.
+      - dependency-name: cache-manager
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: npm
     directory: /adapters/keyv
     schedule:
