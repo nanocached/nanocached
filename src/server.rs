@@ -4090,7 +4090,26 @@ async fn handle_connection(
         // on until the tail itself is dropped or rebuilt. Releasing the
         // charge on that reported capacity alone left up to a frame's
         // worth of memory per idle connection outside the budget.
-        if (received.capacity() > REQUEST_BUFFER_SHRINK_THRESHOLD || receive_charged > 0)
+        //
+        // Issue #1204: a buffer over the threshold is rebuilt only when it
+        // is mostly slack. A rebuild leaves `capacity == len`, and the
+        // growth below then doubles it; for `len` between half the
+        // threshold and the threshold that is over the threshold again, so
+        // a client trickling a frame in that range made every read copy
+        // the buffer twice (about 50 KB of memcpy per byte received).
+        // Growth from an exact-size buffer reaches `2 * len`, never past
+        // `2 * len + threshold`, so it does not trigger the next rebuild.
+        // A charge with the reported capacity at or under the threshold is
+        // the `split_to` case above, whose capacity cannot be trusted:
+        // that rebuilds, and the rebuild releases the charge.
+        let mostly_slack = received.capacity()
+            > received
+                .len()
+                .saturating_mul(2)
+                .saturating_add(REQUEST_BUFFER_SHRINK_THRESHOLD);
+        let charged_under_threshold =
+            received.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD && receive_charged > 0;
+        if (mostly_slack || charged_under_threshold)
             && received.len() <= REQUEST_BUFFER_SHRINK_THRESHOLD
         {
             let mut shrunk = BytesMut::with_capacity(received.len());
@@ -11953,6 +11972,77 @@ mod tests {
             1,
             "the charge was released without rebuilding the buffer, so the \
              256 KiB allocation the frame grew it to is still held, uncharged"
+        );
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), connection_task).await;
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_trickled_frame_between_half_and_all_of_the_threshold_does_not_rebuild_the_buffer_per_read()
+     {
+        // Issue #1204: a 100 KB frame grows the buffer past the threshold
+        // and is cut out; the next frame's first 60 KB are already in the
+        // buffer when its remaining bytes start to trickle. A rebuild
+        // leaves the buffer exactly as big as its contents, the next read
+        // grows it to twice that, which is over the threshold again once it
+        // is nearly full, and the following read used to rebuild it again:
+        // 3,000 one-byte writes meant about 1,700 rebuilds, each copying
+        // 60 KB twice.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(4 * MAX_REQUEST_SIZE);
+        let (mut client, server) = tcp_pair().await;
+        client.set_nodelay(true).unwrap();
+        RECEIVE_BUFFER_REBUILDS.with(|n| n.set(0));
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        let mut frame = b"S 1 100000\nk".to_vec();
+        frame.extend(std::iter::repeat_n(b'v', 100_000));
+        frame.extend_from_slice(b"S 1 70000\nk");
+        frame.extend(std::iter::repeat_n(b'v', 60_000));
+        client.write_all(&frame).await.unwrap();
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"S\n");
+        sleep(Duration::from_millis(100)).await;
+        let rebuilds_before = RECEIVE_BUFFER_REBUILDS.with(|n| n.get());
+
+        for _ in 0..3_000 {
+            client.write_all(b"v").await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        sleep(Duration::from_millis(100)).await;
+        let rebuilds = RECEIVE_BUFFER_REBUILDS.with(|n| n.get()) - rebuilds_before;
+        assert!(
+            rebuilds <= 2,
+            "3,000 one-byte writes into a 60 KB partial frame rebuilt the buffer {rebuilds} times"
+        );
+
+        // The frame still completes, and once it is cut out the connection
+        // holds nothing of the budget.
+        client.write_all(&[b'v'; 7_000]).await.unwrap();
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"S\n");
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            budget.available(),
+            4 * MAX_REQUEST_SIZE,
+            "an idle connection must hold nothing of the budget"
         );
 
         drop(client);

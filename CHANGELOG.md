@@ -14,6 +14,7 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a client trickling a large frame into a receive buffer holding between 32 KiB and 64 KiB made the node copy that buffer twice on every read (about 50 KB of memcpy per byte received; 3,000 one-byte writes gave 1,735 rebuilds in a debug test). The buffer is rebuilt to release memory, the next read doubled it back over the 64 KiB threshold, and the read after that rebuilt it again. A buffer over the threshold is now rebuilt only when it is mostly slack (`capacity > 2 * len + 64 KiB`), and the receive charge still goes only after a rebuild (#1204).
 - `nanocached-discovery`: remembering a departed node (an eviction, a `V`, an
   abandoned join) scanned the whole departed table, up to 4,096 names, on
   every call, so a sweep that expired many nodes at once held the
