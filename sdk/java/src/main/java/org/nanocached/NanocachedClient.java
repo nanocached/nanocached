@@ -221,7 +221,8 @@ public final class NanocachedClient implements AutoCloseable {
          * though this builder can tell "never called" apart on its own.
          * Call {@link #disableReconnectCooldown()} to actually disable
          * the cooldown — the Go SDK's equivalent is a negative {@code
-         * Config.ReconnectCooldown}. */
+         * Config.ReconnectCooldown}. A value above one year is rejected
+         * with an {@link IllegalArgumentException}. */
         public Options reconnectCooldown(Duration cooldown) {
             // Matches authSecret's null handling above (audit
             // finding J3) — a raw NullPointerException here would read
@@ -238,6 +239,7 @@ public final class NanocachedClient implements AutoCloseable {
                 throw new IllegalArgumentException(
                         "nanocached: reconnectCooldown must not be null or negative");
             }
+            requireWithinMaxDuration("reconnectCooldown", cooldown);
             this.reconnectCooldown = cooldown.isZero() ? DEFAULT_RECONNECT_COOLDOWN : cooldown;
             this.reconnectCooldownDisabled = false;
             return this;
@@ -277,12 +279,15 @@ public final class NanocachedClient implements AutoCloseable {
          * request mid-write could desync that connection — but left to
          * finish on this client's background executor, its result
          * discarded, and is drained by {@link #close()} exactly like a
-         * {@code fireAndForgetReplicas} write. Writes are unaffected. */
+         * {@code fireAndForgetReplicas} write. Writes are unaffected.
+         * A value above one year is rejected with an {@link
+         * IllegalArgumentException}. */
         public Options readHedgeAfter(Duration interval) {
             if (interval != null && interval.compareTo(Duration.ZERO) <= 0) {
                 throw new IllegalArgumentException(
                         "nanocached: readHedgeAfter must be a positive duration, got " + interval);
             }
+            if (interval != null) requireWithinMaxDuration("readHedgeAfter", interval);
             this.readHedgeAfter = interval;
             return this;
         }
@@ -363,6 +368,22 @@ public final class NanocachedClient implements AutoCloseable {
     // DEFAULT_RECONNECT_COOLDOWN_MS and sdk/python/src/nanocached/client.py's
     // _DEFAULT_RECONNECT_COOLDOWN.
     private static final Duration DEFAULT_RECONNECT_COOLDOWN = Duration.ofMillis(1_000);
+
+    // Upper bound for the Duration options (reconnectCooldown, readHedgeAfter),
+    // issue #1239. They are held as nanoseconds in a long: a Duration beyond
+    // ~292 years made toNanos() throw a bare ArithmeticException at connect,
+    // and a cooldown deadline of System.nanoTime() + nanos wrapped negative
+    // well before that, so the cooldown was already over when it was read.
+    // A year is far past any useful value for either option and leaves the
+    // nanosecond arithmetic a wide margin.
+    private static final Duration MAX_DURATION_OPTION = Duration.ofDays(365);
+
+    private static void requireWithinMaxDuration(String option, Duration value) {
+        if (value.compareTo(MAX_DURATION_OPTION) > 0) {
+            throw new IllegalArgumentException(
+                    "nanocached: " + option + " must not exceed " + MAX_DURATION_OPTION + ", got " + value);
+        }
+    }
 
     // The server rejects (and drops the connection for) any request frame
     // over MAX_REQUEST_SIZE (src/server.rs), 1 MiB — a hard cap on the

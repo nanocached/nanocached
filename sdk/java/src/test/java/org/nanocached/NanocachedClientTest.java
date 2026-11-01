@@ -2649,6 +2649,25 @@ class NanocachedClientTest {
     }
 
     @Test
+    void durationOptionsRejectAValueThatWouldOverflowNanosecondArithmetic() {
+        // Issue #1239: these were accepted by the setters, then
+        // reconnectCooldown.toNanos() threw a bare ArithmeticException at
+        // connect (and a smaller huge cooldown wrapped nanoTime() + nanos).
+        Duration huge = Duration.ofSeconds(Long.MAX_VALUE);
+        assertThrows(IllegalArgumentException.class,
+                () -> NanocachedClient.builder().reconnectCooldown(huge));
+        assertThrows(IllegalArgumentException.class,
+                () -> NanocachedClient.builder().readHedgeAfter(huge));
+        assertThrows(IllegalArgumentException.class,
+                () -> NanocachedClient.builder().reconnectCooldown(Duration.ofDays(366)));
+        assertThrows(IllegalArgumentException.class,
+                () -> NanocachedClient.builder().readHedgeAfter(Duration.ofDays(366)));
+        // The bound is generous: a day-scale value is still accepted.
+        NanocachedClient.builder().reconnectCooldown(Duration.ofDays(365));
+        NanocachedClient.builder().readHedgeAfter(Duration.ofDays(365));
+    }
+
+    @Test
     void reconnectCooldownStillRejectsNullOrNegative() {
         assertThrows(IllegalArgumentException.class,
                 () -> NanocachedClient.builder().reconnectCooldown(null));

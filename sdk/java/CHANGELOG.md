@@ -13,6 +13,11 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `reconnectCooldown` and `readHedgeAfter` accepted any positive `Duration`.
+  One beyond about 292 years failed later, at `connect`, with a bare
+  `ArithmeticException`, and a large cooldown wrapped the nanosecond
+  deadline so it was already over when read. Both setters now reject a
+  duration above one year with an `IllegalArgumentException` (#1239).
 - A request retrying while `close()` ran could still dial and authenticate
   a new connection to the node (up to the 5 s connect deadline) before
   failing with `AlreadyClosed`, leaving the node with one extra short-lived
