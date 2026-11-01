@@ -14,6 +14,18 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: when a source IP's share of the parked-frame pool held
+  one frame but not two, a second request could be refused at once (`B`,
+  or `R` for a retry-capable client) although the first was already
+  admitted. The share of in-flight bytes the second request had just
+  released is handed to the first one's waiter, which has not run yet and
+  so still holds its parked bytes; the second request asked for the pool in
+  the same poll and found it full. The refusal now waits one turn of the
+  scheduler and looks again, at the in-flight budgets as well, so the
+  second request waits behind the first. Two 900 KB uploads from one IP
+  against a 256 KiB share: 26 of 240 were answered `B` before (multi-thread
+  runtime), none after. A pool that is really full still refuses at once.
+  (#1218)
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;

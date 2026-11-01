@@ -6686,11 +6686,34 @@ async fn admit_request(
     }
     let held = held();
     let [ip_parked, proxy_parked] = parked;
-    let Some(_ip_parked) = ip_parked.try_charge(held) else {
-        return Admission::Refused;
+    let park = || {
+        let ip = ip_parked.try_charge(held)?;
+        let proxy = proxy_parked.try_charge(held)?;
+        Some((ip, proxy))
     };
-    let Some(_proxy_parked) = proxy_parked.try_charge(held) else {
-        return Admission::Refused;
+    let _parked = match park() {
+        Some(parked) => parked,
+        None => {
+            // A full pool is not always a pool of requests that are
+            // still waiting. The bytes this request just waited on may
+            // have been handed to another waiting request (the semaphore
+            // assigns them as they are released), which has not run yet
+            // and so still holds what it parked: the request that
+            // released them gets here in the same poll, before that one
+            // can give its parked bytes back, and would be refused for
+            // room that is about to be there. One turn of the scheduler
+            // lets it run; then look again, at the in-flight budgets as
+            // well, which may be free by now. A pool that is really full
+            // refuses as before, one turn later.
+            tokio::task::yield_now().await;
+            if let Some(charge) = InFlightCharge::try_charge(cost, budgets) {
+                return Admission::Granted(charge);
+            }
+            match park() {
+                Some(parked) => parked,
+                None => return Admission::Refused,
+            }
+        }
     };
     let [connection, ip, proxy] = budgets;
     tokio::select! {
@@ -9587,6 +9610,103 @@ mod tests {
             .expect("admitted once the share is free");
         assert!(matches!(admitted, Admission::Granted(_)));
         assert_eq!(parked_free(), (MAX_REQUEST_SIZE, 4 * MAX_REQUEST_SIZE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_is_not_refused_for_parked_bytes_of_one_that_was_just_admitted() {
+        // Issue #1218. The IP's share of the pool holds one 600,000-byte
+        // frame, not two. A waits for the share with its frame parked;
+        // the holder releases the share, which the semaphore hands to A's
+        // waiter, and B, a second connection of the IP, goes on in the
+        // same poll to ask for the share and for room in the pool before A
+        // has run to give its parked bytes back. B used to be refused
+        // there, although A is admitted a moment later and B would have
+        // been the next to wait; it now looks once more after a turn of
+        // the scheduler and waits behind A.
+        let admission = InFlightAdmission::new(&ConnectionLimits {
+            max_connections: 8,
+            max_connections_per_ip: 8,
+            max_in_flight_bytes: 4 * MAX_REQUEST_SIZE,
+            max_in_flight_bytes_per_ip: MAX_REQUEST_SIZE,
+            admission_wait: Duration::from_secs(5),
+        });
+        let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let budgets = admission.for_connection(ip);
+        let wait = Duration::from_secs(5);
+        let (_drain_tx, drain) = watch::channel(false);
+        let (fifo_tx, _fifo_rx) = mpsc::channel::<ClientReply>(1);
+        let ip_in_flight = budgets.ip.budgets.in_flight.clone();
+        let ip_parked = budgets.ip.budgets.parked.clone();
+        let proxy = budgets.proxy.clone();
+        let proxy_parked = budgets.parked.clone();
+
+        // The holder: the share's whole in-flight budget.
+        let held = ip_in_flight.charge(MAX_REQUEST_SIZE).await.unwrap();
+
+        let a = {
+            let (ip_in_flight, ip_parked, proxy, proxy_parked) = (
+                ip_in_flight.clone(),
+                ip_parked.clone(),
+                proxy.clone(),
+                proxy_parked.clone(),
+            );
+            let (mut drain, fifo_tx) = (drain.clone(), fifo_tx.clone());
+            tokio::spawn(async move {
+                let connection = InFlightBudget::new(CLIENT_IN_FLIGHT_BYTES);
+                admit_request(
+                    MAX_REQUEST_SIZE,
+                    || 600_000,
+                    [&connection, &ip_in_flight, &proxy],
+                    [&ip_parked, &proxy_parked],
+                    wait,
+                    &mut drain,
+                    &fifo_tx,
+                )
+                .await
+            })
+        };
+        // A is waiting, its frame parked.
+        sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            ip_parked.permits.available_permits(),
+            MAX_REQUEST_SIZE - 600_000
+        );
+
+        // The holder gives the share up and B asks, with no await between.
+        drop(held);
+        let connection = InFlightBudget::new(CLIENT_IN_FLIGHT_BYTES);
+        let mut drain_b = drain.clone();
+        let b = admit_request(
+            MAX_REQUEST_SIZE,
+            || 600_000,
+            [&connection, &ip_in_flight, &proxy],
+            [&ip_parked, &proxy_parked],
+            wait,
+            &mut drain_b,
+            &fifo_tx,
+        );
+        tokio::pin!(b);
+        assert!(
+            timeout(Duration::from_millis(100), &mut b).await.is_err(),
+            "B waits behind A: it was not refused for A's parked bytes"
+        );
+        let Admission::Granted(a_charge) = a.await.unwrap() else {
+            panic!("A is admitted");
+        };
+        assert_eq!(
+            ip_parked.permits.available_permits(),
+            MAX_REQUEST_SIZE - 600_000,
+            "only B's frame is parked now"
+        );
+
+        // A finishes: B is admitted.
+        drop(a_charge);
+        assert!(matches!(
+            timeout(Duration::from_millis(100), &mut b)
+                .await
+                .expect("admitted once A's share is free"),
+            Admission::Granted(_)
+        ));
     }
 
     #[test]
