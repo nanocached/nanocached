@@ -14,6 +14,18 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: when a source IP's share of the parked-frame pool held
+  one frame but not two, a second request could be refused at once (`B`,
+  or `R` for a retry-capable client) although the first was already
+  admitted. The share of in-flight bytes the second request had just
+  released is handed to the first one's waiter, which has not run yet and
+  so still holds its parked bytes; the second request asked for the pool in
+  the same poll and found it full. The refusal now waits one turn of the
+  scheduler and looks again, at the in-flight budgets as well, so the
+  second request waits behind the first. Two 900 KB uploads from one IP
+  against a 256 KiB share: 26 of 240 were answered `B` before (multi-thread
+  runtime), none after. A pool that is really full still refuses at once.
+  (#1218)
 - `nanocached-node`: a client trickling a large frame into a receive buffer holding between 32 KiB and 64 KiB made the node copy that buffer twice on every read (about 50 KB of memcpy per byte received; 3,000 one-byte writes gave 1,735 rebuilds in a debug test). The buffer is rebuilt to release memory, the next read doubled it back over the 64 KiB threshold, and the read after that rebuilt it again. A buffer over the threshold is now rebuilt only when it is mostly slack (`capacity > 2 * len + 64 KiB`), and the receive charge still goes only after a rebuild (#1204).
 - `nanocached-discovery`: remembering a departed node (an eviction, a `V`, an
   abandoned join) scanned the whole departed table, up to 4,096 names, on
