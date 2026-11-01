@@ -51,7 +51,7 @@ and friends run against a nanocached cluster.
 pip install nanocached-django
 ```
 
-Pulls in the `nanocached` SDK of the same version and `Django>=4.2`.
+Pulls in the `nanocached` SDK of the same version and `Django>=5.2`.
 
 ## Setup
 
@@ -279,8 +279,9 @@ decimal digits of an `int`), and after compression when
 
 ## Requirements
 
-Python 3.11+, Django 4.2+, `nanocached` (Python SDK) 0.6.0+ (what
-`pyproject.toml` pins), a nanocached server 0.4.0 or later — the release
+Python 3.11+, Django 5.2+ (version 0.6.0 is the last release that
+supports Django 4.2, whose extended support ended on 2026-04-07),
+`nanocached` (Python SDK) 0.6.0+ (what `pyproject.toml` pins), a nanocached server 0.4.0 or later — the release
 that added namespaces, `CLEAR`, the put-if-absent `add()` uses, the
 `INCR` behind `incr`/`decr`, and the batched multi-get/multi-set behind
 `get_many`/`set_many`. `touch()` additionally needs a server release that
