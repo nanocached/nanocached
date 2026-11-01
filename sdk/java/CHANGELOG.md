@@ -18,6 +18,23 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
   failing with `AlreadyClosed`, leaving the node with one extra short-lived
   connection. The redial now checks that the client is closed before
   dialing (#1229).
+- An `Error` (`OutOfMemoryError`, a `LinkageError`, an `AssertionError`
+  under `-ea`) thrown by one of the parallel legs of `getMany`, `setMany`,
+  `touchMany`, `clear`, or by a replica leg of a single-key write reached
+  the caller as a `CompletionException`. It is now thrown as itself, after
+  the remaining legs have been drained, as a hedged read already did
+  (#1215).
+- With `fireAndForgetReplicas`, the background replica leg of `set` and of
+  the batch `setMany*` calls copied the value but still read the caller's
+  key and namespace arrays when it ran. A caller that overwrote those
+  buffers right after the call returned made the replica store the value
+  under a different key or namespace. The leg now gets its own copies of
+  both (#1199).
+- `client.namespace(byte[])` kept the caller's array by reference, so
+  overwriting the buffer afterwards silently re-scoped the handle: later
+  calls hashed to a different owner and carried a different namespace in
+  their frames. The handle now keeps its own copy, as its `namespace()`
+  getter already returned one (#1181).
 - With `readHedgeAfter` set, a read could block its calling thread forever
   when a hedge leg threw an `Error` (`OutOfMemoryError`, a `LinkageError`
   after a redeploy, an `AssertionError` under `-ea`): the leg recorded no

@@ -1316,7 +1316,11 @@ public final class NanocachedClient implements AutoCloseable {
         private final byte[] namespace;
 
         private Namespace(byte[] namespace) {
-            this.namespace = namespace;
+            // Copied, like the getter below: this array is reused for every
+            // call the handle makes, so a caller who later overwrites the
+            // buffer they passed in would otherwise re-scope the handle
+            // (different HRW owner, different namespace in the frames).
+            this.namespace = namespace.clone();
         }
 
         /** The namespace this handle scopes every call to. A defensive
@@ -2560,8 +2564,14 @@ public final class NanocachedClient implements AutoCloseable {
                 // the uncopied `outgoing` above, since it always finishes before
                 // this method returns and so can never observe a later mutation.
                 byte[] backgroundSafe = compress ? outgoing : Arrays.copyOf(outgoing, outgoing.length);
+                // Issue #1199: the same holds for the key and the namespace —
+                // the leg frames them only once it runs, so a caller that
+                // reuses those buffers must not change where the replica
+                // stores the value.
+                byte[] backgroundKey = key.clone();
+                byte[] backgroundNamespace = namespace.clone();
                 return connection -> {
-                    connection.set(namespace, key, backgroundSafe, wireTtlSeconds);
+                    connection.set(backgroundNamespace, backgroundKey, backgroundSafe, wireTtlSeconds);
                     return null;
                 };
             });
@@ -3803,11 +3813,17 @@ public final class NanocachedClient implements AutoCloseable {
                 // instead of the shared, still-mutable one. Only the entries
                 // this leg actually touches are copied, not the whole batch.
                 byte[][] backgroundValues = compress ? valueBytes : copyValuesForBackground(valueBytes, batch.indices);
+                // Issue #1199: the leg frames the keys and the namespace
+                // only once it runs, so copy those too (the keys this leg
+                // touches; a Map-based call built its own key arrays, a
+                // positional byte[][] call hands us the caller's).
+                byte[][] backgroundKeys = copyValuesForBackground(keyBytes, batch.indices);
+                byte[] backgroundNamespace = namespace.clone();
                 // Its outcome is never waited for, so it records nothing
                 // in the tracker: the retry pass (if any) sends this
                 // owner its positions again, as before.
                 Runnable backgroundLeg = () -> runMultiSetLeg(
-                        namespace, name, batch, keyBytes, backgroundValues, ttlSeconds, retry, null);
+                        backgroundNamespace, name, batch, backgroundKeys, backgroundValues, ttlSeconds, retry, null);
                 try {
                     CompletableFuture.runAsync(backgroundLeg, backgroundLegs)
                             .whenComplete((ignoredResult, error) -> {
@@ -3865,12 +3881,12 @@ public final class NanocachedClient implements AutoCloseable {
      * documented invariant (issue #413). It's dropped instead.
      * Returns the first bug, or {@code null} if every leg succeeded. */
     RuntimeException drainLegsKeepingFirstBug(List<CompletableFuture<Void>> legs) {
-        RuntimeException legBug = null;
+        Throwable legBug = null;
         for (CompletableFuture<Void> pending : legs) {
             try {
                 pending.join();
             } catch (CompletionException wrapped) {
-                RuntimeException bug = unwrapReplicaBug(wrapped);
+                Throwable bug = unwrapReplicaBug(wrapped);
                 if (legBug == null) {
                     legBug = bug;
                 } else if (!(bug instanceof NanocachedException.DecompressionFailed)) {
@@ -3878,7 +3894,9 @@ public final class NanocachedClient implements AutoCloseable {
                 }
             }
         }
-        return legBug;
+        // An Error (OutOfMemoryError, LinkageError, AssertionError) is thrown
+        // as itself, after every leg has been drained — issue #1215.
+        return asRuntimeOrThrowError(legBug);
     }
 
     /** Dispatches one owner's {@code o} sub-batch (via {@link
@@ -3910,9 +3928,11 @@ public final class NanocachedClient implements AutoCloseable {
      * background — copies only the entries {@code indices} (this leg's
      * own {@link OwnerBatch#indices}) actually reads, leaving every other
      * slot {@code null} since {@link #runMultiSetLeg} never looks at
-     * them. Only called when {@code compress} is off for the whole batch
-     * (see the caller) — when it's on, every element is already a fresh
-     * array from {@link Compression#compressValue} and needs no copy.
+     * them. Only called for values when {@code compress} is off for the
+     * whole batch (see the caller) — when it's on, every element is
+     * already a fresh array from {@link Compression#compressValue} and
+     * needs no copy. Also used for the key arrays (issue #1199), which
+     * are never compressed and so always need the copy.
      */
     private static byte[][] copyValuesForBackground(byte[][] valueBytes, List<Integer> indices) {
         byte[][] copy = new byte[valueBytes.length][];
@@ -5234,12 +5254,12 @@ public final class NanocachedClient implements AutoCloseable {
         // itself also failed — any other one is still counted/logged via
         // reportBackgroundWriteBug, the same as a fireAndForgetReplicas
         // leg's bug above.
-        RuntimeException replicaBug = null;
+        Throwable replicaBug = null;
         for (CompletableFuture<Void> pending : replicaWrites) {
             try {
                 pending.join();
             } catch (CompletionException wrapped) {
-                RuntimeException bug = unwrapReplicaBug(wrapped);
+                Throwable bug = unwrapReplicaBug(wrapped);
                 if (primaryError != null && replicaBug == null) {
                     replicaBug = bug;
                 } else {
@@ -5249,7 +5269,8 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         if (primaryError != null) {
-            throw replicaBug != null ? replicaBug : primaryError;
+            RuntimeException replicaRuntimeBug = asRuntimeOrThrowError(replicaBug);
+            throw replicaRuntimeBug != null ? replicaRuntimeBug : primaryError;
         }
         return value;
     }
@@ -5612,10 +5633,25 @@ public final class NanocachedClient implements AutoCloseable {
      * a genuine programming bug. Every exception escaping this SDK's
      * public API must extend {@link NanocachedException} or be the raw
      * bug itself — never a {@link CompletionException} (audit
-     * finding, see {@link #write}). */
-    private static RuntimeException unwrapReplicaBug(CompletionException wrapped) {
+     * finding, see {@link #write}).
+     *
+     * <p>An {@link Error} cause (an {@code OutOfMemoryError}, a {@code
+     * LinkageError}, an {@code AssertionError} under {@code -ea}) is
+     * returned as itself too, exactly as {@link #readHedged} rethrows one
+     * (issue #1150); {@link #asRuntimeOrThrowError} is what turns it back
+     * into a throw (issue #1215). */
+    private static Throwable unwrapReplicaBug(CompletionException wrapped) {
         Throwable cause = wrapped.getCause();
-        return cause instanceof RuntimeException runtime ? runtime : wrapped;
+        return cause instanceof RuntimeException || cause instanceof Error ? cause : wrapped;
+    }
+
+    /** The bug {@link #unwrapReplicaBug} returned, as the unchecked value
+     * callers hand back to their own caller: an {@link Error} is thrown
+     * right here instead (so it reaches the caller as itself, never wrapped
+     * in a {@link CompletionException}), {@code null} stays {@code null}. */
+    private static RuntimeException asRuntimeOrThrowError(Throwable bug) {
+        if (bug instanceof Error error) throw error;
+        return (RuntimeException) bug;
     }
 
     /** Submits {@code replicaWrite} to {@link #replicaWriters}, falling

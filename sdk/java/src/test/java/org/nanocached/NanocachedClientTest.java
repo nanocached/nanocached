@@ -322,6 +322,23 @@ class NanocachedClientTest {
         }
     }
 
+    // The handle keeps its own copy of the namespace: a caller who reuses the
+    // buffer after creating the handle must not re-scope it (issue #1181).
+    @Test
+    void namespaceHandleCopiesTheCallersBuffer() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                byte[] buf = "tenant-a".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                NanocachedClient.Namespace ns = client.namespace(buf);
+                ns.set("k", "v");
+                java.util.Arrays.fill(buf, (byte) 'x');
+                assertEquals(Optional.of("v"), ns.get("k"));
+                assertArrayEquals("tenant-a".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                        ns.namespace());
+            }
+        }
+    }
+
     @Test
     void wrongNodePropagatesForBatchedOpsInSingleMode() throws Exception {
         try (MockNode node = new MockNode()) {
@@ -4085,6 +4102,28 @@ class NanocachedClientTest {
                     // Restore so close() runs its real teardown.
                     closedField.setBoolean(client, false);
                 }
+    void drainLegsKeepingFirstBugThrowsALegErrorAsItselfAfterDrainingEveryLeg() throws Exception {
+        // Issue #1215: CompletableFuture#join wraps a leg's Error
+        // (OutOfMemoryError, LinkageError, AssertionError, ...) in a
+        // CompletionException whose cause is not a RuntimeException, so
+        // unwrapReplicaBug used to hand the wrapper back and getMany /
+        // setMany / touchMany / clear leaked a CompletionException. Like
+        // readHedged (issue #1150), the Error must now reach the caller as
+        // itself -- and only after the remaining legs were drained.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                AssertionError injected = new AssertionError("a leg's Error");
+                RuntimeException later = new IllegalStateException("a later leg's bug");
+                List<CompletableFuture<Void>> legs = List.of(
+                        CompletableFuture.failedFuture(injected),
+                        CompletableFuture.failedFuture(later));
+
+                long before = client.stats().backgroundWriteBugs();
+                Throwable thrown = assertThrows(Throwable.class, () -> client.drainLegsKeepingFirstBug(legs));
+
+                assertSame(injected, thrown, "the leg's Error must reach the caller as itself");
+                assertEquals(before + 1, client.stats().backgroundWriteBugs(),
+                        "the later leg must still have been drained and its bug counted");
             }
         }
     }
@@ -4478,6 +4517,90 @@ class NanocachedClientTest {
                 assertArrayEquals("original".getBytes(StandardCharsets.UTF_8),
                         cluster.nodes().get(replica).store.get(stored),
                         "the replica must store the original bytes, not the caller's later in-place mutation");
+            }
+        }
+    }
+
+    // Occupies the (single) background-leg thread so a fire-and-forget leg
+    // stays queued, not yet having read its arguments, until the returned
+    // latch is released.
+    private static java.util.concurrent.CountDownLatch blockBackgroundLegs(NanocachedClient client)
+            throws Exception {
+        Field backgroundLegsField = NanocachedClient.class.getDeclaredField("backgroundLegs");
+        backgroundLegsField.setAccessible(true);
+        ExecutorService backgroundLegs = (ExecutorService) backgroundLegsField.get(client);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch occupied = new java.util.concurrent.CountDownLatch(1);
+        backgroundLegs.submit(() -> {
+            occupied.countDown();
+            release.await();
+            return null;
+        });
+        assertTrue(occupied.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                "the backgroundLegs thread should have started its blocking dummy task");
+        return release;
+    }
+
+    @Test
+    void fireAndForgetSetLegDoesNotAliasTheCallersKeyOrNamespace() throws Exception {
+        // Issue #1199: #326 copies the value only. The key and namespace
+        // arrays are framed when the background leg runs, so a caller that
+        // overwrites them right after set() returns must not move the
+        // replica's copy to a different key / namespace.
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+        try (Cluster cluster = startCluster(2)) {
+            byte[] namespace = "tenant".getBytes(StandardCharsets.UTF_8);
+            byte[] key = "k".getBytes(StandardCharsets.UTF_8);
+            String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
+
+            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+                java.util.concurrent.CountDownLatch release = blockBackgroundLegs(client);
+                try {
+                    client.set(namespace, key, "v".getBytes(StandardCharsets.UTF_8), 0L);
+                    Arrays.fill(key, (byte) 'X');
+                    Arrays.fill(namespace, (byte) 'Y');
+                } finally {
+                    release.countDown();
+                }
+
+                MockNode node = cluster.nodes().get(replica);
+                waitFor(() -> !node.namespacedStores.isEmpty(), "the background write to land on the replica");
+                Map<String, byte[]> stored = node.namespacedStores.get("tenant");
+                assertTrue(stored != null && stored.containsKey("k"),
+                        "the replica must store under the original namespace and key, got "
+                                + node.namespacedStores.keySet());
+                assertArrayEquals("v".getBytes(StandardCharsets.UTF_8), stored.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void fireAndForgetSetManyLegDoesNotAliasTheCallersKeyOrNamespace() throws Exception {
+        // Issue #1199: as above, for the batch path (multiSetPass).
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+        try (Cluster cluster = startCluster(2)) {
+            byte[] namespace = "tenant".getBytes(StandardCharsets.UTF_8);
+            byte[] key = "k".getBytes(StandardCharsets.UTF_8);
+            String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
+
+            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+                java.util.concurrent.CountDownLatch release = blockBackgroundLegs(client);
+                try {
+                    client.setManyBytes(namespace, new byte[][] {key},
+                            new byte[][] {"v".getBytes(StandardCharsets.UTF_8)}, 0L);
+                    Arrays.fill(key, (byte) 'X');
+                    Arrays.fill(namespace, (byte) 'Y');
+                } finally {
+                    release.countDown();
+                }
+
+                MockNode node = cluster.nodes().get(replica);
+                waitFor(() -> !node.namespacedStores.isEmpty(), "the background write to land on the replica");
+                Map<String, byte[]> stored = node.namespacedStores.get("tenant");
+                assertTrue(stored != null && stored.containsKey("k"),
+                        "the replica must store under the original namespace and key, got "
+                                + node.namespacedStores.keySet());
+                assertArrayEquals("v".getBytes(StandardCharsets.UTF_8), stored.get("k"));
             }
         }
     }
