@@ -14,6 +14,18 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
+  started the decommission and sent its leave only after the whole handoff,
+  so a handoff longer than discovery's liveness timeout (15 s by default;
+  a node with about 50,000 keys or more on a LAN) had the node evicted
+  halfway through. Survivors adopted a roster without it, clients wrote
+  straight to the new owner, and the drain's unconditional `U`s then
+  overwrote those acknowledged writes with the old values: with two nodes at
+  R=1 and 1.2 million keys, 141 of 1,000 sampled keys read as missing during
+  the drain and all 141 came back with their old value after it. The node
+  now heartbeats through the handoff (without adopting the rosters the acks
+  carry) and stops, waiting for the heartbeat tasks to exit, right before
+  the leave, so no heartbeat can re-register it afterwards (#1158).
 - `nanocached-node`: a connection's receive-buffer charge against
   `--max-in-flight-bytes` was released as soon as the buffer's reported
   capacity fell to the free 64 KiB, but after a large frame that reported

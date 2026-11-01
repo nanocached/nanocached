@@ -359,6 +359,12 @@ const HEARTBEAT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 /// is itself bounded by at most ~100ms sleeps, so a well-behaved task
 /// should never need close to this long.
 const DECOMMISSION_OVERRIDE_GRACE: Duration = Duration::from_secs(2);
+/// Issue #1158: how long `run_decommission` waits, after stopping the
+/// heartbeats, for the registration tasks to exit before it sends the `V`.
+/// They return at once unless one is inside a write to discovery; kept
+/// under `DECOMMISSION_OVERRIDE_GRACE` so an operator override still
+/// reaches the `V`.
+const HEARTBEAT_QUIESCE_WAIT: Duration = Duration::from_secs(1);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Issue #1028: the per-connection log lines (`INFO accepted connection
@@ -1399,21 +1405,31 @@ pub(crate) async fn run_with_hooks(
         .as_ref()
         .map(|config| config.discovery_addrs.clone());
 
-    // Issue #124: heartbeats get their own stop signal, flipped either
-    // at normal shutdown or the moment a decommission begins — a
-    // heartbeat surviving past the leave would be answered as an
-    // unknown node and re-register, quietly re-joining the cluster the
-    // node just left.
+    // Issue #124: heartbeats get their own stop signal, flipped at normal
+    // shutdown or, during a decommission, by `run_decommission` just before
+    // it sends the leave — a heartbeat surviving past the leave would be
+    // answered as an unknown node and re-register, quietly re-joining the
+    // cluster the node just left.
+    //
+    // Issue #1158: that stop used to be flipped when the decommission
+    // began, so a drain longer than the discovery's liveness timeout had
+    // this node evicted halfway through the handoff. Heartbeats now run
+    // through the drain; `registrations_done_rx` lets `run_decommission`
+    // wait until every registration task has really exited before the `V`.
     let (heartbeat_stop_tx, heartbeat_stop_rx) = watch::channel(false);
+    let heartbeat_stop_tx = Arc::new(heartbeat_stop_tx);
+    let (registrations_done_tx, registrations_done_rx) = mpsc::channel::<()>(1);
     let heartbeat_task = match (heartbeat, &node_context) {
         (Some(config), Some(node_context)) => Some(tokio::spawn(send_heartbeats(
             config,
             node_context.clone(),
             rereplication_rx,
             heartbeat_stop_rx,
+            registrations_done_tx,
         ))),
         _ => None,
     };
+    let mut registrations_done_rx = Some(registrations_done_rx);
 
     // Buffered rather than unbounded: staged node join allows only one migration in
     // flight per node (see `NodeContext::active_migration`), so a handful of
@@ -1520,6 +1536,10 @@ pub(crate) async fn run_with_hooks(
                         );
                         task.abort();
                     }
+                    // Issue #1158: heartbeats now outlive the decommission's
+                    // start, and an aborted (or never-reached) `send_leave`
+                    // would leave them running through the shutdown below.
+                    heartbeat_stop_tx.send_replace(true);
 
                     break;
                 }
@@ -1540,15 +1560,38 @@ pub(crate) async fn run_with_hooks(
                         drain_timeout.as_secs()
                     );
                     decommission_started = true;
-                    // Stop heartbeating before anything else: a
-                    // heartbeat landing after the V would re-register
-                    // this node (see heartbeat_stop_tx above).
-                    heartbeat_stop_tx.send_replace(true);
+                    // Issue #1158: heartbeats keep running through the
+                    // drain, so a handoff longer than the liveness timeout
+                    // does not get this node evicted (survivors adopting a
+                    // roster without it while the drain's unconditional `U`
+                    // still overwrites writes made directly to the new
+                    // owner). `run_decommission` stops them, and waits for
+                    // the registration tasks to exit, right before the `V`
+                    // (a heartbeat landing after the V would re-register
+                    // this node, see heartbeat_stop_tx above). A node that
+                    // was never promoted holds no liveness (its `J`
+                    // connection just waits), so stop it now as before
+                    // rather than let discovery promote it mid-drain.
+                    if !node_context.promoted.load(Ordering::SeqCst) {
+                        heartbeat_stop_tx.send_replace(true);
+                    }
+                    let heartbeat_stop = registrations_done_rx.take().map(|registrations_done| {
+                        HeartbeatStop {
+                            stop_tx: Arc::clone(&heartbeat_stop_tx),
+                            registrations_done,
+                        }
+                    });
                     let node_context = node_context.clone();
                     let discovery_addrs = discovery_addrs.clone();
                     let done = decommission_done_tx.clone();
                     decommission_task = Some(tokio::spawn(async move {
-                        run_decommission(node_context, discovery_addrs, drain_timeout).await;
+                        run_decommission(
+                            node_context,
+                            discovery_addrs,
+                            drain_timeout,
+                            heartbeat_stop,
+                        )
+                        .await;
                         let _ = done.send(true);
                     }));
                     // Issue #407: re-arm so a second signal during the
@@ -4362,6 +4405,7 @@ async fn send_heartbeats(
     node_context: NodeContext,
     mut rereplication_rx: mpsc::Receiver<RereplicationTask>,
     shutdown_rx: watch::Receiver<bool>,
+    registrations_done: mpsc::Sender<()>,
 ) {
     let (promoted_tx, promoted_rx) = watch::channel(false);
     let promoted_tx = Arc::new(promoted_tx);
@@ -4374,7 +4418,11 @@ async fn send_heartbeats(
             DiscoveryRole::Standby(promoted_rx.clone())
         };
 
-        tasks.spawn(register_with_discovery(
+        // Issue #1158: the guard lives exactly as long as this
+        // registration task, so `registrations_done.recv()` resolving
+        // (every sender dropped) means no heartbeat can be sent any more.
+        let guard = registrations_done.clone();
+        let registration = register_with_discovery(
             discovery_addr.clone(),
             config.port,
             config.interval,
@@ -4383,8 +4431,13 @@ async fn send_heartbeats(
             node_context.clone(),
             role,
             shutdown_rx.clone(),
-        ));
+        );
+        tasks.spawn(async move {
+            registration.await;
+            drop(guard);
+        });
     }
+    drop(registrations_done);
     // This function's own copy must go, or its later drain of
     // `rereplication_rx` would deadlock waiting for a channel it is
     // itself still holding a sender to (`NodeContext::rereplication_tx`)
@@ -4591,11 +4644,19 @@ async fn register_with_discovery(
                             // Issue #571: asked of the primary only — a
                             // standby never sees a Waiting joiner, so its
                             // answer would mean nothing.
+                            // Issue #1158: set once `run_decommission` has
+                            // fixed the handoff's rings. From then on the
+                            // heartbeat is liveness only — see below.
+                            let leaving = node_context
+                                .leaving
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .is_some();
                             let pending_joiner = match &role {
-                                DiscoveryRole::Primary(_) => {
+                                DiscoveryRole::Primary(_) if !leaving => {
                                     unconfirmed_completed_joiner(&node_context)
                                 }
-                                DiscoveryRole::Standby(_) => None,
+                                _ => None,
                             };
                             let heartbeat = heartbeat_message(
                                 &node_context.name,
@@ -4658,8 +4719,17 @@ async fn register_with_discovery(
                             // other (discovery HA), and flip-flopping
                             // between two replicas' views would be worse
                             // than either.
+                            //
+                            // Issue #1158: not while this node is draining.
+                            // Heartbeats keep it a member until the leave,
+                            // but the handoff works from the rings fixed when
+                            // it began; adopting a later roster would change
+                            // what this node serves mid-drain and could start
+                            // a re-replication for a node that is leaving
+                            // cleanly anyway.
                             if let Some((members, replication)) = roster
                                 && matches!(role, DiscoveryRole::Primary(_))
+                                && !leaving
                             {
                                 let published = members.clone();
                                 note_published_roster(
@@ -6915,10 +6985,55 @@ async fn shutdown_requested(shutdown_rx: &mut watch::Receiver<bool>) {
     }
 }
 
+/// What `run_decommission` needs to stop the heartbeats it deliberately
+/// leaves running through the drain (issue #1158).
+pub(crate) struct HeartbeatStop {
+    /// `run`'s heartbeat stop signal.
+    stop_tx: Arc<watch::Sender<bool>>,
+    /// Resolves (to `None`) once every registration task `send_heartbeats`
+    /// spawned has exited and dropped its sender.
+    registrations_done: mpsc::Receiver<()>,
+}
+
+impl HeartbeatStop {
+    /// Stops the heartbeats and waits for the tasks that send them to
+    /// exit, so none can land after the `V` and re-register the node.
+    /// Bounded: a task stuck in a write to an unresponsive discovery is
+    /// not worth holding the leave back for.
+    async fn stop_and_wait(&mut self) {
+        self.stop_tx.send_replace(true);
+        if timeout(HEARTBEAT_QUIESCE_WAIT, self.registrations_done.recv())
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "WARN decommission: heartbeat tasks still running {}s after the stop signal \
+                 — leaving anyway",
+                HEARTBEAT_QUIESCE_WAIT.as_secs()
+            );
+        }
+    }
+}
+
+/// `send_leave`, preceded by stopping the heartbeats (issue #1158): every
+/// path of `run_decommission` that leaves goes through here, so the `V` is
+/// never followed by a heartbeat that would re-register the node.
+async fn leave_membership(
+    node_context: &NodeContext,
+    discovery_addrs: &[String],
+    heartbeat: &mut Option<HeartbeatStop>,
+) {
+    if let Some(heartbeat) = heartbeat.as_mut() {
+        heartbeat.stop_and_wait().await;
+    }
+    send_leave(node_context, discovery_addrs).await;
+}
+
 async fn run_decommission(
     node_context: NodeContext,
     discovery_addrs: Vec<String>,
     drain_budget: Duration,
+    mut heartbeat: Option<HeartbeatStop>,
 ) {
     let deadline = Instant::now() + drain_budget;
     // Tenth-pass audit (2026-09-02), issue #407 follow-up: this node's own
@@ -7003,7 +7118,7 @@ async fn run_decommission(
             "INFO decommission: second shutdown signal received during the join-migration \
              wait — leaving without a handoff"
         );
-        send_leave(&node_context, &discovery_addrs).await;
+        leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
         return;
     }
 
@@ -7028,7 +7143,7 @@ async fn run_decommission(
                 "WARN decommission: shutdown override while fetching the roster; leaving \
                  without a handoff"
             );
-            send_leave(&node_context, &discovery_addrs).await;
+            leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
             return;
         }
         Some(Ok(roster)) => roster,
@@ -7037,7 +7152,7 @@ async fn run_decommission(
                 "WARN decommission: fetching the roster failed ({error}); leaving without a \
                  handoff"
             );
-            send_leave(&node_context, &discovery_addrs).await;
+            leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
             return;
         }
     };
@@ -7046,7 +7161,7 @@ async fn run_decommission(
     if !members.iter().any(|(name, _, _)| *name == self_name) {
         // Not a member (already expired, or never joined): nothing to
         // hand off.
-        send_leave(&node_context, &discovery_addrs).await;
+        leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
         return;
     }
     let survivors: Vec<(String, String, String)> = members
@@ -7056,7 +7171,7 @@ async fn run_decommission(
         .collect();
     if survivors.is_empty() {
         println!("INFO decommission: last member — nothing to hand off");
-        send_leave(&node_context, &discovery_addrs).await;
+        leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
         return;
     }
 
@@ -7092,7 +7207,7 @@ async fn run_decommission(
     // 3. Transfer.
     let Some(keys) = list_keys(&node_context.request_tx).await else {
         eprintln!("WARN decommission: cache task unavailable; leaving without a handoff");
-        send_leave(&node_context, &discovery_addrs).await;
+        leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
         return;
     };
     // Issue #970: dead copies stay out of this handoff unless their marks are still held.
@@ -7262,7 +7377,7 @@ async fn run_decommission(
     println!("INFO decommission: handed off {sent} entr(ies)");
 
     // 4. Leave.
-    send_leave(&node_context, &discovery_addrs).await;
+    leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
 
     // 5. Grace: keep forwarding concurrent writes while clients refresh
     // onto the post-leave roster.
@@ -20540,6 +20655,7 @@ mod tests {
             node_context.clone(),
             vec![discovery_addr.clone()],
             Duration::from_secs(5),
+            None,
         )
         .await;
 
@@ -20557,6 +20673,356 @@ mod tests {
         drop(node_context);
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    /// Issue #1158: a discovery that logs what a node sends it, in order,
+    /// as one letter per message (`J`/`P` registration, `H` heartbeat,
+    /// `T` roster fetch, `V` leave). Heartbeats are acked with a bare `A`.
+    fn spawn_logging_discovery(
+        listener: TcpListener,
+        peer_addr: String,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<char>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let log: Arc<std::sync::Mutex<Vec<char>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&log);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = Arc::clone(&recorded);
+                let peer_addr = peer_addr.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let Some(position) = buf.iter().position(|byte| *byte == b'\n') else {
+                            let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                            continue;
+                        };
+                        let line: Vec<u8> = buf.drain(..=position).collect();
+                        let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+                        let letter = line.chars().next().unwrap();
+                        let fields: Vec<usize> = line
+                            .split(' ')
+                            .skip(1)
+                            .map(|field| field.parse().unwrap())
+                            .collect();
+                        // `J`/`P`: name-len port token-len; `H`: name-len
+                        // replication token-len; `T`/`V`: name-len
+                        // token-len.
+                        let need = match letter {
+                            'J' | 'P' | 'H' => fields[0] + fields[2],
+                            _ => fields[0] + fields[1],
+                        };
+                        while buf.len() < need {
+                            let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                        }
+                        buf.drain(..need);
+                        recorded.lock().unwrap().push(letter);
+                        let reply: Vec<u8> = match letter {
+                            'J' | 'P' | 'V' => b"R\n".to_vec(),
+                            'H' => b"A\n".to_vec(),
+                            _ => {
+                                let entries = [
+                                    ("leaver", "127.0.0.1:1", "tok-leaver"),
+                                    ("peer", peer_addr.as_str(), "tok-peer"),
+                                ];
+                                let mut response = format!("N {} 1\n", entries.len()).into_bytes();
+                                for (name, addr, token) in entries {
+                                    response.extend_from_slice(
+                                        format!(
+                                            "{} {} {}\n{name}{addr}{token}\n",
+                                            name.len(),
+                                            addr.len(),
+                                            token.len()
+                                        )
+                                        .as_bytes(),
+                                    );
+                                }
+                                response
+                            }
+                        };
+                        let _ = stream.write_all(&reply).await;
+                    }
+                });
+            }
+        });
+        (log, task)
+    }
+
+    /// Issue #1158: a handoff target that takes `delay` to acknowledge each
+    /// `U`, so a drain of N keys lasts about N * delay.
+    fn spawn_slow_peer(listener: TcpListener, delay: Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut connection, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = BytesMut::new();
+                    loop {
+                        let Some(header_end) = buf.iter().position(|byte| *byte == b'\n') else {
+                            let mut chunk = [0u8; 1024];
+                            let Ok(bytes_read) = connection.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                            continue;
+                        };
+                        let header = String::from_utf8(buf[..header_end].to_vec()).unwrap();
+                        let fields: Vec<usize> = header
+                            .split(' ')
+                            .skip(1)
+                            .filter_map(|field| field.parse().ok())
+                            .collect();
+                        let (body_length, reply) = if header.starts_with("A ") {
+                            (fields[0], &b"On\n"[..])
+                        } else {
+                            assert!(header.starts_with("U "), "unexpected frame {header:?}");
+                            (fields[0] + fields[1] + fields[2] + fields[3], &b"S\n"[..])
+                        };
+                        let frame_end = header_end + 1 + body_length;
+                        while buf.len() < frame_end {
+                            let mut chunk = [0u8; 1024];
+                            let Ok(bytes_read) = connection.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                        }
+                        let _ = buf.split_to(frame_end);
+                        if header.starts_with("U ") {
+                            sleep(delay).await;
+                        }
+                        let _ = connection.write_all(reply).await;
+                    }
+                });
+            }
+        })
+    }
+
+    /// Issue #1158: a real `run_with_hooks` node (heartbeat every 20 ms)
+    /// holding `keys` keys it owns, with the two shutdown signals a test
+    /// sends by hand, a discovery logging what the node says and a peer that
+    /// answers each handoff `U` after `delay`.
+    struct DrainingNode {
+        log: Arc<std::sync::Mutex<Vec<char>>>,
+        first_signal: Arc<tokio::sync::Notify>,
+        second_signal: Arc<tokio::sync::Notify>,
+        node: tokio::task::JoinHandle<io::Result<()>>,
+        helpers: Vec<tokio::task::JoinHandle<()>>,
+        owned: usize,
+    }
+
+    impl DrainingNode {
+        async fn start(keys: usize, delay: Duration) -> Self {
+            let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let peer_addr = peer_listener.local_addr().unwrap().to_string();
+            let peer = spawn_slow_peer(peer_listener, delay);
+            let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+            let (log, discovery) = spawn_logging_discovery(discovery_listener, peer_addr);
+
+            let node_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let node_port = node_listener.local_addr().unwrap().port();
+            let first_signal = Arc::new(tokio::sync::Notify::new());
+            let second_signal = Arc::new(tokio::sync::Notify::new());
+            let signals = [Arc::clone(&first_signal), Arc::clone(&second_signal)];
+            let mut taken = 0usize;
+            let hooks = RunHooks {
+                shutdown: Box::new(move || {
+                    let signal = Arc::clone(&signals[taken.min(1)]);
+                    taken += 1;
+                    Box::pin(async move {
+                        signal.notified().await;
+                        Ok(())
+                    })
+                }),
+                node_name: Some("leaver".to_string()),
+                listener: Some(node_listener),
+                gates: Default::default(),
+            };
+            let node = tokio::spawn(run_with_hooks(
+                "127.0.0.1:0",
+                Some(HeartbeatConfig {
+                    discovery_addrs: vec![discovery_addr],
+                    port: node_port,
+                    interval: Duration::from_millis(20),
+                    auth_secret: None,
+                    tls_connector: None,
+                }),
+                None,
+                None,
+                MAX_CACHE_MEMORY_BYTES,
+                None,
+                Duration::from_secs(60),
+                ConnectionLimits::default(),
+                Vec::new(),
+                hooks,
+            ));
+
+            // Keys the leaver owns over {leaver, peer} at R=1 are the ones
+            // the drain hands to the peer, one slow round trip each.
+            let ring = HashRing::new(vec!["leaver".to_string(), "peer".to_string()]);
+            let mut client = TcpStream::connect(("127.0.0.1", node_port)).await.unwrap();
+            let mut owned = 0;
+            let mut index = 0;
+            while owned < keys {
+                let name = format!("key-{index}");
+                index += 1;
+                if !ring.is_owner(&key(name.as_bytes()), "leaver", 1) {
+                    continue;
+                }
+                let request = format!("S {} 1\n{name}v", name.len());
+                client.write_all(request.as_bytes()).await.unwrap();
+                let mut reply = [0u8; 16];
+                assert!(client.read(&mut reply).await.unwrap() > 0);
+                owned += 1;
+            }
+
+            Self {
+                log,
+                first_signal,
+                second_signal,
+                node,
+                helpers: vec![peer, discovery],
+                owned,
+            }
+        }
+
+        /// Waits (real time, bounded) until `condition` holds of the log.
+        async fn wait_for(&self, what: &str, condition: impl Fn(&[char]) -> bool) {
+            for _ in 0..500 {
+                if condition(&self.log.lock().unwrap()) {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            panic!(
+                "timed out waiting for {what}: {:?}",
+                self.log.lock().unwrap()
+            );
+        }
+
+        fn log(&self) -> Vec<char> {
+            self.log.lock().unwrap().clone()
+        }
+
+        async fn finish(self, within: Duration) {
+            let result = tokio::time::timeout(within, self.node)
+                .await
+                .expect("the node must exit")
+                .unwrap();
+            assert!(result.is_ok(), "{result:?}");
+            for helper in self.helpers {
+                helper.abort();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_drain_keeps_heartbeating_until_just_before_the_leave() {
+        // Issue #1158: the heartbeat used to stop the moment SIGTERM
+        // started the decommission, so a handoff longer than discovery's
+        // liveness timeout (15 s by default) got the leaver evicted
+        // halfway through, with survivors serving the keys it had not
+        // handed over yet and its `U`s then overwriting what they had
+        // accepted since. Here the drain lasts ~1 s against a 20 ms
+        // heartbeat: discovery must keep hearing from the node for all of
+        // it, and not at all after the `V`.
+        let node = DrainingNode::start(12, Duration::from_millis(100)).await;
+        node.wait_for("two heartbeats", |log| {
+            log.iter().filter(|letter| **letter == 'H').count() >= 2
+        })
+        .await;
+
+        let before_signal = node.log().len();
+        node.first_signal.notify_one();
+        node.wait_for("the leave", |log| log.contains(&'V')).await;
+        // The leave must be the end of the heartbeats; give a stray one
+        // plenty of time to show up.
+        sleep(Duration::from_millis(300)).await;
+
+        let log = node.log();
+        let leave = log.iter().position(|letter| *letter == 'V').unwrap();
+        let during_drain = log[before_signal..leave]
+            .iter()
+            .filter(|letter| **letter == 'H')
+            .count();
+        assert!(
+            during_drain >= node.owned * 100 / 20 / 2,
+            "the node must keep heartbeating while it drains (a ~{}ms drain, one heartbeat \
+             per 20ms): {log:?}",
+            node.owned * 100
+        );
+        assert_eq!(
+            log.iter().filter(|letter| **letter == 'V').count(),
+            1,
+            "{log:?}"
+        );
+        assert!(
+            log[leave + 1..]
+                .iter()
+                .all(|letter| !matches!(letter, 'H' | 'J' | 'P')),
+            "nothing may re-register the node after the leave: {log:?}"
+        );
+
+        node.second_signal.notify_one();
+        node.finish(Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_overridden_drain_stops_heartbeating_before_it_leaves() {
+        // Issue #1158: a second signal mid-drain takes the early-leave
+        // path. The heartbeats it must stop are no longer stopped when the
+        // decommission begins, so that path has to stop them too — before
+        // the `V`, and for good once the node exits.
+        let node = DrainingNode::start(40, Duration::from_millis(100)).await;
+        node.wait_for("two heartbeats", |log| {
+            log.iter().filter(|letter| **letter == 'H').count() >= 2
+        })
+        .await;
+
+        node.first_signal.notify_one();
+        node.wait_for("the handoff to be under way", |log| log.contains(&'T'))
+            .await;
+        sleep(Duration::from_millis(200)).await;
+        node.second_signal.notify_one();
+        node.wait_for("the leave", |log| log.contains(&'V')).await;
+        let leave_at = node.log().len();
+        // Well inside the 40 * 100ms the full drain would take.
+        let log_probe = Arc::clone(&node.log);
+        node.finish(Duration::from_secs(3)).await;
+
+        let log = log_probe.lock().unwrap().clone();
+        let leave = log.iter().position(|letter| *letter == 'V').unwrap();
+        assert!(leave < leave_at, "{log:?}");
+        assert!(
+            log[leave + 1..]
+                .iter()
+                .all(|letter| !matches!(letter, 'H' | 'J' | 'P')),
+            "no heartbeat after the leave: {log:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -20631,6 +21097,7 @@ mod tests {
                 node_context.clone(),
                 vec![discovery_addr.clone()],
                 Duration::from_secs(120),
+                None,
             ),
         )
         .await
@@ -20728,6 +21195,7 @@ mod tests {
             node_context.clone(),
             vec![discovery_addr.clone()],
             Duration::from_secs(120),
+            None,
         ));
         // Let it get as far as the stalled handshake, then override.
         sleep(Duration::from_millis(300)).await;
@@ -20876,6 +21344,7 @@ mod tests {
                 node_context.clone(),
                 vec![discovery_addr.clone()],
                 Duration::from_secs(1),
+                None,
             ),
         )
         .await;
@@ -20993,6 +21462,7 @@ mod tests {
             node_context.clone(),
             vec![discovery_addr.clone()],
             Duration::from_secs(30),
+            None,
         ));
 
         // Bounded wait (not a fixed sleep) for all three attempts to land.
@@ -21245,6 +21715,7 @@ mod tests {
             node_context.clone(),
             vec![discovery_addr.clone()],
             Duration::from_secs(5),
+            None,
         )
         .await;
 
@@ -25154,6 +25625,7 @@ mod tests {
             ),
             rereplication_rx,
             shutdown_rx,
+            mpsc::channel(1).0,
         )
         .await;
     }
@@ -25211,6 +25683,7 @@ mod tests {
             ),
             mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
 
         sleep(Duration::from_millis(150)).await;
@@ -26364,6 +26837,7 @@ mod tests {
             ),
             mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
         sleep(Duration::from_millis(150)).await;
         shutdown_tx.send_replace(true);
@@ -26745,6 +27219,7 @@ mod tests {
             node_context,
             rereplication_rx,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
 
         // Poll for the expected frame count instead of a fixed sleep —
@@ -27063,6 +27538,7 @@ mod tests {
             ),
             mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
         sleep(Duration::from_millis(150)).await;
         shutdown_tx.send_replace(true);
@@ -27131,6 +27607,7 @@ mod tests {
             ),
             mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
 
         // Let at least one "unknown" heartbeat go out before this node
@@ -27219,6 +27696,7 @@ mod tests {
             node_context.clone(),
             mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
 
         sleep(Duration::from_millis(100)).await;
@@ -27404,6 +27882,7 @@ mod tests {
             node_context.clone(),
             mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
 
         for _ in 0..500 {
@@ -28144,6 +28623,7 @@ mod tests {
             ),
             mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
 
         for _ in 0..500 {
@@ -28242,6 +28722,7 @@ mod tests {
             ),
             mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
 
         for _ in 0..500 {
@@ -28292,6 +28773,7 @@ mod tests {
             ),
             mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
 
         sleep(Duration::from_millis(50)).await;
@@ -28356,6 +28838,7 @@ mod tests {
             ),
             mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
 
         let redialed = timeout(OUTBOUND_IO_TIMEOUT + Duration::from_secs(5), redialed_rx).await;
@@ -28525,6 +29008,7 @@ mod tests {
             ),
             mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
+            mpsc::channel(1).0,
         ));
 
         sleep(Duration::from_millis(150)).await;
