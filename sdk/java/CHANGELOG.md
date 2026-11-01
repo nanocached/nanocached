@@ -13,6 +13,11 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A request retrying while `close()` ran could still dial and authenticate
+  a new connection to the node (up to the 5 s connect deadline) before
+  failing with `AlreadyClosed`, leaving the node with one extra short-lived
+  connection. The redial now checks that the client is closed before
+  dialing (#1229).
 - With `readHedgeAfter` set, a read could block its calling thread forever
   when a hedge leg threw an `Error` (`OutOfMemoryError`, a `LinkageError`
   after a redeploy, an `AssertionError` under `-ea`): the leg recorded no

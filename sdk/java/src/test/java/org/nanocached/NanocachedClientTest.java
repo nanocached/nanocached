@@ -4041,6 +4041,54 @@ class NanocachedClientTest {
         }
     }
 
+    @Test
+    void memberConnectionDoesNotRedialOnceCloseHasBegun() throws Exception {
+        // Issue #1229: a request whose connection close() poisoned retries
+        // through memberConnection. It used to dial and authenticate one more
+        // connection (up to the connect deadline) before openNodeConnection
+        // noticed `closed` and gave up; it must refuse before dialing.
+        // Setting `closed` directly (reflection) reproduces the state such a
+        // retry sees, as in aHedgeLegRacingCloseIsRefusedNotRegistered.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                client.set("k", "v");
+
+                Field closedField = NanocachedClient.class.getDeclaredField("closed");
+                closedField.setAccessible(true);
+                Field membersField = NanocachedClient.class.getDeclaredField("members");
+                membersField.setAccessible(true);
+                Map<?, ?> members = (Map<?, ?>) membersField.get(client);
+                String name = (String) members.keySet().iterator().next();
+                Object member = members.get(name);
+                Field connectionField = member.getClass().getDeclaredField("connection");
+                connectionField.setAccessible(true);
+                Connection dead = (Connection) connectionField.get(member);
+                dead.close();
+                MockNode node = cluster.nodes().get(name);
+                int connectionsBefore = node.connectionCount.get();
+
+                Method memberConnection =
+                        NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
+                memberConnection.setAccessible(true);
+
+                closedField.setBoolean(client, true);
+                try {
+                    InvocationTargetException thrown = assertThrows(
+                            InvocationTargetException.class, () -> memberConnection.invoke(client, name));
+                    assertTrue(thrown.getCause() instanceof NanocachedException.AlreadyClosed,
+                            "expected AlreadyClosed, got " + thrown.getCause());
+                    assertSame(dead, connectionField.get(member),
+                            "no replacement connection may be installed once close() began");
+                    assertEquals(connectionsBefore, node.connectionCount.get(),
+                            "the node must not see another connection once close() began");
+                } finally {
+                    // Restore so close() runs its real teardown.
+                    closedField.setBoolean(client, false);
+                }
+            }
+        }
+    }
+
     // ── クラスタでの INCR/DECR (issue #129) ─────────────────────────
     // The one thing that must never happen: a replica replaying the
     // increment itself. Comparing final stored values between primary and
