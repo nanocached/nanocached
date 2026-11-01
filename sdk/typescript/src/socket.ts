@@ -34,6 +34,28 @@ function ignoreSocketError(): void {}
  * (connected, or connected *and* the TLS handshake has completed). */
 export async function connectSocket(options: ConnectSocketOptions): Promise<Socket | TLSSocket> {
   return new Promise((resolve, reject) => {
+    // The socket is created before the dial timer is armed. `net.connect`
+    // and `tls.connect` throw synchronously for an invalid port (NaN, a
+    // fraction, above 65535) or host; that throw rejects this promise
+    // through the executor, and a timer armed earlier would stay armed
+    // and, on firing, touch a `socket` binding that was never
+    // initialised — a ReferenceError thrown from a timer callback, which
+    // is an uncaught exception that ends the process five seconds after
+    // `connect()` had already rejected (issue #1163).
+    let socket: Socket | TLSSocket;
+    try {
+      socket = options.tls
+        ? tlsConnect({
+            host: options.host,
+            port: options.port,
+            ...(options.ca !== undefined ? { ca: options.ca } : {}),
+          })
+        : netConnect({ host: options.host, port: options.port });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
     const deadline = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
     const timer = setTimeout(() => {
       socket.destroy();
@@ -58,14 +80,6 @@ export async function connectSocket(options: ConnectSocketOptions): Promise<Sock
         }),
       );
     };
-
-    const socket = options.tls
-      ? tlsConnect({
-          host: options.host,
-          port: options.port,
-          ...(options.ca !== undefined ? { ca: options.ca } : {}),
-        })
-      : netConnect({ host: options.host, port: options.port });
 
     // Disable Nagle's algorithm (issue #301): every other SDK, the
     // server, the proxy, and discovery all disable it explicitly — left

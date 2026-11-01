@@ -32,3 +32,38 @@ describe("connectSocket (issue #301)", () => {
     }
   });
 });
+
+describe("connectSocket with an address Node rejects synchronously (issue #1163)", () => {
+  // `net.connect` throws synchronously for a port that is NaN, a
+  // fraction or above 65535 (a misconfigured seed address — a discovery
+  // address never gets here). The promise rejected correctly, but the
+  // dial timer had already been armed and stayed armed: on firing it
+  // touched the never-initialised `socket` binding and threw a
+  // ReferenceError out of a timer callback — an uncaught exception that
+  // ended the process five seconds after the caller had handled the
+  // rejection.
+  for (const port of [70000, Number.NaN, 1.5]) {
+    it(`port ${port}: rejects at once and leaves no timer behind`, async () => {
+      const uncaught: unknown[] = [];
+      const capture = (error: unknown) => {
+        uncaught.push(error);
+      };
+      process.on("uncaughtException", capture);
+      try {
+        await assert.rejects(
+          connectSocket({ host: "127.0.0.1", port, connectDeadlineMs: 20 }),
+          (error: unknown) => error instanceof RangeError || error instanceof TypeError,
+        );
+        // Past the deadline by a wide margin: a leftover timer fires here.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assert.deepEqual(
+          uncaught.map((error) => String(error)),
+          [],
+          "the connect timer fired after the synchronous dial failure",
+        );
+      } finally {
+        process.removeListener("uncaughtException", capture);
+      }
+    });
+  }
+});
