@@ -2,7 +2,7 @@
 name = "nanocached"
 version = "0.5.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Async client SDK for nanocached, a tiny distributed cache with client-side replication"
 license = "MIT"
 homepage = "https://nanocached.org"
@@ -38,7 +38,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"],
 # feature-gated: unlike `tls`/`compression`, CAS has no alternative
 # backend or opt-out story worth threading through the rest of this
 # crate.
-sha2 = "0.10"
+sha2 = "0.11"
 
 [features]
 default = ["tls", "compression"]

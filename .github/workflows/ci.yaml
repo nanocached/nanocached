@@ -333,20 +333,20 @@ jobs:
           cargo check --no-default-features --features compression
           cargo test --no-default-features
 
-      - name: Install MSRV toolchain (1.85.0)
+      - name: Install MSRV toolchain (1.88.0)
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (unreleased; no tags to pin instead)
         with:
-          toolchain: 1.85.0
+          toolchain: 1.88.0
 
       # The repo-root `rust-toolchain.toml` pins 1.96, which shadows any
       # toolchain requested here unless overridden — without this, the
       # steps above never actually exercise the crate's declared
-      # `rust-version = "1.85"` (Cargo.toml), so it could silently drift
+      # `rust-version = "1.88"` (Cargo.toml), so it could silently drift
       # from what's checked here.
       - name: Check MSRV compiles
         working-directory: sdk/rust
         env:
-          RUSTUP_TOOLCHAIN: 1.85.0
+          RUSTUP_TOOLCHAIN: 1.88.0
         run: cargo check --all-features
 
   dotnet-sdk:
