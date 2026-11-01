@@ -13,6 +13,12 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- With `fireAndForgetReplicas`, the background replica leg of `set` and of
+  the batch `setMany*` calls copied the value but still read the caller's
+  key and namespace arrays when it ran. A caller that overwrote those
+  buffers right after the call returned made the replica store the value
+  under a different key or namespace. The leg now gets its own copies of
+  both (#1199).
 - `client.namespace(byte[])` kept the caller's array by reference, so
   overwriting the buffer afterwards silently re-scoped the handle: later
   calls hashed to a different owner and carried a different namespace in
