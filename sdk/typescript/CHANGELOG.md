@@ -11,6 +11,13 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- With `fireAndForgetReplicas`, a write whose primary failed (a refused
+  connection, say) still waited for every background replica write to settle
+  before reporting the failure, so one slow or hung replica delayed the error
+  and the refresh-and-retry behind it by up to its request timeout (35 s
+  measured against a stopped node). Only the synchronous legs are waited for
+  now; a programming error that a background leg has already raised is still
+  reported (#1240).
 - `connect()` with a seed address whose port is not a valid TCP port (`NaN`
   from an unset environment variable, a fraction, a number above 65535)
   rejected at once, as it should, but the dial timer had already been armed
