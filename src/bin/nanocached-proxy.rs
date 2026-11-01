@@ -151,8 +151,9 @@
 
 use bytes::{Bytes, BytesMut};
 use nanocached::infra::{
-    ACCEPT_ERROR_BACKOFF, METRICS_MAX_CONNECTIONS, PerIpConnections, read_http_request_path,
-    should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip, write_http_response,
+    ACCEPT_ERROR_BACKOFF, LogLimiter, METRICS_MAX_CONNECTIONS, PerIpConnections,
+    read_http_request_path, should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip,
+    write_http_response,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -4823,6 +4824,109 @@ async fn retry_multi_get(
     }
 }
 
+/// Issue #1162: the budget for replica-leg warnings, lines per second.
+/// With a node down, every write that has it as a replica logs, and
+/// `eprintln!` is a blocking write under the stderr lock: unbounded, a
+/// backed-up log pipe stalls the runtime workers exactly while a node is
+/// failing. Small, because the lines say the same thing; the count of
+/// what was dropped is reported ahead of the next line written.
+const REPLICA_WARN_LINES_PER_SECOND: u32 = 5;
+
+#[cfg(not(test))]
+static REPLICA_WARN_LOG: LogLimiter =
+    LogLimiter::new(REPLICA_WARN_LINES_PER_SECOND, Duration::from_secs(1));
+
+// Per thread under test, so that tests running side by side neither spend
+// each other's budget nor count each other's lines (the tests that count
+// them run on one thread).
+#[cfg(test)]
+thread_local! {
+    static REPLICA_WARN_LOG: LogLimiter =
+        const { LogLimiter::new(REPLICA_WARN_LINES_PER_SECOND, Duration::from_secs(1)) };
+    static REPLICA_WARN_LINES_WRITTEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn write_replica_warning(line: std::fmt::Arguments<'_>) {
+    #[cfg(test)]
+    REPLICA_WARN_LINES_WRITTEN.with(|written| written.set(written.get() + 1));
+    eprintln!("{line}");
+}
+
+/// Writes one replica-leg warning through `REPLICA_WARN_LOG`: when the
+/// budget allows, with the count of the lines dropped since the last one
+/// ahead of it; otherwise it is only counted (issue #1162).
+fn log_replica_warning(line: std::fmt::Arguments<'_>) {
+    #[cfg(not(test))]
+    let admitted = REPLICA_WARN_LOG.admit();
+    #[cfg(test)]
+    let admitted = REPLICA_WARN_LOG.with(LogLimiter::admit);
+    let Some(suppressed) = admitted else {
+        return;
+    };
+    if suppressed > 0 {
+        write_replica_warning(format_args!(
+            "WARN {suppressed} more replica leg warnings (not logged individually)"
+        ));
+    }
+    write_replica_warning(line);
+}
+
+/// The replica legs of one request (or one retry pass) that failed or that
+/// a node refused, tallied across its groups so they are logged as one
+/// line each, not one per key (issue #1162): a batch of a million-odd
+/// one-byte keys with a node down fails a leg per key. Only the log is
+/// aggregated; `replica_refusals_total` still counts every leg.
+#[derive(Default)]
+struct ReplicaLegTally {
+    failed: usize,
+    first_failure: Option<String>,
+    refused: usize,
+}
+
+impl ReplicaLegTally {
+    /// `legs` replica legs went with a group that failed or came back
+    /// malformed; `reason` describes that, kept for the first group only.
+    fn failed(&mut self, legs: usize, reason: impl FnOnce() -> String) {
+        if legs == 0 {
+            return;
+        }
+        self.failed += legs;
+        if self.first_failure.is_none() {
+            self.first_failure = Some(reason());
+        }
+    }
+
+    /// `legs` replica legs a node answered `W`.
+    fn refused(&mut self, legs: usize) {
+        self.refused += legs;
+    }
+
+    /// Counts the refused legs, each one, and writes the request's lines:
+    /// at most one for the failed legs and one for the refused ones. `what`
+    /// names the write.
+    fn log(self, context: &ProxyContext, what: &str) {
+        count_refused_replica_legs(context, self.refused);
+        if let Some(reason) = self.first_failure {
+            log_replica_warning(format_args!(
+                "WARN replica {what}: {} leg(s) failed, first: {reason}",
+                self.failed
+            ));
+        }
+        if self.refused > 0 {
+            log_refused_replica_legs(what, None, "W (wrong node)", self.refused);
+        }
+    }
+}
+
+/// Why a group's reply did not carry its legs' results, for
+/// `ReplicaLegTally::failed`.
+fn describe_group_failure<E: std::fmt::Display>(reply: &Result<NodeReply, E>) -> String {
+    match reply {
+        Err(error) => error.to_string(),
+        Ok(_) => "malformed reply".to_string(),
+    }
+}
+
 /// Issue #150: the batch a `finish_multi_set`/`retry_multi_set` pass
 /// works against — bundled purely to stay under clippy's argument-count
 /// lint; `keys`/`values` are parallel, `ttl` is the one shared value for
@@ -4857,19 +4961,38 @@ fn note_refused_replica_leg(
         NodeReply::Error => "E",
         _ => return,
     };
+    count_refused_replica_legs(context, 1);
+    log_refused_replica_legs(what, addr, status, 1);
+}
+
+/// Counts `legs` refused replica legs, one by one: the metric is the
+/// per-leg record the log lines are not (issue #1162).
+fn count_refused_replica_legs(context: &ProxyContext, legs: usize) {
     context
         .replica_refusals_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    match addr {
-        Some(addr) => eprintln!(
-            "WARN replica {what} to {addr} answered {status} — the client saw success; \
-             that copy is missing or stale until the next write"
-        ),
-        None => eprintln!(
-            "WARN replica {what} answered {status} — the client saw success; \
-             that copy is missing or stale until the next write"
-        ),
-    }
+        .fetch_add(legs as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The log line for `legs` replica legs refused with `status`.
+fn log_refused_replica_legs(what: &str, addr: Option<&str>, status: &str, legs: usize) {
+    let on = match addr {
+        Some(addr) => format!(" to {addr}"),
+        None => String::new(),
+    };
+    let which = if legs == 1 {
+        String::new()
+    } else {
+        format!(" ({legs} legs)")
+    };
+    log_replica_warning(format_args!(
+        "WARN replica {what}{on}{which} answered {status} — the client saw success; \
+         {} missing or stale until the next write",
+        if legs == 1 {
+            "that copy is"
+        } else {
+            "those copies are"
+        }
+    ));
 }
 
 async fn finish_multi_set(
@@ -4893,18 +5016,16 @@ async fn finish_multi_set(
         entries[position] = Some(ProxyAckEntry::WrongNode);
     }
 
+    // Issue #1162: the replica legs are tallied and logged once per
+    // request, not once per key.
+    let mut replica_legs = ReplicaLegTally::default();
     for (legs, reply) in groups_legs.into_iter().zip(pending) {
         match reply.await {
             Ok(NodeReply::MultiAck(results)) if results.len() == legs.len() => {
                 for ((position, is_primary), result) in legs.into_iter().zip(results) {
                     if !is_primary {
                         if matches!(result, ProxyAckEntry::WrongNode) {
-                            note_refused_replica_leg(
-                                context,
-                                "multi-set leg",
-                                None,
-                                &NodeReply::WrongNode,
-                            );
+                            replica_legs.refused(1);
                         }
                         continue;
                     }
@@ -4914,17 +5035,20 @@ async fn finish_multi_set(
                     }
                 }
             }
-            _ => {
+            reply => {
+                let mut replicas = 0;
                 for (position, is_primary) in legs {
                     if is_primary {
                         retry_positions.push(position);
                     } else {
-                        eprintln!("WARN replica multi-set leg failed");
+                        replicas += 1;
                     }
                 }
+                replica_legs.failed(replicas, || describe_group_failure(&reply));
             }
         }
     }
+    replica_legs.log(context, "multi-set");
 
     if !retry_positions.is_empty() {
         retry_multi_set(
@@ -5012,6 +5136,7 @@ async fn retry_multi_set(
         .call_each(context, requests, Expect::MultiAck)
         .await;
 
+    let mut replica_legs = ReplicaLegTally::default();
     for ((_, legs), reply) in groups.into_iter().zip(replies) {
         match reply {
             Ok(NodeReply::MultiAck(results)) if results.len() == legs.len() => {
@@ -5019,26 +5144,24 @@ async fn retry_multi_set(
                     if is_primary {
                         entries[position] = Some(result);
                     } else if matches!(result, ProxyAckEntry::WrongNode) {
-                        note_refused_replica_leg(
-                            context,
-                            "multi-set leg (retry)",
-                            None,
-                            &NodeReply::WrongNode,
-                        );
+                        replica_legs.refused(1);
                     }
                 }
             }
-            _ => {
+            reply => {
+                let mut replicas = 0;
                 for (position, is_primary) in legs {
                     if is_primary {
                         entries[position] = Some(ProxyAckEntry::WrongNode);
                     } else {
-                        eprintln!("WARN replica multi-set leg failed (retry)");
+                        replicas += 1;
                     }
                 }
+                replica_legs.failed(replicas, || describe_group_failure(&reply));
             }
         }
     }
+    replica_legs.log(context, "multi-set (retry)");
 }
 
 /// One backend sub-frame of a batched touch: where it goes, what it asks
@@ -5138,12 +5261,12 @@ struct MultiTouchBatch<'a> {
 /// the whole frame as an outcome unknown. A frame that provably never left
 /// (`request_not_sent`) or that the node refused is retried as before.
 fn settle_multi_touch_group(
-    context: &ProxyContext,
     group: &TouchGroup,
     reply: io::Result<NodeReply>,
     entries: &mut [Option<ProxyMultiEntry>],
     answered_by: &mut [Option<String>],
     retry_positions: &mut Vec<usize>,
+    replica_legs: &mut ReplicaLegTally,
     expiring: bool,
 ) -> bool {
     let legs = &group.legs;
@@ -5165,12 +5288,7 @@ fn settle_multi_touch_group(
             for (&(position, is_primary), result) in legs.iter().zip(results) {
                 if !is_primary {
                     if matches!(result, ProxyMultiEntry::WrongNode) {
-                        note_refused_replica_leg(
-                            context,
-                            "multi-touch leg",
-                            None,
-                            &NodeReply::WrongNode,
-                        );
+                        replica_legs.refused(1);
                     }
                 } else if matches!(result, ProxyMultiEntry::WrongNode) {
                     retry_positions.push(position);
@@ -5180,14 +5298,16 @@ fn settle_multi_touch_group(
                 }
             }
         }
-        _ => {
+        reply => {
+            let mut replicas = 0;
             for &(position, is_primary) in legs {
                 if is_primary {
                     retry_positions.push(position);
                 } else {
-                    eprintln!("WARN replica multi-touch leg failed");
+                    replicas += 1;
                 }
             }
+            replica_legs.failed(replicas, || describe_group_failure(&reply));
         }
     }
     false
@@ -5216,20 +5336,22 @@ async fn finish_multi_touch(
     let mut answered_by: Vec<Option<String>> = vec![None; batch.keys.len()];
     let expiring = batch.ttl == Some(0);
     let mut unknown = false;
+    let mut replica_legs = ReplicaLegTally::default();
     for (group, reply) in groups.into_iter().zip(pending) {
         unknown |= settle_multi_touch_group(
-            context,
             &group,
             reply.await,
             &mut entries,
             &mut answered_by,
             &mut retry_positions,
+            &mut replica_legs,
             expiring,
         );
         if get {
             cap_multi_reply_values(entries.iter_mut().flatten());
         }
     }
+    replica_legs.log(context, "multi-touch");
     if !unknown && !retry_positions.is_empty() {
         unknown = retry_multi_touch(
             context,
@@ -5333,17 +5455,24 @@ async fn expire_batch_on_other_owners(
         .await;
     for ((addr, _), result) in frames.iter().zip(results) {
         match result {
-            Err(error) => eprintln!("WARN replica multi-touch to {addr} failed: {error}"),
+            Err(error) => log_replica_warning(format_args!(
+                "WARN replica multi-touch to {addr} failed: {error}"
+            )),
             Ok(NodeReply::MultiTouch(results)) => {
-                for entry in results {
-                    if matches!(entry, ProxyMultiEntry::WrongNode) {
-                        note_refused_replica_leg(
-                            context,
-                            "multi-touch leg",
-                            Some(addr),
-                            &NodeReply::WrongNode,
-                        );
-                    }
+                // One line per node, not per key (issue #1162); the
+                // metric still counts each key.
+                let refused = results
+                    .iter()
+                    .filter(|entry| matches!(entry, ProxyMultiEntry::WrongNode))
+                    .count();
+                if refused > 0 {
+                    count_refused_replica_legs(context, refused);
+                    log_refused_replica_legs(
+                        "multi-touch leg",
+                        Some(addr),
+                        "W (wrong node)",
+                        refused,
+                    );
                 }
             }
             Ok(reply) => note_refused_replica_leg(context, "multi-touch leg", Some(addr), &reply),
@@ -5398,20 +5527,22 @@ async fn retry_multi_touch(
 
     let mut unresolved = Vec::new();
     let mut unknown = false;
+    let mut replica_legs = ReplicaLegTally::default();
     for (group, reply) in groups.iter().zip(replies) {
         unknown |= settle_multi_touch_group(
-            context,
             group,
             reply,
             entries,
             answered_by,
             &mut unresolved,
+            &mut replica_legs,
             expiring,
         );
         if batch.get {
             cap_multi_reply_values(entries.iter_mut().flatten());
         }
     }
+    replica_legs.log(context, "multi-touch (retry)");
     for position in unresolved {
         entries[position] = Some(ProxyMultiEntry::WrongNode);
     }
@@ -5486,8 +5617,10 @@ async fn finish_write(
         let addr = owners.get(index).map(String::as_str);
         match replica_reply {
             Err(error) => match addr {
-                Some(addr) => eprintln!("WARN replica write to {addr} failed: {error}"),
-                None => eprintln!("WARN replica write failed: {error}"),
+                Some(addr) => log_replica_warning(format_args!(
+                    "WARN replica write to {addr} failed: {error}"
+                )),
+                None => log_replica_warning(format_args!("WARN replica write failed: {error}")),
             },
             Ok(reply) => note_refused_replica_leg(context, "write", addr, reply),
         }
@@ -5679,8 +5812,10 @@ async fn finish_touch(
         let addr = owners.get(index).map(String::as_str);
         match replica_reply {
             Err(error) => match addr {
-                Some(addr) => eprintln!("WARN replica touch to {addr} failed: {error}"),
-                None => eprintln!("WARN replica touch failed: {error}"),
+                Some(addr) => log_replica_warning(format_args!(
+                    "WARN replica touch to {addr} failed: {error}"
+                )),
+                None => log_replica_warning(format_args!("WARN replica touch failed: {error}")),
             },
             Ok(reply) => note_refused_replica_leg(context, "touch", addr, reply),
         }
@@ -6057,7 +6192,9 @@ async fn fan_out_to_replicas(
     let results = context.backends.call_each(context, requests, expect).await;
     for (addr, result) in replicas.iter().zip(results) {
         match result {
-            Err(error) => eprintln!("WARN replica {what} to {addr} failed: {error}"),
+            Err(error) => log_replica_warning(format_args!(
+                "WARN replica {what} to {addr} failed: {error}"
+            )),
             Ok(reply) => note_refused_replica_leg(context, what, Some(addr), &reply),
         }
     }
@@ -11786,6 +11923,95 @@ mod tests {
             assert_eq!(node.flushed.load(Ordering::SeqCst), 1);
             assert_eq!(node.len(), 0);
         }
+    }
+
+    /// A proxy over one live node and one node that refuses connections,
+    /// replication 2: the dead node is the replica of about half the keys
+    /// and the primary of the rest.
+    async fn proxy_with_a_dead_replica() -> (MockNode, String) {
+        let live = MockNode::start().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let roster = vec![
+            ("node-live".to_string(), live.addr.clone()),
+            ("node-dead".to_string(), dead_addr),
+        ];
+        let discovery = start_mock_discovery(roster, 2).await;
+        (live, start_proxy(&discovery, None, 64).await)
+    }
+
+    /// `o` (`touch: false`) or `y` of `keys` one-byte-value keys.
+    fn multi_write_frame(keys: usize, touch: bool) -> Vec<u8> {
+        let mut header = format!("{} 0 {keys}", if touch { "y" } else { "o" });
+        let mut body = String::new();
+        for i in 0..keys {
+            if touch {
+                header.push_str(" 4");
+                body.push_str(&format!("k{i:03}"));
+            } else {
+                header.push_str(" 4 1");
+                body.push_str(&format!("k{i:03}v"));
+            }
+        }
+        if touch {
+            header.push_str(" 30");
+        }
+        header.push('\n');
+        format!("{header}{body}").into_bytes()
+    }
+
+    fn replica_warn_lines() -> u64 {
+        REPLICA_WARN_LINES_WRITTEN.with(std::cell::Cell::get)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dead_replica_costs_one_warning_line_per_multi_key_request_not_one_per_key() {
+        // Issue #1162: the failed replica legs of an `o` or `y` were each
+        // logged, so one 200-key `o` against a dead node wrote 109 lines.
+        // A request now writes one line for its failed legs (plus one for
+        // its retry pass, where a dead primary sends it).
+        let (live, proxy) = proxy_with_a_dead_replica().await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        for touch in [false, true] {
+            let before = replica_warn_lines();
+            stream
+                .write_all(&multi_write_frame(200, touch))
+                .await
+                .unwrap();
+            let reply = read_line(&mut stream, &mut buf).await.unwrap();
+            let kind = if touch { "Y 200" } else { "O 200" };
+            assert!(reply.starts_with(kind), "{reply}");
+            let lines = replica_warn_lines() - before;
+            assert!(
+                (1..=2).contains(&lines),
+                "{kind} wrote {lines} replica warning lines for 200 keys"
+            );
+        }
+        drop(live);
+    }
+
+    #[test]
+    fn replica_warnings_past_the_budget_are_counted_not_written() {
+        // Issue #1162: a node that stays down fails a leg of every write,
+        // and every site that logs one (the single-key writes and touches,
+        // the replica fan-out, the multi-key groups) goes through
+        // `log_replica_warning`. Past `REPLICA_WARN_LINES_PER_SECOND` in a
+        // window a line is only counted; the count leads the first line
+        // of the next window.
+        for _ in 0..200 {
+            log_replica_warning(format_args!("WARN replica write to 10.0.0.1:8356 failed"));
+        }
+        assert_eq!(
+            replica_warn_lines(),
+            u64::from(REPLICA_WARN_LINES_PER_SECOND)
+        );
+        let later = Instant::now() + Duration::from_secs(2);
+        let admitted = REPLICA_WARN_LOG.with(|log| log.admit_at(later));
+        assert_eq!(
+            admitted,
+            Some(200 - u64::from(REPLICA_WARN_LINES_PER_SECOND))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

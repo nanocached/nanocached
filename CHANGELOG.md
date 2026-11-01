@@ -14,6 +14,17 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a replica leg of a write that failed or was refused
+  logged a `WARN` line of its own, so with a node down one `o` or `y` wrote
+  a line for every key that node held a copy of: a 200-key `o` against one
+  dead node wrote 109 lines, and a 1 MiB frame holds about 260,000
+  one-byte keys. `eprintln!` is a blocking write under the stderr lock, so a
+  backed-up log pipe stalled the proxy's workers exactly while a node was
+  failing. A multi-key request now writes one line for its failed legs (with
+  their count and the first reason) and one for the refused ones, and all
+  replica-leg warnings, single-key writes and touches included, go through
+  a limiter of 5 lines per second that reports how many it dropped.
+  `nanocached_proxy_replica_refusals_total` still counts every leg (#1162).
 - `nanocached-node`: a connection's receive-buffer charge against
   `--max-in-flight-bytes` was released as soon as the buffer's reported
   capacity fell to the free 64 KiB, but after a large frame that reported
