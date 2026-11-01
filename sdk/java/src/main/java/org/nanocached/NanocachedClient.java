@@ -4886,6 +4886,21 @@ public final class NanocachedClient implements AutoCloseable {
         static <T> LegOutcome<T> fatal(Error error) {
             return new LegOutcome<>(null, null, null, null, error);
         }
+
+        /** Issue #1248: what {@link #startHedgeLeg} records when a leg ended
+         * without an outcome of its own. Allocated once, at class
+         * initialization: that case is exactly an arm above having failed to
+         * allocate (an OutOfMemoryError while the leg was settling), and
+         * building a fresh outcome there would fail the same way, so the
+         * reader would never be signalled. A bug outcome carries no value, so
+         * sharing one across element types is safe. */
+        private static final LegOutcome<Object> ENDED_WITHOUT_OUTCOME = LegOutcome.bug(
+                new NanocachedException("nanocached: hedged read leg ended without an outcome"));
+
+        @SuppressWarnings("unchecked")
+        static <T> LegOutcome<T> endedWithoutOutcome() {
+            return (LegOutcome<T>) ENDED_WITHOUT_OUTCOME;
+        }
     }
 
     /**
@@ -5073,8 +5088,7 @@ public final class NanocachedClient implements AutoCloseable {
                         "nanocached: hedged read leg failed unexpectedly", error));
             } finally {
                 if (outcome == null) {
-                    outcome = LegOutcome.bug(new NanocachedException(
-                            "nanocached: hedged read leg ended without an outcome"));
+                    outcome = LegOutcome.endedWithoutOutcome();
                 }
                 results.put(index, outcome);
                 completions.add(index);

@@ -13,6 +13,11 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- With `readHedgeAfter` set, a hedge leg that could not allocate its
+  outcome object while recovering from an `OutOfMemoryError` could still
+  leave the reading thread waiting forever, because the fallback outcome
+  was built at that very point. The fallback is now allocated once, up
+  front (#1248).
 - `reconnectCooldown` and `readHedgeAfter` accepted any positive `Duration`.
   One beyond about 292 years failed later, at `connect`, with a bare
   `ArithmeticException`, and a large cooldown wrapped the nanosecond
