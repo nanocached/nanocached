@@ -190,7 +190,9 @@ mirrors of this one.
 
 ## Requirements
 
-.NET 8+, nanocached server 0.4.0 or later — the release that added
+.NET 10+ (version 0.6.0 is the last release that supports .NET 8 and
+.NET 9, which reached end of support on 2026-11-10), nanocached server
+0.4.0 or later — the release that added
 namespaces and the compare-and-set that sliding renewals use.
 
 ## Building

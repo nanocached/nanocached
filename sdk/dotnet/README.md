@@ -5,7 +5,9 @@ a tiny distributed cache. Talks to either a single `nanocached-node` or a
 `nanocached-discovery`-fronted cluster — the SDK figures out which from
 the server's own handshake, so the calling code is identical either way.
 
-Targets .NET 8+. No dependencies. NuGet package ID: `Nanocached`.
+Targets .NET 10+. No dependencies. NuGet package ID: `Nanocached`.
+Version 0.6.0 is the last release that supports .NET 8 and .NET 9; both
+reached end of support on 2026-11-10.
 
 ## Quick start
 
