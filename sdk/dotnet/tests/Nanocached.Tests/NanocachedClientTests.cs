@@ -3321,6 +3321,27 @@ public class NanocachedClientTests
             "the background write to land on the replica");
     }
 
+    // Issue #1244: a retry that Close() poisoned in flight is rejected
+    // before it dials, not after the node has already seen a new connection.
+    [Fact]
+    public async Task ARedialAfterCloseIsRejectedWithoutDialingTheNode()
+    {
+        using var node = new MockNode();
+        NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        client.Close();
+        int connectionsBefore = node.ConnectionCount;
+
+        MethodInfo slotConnection = typeof(NanocachedClient)
+            .GetMethod("SlotConnectionAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var redial = (Task<Connection>)slotConnection.Invoke(client, new object?[] { null })!;
+        await Assert.ThrowsAsync<AlreadyClosedException>(() => redial);
+
+        // An accepted connection is counted as soon as the node accepts it;
+        // give a (wrongly) dialed one time to arrive.
+        await Task.Delay(200);
+        Assert.Equal(connectionsBefore, node.ConnectionCount);
+    }
+
     [Fact]
     public async Task FireAndForgetReplicasFallsBackToSynchronousPastTheCap()
     {

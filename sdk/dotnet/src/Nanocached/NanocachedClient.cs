@@ -4539,6 +4539,13 @@ public sealed class NanocachedClient : IDisposable
             (_, address, current) = SnapshotSlot(slot);
             if (current is not null && !current.IsClosed) return current;
 
+            // Issue #1244: a request Close() poisoned in flight comes here
+            // to redial; the closed checks after the dial would only drop
+            // the new connection, after it had already been dialed and
+            // identified against the node. Checked here, past the gate,
+            // because the wait for the gate may have spanned a Close().
+            if (_closed) throw new AlreadyClosedException();
+
             // SDK proxy mode (issue #122): the single connection's redial
             // gets an extra fallback a cluster member's never needs — see
             // DialProxyWithFailoverAsync's doc comment.

@@ -10,6 +10,14 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- A request that `Close()` poisoned while in flight, and then retried, redialed
+  and identified against the node before the closed check rejected it with
+  `AlreadyClosedException`, leaving one extra connection on the node after
+  `Close()` had returned. The redial path now checks for a closed client before
+  dialing. (#1244)
+
 ### Changed
 
 - Target framework is now `net10.0`; .NET 8 and .NET 9 reach end of support on 2026-11-10, and 0.6.0 is the last release that targets `net8.0`. Packages are built with the .NET 10 SDK.
