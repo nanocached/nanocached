@@ -11,6 +11,11 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A response that arrived with no request pending (a server or proxy
+  replying to something nobody asked) was parsed and silently discarded, and
+  the connection kept being used. The Python and Go SDKs treat it as a
+  desynced stream; this SDK now does too: the connection is poisoned with a
+  `ConnectionLostError` at once and later requests redial (#1177).
 - `connect()` with a seed address whose port is not a valid TCP port (`NaN`
   from an unset environment variable, a fraction, a number above 65535)
   rejected at once, as it should, but the dial timer had already been armed

@@ -1515,6 +1515,42 @@ describe("unsolicited busy response (issue #45)", () => {
   });
 });
 
+describe("unsolicited response with nothing pending (issue #1177)", () => {
+  it("poisons the connection instead of silently dropping the reply", async () => {
+    // Regression: a parsed response with no pending request was discarded
+    // (`if (waiter === undefined) continue`) and the connection stayed
+    // open, where the Python and Go SDKs poison it. The server here sends
+    // a stored-ack nobody asked for, and never closes its side.
+    const { createServer, connect } = await import("node:net");
+    const { Connection } = await import("../src/connection.js");
+
+    const serverSockets: import("node:net").Socket[] = [];
+    const server = createServer((socket) => {
+      serverSockets.push(socket);
+      socket.write("S\n");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as import("node:net").AddressInfo).port;
+
+    try {
+      const socket = connect(port, "127.0.0.1");
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      const connection = new Connection(socket);
+
+      await waitFor(() => connection.isClosed(), "the unsolicited reply to poison the connection");
+      assert.ok(socket.destroyed, "the client must destroy the socket itself");
+      await assert.rejects(connection.get("k"), (error: unknown) => {
+        assert.ok(error instanceof ConnectionLostError);
+        assert.match((error as Error).message, /unsolicited .* response .*desynced/);
+        return true;
+      });
+    } finally {
+      for (const socket of serverSockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
 describe("onData's fatal paths route through poison() (issue #187)", () => {
   it("a malformed response marks the connection closed synchronously, before the 'close' event", async () => {
     // Regression: onData's response-parse-failure branch called
