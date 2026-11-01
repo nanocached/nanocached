@@ -838,6 +838,10 @@ export class NanocachedClient {
   private closed = false;
   private lastNodeListFetch = Date.now();
   private nodeListRefresh: Promise<void> | null = null;
+  /** How many node-list/proxy refreshes have been started — lets a forced
+   * refresh tell one that began after its failure from one already in
+   * flight (issue #1227). */
+  private refreshStarts = 0;
   /** One in-flight lazy reconnect per connection slot (the node name in
    * cluster mode, "" in single mode) — concurrent requests that all find
    * the same dead connection share one reconnect instead of dialing N
@@ -3783,10 +3787,14 @@ export class NanocachedClient {
    * callers that both need a refresh share one in-flight refresh
    * (nodeListRefresh is set synchronously, before the first await, so a
    * second caller arriving before the first refresh resolves sees it
-   * already set) rather than each starting their own — including a
-   * `force` call arriving while an ordinary staleness-triggered refresh is
-   * already in flight, which is still enough to satisfy it (either way,
-   * the node/proxy list ends up current). */
+   * already set) rather than each starting their own. A `force` call is
+   * different (issue #1227): it reacts to a failure it has just seen, and
+   * a refresh that was already in flight fetched its list before that
+   * failure, so it may still list the dead node. The forced caller waits
+   * that refresh out but is only satisfied by one that *started* after it
+   * decided to refresh — one a concurrent forced caller started in the
+   * meantime, or its own. All forced callers that arrived during the old
+   * refresh therefore share a single follow-up refresh. */
   private async maybeRefreshNodeList(options?: { force?: boolean }): Promise<void> {
     if (this.target.kind === "single") return;
     if (this.target.kind === "proxy") {
@@ -3795,11 +3803,26 @@ export class NanocachedClient {
       return;
     }
 
-    if (this.nodeListRefresh) {
-      await this.nodeListRefresh;
-      return;
+    // Every refresh started so far began before this point (issue #1227).
+    const observed = this.refreshStarts;
+    for (;;) {
+      const inFlight = this.nodeListRefresh;
+      if (inFlight !== null) {
+        if (!options?.force || this.refreshStarts > observed) {
+          await inFlight;
+          return;
+        }
+        // Forced, and this refresh began before the failure was seen: let
+        // it finish (its starter reports its own errors) and look again.
+        await inFlight.catch(() => {});
+        continue;
+      }
+      // A refresh that started after `observed` has already completed.
+      if (options?.force && this.refreshStarts > observed) return;
+      break;
     }
 
+    this.refreshStarts++;
     this.nodeListRefresh = this.target.kind === "proxy" ? this.refreshProxyTarget() : this.refreshNodeList();
     try {
       await this.nodeListRefresh;

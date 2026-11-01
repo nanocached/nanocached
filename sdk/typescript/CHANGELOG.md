@@ -11,6 +11,14 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A forced node-list refresh (made after a connection failure or a wrong-node
+  answer) joined a refresh that was already in flight, even when that one had
+  fetched its list from discovery before the failure. If a node died in
+  between, the stale list still contained it, the retried operation failed
+  against it again and the error reached the caller. A forced refresh now
+  waits such a refresh out and is satisfied only by one that started after
+  the failure; callers that arrived during the old refresh share a single
+  follow-up refresh (#1227).
 - A `close()` that ran in the few microtasks between a redial finishing and
   its connection being installed (single-node, cluster member or proxy
   target) closed only the connections installed at that moment, so the new
