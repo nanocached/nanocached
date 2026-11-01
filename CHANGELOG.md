@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-discovery`: remembering a departed node (an eviction, a `V`, an
+  abandoned join) scanned the whole departed table, up to 4,096 names, on
+  every call, so a sweep that expired many nodes at once held the
+  single-threaded runtime for seconds (3.3 s for 65,536 consecutive
+  evictions on a release build, with no connection served meanwhile). The
+  table now keeps its names in time order and prunes and evicts from the
+  front, so each call costs constant time on average; 65,536 evictions take
+  12 ms (#1201).
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
