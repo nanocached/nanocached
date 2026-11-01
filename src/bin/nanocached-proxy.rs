@@ -1841,6 +1841,24 @@ thread_local! {
     static KEY_HANDLES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// How many times `handle_client` has allocated a bigger read buffer on the
+// current thread, for the test that checks a large frame's buffer is
+// allocated and charged once, not again on every read.
+#[cfg(test)]
+thread_local! {
+    static READ_BUFFER_GROWTHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_read_buffer_growth() {
+    READ_BUFFER_GROWTHS.with(|growths| growths.set(growths.get() + 1));
+}
+
+#[cfg(test)]
+fn read_buffer_growths() -> usize {
+    READ_BUFFER_GROWTHS.with(|growths| growths.get())
+}
+
 #[cfg(test)]
 fn count_key_handles(handles: usize) {
     KEY_HANDLES_BUILT.with(|built| built.set(built.get() + handles));
@@ -7087,7 +7105,19 @@ async fn handle_client(
         // or an idle connection would keep part of its source IP's share
         // until it closed, and a neighbour asking for the whole share
         // would wait for it.
-        if shrink_drained_buffer(&mut buf) || buf.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
+        //
+        // A buffer already grown to the length of the frame it is filling
+        // is neither: with the header in, it holds 4 KiB of a 1 MB frame
+        // and is exactly as big as the frame needs. Shrinking it there
+        // would give the charge back and make the growth below allocate
+        // and charge the whole frame again, on every read until 64 KiB had
+        // arrived, each time at the back of the budgets' queues.
+        let sized_to_pending_frame = scan
+            .frame_end
+            .is_some_and(|end| end > buf.len() && end <= buf.capacity());
+        if (!sized_to_pending_frame && shrink_drained_buffer(&mut buf))
+            || buf.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD
+        {
             receive_charge = None;
             receive_charged = 0;
         } else if receive_charged == 0 {
@@ -7149,6 +7179,8 @@ async fn handle_client(
             None => Some((buf.capacity() * 2).max(buf.len() + READ_CHUNK)),
         };
         if let Some(grown) = grown {
+            #[cfg(test)]
+            count_read_buffer_growth();
             let want = [
                 &connection_in_flight_bytes,
                 &ip_in_flight_share.budgets.in_flight,
@@ -8910,6 +8942,29 @@ mod tests {
         assert!(
             served >= 1,
             "the first batch to complete parks its frame and is served"
+        );
+        drop(node);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_large_frames_buffer_is_allocated_once_not_on_every_read() {
+        // With the header of a 1 MB `S` in, the buffer is grown to the
+        // whole frame and charged in one step. The first 64 KiB of the
+        // body used to look like a drained buffer (capacity over the
+        // threshold, contents under it): it was shrunk, its charge given
+        // back and the whole frame allocated and charged again, about 16
+        // times.
+        let (node, proxy, _context) = slow_single_node(b"k", Duration::ZERO, None).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let mut frame = b"S 1 1000000\nk".to_vec();
+        frame.extend(std::iter::repeat_n(b'v', 1_000_000));
+        let before = read_buffer_growths();
+        stream.write_all(&frame).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        let growths = read_buffer_growths() - before;
+        assert!(
+            growths <= 3,
+            "one 1 MB frame must take a few buffer growths, not one per read: {growths}"
         );
         drop(node);
     }

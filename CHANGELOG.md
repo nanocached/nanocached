@@ -14,6 +14,17 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a large frame's receive buffer was shrunk and
+  allocated again on every read until 64 KiB of its body had arrived. With
+  the header in, the buffer is sized to the whole frame and charged in one
+  step, but the next read left it with more capacity than 64 KiB and less
+  content than 64 KiB, which the drained-buffer check took for an emptied
+  buffer: it was copied down, its charge given back, and the next iteration
+  allocated and charged the whole frame again at the back of the budgets'
+  queues. A 1 MB `S` went through 17 allocations and charges (about 16
+  malloc/free pairs and semaphore rounds of the frame's length, each losing
+  the connection its place in line); it now takes 2. A buffer already
+  grown to the frame it is filling is no longer shrunk. (#1176)
 - `nanocached-node`: a draining node stopped heartbeating the moment SIGTERM
   started the decommission and sent its leave only after the whole handoff,
   so a handoff longer than discovery's liveness timeout (15 s by default;
