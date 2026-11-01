@@ -4389,6 +4389,141 @@ class NanocachedClientTest {
         NanocachedClient.maxInFlightBackgroundReplicaWrites = 32;
     }
 
+    // ── fire-and-forget replica legs must not alias the caller's key / namespace (issue #1255) ──
+
+    /** Runs {@code call} with the single background-leg thread held, so the
+     * operation's replica leg is still queued -- not yet having read any of
+     * its arguments -- when {@code afterCall} overwrites the caller's
+     * arrays; then lets the leg run and waits until it has finished. */
+    private static void runWithBackgroundLegHeld(
+            NanocachedClient client, Runnable call, Runnable afterCall) throws Exception {
+        Field backgroundLegsField = NanocachedClient.class.getDeclaredField("backgroundLegs");
+        backgroundLegsField.setAccessible(true);
+        ExecutorService backgroundLegs = (ExecutorService) backgroundLegsField.get(client);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch occupied = new java.util.concurrent.CountDownLatch(1);
+        backgroundLegs.submit(() -> {
+            occupied.countDown();
+            release.await();
+            return null;
+        });
+        assertTrue(occupied.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                "the backgroundLegs thread should have started its blocking dummy task");
+        try {
+            call.run();
+            afterCall.run();
+        } finally {
+            release.countDown();
+        }
+        // The permit is released only after the leg has finished.
+        Field permitsField = NanocachedClient.class.getDeclaredField("backgroundReplicaWritePermits");
+        permitsField.setAccessible(true);
+        java.util.concurrent.Semaphore permits = (java.util.concurrent.Semaphore) permitsField.get(client);
+        waitFor(() -> permits.availablePermits() == 1, "the background replica leg to finish");
+    }
+
+    private static void seedNamespaced(Cluster cluster, String ns, String key, String value) {
+        for (MockNode node : cluster.nodes().values()) {
+            node.namespacedStores.computeIfAbsent(ns, n -> new java.util.concurrent.ConcurrentHashMap<>())
+                    .put(key, value.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    void fireAndForgetDeleteLegDoesNotAliasTheCallersKeyOrNamespace() throws Exception {
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+        try (Cluster cluster = startCluster(2)) {
+            byte[] namespace = "tenant".getBytes(StandardCharsets.UTF_8);
+            byte[] key = "k".getBytes(StandardCharsets.UTF_8);
+            String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
+            seedNamespaced(cluster, "tenant", "k", "v");
+
+            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+                runWithBackgroundLegHeld(client,
+                        () -> client.delete(namespace, key),
+                        () -> {
+                            Arrays.fill(key, (byte) 'X');
+                            Arrays.fill(namespace, (byte) 'Y');
+                        });
+                MockNode node = cluster.nodes().get(replica);
+                assertFalse(node.namespacedStores.get("tenant").containsKey("k"),
+                        "the replica must have deleted the original key");
+            }
+        }
+    }
+
+    @Test
+    void fireAndForgetTouchLegDoesNotAliasTheCallersKeyOrNamespace() throws Exception {
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+        try (Cluster cluster = startCluster(2)) {
+            byte[] namespace = "tenant".getBytes(StandardCharsets.UTF_8);
+            byte[] key = "k".getBytes(StandardCharsets.UTF_8);
+            String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
+            seedNamespaced(cluster, "tenant", "k", "v");
+
+            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+                runWithBackgroundLegHeld(client,
+                        () -> client.touch(namespace, key, 77),
+                        () -> {
+                            Arrays.fill(key, (byte) 'X');
+                            Arrays.fill(namespace, (byte) 'Y');
+                        });
+                MockNode node = cluster.nodes().get(replica);
+                Map<String, Long> ttls = node.namespacedTtls.get("tenant");
+                assertEquals(77L, ttls == null ? null : ttls.get("k"),
+                        "the replica must have touched the original key");
+            }
+        }
+    }
+
+    @Test
+    void fireAndForgetIncrLegDoesNotAliasTheCallersKeyOrNamespace() throws Exception {
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+        try (Cluster cluster = startCluster(2)) {
+            byte[] namespace = "tenant".getBytes(StandardCharsets.UTF_8);
+            byte[] key = "k".getBytes(StandardCharsets.UTF_8);
+            String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
+            seedNamespaced(cluster, "tenant", "k", "5");
+
+            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+                runWithBackgroundLegHeld(client,
+                        () -> assertEquals(java.util.OptionalLong.of(6), client.incr(namespace, key, 1)),
+                        () -> {
+                            Arrays.fill(key, (byte) 'X');
+                            Arrays.fill(namespace, (byte) 'Y');
+                        });
+                MockNode node = cluster.nodes().get(replica);
+                assertArrayEquals("6".getBytes(StandardCharsets.UTF_8),
+                        node.namespacedStores.get("tenant").get("k"),
+                        "the replica must hold the incremented value under the original key");
+            }
+        }
+    }
+
+    @Test
+    void fireAndForgetTouchManyLegDoesNotAliasTheCallersKeyOrNamespace() throws Exception {
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+        try (Cluster cluster = startCluster(2)) {
+            byte[] namespace = "tenant".getBytes(StandardCharsets.UTF_8);
+            byte[] key = "k".getBytes(StandardCharsets.UTF_8);
+            String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
+            seedNamespaced(cluster, "tenant", "k", "v");
+
+            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+                runWithBackgroundLegHeld(client,
+                        () -> client.touchMany(namespace, new byte[][] {key}, 77),
+                        () -> {
+                            Arrays.fill(key, (byte) 'X');
+                            Arrays.fill(namespace, (byte) 'Y');
+                        });
+                MockNode node = cluster.nodes().get(replica);
+                Map<String, Long> ttls = node.namespacedTtls.get("tenant");
+                assertEquals(77L, ttls == null ? null : ttls.get("k"),
+                        "the replica must have touched the original key");
+            }
+        }
+    }
+
     @Test
     void byDefaultAWriteStillWaitsForTheReplicaLeg() throws Exception {
         try (Cluster cluster = startCluster(2)) {

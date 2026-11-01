@@ -13,6 +13,13 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- With `fireAndForgetReplicas`, the background replica legs of `delete`,
+  `touch`, `getAndTouch`, `incr`/`decr`, `replace`/`cas`, `deleteIfMatches`
+  and the batch `touchMany`/`getManyAndTouch` read the caller's key and
+  namespace arrays when they ran, after the call had returned. A caller
+  that overwrote those buffers right after the call made the replica
+  delete, touch or store a different key. Each leg now gets its own copy of
+  both; nothing changes with the option off (#1255).
 - With `readHedgeAfter` set, a hedge leg that could not allocate its
   outcome object while recovering from an `OutOfMemoryError` could still
   leave the reading thread waiting forever, because the fallback outcome

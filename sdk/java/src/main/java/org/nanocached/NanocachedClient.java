@@ -369,6 +369,15 @@ public final class NanocachedClient implements AutoCloseable {
     // _DEFAULT_RECONNECT_COOLDOWN.
     private static final Duration DEFAULT_RECONNECT_COOLDOWN = Duration.ofMillis(1_000);
 
+    /** Issue #1255: with {@code fireAndForgetReplicas} a replica leg frames
+     * its request after the call has returned, so the arrays it closes over
+     * must not be the caller's own (they may be reused or overwritten at
+     * once). Copies {@code bytes} in that mode and returns it unchanged
+     * otherwise, where every leg finishes before the call returns. */
+    private byte[] ownedForBackground(byte[] bytes) {
+        return fireAndForgetReplicas ? bytes.clone() : bytes;
+    }
+
     // Upper bound for the Duration options (reconnectCooldown, readHedgeAfter),
     // issue #1239. They are held as nanoseconds in a long: a Duration beyond
     // ~292 years made toNanos() throw a bare ArithmeticException at connect,
@@ -2664,10 +2673,13 @@ public final class NanocachedClient implements AutoCloseable {
         validateKey(namespace, key);
         Long wireTtl = touchWireTtl(ttlSeconds);
         beforeOperation();
+        // Issue #1255: the op below also runs as a background replica leg.
+        byte[] ownedNamespace = ownedForBackground(namespace);
+        byte[] ownedKey = ownedForBackground(key);
         try {
             boolean expiring = expiresAtOnce(wireTtl);
             return withTouchRetry(expiring, () -> write(
-                    namespace, key, connection -> connection.touch(namespace, key, wireTtl),
+                    namespace, key, connection -> connection.touch(ownedNamespace, ownedKey, wireTtl),
                     null, null, !expiring, true, expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
@@ -2723,17 +2735,20 @@ public final class NanocachedClient implements AutoCloseable {
         validateKey(namespace, key);
         Long wireTtl = touchWireTtl(ttlSeconds);
         beforeOperation();
+        // Issue #1255: both ops below also run as background replica legs.
+        byte[] ownedNamespace = ownedForBackground(namespace);
+        byte[] ownedKey = ownedForBackground(key);
         byte[] raw;
         try {
             boolean expiring = expiresAtOnce(wireTtl);
             raw = withTouchRetry(expiring, () -> write(
                     namespace, key,
-                    connection -> connection.getAndTouch(namespace, key, wireTtl),
+                    connection -> connection.getAndTouch(ownedNamespace, ownedKey, wireTtl),
                     null,
                     // A replica is sent the plain touch: it has no value to
                     // return, and `G` there would only move the value over
                     // the wire for nothing.
-                    connection -> connection.touch(namespace, key, wireTtl),
+                    connection -> connection.touch(ownedNamespace, ownedKey, wireTtl),
                     !expiring, true, expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
@@ -3376,7 +3391,13 @@ public final class NanocachedClient implements AutoCloseable {
             // leg holds no primary key, so it has nothing to put in
             // `retry`.
             if (fireAndForgetReplicas && pureReplica && backgroundReplicaWritePermits.tryAcquire()) {
-                Runnable backgroundLeg = () -> runMultiTouchLeg(namespace, leg, keyBytes, wireTtl, retry, state);
+                // Issue #1255: the leg frames its keys and namespace after the
+                // call returned; copy the keys it touches (the caller's own
+                // arrays for a positional byte[][] call) and the namespace.
+                byte[][] backgroundKeys = copyValuesForBackground(keyBytes, leg.indices);
+                byte[] backgroundNamespace = namespace.clone();
+                Runnable backgroundLeg =
+                        () -> runMultiTouchLeg(backgroundNamespace, leg, backgroundKeys, wireTtl, retry, state);
                 try {
                     CompletableFuture.runAsync(backgroundLeg, backgroundLegs)
                             .whenComplete((ignoredResult, error) -> {
@@ -3464,8 +3485,11 @@ public final class NanocachedClient implements AutoCloseable {
     boolean delete(byte[] namespace, byte[] key) {
         validateKey(namespace, key);
         beforeOperation();
+        // Issue #1255: the op below also runs as a background replica leg.
+        byte[] ownedNamespace = ownedForBackground(namespace);
+        byte[] ownedKey = ownedForBackground(key);
         return withWrongNodeRetry(
-                () -> write(namespace, key, connection -> connection.delete(namespace, key)));
+                () -> write(namespace, key, connection -> connection.delete(ownedNamespace, ownedKey)));
     }
 
     public void setMany(Map<String, String> values) {
@@ -5460,8 +5484,11 @@ public final class NanocachedClient implements AutoCloseable {
     private void replicateIncrResult(
             byte[] namespace, byte[] key, List<String> names, Connection.IncrResult result) {
         byte[] valueBytes = Long.toString(result.value()).getBytes(StandardCharsets.US_ASCII);
+        // Issue #1255: a background replica leg frames these after the call returned.
+        byte[] ownedNamespace = ownedForBackground(namespace);
+        byte[] ownedKey = ownedForBackground(key);
         replicateResultToReplicas(names, connection -> {
-            connection.set(namespace, key, valueBytes, result.ttlSeconds());
+            connection.set(ownedNamespace, ownedKey, valueBytes, result.ttlSeconds());
             return null;
         });
     }
@@ -5608,8 +5635,11 @@ public final class NanocachedClient implements AutoCloseable {
                 connection -> connection.casSet(namespace, key, value, ttlSeconds, cond));
         if (!stored) return false;
 
+        // Issue #1255: a background replica leg frames these after the call returned.
+        byte[] ownedNamespace = ownedForBackground(namespace);
+        byte[] ownedKey = ownedForBackground(key);
         replicateResultToReplicas(names, connection -> {
-            connection.set(namespace, key, value, ttlSeconds);
+            connection.set(ownedNamespace, ownedKey, value, ttlSeconds);
             return null;
         }, () -> {
             // issue #326: `value` here is cas()'s own `outgoing` — the caller's
@@ -5621,7 +5651,7 @@ public final class NanocachedClient implements AutoCloseable {
             // cas()) has already returned to the caller.
             byte[] backgroundSafe = compress ? value : Arrays.copyOf(value, value.length);
             return connection -> {
-                connection.set(namespace, key, backgroundSafe, ttlSeconds);
+                connection.set(ownedNamespace, ownedKey, backgroundSafe, ttlSeconds);
                 return null;
             };
         });
@@ -5653,8 +5683,11 @@ public final class NanocachedClient implements AutoCloseable {
                 () -> memberConnection(names.get(0)), connection -> connection.casDelete(namespace, key, cond));
         if (!deleted) return false;
 
+        // Issue #1255: a background replica leg frames these after the call returned.
+        byte[] ownedNamespace = ownedForBackground(namespace);
+        byte[] ownedKey = ownedForBackground(key);
         replicateResultToReplicas(names, connection -> {
-            connection.delete(namespace, key);
+            connection.delete(ownedNamespace, ownedKey);
             return null;
         });
         return true;
