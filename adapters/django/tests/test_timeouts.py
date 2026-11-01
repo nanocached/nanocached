@@ -61,6 +61,33 @@ class TimeoutTests(unittest.TestCase):
         self.cache.set("fractional", "value", timeout=1.1)
         self.assertEqual(self._wire_ttl("fractional"), 2)
 
+    def test_infinite_timeout_means_no_expiry(self) -> None:
+        # LocMemCache stores time.time() + inf and never expires the
+        # entry; int(inf) used to raise OverflowError here.
+        self.cache.set("inf", "value", timeout=float("inf"))
+        self.assertEqual(self.cache.get("inf"), "value")
+        self.assertEqual(self._wire_ttl("inf"), 0)
+
+    def test_timeout_beyond_the_wire_range_means_no_expiry(self) -> None:
+        # 2**64 seconds does not fit the wire TTL (the SDK raised
+        # ValueError); it is ~5.8e11 years, so "never expires" is the
+        # same thing in practice, and what LocMemCache does.
+        for i, timeout in enumerate((2**64, 10**30, 1e30)):
+            with self.subTest(timeout=timeout):
+                self.cache.set(f"huge{i}", "value", timeout=timeout)
+                self.assertEqual(self._wire_ttl(f"huge{i}"), 0)
+
+    def test_largest_wire_timeout_is_still_sent_as_is(self) -> None:
+        self.cache.set("max", "value", timeout=2**64 - 1)
+        self.assertEqual(self._wire_ttl("max"), 2**64 - 1)
+
+    def test_extreme_timeout_on_add_and_set_many(self) -> None:
+        self.assertTrue(self.cache.add("add-inf", "value", timeout=float("inf")))
+        self.assertEqual(self._wire_ttl("add-inf"), 0)
+        self.cache.set_many({"many-inf": "value"}, timeout=10**30)
+        self.assertEqual(self.cache.get("many-inf"), "value")
+        self.assertEqual(self._wire_ttl("many-inf"), 0)
+
 
 class KeyPrefixAndVersionTests(unittest.TestCase):
     def setUp(self) -> None:
