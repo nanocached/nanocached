@@ -31,8 +31,13 @@ framework adapters at one version, whether or not a component changed.
   frame, queued for the whole share behind that request and kept the charge
   until then. After the 60-second admission wait one of the two was
   answered `B`/`R` with nothing else running. A request now gives back its
-  receive buffer's charge before it waits, so it waits only for requests
-  (#1146).
+  receive buffer's charge before it waits, so it waits only for requests.
+  What its connection holds while it waits (its receive buffer, with the
+  frame of up to 1 MiB in it) is charged to a second pool of the budget's
+  size, with the same quarter per source IP, and a request that would have
+  to wait while that pool is full is answered `B`/`R` at once instead of
+  after 60 seconds; the proxy's ceiling for request bytes is twice
+  `--max-in-flight-bytes` (#1146).
 
 ## [0.6.0] - 2026-11-01
 
