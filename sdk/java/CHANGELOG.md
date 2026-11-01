@@ -13,6 +13,11 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- `reconnectCooldown` and `readHedgeAfter` accepted any positive `Duration`.
+  One beyond about 292 years failed later, at `connect`, with a bare
+  `ArithmeticException`, and a large cooldown wrapped the nanosecond
+  deadline so it was already over when read. Both setters now reject a
+  duration above one year with an `IllegalArgumentException` (#1239).
 - With `readHedgeAfter` set, a read could block its calling thread forever
   when a hedge leg threw an `Error` (`OutOfMemoryError`, a `LinkageError`
   after a redeploy, an `AssertionError` under `-ea`): the leg recorded no
