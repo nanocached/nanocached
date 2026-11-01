@@ -33,6 +33,7 @@ framework adapters at one version, whether or not a component changed.
   it; 10 nodes from one source took 27 s to all get in and `L` after the
   grace listed 5. The limit is now a burst of 64 new registrations per
   source, refilled one every 2 seconds (#1148).
+
 ### Changed
 
 - Container images: `:latest` is now the latest release, moved only by the
