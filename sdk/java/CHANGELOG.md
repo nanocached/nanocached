@@ -19,6 +19,11 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
   buffers right after the call returned made the replica store the value
   under a different key or namespace. The leg now gets its own copies of
   both (#1199).
+- `client.namespace(byte[])` kept the caller's array by reference, so
+  overwriting the buffer afterwards silently re-scoped the handle: later
+  calls hashed to a different owner and carried a different namespace in
+  their frames. The handle now keeps its own copy, as its `namespace()`
+  getter already returned one (#1181).
 - With `readHedgeAfter` set, a read could block its calling thread forever
   when a hedge leg threw an `Error` (`OutOfMemoryError`, a `LinkageError`
   after a redeploy, an `AssertionError` under `-ea`): the leg recorded no
