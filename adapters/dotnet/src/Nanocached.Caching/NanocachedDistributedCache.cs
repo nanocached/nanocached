@@ -37,7 +37,10 @@ namespace Nanocached.Caching;
 /// (with its own TTL) than the one this renewal was about to restore. An
 /// entry with no sliding window is never rewritten on <see cref="Get"/> —
 /// its TTL (if any) is fixed regardless of access, so the extra round trip
-/// would buy nothing.</para>
+/// would buy nothing. A renewal that fails with an SDK error (the node
+/// went away between the read and the renewal) is skipped too: the value
+/// already read is returned, and the failure is counted in
+/// <see cref="SlidingRenewalFailures"/>.</para>
 /// </summary>
 public class NanocachedDistributedCache : IDistributedCache
 {
@@ -65,6 +68,14 @@ public class NanocachedDistributedCache : IDistributedCache
     /// <see cref="InvalidOperationException"/>, and a direct read sees
     /// envelope bytes rather than the payload.</summary>
     public string Namespace { get; }
+
+    private long _slidingRenewalFailures;
+
+    /// <summary>How many times <see cref="GetAsync"/> returned a value
+    /// without renewing its sliding window because the renewal write failed
+    /// with an SDK error (a lost connection, say). The hit is returned, and
+    /// the entry expires on its old schedule (issue #1234).</summary>
+    public long SlidingRenewalFailures => Interlocked.Read(ref _slidingRenewalFailures);
 
     // Strict, like the SDK's own string overloads: Encoding.UTF8 silently
     // replaces a lone surrogate (half of a UTF-16 pair with no partner)
@@ -150,7 +161,26 @@ public class NanocachedDistributedCache : IDistributedCache
         // exactly that — someone else just wrote a fresher entry — so the
         // renewal is skipped, not retried.
         long wireTtl = envelope.WireTtlSeconds(now);
-        await _namespace.ReplaceAsync(keyBytes, hit.Token, envelope.ToBytes(), wireTtl).ConfigureAwait(false);
+        try
+        {
+            await _namespace.ReplaceAsync(keyBytes, hit.Token, envelope.ToBytes(), wireTtl).ConfigureAwait(false);
+        }
+        catch (NanocachedException error)
+        {
+            // Issue #1234: the value is already in hand, and the renewal is
+            // an optimization of its lifetime - if the node went away
+            // between the read and the renewal, the entry simply expires on
+            // its old schedule. Failing the Get would throw away a hit the
+            // caller can use. Not silent: counted in SlidingRenewalFailures,
+            // and the first one is written to stderr. (RefreshAsync, whose
+            // whole job is the renewal, still throws.)
+            if (Interlocked.Increment(ref _slidingRenewalFailures) == 1)
+            {
+                Console.Error.WriteLine(
+                    "nanocached.caching: a sliding-expiration renewal failed and was skipped "
+                    + $"(further failures are only counted in SlidingRenewalFailures): {error.Message}");
+            }
+        }
         return envelope.Payload;
     }
 

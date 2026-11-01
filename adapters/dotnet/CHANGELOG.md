@@ -11,6 +11,12 @@ changed. What 1.0.0 will promise is described on the
 
 ### Fixed
 
+- `GetAsync` on an entry with a sliding window threw when the renewal write
+  failed (the node reachable for the read and gone for the next request),
+  discarding a value it had already read. The renewal is now skipped and the
+  value returned; the skip is counted in the new
+  `NanocachedDistributedCache.SlidingRenewalFailures` and the first one is
+  written to stderr. `RefreshAsync` still throws. (#1234)
 - A `NanocachedCacheOptions.Addresses` entry such as `host:99999`, `host:0`,
   `host:-5` or `host: 80` was accepted: the port was parsed with the default
   number style and the current culture and never range-checked, so the

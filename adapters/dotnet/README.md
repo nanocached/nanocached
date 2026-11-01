@@ -132,6 +132,14 @@ is a no-op on a missing key, per the SPI's contract. An entry with no
 sliding window is never rewritten by `Get` — its TTL, if any, is fixed
 regardless of access, so the extra round trip would buy nothing.
 
+If the node cannot be reached for that renewal (it was reachable for the
+read a moment earlier), `Get` still returns the value it read: the renewal
+is skipped, the entry expires on its old schedule, and the skipped renewal
+is counted in `NanocachedDistributedCache.SlidingRenewalFailures` (the first
+one is also written to stderr). `Refresh`, whose only job is the renewal,
+throws instead. The `CancellationToken` of the `IDistributedCache` methods
+is checked on entry only; the SDK's calls take no token to pass it to.
+
 Whole-second TTLs only reach the wire: a positive sub-second remainder
 always rounds **up** to 1 second, never down to 0 (which would mean "no
 expiry"). The envelope keeps the exact absolute deadline, and `Get`
