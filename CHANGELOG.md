@@ -14,6 +14,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a write waiting in a forward queue (and a namespace name
+  held for a handoff's pending clears) was a set of slices of the receive
+  buffer it was parsed from, and a slice keeps the buffer's whole allocation
+  alive, while the 64 MiB queue bound counted only the key and value lengths.
+  After one large frame on a connection (a `G` for a long missing key, say),
+  each small `S` behind it queued about a frame's worth of memory the bound
+  never saw: with the forward target not answering, 600 such writes grew a
+  node by 530 MB, so a client could push the node past its memory limit. A
+  write is now copied into allocations of its own when it enters the queue
+  (#1160).
 - `nanocached-node`: a forward to a handoff target that had died but was
   still in the roster wrote two WARN lines per forwarded write, and
   re-replication wrote three per key it tried to send to such a target and
