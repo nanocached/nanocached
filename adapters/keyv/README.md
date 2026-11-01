@@ -1,10 +1,11 @@
 # nanocached-keyv
 
-A [Keyv](https://keyv.org/) `KeyvStoreAdapter` for the
-[nanocached](https://github.com/nanocached/nanocached) TypeScript/Node.js SDK
-— for `cache-manager` v6+ (its `createCache()`, not the older `caching()`)
-and NestJS 11's `CacheModule`, both of which moved onto Keyv storage
-adapters. If you're still on `cache-manager` v5, see the sibling
+A [Keyv](https://keyv.org/) storage adapter for the
+[nanocached](https://github.com/nanocached/nanocached) TypeScript/Node.js SDK,
+for **keyv 5 and keyv 6** — and so for `cache-manager` v6+ (its
+`createCache()`, not the older `caching()`) and NestJS 11's `CacheModule`,
+both of which moved onto Keyv storage adapters (and currently run on
+keyv 5). If you're still on `cache-manager` v5, see the sibling
 [`nanocached-cache-manager`](../cache-manager) instead.
 
 - **One store ⇄ one namespace.** Every `NanocachedKeyvStore` is scoped to
@@ -32,9 +33,10 @@ adapters. If you're still on `cache-manager` v5, see the sibling
 npm install nanocached-keyv keyv
 ```
 
-`keyv` v5 is a peer dependency; the `nanocached` SDK comes with the
+`keyv` (5 or 6) is a peer dependency; the `nanocached` SDK comes with the
 package (each adapter release depends on the SDK release of the same
-version).
+version). keyv 6 itself requires Node.js 22.19 or later; this package's own
+floor is Node.js 22, which is enough with keyv 5.
 
 ## Setup
 
@@ -48,9 +50,11 @@ const store = await nanocachedKeyvStore({
   secret: "...",     // optional, matches NANOCACHED_AUTH_SECRET
 });
 
-// Always wrap it yourself, and always with useKeyPrefix: false — see
-// "Namespace vs. Keyv's own prefixing" below for why.
-const keyv = new Keyv({ store, useKeyPrefix: false });
+// Always wrap it yourself. With keyv 5, always with useKeyPrefix: false —
+// see "Namespace vs. Keyv's own prefixing" below for why.
+const keyv = new Keyv({ store, useKeyPrefix: false }); // keyv 5
+// With keyv 6 (which has no useKeyPrefix option) it is just:
+// const keyv = new Keyv(store);
 
 await keyv.set("user:42", { name: "Ada" }, 60_000); // ttl in ms
 const user = await keyv.get("user:42"); // { name: "Ada" } | undefined
@@ -71,6 +75,10 @@ convention.
 never reuses a client the caller already has.
 
 ### With `cache-manager` v6+
+
+`cache-manager` 7 and `@nestjs/cache-manager` build on keyv 5, so the
+examples below use the keyv 5 form (`useKeyPrefix: false`). Build the `Keyv`
+instance from the same keyv major version the framework itself uses.
 
 ```ts
 import { createCache } from "cache-manager";
@@ -164,11 +172,25 @@ string in every wire key, and keys that are less legible if you inspect
 the server directly — which is why the examples above pass
 `useKeyPrefix: false`.
 
+**keyv 6 differs in two ways.** There is no `useKeyPrefix` option: a
+`Keyv` with no `namespace` of its own sends the raw key to the wire (the same
+thing `useKeyPrefix: false` gives you on keyv 5), and a `Keyv` with a
+`namespace` has keyv 6 prefix every key with `<namespace>::<key>` itself. And
+`clear()` on a `Keyv` that has a namespace does **not** wipe the nanocached
+namespace: keyv 6 clears a namespace by enumerating the store's keys, which
+the wire cannot do, so it emits an `error` event (it throws when nothing
+listens, see "When the node is unreachable") and deletes nothing. That is the
+safe outcome rather than a silent wipe, but it means that with keyv 6 you
+should not set a Keyv `namespace` on a store you call `clear()` on; leave it
+out and give each `Keyv` its own store with its own `namespace` config, as
+above. Without a Keyv namespace, `clear()` is the nanocached namespace's
+`CLEAR`, exactly as on keyv 5.
+
 ## Honest subset — what's omitted, and why each is the more correct choice
 
 Probed directly against `keyv@5.6.0` (the version real `cache-manager` v6+
-and `@nestjs/cache-manager` 3.x currently depend on) while building this
-adapter:
+and `@nestjs/cache-manager` currently depend on) while building this
+adapter, and re-checked against `keyv@6.1.0`:
 
 - **`has`/`hasMany`**: a naive presence check on this wire would misreport
   a key as present *after* its precise millisecond `expires` deadline
@@ -194,7 +216,40 @@ adapter:
   Reproduced live. Omitting the `iterator` property entirely avoids that
   code path; `keyv.iterator` simply stays `undefined`, which is one of the
   two outcomes the wire's actual limitation (no key enumeration) leaves
-  available anyway.
+  available anyway. (keyv 6 has no such crash, and its `keyv.iterator` yields
+  nothing for this adapter.)
+
+## How keyv 6 drives this adapter
+
+keyv 6 changed the storage-adapter contract: `set(key, value, expires)`
+receives an absolute Unix-millisecond expiry, for an adapter that advertises
+`capabilities.expires`. This adapter does not advertise it, so keyv 6 treats
+it as a legacy relative-`ttl` adapter and wraps it in its own
+`KeyvBridgeAdapter`, which turns the absolute expiry back into the remaining
+milliseconds before calling `set(key, value, ttl)` — the same call keyv 5
+makes. One code path therefore serves both versions, and a keyv 5 and a
+keyv 6 `Keyv` can even share one store without either misreading the other's
+`set()`. (If the adapter did advertise `expires`, it could not tell which
+convention a given call uses, and a keyv 5 relative `ttl` of 60000 would read
+as an expiry in 1970.)
+
+TTL rounding is unchanged: a positive sub-second value rounds up to 1 s,
+other values round up to the next whole second, and no expiry sends 0. Under
+keyv 6 the value being rounded is the time left when the bridge reaches the
+adapter, a few milliseconds less than the `ttl` you passed, so a `ttl` that
+is not a whole number of seconds (2001 ms, say) can land on the lower second
+(2 s rather than 3 s); whole-second values (1000, 60000) are exact. A
+deadline that has already passed is never written: the bridge deletes the
+key instead, as keyv 5 does for a negative `ttl`. Both versions also check
+the deadline on read, so an entry is hidden at its precise millisecond
+whatever the wire's second-granularity ttl says.
+
+Other visible differences between the versions:
+
+- A miss is `undefined` on both, and a stored `null` still round-trips as
+  `null`.
+- `has`, `getMany` and `deleteMany` come from the bridge on keyv 6 (loops over
+  `get`/`delete`), from keyv 5's own fallbacks on keyv 5; same results.
 
 ## When the node is unreachable
 
@@ -204,13 +259,17 @@ the store's `get`/`set`/`delete`/`clear` reject with the SDK's
 `ConnectionLostError`, or with the operating system's own connect error
 (an `Error` with `code: "ECONNREFUSED"`, for example) when no connection
 could be opened at all. What your code sees is then Keyv's own
-convention, not this adapter's: by default (`throwOnErrors: false`) Keyv
-swallows the rejection. `set`/`delete`/`clear` resolve `false` and emit
-the error on Keyv's `error` event; `get` resolves `undefined` and, in
-`keyv` 5.6, emits nothing at all — so an outage looks like a cold cache
-on reads, and only writes report it, and only to an `error` listener.
-With `new Keyv({ store, throwOnErrors: true })` every rejection
-propagates to the caller instead. `cache-manager` v6+ `createCache()` and NestJS's
+convention, not this adapter's. With **keyv 5**, by default
+(`throwOnErrors: false`) Keyv swallows the rejection: `set`/`delete`/`clear`
+resolve `false` and emit the error on Keyv's `error` event; `get` resolves
+`undefined` and, in `keyv` 5.6, emits nothing at all — so an outage looks
+like a cold cache on reads, and only writes report it, and only to an
+`error` listener. With `new Keyv({ store, throwOnErrors: true })` every
+rejection propagates to the caller instead. With **keyv 6** there is no
+`throwOnErrors`; it follows the `error` listener instead: with a listener
+attached, the failed `set`/`delete` resolve `false`, `get` resolves
+`undefined`, and every failure (reads included) is passed to the listener;
+with no listener on the `Keyv`, the call rejects with the error. `cache-manager` v6+ `createCache()` and NestJS's
 `CacheModule` build on Keyv's default, so their `get`/`wrap` fail open
 in the same way.
 
@@ -227,11 +286,9 @@ described above, so an oversize value is silently not cached unless
 
 ## Requirements
 
-Node.js 22+, `keyv` ^5 (the relative-millisecond-`ttl` adapter contract
-this targets — `keyv@6`'s absolute-`expires` contract is a different shape
-and, as of writing, still only at a release candidate, not what published
-`cache-manager`/`@nestjs/cache-manager` depend on), nanocached server
-0.4.0 or later — the release that added namespaces and `CLEAR`.
+Node.js 22+ (keyv 6 itself needs 22.19+), `keyv` ^5 or ^6 (tested against
+5.6.0 and 6.1.0), nanocached server 0.4.0 or later — the release that added
+namespaces and `CLEAR`.
 
 ## Policy note
 
@@ -248,6 +305,10 @@ ecosystems get their own idiomatic adapters (Spring `CacheManager`,
 cd adapters/keyv
 pnpm install && pnpm typecheck && pnpm test
 ```
+
+The tests run the adapter through keyv 6 directly (`keyv`, the dev
+dependency) and through keyv 5 (`keyv5`, an npm alias of `keyv@^5`, which is
+also what `cache-manager` and NestJS use).
 
 This package depends on the sibling `sdk/typescript` via
 `"nanocached": "link:../../sdk/typescript"` — see the sibling

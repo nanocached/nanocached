@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { Inject, Injectable, Module } from "@nestjs/common";
 import { Test } from "@nestjs/testing";
 import { CACHE_MANAGER, CacheModule, type Cache } from "@nestjs/cache-manager";
-import Keyv from "keyv";
+import Keyv from "keyv5";
 import { nanocachedKeyvStore } from "../src/index.js";
 import { startMockNode, type MockNode } from "./mockNode.js";
 
