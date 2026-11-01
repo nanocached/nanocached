@@ -446,9 +446,12 @@ const MULTI_KEY_OVERHEAD_BYTES: usize = 160;
 /// reallocated down to it. The node's own threshold.
 const REQUEST_BUFFER_SHRINK_THRESHOLD: usize = 64 * 1024;
 
-/// Bounds on the `L` response, mirroring `verify-staged-join`'s: a
-/// corrupt header must not drive allocations or blocking reads.
-const MAX_ROSTER_ENTRIES: usize = 4096;
+/// Bounds on the `L` response: a corrupt header must not drive
+/// allocations or blocking reads. The entry count is the fleet's one
+/// (`MAX_REGISTRY_SIZE` on discovery, the node's and the SDKs' `L`/`T`
+/// parsers): it used to be 4096 here, so a roster above that failed
+/// every refresh on the proxy alone (issue #1246).
+const MAX_ROSTER_ENTRIES: usize = 1 << 16;
 const MAX_NAME_OR_ADDR_LENGTH: usize = 1024;
 
 /// This process's own identity toward discovery (issue #122): a random
@@ -16160,5 +16163,47 @@ mod tests {
             .await
             .expect("the live replica's roster should still answer");
         assert_eq!(ring.all_addresses(), vec!["127.0.0.1:2".to_string()]);
+    }
+
+    /// Issue #1246: the `L` parser's entry bound is the fleet's 65,536,
+    /// not 4096 — a roster above 4096 nodes used to fail every refresh on
+    /// the proxy alone, while discovery, the node and the SDKs all carried
+    /// it.
+    #[tokio::test]
+    async fn fetch_roster_accepts_a_roster_above_4096_nodes_and_refuses_one_above_65536() {
+        let roster: Vec<(String, String)> = (0..5000)
+            .map(|i| {
+                (
+                    format!("node-{i}"),
+                    format!("10.0.{}.{}:8356", i / 256, i % 256),
+                )
+            })
+            .collect();
+        let discovery = start_mock_discovery(roster, 2).await;
+        let ring = fetch_roster_from(&discovery, &None, &None)
+            .await
+            .expect("a 5000-node roster is within the fleet-wide bound");
+        assert_eq!(ring.nodes.len(), 5000);
+        assert_eq!(ring.replication, 2);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = BytesMut::new();
+            // Whatever the proxy sends first (an `A`/`L` line), answer the
+            // roster header with one entry too many and stop there.
+            let _ = read_line(&mut stream, &mut buf).await;
+            let _ = stream
+                .write_all(format!("N {} 1\n", MAX_ROSTER_ENTRIES + 1).as_bytes())
+                .await;
+            let _ = stream.flush().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let error = match fetch_roster_from(&addr, &None, &None).await {
+            Ok(_) => panic!("a roster above 65,536 entries must be refused at the header"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     }
 }
