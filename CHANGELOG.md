@@ -14,6 +14,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a forward to a handoff target that had died but was
+  still in the roster wrote two WARN lines per forwarded write, and
+  re-replication wrote three per key it tried to send to such a target and
+  redialled it for every key. Each line is a synchronous stderr write, so
+  200,000 writes against a killed joiner produced 400,003 lines (47 MB) and
+  took 3.5 times as long, and a re-replication toward a killed peer wrote
+  183,741 lines for 61,248 keys. The first failure against a target is
+  still written in full; repeats are limited to one line per 10 seconds
+  with a count of the rest. Re-replication now skips a target's remaining
+  keys for 30 seconds once one key has used up every attempt (#1161).
 - `nanocached-proxy`: a replica leg of a write that failed or was refused
   logged a `WARN` line of its own, so with a node down one `o` or `y` wrote
   a line for every key that node held a copy of: a 200-key `o` against one
