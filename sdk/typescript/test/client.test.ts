@@ -1515,6 +1515,76 @@ describe("unsolicited busy response (issue #45)", () => {
   });
 });
 
+describe("a forced node-list refresh and one already in flight (issue #1227)", () => {
+  async function withStubbedRefresh(
+    run: (ctx: {
+      client: NanocachedClient;
+      starts: () => number;
+      release: (index: number) => void;
+    }) => Promise<void>,
+  ): Promise<void> {
+    const node = await startMockNode();
+    const discovery = await startMockDiscovery([{ name: "n1", address: node.address }]);
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        const gates: Array<() => void> = [];
+        // Every refresh blocks until the test releases it, so the test
+        // decides which one is "in flight" when a forced caller arrives.
+        (client as any).refreshNodeList = () => new Promise<void>((resolve) => gates.push(resolve));
+        await run({ client, starts: () => gates.length, release: (index) => gates[index]() });
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), node.close()]);
+    }
+  }
+
+  it("is not satisfied by a refresh that started before the failure; callers share one follow-up", async () => {
+    await withStubbedRefresh(async ({ client, starts, release }) => {
+      const refresh = (force: boolean) => (client as any).maybeRefreshNodeList({ force }) as Promise<void>;
+      // An ordinary staleness refresh starts first and stays in flight: it
+      // fetched its list before the failures below.
+      (client as any).lastNodeListFetch = 0;
+      let staleDone = false;
+      const stale = refresh(false).then(() => (staleDone = true));
+      assert.equal(starts(), 1);
+
+      let forcedDone = 0;
+      const forced = [refresh(true), refresh(true), refresh(true)].map((p) => p.then(() => forcedDone++));
+      await delay(20);
+      assert.equal(forcedDone, 0);
+
+      release(0);
+      await stale;
+      await waitFor(() => starts() === 2, "a refresh that starts after the failure");
+      await delay(20);
+      assert.equal(starts(), 2, "the three forced callers must share one follow-up refresh");
+      assert.equal(forcedDone, 0, "the old refresh must not satisfy a forced caller");
+
+      release(1);
+      await Promise.all(forced);
+      assert.equal(forcedDone, 3);
+      assert.ok(staleDone);
+      assert.equal(starts(), 2);
+    });
+  });
+
+  it("an ordinary caller still joins whichever refresh is in flight", async () => {
+    await withStubbedRefresh(async ({ client, starts, release }) => {
+      const refresh = (force: boolean) => (client as any).maybeRefreshNodeList({ force }) as Promise<void>;
+      (client as any).lastNodeListFetch = 0;
+      const first = refresh(false);
+      const second = refresh(false);
+      assert.equal(starts(), 1);
+      release(0);
+      await Promise.all([first, second]);
+      assert.equal(starts(), 1);
+    });
+  });
+});
+
 describe("onData's fatal paths route through poison() (issue #187)", () => {
   it("a malformed response marks the connection closed synchronously, before the 'close' event", async () => {
     // Regression: onData's response-parse-failure branch called
