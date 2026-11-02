@@ -204,6 +204,7 @@ framework adapters at one version, whether or not a component changed.
   (and a multi-key header that outgrows the free 64 KiB takes the largest
   frame's worth at once), so uploads queue for the share and take their
   turns (#1147).
+- `nanocached-node`: the sweep's queue of expired and migrated keys kept its allocation after it was worked off, so one large burst of expiries left the node holding 64 bytes per key of the burst's peak outside `--max-memory` for good (100,000 keys that had expired and been swept left a queue of 131,072 slots, 8 MiB, and the same burst at 500,000 keys left 32 MiB; by arithmetic the default 256 MiB with small entries can reach 128 MiB). The queue is replaced by an empty one as soon as it is drained, and the next pass allocates only for what it finds. (#1280)
 
 ### Changed
 
