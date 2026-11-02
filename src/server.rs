@@ -7927,7 +7927,7 @@ async fn fetch_roster_for_leave(
     let mut last_error = io::Error::other("no discovery replicas configured");
 
     for addr in discovery_addrs {
-        match timeout(OUTBOUND_IO_TIMEOUT, fetch_roster_once(node_context, addr)).await {
+        match timeout(OUTBOUND_IO_TIMEOUT, fetch_joined_roster(node_context, addr)).await {
             Ok(Ok(roster)) => return Ok(roster),
             Ok(Err(error)) => last_error = error,
             Err(_) => {
@@ -7940,6 +7940,40 @@ async fn fetch_roster_for_leave(
     }
 
     Err(last_error)
+}
+
+/// `fetch_roster_once`'s roster, cut down to the nodes discovery publishes
+/// (issue #1282): `T` lists every registered node, a `Waiting` or `Joining`
+/// one included, because the eviction re-replication and a join's own
+/// forwarding legitimately send frames to a joiner. The drain is neither:
+/// its `V` abandons any join still pending, so the ring clients route by
+/// afterwards is the `Joined` members less this node, and a ring built from
+/// the whole `T` result ranks an unpublished joiner above the leaver for
+/// some keys (they are skipped as not this node's) and names it entrant for
+/// others (they are sent to a node that is not in the ring and is not
+/// where reads will look). `L` is that published list. It is fetched after
+/// `T`, from the same address: a node promoted in between is in both and
+/// stays, one promoted after the `L` is a membership change inside the
+/// drain window, the case the architecture notes accept. No wire change:
+/// both commands are the ones a node and discovery already speak. `L`
+/// withheld (`B`) is an error, so the caller tries the next replica.
+async fn fetch_joined_roster(
+    node_context: &NodeContext,
+    addr: &str,
+) -> io::Result<(Vec<(String, String, String)>, usize)> {
+    let (members, replication) = fetch_roster_once(node_context, addr).await?;
+    let Some((published, _)) = fetch_published_roster_once(node_context, addr).await? else {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "discovery withholds the published roster",
+        ));
+    };
+    let published: HashSet<String> = published.into_iter().collect();
+    let members = members
+        .into_iter()
+        .filter(|(name, _, _)| published.contains(name))
+        .collect();
+    Ok((members, replication))
 }
 
 /// Issue #295: `T <name-len> <token-len>\n<name><token>` — a
@@ -21917,6 +21951,21 @@ mod tests {
                         let line: Vec<u8> = buf.drain(..=position).collect();
                         let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
                         let letter = line.chars().next().unwrap();
+                        if letter == 'L' {
+                            // Issue #1282: the published roster, which the
+                            // drain intersects with `T`'s.
+                            recorded.lock().unwrap().push(letter);
+                            let entries = [("leaver", "127.0.0.1:1"), ("peer", peer_addr.as_str())];
+                            let mut response = format!("N {} 1\n", entries.len()).into_bytes();
+                            for (name, addr) in entries {
+                                response.extend_from_slice(
+                                    format!("{} {}\n{name}{addr}\n", name.len(), addr.len())
+                                        .as_bytes(),
+                                );
+                            }
+                            let _ = stream.write_all(&response).await;
+                            continue;
+                        }
                         let fields: Vec<usize> = line
                             .split(' ')
                             .skip(1)
@@ -22854,6 +22903,113 @@ mod tests {
             }
         });
         (left, discovery_task)
+    }
+
+    /// A discovery whose `T` lists leaver, peer and a `Joining` joiner while
+    /// its `L` (what clients route by) lists the first two, or answers `B`.
+    fn spawn_pending_joiner_discovery(
+        listener: TcpListener,
+        published_withheld: bool,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 256];
+                    loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..read]);
+                        if buf.starts_with(b"L\n") {
+                            let response: &[u8] = if published_withheld {
+                                b"B\n"
+                            } else {
+                                b"N 2 1\n6 11\nleaver127.0.0.1:1\n4 11\npeer127.0.0.1:2\n"
+                            };
+                            let _ = stream.write_all(response).await;
+                            return;
+                        }
+                        // `T 6 9\n` and its 15 body bytes.
+                        if buf.starts_with(b"T ") && buf.len() >= "T 6 9\n".len() + 6 + 9 {
+                            let _ = stream
+                                .write_all(
+                                    b"N 3 1\n6 11 10\nleaver127.0.0.1:1tok-leaver\n4 11 8\npeer127.0.0.1:2tok-peer\n6 11 10\njoiner127.0.0.1:3tok-joiner\n",
+                                )
+                                .await;
+                            return;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_decommission_roster_leaves_out_a_node_discovery_has_not_published() {
+        // Issue #1282: `T` lists a joiner that is still `Joining`, `L` does
+        // not; the drain's ring must be the published one.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let task = spawn_pending_joiner_discovery(listener, false);
+        let context = roster_fetch_context(&addr, true);
+
+        let (members, replication) = fetch_roster_for_leave(&context, std::slice::from_ref(&addr))
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = members.iter().map(|(name, _, _)| name.as_str()).collect();
+        assert_eq!(names, ["leaver", "peer"]);
+        assert_eq!(replication, 1);
+        // The tokens still come from `T`.
+        assert_eq!(members[1].2, "tok-peer");
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_decommission_roster_fetch_fails_when_the_published_roster_is_withheld() {
+        // Without `L` the joiner cannot be told from a member: an error,
+        // not the unfiltered `T`.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let task = spawn_pending_joiner_discovery(listener, true);
+        let context = roster_fetch_context(&addr, true);
+
+        let error = fetch_roster_for_leave(&context, std::slice::from_ref(&addr))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        task.abort();
+    }
+
+    fn roster_fetch_context(discovery_addr: &str, promoted: bool) -> NodeContext {
+        NodeContext {
+            gates: Default::default(),
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: discovery_addr.to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(promoted)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

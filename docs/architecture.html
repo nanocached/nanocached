@@ -121,7 +121,10 @@ unreachable.</p>
 membership taken when it starts, and no two of them coordinate. A
 planned leave (the SIGTERM decommission — see
 <a href="deployment.html">Deployment</a>) computes its handoffs the same
-way, from one roster fetch as the drain begins. Two membership changes
+way, from one roster fetch as the drain begins — the roster clients route
+by, so a node whose join is still pending is not in it: the leaver's
+<code>V</code> abandons that join, and keys are handed to the members that
+will own them, not to the joiner. Two membership changes
 landing inside one drain window — two nodes scaled in at once, or an
 eviction while a third drains — can therefore leave keys transiently
 below R: each leaver picks entrants from a roster that still lists the

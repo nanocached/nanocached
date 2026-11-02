@@ -204,6 +204,7 @@ framework adapters at one version, whether or not a component changed.
   (and a multi-key header that outgrows the free 64 KiB takes the largest
   frame's worth at once), so uploads queue for the share and take their
   turns (#1147).
+- `nanocached-node`: a node asked to leave while another node's join was still pending built its drain ring from the whole `T` roster, which lists `Waiting` and `Joining` nodes too, so with a joiner D in it the leaver skipped the keys D would rank above it for (treated as not its own) and sent the keys D would be entrant for to D, which is not in the roster clients route by once the leaver's `V` has abandoned the join. D then re-joined or died with those keys never delivered to the members that own them: 49 of the leaver's 99 keys were missing on the new owners at R=1 and 150 of 197 at R=2 in the simulation (0 without a joiner), permanently if D never re-joined. The drain now keeps only the `T` entries that the published roster (`L`, fetched from the same discovery right after `T`) also lists; no wire change, and `L` withheld (`B`) fails the fetch for that discovery address like `T` withheld (#1282).
 
 ### Changed
 
