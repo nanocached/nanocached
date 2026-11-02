@@ -204,6 +204,7 @@ framework adapters at one version, whether or not a component changed.
   (and a multi-key header that outgrows the free 64 KiB takes the largest
   frame's worth at once), so uploads queue for the share and take their
   turns (#1147).
+- `nanocached-node`: once the receive buffers and multi-key frame charges of the connections added up to exactly `--max-in-flight-bytes`, every reply and every multi-key frame ran uncharged and all at once, so the budget stopped bounding anything: the room a charge may ask for (the budget less what connections pin) was 0, and a charge clamped to 0 is not waited for at all. A reply or frame with a cost now waits until some byte is released and then takes its usual share of the room, and the connection is closed after 10 s if nothing is, as it was before the clamps of #1262 and #1264. (A connection that pins the whole budget by itself does not wait for bytes only it holds, and the clamp that keeps two oversized requests from waiting for each other is unchanged.) With `--max-in-flight-bytes 1048576`, a 1,000,000-byte value requested by 200 connections that never read, and one more connection holding a 1,047,700-byte receive buffer, the node's resident memory was 195 MiB before and is 9 MiB now, and the waiting connections are closed with the budget error where none was. (#1274)
 
 ### Changed
 
