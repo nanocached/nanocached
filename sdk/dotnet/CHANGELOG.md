@@ -55,6 +55,15 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
   the HRW input and the namespace of every later call through the handle (keys
   written through one handle landed on different nodes). The handle now copies
   on the way in and returns a copy from `NamespaceBytes`. (#1182)
+- With `ReadRepair`, the background write that repairs the primary after a
+  replica answered a miss used the caller's own namespace and key arrays and
+  the very `byte[]` that `GetBytesAsync` returns (when compression is off),
+  and it runs after the call has returned, so reusing the key buffer or
+  editing the returned value in place made the primary store the repair under
+  a different key or with the edited bytes, for 60 seconds. Unlike a
+  fire-and-forget replica leg this happens whether or not
+  `FireAndForgetReplicas` is set. The repair now takes its own copy of
+  namespace, key and value. (#1289)
 
 ### Changed
 

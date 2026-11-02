@@ -1133,14 +1133,25 @@ public sealed class NanocachedClient : IDisposable
             if (_backgroundReplicaPermits.Wait(0))
             {
                 string primary = names[0];
-                byte[] repairValue = value;
+                // The repair runs after this call has returned (thread-pool
+                // queue, or the primary's redial), so it must not close over
+                // the caller's own arrays: `value` is the very byte[] the
+                // caller gets back when compression is off, and the
+                // namespace / key may be reused at once. Always copied --
+                // read repair is asynchronous whether or not
+                // FireAndForgetReplicas is set, so OwnedForBackgroundLegs
+                // (which keys off that option) does not apply. Taken only
+                // past the permit check, so a skipped repair costs nothing.
+                byte[] repairNamespace = (byte[])namespaceBytes.Clone();
+                byte[] repairKey = (byte[])key.Clone();
+                byte[] repairValue = (byte[])value.Clone();
                 Task background = Task.Run(async () =>
                 {
                     try
                     {
                         await ApplyReconnectingAsync<object?>(primary, async connection =>
                         {
-                            await connection.SetAsync(namespaceBytes, key, repairValue, ReadRepairTtlSeconds)
+                            await connection.SetAsync(repairNamespace, repairKey, repairValue, ReadRepairTtlSeconds)
                                 .ConfigureAwait(false);
                             return null;
                         }).ConfigureAwait(false);
