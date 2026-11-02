@@ -204,6 +204,7 @@ framework adapters at one version, whether or not a component changed.
   (and a multi-key header that outgrows the free 64 KiB takes the largest
   frame's worth at once), so uploads queue for the share and take their
   turns (#1147).
+- `nanocached-node`: over TLS the tail of a large reply could be lost to a client that reads slowly: the node wrote the reply with `write_all` and never flushed, and tokio-rustls reports a write as done once the plaintext is accepted even when ciphertext is still waiting for room in the socket, so the last part sat in the TLS writer until the next write, which on an idle connection never came. A 1,000,000-byte value read 4 KiB at a time with a 4 KiB receive buffer stalled in 2 of 4 runs (947,730 of 1,000,010 bytes, then nothing until the client's timeout), and a 512 KiB reply to such a reader stopped at 491,400 of 524,299 bytes every time in the test that now pins this. Replies are flushed inside the same write timeout, as is every write that is followed by a wait for the peer's answer. The same went for the writes to peers that are followed by a read of the ack (handoff, leave, forwards, roster fetches, authentication). Plain TCP is unchanged. (#1279)
 
 ### Changed
 

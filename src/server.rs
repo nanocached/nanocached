@@ -4901,6 +4901,7 @@ async fn register_with_discovery(
                         // via `heartbeat_task.await`, hang shutdown).
                         let exchange = timeout(OUTBOUND_IO_TIMEOUT, async {
                             stream.write_all(&auth).await?;
+                            stream.flush().await?;
                             let mut ack = [0u8; 3];
                             stream.read_exact(&mut ack).await?;
                             io::Result::Ok(ack)
@@ -7797,6 +7798,7 @@ async fn send_leave(node_context: &NodeContext, discovery_addrs: &[String]) {
             frame.extend_from_slice(node_context.name.as_bytes());
             frame.extend_from_slice(node_context.token.as_bytes());
             stream.write_all(&frame).await?;
+            stream.flush().await?;
             let mut ack = [0u8; 2];
             stream.read_exact(&mut ack).await?;
             if &ack != b"R\n" {
@@ -7900,6 +7902,7 @@ async fn send_handoff_set(
         stream
             .write_all(&handoff_message(key, value, ttl, if_absent, token))
             .await?;
+        stream.flush().await?;
         let mut ack = [0u8; 2];
         stream.read_exact(&mut ack).await?;
         if &ack != b"S\n" {
@@ -7979,6 +7982,7 @@ async fn fetch_roster_once(
     request.extend_from_slice(node_context.name.as_bytes());
     request.extend_from_slice(node_context.token.as_bytes());
     stream.write_all(&request).await?;
+    stream.flush().await?;
 
     let bad = || io::Error::new(io::ErrorKind::InvalidData, "bad T response");
 
@@ -9245,6 +9249,7 @@ async fn connect_and_authenticate(
     if let Some(secret) = &node_context.auth_secret {
         timeout(OUTBOUND_IO_TIMEOUT, async {
             stream.write_all(&auth_message(secret)).await?;
+            stream.flush().await?;
 
             let mut ack = [0u8; 3];
             stream.read_exact(&mut ack).await?;
@@ -9278,6 +9283,7 @@ async fn send_set(
     );
     timeout(OUTBOUND_IO_TIMEOUT, async {
         stream.write_all(&set_message(key, value, ttl)).await?;
+        stream.flush().await?;
 
         let mut ack = [0u8; 2];
         stream.read_exact(&mut ack).await?;
@@ -9514,6 +9520,7 @@ impl ForwardedWrite<'_> {
                 stream
                     .write_all(&handoff_message(key, value, ttl, if_absent, token))
                     .await?;
+                stream.flush().await?;
 
                 let mut ack = [0u8; 2];
                 stream.read_exact(&mut ack).await?;
@@ -9530,6 +9537,7 @@ impl ForwardedWrite<'_> {
                 stream
                     .write_all(&handoff_delete_message(key, token))
                     .await?;
+                stream.flush().await?;
 
                 let mut ack = [0u8; 2];
                 stream.read_exact(&mut ack).await?;
@@ -9547,6 +9555,7 @@ impl ForwardedWrite<'_> {
             }
             ForwardedWrite::Delete { key } => {
                 stream.write_all(&delete_message(key)).await?;
+                stream.flush().await?;
 
                 let mut ack = [0u8; 2];
                 stream.read_exact(&mut ack).await?;
@@ -9561,6 +9570,7 @@ impl ForwardedWrite<'_> {
             }
             ForwardedWrite::Clear { scope, token } => {
                 stream.write_all(&scope.handoff_message(token)).await?;
+                stream.flush().await?;
 
                 let mut ack = [0u8; 2];
                 stream.read_exact(&mut ack).await?;
@@ -10604,6 +10614,7 @@ async fn fetch_published_roster_once(
     let stream = connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
     let mut stream = tokio::io::BufReader::new(stream);
     stream.write_all(b"L\n").await?;
+    stream.flush().await?;
     read_published_roster(&mut stream).await
 }
 
@@ -30370,6 +30381,116 @@ mod tests {
         tls.shutdown().await.unwrap();
 
         server_task.await.unwrap();
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_reply_over_tls_is_flushed_to_a_slow_reader() {
+        // Issue #1279: tokio-rustls's `poll_write` returns `Ready(n)` with
+        // ciphertext still buffered when the socket is full, and nothing
+        // polls the stream again once `write_all` is done, so the tail of
+        // a reply larger than the socket buffers sat in the TLS writer for
+        // good while the client waited for it. Tiny socket buffers on both
+        // ends (as in the Rust SDK's equivalent test) make that
+        // deterministic: the reply is far larger than the two buffers
+        // together, so the write always ends with bytes left to flush.
+        const SMALL_SOCKET_BUFFER: u32 = 4096;
+        const VALUE_LEN: usize = 512 * 1024;
+        let (acceptor, connector) = self_signed_tls();
+
+        // Set before `listen`, so the accepted socket inherits it.
+        let listener_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        listener_socket
+            .set_send_buffer_size(SMALL_SOCKET_BUFFER)
+            .unwrap();
+        listener_socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .unwrap();
+        let listener = listener_socket.listen(1).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            auth_secret: None,
+            tls_acceptor: Some(acceptor),
+            node_context: None,
+            migration_tx: mpsc::channel(1).0,
+            forward_tx: mpsc::channel(1).0,
+            forward_queues: Arc::new(ForwardQueues::default()),
+            in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+        };
+        let server_task = tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            let mut connection_tasks = JoinSet::new();
+            dispatch_connection(
+                stream,
+                peer_addr,
+                request_tx,
+                Arc::new(Semaphore::new(1)),
+                Arc::new(Mutex::new(HashMap::new())),
+                DEFAULT_MAX_CONNECTIONS_PER_IP,
+                config,
+                shutdown_rx,
+                &mut connection_tasks,
+            );
+            while connection_tasks.join_next().await.is_some() {}
+        });
+
+        let client_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        client_socket
+            .set_recv_buffer_size(SMALL_SOCKET_BUFFER)
+            .unwrap();
+        let tcp = client_socket.connect(address).await.unwrap();
+        let mut tls = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+
+        let value = vec![b'v'; VALUE_LEN];
+        let mut request = format!("S 3 {VALUE_LEN}\nkey").into_bytes();
+        request.extend_from_slice(&value);
+        request.extend_from_slice(b"G 3\nkey");
+        tls.write_all(&request).await.unwrap();
+        tls.flush().await.unwrap();
+
+        // A slow reader: nothing at first, so both socket buffers fill,
+        // then 4 KiB at a time with a pause between reads.
+        sleep(Duration::from_millis(300)).await;
+        let expected = 2 + format!("V {VALUE_LEN}\n").len() + VALUE_LEN;
+        let mut received = Vec::with_capacity(expected);
+        let mut chunk = [0u8; 4096];
+        let drain = async {
+            while received.len() < expected {
+                let n = tls.read(&mut chunk).await.unwrap();
+                assert!(
+                    n > 0,
+                    "the connection closed after {} bytes",
+                    received.len()
+                );
+                received.extend_from_slice(&chunk[..n]);
+                sleep(Duration::from_millis(1)).await;
+            }
+        };
+        timeout(Duration::from_secs(20), drain)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "only {} of {expected} reply bytes arrived over TLS: the tail of the reply \
+                 is stuck in rustls's send buffer without a flush",
+                    received.len()
+                )
+            });
+        assert!(received.starts_with(b"S\nV "));
+        assert!(received.ends_with(&value));
+
+        tls.shutdown().await.unwrap();
+        timeout(Duration::from_secs(5), server_task)
+            .await
+            .unwrap()
+            .unwrap();
         cache_task.await.unwrap();
     }
 
