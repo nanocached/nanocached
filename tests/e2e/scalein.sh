@@ -20,7 +20,7 @@ E="$(cd "$(dirname "$0")" && pwd)"
 source $E/cl.sh
 P=nsi; D=$P-disc:8357
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
-cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 mkdir -p $E/logs
 cleanup; docker network create $NET >/dev/null
 disc_up $P-disc --replication-factor 2; sleep 1

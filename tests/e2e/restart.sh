@@ -16,13 +16,13 @@ E="$(cd "$(dirname "$0")" && pwd)"
 source "$E/cl.sh"
 P=nrd; D=$P-disc:8357
 T(){ echo "### $(date -u +%T.%N | cut -c1-12) [$P] $*"; }
-cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 RUN=${RUN:-$(date +%H%M%S)}; L="$E/logs/rdiag-$RUN"; mkdir -p "$L"
 cleanup; docker network create $NET >/dev/null
 disc_up $P-disc --replication-factor 2; sleep 1
 live=(); seq_no=0
 spawn(){ seq_no=$((seq_no+1)); spawned=$P-n$seq_no; node_up $spawned $D --drain-timeout 20; live+=("$spawned"); }
-ipmap(){ for c in $(docker ps -q --filter name=$P-); do docker inspect -f '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $c | tr -d /; done | sort > "$L/${1:-ipmap}.txt"; }
+ipmap(){ for c in $(docker ps -q --filter "name=^/$P-"); do docker inspect -f '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $c | tr -d /; done | sort > "$L/${1:-ipmap}.txt"; }
 for _ in 1 2 3; do spawn; wait_members ${#live[@]} $D 120 || { T "FAIL: bootstrap"; cleanup; exit 1; }; done
 docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1
 LOAD_SECS=${LOAD_SECS:-75}
@@ -49,6 +49,6 @@ echo "=== load: $load"
 check=$(docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
 echo "=== check: $check"
 docker logs -t $P-disc > "$L/disc.log" 2>&1
-for c in $(docker ps -aq --filter name=$P-); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); docker logs -t $c > "$L/$n.log" 2>&1; done
+for c in $(docker ps -aq --filter "name=^/$P-"); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); docker logs -t $c > "$L/$n.log" 2>&1; done
 echo "=== RESULT run=$RUN miss=$(grep -c '^.*MISS ' "$L/load.log") probes=$(grep -c 'PROBE ' "$L/load.log")"
 cleanup

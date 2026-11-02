@@ -36,7 +36,7 @@ P=rp; D=$P-disc:8357
 DISPLACED=${DISPLACED:-n2}; SEED=${SEED:-20000}; WRITE_AFTER=${WRITE_AFTER:-0.3}
 RUN=${RUN:-$(date +%H%M%S)}; L="$E/logs/repro-$RUN"; rm -rf "$L"; mkdir -p "$L"
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
-cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 wait_log(){ local c=$1 pat=$2 want=${3:-1} to=${4:-60} t0=$(date +%s); while :; do n=$(docker logs $c 2>&1 | grep -c -- "$pat"); [ "$n" -ge "$want" ] && return 0; [ $(( $(date +%s)-t0 )) -ge $to ] && { T "TIMEOUT waiting '$pat' x$want in $c"; return 1; }; sleep 0.05; done; }
 name_of(){ local ip; ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $1); docker logs $P-disc 2>&1 | grep "node registered:" | grep " at $ip:" | tail -1 | sed 's/.*node registered: \([^ ]*\) at.*/\1/'; }
 client(){ docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python "$@"; }
