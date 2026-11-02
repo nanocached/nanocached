@@ -430,10 +430,34 @@ type Target =
  * that waits behind a slow peer holds a reference to the caller's buffer
  * and not a second copy of it: 256 pending sets of one 512 KiB buffer held
  * 130 MiB of copies. The caller must leave the bytes alone until the call
- * settles; the Go, Java, .NET and Rust SDKs do not copy it either. */
+ * settles. A replica leg that outlives the call (`fireAndForgetReplicas`,
+ * the read-repair write-back) is the exception: it gets its own copy, made
+ * when the leg is started (`detachedLegBytes`), so the caller owns its
+ * buffers again as soon as the promise resolves. */
 function valueBytesOf(value: string | Uint8Array): Buffer {
   if (typeof value === "string") return utf8Bytes(value);
   return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+}
+
+/** The caller's bytes as one replica leg sends them. */
+interface LegBytes {
+  readonly key: string | Uint8Array;
+  /** Only for an op that sends the caller's own value bytes (an
+   * uncompressed `set`/`replace`); `undefined` when the op builds its own. */
+  readonly value: Buffer | undefined;
+}
+
+/** What a replica leg that outlives its call may read. A leg awaited by the
+ * call can read the caller's buffers directly, but a background leg
+ * (`fireAndForgetReplicas`) can still be waiting for its connection when
+ * the call resolves and the caller reuses the buffers, so it sends copies
+ * of them. The copy is made on the first call and shared by every
+ * background leg of one operation; a leg must call this synchronously when
+ * it is started, not after its first `await`. A string key is immutable and
+ * is not copied. */
+function detachedLegBytes(key: string | Uint8Array, value?: Buffer): () => LegBytes {
+  let copy: LegBytes | undefined;
+  return () => (copy ??= { key: typeof key === "string" ? key : Buffer.from(key), value: value === undefined ? undefined : Buffer.from(value) });
 }
 
 function targetKey(options: { host: string; port: number }): string {
@@ -1425,7 +1449,6 @@ export class NanocachedClient {
       if (value === null) continue;
 
       const primaryName = names[0];
-      const repairValue = value;
       // Bounded and tracked the same way a fireAndForgetReplicas replica
       // write is (fire-and-forget replica writes) — reusing backgroundReplicaWrites and
       // FIRE_AND_FORGET_TUNING.maxInFlight — so close() drains this
@@ -1442,8 +1465,12 @@ export class NanocachedClient {
       // already reached — read repair is opportunistic, so a later miss
       // repairs it.
       if (primaryName !== undefined && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+        // This write outlives the read, and both the key and `value` are
+        // the caller's to reuse as soon as it resolves (the value is what
+        // the read returns), so the write-back sends copies.
+        const repair = detachedLegBytes(key, value)();
         const repaired = this.memberConnection(primaryName)
-          .then((connection) => connection.set(key, repairValue, READ_REPAIR_TTL_SECONDS, namespace))
+          .then((connection) => connection.set(repair.key, repair.value!, READ_REPAIR_TTL_SECONDS, namespace))
           .catch((error) => {
             // Swallowed by design — see the doc comment.
             if (!isSwallowable(error)) throw error;
@@ -1472,7 +1499,9 @@ export class NanocachedClient {
    * is enabled (value compression). A `Uint8Array` value is not copied: it
    * is read when the request is written, which can be after this call
    * returns while the connection is busy, so leave it unchanged until the
-   * promise settles. */
+   * promise settles. A replica leg that outlives the call
+   * (`fireAndForgetReplicas`) works from its own copy, so the buffer is
+   * yours again once the promise has settled. */
   async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<void> {
     return this.setInNamespace(EMPTY_NAMESPACE, key, value, ttlSeconds);
   }
@@ -1726,7 +1755,16 @@ export class NanocachedClient {
     const outgoing = this.compress ? compressValue(valueBytes, this.compressionThreshold) : valueBytes;
     return this.withWrongNodeRetry(() =>
       this.target.kind === "cluster"
-        ? this.writeToOwners(key, namespace, (connection) => connection.set(key, outgoing, ttlSeconds, namespace))
+        ? this.writeToOwners(
+            key,
+            namespace,
+            (connection, bytes) => connection.set(bytes.key, bytes.value ?? outgoing, ttlSeconds, namespace),
+            undefined,
+            false,
+            false,
+            // `outgoing` is the caller's own buffer unless it was compressed.
+            this.compress || typeof value === "string" ? undefined : outgoing,
+          )
         : this.connectionForSingleTarget().then((connection) => connection.set(key, outgoing, ttlSeconds, namespace)),
     );
   }
@@ -1736,7 +1774,7 @@ export class NanocachedClient {
     await this.maybeRefreshNodeList();
     return this.withWrongNodeRetry(() =>
       this.target.kind === "cluster"
-        ? this.writeToOwners(key, namespace, (connection) => connection.delete(key, namespace))
+        ? this.writeToOwners(key, namespace, (connection, bytes) => connection.delete(bytes.key, namespace))
         : this.connectionForSingleTarget().then((connection) => connection.delete(key, namespace)),
     );
   }
@@ -1752,7 +1790,7 @@ export class NanocachedClient {
       return await this.withWrongNodeRetry(
         () =>
           this.target.kind === "cluster"
-            ? this.writeToOwners(key, namespace, (connection) => connection.touch(key, ttlSeconds, namespace), undefined, expiring, expiring)
+            ? this.writeToOwners(key, namespace, (connection, bytes) => connection.touch(bytes.key, ttlSeconds, namespace), undefined, expiring, expiring)
             : this.connectionForSingleTarget().then((connection) => connection.touch(key, ttlSeconds, namespace)),
         { nonIdempotent: expiring, rejectionIsFinal: true },
       );
@@ -1782,8 +1820,8 @@ export class NanocachedClient {
             ? this.writeToOwners(
                 key,
                 namespace,
-                (connection) => connection.getAndTouch(key, ttlSeconds, namespace),
-                (connection) => connection.touch(key, ttlSeconds, namespace),
+                (connection, bytes) => connection.getAndTouch(bytes.key, ttlSeconds, namespace),
+                (connection, bytes) => connection.touch(bytes.key, ttlSeconds, namespace),
                 expiring,
                 expiring,
               )
@@ -2947,7 +2985,7 @@ export class NanocachedClient {
     return this.withWrongNodeRetry(
       () =>
         this.target.kind === "cluster"
-          ? this.casOnOwners(key, namespace, outgoing, cond, ttlSeconds)
+          ? this.casOnOwners(key, namespace, outgoing, cond, ttlSeconds, !this.compress && typeof value !== "string")
           : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) =>
               connection.cas(key, outgoing, cond, ttlSeconds, namespace),
             ),
@@ -3235,11 +3273,13 @@ export class NanocachedClient {
   private async writeToOwners<T>(
     key: string | Uint8Array,
     namespace: Uint8Array,
-    op: (connection: Connection) => Promise<T>,
+    op: (connection: Connection, bytes: LegBytes) => Promise<T>,
     /** What the non-primary owners are sent when it differs from the
      * primary's `op` (issue #825): a get-and-touch asks only the primary
-     * for the value. */
-    replicaOp: (connection: Connection) => Promise<unknown> = op,
+     * for the value. A background replica leg is handed copies of the
+     * caller's key and `callerValue` (see `detachedLegBytes`); the legs
+     * this call awaits get the caller's own. */
+    replicaOp: (connection: Connection, bytes: LegBytes) => Promise<unknown> = op,
     /** The primary leg is not safe to resend once its frame may have been
      * written (a touch with ttl 0, issue #901): reaching the primary then
      * goes through `dialForWrite`, so a failure to get a connection counts
@@ -3254,6 +3294,9 @@ export class NanocachedClient {
      * guarantee, the same class as the retry paths. A primary that fails
      * gets no replica leg. */
     replicasAfterPrimary = false,
+    /** The value bytes `op` sends when they are the caller's own buffer
+     * (an uncompressed `set`), for a background leg to copy. */
+    callerValue: Buffer | undefined = undefined,
   ): Promise<T> {
     const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
     if (primaryName === undefined) {
@@ -3265,10 +3308,15 @@ export class NanocachedClient {
     // primary can report one that has already occurred without waiting
     // for legs that have not settled.
     const backgroundBugs: unknown[] = [];
+    const liveBytes: LegBytes = { key, value: callerValue };
+    const detachBytes = detachedLegBytes(key, callerValue);
     const replicaWrite = async (name: string, background = false): Promise<void> => {
+      // Before the first `await`: a background leg may resume after the
+      // call has resolved.
+      const bytes = background ? detachBytes() : liveBytes;
       try {
         const connection = await this.memberConnection(name);
-        await replicaOp(connection);
+        await replicaOp(connection, bytes);
       } catch (error) {
         // Swallowed by design — see the doc comment. Counted in
         // stats().replicaWriteFailures, whether this leg ran
@@ -3348,7 +3396,7 @@ export class NanocachedClient {
       const connection = primaryNotResendable
         ? await this.dialForWrite(() => this.memberConnection(primaryName))
         : await this.memberConnection(primaryName);
-      primary = { ok: true, value: await op(connection) };
+      primary = { ok: true, value: await op(connection, liveBytes) };
     } catch (error) {
       primary = { ok: false, error };
     }
@@ -3449,10 +3497,13 @@ export class NanocachedClient {
     // throw out of incr() after the primary already applied the delta.
     const ttlSeconds = Math.min(result.ttlSeconds ?? 0, Number.MAX_SAFE_INTEGER);
 
-    const replicaWrite = async (name: string): Promise<void> => {
+    const detachBytes = detachedLegBytes(key);
+    const replicaWrite = async (name: string, background = false): Promise<void> => {
+      // Before the first `await`, as in writeToOwners.
+      const legKey = background ? detachBytes().key : key;
       try {
         const connection = await this.memberConnection(name);
-        await connection.set(key, valueBytes, ttlSeconds, namespace);
+        await connection.set(legKey, valueBytes, ttlSeconds, namespace);
       } catch (error) {
         // Swallowed by design — see the doc comment above (and
         // writeToOwners', which this mirrors). An actual programming bug
@@ -3477,7 +3528,7 @@ export class NanocachedClient {
     const backgroundLegs: Promise<void>[] = [];
     for (const name of replicaNames) {
       if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
-        const background = replicaWrite(name);
+        const background = replicaWrite(name, true);
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
         settled.finally(() => this.backgroundReplicaWrites.delete(background));
@@ -3531,7 +3582,16 @@ export class NanocachedClient {
    * (stats().replicaWriteFailures, fireAndForgetReplicas-aware) — the
    * primary's write already succeeded, so its result is always what's
    * returned. */
-  private async casOnOwners(key: string | Uint8Array, namespace: Uint8Array, value: Buffer, cond: CasCondition, ttlSeconds: number): Promise<boolean> {
+  private async casOnOwners(
+    key: string | Uint8Array,
+    namespace: Uint8Array,
+    value: Buffer,
+    cond: CasCondition,
+    ttlSeconds: number,
+    /** `value` is the caller's own buffer (uncompressed, not a string), so a
+     * background replica leg sends a copy of it. */
+    callerOwnsValue: boolean,
+  ): Promise<boolean> {
     const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
     if (primaryName === undefined) {
       throw new ConnectionLostError("nanocached: no owner is reachable for this key", { requestWasSent: false });
@@ -3543,10 +3603,13 @@ export class NanocachedClient {
       return stored;
     }
 
-    const replicaWrite = async (name: string): Promise<void> => {
+    const detachBytes = detachedLegBytes(key, callerOwnsValue ? value : undefined);
+    const replicaWrite = async (name: string, background = false): Promise<void> => {
+      // Before the first `await`, as in writeToOwners.
+      const bytes = background ? detachBytes() : undefined;
       try {
         const connection = await this.memberConnection(name);
-        await connection.set(key, value, ttlSeconds, namespace);
+        await connection.set(bytes?.key ?? key, bytes?.value ?? value, ttlSeconds, namespace);
       } catch (error) {
         // Swallowed by design — see the doc comment above (and
         // incrOnOwners'/writeToOwners', which this mirrors). An actual
@@ -3568,7 +3631,7 @@ export class NanocachedClient {
     const backgroundLegs: Promise<void>[] = [];
     for (const name of replicaNames) {
       if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
-        const background = replicaWrite(name);
+        const background = replicaWrite(name, true);
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
         settled.finally(() => this.backgroundReplicaWrites.delete(background));
@@ -3617,10 +3680,13 @@ export class NanocachedClient {
       return deleted;
     }
 
-    const replicaWrite = async (name: string): Promise<void> => {
+    const detachBytes = detachedLegBytes(key);
+    const replicaWrite = async (name: string, background = false): Promise<void> => {
+      // Before the first `await`, as in writeToOwners.
+      const legKey = background ? detachBytes().key : key;
       try {
         const connection = await this.memberConnection(name);
-        await connection.delete(key, namespace);
+        await connection.delete(legKey, namespace);
       } catch (error) {
         if (!isSwallowable(error)) throw error;
         this.replicaWriteFailures++;
@@ -3634,7 +3700,7 @@ export class NanocachedClient {
     const backgroundLegs: Promise<void>[] = [];
     for (const name of replicaNames) {
       if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
-        const background = replicaWrite(name);
+        const background = replicaWrite(name, true);
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
         settled.finally(() => this.backgroundReplicaWrites.delete(background));

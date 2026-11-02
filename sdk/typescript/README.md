@@ -678,7 +678,10 @@ never replayed.
   `Buffer` value is not copied: it is read when the request is written,
   which can be after the call returns while the connection is busy, so
   leave it unchanged until the promise settles (a string is encoded when
-  `set` is called)
+  `set` is called). A replica write that outlives the call
+  (`fireAndForgetReplicas`) and the read-repair write-back work from their
+  own copies of a `Uint8Array` key and value, so both are yours again as
+  soon as the promise settles
 - `client.delete(key)` — resolves `boolean` (whether the key existed)
 - `client.incr(key, delta = 1)` / `client.decr(key, delta = 1)` — resolves
   `number | null` (`null` on a miss); throws `NotNumericError` if the

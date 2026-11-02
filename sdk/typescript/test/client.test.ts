@@ -5597,6 +5597,112 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
       await cluster.close();
     }
   });
+
+  // The caller's key and value buffers stay theirs once the promise has
+  // resolved, even though a background replica leg has not been written
+  // yet: the replica's connection is held busy, the caller overwrites its
+  // buffers after the call returns, and the leg must still carry the bytes
+  // the call was made with.
+  describe("a background replica leg does not read the caller's buffers after the call resolved", () => {
+    const cases: {
+      name: string;
+      seed?: string;
+      call: (client: NanocachedClient, key: Uint8Array, value: Uint8Array) => Promise<unknown>;
+      check: (replica: MockNode) => void;
+    }[] = [
+      {
+        name: "set",
+        seed: "init",
+        call: (client, key, value) => client.set(key, value),
+        check: (replica) => {
+          assert.deepEqual(storeOf(replica), [["k", "init-replaced"]]);
+        },
+      },
+      {
+        name: "delete",
+        seed: "init",
+        call: (client, key) => client.delete(key),
+        check: (replica) => {
+          assert.deepEqual(storeOf(replica), []);
+        },
+      },
+      {
+        name: "touch",
+        seed: "init",
+        call: (client, key) => client.touch(key, 77),
+        check: (replica) => {
+          assert.equal(replica.ttlOf("k"), 77);
+          assert.deepEqual(storeOf(replica), [["k", "init"]]);
+        },
+      },
+      {
+        name: "getAndTouchBytes",
+        seed: "init",
+        call: (client, key) => client.getAndTouchBytes(key, 77),
+        check: (replica) => {
+          assert.equal(replica.ttlOf("k"), 77);
+          assert.deepEqual(storeOf(replica), [["k", "init"]]);
+        },
+      },
+      {
+        name: "incr",
+        seed: "5",
+        call: (client, key) => client.incr(key),
+        check: (replica) => {
+          assert.deepEqual(storeOf(replica), [["k", "6"]]);
+        },
+      },
+      {
+        name: "replace",
+        seed: "init",
+        call: (client, key, value) => client.replace(key, contentDigest(Buffer.from("init")), value),
+        check: (replica) => {
+          assert.deepEqual(storeOf(replica), [["k", "init-replaced"]]);
+        },
+      },
+      {
+        name: "deleteIfMatches",
+        seed: "init",
+        call: (client, key) => client.deleteIfMatches(key, contentDigest(Buffer.from("init"))),
+        check: (replica) => {
+          assert.deepEqual(storeOf(replica), []);
+        },
+      },
+    ];
+
+    const storeOf = (node: MockNode): [string, string][] => [...node.store.entries()].map(([key, value]) => [key, value.toString()]);
+
+    for (const { name, seed, call, check } of cases) {
+      it(name, async () => {
+        const cluster = await startReplicatedCluster();
+        const client = await NanocachedClient.connect({
+          addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+          fireAndForgetReplicas: true,
+        });
+        try {
+          const { primary, replica } = cluster.ownerOf("k");
+          for (const node of [primary, replica]) node.mock.store.set("k", Buffer.from(seed!));
+          const connection = await (client as any).memberConnection(replica.name);
+          let release!: () => void;
+          connection.writeGate = new Promise<void>((resolve) => (release = resolve));
+
+          const key = Buffer.from("k");
+          const value = Buffer.from("init-replaced");
+          await call(client, key, value);
+          // The call has resolved, so the buffers are the caller's again.
+          key.fill("Z".charCodeAt(0));
+          value.fill("B".charCodeAt(0));
+          release();
+          await client.close(); // drains the background legs
+
+          check(replica.mock);
+        } finally {
+          await client.close();
+          await cluster.close();
+        }
+      });
+    }
+  });
 });
 
 describe("NanocachedClient cluster-leg chunked partial success on connection loss (issue #411)", () => {
@@ -5958,6 +6064,45 @@ describe("NanocachedClient read repair (read repair)", () => {
       await cluster.close();
     }
   });
+
+  // The key the caller passed in and the value the call returned are theirs
+  // too: the repair write-back to the primary is detached, and the
+  // primary's connection is held busy here until the caller has overwritten
+  // them.
+  for (const reused of ["key", "value"] as const) {
+    it(`does not read the caller's ${reused} buffer after the read has resolved`, async () => {
+      const cluster = await startReplicatedCluster();
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+        readRepair: true,
+      });
+      try {
+        const { primary, replica } = cluster.ownerOf("k");
+        replica.mock.store.set("k", Buffer.from("hello"));
+        const connection = await (client as any).memberConnection(primary.name);
+        // Hold the primary's connection once the miss GET has been answered.
+        let release!: () => void;
+        const get = connection.get.bind(connection);
+        connection.get = async (...args: unknown[]) => {
+          const result = await get(...args);
+          connection.writeGate = new Promise<void>((resolve) => (release = resolve));
+          return result;
+        };
+
+        const key = Buffer.from("k");
+        const value = await client.getBytes(key);
+        assert.equal(value?.toString(), "hello");
+        (reused === "key" ? key : value!).fill("Z".charCodeAt(0));
+        release();
+        await client.close(); // drains the write-back
+
+        assert.deepEqual([...primary.mock.store.entries()].map(([k, v]) => [k, v.toString()]), [["k", "hello"]]);
+      } finally {
+        await client.close();
+        await cluster.close();
+      }
+    });
+  }
 });
 
 describe("NanocachedClient hedged reads (issue #64)", () => {
