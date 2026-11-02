@@ -228,6 +228,7 @@ framework adapters at one version, whether or not a component changed.
   later-finishing run could move `:main` back to an older commit. A build
   of a commit that is no longer the tip gets its `:sha-<commit>` tag only
   (#1165).
+- `ci`: the nightly `hostile-conformance` workflow failed every night since the .NET 10 bump, with its 11 .NET cells reporting "no record": the .NET drivers (`tools/conformance/drivers/dotnet/{run,scenario}.sh`) still ran in `mcr.microsoft.com/dotnet/runtime:8.0`, and a `net10.0` app cannot start there ("You must install or update .NET to run this application ... Framework: 'Microsoft.NETCore.App', version '10.0.0'"). They now run in `runtime:10.0`. The Rust drivers' image, `rust:latest` in the build (`build.sh`) and in the run (`run.sh`, `scenario.sh`), is pinned to `rust:1.96` in all three, so a new Rust release cannot change a nightly's result (#1286).
 
 ## [0.6.0] - 2026-11-01
 
