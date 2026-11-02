@@ -30,13 +30,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -4872,7 +4870,7 @@ public final class NanocachedClient implements AutoCloseable {
      * #readHedged}. Exactly one of {@code wrongNode}/{@code failure}/
      * {@code bug} is set for anything but a hit ({@code value} may
      * legitimately be {@code null} too, for a miss). */
-    private static final class LegOutcome<T> {
+    static final class LegOutcome<T> {
         final T value;
         final NanocachedException.WrongNode wrongNode;
         final NanocachedException failure;
@@ -4927,6 +4925,82 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
+    /** Issue #1265: where a hedge leg reports its outcome to {@link
+     * #readHedged}, built so that reporting allocates nothing. The earlier
+     * shape -- a {@code ConcurrentHashMap.put} plus a {@code
+     * LinkedBlockingQueue.add} of a boxed index -- created a map node, a
+     * queue node and an {@code Integer} at the moment a leg settled; under
+     * an {@code OutOfMemoryError} that is the one place a failure must not
+     * be able to happen, because the reader waits for exactly this signal.
+     * Here there is one slot per owner and a {@link
+     * java.util.concurrent.Semaphore}, both created by the reader before
+     * the first leg starts; {@link #settle} is an array store plus {@code
+     * Semaphore.release()}, which is a CAS and an unpark, nothing more.
+     *
+     * <p>The reader takes the lowest-indexed settled slot, not the
+     * earliest-settled one. That only matters when several legs have
+     * settled by the time the reader looks, and then it is the better
+     * order: the primary's answer, which is the only miss that is final,
+     * is considered before a replica's. */
+    static final class HedgeSettlement<T> {
+        private final java.util.concurrent.atomic.AtomicReferenceArray<LegOutcome<T>> slots;
+        private final java.util.concurrent.Semaphore settled = new java.util.concurrent.Semaphore(0);
+
+        HedgeSettlement(int legs) {
+            slots = new java.util.concurrent.atomic.AtomicReferenceArray<>(legs);
+        }
+
+        /** Called once per leg, from the leg. Allocation-free: store first,
+         * signal second, so a reader that acquired a permit always finds a
+         * slot. */
+        void settle(int index, LegOutcome<T> outcome) {
+            slots.set(index, outcome);
+            settled.release();
+        }
+
+        /** Waits up to {@code timeoutNanos} for a leg to settle and returns
+         * its index, or {@code -1} if none did. The slot is left in place;
+         * {@link #take} consumes it. Reader thread only. */
+        int await(long timeoutNanos) throws InterruptedException {
+            if (!settled.tryAcquire(timeoutNanos, TimeUnit.NANOSECONDS)) {
+                return -1;
+            }
+            for (int i = 0; i < slots.length(); i++) {
+                if (slots.get(i) != null) {
+                    return i;
+                }
+            }
+            // Unreachable: settle() stores before it releases.
+            throw new NanocachedException("nanocached: hedged read signalled without an outcome");
+        }
+
+        /** Consumes the outcome of the leg {@link #await} returned. */
+        LegOutcome<T> take(int index) {
+            return slots.getAndSet(index, null);
+        }
+    }
+
+    /** Issue #1265: the longest {@link #readHedged} waits, with every owner
+     * in flight, for a leg to report -- a backstop, so that a leg that ends
+     * without reporting for a reason nobody anticipated (the settle path no
+     * longer allocates, but that is one cause among possible others) fails
+     * the read instead of parking the caller for good. It must never fire
+     * on a read that is merely slow, so it is built from the limits a leg
+     * already runs under rather than chosen separately: one attempt is a
+     * dial ({@code Identify.connectTimeoutMillis}) plus a request ({@code
+     * Connection.requestTimeoutMillis}); {@link #applyReconnecting} makes a
+     * second attempt after a non-timeout connection failure; the thread
+     * teardown margin covers scheduling slack; and the whole is doubled
+     * because a hedge leg may sit in {@link #replicaWriters}' queue (as
+     * deep as the pool is wide) behind running legs that each take up to
+     * the same time. Read live, so tests that shorten the timeouts shorten
+     * this. */
+    static long hedgeSettleBoundMillis() {
+        long oneLeg = 2 * (Connection.requestTimeoutMillis + Identify.connectTimeoutMillis)
+                + executorTerminationTimeoutMillis;
+        return 2 * oneLeg;
+    }
+
     /**
      * Hedged reads (issue #64): one slow — not dead — owner otherwise
      * bounds every read that touches it at its full round trip, since the
@@ -4960,8 +5034,7 @@ public final class NanocachedClient implements AutoCloseable {
      * #hedgedReads} exactly like a {@code fireAndForgetReplicas} write.
      */
     private <T> T readHedged(ConnectionOp<T> op, List<String> names) {
-        BlockingQueue<Integer> completions = new LinkedBlockingQueue<>();
-        Map<Integer, LegOutcome<T>> results = new ConcurrentHashMap<>();
+        HedgeSettlement<T> settlement = new HedgeSettlement<>(names.size());
         // Every leg started so far, keyed by index, so that once this read
         // decides its outcome the legs it leaves behind can be resolved
         // (issue #276) -- see resolveLosers. Plain HashMap: only ever
@@ -4969,28 +5042,40 @@ public final class NanocachedClient implements AutoCloseable {
         Map<Integer, CompletableFuture<Void>> legFutures = new HashMap<>();
 
         int nextIndex = 1;
-        legFutures.put(0, startHedgeLeg(0, names.get(0), op, completions, results));
+        legFutures.put(0, startHedgeLeg(0, names.get(0), op, settlement));
         int pendingCount = 1;
 
         RuntimeException lastError = null;
         boolean replicaMissed = false;
 
         while (pendingCount > 0) {
-            Integer index;
+            int index;
             try {
-                index = nextIndex < names.size()
-                        ? completions.poll(readHedgeAfterNanos, TimeUnit.NANOSECONDS)
-                        : completions.take();
+                if (nextIndex < names.size()) {
+                    index = settlement.await(readHedgeAfterNanos);
+                } else {
+                    // Every owner is in flight: wait for one to report, but
+                    // not for ever (issue #1265).
+                    long boundMillis = hedgeSettleBoundMillis();
+                    index = settlement.await(TimeUnit.MILLISECONDS.toNanos(boundMillis));
+                    if (index < 0) {
+                        // Not resolveLosers: that joins the legs, and these
+                        // are the ones that did not report.
+                        throw new NanocachedException(
+                                "nanocached: a hedged read leg did not report an outcome within "
+                                        + boundMillis + " ms");
+                    }
+                }
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 throw new NanocachedException(
                         "nanocached: interrupted while waiting for a hedged read", interrupted);
             }
 
-            if (index == null) {
+            if (index < 0) {
                 // Hedge interval elapsed with no answer: one more owner,
                 // without waiting for any leg already in flight.
-                legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, completions, results));
+                legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
                 pendingCount++;
                 nextIndex++;
                 continue;
@@ -5006,7 +5091,7 @@ public final class NanocachedClient implements AutoCloseable {
             if (finishedLeg != null) {
                 hedgedReads.remove(finishedLeg);
             }
-            LegOutcome<T> outcome = results.remove(index);
+            LegOutcome<T> outcome = settlement.take(index);
             if (outcome.wrongNode != null) {
                 resolveLosers(legFutures.values());
                 throw outcome.wrongNode;
@@ -5030,7 +5115,7 @@ public final class NanocachedClient implements AutoCloseable {
                 // Everything started so far has failed or missed
                 // provisionally: the next owner gets its turn right away,
                 // rather than waiting out another full interval.
-                legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, completions, results));
+                legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
                 pendingCount++;
                 nextIndex++;
             }
@@ -5076,11 +5161,11 @@ public final class NanocachedClient implements AutoCloseable {
      * name}), running it on {@link #replicaWriters} — falling back to
      * running it inline if that pool was concurrently shut down by {@link
      * #close()}, mirroring {@link #submitReplicaWrite} — and reporting its
-     * outcome by putting it in {@code results} and offering {@code index}
-     * to {@code completions}, rather than through the {@link
+     * outcome through {@code settlement} (an allocation-free slot plus
+     * signal, see {@link HedgeSettlement}), rather than through the {@link
      * CompletableFuture}'s own result: {@link #readHedged} needs to learn
      * of a completion the instant it happens, including one that races in
-     * while it's blocked waiting on an earlier leg, which a queue gives
+     * while it's blocked waiting on an earlier leg, which a signal gives
      * for free and a bare future does not. The future itself exists only
      * so {@link #hedgedReads}/{@link #drainHedgedReads} can still block
      * {@link #close()} until this leg — win or lose — actually finishes.
@@ -5088,12 +5173,13 @@ public final class NanocachedClient implements AutoCloseable {
      * via {@link #resolveLosers} past {@link #maxInFlightHedgeLoserLegs}
      * (issue #276) without waiting on {@link #close()}. */
     private <T> CompletableFuture<Void> startHedgeLeg(int index, String name, ConnectionOp<T> op,
-            BlockingQueue<Integer> completions, Map<Integer, LegOutcome<T>> results) {
+            HedgeSettlement<T> settlement) {
         Runnable task = () -> {
             // Issue #1150: whatever happens, record an outcome and signal the
-            // reader -- it waits on `completions` with no timeout once every
-            // owner is in flight, so a leg that ended without signalling (an
-            // Error used to) parked the caller thread forever.
+            // reader -- it waits on `settlement` once every owner is in
+            // flight, so a leg that ended without signalling (an Error used
+            // to) parked the caller thread forever. Issue #1265: settling
+            // allocates nothing, and the reader's wait is bounded anyway.
             LegOutcome<T> outcome = null;
             try {
                 T value = applyReconnecting(() -> memberConnection(name), op);
@@ -5114,8 +5200,7 @@ public final class NanocachedClient implements AutoCloseable {
                 if (outcome == null) {
                     outcome = LegOutcome.endedWithoutOutcome();
                 }
-                results.put(index, outcome);
-                completions.add(index);
+                settlement.settle(index, outcome);
             }
         };
 
