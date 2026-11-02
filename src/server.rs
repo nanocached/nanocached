@@ -1222,9 +1222,10 @@ struct NodeContext {
     /// migration has delivered so far, so answering locally returns `N`
     /// for a key that is live elsewhere; `wrong_node` answers `W` instead,
     /// and the client's forced refresh — `L` no longer lists the evicted
-    /// name — lands the retry on a surviving owner. Set once, never
-    /// cleared: a later re-registration (`P`) is of a member that already
-    /// holds its share.
+    /// name — lands the retry on a surviving owner. Set once: a later
+    /// re-registration (`P`) is of a member that already holds its share.
+    /// Cleared only for a node the primary says it evicted, which starts
+    /// over as a joiner (`discard_state_to_rejoin`).
     promoted: Arc<AtomicBool>,
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
@@ -1503,6 +1504,10 @@ pub(crate) struct SimGates {
     /// `run_rereplication`: the put-if-absent copies a membership change
     /// sends to the owners it promoted.
     pub(crate) pass: Gate,
+    /// `register_with_discovery`: the heartbeat to the primary. Held, the
+    /// node goes silent the way a stopped or partitioned process does — its
+    /// connection stays open and it serves what it holds — until released.
+    pub(crate) heartbeat: Gate,
 }
 
 pub(crate) struct RunHooks {
@@ -4444,9 +4449,22 @@ async fn run_cache(
 ///
 /// `letter` is `J` for a staged join, or `P` (discovery HA) to declare an
 /// already-promoted member — same shape, no handoff orchestration on the
-/// other end.
-fn registration_message(letter: char, name: &str, port: u16, token: &str) -> Vec<u8> {
-    let mut message = format!("{letter} {} {port} {}\n", name.len(), token.len()).into_bytes();
+/// other end. `rejoin_capable` adds the `G` to a `P` that tells discovery
+/// this node can clear its cache and join again if discovery answers `G\n`
+/// (it evicted the name earlier): see `discard_state_to_rejoin`.
+fn registration_message(
+    letter: char,
+    name: &str,
+    port: u16,
+    token: &str,
+    rejoin_capable: bool,
+) -> Vec<u8> {
+    let mut message = format!("{letter} {} {port} {}", name.len(), token.len());
+    if rejoin_capable {
+        message.push_str(" G");
+    }
+    message.push('\n');
+    let mut message = message.into_bytes();
     message.extend_from_slice(name.as_bytes());
     message.extend_from_slice(token.as_bytes());
     message
@@ -4836,6 +4854,49 @@ async fn send_heartbeats(
     }
 }
 
+/// The primary discovery answered this node's `P` with `G`: it evicted the
+/// name for missed heartbeats (a process that was stopped, or cut off from
+/// discovery for longer than its liveness window) and has kept the record
+/// since. The cluster went on without this node: re-replicated its keys to
+/// other owners and took writes for them there. What this node still holds
+/// is older than that, and a plain re-registration would put it back in the
+/// ring as an owner of those keys — serving the old values, and getting
+/// the newer copies on the other nodes deleted by their reclaim pass once
+/// they no longer own them.
+///
+/// So the node starts over as a fresh joiner: not promoted (every key
+/// request is answered `W` until its join ends), no membership view, and an
+/// empty cache. The cache has to go, not only be refilled: a join's handoff
+/// is put-if-absent, so an old value would win over the survivors' newer
+/// one, and a key deleted meanwhile is not in the handoff at all. The
+/// caller then sends `J`. Returns `false`, touching nothing, while the node
+/// is draining: its cache is what the drain hands to the entrants, and the
+/// node is on its way out.
+async fn discard_state_to_rejoin(node_context: &NodeContext, discovery_addr: &str) -> bool {
+    let leaving = node_context
+        .leaving
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some();
+    if leaving {
+        return false;
+    }
+    eprintln!(
+        "WARN discovery at {discovery_addr} evicted this node earlier and the cluster has moved \
+         on without it: dropping the cache and joining again"
+    );
+    // First, so that nothing is served from what is about to go.
+    node_context.promoted.store(false, Ordering::SeqCst);
+    for ring in [&node_context.known_ring, &node_context.latest_published] {
+        *ring.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+    if let Err(error) = execute_command(&node_context.request_tx, Command::ClearAll).await {
+        // The cache task is gone, which only happens while shutting down.
+        eprintln!("WARN could not clear the cache before joining again: {error}");
+    }
+    true
+}
+
 /// Holds one long-lived connection to a single discovery replica:
 /// registers (`J` for the primary's first time, `P` otherwise — see
 /// `DiscoveryRole`), then sends a heartbeat on it every `interval`,
@@ -4852,27 +4913,39 @@ async fn register_with_discovery(
     mut role: DiscoveryRole,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let join = registration_message('J', &node_context.name, port, &node_context.token);
-    let announce = registration_message('P', &node_context.name, port, &node_context.token);
+    let join = registration_message('J', &node_context.name, port, &node_context.token, false);
+    // Only the primary's announce can send this node back through a join:
+    // its roster is the one this node adopts and its `J` the one that
+    // stages a handoff. A standby replica just lists the node.
+    let announce = registration_message(
+        'P',
+        &node_context.name,
+        port,
+        &node_context.token,
+        matches!(role, DiscoveryRole::Primary(_)),
+    );
 
-    // A standby must not announce a node the primary hasn't promoted yet:
-    // that would make it visible in the standby's `L` before its staged node join
-    // handoff has run, which is exactly the state `J`'s staging exists to
-    // prevent.
-    if let DiscoveryRole::Standby(promoted_rx) = &mut role {
-        while !*promoted_rx.borrow() {
-            tokio::select! {
-                _ = shutdown_rx.changed() => return,
-                result = promoted_rx.changed() => {
-                    if result.is_err() {
-                        return;
+    loop {
+        // A standby must not announce a node the primary hasn't promoted yet:
+        // that would make it visible in the standby's `L` before its staged node join
+        // handoff has run, which is exactly the state `J`'s staging exists to
+        // prevent. Asked again on every connection, not only at the start:
+        // a node sent back through a join by the primary (`G` to its `P`,
+        // `discard_state_to_rejoin`) is not promoted again until that join
+        // ends, and the standby must not list it meanwhile.
+        if let DiscoveryRole::Standby(promoted_rx) = &mut role {
+            while !*promoted_rx.borrow() {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => return,
+                    result = promoted_rx.changed() => {
+                        if result.is_err() {
+                            return;
+                        }
                     }
                 }
             }
         }
-    }
 
-    loop {
         if *shutdown_rx.borrow() {
             return;
         }
@@ -4971,7 +5044,20 @@ async fn register_with_discovery(
                         result = stream.read_exact(&mut promoted) => result,
                     };
 
-                    if read_promoted.is_ok() && &promoted == b"R\n" {
+                    // Discovery evicted this node earlier and the cluster
+                    // moved on without it (see `discard_state_to_rejoin`):
+                    // start over, with a `J` on the next connection. Only
+                    // the primary may say so, and a node that was not
+                    // promoted never sent a `P` that could be answered so.
+                    if read_promoted.is_ok()
+                        && &promoted == b"G\n"
+                        && let DiscoveryRole::Primary(promoted_tx) = &role
+                    {
+                        if discard_state_to_rejoin(&node_context, &discovery_addr).await {
+                            promoted_tx.send_replace(false);
+                            continue;
+                        }
+                    } else if read_promoted.is_ok() && &promoted == b"R\n" {
                         if sending_join {
                             println!("INFO joined the cluster via discovery at {discovery_addr}");
                         } else {
@@ -4988,6 +5074,16 @@ async fn register_with_discovery(
                         }
 
                         loop {
+                            // A standby's registration ends with the
+                            // primary's promotion of this node (see the top
+                            // of the outer loop).
+                            if let DiscoveryRole::Standby(promoted_rx) = &role
+                                && !*promoted_rx.borrow()
+                            {
+                                break;
+                            }
+                            #[cfg(test)]
+                            node_context.gates.heartbeat.wait().await;
                             // Rebuilt every tick, not precomputed once:
                             // this node's belief starts unknown and is set
                             // only once it has sent its own first client-side replication
@@ -24481,8 +24577,20 @@ mod tests {
     #[test]
     fn join_message_declares_the_name_length_and_the_port() {
         assert_eq!(
-            registration_message('J', "some-name", 8356, "tk-some-name"),
+            registration_message('J', "some-name", 8356, "tk-some-name", false),
             b"J 9 8356 12\nsome-nametk-some-name".to_vec()
+        );
+    }
+
+    #[test]
+    fn an_announce_says_whether_the_node_can_start_over() {
+        assert_eq!(
+            registration_message('P', "some-name", 8356, "tk-some-name", false),
+            b"P 9 8356 12\nsome-nametk-some-name".to_vec()
+        );
+        assert_eq!(
+            registration_message('P', "some-name", 8356, "tk-some-name", true),
+            b"P 9 8356 12 G\nsome-nametk-some-name".to_vec()
         );
     }
 
@@ -30059,7 +30167,7 @@ mod tests {
         let registrations = registrations.lock().unwrap();
         assert!(registrations.len() >= 2, "node never re-registered");
         assert_eq!(registrations[0], b"J 9 8356 12\ntest-nodetk-test-node");
-        assert_eq!(registrations[1], b"P 9 8356 12\ntest-nodetk-test-node");
+        assert_eq!(registrations[1], b"P 9 8356 12 G\ntest-nodetk-test-node");
     }
 
     #[tokio::test(flavor = "current_thread")]

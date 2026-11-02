@@ -127,6 +127,18 @@ one instance per action avoid the window entirely; a larger single step
 (or a spot reclaim of several instances at once) trades that safety for
 speed and should be reserved for R&nbsp;≥&nbsp;2.</p>
 
+<h2 id="evicted-node">A node that was evicted</h2>
+<p>A node that stops heartbeating for longer than the discovery&rsquo;s
+<code>--liveness-timeout</code> (15&nbsp;s by default) is evicted, whether
+the process was stopped (a paused VM, <code>SIGSTOP</code>, a long garbage
+collection of the host) or the network between it and discovery was cut.
+If the process is still running when it can reach discovery again, it drops
+its cache and joins again as a new node (its log says
+<code>evicted this node earlier</code>); it does not resume with what it
+held, because the cluster has moved on without it. At R=1 the keys it held
+and nobody rewrote in the meantime are therefore gone with it, as they were
+when it was evicted. Keep the heartbeat path short enough, and the liveness
+timeout long enough, that a pause you expect does not evict it.</p>
 <h2>Proxy: drain</h2>
 <p>On SIGTERM a proxy deregisters from discovery's proxy roster
 immediately (new clients stop being handed its address), finishes

@@ -138,7 +138,7 @@
 //!                             ordinary heartbeat connection (`H` from
 //!                             here on).
 //!
-//!   P <name-length> <port> <token-length>\n<name><token>   Announce
+//!   P <name-length> <port> <token-length> [G]\n<name><token>   Announce
 //!                             (discovery HA): an already-promoted node
 //!                             (re-)declaring "I am a `Joined` member at
 //!                             this address" (composed like `J`'s) —
@@ -156,6 +156,24 @@
 //!                             doesn't match `token`, so knowing another
 //!                             node's (public, `L`-listed) name is not
 //!                             enough to redirect its traffic.
+//!                             A `G` after the token lengths
+//!                             (`P <name-length> <port> <token-length> G`)
+//!                             says the node can start over: if `name` is
+//!                             on record as departed (evicted for missed
+//!                             heartbeats, left, or its join abandoned
+//!                             within `DEPARTED_RETENTION`) and not
+//!                             registered, discovery answers `G\n` and
+//!                             closes without registering it. The cluster
+//!                             moved on without that node — re-replicated
+//!                             its keys, took writes for them — so what it
+//!                             still holds is not to be served; the node
+//!                             clears its cache and sends `J`. A discovery
+//!                             that has just restarted has no record, so a
+//!                             node that kept heartbeating through the
+//!                             restart still re-registers at once. Without
+//!                             the `G` (a node of an earlier version, or an
+//!                             announce to a standby replica) the announce
+//!                             is accepted as before.
 //!
 //!   C <name-length> <joining-length> <token-length> [<generation>]\n
 //!   <name><joining><token>   Sent by an already-`Joined` node to report
@@ -1575,6 +1593,10 @@ enum DiscoveryCommand {
         name: String,
         port: u16,
         token: String,
+        /// The trailing `G`: the sender is a node that clears its cache and
+        /// joins again when told it was evicted (`G\n`, see the module
+        /// docs' `P`). An announce without it is always accepted.
+        rejoin_capable: bool,
     },
     /// Issue #295: a registered node fetching the roster *with* every
     /// member's own membership token — `name`/`token` self-identify the
@@ -1855,6 +1877,13 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             let port = parts.next().ok_or(ParseError::InvalidLength)?;
             let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
+            // `P` alone takes one more field, the `G` of a node that can
+            // start over (`DiscoveryCommand::Announce::rejoin_capable`).
+            let rejoin_capable = match parts.next() {
+                None => false,
+                Some(b"G") if command == b"P" => true,
+                Some(_) => return Err(ParseError::InvalidLength),
+            };
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
             }
@@ -1872,10 +1901,17 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             // Same owned-fn-pointer dance as `H`/`C` above: resolve the
             // variant while `command` is still alive, so `input` can be
             // reborrowed mutably below.
-            let make: fn(String, u16, String) -> DiscoveryCommand = match command {
-                b"J" => |name, port, token| DiscoveryCommand::Join { name, port, token },
-                b"Y" => |name, port, token| DiscoveryCommand::ProxyAnnounce { name, port, token },
-                _ => |name, port, token| DiscoveryCommand::Announce { name, port, token },
+            let make: fn(String, u16, String, bool) -> DiscoveryCommand = match command {
+                b"J" => |name, port, token, _| DiscoveryCommand::Join { name, port, token },
+                b"Y" => {
+                    |name, port, token, _| DiscoveryCommand::ProxyAnnounce { name, port, token }
+                }
+                _ => |name, port, token, rejoin_capable| DiscoveryCommand::Announce {
+                    name,
+                    port,
+                    token,
+                    rejoin_capable,
+                },
             };
             let [name, token] = parse_string_fields(
                 input,
@@ -1886,7 +1922,7 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
                 ],
             )?;
 
-            Ok(make(name, port, token))
+            Ok(make(name, port, token, rejoin_capable))
         }
 
         _ => Err(ParseError::InvalidCommand),
@@ -2138,6 +2174,21 @@ fn pending_joiner_verdict(registry: &Registry, joiner: &str) -> &'static [u8] {
     } else {
         b"K\n"
     }
+}
+
+/// Whether a node announcing itself (`P`) under `name` has to start over:
+/// `name` is on record as departed within `DEPARTED_RETENTION` and is not
+/// registered. Takes the two locks one after the other, never nested.
+fn announce_needs_rejoin(registry: &Registry, name: &str) -> bool {
+    if lock(registry).contains_key(name) {
+        return false;
+    }
+    registry
+        .departed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .departed_at(name)
+        .is_some_and(|at| at.elapsed() < DEPARTED_RETENTION)
 }
 
 fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, NodeInfo>> {
@@ -5250,8 +5301,35 @@ async fn handle_connection(
 
                 continue;
             }
-            Ok(DiscoveryCommand::Announce { name, port, token }) => {
+            Ok(DiscoveryCommand::Announce {
+                name,
+                port,
+                token,
+                rejoin_capable,
+            }) => {
                 let addr = format!("{peer_ip}:{port}");
+
+                // A node that was evicted and now announces itself again
+                // holds a cache the cluster has moved on from: its keys
+                // were re-replicated to other owners and took writes
+                // there. Put straight back in the ring it would serve its
+                // old values and, once the survivors' copies stop being
+                // owned (the reclaim pass), delete the newer ones. So it
+                // is not registered: it is told to clear its cache and
+                // join through `J`, whose handoff fills it from the
+                // owners. Only on a positive record of the departure
+                // (`record_departed`) — a restarted discovery has none
+                // and re-registers its nodes at once — and only for a node
+                // that said it can (`rejoin_capable`): an older node would
+                // read the reply as a failure and ask again forever.
+                if rejoin_capable && announce_needs_rejoin(&registry, &name) {
+                    println!(
+                        "INFO node announced after its eviction: {name} must clear its cache and \
+                         join again"
+                    );
+                    write_response(&mut stream, b"G\n").await?;
+                    return Ok(());
+                }
 
                 // Issue: `announce_insert_allowed` (only reached for a
                 // genuinely new name, below) is a *different* mutex
@@ -7218,9 +7296,38 @@ mod tests {
                 name: "some-name".to_string(),
                 port: 8356,
                 token: "tk-some-name".to_string(),
+                rejoin_capable: false,
             }
         );
         assert_eq!(&input[..], b"L\n");
+    }
+
+    #[test]
+    fn parse_reads_the_g_of_a_node_that_can_start_over_on_an_announce_only() {
+        let mut input = BytesMut::from(&b"P 9 8356 12 G\nsome-nametk-some-nameL\n"[..]);
+        assert_eq!(
+            parse(&mut input).unwrap(),
+            DiscoveryCommand::Announce {
+                name: "some-name".to_string(),
+                port: 8356,
+                token: "tk-some-name".to_string(),
+                rejoin_capable: true,
+            }
+        );
+        assert_eq!(&input[..], b"L\n");
+        for frame in [
+            &b"J 9 8356 12 G\nsome-nametk-some-name"[..],
+            b"Y 9 8356 12 G\nsome-nametk-some-name",
+            b"P 9 8356 12 X\nsome-nametk-some-name",
+            b"P 9 8356 12 G G\nsome-nametk-some-name",
+        ] {
+            let mut input = BytesMut::from(frame);
+            assert!(
+                parse(&mut input).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(frame)
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7327,6 +7434,79 @@ mod tests {
             lock(&registry).get("node-a").unwrap().address,
             "127.0.0.1:2222"
         );
+    }
+
+    /// What `announce` (a whole `P` frame) is answered on a fresh
+    /// connection to a registry in which `prepare` has run, and whether
+    /// the name is registered afterwards.
+    async fn announce_reply(frame: &[u8], prepare: impl FnOnce(&Registry)) -> (Vec<u8>, bool) {
+        let registry: Registry = Arc::new(RegistryState::default());
+        prepare(&registry);
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut client, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            current_join,
+            ConnectionConfig {
+                idle_timeout: Duration::from_secs(5),
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        client.write_all(frame).await.unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        let registered = lock(&registry).contains_key("node-a");
+        (reply.to_vec(), registered)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_announcing_after_its_eviction_is_told_to_start_over_instead_of_registered() {
+        // The node was evicted: the survivors took over its keys and
+        // accepted writes for them. Registered again with the cache it
+        // held, it would serve the older values, and the reclaim pass on
+        // the survivors would then delete the newer ones.
+        let evicted = |registry: &Registry| record_departed(registry, "node-a");
+        let (reply, registered) = announce_reply(b"P 6 2222 9 G\nnode-atk-node-a", evicted).await;
+        assert_eq!(reply, b"G\n");
+        assert!(!registered, "it must join through J, not be admitted by P");
+
+        // An announce without the `G` (a node of an earlier version, or one
+        // to a standby replica) is admitted as before.
+        let (reply, registered) = announce_reply(b"P 6 2222 9\nnode-atk-node-a", evicted).await;
+        assert_eq!(reply, b"R\n");
+        assert!(registered);
+
+        // No record of a departure (a discovery that has just restarted
+        // and met its running nodes again): admitted at once.
+        let (reply, registered) = announce_reply(b"P 6 2222 9 G\nnode-atk-node-a", |_| {}).await;
+        assert_eq!(reply, b"R\n");
+        assert!(registered);
+
+        // Registered since (it joined again): its announces are refreshes.
+        let (reply, registered) = announce_reply(b"P 6 2222 9 G\nnode-atk-node-a", |registry| {
+            record_departed(registry, "node-a");
+            lock(registry).insert(
+                "node-a".to_string(),
+                NodeInfo::new(
+                    "127.0.0.1:2222".to_string(),
+                    NodeState::Joined,
+                    "tk-node-a".to_string(),
+                ),
+            );
+        })
+        .await;
+        assert_eq!(reply, b"R\n");
+        assert!(registered);
     }
 
     #[tokio::test(flavor = "current_thread")]

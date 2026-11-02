@@ -204,6 +204,25 @@ framework adapters at one version, whether or not a component changed.
   (and a multi-key header that outgrows the free 64 KiB takes the largest
   frame's worth at once), so uploads queue for the share and take their
   turns (#1147).
+- `nanocached-node`, `nanocached-discovery`: a node evicted for missed
+  heartbeats (a stopped process, or a cut longer than `--liveness-timeout`)
+  re-registered with a plain `P`, went straight back into the ring with the
+  cache it held and served the values from before the eviction (and keys
+  deleted since), while the reclaim pass on the survivors, no longer owners
+  of those keys, deleted the newer copies for good. Discovery now answers a
+  `P` carrying the new trailing `G` from a name it has on record as departed
+  (the last hour) with `G` instead of registering it; the node answers `W`
+  to every key request, clears its cache and joins again with `J`, and the
+  owners' handoff fills it (a join's handoff is put-if-absent, so an old
+  entry would have won over the newer one, and a deleted key is not in it,
+  hence the clear). A restarted discovery has no record and still
+  re-registers its nodes at once, and an announce without the `G` (a node of
+  an earlier version, or one to a standby replica) is accepted as before:
+  upgrade discovery before the nodes. R=1, 3 nodes, 200 keys, one node
+  stopped 25 s, every key rewritten meanwhile: before, the 56 keys on the
+  returned node read the old value 15 s and 190 s later (and the survivors
+  dropped their 56 newer copies at the reclaim pass); after, 200 of 200 read
+  the new value at both times (#1276).
 
 ### Changed
 
