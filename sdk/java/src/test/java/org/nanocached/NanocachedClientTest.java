@@ -5099,6 +5099,46 @@ class NanocachedClientTest {
     }
 
     @Test
+    void theReadRepairWriteBackDoesNotAliasTheCallersKeyNamespaceOrReturnedValue() throws Exception {
+        // Issue #1288: read repair is always asynchronous, and the repair
+        // write used the caller's own namespace/key arrays and the very
+        // byte[] returned to the caller. A caller that reuses its key
+        // buffer, or edits the returned value in place, right after
+        // getBytes() returns must not change what lands on the primary.
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+        try (Cluster cluster = startCluster(2)) {
+            byte[] namespace = "tenant".getBytes(StandardCharsets.UTF_8);
+            byte[] key = "k".getBytes(StandardCharsets.UTF_8);
+            List<String> owners = new HashRing(NAMES).owners(namespace, key, 2);
+            cluster.nodes().get(owners.get(1)).namespacedStores
+                    .computeIfAbsent("tenant", n -> new java.util.concurrent.ConcurrentHashMap<>())
+                    .put("k", "from-replica".getBytes(StandardCharsets.UTF_8));
+
+            try (NanocachedClient client = connectWithReadRepair(cluster.discovery().port())) {
+                java.util.concurrent.CountDownLatch release = blockBackgroundLegs(client);
+                try {
+                    byte[] value = client.getBytes(namespace, key).orElseThrow();
+                    assertArrayEquals("from-replica".getBytes(StandardCharsets.UTF_8), value);
+                    Arrays.fill(key, (byte) 'z');
+                    Arrays.fill(namespace, (byte) 'Y');
+                    Arrays.fill(value, (byte) 'X');
+                } finally {
+                    release.countDown();
+                }
+
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                waitFor(() -> !primary.namespacedStores.isEmpty(), "the primary to be repaired");
+                Map<String, byte[]> stored = primary.namespacedStores.get("tenant");
+                assertTrue(stored != null && stored.containsKey("k"),
+                        "the primary must be repaired under the original namespace and key, got "
+                                + primary.namespacedStores.keySet());
+                assertArrayEquals("from-replica".getBytes(StandardCharsets.UTF_8), stored.get("k"),
+                        "the repair must carry the bytes read, not the caller's later in-place edit");
+            }
+        }
+    }
+
+    @Test
     void staysACleanMissWhenNoOwnerHasTheValue() throws Exception {
         try (Cluster cluster = startCluster(2)) {
             try (NanocachedClient client = connectWithReadRepair(cluster.discovery().port())) {

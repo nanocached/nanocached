@@ -66,6 +66,15 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
   outcome, so the caller kept waiting for an answer that never came. The
   leg now always reports back and the `Error` is rethrown to the caller as
   itself (#1150).
+- With `readRepair`, the background write that repairs the primary after a
+  replica answered a miss used the caller's own namespace and key arrays
+  and the very `byte[]` that `getBytes` returns (when compression is off),
+  and it runs after the call has returned, so reusing the key buffer or
+  editing the returned value in place made the primary store the repair
+  under a different key or with the edited bytes, for 60 seconds. Unlike a
+  fire-and-forget replica leg this happens whether or not
+  `fireAndForgetReplicas` is set. The repair now takes its own copy of
+  namespace, key and value (#1288).
 
 ## [0.6.0] - 2026-11-01
 
