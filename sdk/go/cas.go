@@ -209,7 +209,7 @@ func (c *Client) casNS(namespace []byte, key string, value []byte, cond string, 
 	keyBytes := []byte(key)
 	var stored bool
 	err := c.withClusterRetryNonIdempotent(func() error {
-		s, casErr := c.cas(namespace, keyBytes, outgoing, cond, wireTTL)
+		s, casErr := c.cas(namespace, keyBytes, outgoing, !c.compress, cond, wireTTL)
 		stored = s
 		return casErr
 	})
@@ -228,7 +228,11 @@ func (c *Client) casNS(namespace []byte, key string, value []byte, cond string, 
 // best-effort, fire-and-forget-aware machinery write()/incr() use for
 // their own replica legs), never by replaying `k` itself. A mismatch
 // (`N`) leaves every replica untouched — nothing was written anywhere.
-func (c *Client) cas(namespace, key []byte, value []byte, cond string, wireTTL int64) (bool, error) {
+//
+// callerOwnsValue says value is the caller's own slice (casNS passes it
+// uncompressed), which a detached replica leg must not read after the call
+// has returned: fanReplicasValue hands such a leg a copy.
+func (c *Client) cas(namespace, key []byte, value []byte, callerOwnsValue bool, cond string, wireTTL int64) (bool, error) {
 	var stored bool
 	primaryOp := func(conn *connection) error {
 		s, casErr := conn.casNS(namespace, key, value, cond, wireTTL)
@@ -250,8 +254,15 @@ func (c *Client) cas(namespace, key []byte, value []byte, cond string, wireTTL i
 		}
 		primaryErr = c.applyNonIdempotent(names[0], primaryOp)
 		if primaryErr == nil && stored {
-			wg := c.fanReplicas(names[1:], func(conn *connection) error {
-				return conn.setNS(namespace, key, value, wireTTL)
+			var callerValue []byte
+			if callerOwnsValue {
+				callerValue = value
+			}
+			wg := c.fanReplicasValue(names[1:], callerValue, func(conn *connection, detached []byte) error {
+				if detached == nil {
+					detached = value
+				}
+				return conn.setNS(namespace, key, detached, wireTTL)
 			})
 			wg.Wait()
 		}

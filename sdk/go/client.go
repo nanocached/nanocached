@@ -37,6 +37,7 @@
 package nanocached
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -1164,9 +1165,19 @@ func (c *Client) setBytesNS(namespace []byte, key string, value []byte, ttlSecon
 		outgoing = compressValue(value, c.compressionThreshold)
 	}
 	keyBytes := []byte(key)
+	// outgoing is the caller's own slice unless it was compressed (which
+	// builds a new one), so only then does a detached replica leg need a
+	// copy of it (see fanReplicasValue).
+	var callerValue []byte
+	if !c.compress {
+		callerValue = outgoing
+	}
 	return c.withClusterRetry(func() error {
-		return c.write(namespace, keyBytes, func(conn *connection, _ bool) error {
-			return conn.setNS(namespace, keyBytes, outgoing, wireTTL)
+		return c.writeValue(namespace, keyBytes, callerValue, func(conn *connection, _ bool, value []byte) error {
+			if value == nil {
+				value = outgoing
+			}
+			return conn.setNS(namespace, keyBytes, value, wireTTL)
 		})
 	})
 }
@@ -1954,12 +1965,25 @@ func (c *Client) multiSetPass(
 				if !c.closed {
 					c.backgroundReplicaWG.Add(1)
 					c.mu.Unlock()
-					go func(name string, batch *ownerBatch) {
+					// The values are the caller's own slices unless they were
+					// compressed, and this leg can still be queued when
+					// SetManyBytes returns and the caller reuses them: it
+					// sends copies, made before the goroutine starts. (The
+					// keys are encoded from the map's strings, so they are
+					// already private.)
+					legValues := valueBytes
+					if !c.compress {
+						legValues = make([][]byte, len(valueBytes))
+						for _, idx := range batch.indices {
+							legValues[idx] = bytes.Clone(valueBytes[idx])
+						}
+					}
+					go func(name string, batch *ownerBatch, legValues [][]byte) {
 						defer c.backgroundReplicaWG.Done()
 						defer func() { <-c.backgroundReplicaSem }()
 						c.runMultiSetLeg(namespace, name, batch.indices, batch.isPrimary,
-							keys, keyBytes, valueBytes, ttlSeconds, &mu, nil, nil, nil)
-					}(name, batch)
+							keys, keyBytes, legValues, ttlSeconds, &mu, nil, nil, nil)
+					}(name, batch, legValues)
 					continue
 				}
 				c.mu.Unlock()
@@ -2947,6 +2971,15 @@ func (c *Client) write(namespace, key []byte, op func(conn *connection, primary 
 	return c.writeWith(namespace, key, op, c.applyReconnecting, false)
 }
 
+// writeValue is write for an op that sends the caller's own value bytes
+// (callerValue, nil when the op builds its own): op's third argument is what
+// the leg must send in place of them, a private copy for a replica leg that
+// may outlive this call — see fanReplicasValue. It is nil when op should use
+// its own value.
+func (c *Client) writeValue(namespace, key, callerValue []byte, op func(conn *connection, primary bool, value []byte) error) error {
+	return c.writeWithValue(namespace, key, callerValue, op, c.applyReconnecting, false)
+}
+
 // writeWith is write with the primary leg's send policy chosen by the
 // caller: applyReconnecting (resend after a connection loss, for an
 // idempotent op) or applyExpiring (resend only a request that was never
@@ -2970,10 +3003,22 @@ func (c *Client) writeWith(
 	applyPrimary func(slot string, op func(*connection) error) error,
 	replicasAfterPrimary bool,
 ) error {
+	return c.writeWithValue(namespace, key, nil, func(conn *connection, primary bool, _ []byte) error { return op(conn, primary) },
+		applyPrimary, replicasAfterPrimary)
+}
+
+// writeWithValue is writeWith for an op that may send the caller's own value
+// bytes — see writeValue.
+func (c *Client) writeWithValue(
+	namespace, key, callerValue []byte,
+	op func(conn *connection, primary bool, value []byte) error,
+	applyPrimary func(slot string, op func(*connection) error) error,
+	replicasAfterPrimary bool,
+) error {
 	c.mu.Lock()
 	single := c.ring == nil
 	c.mu.Unlock()
-	primaryOp := func(conn *connection) error { return op(conn, true) }
+	primaryOp := func(conn *connection) error { return op(conn, true, nil) }
 	if single {
 		return applyPrimary("", primaryOp)
 	}
@@ -2987,7 +3032,7 @@ func (c *Client) writeWith(
 		if err := applyPrimary(names[0], primaryOp); err != nil {
 			return err
 		}
-		wg := c.fanReplicas(c.ownersExcept(namespace, key, names[0]), func(conn *connection) error { return op(conn, false) })
+		wg := c.fanReplicasValue(c.ownersExcept(namespace, key, names[0]), callerValue, func(conn *connection, value []byte) error { return op(conn, false, value) })
 		wg.Wait()
 		return nil
 	}
@@ -2995,7 +3040,7 @@ func (c *Client) writeWith(
 	// Fan out to the replicas concurrently with the primary write — see
 	// fanReplicas for the failure/fire-and-forget semantics both this and
 	// Incr's post-success result fan-out (issue #129) share.
-	wg := c.fanReplicas(names[1:], func(conn *connection) error { return op(conn, false) })
+	wg := c.fanReplicasValue(names[1:], callerValue, func(conn *connection, value []byte) error { return op(conn, false, value) })
 	err := applyPrimary(names[0], primaryOp)
 	wg.Wait()
 	return err
@@ -3036,11 +3081,23 @@ func (c *Client) ownersExcept(namespace, key []byte, answered string) []string {
 // already succeeded — see incr's own doc comment for why it fans out the
 // literal result via Set instead of replaying `i`).
 func (c *Client) fanReplicas(replicas []string, op func(conn *connection) error) *sync.WaitGroup {
-	replicaWrite := func(replica string) {
-		if err := c.applyReconnecting(replica, op); err != nil {
+	return c.fanReplicasValue(replicas, nil, func(conn *connection, _ []byte) error { return op(conn) })
+}
+
+// fanReplicasValue is fanReplicas for an op that sends the caller's own
+// bytes, callerValue (nil when it sends none). A leg the call waits for reads
+// those bytes while the call is still running, so op is handed nil and uses
+// callerValue as it is. A detached leg can still be queued behind another
+// write on its connection when the call returns and the caller reuses its
+// slice, so it is handed a copy, made here before the goroutine starts and
+// shared by every detached leg of this call.
+func (c *Client) fanReplicasValue(replicas []string, callerValue []byte, op func(conn *connection, value []byte) error) *sync.WaitGroup {
+	replicaWrite := func(replica string, value []byte) {
+		if err := c.applyReconnecting(replica, func(conn *connection) error { return op(conn, value) }); err != nil {
 			c.stats.replicaWriteFailures.Add(1)
 		}
 	}
+	var detachedValue []byte
 
 	var wg sync.WaitGroup
 	for _, name := range replicas {
@@ -3060,11 +3117,14 @@ func (c *Client) fanReplicas(replicas []string, op func(conn *connection) error)
 				if !c.closed {
 					c.backgroundReplicaWG.Add(1)
 					c.mu.Unlock()
-					go func(replica string) {
+					if callerValue != nil && detachedValue == nil {
+						detachedValue = bytes.Clone(callerValue)
+					}
+					go func(replica string, value []byte) {
 						defer c.backgroundReplicaWG.Done()
 						defer func() { <-c.backgroundReplicaSem }()
-						replicaWrite(replica)
-					}(name)
+						replicaWrite(replica, value)
+					}(name, detachedValue)
 					continue
 				}
 				c.mu.Unlock()
@@ -3076,7 +3136,7 @@ func (c *Client) fanReplicas(replicas []string, op func(conn *connection) error)
 		wg.Add(1)
 		go func(replica string) {
 			defer wg.Done()
-			replicaWrite(replica)
+			replicaWrite(replica, nil)
 		}(name)
 	}
 	return &wg
