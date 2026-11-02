@@ -86,6 +86,13 @@ graceful degrade, not a queue or a drop). `Close()` waits for any
 still-in-flight background replica writes before tearing down
 connections.
 
+A background leg works from its own copy of the value, so a `[]byte`
+passed to `SetBytes`, `SetManyBytes`, `PutIfAbsent`, `ReplaceIfPresent` or
+`Replace` is the caller's again as soon as the call returns. The
+copy costs one allocation per call, and only when a leg actually runs in
+the background and `Compress` is off (a compressed value is already a new
+buffer).
+
 ## Read repair
 
 Off by default. A clean miss (the key's first-reached owner reports it
