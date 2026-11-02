@@ -376,7 +376,8 @@ pub struct Cache {
     /// `SWEEP_BUDGET`-sized bites. Refilled (by scanning the namespaces for
     /// expired keys and collecting their `migrated` marks) only once this drains empty,
     /// so an in-progress sweep pass isn't rescanned from scratch every
-    /// call.
+    /// call. Replaced by an empty deque once drained (issue #1280): the
+    /// snapshot is transient, not a standing allocation.
     pending_removal: VecDeque<Key>,
     /// Issue #582: when the last `U` handoff write (`handoff_set` /
     /// `handoff_set_if_absent`) that arrived *ahead of its ring* landed.
@@ -2212,6 +2213,16 @@ impl Cache {
                     self.expirations += 1;
                 }
             }
+        }
+
+        // A `VecDeque` keeps its capacity when it empties, and a burst of
+        // expiries fills it with every expired key at once (64 bytes each,
+        // outside `--max-memory`): let the allocation go with the last of
+        // the queue instead of holding the burst's peak until the next
+        // one. An empty deque with no capacity allocates nothing, and the
+        // refill above allocates only for what it finds.
+        if self.pending_removal.is_empty() {
+            self.pending_removal = VecDeque::new();
         }
 
         removed
@@ -4563,6 +4574,47 @@ mod tests {
         assert_eq!(
             cache.get_at(&leftover, later),
             Some(Bytes::from_static(b"fresh"))
+        );
+    }
+
+    #[test]
+    fn a_drained_sweep_queue_gives_its_memory_back() {
+        // Issue #1280: the queue is filled with every expired key at once
+        // and drained in `SWEEP_BUDGET` bites, and a `VecDeque` keeps its
+        // capacity when it empties: after one large expiry burst the node
+        // held 64 bytes per key of the burst's peak outside `--max-memory`
+        // for good (2^19 slots, 32 MiB, for 500,000 expired keys).
+        let mut cache = Cache::new(UNBOUNDED);
+        let now = Instant::now();
+        let keys = 50 * SWEEP_BUDGET;
+        for i in 0..keys {
+            cache.set_with_ttl(
+                Key::from(Bytes::from(format!("key-{i}"))),
+                Bytes::from_static(b"v"),
+                Duration::from_secs(1),
+            );
+        }
+
+        let later = now + Duration::from_secs(60);
+        assert_eq!(cache.sweep_at(later, true, None), SWEEP_BUDGET);
+        assert!(
+            cache.pending_removal.capacity() >= keys - SWEEP_BUDGET,
+            "the queue holds the burst while it is being worked off"
+        );
+        let mut removed = SWEEP_BUDGET;
+        loop {
+            let this_round = cache.sweep_at(later, true, None);
+            removed += this_round;
+            if this_round < SWEEP_BUDGET {
+                break;
+            }
+        }
+        assert_eq!(removed, keys);
+        assert_eq!(cache.len(), 0);
+        assert!(
+            cache.pending_removal.capacity() <= SWEEP_BUDGET,
+            "a drained queue keeps room for {} keys",
+            cache.pending_removal.capacity()
         );
     }
 
