@@ -2039,3 +2039,73 @@ async fn a_node_that_comes_back_after_its_eviction_does_not_serve_what_it_held_b
         "deleted keys are back on an owner: {out:?}"
     );
 }
+
+/// What one run of the discovery-stall scenario saw.
+#[derive(Debug)]
+struct StallOutcome {
+    /// Copies (key, owner) the client wrote before the stall.
+    copies: usize,
+    /// Of those, the ones an owner no longer answers with the value after
+    /// the stall and the minute that follows.
+    lost: usize,
+}
+
+/// Discovery itself stops for longer than the liveness window (a stopped
+/// process, a paused VM) and, on resuming, sweeps before it has read the
+/// nodes' heartbeats: every node is evicted, though none of them was ever
+/// silent. They announce themselves again at once. Nobody moved on without
+/// them, so none may be sent back through a join (which would empty its
+/// cache): every copy survives.
+async fn scenario_discovery_stall() -> StallOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc) = (Port::reserve(), Port::reserve(), Port::reserve());
+    let c = pc.number;
+    let keys: Vec<String> = (0..40).map(|i| format!("s{i}")).collect();
+    let Trio {
+        dport,
+        disc,
+        a,
+        b,
+        names,
+        nodes: [na, nb, nc],
+        mut client,
+    } = trio(&mut dp, &mut pa, &mut pb, &mut pc, &keys).await;
+    let ports = [a, b, c];
+    let ring3 = HashRing::new(names.to_vec());
+
+    // The clock jumps 25 s in one step: the sweep, whose ticks are a second
+    // apart, finds every heartbeat 25 s old; the nodes' own timers fire in
+    // the same step, but their heartbeats are read after the sweep.
+    tokio::time::advance(Duration::from_secs(25)).await;
+    settle().await;
+    run_for(Duration::from_secs(60)).await;
+    run_until_members(dport, 3).await;
+
+    let mut out = StallOutcome { copies: 0, lost: 0 };
+    for key in &keys {
+        for owner in ring3.owners(&Key::unnamespaced(Bytes::from(key.clone())), 2) {
+            let port = ports[names.iter().position(|n| n == owner).unwrap()];
+            out.copies += 1;
+            if client.value(port, key).await.as_deref() != Some("v1") {
+                out.lost += 1;
+            }
+        }
+    }
+    disc.abort();
+    na.abort();
+    nb.abort();
+    nc.abort();
+    out
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn nodes_evicted_while_discovery_itself_was_stalled_keep_their_caches() {
+    let _spin = spin();
+    let out = scenario_discovery_stall().await;
+    eprintln!("{out:?}");
+    assert!(out.copies > 0, "nothing to check: {out:?}");
+    assert_eq!(out.lost, 0, "a stall of discovery emptied caches: {out:?}");
+}

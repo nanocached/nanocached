@@ -269,7 +269,7 @@ use nanocached::infra::{
     load_tls_acceptor, load_tls_connector, per_ip_key, read_http_request_path, reject_over_limit,
     should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip, write_http_response,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -865,6 +865,11 @@ const MAX_DEPARTED: usize = 4096;
 struct Departed {
     at: FxHashMap<String, Instant>,
     order: VecDeque<(Instant, String)>,
+    /// The names in `at` whose eviction was judged by a sweep that had not
+    /// run for a long while (`sweep_was_stalled`): discovery itself was
+    /// not processing heartbeats, so the silence says nothing about the
+    /// node. Such a node may re-register at once (`earns_rejoin`).
+    unreliable: FxHashSet<String>,
 }
 
 impl Departed {
@@ -881,6 +886,7 @@ impl Departed {
             }
             if self.is_current(*at, front) {
                 self.at.remove(front);
+                self.unreliable.remove(front);
             }
             self.order.pop_front();
         }
@@ -891,10 +897,12 @@ impl Departed {
             while let Some((at, front)) = self.order.pop_front() {
                 if self.is_current(at, &front) {
                     self.at.remove(&front);
+                    self.unreliable.remove(&front);
                     break;
                 }
             }
         }
+        self.unreliable.remove(name);
         self.at.insert(name.to_string(), now);
         self.order.push_back((now, name.to_string()));
         if self.order.len() > 2 * MAX_DEPARTED {
@@ -903,8 +911,26 @@ impl Departed {
         }
     }
 
+    /// `record` for an eviction decided by a stalled sweep.
+    fn record_unreliable(&mut self, name: &str, now: Instant) {
+        self.record(name, now);
+        self.unreliable.insert(name.to_string());
+    }
+
     fn forget(&mut self, name: &str) {
         self.at.remove(name);
+        self.unreliable.remove(name);
+    }
+
+    /// Whether a node announcing itself under `name` has to start over: it
+    /// departed within `DEPARTED_RETENTION`, and not on the word of a
+    /// sweep that was itself not running.
+    fn earns_rejoin(&self, name: &str) -> bool {
+        !self.unreliable.contains(name)
+            && self
+                .at
+                .get(name)
+                .is_some_and(|at| at.elapsed() < DEPARTED_RETENTION)
     }
 
     fn departed_at(&self, name: &str) -> Option<Instant> {
@@ -2148,6 +2174,27 @@ fn record_departed(registry: &Registry, name: &str) {
         .record(name, Instant::now());
 }
 
+/// `record_departed` for a node evicted by a sweep that had not run for
+/// a long while (`sweep_was_stalled`): the node is on record as gone for
+/// the pending-joiner question, but is not sent back through a join when it
+/// announces itself again.
+fn record_departed_by_stalled_sweep(registry: &Registry, name: &str) {
+    registry
+        .departed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record_unreliable(name, Instant::now());
+}
+
+/// Whether a sweep tick at `now` comes so long after the previous one,
+/// `last`, that discovery itself was not running in between: stopped,
+/// suspended, or starved of CPU. The sweep ticks at most a second apart, so
+/// a gap of half the liveness timeout is a stall, and every node's last
+/// heartbeat is as old as the stall — the nodes did nothing wrong.
+fn sweep_was_stalled(last: Instant, now: Instant, liveness_timeout: Duration) -> bool {
+    now.duration_since(last) > liveness_timeout / 2
+}
+
 /// Issue #571: `name` registered (again) — it is no longer gone.
 fn forget_departed(registry: &Registry, name: &str) {
     registry
@@ -2187,8 +2234,7 @@ fn announce_needs_rejoin(registry: &Registry, name: &str) -> bool {
         .departed
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .departed_at(name)
-        .is_some_and(|at| at.elapsed() < DEPARTED_RETENTION)
+        .earns_rejoin(name)
 }
 
 fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, NodeInfo>> {
@@ -4413,6 +4459,7 @@ async fn sweep_expired(
         .max(Duration::from_millis(1));
     let mut ticker = interval(sweep_interval);
     let mut grace_joins_kicked = false;
+    let mut last_tick = Instant::now();
 
     // The join fan-outs (`abandon_current_join`'s `X`s, `try_begin_next_join`'s
     // `M`s with their retries) used to be awaited right here, which parked
@@ -4442,6 +4489,9 @@ async fn sweep_expired(
         tokio::select! {
             _ = ticker.tick() => {
                 let now = Instant::now();
+                let stalled = sweep_was_stalled(last_tick, now, liveness_timeout);
+                let since_last_tick = now.duration_since(last_tick);
+                last_tick = now;
                 // Reap finished fan-outs: frees the slot, and surfaces a
                 // panic the way the old inline call's would have (loudly).
                 while let Some(finished) = fanouts.try_join_next() {
@@ -4518,7 +4568,17 @@ async fn sweep_expired(
                         "WARN node evicted: {name} (no heartbeat within {}s)",
                         liveness_timeout.as_secs()
                     );
-                    record_departed(&registry, name);
+                    if stalled {
+                        eprintln!(
+                            "WARN discovery was not running for {}s before this sweep: {name} \
+                             may be healthy and is not sent back through a join if it announces \
+                             itself again",
+                            since_last_tick.as_secs()
+                        );
+                        record_departed_by_stalled_sweep(&registry, name);
+                    } else {
+                        record_departed(&registry, name);
+                    }
                 }
 
                 // Issue #34 forged-completion fix, other half (see
@@ -5923,6 +5983,68 @@ mod tests {
         );
         assert!(departed.departed_at("again").is_some());
         assert!(departed.departed_at("fresh").is_some());
+    }
+
+    #[test]
+    fn a_departure_judged_by_a_stalled_sweep_does_not_earn_a_rejoin() {
+        let mut departed = Departed::default();
+        let now = Instant::now();
+        departed.record("evicted", now);
+        departed.record_unreliable("stalled", now);
+        assert!(departed.earns_rejoin("evicted"));
+        assert!(!departed.earns_rejoin("stalled"));
+        assert!(!departed.earns_rejoin("never-seen"));
+        // Still on record as gone (the pending-joiner question).
+        assert!(departed.departed_at("stalled").is_some());
+        // Recorded again, this time by a sweep that was running: it earns it.
+        departed.record("stalled", now);
+        assert!(departed.earns_rejoin("stalled"));
+        // Forgotten (it registered again) and gone from both.
+        departed.record_unreliable("again", now);
+        departed.forget("again");
+        assert!(departed.departed_at("again").is_none() && departed.unreliable.is_empty());
+    }
+
+    #[test]
+    fn the_unreliable_set_follows_the_departed_records_out() {
+        let mut departed = Departed::default();
+        let base = Instant::now();
+        departed.record_unreliable("first", base);
+        for index in 0..MAX_DEPARTED {
+            departed.record(
+                &format!("n{index}"),
+                base + Duration::from_nanos(index as u64 + 1),
+            );
+        }
+        // "first" was the oldest and went out when the cap was reached.
+        assert!(departed.departed_at("first").is_none());
+        assert!(departed.unreliable.is_empty());
+    }
+
+    #[test]
+    fn a_sweep_is_stalled_when_it_comes_much_later_than_the_ticks_a_second_apart() {
+        let last = Instant::now();
+        let liveness = Duration::from_secs(15);
+        assert!(!sweep_was_stalled(
+            last,
+            last + Duration::from_secs(1),
+            liveness
+        ));
+        assert!(!sweep_was_stalled(
+            last,
+            last + Duration::from_millis(7500),
+            liveness
+        ));
+        assert!(sweep_was_stalled(
+            last,
+            last + Duration::from_millis(7501),
+            liveness
+        ));
+        assert!(sweep_was_stalled(
+            last,
+            last + Duration::from_secs(25),
+            liveness
+        ));
     }
 
     #[test]

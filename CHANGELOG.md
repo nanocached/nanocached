@@ -216,9 +216,12 @@ framework adapters at one version, whether or not a component changed.
   owners' handoff fills it (a join's handoff is put-if-absent, so an old
   entry would have won over the newer one, and a deleted key is not in it,
   hence the clear). A restarted discovery has no record and still
-  re-registers its nodes at once, and an announce without the `G` (a node of
-  an earlier version, or one to a standby replica) is accepted as before:
-  upgrade discovery before the nodes. R=1, 3 nodes, 200 keys, one node
+  re-registers its nodes at once; so do nodes evicted by a sweep that came
+  after discovery itself had not run for more than half the liveness timeout
+  (a stopped discovery finds every heartbeat old when it resumes: 3 of 3
+  nodes evicted and, without this, all 200 keys gone). An announce without
+  the `G` (a node of an earlier version, or one to a standby replica) is
+  accepted as before: upgrade discovery before the nodes. R=1, 3 nodes, 200 keys, one node
   stopped 25 s, every key rewritten meanwhile: before, the 56 keys on the
   returned node read the old value 15 s and 190 s later (and the survivors
   dropped their 56 newer copies at the reclaim pass); after, 200 of 200 read

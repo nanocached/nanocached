@@ -130,8 +130,12 @@ unreachable.</p>
   the keys it owns now. What it held before the eviction is not kept,
   at any replication factor. A discovery that has just been restarted
   remembers nothing, and the nodes that kept heartbeating through the
-  restart re-register at once, as before. A node evicted longer ago than
-  that hour, or by a standby discovery replica (which only lists nodes), is
+  restart re-register at once, as before. So do the nodes evicted by a
+  sweep that came after discovery itself had not been running for longer
+  than half the liveness timeout (a stopped or suspended discovery process,
+  which finds every heartbeat old when it resumes): they were not silent,
+  and nobody moved on without them. A node evicted longer ago than that
+  hour, or by a standby discovery replica (which only lists nodes), is
   registered as before.</li>
 </ul>
 <p>These healers share one consistency model: each acts on a snapshot of

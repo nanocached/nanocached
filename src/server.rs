@@ -30167,7 +30167,7 @@ mod tests {
         let registrations = registrations.lock().unwrap();
         assert!(registrations.len() >= 2, "node never re-registered");
         assert_eq!(registrations[0], b"J 9 8356 12\ntest-nodetk-test-node");
-        assert_eq!(registrations[1], b"P 9 8356 12\ntest-nodetk-test-node");
+        assert_eq!(registrations[1], b"P 9 8356 12 G\ntest-nodetk-test-node");
     }
 
     #[tokio::test(flavor = "current_thread")]
