@@ -117,7 +117,7 @@ LOAD_SECS=$(( ROUNDS * ROUND_BUDGET + 30 ))
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
 # Portable `timeout` (macOS has none): kill the command after N seconds.
 tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }
-cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 # A reused RUN name must not keep the previous run's node logs: the end-of-run
 # capture skips files that already exist (a leaver's log is saved when it leaves).
 RUN=${RUN:-$(date +%H%M%S)}; L="$E/logs/chaos-$RUN"; rm -rf "$L"; mkdir -p "$L"
@@ -413,7 +413,7 @@ if sdk.get('read_err'): print('sdk read_err', sdk['read_err'])
   [ -z "$mbad" ] || { T "FAIL: multi oracle: $(echo $mbad | tr '\n' ' ')"; fail=1; }
   echo "$msdk $mcheck" | grep -oE '"(md_stale|mn_stale|md_ok|mn_ok|md_stale_on_owner|mn_stale_on_owner|md_stale_on_primary|md_stale_on_replica|md_stale_keys|mn_stale_on_primary|mn_stale_on_replica|mn_stale_keys|md_owners_differ|mn_owners_differ|batches|keys_acked|partial|wrong_node|other_err)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== multi accepted (printed, not asserted): /'; echo
 fi
-for c in $(docker ps -aq --filter name=$P-); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); ip=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $c); echo "$n $ip" >> "$L/ipmap.txt"; [ -f "$L/$n.log" ] || docker logs -t $c > "$L/$n.log" 2>&1; done
+for c in $(docker ps -aq --filter "name=^/$P-"); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); ip=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $c); echo "$n $ip" >> "$L/ipmap.txt"; [ -f "$L/$n.log" ] || docker logs -t $c > "$L/$n.log" 2>&1; done
 echo "=== entries:"; cat "$L/entries.txt"
 echo "=== logs in $L"; cat "$L/ipmap.txt"
 cleanup

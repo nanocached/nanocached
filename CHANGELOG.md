@@ -205,6 +205,54 @@ framework adapters at one version, whether or not a component changed.
   frame's worth at once), so uploads queue for the share and take their
   turns (#1147).
 - `nanocached-node`: a node asked to leave while another node's join was still pending built its drain ring from the whole `T` roster, which lists `Waiting` and `Joining` nodes too, so with a joiner D in it the leaver skipped the keys D would rank above it for (treated as not its own) and sent the keys D would be entrant for to D, which is not in the roster clients route by once the leaver's `V` has abandoned the join. D then re-joined or died with those keys never delivered to the members that own them: 49 of the leaver's 99 keys were missing on the new owners at R=1 and 150 of 197 at R=2 in the simulation (0 without a joiner), permanently if D never re-joined. The drain now keeps only the `T` entries that the published roster (`L`, fetched from the same discovery right after `T`) also lists; no wire change, and `L` withheld (`B`) fails the fetch for that discovery address like `T` withheld (#1282).
+- `nanocached-node`: a node asked to leave right after discovery restarted fetched the roster for its drain once, and gave up on the first failure: discovery answers `B` through its startup grace (15 s) and closes the `T` connection of a node it has not seen re-register yet (a heartbeat is up to 5 s away), so the node logged `fetching the roster failed ... leaving without a handoff`, sent `V` and exited with the whole `--drain-timeout` unused. At R=1 every key it owned was lost (99 of 99 on the new owners in the simulation, with the SIGTERM 1 s and 7 s after the restart; 0 missing with the SIGTERM 30 s after). The fetch is now retried every second until the drain deadline when the node was promoted (it was a member, so discovery being unready is transient and its heartbeats re-register it during the drain); `B`, a closed connection, a refused connection and a timeout all retry, and the operator's second signal still ends it at once. A node discovery never promoted still makes one attempt, since discovery closes its `T` for good (#1281).
+- `nanocached-node`: over TLS the tail of a large reply could be lost to a client that reads slowly: the node wrote the reply with `write_all` and never flushed, and tokio-rustls reports a write as done once the plaintext is accepted even when ciphertext is still waiting for room in the socket, so the last part sat in the TLS writer until the next write, which on an idle connection never came. A 1,000,000-byte value read 4 KiB at a time with a 4 KiB receive buffer stalled in 2 of 4 runs (947,730 of 1,000,010 bytes, then nothing until the client's timeout), and a 512 KiB reply to such a reader stopped at 491,400 of 524,299 bytes every time in the test that now pins this. Replies are flushed inside the same write timeout, as is every write that is followed by a wait for the peer's answer. The same went for the writes to peers that are followed by a read of the ack (handoff, leave, forwards, roster fetches, authentication). Plain TCP is unchanged. (#1279)
+- `nanocached-node`: once the receive buffers and multi-key frame charges of the connections added up to exactly `--max-in-flight-bytes`, every reply and every multi-key frame ran uncharged and all at once, so the budget stopped bounding anything: the room a charge may ask for (the budget less what connections pin) was 0, and a charge clamped to 0 is not waited for at all. A reply or frame with a cost now waits until some byte is released and then takes its usual share of the room, and the connection is closed after 10 s if nothing is, as it was before the clamps of #1262 and #1264. (A connection that pins the whole budget by itself does not wait for bytes only it holds, and the clamp that keeps two oversized requests from waiting for each other is unchanged.) With `--max-in-flight-bytes 1048576`, a 1,000,000-byte value requested by 200 connections that never read, and one more connection holding a 1,047,700-byte receive buffer, the node's resident memory was 195 MiB before and is 9 MiB now, and the waiting connections are closed with the budget error where none was. (#1274)
+- `nanocached-node`: the sweep's queue of expired and migrated keys kept its allocation after it was worked off, so one large burst of expiries left the node holding 64 bytes per key of the burst's peak outside `--max-memory` for good (100,000 keys that had expired and been swept left a queue of 131,072 slots, 8 MiB, and the same burst at 500,000 keys left 32 MiB; by arithmetic the default 256 MiB with small entries can reach 128 MiB). The queue is replaced by an empty one as soon as it is drained, and the next pass allocates only for what it finds. (#1280)
+- `nanocached-discovery`: the log lines a peer can cause at will were
+  written unconditionally: one `WARN connection error` per failed
+  connection, one `WARN rejected ...` (and the connection error behind it)
+  per refused `T`, join, announce, leave or deregister, one per TLS
+  handshake failure and accept failure. A flood of short connections
+  within the per-IP cap wrote about 8,000 lines a second (24,526 lines for
+  24,525 connections in 3 s, release build), and `eprintln!` blocks the
+  runtime thread, so with the log pipe unread discovery stopped answering
+  after about 1,100 such connections. These lines now go through the node's
+  limiter, 50 lines a second for connections and 50 for rejections, with
+  the count of what was dropped in one summary line ahead of the next line
+  written: the same flood writes 154 lines for 26,089 connections, and a
+  log pipe nobody reads, which stopped discovery within 5 s, no longer
+  does in that time (it fills about 150 times slower). A sink that stays
+  stalled still blocks the writes eventually (#1285).
+- `nanocached-proxy`: a node's reply to a 1 MiB `m` (or `y` with `G`) of
+  short keys was refused as "line exceeded its size cap", because the
+  proxy read every backend reply header under the 1 MiB request bound while
+  an `M` header carries a length token per key: 349,000 one-byte keys (the
+  most a frame holds) with two- and three-digit values made a 1,194,009
+  byte header. The refusal poisoned the backend connection, the retry
+  poisoned every other owner's, and the whole batch came back `W` (no hit
+  out of 349,000) with every other request pipelined on those connections
+  failing (8 connections incrementing during five such batches saw 10 `E`,
+  17 replies cut off by the close and 10 reconnects). An `M` header is now
+  read up to 4 MiB, which holds the longest header any frame can be
+  answered with (about 3.1 MB), and the line is charged to the request's
+  in-flight cost at nine bytes a key; every other reply keeps the 1 MiB
+  bound. The same batches now come back with all 349,000 hits, no poisoned
+  connection and no failed increment (#1283).
+- `nanocached-node`: a value within about 45 bytes of the 1 MiB request limit
+  could be stored but never moved. The handoff `U` that join migration,
+  decommission drain and re-replication send is the client's `S` plus the
+  receiver's 36-byte token and two length fields, and the receiver applied
+  the client limit to it, so it answered `En` and closed: a join that had
+  such a key to hand over logged `peer did not acknowledge the handed-off
+  entry` three times and abandoned (the joiner was not promoted in 40 s),
+  and a re-replication sends the same `U` (by code reading, not measured: it
+  would write the target off for 30 s over it). The
+  frames only another node sends (`U`, `u`, `f`) now get 4 KiB above the
+  request limit; client frames keep it. With 8 keys of 1,048,546 bytes on
+  one node and a second joining: before, the join was abandoned and the
+  joiner held 0 entries after 40 s; after, it was promoted in 2 s holding
+  the 5 keys it owns (#1275).
 
 ### Changed
 
@@ -229,6 +277,9 @@ framework adapters at one version, whether or not a component changed.
   later-finishing run could move `:main` back to an older commit. A build
   of a commit that is no longer the tip gets its `:sha-<commit>` tag only
   (#1165).
+- `ci`: the nightly `hostile-conformance` workflow failed every night since the .NET 10 bump, with its 11 .NET cells reporting "no record": the .NET drivers (`tools/conformance/drivers/dotnet/{run,scenario}.sh`) still ran in `mcr.microsoft.com/dotnet/runtime:8.0`, and a `net10.0` app cannot start there ("You must install or update .NET to run this application ... Framework: 'Microsoft.NETCore.App', version '10.0.0'"). They now run in `runtime:10.0`. The Rust drivers' image, `rust:latest` in the build (`build.sh`) and in the run (`run.sh`, `scenario.sh`), is pinned to `rust:1.96` in all three, so a new Rust release cannot change a nightly's result (#1286).
+- `tests/e2e`: 14 scripts (`chaos.sh`, `scalein.sh`, `proxydrain.sh`, `steady582.sh`, `joinstale.sh`, `repro582.sh`, `freshjoin.sh`, `restart.sh`, `proxykill.sh`, `reclaim970.sh`, `i91.sh`, `i92.sh`, `i93.sh`, `i96.sh`) cleaned up with `docker ps -aq --filter name=$P-`, and Docker's `name=` filter is an unanchored regex, so every container whose name merely contained the prefix was removed at start and at exit (`bench-probe-zz` matched `nch-`; `st-` matches `test-...` and `last-...`). The filters are now `name=^/$P-`, as `lr.sh` and `hostile/lib.sh` already had. With a decoy container named `decoy-<prefix>-x` next to a real `<prefix>-real`, each script's cleanup used to remove both and now removes only the second (#1287).
+- `release-server`: `ghcr.io/nanocached/nanocached-{node,discovery}:latest` pointed at an unreleased `main` build while `nanocached-proxy:latest` pointed at 0.6.0 (checked with `docker buildx imagetools inspect`: the node and discovery images carried no version label, the proxy's digest equalled `:0.6.0`), the leftover of the old publish behaviour: the `latest` job only ran on a release, so nothing could repair the registry in between. The Release server workflow now also has a manual `workflow_dispatch` entry (input `version`, default the newest stable `server/v*` tag) that skips the build, checks that all three `:X.Y.Z` images exist, applies the same "do not move backwards" check and points all three `:latest` tags at that version. The release path (tag push, build, `latest`) is unchanged, and the procedure is in `docs/deployment-operations.html` (#1284).
 
 ## [0.6.0] - 2026-11-01
 

@@ -159,6 +159,41 @@ impl InFlightBudget {
         self.bytes.saturating_sub(pinned)
     }
 
+    /// Charges `cost` on top of the `own` bytes a holder already pins,
+    /// clamped to `room` (`None` for a cost of nothing, and for a holder
+    /// that pins the whole budget itself: no other connection could free
+    /// what it would wait for, so it asks for nothing, as it always did).
+    /// Issue #1274: when the other connections' pinned bytes add up to the
+    /// whole budget `room` is 0, and a charge clamped to 0 let every reply
+    /// and multi-key frame through uncharged and concurrently, so the
+    /// budget stopped bounding anything. A cost of more than nothing now
+    /// waits until some byte is released and then clamps against the room
+    /// there is, like any other request: it takes the one byte only as a
+    /// wake-up, since a charge of one byte for a megabyte of reply would
+    /// let every waiter through at once as soon as the first byte came
+    /// back. The caller bounds the wait (`WRITE_TIMEOUT`, then the
+    /// connection is closed).
+    async fn charge_within_room(
+        &self,
+        cost: usize,
+        own: usize,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if cost == 0 || own >= self.bytes {
+            return None;
+        }
+        loop {
+            let room = self.room(own);
+            if room > 0 {
+                return Some(self.charge_exact(cost.min(room)).await);
+            }
+            // Nothing is left once the pinned bytes are counted. Every
+            // pinned byte is held, and a holder lowers the tally before it
+            // gives the permits back, so a byte that can be had is a byte
+            // that is no longer pinned and the room is looked at again.
+            drop(self.charge_exact(1).await);
+        }
+    }
+
     /// Reserves `cost` bytes (clamped to the budget), waiting for them.
     /// Every holder in the server charges in steps on top of what it
     /// already holds, so they go through `charge_exact` with their own
@@ -250,14 +285,16 @@ impl FrameCharge {
     fn shrink_to(&mut self, keep: usize) -> usize {
         let keep = u32::try_from(keep).unwrap_or(u32::MAX).min(self.held);
         let released = self.held - keep;
-        if released > 0 {
-            self.permits.add_permits(released as usize);
-            self.held = keep;
-        }
+        // The tally goes down before the permits come back: a waiter that
+        // finds a byte free must find it unpinned too (`charge_within_room`).
         if self.pinned_held > keep {
             self.pinned
                 .fetch_sub((self.pinned_held - keep) as usize, Ordering::Relaxed);
             self.pinned_held = keep;
+        }
+        if released > 0 {
+            self.permits.add_permits(released as usize);
+            self.held = keep;
         }
         self.held as usize
     }
@@ -277,12 +314,12 @@ impl FrameCharge {
 
 impl Drop for FrameCharge {
     fn drop(&mut self) {
-        if self.held > 0 {
-            self.permits.add_permits(self.held as usize);
-        }
         if self.pinned_held > 0 {
             self.pinned
                 .fetch_sub(self.pinned_held as usize, Ordering::Relaxed);
+        }
+        if self.held > 0 {
+            self.permits.add_permits(self.held as usize);
         }
     }
 }
@@ -443,19 +480,25 @@ async fn charge_multi_key_frame(
         };
     // A frame costing more than the budget takes what the pinned bytes
     // leave of it (`InFlightBudget::room`) and runs alone with them.
-    let cost = keys
-        .saturating_mul(per_key)
-        .min(config.in_flight_bytes.room(receive_charged));
-    let permit = timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge_exact(cost))
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "in-flight byte budget exhausted while serving a request",
-            )
-        })?;
-    let held = u32::try_from(permit.num_permits()).unwrap_or(u32::MAX);
-    permit.forget();
+    let cost = keys.saturating_mul(per_key);
+    let permit = timeout(
+        WRITE_TIMEOUT,
+        config
+            .in_flight_bytes
+            .charge_within_room(cost, receive_charged),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "in-flight byte budget exhausted while serving a request",
+        )
+    })?;
+    let held = permit.map_or(0, |permit| {
+        let held = u32::try_from(permit.num_permits()).unwrap_or(u32::MAX);
+        permit.forget();
+        held
+    });
     // What the reply phase will keep of this charge is pinned from the
     // start (issue #1264): a waiter may count on the working charge above
     // it being given back, but not on that part, which stays held through
@@ -503,21 +546,19 @@ async fn write_reply(
     tag: Option<u32>,
     held: usize,
 ) -> io::Result<()> {
-    let bytes = reply_bytes(response).min(config.in_flight_bytes.room(held));
-    let _charge = if bytes == 0 {
-        None
-    } else {
-        Some(
-            timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge_exact(bytes))
-                .await
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "in-flight byte budget exhausted while answering",
-                    )
-                })?,
+    let _charge = timeout(
+        WRITE_TIMEOUT,
+        config
+            .in_flight_bytes
+            .charge_within_room(reply_bytes(response), held),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "in-flight byte budget exhausted while answering",
         )
-    };
+    })?;
     write_response(stream, &encode_response(response, tag)).await
 }
 /// How long a connection may go without completing a full request before
@@ -652,6 +693,9 @@ static CONNECTION_ERROR_LOG: LogLimiter =
 /// still stack up to several multiples of this before failing. See
 /// `FORWARD_TIMEOUT` for the bound that actually caps the whole call.
 const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Issue #1281: how long the decommission waits between two roster fetches
+/// while discovery is not ready to answer its `T`.
+const ROSTER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// Caps the *entire* forward-to-joiner operation — dial, TLS, auth, and
 /// the write/ack — that `set_on_joining_node`/`delete_on_joining_node`
 /// run synchronously inside a client's connection task while a migration
@@ -752,13 +796,37 @@ const MAX_FORWARD_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 /// queue for 140,000 pairs).
 const FORWARD_ENTRY_OVERHEAD_BYTES: usize = 320;
 
-/// Whether one frame of `size` bytes is over `MAX_REQUEST_SIZE`. A bound
-/// on a frame, not on the receive buffer: `handle_connection` applies it
-/// to the frame `parse` took, or to the front frame still arriving, never
-/// to the buffer after a read (which also holds what was pipelined
-/// behind that frame).
-fn request_is_too_large(size: usize) -> bool {
-    size > MAX_REQUEST_SIZE
+/// What a frame of the cluster-internal kind (`U`, `u`, `f`) may carry
+/// beyond `MAX_REQUEST_SIZE`. A handoff `U` is the client's `S` for the
+/// same value plus the receiver's 36-byte membership token, its length
+/// field, the namespace length field and an optional ` A` — 40 to 50
+/// bytes more. With one limit for both, a value within that margin of the
+/// client limit was stored by the owner and could then never be moved:
+/// join migration, decommission drain and re-replication all send it as
+/// a `U`, and the receiver refused it as too large. The margin is
+/// generous (the real overhead is under 64 bytes), and costs nothing: a
+/// `U` is only acted on after its token checks, and the receive buffer
+/// is charged against the in-flight budget as it grows, not by this
+/// limit.
+const INTERNAL_FRAME_ALLOWANCE: usize = 4096;
+
+/// The largest frame the node accepts when it starts with `lead`: the
+/// request limit for everything a client sends, and the limit plus
+/// `INTERNAL_FRAME_ALLOWANCE` for the frames only another node sends.
+fn request_limit(lead: Option<u8>) -> usize {
+    match lead {
+        Some(b'U' | b'u' | b'f') => MAX_REQUEST_SIZE + INTERNAL_FRAME_ALLOWANCE,
+        _ => MAX_REQUEST_SIZE,
+    }
+}
+
+/// Whether one frame of `size` bytes, starting with `lead`, is over
+/// `request_limit`. A bound on a frame, not on the receive buffer:
+/// `handle_connection` applies it to the frame `parse` took, or to the
+/// front frame still arriving, never to the buffer after a read (which
+/// also holds what was pipelined behind that frame).
+fn request_is_too_large(size: usize, lead: Option<u8>) -> bool {
+    size > request_limit(lead)
 }
 
 /// A connection this process accepted, plaintext or TLS-terminated.
@@ -2896,6 +2964,7 @@ async fn handle_connection(
         }
 
         let buffered_before = received.len();
+        let lead = received.first().copied();
         let mut parsed = parse_resumable(&mut received, tagged, &mut parse_progress, false);
         // A multi-key frame (`m`, `o`, `y`) is charged for its per-key
         // working memory before the parser builds its key vectors, not
@@ -2911,7 +2980,7 @@ async fn handle_connection(
             frame_len,
         }) = parsed
         {
-            if request_is_too_large(frame_len) {
+            if request_is_too_large(frame_len, lead) {
                 return Err(reject_oversized_request(
                     &mut stream,
                     "request is too large".to_string(),
@@ -2935,7 +3004,7 @@ async fn handle_connection(
             // proxy's shared backend connection, where every client's
             // frames arrive back to back, that poisoned the connection
             // for the other clients.
-            if request_is_too_large(buffered_before - received.len()) {
+            if request_is_too_large(buffered_before - received.len(), lead) {
                 return Err(reject_oversized_request(
                     &mut stream,
                     "request is too large".to_string(),
@@ -4269,7 +4338,7 @@ async fn handle_connection(
                 // so what is buffered here is the front frame alone: the
                 // one place the limit can be applied to a frame still
                 // arriving (the complete-frame case is handled above).
-                if request_is_too_large(received.len()) {
+                if request_is_too_large(received.len(), lead) {
                     return Err(reject_oversized_request(
                         &mut stream,
                         "request is too large".to_string(),
@@ -4342,9 +4411,9 @@ async fn handle_connection(
         // charged. Without this an idle connection would pin up to a
         // frame's worth of the shared budget until it closed.
         if received.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
+            receive_tally.set(0);
             receive_charge = None;
             receive_charged = 0;
-            receive_tally.set(0);
         }
 
         // Bounded by time remaining until `deadline`, not by a fresh
@@ -4901,6 +4970,7 @@ async fn register_with_discovery(
                         // via `heartbeat_task.await`, hang shutdown).
                         let exchange = timeout(OUTBOUND_IO_TIMEOUT, async {
                             stream.write_all(&auth).await?;
+                            stream.flush().await?;
                             let mut ack = [0u8; 3];
                             stream.read_exact(&mut ack).await?;
                             io::Result::Ok(ack)
@@ -7509,7 +7579,7 @@ async fn run_decommission(
     let fetched = tokio::select! {
         biased;
         _ = shutdown_requested(&mut shutdown_rx) => None,
-        result = fetch_roster_for_leave(&node_context, &discovery_addrs) => Some(result),
+        result = fetch_roster_for_leave(&node_context, &discovery_addrs, deadline) => Some(result),
     };
     let roster = match fetched {
         None => {
@@ -7797,6 +7867,7 @@ async fn send_leave(node_context: &NodeContext, discovery_addrs: &[String]) {
             frame.extend_from_slice(node_context.name.as_bytes());
             frame.extend_from_slice(node_context.token.as_bytes());
             stream.write_all(&frame).await?;
+            stream.flush().await?;
             let mut ack = [0u8; 2];
             stream.read_exact(&mut ack).await?;
             if &ack != b"R\n" {
@@ -7900,6 +7971,7 @@ async fn send_handoff_set(
         stream
             .write_all(&handoff_message(key, value, ttl, if_absent, token))
             .await?;
+        stream.flush().await?;
         let mut ack = [0u8; 2];
         stream.read_exact(&mut ack).await?;
         if &ack != b"S\n" {
@@ -7923,11 +7995,50 @@ async fn send_handoff_set(
 async fn fetch_roster_for_leave(
     node_context: &NodeContext,
     discovery_addrs: &[String],
+    deadline: Instant,
+) -> io::Result<(Vec<(String, String, String)>, usize)> {
+    // A promoted node was a member, so a failed fetch is discovery not
+    // being ready for it yet (issue #1281): restarted and in its startup
+    // grace (`B`), or not yet holding this node's re-registration (the `T`
+    // connection is closed), or not accepting connections. The heartbeats
+    // keep running through the drain and re-register it, so the same fetch
+    // succeeds a moment later. A node discovery never promoted is not in
+    // the registry as `Joined` and has nothing to hand off: one attempt.
+    let retry = node_context.promoted.load(Ordering::SeqCst);
+    let mut logged = false;
+    loop {
+        let error = match fetch_roster_round(node_context, discovery_addrs, deadline).await {
+            Ok(roster) => return Ok(roster),
+            Err(error) => error,
+        };
+        if !retry || Instant::now() + ROSTER_RETRY_INTERVAL >= deadline {
+            return Err(error);
+        }
+        if !logged {
+            logged = true;
+            eprintln!(
+                "WARN decommission: fetching the roster failed ({error}); retrying every {}s \
+                 until the drain deadline",
+                ROSTER_RETRY_INTERVAL.as_secs()
+            );
+        }
+        sleep(ROSTER_RETRY_INTERVAL).await;
+    }
+}
+
+/// One pass over every discovery address, each bounded by
+/// `OUTBOUND_IO_TIMEOUT` and the drain `deadline`; the last error when none
+/// of them answers.
+async fn fetch_roster_round(
+    node_context: &NodeContext,
+    discovery_addrs: &[String],
+    deadline: Instant,
 ) -> io::Result<(Vec<(String, String, String)>, usize)> {
     let mut last_error = io::Error::other("no discovery replicas configured");
 
     for addr in discovery_addrs {
-        match timeout(OUTBOUND_IO_TIMEOUT, fetch_joined_roster(node_context, addr)).await {
+        let bound = OUTBOUND_IO_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+        match timeout(bound, fetch_joined_roster(node_context, addr)).await {
             Ok(Ok(roster)) => return Ok(roster),
             Ok(Err(error)) => last_error = error,
             Err(_) => {
@@ -8013,6 +8124,7 @@ async fn fetch_roster_once(
     request.extend_from_slice(node_context.name.as_bytes());
     request.extend_from_slice(node_context.token.as_bytes());
     stream.write_all(&request).await?;
+    stream.flush().await?;
 
     let bad = || io::Error::new(io::ErrorKind::InvalidData, "bad T response");
 
@@ -9279,6 +9391,7 @@ async fn connect_and_authenticate(
     if let Some(secret) = &node_context.auth_secret {
         timeout(OUTBOUND_IO_TIMEOUT, async {
             stream.write_all(&auth_message(secret)).await?;
+            stream.flush().await?;
 
             let mut ack = [0u8; 3];
             stream.read_exact(&mut ack).await?;
@@ -9312,6 +9425,7 @@ async fn send_set(
     );
     timeout(OUTBOUND_IO_TIMEOUT, async {
         stream.write_all(&set_message(key, value, ttl)).await?;
+        stream.flush().await?;
 
         let mut ack = [0u8; 2];
         stream.read_exact(&mut ack).await?;
@@ -9548,6 +9662,7 @@ impl ForwardedWrite<'_> {
                 stream
                     .write_all(&handoff_message(key, value, ttl, if_absent, token))
                     .await?;
+                stream.flush().await?;
 
                 let mut ack = [0u8; 2];
                 stream.read_exact(&mut ack).await?;
@@ -9564,6 +9679,7 @@ impl ForwardedWrite<'_> {
                 stream
                     .write_all(&handoff_delete_message(key, token))
                     .await?;
+                stream.flush().await?;
 
                 let mut ack = [0u8; 2];
                 stream.read_exact(&mut ack).await?;
@@ -9581,6 +9697,7 @@ impl ForwardedWrite<'_> {
             }
             ForwardedWrite::Delete { key } => {
                 stream.write_all(&delete_message(key)).await?;
+                stream.flush().await?;
 
                 let mut ack = [0u8; 2];
                 stream.read_exact(&mut ack).await?;
@@ -9595,6 +9712,7 @@ impl ForwardedWrite<'_> {
             }
             ForwardedWrite::Clear { scope, token } => {
                 stream.write_all(&scope.handoff_message(token)).await?;
+                stream.flush().await?;
 
                 let mut ack = [0u8; 2];
                 stream.read_exact(&mut ack).await?;
@@ -10638,6 +10756,7 @@ async fn fetch_published_roster_once(
     let stream = connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
     let mut stream = tokio::io::BufReader::new(stream);
     stream.write_all(b"L\n").await?;
+    stream.flush().await?;
     read_published_roster(&mut stream).await
 }
 
@@ -12705,6 +12824,126 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reply_waits_for_the_budget_when_other_connections_pin_all_of_it() {
+        // Issue #1274: with the receive buffers and frame charges of other
+        // connections adding up to exactly the budget, `room` is 0 and a
+        // reply used to clamp its cost to 0 and run uncharged, as did
+        // every reply after it: the budget stopped bounding anything. It
+        // now asks for at least one byte, so it waits for the pinned
+        // bytes to be released (or WRITE_TIMEOUT, then the connection is
+        // closed), exactly as it would with a byte less pinned.
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let mut pinner = ReceiveTally::new(&budget);
+        pinner.set(MAX_REQUEST_SIZE);
+        let pinned_permit = budget.charge(MAX_REQUEST_SIZE).await;
+        assert_eq!(budget.room(0), 0, "the premise: nothing left to clamp to");
+        let config = connection_config_with_budget(&budget, IDLE_TIMEOUT);
+
+        let (mut client, server) = tcp_pair().await;
+        let mut server = ServerStream::Plain(server);
+        let response = Response::Value(Bytes::from(vec![b'v'; 1000]));
+        let write = write_reply(&mut server, &config, &response, None, 0);
+        tokio::pin!(write);
+        assert!(
+            timeout(Duration::from_millis(300), &mut write)
+                .await
+                .is_err(),
+            "a reply must wait while the whole budget is pinned, not run uncharged"
+        );
+        let mut probe = [0u8; 1];
+        assert!(
+            timeout(Duration::from_millis(50), client.read(&mut probe))
+                .await
+                .is_err(),
+            "nothing of the reply may have been sent"
+        );
+
+        // The pinned bytes go away: the reply is charged and written.
+        pinner.set(0);
+        drop(pinned_permit);
+        timeout(Duration::from_secs(5), &mut write)
+            .await
+            .expect("the reply proceeds once the budget frees")
+            .unwrap();
+        let mut reply = vec![0u8; 1007];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reply.starts_with(b"V 1000\n"));
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_waits_for_the_budget_when_other_connections_pin_all_of_it() {
+        // Issue #1274, the frame side: `charge_multi_key_frame` charged
+        // `min(cost, room)` = 0 once the pinned bytes added up to the
+        // budget, so a multi-key frame built its working memory for free.
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let mut pinner = ReceiveTally::new(&budget);
+        pinner.set(MAX_REQUEST_SIZE);
+        let pinned_permit = budget.charge(MAX_REQUEST_SIZE).await;
+        let config = connection_config_with_budget(&budget, IDLE_TIMEOUT);
+
+        let charge = charge_multi_key_frame(&config, 0, 1_000, false);
+        tokio::pin!(charge);
+        assert!(
+            timeout(Duration::from_millis(300), &mut charge)
+                .await
+                .is_err(),
+            "a frame must wait while the whole budget is pinned, not be charged nothing"
+        );
+
+        pinner.set(0);
+        drop(pinned_permit);
+        let frame_charge = timeout(Duration::from_secs(5), &mut charge)
+            .await
+            .expect("the frame is charged once the budget frees")
+            .unwrap();
+        assert_eq!(
+            frame_charge.held as usize,
+            1_000 * MULTI_KEY_FRAME_BYTES_PER_KEY
+        );
+        drop(frame_charge);
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connection_holding_the_whole_budget_itself_does_not_wait_for_it() {
+        // The other side of #1274's fix: asking for at least one byte must
+        // not make a holder wait for bytes only it holds (a receive buffer
+        // clamped to the whole budget). Nothing else could free them.
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let mut mine = ReceiveTally::new(&budget);
+        mine.set(MAX_REQUEST_SIZE);
+        let _held = budget.charge(MAX_REQUEST_SIZE).await;
+        let config = connection_config_with_budget(&budget, IDLE_TIMEOUT);
+        let (mut client, server) = tcp_pair().await;
+        let mut server = ServerStream::Plain(server);
+        let response = Response::Value(Bytes::from(vec![b'v'; 1000]));
+        timeout(
+            Duration::from_secs(2),
+            write_reply(&mut server, &config, &response, None, MAX_REQUEST_SIZE),
+        )
+        .await
+        .expect("a holder of the whole budget is not left waiting for itself")
+        .unwrap();
+        let mut reply = vec![0u8; 1007];
+        timeout(Duration::from_secs(2), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        let frame = timeout(
+            Duration::from_secs(2),
+            charge_multi_key_frame(&config, MAX_REQUEST_SIZE, 1_000, false),
+        )
+        .await
+        .expect("nor is a frame")
+        .unwrap();
+        assert_eq!(frame.held, 0);
+    }
+
     #[test]
     fn the_forward_phase_keeps_what_the_batches_hold_and_nothing_when_there_are_none() {
         let namespace = Bytes::from_static(b"ns");
@@ -14498,17 +14737,55 @@ mod tests {
 
     #[test]
     fn request_size_below_limit_is_allowed() {
-        assert!(!request_is_too_large(MAX_REQUEST_SIZE - 1));
+        assert!(!request_is_too_large(MAX_REQUEST_SIZE - 1, Some(b'S')));
     }
 
     #[test]
     fn request_size_at_limit_is_allowed() {
-        assert!(!request_is_too_large(MAX_REQUEST_SIZE));
+        assert!(!request_is_too_large(MAX_REQUEST_SIZE, Some(b'S')));
     }
 
     #[test]
     fn request_size_above_limit_is_rejected() {
-        assert!(request_is_too_large(MAX_REQUEST_SIZE + 1));
+        assert!(request_is_too_large(MAX_REQUEST_SIZE + 1, Some(b'S')));
+    }
+
+    #[test]
+    fn a_cluster_internal_frame_may_exceed_the_request_limit_by_the_allowance() {
+        for lead in [b'U', b'u', b'f'] {
+            assert!(!request_is_too_large(
+                MAX_REQUEST_SIZE + INTERNAL_FRAME_ALLOWANCE,
+                Some(lead)
+            ));
+            assert!(request_is_too_large(
+                MAX_REQUEST_SIZE + INTERNAL_FRAME_ALLOWANCE + 1,
+                Some(lead)
+            ));
+        }
+        // Everything a client sends keeps the plain limit, and so does a
+        // frame whose lead byte is not known yet.
+        for lead in [b'S', b's', b'o', b'k', b'm', b'y'] {
+            assert!(request_is_too_large(MAX_REQUEST_SIZE + 1, Some(lead)));
+        }
+        assert!(request_is_too_large(MAX_REQUEST_SIZE + 1, None));
+    }
+
+    #[test]
+    fn the_allowance_covers_the_worst_handoff_overhead_over_the_set_frame() {
+        // The widest `U` a stored value can need against the widest `s`
+        // that stored it: a 36-byte token, a TTL, `A`, and a namespace.
+        let key = Key::new(Bytes::from_static(b"ns"), Bytes::from_static(b"name"));
+        let value = vec![b'v'; 100_000];
+        let ttl = Some(Duration::from_secs(4_000_000_000));
+        let token = Uuid::nil().to_string();
+        let handoff = handoff_message(&key, &value, ttl, true, &token).len();
+        let set = set_message(&key, &value, ttl).len();
+        assert!(handoff > set);
+        assert!(
+            handoff - set < INTERNAL_FRAME_ALLOWANCE / 8,
+            "overhead {} vs allowance {INTERNAL_FRAME_ALLOWANCE}",
+            handoff - set
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -17340,6 +17617,114 @@ mod tests {
         connection_task.await.unwrap().unwrap();
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    /// Runs a connection with a node context whose token is "tk-self" and
+    /// sends it `request`; returns what the node wrote back before it
+    /// closed, the connection task's result, and the cache the request
+    /// reached.
+    async fn run_handoff_connection(
+        request: Vec<u8>,
+        pending_reads: &[u8],
+    ) -> (Vec<u8>, io::Result<()>, mpsc::Sender<CacheRequest>) {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let node_context = NodeContext {
+            gates: Default::default(),
+            name: "self".to_string(),
+            token: "tk-self".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
+                ring: Arc::new(HashRing::new(vec!["other".to_string()])),
+                replication: 1,
+            })))),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        };
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+        client.write_all(&request).await.unwrap();
+        client.write_all(pending_reads).await.unwrap();
+        client.shutdown().await.unwrap();
+        let response = read_until_close(&mut client).await;
+        (response, connection_task.await.unwrap(), request_tx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_handoff_of_a_value_near_the_request_limit_is_stored() {
+        // A client `S` is accepted up to `MAX_REQUEST_SIZE`; the `U` that
+        // moves the same value to another node (join migration, drain,
+        // re-replication) is about 45 bytes longer. With one limit for
+        // both, a value that fits was stored and then could never be
+        // moved. Built with `handoff_message`, the frame the senders use.
+        let key = Key::new(Bytes::from_static(b"ns"), Bytes::from_static(b"name"));
+        let value = vec![b'v'; MAX_REQUEST_SIZE - 10];
+        let handoff = handoff_message(&key, &value, Some(Duration::from_secs(60)), true, "tk-self");
+        assert!(
+            handoff.len() > MAX_REQUEST_SIZE,
+            "the frame must be past the client limit for this test to mean anything"
+        );
+        let (response, result, request_tx) = run_handoff_connection(handoff, b"").await;
+        result.unwrap();
+        // The `U` is acknowledged, and the value is in the cache whole.
+        assert_eq!(&response[..], b"S\n");
+        match send_command(&request_tx, Command::PeekEntry { key }).await {
+            Response::Entries(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].1.len(), value.len());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        drop(request_tx);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_handoff_past_the_allowance_is_still_refused() {
+        let key = Key::new(Bytes::from_static(b"ns"), Bytes::from_static(b"name"));
+        let value = vec![b'v'; MAX_REQUEST_SIZE + INTERNAL_FRAME_ALLOWANCE];
+        let handoff = handoff_message(&key, &value, None, false, "tk-self");
+        let (response, result, _request_tx) = run_handoff_connection(handoff, b"").await;
+        assert_eq!(response, b"En\n");
+        assert_eq!(result.unwrap_err().to_string(), "request is too large");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_set_frame_over_the_request_limit_is_refused_even_at_a_handoff_sized_value() {
+        // The allowance is for the frames only a node sends: the `S` that
+        // carries the same value is over the limit by its own size.
+        let value = vec![b'v'; MAX_REQUEST_SIZE];
+        let mut request = format!("S 4 {}\nname", value.len()).into_bytes();
+        request.extend_from_slice(&value);
+        let (response, result, _request_tx) = run_handoff_connection(request, b"").await;
+        assert_eq!(response, b"En\n");
+        assert_eq!(result.unwrap_err().to_string(), "request is too large");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -22960,9 +23345,13 @@ mod tests {
         let task = spawn_pending_joiner_discovery(listener, false);
         let context = roster_fetch_context(&addr, true);
 
-        let (members, replication) = fetch_roster_for_leave(&context, std::slice::from_ref(&addr))
-            .await
-            .unwrap();
+        let (members, replication) = fetch_roster_for_leave(
+            &context,
+            std::slice::from_ref(&addr),
+            Instant::now() + Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
 
         let names: Vec<&str> = members.iter().map(|(name, _, _)| name.as_str()).collect();
         assert_eq!(names, ["leaver", "peer"]);
@@ -22975,18 +23364,78 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn the_decommission_roster_fetch_fails_when_the_published_roster_is_withheld() {
         // Without `L` the joiner cannot be told from a member: an error,
-        // not the unfiltered `T`.
+        // not the unfiltered `T`. A promoted node retries that error until
+        // the drain deadline (issue #1281); the filter is what is under test
+        // here, so the node is one discovery never promoted: one attempt.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let task = spawn_pending_joiner_discovery(listener, true);
-        let context = roster_fetch_context(&addr, true);
+        let context = roster_fetch_context(&addr, false);
 
-        let error = fetch_roster_for_leave(&context, std::slice::from_ref(&addr))
-            .await
-            .unwrap_err();
+        let error = fetch_roster_for_leave(
+            &context,
+            std::slice::from_ref(&addr),
+            Instant::now() + Duration::from_secs(20),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
         task.abort();
+    }
+
+    /// A discovery that answers the first `refusals` roster fetches the way a
+    /// restarted one does (`B` while `closing` is false, otherwise by closing
+    /// the connection as it does for a node it does not list yet), then
+    /// serves a two-member roster. Counts the connections it took.
+    fn spawn_unready_discovery(
+        listener: TcpListener,
+        refusals: usize,
+        closing: bool,
+    ) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&connections);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let counted = Arc::clone(&counted);
+                tokio::spawn(async move {
+                    // `T <name-len> <token-len>\n<name><token>`, or the `L\n`
+                    // the drain sends after it for the published roster
+                    // (issue #1282), which is answered without counting.
+                    let mut request = [0u8; 64];
+                    let mut buffered = 0usize;
+                    let expected = "T 6 9\n".len() + 6 + 9;
+                    while buffered < expected {
+                        match stream.read(&mut request[buffered..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => buffered += read,
+                        }
+                        if request[..buffered].starts_with(b"L\n") {
+                            let _ = stream
+                                .write_all(
+                                    b"N 2 1\n6 11\nleaver127.0.0.1:1\n4 11\npeer127.0.0.1:2\n",
+                                )
+                                .await;
+                            return;
+                        }
+                    }
+                    let seen = counted.fetch_add(1, Ordering::SeqCst);
+                    if seen < refusals {
+                        if !closing {
+                            let _ = stream.write_all(b"B\n").await;
+                        }
+                        return;
+                    }
+                    let response =
+                        b"N 2 1\n6 11 10\nleaver127.0.0.1:1tok-leaver\n4 11 8\npeer127.0.0.1:2tok-peer\n";
+                    let _ = stream.write_all(response).await;
+                });
+            }
+        });
+        (connections, task)
     }
 
     fn roster_fetch_context(discovery_addr: &str, promoted: bool) -> NodeContext {
@@ -23010,6 +23459,124 @@ mod tests {
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_decommission_roster_fetch_waits_out_a_discovery_that_is_not_ready() {
+        // Issue #1281: discovery restarted a moment ago answers `B` (startup
+        // grace) or closes the connection (this node not re-registered yet).
+        // The drain used to take that as final and leave with every key
+        // still on this node.
+        for closing in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let (connections, task) = spawn_unready_discovery(listener, 2, closing);
+            let context = roster_fetch_context(&addr, true);
+
+            let started = Instant::now();
+            let (members, replication) = fetch_roster_for_leave(
+                &context,
+                std::slice::from_ref(&addr),
+                Instant::now() + Duration::from_secs(20),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("closing={closing}: {error}"));
+
+            assert_eq!(members.len(), 2, "closing={closing}");
+            assert_eq!(replication, 1);
+            assert_eq!(
+                connections.load(Ordering::SeqCst),
+                3,
+                "closing={closing}: two refusals, then the roster"
+            );
+            assert!(started.elapsed() >= 2 * ROSTER_RETRY_INTERVAL - Duration::from_millis(100));
+            task.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_decommission_roster_fetch_stops_retrying_at_the_drain_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (connections, task) = spawn_unready_discovery(listener, usize::MAX, false);
+        let context = roster_fetch_context(&addr, true);
+
+        let started = Instant::now();
+        let error = fetch_roster_for_leave(
+            &context,
+            std::slice::from_ref(&addr),
+            Instant::now() + Duration::from_millis(2500),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "gave up after {:?}, well past the 2.5s deadline",
+            started.elapsed()
+        );
+        assert!(
+            connections.load(Ordering::SeqCst) >= 2,
+            "tried {} time(s)",
+            connections.load(Ordering::SeqCst)
+        );
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_operators_second_signal_ends_the_decommission_roster_retries() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (connections, task) = spawn_unready_discovery(listener, usize::MAX, false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut context = roster_fetch_context(&addr, true);
+        context.shutdown_rx = shutdown_rx;
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        context.request_tx = request_tx;
+
+        let decommission = tokio::spawn(run_decommission(
+            context,
+            vec![addr.clone()],
+            Duration::from_secs(60),
+            None,
+        ));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            connections.load(Ordering::SeqCst) >= 2,
+            "the roster fetch should still be retrying"
+        );
+        assert!(!decommission.is_finished());
+
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), decommission)
+            .await
+            .expect("an override must end the retries, not wait out the 60s drain budget")
+            .unwrap();
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_decommission_roster_fetch_of_a_node_discovery_never_promoted_is_not_retried() {
+        // Such a node is not `Joined`, so discovery closes every `T`; there
+        // is nothing to wait for and nothing to hand off.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (connections, task) = spawn_unready_discovery(listener, usize::MAX, true);
+        let context = roster_fetch_context(&addr, false);
+
+        let started = Instant::now();
+        let result = fetch_roster_for_leave(
+            &context,
+            std::slice::from_ref(&addr),
+            Instant::now() + Duration::from_secs(20),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < ROSTER_RETRY_INTERVAL);
+        task.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -30526,6 +31093,116 @@ mod tests {
         tls.shutdown().await.unwrap();
 
         server_task.await.unwrap();
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_reply_over_tls_is_flushed_to_a_slow_reader() {
+        // Issue #1279: tokio-rustls's `poll_write` returns `Ready(n)` with
+        // ciphertext still buffered when the socket is full, and nothing
+        // polls the stream again once `write_all` is done, so the tail of
+        // a reply larger than the socket buffers sat in the TLS writer for
+        // good while the client waited for it. Tiny socket buffers on both
+        // ends (as in the Rust SDK's equivalent test) make that
+        // deterministic: the reply is far larger than the two buffers
+        // together, so the write always ends with bytes left to flush.
+        const SMALL_SOCKET_BUFFER: u32 = 4096;
+        const VALUE_LEN: usize = 512 * 1024;
+        let (acceptor, connector) = self_signed_tls();
+
+        // Set before `listen`, so the accepted socket inherits it.
+        let listener_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        listener_socket
+            .set_send_buffer_size(SMALL_SOCKET_BUFFER)
+            .unwrap();
+        listener_socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .unwrap();
+        let listener = listener_socket.listen(1).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            auth_secret: None,
+            tls_acceptor: Some(acceptor),
+            node_context: None,
+            migration_tx: mpsc::channel(1).0,
+            forward_tx: mpsc::channel(1).0,
+            forward_queues: Arc::new(ForwardQueues::default()),
+            in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+        };
+        let server_task = tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            let mut connection_tasks = JoinSet::new();
+            dispatch_connection(
+                stream,
+                peer_addr,
+                request_tx,
+                Arc::new(Semaphore::new(1)),
+                Arc::new(Mutex::new(HashMap::new())),
+                DEFAULT_MAX_CONNECTIONS_PER_IP,
+                config,
+                shutdown_rx,
+                &mut connection_tasks,
+            );
+            while connection_tasks.join_next().await.is_some() {}
+        });
+
+        let client_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        client_socket
+            .set_recv_buffer_size(SMALL_SOCKET_BUFFER)
+            .unwrap();
+        let tcp = client_socket.connect(address).await.unwrap();
+        let mut tls = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+
+        let value = vec![b'v'; VALUE_LEN];
+        let mut request = format!("S 3 {VALUE_LEN}\nkey").into_bytes();
+        request.extend_from_slice(&value);
+        request.extend_from_slice(b"G 3\nkey");
+        tls.write_all(&request).await.unwrap();
+        tls.flush().await.unwrap();
+
+        // A slow reader: nothing at first, so both socket buffers fill,
+        // then 4 KiB at a time with a pause between reads.
+        sleep(Duration::from_millis(300)).await;
+        let expected = 2 + format!("V {VALUE_LEN}\n").len() + VALUE_LEN;
+        let mut received = Vec::with_capacity(expected);
+        let mut chunk = [0u8; 4096];
+        let drain = async {
+            while received.len() < expected {
+                let n = tls.read(&mut chunk).await.unwrap();
+                assert!(
+                    n > 0,
+                    "the connection closed after {} bytes",
+                    received.len()
+                );
+                received.extend_from_slice(&chunk[..n]);
+                sleep(Duration::from_millis(1)).await;
+            }
+        };
+        timeout(Duration::from_secs(20), drain)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "only {} of {expected} reply bytes arrived over TLS: the tail of the reply \
+                 is stuck in rustls's send buffer without a flush",
+                    received.len()
+                )
+            });
+        assert!(received.starts_with(b"S\nV "));
+        assert!(received.ends_with(&value));
+
+        tls.shutdown().await.unwrap();
+        timeout(Duration::from_secs(5), server_task)
+            .await
+            .unwrap()
+            .unwrap();
         cache_task.await.unwrap();
     }
 
