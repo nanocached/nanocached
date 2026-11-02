@@ -12,6 +12,8 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-02
+
 ### Fixed
 
 - `nanocached-node`: two replies whose values each exceeded what `--max-in-flight-bytes` had free waited for each other for the full 10 s and were both closed with "in-flight byte budget exhausted while answering": a reply asked for the budget less what its own connection held, which could only be satisfied once the other connection's receive buffer and reply-phase frame charge were gone, and those are only gone once that reply has been written. A reply now asks for what the budget has left after every connection's receive buffer and the 64 bytes per key a multi-key reply keeps charged while it is written (that remainder joins the node-wide tally the receive buffers already had), the same clamp a multi-key frame got for its own version of this. Two `m` replies of 1.2 MB against a 1 MiB budget, each on a connection pinning a 64 KiB buffer, used to hit the timeout and are now served one after the other in well under a second (#1264).
@@ -278,7 +280,7 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
-- Container images are built from `rust:1.96.0-alpine3.24` and run on
+- Container images are built from `rust:1.99.0-alpine3.24` and run on
   `alpine:3.24`. Alpine 3.21, the previous base, reached its end of support
   on 2026-11-01, after which its musl, busybox and apk get no security
   fixes; 3.24 is supported until 2028-06-01. Dependabot now watches the
@@ -1598,7 +1600,8 @@ without a deprecation cycle and are listed here.
 - Container images for `nanocached-node` and `nanocached-discovery`
   (separate Dockerfile targets).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/server/v0.6.0...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/server/v0.6.1...HEAD
+[0.6.1]: https://github.com/nanocached/nanocached/compare/server/v0.6.0...server/v0.6.1
 [0.6.0]: https://github.com/nanocached/nanocached/compare/server/v0.5.1...server/v0.6.0
 [0.5.1]: https://github.com/nanocached/nanocached/compare/server/v0.5.0...server/v0.5.1
 [0.5.0]: https://github.com/nanocached/nanocached/compare/server/v0.4.8...server/v0.5.0

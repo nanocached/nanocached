@@ -9,6 +9,8 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-02
+
 ### Fixed
 
 - `timeout=float("inf")` raised `OverflowError` and a timeout beyond 2**64-1 seconds (for example `10**30`) raised the SDK's `ValueError`, while Django's `LocMemCache` accepts both and never expires the entry. Such timeouts now mean "never expires", the same as `timeout=None`. (#1187)

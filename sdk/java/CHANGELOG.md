@@ -11,6 +11,8 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-02
+
 ### Fixed
 
 - With `readHedgeAfter` set, a hedge leg reported its outcome through a
@@ -637,7 +639,8 @@ without a deprecation cycle and are listed below.
 - First tag-driven release of the aligned SDK line (see the repository
   release history for earlier changes).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.6.0...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.6.1...HEAD
+[0.6.1]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.6.0...sdk/java/v0.6.1
 [0.6.0]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.5.1...sdk/java/v0.6.0
 [0.5.1]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.5.0...sdk/java/v0.5.1
 [0.5.0]: https://github.com/nanocached/nanocached/compare/sdk/java/v0.4.8...sdk/java/v0.5.0
