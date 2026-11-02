@@ -228,6 +228,19 @@ framework adapters at one version, whether or not a component changed.
   later-finishing run could move `:main` back to an older commit. A build
   of a commit that is no longer the tip gets its `:sha-<commit>` tag only
   (#1165).
+- `nanocached-node`: a value within about 45 bytes of the 1 MiB request limit
+  could be stored but never moved. The handoff `U` that join migration,
+  decommission drain and re-replication send is the client's `S` plus the
+  receiver's 36-byte token and two length fields, and the receiver applied
+  the client limit to it, so it answered `En` and closed: a join that had
+  such a key to hand over logged `peer did not acknowledge the handed-off
+  entry` three times and abandoned (the joiner was not promoted in 40 s),
+  and a re-replication target was written off for 30 s over it. The
+  frames only another node sends (`U`, `u`, `f`) now get 4 KiB above the
+  request limit; client frames keep it. With 8 keys of 1,048,546 bytes on
+  one node and a second joining: before, the join was abandoned and the
+  joiner held 0 entries after 40 s; after, it was promoted in 2 s holding
+  the 5 keys it owns (#1275).
 
 ## [0.6.0] - 2026-11-01
 
