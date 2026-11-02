@@ -1873,3 +1873,157 @@ async fn a_delete_tombstone_does_not_outlive_the_dead_copy_that_a_later_write_pu
         "B refused its owner's copy of a key created again after the delete: {out:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// A node asked to leave right after discovery restarted.
+// ---------------------------------------------------------------------
+
+/// What one run of the restart-then-leave scenario saw.
+#[derive(Debug)]
+struct RestartLeaveOutcome {
+    /// Keys A owned in {A, B, C} (R=1, so each lives only on its owner).
+    a_keys: usize,
+    /// Of those, keys an owner in {B, C} does not hold after A left.
+    missing: usize,
+    /// Members discovery lists once A has left.
+    members_after: usize,
+}
+
+/// A, B and C hold 300 keys at R=1; discovery is replaced by a new process
+/// (empty registry, 15 s startup grace); A is asked to leave `leave_after`
+/// later. A's roster fetch then meets either a registry that does not list
+/// it yet or discovery's `B` answer; the drain has 25 s to get through.
+async fn scenario_restart_then_leave(leave_after: Duration) -> RestartLeaveOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let replication = 1;
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc) = (Port::reserve(), Port::reserve(), Port::reserve());
+    let (dport, a, b, c) = (dp.number, pa.number, pb.number, pc.number);
+    let keys: Vec<String> = (0..300).map(|i| format!("y{i}")).collect();
+    let listener = dp.take_listener();
+    let disc = tokio::spawn(async move {
+        let r = discovery::run_on_listener(
+            listener,
+            Duration::from_secs(15),
+            Duration::from_secs(15),
+            replication,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        eprintln!("discovery ended: {r:?}");
+    });
+    settle().await;
+    let mut client = Client::new();
+    let na = start_node(&mut pa, dport, Some("node-a"));
+    run_for(Duration::from_secs(20)).await;
+    let nb = start_node(&mut pb, dport, Some("node-b"));
+    run_for(Duration::from_secs(25)).await;
+    let nc = start_node(&mut pc, dport, Some("node-c"));
+    run_for(Duration::from_secs(25)).await;
+    let roster3 = roster(dport).await;
+    assert_eq!(roster3.len(), 3, "A, B and C are members: {roster3:?}");
+    let names = [
+        name_at(&roster3, a),
+        name_at(&roster3, b),
+        name_at(&roster3, c),
+    ];
+    let ports = [a, b, c];
+    let ring3 = HashRing::new(names.to_vec());
+    for key in &keys {
+        for owner in ring3.owners(&Key::unnamespaced(Bytes::from(key.clone())), replication) {
+            let port = ports[names.iter().position(|n| n == owner).unwrap()];
+            assert_eq!(client.set(port, key, "v1").await, "S", "{key} on {owner}");
+        }
+    }
+    run_for(Duration::from_secs(70)).await;
+
+    // Discovery restarts: a new process on the same port.
+    disc.abort();
+    run_for(Duration::from_secs(1)).await;
+    let listener = TcpListener::bind(("127.0.0.1", dport)).await.unwrap();
+    let disc2 = tokio::spawn(async move {
+        let r = discovery::run_on_listener(
+            listener,
+            Duration::from_secs(15),
+            Duration::from_secs(15),
+            replication,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        eprintln!("discovery (restarted) ended: {r:?}");
+    });
+    run_for(leave_after).await;
+
+    na.leave.notify_one();
+    run_until_gone(&na, "A").await;
+    run_for(Duration::from_secs(40)).await;
+    let members_after = roster(dport).await.len();
+
+    let ring_bc = HashRing::new(vec![names[1].clone(), names[2].clone()]);
+    let mut out = RestartLeaveOutcome {
+        a_keys: 0,
+        missing: 0,
+        members_after,
+    };
+    for key in &keys {
+        let key_bytes = Key::unnamespaced(Bytes::from(key.clone()));
+        if !ring3
+            .owners(&key_bytes, replication)
+            .contains(&names[0].as_str())
+        {
+            continue;
+        }
+        out.a_keys += 1;
+        for owner in ring_bc.owners(&key_bytes, replication) {
+            let port = if owner == names[1] { b } else { c };
+            if !client.holds(port, key).await {
+                out.missing += 1;
+            }
+        }
+    }
+    disc2.abort();
+    nb.abort();
+    nc.abort();
+    out
+}
+
+/// A SIGTERM 7 s after the restart lands while discovery still answers `B`
+/// (its startup grace is 15 s): the drain must wait for the roster rather
+/// than give up on its first fetch and leave with every key still on A.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_node_asked_to_leave_during_discovery_startup_grace_still_hands_off() {
+    let _spin = spin();
+    let out = scenario_restart_then_leave(Duration::from_secs(7)).await;
+    eprintln!("{out:?}");
+    assert!(out.a_keys > 0, "nothing to check: {out:?}");
+    assert_eq!(out.members_after, 2, "A is gone from the roster: {out:?}");
+    assert_eq!(
+        out.missing, 0,
+        "A left without handing its keys off: {out:?}"
+    );
+}
+
+/// A SIGTERM 1 s after the restart: A has not registered with the new
+/// discovery yet (its next heartbeat is up to 5 s away), which closes the
+/// `T` connection instead of answering.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_node_asked_to_leave_before_it_re_registered_with_a_restarted_discovery_still_hands_off()
+{
+    let _spin = spin();
+    let out = scenario_restart_then_leave(Duration::from_secs(1)).await;
+    eprintln!("{out:?}");
+    assert!(out.a_keys > 0, "nothing to check: {out:?}");
+    assert_eq!(out.members_after, 2, "A is gone from the roster: {out:?}");
+    assert_eq!(
+        out.missing, 0,
+        "A left without handing its keys off: {out:?}"
+    );
+}
