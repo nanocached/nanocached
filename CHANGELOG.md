@@ -204,6 +204,21 @@ framework adapters at one version, whether or not a component changed.
   (and a multi-key header that outgrows the free 64 KiB takes the largest
   frame's worth at once), so uploads queue for the share and take their
   turns (#1147).
+- `nanocached-discovery`: the log lines a peer can cause at will were
+  written unconditionally: one `WARN connection error` per failed
+  connection, one `WARN rejected ...` (and the connection error behind it)
+  per refused `T`, join, announce, leave or deregister, one per TLS
+  handshake failure and accept failure. A flood of short connections
+  within the per-IP cap wrote about 8,000 lines a second (24,526 lines for
+  24,525 connections in 3 s, release build), and `eprintln!` blocks the
+  runtime thread, so with the log pipe unread discovery stopped answering
+  after about 1,100 such connections. These lines now go through the node's
+  limiter, 50 lines a second for connections and 50 for rejections, with
+  the count of what was dropped in one summary line ahead of the next line
+  written: the same flood writes 154 lines for 26,089 connections, and a
+  log pipe nobody reads, which stopped discovery within 5 s, no longer
+  does in that time (it fills about 150 times slower). A sink that stays
+  stalled still blocks the writes eventually (#1285).
 - `nanocached-proxy`: a node's reply to a 1 MiB `m` (or `y` with `G`) of
   short keys was refused as "line exceeded its size cap", because the
   proxy read every backend reply header under the 1 MiB request bound while
