@@ -204,6 +204,7 @@ framework adapters at one version, whether or not a component changed.
   (and a multi-key header that outgrows the free 64 KiB takes the largest
   frame's worth at once), so uploads queue for the share and take their
   turns (#1147).
+- `nanocached-node`: a node asked to leave right after discovery restarted fetched the roster for its drain once, and gave up on the first failure: discovery answers `B` through its startup grace (15 s) and closes the `T` connection of a node it has not seen re-register yet (a heartbeat is up to 5 s away), so the node logged `fetching the roster failed ... leaving without a handoff`, sent `V` and exited with the whole `--drain-timeout` unused. At R=1 every key it owned was lost (99 of 99 on the new owners in the simulation, with the SIGTERM 1 s and 7 s after the restart; 0 missing with the SIGTERM 30 s after). The fetch is now retried every second until the drain deadline when the node was promoted (it was a member, so discovery being unready is transient and its heartbeats re-register it during the drain); `B`, a closed connection, a refused connection and a timeout all retry, and the operator's second signal still ends it at once. A node discovery never promoted still makes one attempt, since discovery closes its `T` for good (#1281).
 
 ### Changed
 

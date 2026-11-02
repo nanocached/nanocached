@@ -652,6 +652,9 @@ static CONNECTION_ERROR_LOG: LogLimiter =
 /// still stack up to several multiples of this before failing. See
 /// `FORWARD_TIMEOUT` for the bound that actually caps the whole call.
 const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Issue #1281: how long the decommission waits between two roster fetches
+/// while discovery is not ready to answer its `T`.
+const ROSTER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// Caps the *entire* forward-to-joiner operation — dial, TLS, auth, and
 /// the write/ack — that `set_on_joining_node`/`delete_on_joining_node`
 /// run synchronously inside a client's connection task while a migration
@@ -7509,7 +7512,7 @@ async fn run_decommission(
     let fetched = tokio::select! {
         biased;
         _ = shutdown_requested(&mut shutdown_rx) => None,
-        result = fetch_roster_for_leave(&node_context, &discovery_addrs) => Some(result),
+        result = fetch_roster_for_leave(&node_context, &discovery_addrs, deadline) => Some(result),
     };
     let roster = match fetched {
         None => {
@@ -7923,11 +7926,50 @@ async fn send_handoff_set(
 async fn fetch_roster_for_leave(
     node_context: &NodeContext,
     discovery_addrs: &[String],
+    deadline: Instant,
+) -> io::Result<(Vec<(String, String, String)>, usize)> {
+    // A promoted node was a member, so a failed fetch is discovery not
+    // being ready for it yet (issue #1281): restarted and in its startup
+    // grace (`B`), or not yet holding this node's re-registration (the `T`
+    // connection is closed), or not accepting connections. The heartbeats
+    // keep running through the drain and re-register it, so the same fetch
+    // succeeds a moment later. A node discovery never promoted is not in
+    // the registry as `Joined` and has nothing to hand off: one attempt.
+    let retry = node_context.promoted.load(Ordering::SeqCst);
+    let mut logged = false;
+    loop {
+        let error = match fetch_roster_round(node_context, discovery_addrs, deadline).await {
+            Ok(roster) => return Ok(roster),
+            Err(error) => error,
+        };
+        if !retry || Instant::now() + ROSTER_RETRY_INTERVAL >= deadline {
+            return Err(error);
+        }
+        if !logged {
+            logged = true;
+            eprintln!(
+                "WARN decommission: fetching the roster failed ({error}); retrying every {}s \
+                 until the drain deadline",
+                ROSTER_RETRY_INTERVAL.as_secs()
+            );
+        }
+        sleep(ROSTER_RETRY_INTERVAL).await;
+    }
+}
+
+/// One pass over every discovery address, each bounded by
+/// `OUTBOUND_IO_TIMEOUT` and the drain `deadline`; the last error when none
+/// of them answers.
+async fn fetch_roster_round(
+    node_context: &NodeContext,
+    discovery_addrs: &[String],
+    deadline: Instant,
 ) -> io::Result<(Vec<(String, String, String)>, usize)> {
     let mut last_error = io::Error::other("no discovery replicas configured");
 
     for addr in discovery_addrs {
-        match timeout(OUTBOUND_IO_TIMEOUT, fetch_roster_once(node_context, addr)).await {
+        let bound = OUTBOUND_IO_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+        match timeout(bound, fetch_roster_once(node_context, addr)).await {
             Ok(Ok(roster)) => return Ok(roster),
             Ok(Err(error)) => last_error = error,
             Err(_) => {
@@ -22854,6 +22896,190 @@ mod tests {
             }
         });
         (left, discovery_task)
+    }
+
+    /// A discovery that answers the first `refusals` roster fetches the way a
+    /// restarted one does (`B` while `closing` is false, otherwise by closing
+    /// the connection as it does for a node it does not list yet), then
+    /// serves a two-member roster. Counts the connections it took.
+    fn spawn_unready_discovery(
+        listener: TcpListener,
+        refusals: usize,
+        closing: bool,
+    ) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&connections);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    // `T <name-len> <token-len>\n<name><token>`
+                    let mut request = [0u8; 64];
+                    let mut buffered = 0usize;
+                    let expected = "T 6 9\n".len() + 6 + 9;
+                    while buffered < expected {
+                        match stream.read(&mut request[buffered..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => buffered += read,
+                        }
+                    }
+                    if seen < refusals {
+                        if !closing {
+                            let _ = stream.write_all(b"B\n").await;
+                        }
+                        return;
+                    }
+                    let response =
+                        b"N 2 1\n6 11 10\nleaver127.0.0.1:1tok-leaver\n4 11 8\npeer127.0.0.1:2tok-peer\n";
+                    let _ = stream.write_all(response).await;
+                });
+            }
+        });
+        (connections, task)
+    }
+
+    fn roster_fetch_context(discovery_addr: &str, promoted: bool) -> NodeContext {
+        NodeContext {
+            gates: Default::default(),
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: discovery_addr.to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(promoted)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_decommission_roster_fetch_waits_out_a_discovery_that_is_not_ready() {
+        // Issue #1281: discovery restarted a moment ago answers `B` (startup
+        // grace) or closes the connection (this node not re-registered yet).
+        // The drain used to take that as final and leave with every key
+        // still on this node.
+        for closing in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let (connections, task) = spawn_unready_discovery(listener, 2, closing);
+            let context = roster_fetch_context(&addr, true);
+
+            let started = Instant::now();
+            let (members, replication) = fetch_roster_for_leave(
+                &context,
+                std::slice::from_ref(&addr),
+                Instant::now() + Duration::from_secs(20),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("closing={closing}: {error}"));
+
+            assert_eq!(members.len(), 2, "closing={closing}");
+            assert_eq!(replication, 1);
+            assert_eq!(
+                connections.load(Ordering::SeqCst),
+                3,
+                "closing={closing}: two refusals, then the roster"
+            );
+            assert!(started.elapsed() >= 2 * ROSTER_RETRY_INTERVAL - Duration::from_millis(100));
+            task.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_decommission_roster_fetch_stops_retrying_at_the_drain_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (connections, task) = spawn_unready_discovery(listener, usize::MAX, false);
+        let context = roster_fetch_context(&addr, true);
+
+        let started = Instant::now();
+        let error = fetch_roster_for_leave(
+            &context,
+            std::slice::from_ref(&addr),
+            Instant::now() + Duration::from_millis(2500),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "gave up after {:?}, well past the 2.5s deadline",
+            started.elapsed()
+        );
+        assert!(
+            connections.load(Ordering::SeqCst) >= 2,
+            "tried {} time(s)",
+            connections.load(Ordering::SeqCst)
+        );
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_operators_second_signal_ends_the_decommission_roster_retries() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (connections, task) = spawn_unready_discovery(listener, usize::MAX, false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut context = roster_fetch_context(&addr, true);
+        context.shutdown_rx = shutdown_rx;
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        context.request_tx = request_tx;
+
+        let decommission = tokio::spawn(run_decommission(
+            context,
+            vec![addr.clone()],
+            Duration::from_secs(60),
+            None,
+        ));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            connections.load(Ordering::SeqCst) >= 2,
+            "the roster fetch should still be retrying"
+        );
+        assert!(!decommission.is_finished());
+
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), decommission)
+            .await
+            .expect("an override must end the retries, not wait out the 60s drain budget")
+            .unwrap();
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_decommission_roster_fetch_of_a_node_discovery_never_promoted_is_not_retried() {
+        // Such a node is not `Joined`, so discovery closes every `T`; there
+        // is nothing to wait for and nothing to hand off.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (connections, task) = spawn_unready_discovery(listener, usize::MAX, true);
+        let context = roster_fetch_context(&addr, false);
+
+        let started = Instant::now();
+        let result = fetch_roster_for_leave(
+            &context,
+            std::slice::from_ref(&addr),
+            Instant::now() + Duration::from_secs(20),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < ROSTER_RETRY_INTERVAL);
+        task.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
