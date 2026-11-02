@@ -9,6 +9,8 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-02
+
 ### Fixed
 
 - A forced node-list refresh (after a connection failure or a `W` reply) joined a refresh that was already in flight, even one that had read discovery's list before the failure, so the retry could go back to the node that had just failed. A forced refresh now waits out a refresh that started earlier and then runs a fresh one (forced callers arriving meanwhile share it); the periodic stale check still joins an in-flight refresh. (#1200)
@@ -545,7 +547,8 @@ without a deprecation cycle and are listed below.
 - First tag-driven release of the aligned SDK line (see the repository
   release history for earlier changes).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.6.0...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.6.1...HEAD
+[0.6.1]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.6.0...sdk/python/v0.6.1
 [0.6.0]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.5.1...sdk/python/v0.6.0
 [0.5.1]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.5.0...sdk/python/v0.5.1
 [0.5.0]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.4.8...sdk/python/v0.5.0

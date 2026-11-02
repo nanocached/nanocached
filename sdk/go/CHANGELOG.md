@@ -10,6 +10,8 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-02
+
 ### Fixed
 
 - A caller that hit a dead node and forced a node-list refresh could reuse a refresh that was already in flight when the node died: only the completion time of the previous fetch was compared, so a fetch that started before the failure and finished after the caller's check counted as fresh, and the caller retried against the roster from before the failure. A forced caller now reuses only a refresh that started after it observed its failure; callers that fail at the same time still share one refresh (#1247).

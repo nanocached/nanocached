@@ -9,6 +9,8 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-02
+
 ### Fixed
 
 - A stored value that is not valid JSON (an entry another application left in
