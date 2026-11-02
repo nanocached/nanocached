@@ -181,7 +181,7 @@ an unreleased <code>main</code> was pushed as <code>:latest</code>
 earlier — a maintainer can bring them back together without cutting a
 release. Run the <strong>Release server</strong> workflow by hand
 (Actions tab, <em>Run workflow</em>, or from a terminal):</p>
-<pre><code>gh workflow run release-server.yaml -f version=0.6.0
+<pre><code>gh workflow run release-server.yaml -f version=0.6.1
 gh run watch</code></pre>
 <p>The <code>version</code> input is optional; left empty, it is the
 newest stable <code>server/v*</code> tag. A manual run builds and pushes
