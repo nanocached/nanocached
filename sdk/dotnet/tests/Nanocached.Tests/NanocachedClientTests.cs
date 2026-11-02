@@ -3582,6 +3582,52 @@ public class NanocachedClientTests
         Assert.Equal(60, cluster.Nodes[owners[0]].LastSetTtl);
     }
 
+    // Issue #1289: read repair is always asynchronous, and the repair write
+    // used the caller's namespace/key arrays and the very byte[] returned to
+    // the caller. The primary's connection is dropped while the replica is
+    // still holding its reply, so the repair has to redial (the node stalls
+    // the handshake) and only builds its frame well after the caller has
+    // reused its buffers.
+    [Fact]
+    public async Task TheReadRepairWriteBackDoesNotReadTheCallersBuffersAfterTheCallReturns()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        byte[] namespaceBytes = Bytes("tenant");
+        byte[] key = Bytes("k");
+        IReadOnlyList<string> owners = new HashRing(Names).Owners(namespaceBytes, key, 2);
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+        string stored = MockNode.KeyOf(namespaceBytes, key);
+        replica.Store[stored] = Bytes("from-replica");
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadRepair = true,
+        });
+        replica.DelayGets(300);
+        primary.DelayAuth(600);
+
+        Task<byte[]?> read = client.GetBytesAsync(namespaceBytes, key);
+        // The replica has the request and is sitting on its reply: the
+        // primary has already answered its miss, so dropping its connection
+        // now leaves the repair with nothing to write on.
+        await WaitForAsync(() => replica.GetCount >= 1, "the replica to receive the read");
+        primary.DropConnections();
+        await Task.Delay(100); // the client's read loop sees the FIN well before the replica answers
+        byte[] value = (await read)!;
+        Assert.Equal(Bytes("from-replica"), value);
+
+        Array.Fill(key, (byte)'z'); // the caller reuses its buffers
+        Array.Fill(namespaceBytes, (byte)'Y');
+        Array.Fill(value, (byte)'X');
+
+        await WaitForAsync(() => !primary.Store.IsEmpty, "the primary to be repaired");
+        Assert.True(primary.Store.TryGetValue(stored, out byte[]? got),
+            $"the primary holds the original namespace and key, got {string.Join(",", primary.Store.Keys)}");
+        Assert.Equal(Bytes("from-replica"), got);
+    }
+
     [Fact]
     public async Task ReadRepairProbesOnlyTheRemainingOwnersNotThePrimary()
     {
