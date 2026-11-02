@@ -1875,6 +1875,175 @@ async fn a_delete_tombstone_does_not_outlive_the_dead_copy_that_a_later_write_pu
 }
 
 // ---------------------------------------------------------------------
+// A node asked to leave while another node's join is still pending.
+// ---------------------------------------------------------------------
+
+/// What one run of the leave-during-a-pending-join scenario saw.
+#[derive(Debug)]
+struct PendingJoinLeaveOutcome {
+    /// Keys A owned in {A, B, C}.
+    a_keys: usize,
+    /// Of those, keys an owner in {B, C} (the published ring after A's
+    /// leave) does not hold.
+    missing_on_new_owner: usize,
+    /// Of those, keys the joiner D, which was never promoted, holds.
+    on_d: usize,
+    /// Members discovery lists once A has left.
+    members_after: usize,
+}
+
+/// A, B and C hold 300 keys. D starts to join while B's transfer is held, so
+/// discovery keeps D `Joining` (unpublished) while A and C finish their
+/// share. Then A is asked to leave. The ring clients route by after that is
+/// {B, C}; every key A owned must be on its owner there, whichever of them
+/// the drain picked for it. D is neither a member nor a place to put keys:
+/// `T` lists it, `L` does not.
+async fn scenario_leave_during_pending_join(replication: usize) -> PendingJoinLeaveOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc, mut pd) = (
+        Port::reserve(),
+        Port::reserve(),
+        Port::reserve(),
+        Port::reserve(),
+    );
+    let (dport, a, b, c, d) = (dp.number, pa.number, pb.number, pc.number, pd.number);
+    let keys: Vec<String> = (0..300).map(|i| format!("y{i}")).collect();
+    let listener = dp.take_listener();
+    let disc = tokio::spawn(async move {
+        let r = discovery::run_on_listener(
+            listener,
+            Duration::from_secs(15),
+            Duration::from_secs(15),
+            replication,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        eprintln!("discovery ended: {r:?}");
+    });
+    settle().await;
+    let mut client = Client::new();
+    let na = start_node(&mut pa, dport, Some("node-a"));
+    run_for(Duration::from_secs(20)).await;
+    let nb = start_node(&mut pb, dport, Some("node-b"));
+    run_for(Duration::from_secs(25)).await;
+    let nc = start_node(&mut pc, dport, Some("node-c"));
+    run_for(Duration::from_secs(25)).await;
+    let roster3 = roster(dport).await;
+    assert_eq!(roster3.len(), 3, "A, B and C are members: {roster3:?}");
+    let names = [
+        name_at(&roster3, a),
+        name_at(&roster3, b),
+        name_at(&roster3, c),
+    ];
+    let ports = [a, b, c];
+    let ring3 = HashRing::new(names.to_vec());
+    for key in &keys {
+        for owner in ring3.owners(&Key::unnamespaced(Bytes::from(key.clone())), replication) {
+            let port = ports[names.iter().position(|n| n == owner).unwrap()];
+            assert_eq!(client.set(port, key, "v1").await, "S", "{key} on {owner}");
+        }
+    }
+    run_for(Duration::from_secs(70)).await;
+
+    nb.gates.transfer.hold();
+    let nd = start_node(&mut pd, dport, Some("node-d"));
+    run_for(Duration::from_secs(10)).await;
+    let r = roster(dport).await;
+    assert_eq!(
+        r.len(),
+        3,
+        "D is not promoted while B's transfer is held: {r:?}"
+    );
+
+    na.leave.notify_one();
+    run_until_gone(&na, "A").await;
+    run_for(Duration::from_secs(2)).await;
+    let r = roster(dport).await;
+    assert_eq!(r.len(), 2, "A left, D is still not a member: {r:?}");
+    let members_after = r.len();
+
+    let ring_bc = HashRing::new(vec![names[1].clone(), names[2].clone()]);
+    let mut out = PendingJoinLeaveOutcome {
+        a_keys: 0,
+        missing_on_new_owner: 0,
+        on_d: 0,
+        members_after,
+    };
+    for key in &keys {
+        let key_bytes = Key::unnamespaced(Bytes::from(key.clone()));
+        if !ring3
+            .owners(&key_bytes, replication)
+            .contains(&names[0].as_str())
+        {
+            continue;
+        }
+        out.a_keys += 1;
+        let mut missing = false;
+        for owner in ring_bc.owners(&key_bytes, replication) {
+            let port = if owner == names[1] { b } else { c };
+            if !client.holds(port, key).await {
+                missing = true;
+            }
+        }
+        if missing {
+            out.missing_on_new_owner += 1;
+        }
+        if client.holds(d, key).await {
+            out.on_d += 1;
+        }
+    }
+    disc.abort();
+    for n in [nb, nc, nd] {
+        n.abort();
+    }
+    out
+}
+
+/// The drain's ring is the published one: a joiner discovery has not
+/// promoted is not an owner in it, so it neither takes keys the leaver
+/// would have sent to B or C nor makes the leaver skip keys it ranks above
+/// the leaver for.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_node_asked_to_leave_hands_off_by_the_published_ring_while_a_join_is_pending() {
+    let _spin = spin();
+    let out = scenario_leave_during_pending_join(1).await;
+    eprintln!("{out:?}");
+    assert!(out.a_keys > 0, "nothing to check: {out:?}");
+    assert_eq!(out.members_after, 2, "{out:?}");
+    assert_eq!(
+        out.missing_on_new_owner, 0,
+        "the drain dropped or misdirected keys: {out:?}"
+    );
+    assert_eq!(
+        out.on_d, 0,
+        "the drain sent keys to an unpublished node: {out:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_node_asked_to_leave_hands_off_by_the_published_ring_while_a_join_is_pending_at_r2() {
+    let _spin = spin();
+    let out = scenario_leave_during_pending_join(2).await;
+    eprintln!("{out:?}");
+    assert!(out.a_keys > 0, "nothing to check: {out:?}");
+    assert_eq!(out.members_after, 2, "{out:?}");
+    assert_eq!(
+        out.missing_on_new_owner, 0,
+        "the drain dropped or misdirected keys: {out:?}"
+    );
+    assert_eq!(
+        out.on_d, 0,
+        "the drain sent keys to an unpublished node: {out:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
 // A node asked to leave right after discovery restarted.
 // ---------------------------------------------------------------------
 
