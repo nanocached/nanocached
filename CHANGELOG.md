@@ -205,6 +205,51 @@ framework adapters at one version, whether or not a component changed.
   frame's worth at once), so uploads queue for the share and take their
   turns (#1147).
 - `nanocached-node`: once the receive buffers and multi-key frame charges of the connections added up to exactly `--max-in-flight-bytes`, every reply and every multi-key frame ran uncharged and all at once, so the budget stopped bounding anything: the room a charge may ask for (the budget less what connections pin) was 0, and a charge clamped to 0 is not waited for at all. A reply or frame with a cost now waits until some byte is released and then takes its usual share of the room, and the connection is closed after 10 s if nothing is, as it was before the clamps of #1262 and #1264. (A connection that pins the whole budget by itself does not wait for bytes only it holds, and the clamp that keeps two oversized requests from waiting for each other is unchanged.) With `--max-in-flight-bytes 1048576`, a 1,000,000-byte value requested by 200 connections that never read, and one more connection holding a 1,047,700-byte receive buffer, the node's resident memory was 195 MiB before and is 9 MiB now, and the waiting connections are closed with the budget error where none was. (#1274)
+- `nanocached-node`: the sweep's queue of expired and migrated keys kept its allocation after it was worked off, so one large burst of expiries left the node holding 64 bytes per key of the burst's peak outside `--max-memory` for good (100,000 keys that had expired and been swept left a queue of 131,072 slots, 8 MiB, and the same burst at 500,000 keys left 32 MiB; by arithmetic the default 256 MiB with small entries can reach 128 MiB). The queue is replaced by an empty one as soon as it is drained, and the next pass allocates only for what it finds. (#1280)
+- `nanocached-discovery`: the log lines a peer can cause at will were
+  written unconditionally: one `WARN connection error` per failed
+  connection, one `WARN rejected ...` (and the connection error behind it)
+  per refused `T`, join, announce, leave or deregister, one per TLS
+  handshake failure and accept failure. A flood of short connections
+  within the per-IP cap wrote about 8,000 lines a second (24,526 lines for
+  24,525 connections in 3 s, release build), and `eprintln!` blocks the
+  runtime thread, so with the log pipe unread discovery stopped answering
+  after about 1,100 such connections. These lines now go through the node's
+  limiter, 50 lines a second for connections and 50 for rejections, with
+  the count of what was dropped in one summary line ahead of the next line
+  written: the same flood writes 154 lines for 26,089 connections, and a
+  log pipe nobody reads, which stopped discovery within 5 s, no longer
+  does in that time (it fills about 150 times slower). A sink that stays
+  stalled still blocks the writes eventually (#1285).
+- `nanocached-proxy`: a node's reply to a 1 MiB `m` (or `y` with `G`) of
+  short keys was refused as "line exceeded its size cap", because the
+  proxy read every backend reply header under the 1 MiB request bound while
+  an `M` header carries a length token per key: 349,000 one-byte keys (the
+  most a frame holds) with two- and three-digit values made a 1,194,009
+  byte header. The refusal poisoned the backend connection, the retry
+  poisoned every other owner's, and the whole batch came back `W` (no hit
+  out of 349,000) with every other request pipelined on those connections
+  failing (8 connections incrementing during five such batches saw 10 `E`,
+  17 replies cut off by the close and 10 reconnects). An `M` header is now
+  read up to 4 MiB, which holds the longest header any frame can be
+  answered with (about 3.1 MB), and the line is charged to the request's
+  in-flight cost at nine bytes a key; every other reply keeps the 1 MiB
+  bound. The same batches now come back with all 349,000 hits, no poisoned
+  connection and no failed increment (#1283).
+- `nanocached-node`: a value within about 45 bytes of the 1 MiB request limit
+  could be stored but never moved. The handoff `U` that join migration,
+  decommission drain and re-replication send is the client's `S` plus the
+  receiver's 36-byte token and two length fields, and the receiver applied
+  the client limit to it, so it answered `En` and closed: a join that had
+  such a key to hand over logged `peer did not acknowledge the handed-off
+  entry` three times and abandoned (the joiner was not promoted in 40 s),
+  and a re-replication sends the same `U` (by code reading, not measured: it
+  would write the target off for 30 s over it). The
+  frames only another node sends (`U`, `u`, `f`) now get 4 KiB above the
+  request limit; client frames keep it. With 8 keys of 1,048,546 bytes on
+  one node and a second joining: before, the join was abandoned and the
+  joiner held 0 entries after 40 s; after, it was promoted in 2 s holding
+  the 5 keys it owns (#1275).
 
 ### Changed
 
