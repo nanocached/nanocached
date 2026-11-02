@@ -21,7 +21,7 @@ SDKP="$(cd "$E/../../sdk/python/src" && pwd)"
 source $E/cl.sh
 P=npd; D=$P-disc:8357
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
-cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 proxies(){ docker run --rm --network $NET -v $E:/w -w /w e2e-client python disc.py $D proxies; }
 mkdir -p $E/logs
 cleanup; docker network create $NET >/dev/null

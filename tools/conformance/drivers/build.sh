@@ -9,4 +9,4 @@ echo "== java"; rm -rf "$HERE/java/classes"; javac --release 17 -d "$HERE/java/c
 echo "== dotnet"; (cd "$HERE/dotnet" && dotnet publish -c Release -o bin >/dev/null) && (cd "$HERE/dotnet-scenario" && dotnet publish -c Release -o bin >/dev/null)
 echo "== rust (in a container, cargo caches kept in volumes)"
 docker run --rm -v "$REPO:/repo" -v conf-cargo-registry:/usr/local/cargo/registry -v conf-cargo-target:/target -e CARGO_TARGET_DIR=/target \
-  -w /repo/tools/conformance/drivers/rust rust:latest sh -c 'cargo build --release 2>&1 | tail -3 && cp /target/release/conformance /target/release/scenario /repo/tools/conformance/drivers/rust/'
+  -w /repo/tools/conformance/drivers/rust rust:1.96 sh -c 'cargo build --release 2>&1 | tail -3 && cp /target/release/conformance /target/release/scenario /repo/tools/conformance/drivers/rust/'
