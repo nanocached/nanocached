@@ -27,7 +27,7 @@ P=r970; D=$P-disc:8357
 GAP=${GAP:-0}; DELAY=${DELAY:-0}; KILL=${KILL:-0}
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
 tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }
-cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 client(){ docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python "$@"; }
 ent(){ for n in "$@"; do printf "%s=%s " $n "$(docker run --rm --network $NET $CLIENT python -c "import urllib.request;b=urllib.request.urlopen('http://$P-$n:9100/metrics',timeout=5).read().decode().splitlines();print([l.split()[1] for l in b if l.startswith('nanocached_node_entries ')][0])" 2>/dev/null || echo '?')"; done; echo; }
 cleanup; docker network create $NET >/dev/null
