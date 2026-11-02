@@ -161,6 +161,26 @@ servers could lose its heartbeats and be evicted. A mixed-version
 cluster is only ever the transient state of such a roll-out; each
 release's changelog notes any exception to this order.</p>
 
+<h2 id="repoint-latest">Re-pointing <code>:latest</code> by hand</h2>
+<p>Each release moves <code>:latest</code> of the node, discovery and
+proxy images to the new version in one step, and never moves it
+backwards. If the three ever disagree — for example because a build of
+an unreleased <code>main</code> was pushed as <code>:latest</code>
+earlier — a maintainer can bring them back together without cutting a
+release. Run the <strong>Release server</strong> workflow by hand
+(Actions tab, <em>Run workflow</em>, or from a terminal):</p>
+<pre><code>gh workflow run release-server.yaml -f version=0.6.0
+gh run watch</code></pre>
+<p>The <code>version</code> input is optional; left empty, it is the
+newest stable <code>server/v*</code> tag. A manual run builds and pushes
+nothing: it checks that the node, discovery and proxy images exist at
+that version, and only then points all three <code>:latest</code> tags
+at it. A version that is not <code>X.Y.Z</code> (a pre-release), or one
+older than the version the node image's <code>:latest</code> already
+carries, is left alone. Check the result with
+<code>docker buildx imagetools inspect ghcr.io/nanocached/nanocached-node:latest</code>
+(and the same for the other two): the digests match the version tag's.</p>
+
 <h2>Verifying a deployment</h2>
 <p>The repository ships runnable scale-in scenarios under
 <a href="https://github.com/nanocached/nanocached/tree/main/tests/e2e"><code>tests/e2e</code></a>:

@@ -228,6 +228,7 @@ framework adapters at one version, whether or not a component changed.
   later-finishing run could move `:main` back to an older commit. A build
   of a commit that is no longer the tip gets its `:sha-<commit>` tag only
   (#1165).
+- `release-server`: `ghcr.io/nanocached/nanocached-{node,discovery}:latest` pointed at an unreleased `main` build while `nanocached-proxy:latest` pointed at 0.6.0 (checked with `docker buildx imagetools inspect`: the node and discovery images carried no version label, the proxy's digest equalled `:0.6.0`), the leftover of the old publish behaviour: the `latest` job only ran on a release, so nothing could repair the registry in between. The Release server workflow now also has a manual `workflow_dispatch` entry (input `version`, default the newest stable `server/v*` tag) that skips the build, checks that all three `:X.Y.Z` images exist, applies the same "do not move backwards" check and points all three `:latest` tags at that version. The release path (tag push, build, `latest`) is unchanged, and the procedure is in `docs/deployment-operations.html` (#1284).
 
 ## [0.6.0] - 2026-11-01
 
