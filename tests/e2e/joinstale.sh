@@ -13,7 +13,7 @@ JOINS=${JOINS:-2}; GAP=${GAP:-10}; KILL=${KILL:-1}; TAIL=${TAIL:-15}; WITH_LOAD=
 export NET=e2e-js; E="$(cd "$(dirname "$0")" && pwd)"; source "$E/cl.sh"
 P=js; D=$P-disc:8357; T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
 tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }
-cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 RUN=${RUN:-js$(date +%H%M%S)}; L="$E/logs/joinstale-$RUN"; rm -rf "$L"; mkdir -p "$L"
 cleanup; docker network create $NET >/dev/null
 disc_up $P-disc --replication-factor 2; sleep 1
