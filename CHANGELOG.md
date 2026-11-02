@@ -228,6 +228,7 @@ framework adapters at one version, whether or not a component changed.
   later-finishing run could move `:main` back to an older commit. A build
   of a commit that is no longer the tip gets its `:sha-<commit>` tag only
   (#1165).
+- `tests/e2e`: 14 scripts (`chaos.sh`, `scalein.sh`, `proxydrain.sh`, `steady582.sh`, `joinstale.sh`, `repro582.sh`, `freshjoin.sh`, `restart.sh`, `proxykill.sh`, `reclaim970.sh`, `i91.sh`, `i92.sh`, `i93.sh`, `i96.sh`) cleaned up with `docker ps -aq --filter name=$P-`, and Docker's `name=` filter is an unanchored regex, so every container whose name merely contained the prefix was removed at start and at exit (`bench-probe-zz` matched `nch-`; `st-` matches `test-...` and `last-...`). The filters are now `name=^/$P-`, as `lr.sh` and `hostile/lib.sh` already had. With a decoy container named `decoy-<prefix>-x` next to a real `<prefix>-real`, each script's cleanup used to remove both and now removes only the second (#1287).
 
 ## [0.6.0] - 2026-11-01
 
