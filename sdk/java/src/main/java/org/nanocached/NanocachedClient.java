@@ -1825,11 +1825,22 @@ public final class NanocachedClient implements AutoCloseable {
             if (value == null) continue;
 
             if (backgroundReplicaWritePermits.tryAcquire()) {
-                byte[] repairValue = value;
+                // The repair runs after this call has returned (executor
+                // queue, or the primary's redial), so it must not close over
+                // the caller's own arrays: `value` is the very byte[] the
+                // caller gets back when compression is off, and namespace /
+                // key may be reused at once. Always copied -- read repair is
+                // asynchronous whether or not fireAndForgetReplicas is set,
+                // so ownedForBackground (which keys off that option) does
+                // not apply. Taken only past the permit check, so a skipped
+                // repair costs nothing.
+                byte[] repairNamespace = namespace.clone();
+                byte[] repairKey = key.clone();
+                byte[] repairValue = value.clone();
                 Runnable repair = () -> {
                     try {
                         applyReconnecting(() -> memberConnection(primary), connection -> {
-                            connection.set(namespace, key, repairValue, READ_REPAIR_TTL_SECONDS);
+                            connection.set(repairNamespace, repairKey, repairValue, READ_REPAIR_TTL_SECONDS);
                             return null;
                         });
                     } catch (NanocachedException ignored) {
