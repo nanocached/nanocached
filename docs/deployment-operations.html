@@ -175,9 +175,10 @@ gh run watch</code></pre>
 newest stable <code>server/v*</code> tag. A manual run builds and pushes
 nothing: it checks that the node, discovery and proxy images exist at
 that version, and only then points all three <code>:latest</code> tags
-at it. A version that is not <code>X.Y.Z</code> (a pre-release), or one
-older than the version the node image's <code>:latest</code> already
-carries, is left alone. Check the result with
+at it. A version that is not <code>X.Y.Z</code> (a pre-release, a typo) or
+whose images do not exist fails the run before anything moves. A version
+older than the one the node image's <code>:latest</code> already carries
+changes nothing and the run ends green with a notice. Check the result with
 <code>docker buildx imagetools inspect ghcr.io/nanocached/nanocached-node:latest</code>
 (and the same for the other two): the digests match the version tag's.</p>
 
