@@ -13,6 +13,14 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- With `readHedgeAfter` set, a hedge leg reported its outcome through a
+  map and a queue that each allocate a node, so an `OutOfMemoryError` at
+  that moment could still leave the reading thread waiting forever for the
+  last leg. Reporting is now an array store and a semaphore release, which
+  allocate nothing, and the final wait is bounded (twice the longest a leg
+  can take: two dial-plus-request attempts, plus a pool-queue allowance), so
+  a leg that ends without reporting fails the read with a
+  `NanocachedException` instead of parking the caller (#1265).
 - With `fireAndForgetReplicas`, the background replica legs of `delete`,
   `touch`, `getAndTouch`, `incr`/`decr`, `replace`/`cas`, `deleteIfMatches`
   and the batch `touchMany`/`getManyAndTouch` read the caller's key and

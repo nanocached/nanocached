@@ -5336,6 +5336,133 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aHedgeLegThatNeverSettlesFailsTheReadWithinABoundInsteadOfParkingTheCaller() throws Exception {
+        // Issue #1265: whatever stops a hedge leg from reporting (an
+        // OutOfMemoryError while it settles, a bug nobody has thought of),
+        // readHedged used to park in completions.take() with no timeout. The
+        // leg here never returns at all -- the observable equivalent for the
+        // reader, since it too never reports -- and the read must still fail
+        // within hedgeSettleBoundMillis() instead of waiting for it. The
+        // timeouts are shortened so that bound is about two seconds.
+        long requestTimeout = Connection.requestTimeoutMillis;
+        int connectTimeout = Identify.connectTimeoutMillis;
+        long terminationMargin = NanocachedClient.executorTerminationTimeoutMillis;
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        try (Cluster cluster = startCluster(2)) {
+            NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50);
+            try {
+                Connection.requestTimeoutMillis = 200;
+                Identify.connectTimeoutMillis = 200;
+                NanocachedClient.executorTerminationTimeoutMillis = 100;
+
+                Class<?> opInterface = Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
+                Object op = Proxy.newProxyInstance(
+                        opInterface.getClassLoader(), new Class<?>[] {opInterface},
+                        (proxy, method, args) -> {
+                            release.await();
+                            return null;
+                        });
+                Method readHedged =
+                        NanocachedClient.class.getDeclaredMethod("readHedged", opInterface, List.class);
+                readHedged.setAccessible(true);
+
+                java.util.concurrent.atomic.AtomicReference<Throwable> thrown =
+                        new java.util.concurrent.atomic.AtomicReference<>();
+                Thread caller = new Thread(() -> {
+                    try {
+                        readHedged.invoke(client, op, List.of(NAMES.get(0), NAMES.get(1)));
+                    } catch (InvocationTargetException e) {
+                        thrown.set(e.getCause());
+                    } catch (Throwable e) {
+                        thrown.set(e);
+                    }
+                }, "hedge-unsettled-caller");
+                caller.setDaemon(true);
+                long start = System.nanoTime();
+                caller.start();
+                caller.join(15_000);
+                boolean parked = caller.isAlive();
+                long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+                if (parked) {
+                    caller.interrupt();
+                    caller.join(2_000);
+                }
+                assertFalse(parked, "readHedged must fail within its bound when no leg ever reports");
+                assertTrue(thrown.get() instanceof NanocachedException, "got " + thrown.get());
+                assertTrue(thrown.get().getMessage().contains("did not report"), thrown.get().getMessage());
+                assertTrue(elapsedMillis >= 1_000,
+                        "the bound must not cut a slow read short, failed after " + elapsedMillis + "ms");
+            } finally {
+                Connection.requestTimeoutMillis = requestTimeout;
+                Identify.connectTimeoutMillis = connectTimeout;
+                NanocachedClient.executorTerminationTimeoutMillis = terminationMargin;
+                release.countDown();
+                client.close();
+            }
+        }
+    }
+
+    @Test
+    void theHedgeSettleBoundCoversAFullReconnectingLegPlusQueueing() {
+        // Issue #1265: the bound must never fire on a read that is merely
+        // slow. A leg is at most two attempts (applyReconnecting redials once),
+        // each a dial (connect timeout) plus a request (request timeout); the
+        // bound has to exceed that, and the pool-queue wait on top of it.
+        long oneAttempt = Connection.requestTimeoutMillis + Identify.connectTimeoutMillis;
+        long bound = NanocachedClient.hedgeSettleBoundMillis();
+        assertTrue(bound >= 2 * (2 * oneAttempt), "bound " + bound + "ms is below two full legs");
+    }
+
+    @Test
+    void settlingAHedgeLegAllocatesNothing() throws Exception {
+        // Issue #1265: an OutOfMemoryError while a leg settles must not be
+        // able to leave the reader unsignalled, so the settle path allocates
+        // nothing: the slots and the signal exist before the leg starts. An
+        // OOM cannot be injected deterministically, so the property is
+        // measured instead -- bytes allocated by this thread across many
+        // settles -- with the old shape (a ConcurrentHashMap put plus a
+        // LinkedBlockingQueue add) as a control that the measurement can see
+        // allocation at all.
+        java.lang.management.ThreadMXBean bean = java.lang.management.ManagementFactory.getThreadMXBean();
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+                bean instanceof com.sun.management.ThreadMXBean
+                        && ((com.sun.management.ThreadMXBean) bean).isThreadAllocatedMemorySupported());
+        com.sun.management.ThreadMXBean sun = (com.sun.management.ThreadMXBean) bean;
+        long self = Thread.currentThread().getId();
+        int rounds = 20_000;
+        Object outcome = new Object();
+
+        java.util.concurrent.ConcurrentHashMap<Integer, Object> oldResults = new java.util.concurrent.ConcurrentHashMap<>();
+        java.util.concurrent.LinkedBlockingQueue<Integer> oldQueue = new java.util.concurrent.LinkedBlockingQueue<>();
+        for (int i = 0; i < rounds; i++) { // warm up
+            oldResults.put(i % 2, outcome);
+            oldQueue.add(i % 2);
+            oldQueue.poll();
+        }
+        long before = sun.getThreadAllocatedBytes(self);
+        for (int i = 0; i < rounds; i++) {
+            oldResults.put(i % 2, outcome);
+            oldQueue.add(i % 2);
+            oldQueue.poll();
+        }
+        long controlBytes = sun.getThreadAllocatedBytes(self) - before;
+        assertTrue(controlBytes > 100_000, "control should allocate, measured " + controlBytes + " bytes");
+
+        NanocachedClient.HedgeSettlement<Object> settlement = new NanocachedClient.HedgeSettlement<>(2);
+        NanocachedClient.LegOutcome<Object> ended = NanocachedClient.LegOutcome.endedWithoutOutcome();
+        for (int i = 0; i < rounds; i++) { // warm up
+            settlement.settle(i % 2, ended);
+        }
+        before = sun.getThreadAllocatedBytes(self);
+        for (int i = 0; i < rounds; i++) {
+            settlement.settle(i % 2, ended);
+        }
+        long settleBytes = sun.getThreadAllocatedBytes(self) - before;
+        assertTrue(settleBytes < controlBytes / 20,
+                "settle allocated " + settleBytes + " bytes over " + rounds + " calls, control " + controlBytes);
+    }
+
+    @Test
     void aHedgeLegRacingCloseIsRefusedNotRegistered() throws Exception {
         // Issue #91: a read that passed its own closed-check can reach
         // hedge-leg registration only after close() set `closed` and drained
