@@ -235,7 +235,8 @@ framework adapters at one version, whether or not a component changed.
   the client limit to it, so it answered `En` and closed: a join that had
   such a key to hand over logged `peer did not acknowledge the handed-off
   entry` three times and abandoned (the joiner was not promoted in 40 s),
-  and a re-replication target was written off for 30 s over it. The
+  and a re-replication sends the same `U` (by code reading, not measured: it
+  would write the target off for 30 s over it). The
   frames only another node sends (`U`, `u`, `f`) now get 4 KiB above the
   request limit; client frames keep it. With 8 keys of 1,048,546 bytes on
   one node and a second joining: before, the join was abandoned and the
