@@ -55,6 +55,16 @@ tag: 0.4.3 was a server-only release.
   callback — an uncaught exception that ended the process after the caller
   had handled the rejection. The socket is now created before the timer is
   armed, so a synchronous dial failure leaves nothing behind (#1163).
+- With `fireAndForgetReplicas`, a replica write that was still waiting for its
+  connection when `set`, `delete`, `touch`, `getAndTouch`, `incr` or the
+  compare-and-set calls resolved read the caller's `Uint8Array` key and value
+  at that later point, so a caller that reused its buffers after the `await`
+  stored the new bytes under another key on the replica (a `set` of `A..A`
+  followed by overwriting the key buffer with `Z` wrote `Z` on the replica).
+  The read-repair write-back to the primary had the same problem with the key
+  and with the value the read returned. These background legs now work from
+  copies made when they are started; the legs a call waits for still use the
+  caller's buffers without copying (#1277).
 
 ## [0.6.0] - 2026-11-01
 
