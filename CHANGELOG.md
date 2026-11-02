@@ -204,6 +204,28 @@ framework adapters at one version, whether or not a component changed.
   (and a multi-key header that outgrows the free 64 KiB takes the largest
   frame's worth at once), so uploads queue for the share and take their
   turns (#1147).
+- `nanocached-node`, `nanocached-discovery`: a node evicted for missed
+  heartbeats (a stopped process, or a cut longer than `--liveness-timeout`)
+  re-registered with a plain `P`, went straight back into the ring with the
+  cache it held and served the values from before the eviction (and keys
+  deleted since), while the reclaim pass on the survivors, no longer owners
+  of those keys, deleted the newer copies for good. Discovery now answers a
+  `P` carrying the new trailing `G` from a name it has on record as departed
+  (the last hour) with `G` instead of registering it; the node answers `W`
+  to every key request, clears its cache and joins again with `J`, and the
+  owners' handoff fills it (a join's handoff is put-if-absent, so an old
+  entry would have won over the newer one, and a deleted key is not in it,
+  hence the clear). A restarted discovery has no record and still
+  re-registers its nodes at once; so do nodes evicted by a sweep that came
+  after discovery itself had not run for more than half the liveness timeout
+  (a stopped discovery finds every heartbeat old when it resumes: 3 of 3
+  nodes evicted and, without this, all 200 keys gone). An announce without
+  the `G` (a node of an earlier version, or one to a standby replica) is
+  accepted as before: upgrade discovery before the nodes. R=1, 3 nodes, 200 keys, one node
+  stopped 25 s, every key rewritten meanwhile: before, the 56 keys on the
+  returned node read the old value 15 s and 190 s later (and the survivors
+  dropped their 56 newer copies at the reclaim pass); after, 200 of 200 read
+  the new value at both times (#1276).
 - `nanocached-node`: a node asked to leave while another node's join was still pending built its drain ring from the whole `T` roster, which lists `Waiting` and `Joining` nodes too, so with a joiner D in it the leaver skipped the keys D would rank above it for (treated as not its own) and sent the keys D would be entrant for to D, which is not in the roster clients route by once the leaver's `V` has abandoned the join. D then re-joined or died with those keys never delivered to the members that own them: 49 of the leaver's 99 keys were missing on the new owners at R=1 and 150 of 197 at R=2 in the simulation (0 without a joiner), permanently if D never re-joined. The drain now keeps only the `T` entries that the published roster (`L`, fetched from the same discovery right after `T`) also lists; no wire change, and `L` withheld (`B`) fails the fetch for that discovery address like `T` withheld (#1282).
 - `nanocached-node`: a node asked to leave right after discovery restarted fetched the roster for its drain once, and gave up on the first failure: discovery answers `B` through its startup grace (15 s) and closes the `T` connection of a node it has not seen re-register yet (a heartbeat is up to 5 s away), so the node logged `fetching the roster failed ... leaving without a handoff`, sent `V` and exited with the whole `--drain-timeout` unused. At R=1 every key it owned was lost (99 of 99 on the new owners in the simulation, with the SIGTERM 1 s and 7 s after the restart; 0 missing with the SIGTERM 30 s after). The fetch is now retried every second until the drain deadline when the node was promoted (it was a member, so discovery being unready is transient and its heartbeats re-register it during the drain); `B`, a closed connection, a refused connection and a timeout all retry, and the operator's second signal still ends it at once. A node discovery never promoted still makes one attempt, since discovery closes its `T` for good (#1281).
 - `nanocached-node`: over TLS the tail of a large reply could be lost to a client that reads slowly: the node wrote the reply with `write_all` and never flushed, and tokio-rustls reports a write as done once the plaintext is accepted even when ciphertext is still waiting for room in the socket, so the last part sat in the TLS writer until the next write, which on an idle connection never came. A 1,000,000-byte value read 4 KiB at a time with a 4 KiB receive buffer stalled in 2 of 4 runs (947,730 of 1,000,010 bytes, then nothing until the client's timeout), and a 512 KiB reply to such a reader stopped at 491,400 of 524,299 bytes every time in the test that now pins this. Replies are flushed inside the same write timeout, as is every write that is followed by a wait for the peer's answer. The same went for the writes to peers that are followed by a read of the ack (handoff, leave, forwards, roster fetches, authentication). Plain TCP is unchanged. (#1279)

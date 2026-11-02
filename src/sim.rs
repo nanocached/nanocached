@@ -681,6 +681,14 @@ impl Client {
         self.request(port, req.as_bytes()).await.0.starts_with('V')
     }
 
+    /// The value `port` answers the key with, if it holds one.
+    async fn value(&mut self, port: u16, key: &str) -> Option<String> {
+        let req = format!("G {}\n{key}", key.len());
+        let (line, body) = self.request(port, req.as_bytes()).await;
+        line.starts_with('V')
+            .then(|| String::from_utf8_lossy(&body).into_owned())
+    }
+
     async fn delete(&mut self, port: u16, key: &str) -> String {
         let req = format!("D {}\n{key}", key.len());
         self.request(port, req.as_bytes()).await.0
@@ -1872,6 +1880,234 @@ async fn a_delete_tombstone_does_not_outlive_the_dead_copy_that_a_later_write_pu
         out.b_missing, 0,
         "B refused its owner's copy of a key created again after the delete: {out:?}"
     );
+}
+
+/// What one run of the #1276 scenario saw.
+#[derive(Debug)]
+struct EvictedReturnOutcome {
+    /// Keys the client rewrote on the survivors while A was out, that A
+    /// owns once it is back.
+    rewritten: usize,
+    /// Keys the client deleted on the survivors meanwhile, that A owns.
+    deleted: usize,
+    /// Of `rewritten`, those A answers with the value it held before the
+    /// eviction, once the cluster is whole again.
+    a_stale: usize,
+    /// Of `deleted`, those A answers with a value.
+    a_resurrected: usize,
+    /// Of `rewritten`, those an owner no longer answers with the new value
+    /// after the reclaim pass has run on every node.
+    lost_after_reclaim: usize,
+    /// Of `deleted`, those any owner answers with a value at the end.
+    resurrected_after_reclaim: usize,
+}
+
+/// #1276: a node that stops heartbeating for longer than the liveness
+/// window is evicted; the survivors re-replicate its keys and the client
+/// writes to them. When the node comes back it announced itself with a
+/// plain `P` and went straight back into the ring with the cache it held:
+/// it served the old values, and the reclaim pass on the survivors, which
+/// no longer own those keys, deleted the new ones.
+///
+/// A, B and C hold `v1` for every key on both owners (R=2). A's heartbeat
+/// is held for 40 s, past the 15 s window, and it is evicted. On B and C
+/// (the whole ring now) the client rewrites half of the keys as `v2` and
+/// deletes the other half. A's heartbeat is let go.
+async fn scenario_1276() -> EvictedReturnOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc) = (Port::reserve(), Port::reserve(), Port::reserve());
+    let c = pc.number;
+    let keys: Vec<String> = (0..40).map(|i| format!("e{i}")).collect();
+    let Trio {
+        dport,
+        disc,
+        a,
+        b,
+        names,
+        nodes: [na, nb, nc],
+        mut client,
+    } = trio(&mut dp, &mut pa, &mut pb, &mut pc, &keys).await;
+    let ports = [a, b, c];
+    let ring3 = HashRing::new(names.to_vec());
+    let owners_of = |key: &str| -> Vec<u16> {
+        ring3
+            .owners(&Key::unnamespaced(Bytes::from(key.to_string())), 2)
+            .iter()
+            .map(|owner| ports[names.iter().position(|n| n == *owner).unwrap()])
+            .collect()
+    };
+
+    // A goes silent. Past the liveness window discovery evicts it, and B
+    // and C adopt the two-node ring and re-replicate.
+    na.gates.heartbeat.hold();
+    run_until_members(dport, 2).await;
+    run_for(Duration::from_secs(20)).await;
+
+    // The client works against what is left: even keys are rewritten,
+    // odd keys are deleted, on both survivors.
+    let mut rewritten = Vec::new();
+    let mut deleted = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        for port in [b, c] {
+            if index % 2 == 0 {
+                assert_eq!(client.set(port, key, "v2").await, "S", "{key} on {port}");
+            } else {
+                let reply = client.delete(port, key).await;
+                assert_ne!(reply, "W", "{key} on {port}");
+            }
+        }
+        if owners_of(key).contains(&a) {
+            if index % 2 == 0 {
+                rewritten.push(key.clone());
+            } else {
+                deleted.push(key.clone());
+            }
+        }
+    }
+
+    // A comes back.
+    na.gates.heartbeat.release();
+    run_until_members(dport, 3).await;
+    run_for(Duration::from_secs(60)).await;
+
+    let mut out = EvictedReturnOutcome {
+        rewritten: rewritten.len(),
+        deleted: deleted.len(),
+        a_stale: 0,
+        a_resurrected: 0,
+        lost_after_reclaim: 0,
+        resurrected_after_reclaim: 0,
+    };
+    for key in &rewritten {
+        if client.value(a, key).await.as_deref() == Some("v1") {
+            out.a_stale += 1;
+        }
+    }
+    for key in &deleted {
+        if client.holds(a, key).await {
+            out.a_resurrected += 1;
+        }
+    }
+
+    // Past the reclaim grace and two passes: what the survivors no longer
+    // own is removed.
+    run_for(Duration::from_secs(120 + 2 * 30 + 30)).await;
+    for key in keys.iter().step_by(2) {
+        for port in owners_of(key) {
+            if client.value(port, key).await.as_deref() != Some("v2") {
+                out.lost_after_reclaim += 1;
+            }
+        }
+    }
+    for key in keys.iter().skip(1).step_by(2) {
+        for port in owners_of(key) {
+            if client.holds(port, key).await {
+                out.resurrected_after_reclaim += 1;
+            }
+        }
+    }
+    disc.abort();
+    na.abort();
+    nb.abort();
+    nc.abort();
+    out
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_node_that_comes_back_after_its_eviction_does_not_serve_what_it_held_before() {
+    let _spin = spin();
+    let out = scenario_1276().await;
+    eprintln!("{out:?}");
+    assert!(
+        out.rewritten > 0 && out.deleted > 0,
+        "nothing to check: {out:?}"
+    );
+    assert_eq!(
+        out.a_stale, 0,
+        "A served values from before its eviction: {out:?}"
+    );
+    assert_eq!(out.a_resurrected, 0, "A served deleted keys: {out:?}");
+    assert_eq!(
+        out.lost_after_reclaim, 0,
+        "an owner lacks the value written while A was out once the reclaim pass has run: {out:?}"
+    );
+    assert_eq!(
+        out.resurrected_after_reclaim, 0,
+        "deleted keys are back on an owner: {out:?}"
+    );
+}
+
+/// What one run of the discovery-stall scenario saw.
+#[derive(Debug)]
+struct StallOutcome {
+    /// Copies (key, owner) the client wrote before the stall.
+    copies: usize,
+    /// Of those, the ones an owner no longer answers with the value after
+    /// the stall and the minute that follows.
+    lost: usize,
+}
+
+/// Discovery itself stops for longer than the liveness window (a stopped
+/// process, a paused VM) and, on resuming, sweeps before it has read the
+/// nodes' heartbeats: every node is evicted, though none of them was ever
+/// silent. They announce themselves again at once. Nobody moved on without
+/// them, so none may be sent back through a join (which would empty its
+/// cache): every copy survives.
+async fn scenario_discovery_stall() -> StallOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc) = (Port::reserve(), Port::reserve(), Port::reserve());
+    let c = pc.number;
+    let keys: Vec<String> = (0..40).map(|i| format!("s{i}")).collect();
+    let Trio {
+        dport,
+        disc,
+        a,
+        b,
+        names,
+        nodes: [na, nb, nc],
+        mut client,
+    } = trio(&mut dp, &mut pa, &mut pb, &mut pc, &keys).await;
+    let ports = [a, b, c];
+    let ring3 = HashRing::new(names.to_vec());
+
+    // The clock jumps 25 s in one step: the sweep, whose ticks are a second
+    // apart, finds every heartbeat 25 s old; the nodes' own timers fire in
+    // the same step, but their heartbeats are read after the sweep.
+    tokio::time::advance(Duration::from_secs(25)).await;
+    settle().await;
+    run_for(Duration::from_secs(60)).await;
+    run_until_members(dport, 3).await;
+
+    let mut out = StallOutcome { copies: 0, lost: 0 };
+    for key in &keys {
+        for owner in ring3.owners(&Key::unnamespaced(Bytes::from(key.clone())), 2) {
+            let port = ports[names.iter().position(|n| n == owner).unwrap()];
+            out.copies += 1;
+            if client.value(port, key).await.as_deref() != Some("v1") {
+                out.lost += 1;
+            }
+        }
+    }
+    disc.abort();
+    na.abort();
+    nb.abort();
+    nc.abort();
+    out
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn nodes_evicted_while_discovery_itself_was_stalled_keep_their_caches() {
+    let _spin = spin();
+    let out = scenario_discovery_stall().await;
+    eprintln!("{out:?}");
+    assert!(out.copies > 0, "nothing to check: {out:?}");
+    assert_eq!(out.lost, 0, "a stall of discovery emptied caches: {out:?}");
 }
 
 // ---------------------------------------------------------------------

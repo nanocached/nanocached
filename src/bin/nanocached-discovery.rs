@@ -138,7 +138,7 @@
 //!                             ordinary heartbeat connection (`H` from
 //!                             here on).
 //!
-//!   P <name-length> <port> <token-length>\n<name><token>   Announce
+//!   P <name-length> <port> <token-length> [G]\n<name><token>   Announce
 //!                             (discovery HA): an already-promoted node
 //!                             (re-)declaring "I am a `Joined` member at
 //!                             this address" (composed like `J`'s) —
@@ -156,6 +156,24 @@
 //!                             doesn't match `token`, so knowing another
 //!                             node's (public, `L`-listed) name is not
 //!                             enough to redirect its traffic.
+//!                             A `G` after the token lengths
+//!                             (`P <name-length> <port> <token-length> G`)
+//!                             says the node can start over: if `name` is
+//!                             on record as departed (evicted for missed
+//!                             heartbeats, left, or its join abandoned
+//!                             within `DEPARTED_RETENTION`) and not
+//!                             registered, discovery answers `G\n` and
+//!                             closes without registering it. The cluster
+//!                             moved on without that node — re-replicated
+//!                             its keys, took writes for them — so what it
+//!                             still holds is not to be served; the node
+//!                             clears its cache and sends `J`. A discovery
+//!                             that has just restarted has no record, so a
+//!                             node that kept heartbeating through the
+//!                             restart still re-registers at once. Without
+//!                             the `G` (a node of an earlier version, or an
+//!                             announce to a standby replica) the announce
+//!                             is accepted as before.
 //!
 //!   C <name-length> <joining-length> <token-length> [<generation>]\n
 //!   <name><joining><token>   Sent by an already-`Joined` node to report
@@ -252,7 +270,7 @@ use nanocached::infra::{
     reject_over_limit, should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip,
     write_http_response,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -848,6 +866,11 @@ const MAX_DEPARTED: usize = 4096;
 struct Departed {
     at: FxHashMap<String, Instant>,
     order: VecDeque<(Instant, String)>,
+    /// The names in `at` whose eviction was judged by a sweep that had not
+    /// run for a long while (`sweep_was_stalled`): discovery itself was
+    /// not processing heartbeats, so the silence says nothing about the
+    /// node. Such a node may re-register at once (`earns_rejoin`).
+    unreliable: FxHashSet<String>,
 }
 
 impl Departed {
@@ -864,6 +887,7 @@ impl Departed {
             }
             if self.is_current(*at, front) {
                 self.at.remove(front);
+                self.unreliable.remove(front);
             }
             self.order.pop_front();
         }
@@ -874,10 +898,12 @@ impl Departed {
             while let Some((at, front)) = self.order.pop_front() {
                 if self.is_current(at, &front) {
                     self.at.remove(&front);
+                    self.unreliable.remove(&front);
                     break;
                 }
             }
         }
+        self.unreliable.remove(name);
         self.at.insert(name.to_string(), now);
         self.order.push_back((now, name.to_string()));
         if self.order.len() > 2 * MAX_DEPARTED {
@@ -886,8 +912,26 @@ impl Departed {
         }
     }
 
+    /// `record` for an eviction decided by a stalled sweep.
+    fn record_unreliable(&mut self, name: &str, now: Instant) {
+        self.record(name, now);
+        self.unreliable.insert(name.to_string());
+    }
+
     fn forget(&mut self, name: &str) {
         self.at.remove(name);
+        self.unreliable.remove(name);
+    }
+
+    /// Whether a node announcing itself under `name` has to start over: it
+    /// departed within `DEPARTED_RETENTION`, and not on the word of a
+    /// sweep that was itself not running.
+    fn earns_rejoin(&self, name: &str) -> bool {
+        !self.unreliable.contains(name)
+            && self
+                .at
+                .get(name)
+                .is_some_and(|at| at.elapsed() < DEPARTED_RETENTION)
     }
 
     fn departed_at(&self, name: &str) -> Option<Instant> {
@@ -1576,6 +1620,10 @@ enum DiscoveryCommand {
         name: String,
         port: u16,
         token: String,
+        /// The trailing `G`: the sender is a node that clears its cache and
+        /// joins again when told it was evicted (`G\n`, see the module
+        /// docs' `P`). An announce without it is always accepted.
+        rejoin_capable: bool,
     },
     /// Issue #295: a registered node fetching the roster *with* every
     /// member's own membership token — `name`/`token` self-identify the
@@ -1856,6 +1904,13 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             let port = parts.next().ok_or(ParseError::InvalidLength)?;
             let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
+            // `P` alone takes one more field, the `G` of a node that can
+            // start over (`DiscoveryCommand::Announce::rejoin_capable`).
+            let rejoin_capable = match parts.next() {
+                None => false,
+                Some(b"G") if command == b"P" => true,
+                Some(_) => return Err(ParseError::InvalidLength),
+            };
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
             }
@@ -1873,10 +1928,17 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             // Same owned-fn-pointer dance as `H`/`C` above: resolve the
             // variant while `command` is still alive, so `input` can be
             // reborrowed mutably below.
-            let make: fn(String, u16, String) -> DiscoveryCommand = match command {
-                b"J" => |name, port, token| DiscoveryCommand::Join { name, port, token },
-                b"Y" => |name, port, token| DiscoveryCommand::ProxyAnnounce { name, port, token },
-                _ => |name, port, token| DiscoveryCommand::Announce { name, port, token },
+            let make: fn(String, u16, String, bool) -> DiscoveryCommand = match command {
+                b"J" => |name, port, token, _| DiscoveryCommand::Join { name, port, token },
+                b"Y" => {
+                    |name, port, token, _| DiscoveryCommand::ProxyAnnounce { name, port, token }
+                }
+                _ => |name, port, token, rejoin_capable| DiscoveryCommand::Announce {
+                    name,
+                    port,
+                    token,
+                    rejoin_capable,
+                },
             };
             let [name, token] = parse_string_fields(
                 input,
@@ -1887,7 +1949,7 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
                 ],
             )?;
 
-            Ok(make(name, port, token))
+            Ok(make(name, port, token, rejoin_capable))
         }
 
         _ => Err(ParseError::InvalidCommand),
@@ -2113,6 +2175,27 @@ fn record_departed(registry: &Registry, name: &str) {
         .record(name, Instant::now());
 }
 
+/// `record_departed` for a node evicted by a sweep that had not run for
+/// a long while (`sweep_was_stalled`): the node is on record as gone for
+/// the pending-joiner question, but is not sent back through a join when it
+/// announces itself again.
+fn record_departed_by_stalled_sweep(registry: &Registry, name: &str) {
+    registry
+        .departed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record_unreliable(name, Instant::now());
+}
+
+/// Whether a sweep tick at `now` comes so long after the previous one,
+/// `last`, that discovery itself was not running in between: stopped,
+/// suspended, or starved of CPU. The sweep ticks at most a second apart, so
+/// a gap of half the liveness timeout is a stall, and every node's last
+/// heartbeat is as old as the stall — the nodes did nothing wrong.
+fn sweep_was_stalled(last: Instant, now: Instant, liveness_timeout: Duration) -> bool {
+    now.duration_since(last) > liveness_timeout / 2
+}
+
 /// Issue #571: `name` registered (again) — it is no longer gone.
 fn forget_departed(registry: &Registry, name: &str) {
     registry
@@ -2139,6 +2222,20 @@ fn pending_joiner_verdict(registry: &Registry, joiner: &str) -> &'static [u8] {
     } else {
         b"K\n"
     }
+}
+
+/// Whether a node announcing itself (`P`) under `name` has to start over:
+/// `name` is on record as departed within `DEPARTED_RETENTION` and is not
+/// registered. Takes the two locks one after the other, never nested.
+fn announce_needs_rejoin(registry: &Registry, name: &str) -> bool {
+    if lock(registry).contains_key(name) {
+        return false;
+    }
+    registry
+        .departed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .earns_rejoin(name)
 }
 
 fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, NodeInfo>> {
@@ -4409,6 +4506,7 @@ async fn sweep_expired(
         .max(Duration::from_millis(1));
     let mut ticker = interval(sweep_interval);
     let mut grace_joins_kicked = false;
+    let mut last_tick = Instant::now();
 
     // The join fan-outs (`abandon_current_join`'s `X`s, `try_begin_next_join`'s
     // `M`s with their retries) used to be awaited right here, which parked
@@ -4438,6 +4536,9 @@ async fn sweep_expired(
         tokio::select! {
             _ = ticker.tick() => {
                 let now = Instant::now();
+                let stalled = sweep_was_stalled(last_tick, now, liveness_timeout);
+                let since_last_tick = now.duration_since(last_tick);
+                last_tick = now;
                 // Reap finished fan-outs: frees the slot, and surfaces a
                 // panic the way the old inline call's would have (loudly).
                 while let Some(finished) = fanouts.try_join_next() {
@@ -4514,7 +4615,17 @@ async fn sweep_expired(
                         "WARN node evicted: {name} (no heartbeat within {}s)",
                         liveness_timeout.as_secs()
                     );
-                    record_departed(&registry, name);
+                    if stalled {
+                        eprintln!(
+                            "WARN discovery was not running for {}s before this sweep: {name} \
+                             may be healthy and is not sent back through a join if it announces \
+                             itself again",
+                            since_last_tick.as_secs()
+                        );
+                        record_departed_by_stalled_sweep(&registry, name);
+                    } else {
+                        record_departed(&registry, name);
+                    }
                 }
 
                 // Issue #34 forged-completion fix, other half (see
@@ -5297,8 +5408,35 @@ async fn handle_connection(
 
                 continue;
             }
-            Ok(DiscoveryCommand::Announce { name, port, token }) => {
+            Ok(DiscoveryCommand::Announce {
+                name,
+                port,
+                token,
+                rejoin_capable,
+            }) => {
                 let addr = format!("{peer_ip}:{port}");
+
+                // A node that was evicted and now announces itself again
+                // holds a cache the cluster has moved on from: its keys
+                // were re-replicated to other owners and took writes
+                // there. Put straight back in the ring it would serve its
+                // old values and, once the survivors' copies stop being
+                // owned (the reclaim pass), delete the newer ones. So it
+                // is not registered: it is told to clear its cache and
+                // join through `J`, whose handoff fills it from the
+                // owners. Only on a positive record of the departure
+                // (`record_departed`) — a restarted discovery has none
+                // and re-registers its nodes at once — and only for a node
+                // that said it can (`rejoin_capable`): an older node would
+                // read the reply as a failure and ask again forever.
+                if rejoin_capable && announce_needs_rejoin(&registry, &name) {
+                    println!(
+                        "INFO node announced after its eviction: {name} must clear its cache and \
+                         join again"
+                    );
+                    write_response(&mut stream, b"G\n").await?;
+                    return Ok(());
+                }
 
                 // Issue: `announce_insert_allowed` (only reached for a
                 // genuinely new name, below) is a *different* mutex
@@ -5892,6 +6030,68 @@ mod tests {
         );
         assert!(departed.departed_at("again").is_some());
         assert!(departed.departed_at("fresh").is_some());
+    }
+
+    #[test]
+    fn a_departure_judged_by_a_stalled_sweep_does_not_earn_a_rejoin() {
+        let mut departed = Departed::default();
+        let now = Instant::now();
+        departed.record("evicted", now);
+        departed.record_unreliable("stalled", now);
+        assert!(departed.earns_rejoin("evicted"));
+        assert!(!departed.earns_rejoin("stalled"));
+        assert!(!departed.earns_rejoin("never-seen"));
+        // Still on record as gone (the pending-joiner question).
+        assert!(departed.departed_at("stalled").is_some());
+        // Recorded again, this time by a sweep that was running: it earns it.
+        departed.record("stalled", now);
+        assert!(departed.earns_rejoin("stalled"));
+        // Forgotten (it registered again) and gone from both.
+        departed.record_unreliable("again", now);
+        departed.forget("again");
+        assert!(departed.departed_at("again").is_none() && departed.unreliable.is_empty());
+    }
+
+    #[test]
+    fn the_unreliable_set_follows_the_departed_records_out() {
+        let mut departed = Departed::default();
+        let base = Instant::now();
+        departed.record_unreliable("first", base);
+        for index in 0..MAX_DEPARTED {
+            departed.record(
+                &format!("n{index}"),
+                base + Duration::from_nanos(index as u64 + 1),
+            );
+        }
+        // "first" was the oldest and went out when the cap was reached.
+        assert!(departed.departed_at("first").is_none());
+        assert!(departed.unreliable.is_empty());
+    }
+
+    #[test]
+    fn a_sweep_is_stalled_when_it_comes_much_later_than_the_ticks_a_second_apart() {
+        let last = Instant::now();
+        let liveness = Duration::from_secs(15);
+        assert!(!sweep_was_stalled(
+            last,
+            last + Duration::from_secs(1),
+            liveness
+        ));
+        assert!(!sweep_was_stalled(
+            last,
+            last + Duration::from_millis(7500),
+            liveness
+        ));
+        assert!(sweep_was_stalled(
+            last,
+            last + Duration::from_millis(7501),
+            liveness
+        ));
+        assert!(sweep_was_stalled(
+            last,
+            last + Duration::from_secs(25),
+            liveness
+        ));
     }
 
     #[test]
@@ -7265,9 +7465,38 @@ mod tests {
                 name: "some-name".to_string(),
                 port: 8356,
                 token: "tk-some-name".to_string(),
+                rejoin_capable: false,
             }
         );
         assert_eq!(&input[..], b"L\n");
+    }
+
+    #[test]
+    fn parse_reads_the_g_of_a_node_that_can_start_over_on_an_announce_only() {
+        let mut input = BytesMut::from(&b"P 9 8356 12 G\nsome-nametk-some-nameL\n"[..]);
+        assert_eq!(
+            parse(&mut input).unwrap(),
+            DiscoveryCommand::Announce {
+                name: "some-name".to_string(),
+                port: 8356,
+                token: "tk-some-name".to_string(),
+                rejoin_capable: true,
+            }
+        );
+        assert_eq!(&input[..], b"L\n");
+        for frame in [
+            &b"J 9 8356 12 G\nsome-nametk-some-name"[..],
+            b"Y 9 8356 12 G\nsome-nametk-some-name",
+            b"P 9 8356 12 X\nsome-nametk-some-name",
+            b"P 9 8356 12 G G\nsome-nametk-some-name",
+        ] {
+            let mut input = BytesMut::from(frame);
+            assert!(
+                parse(&mut input).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(frame)
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7374,6 +7603,79 @@ mod tests {
             lock(&registry).get("node-a").unwrap().address,
             "127.0.0.1:2222"
         );
+    }
+
+    /// What `announce` (a whole `P` frame) is answered on a fresh
+    /// connection to a registry in which `prepare` has run, and whether
+    /// the name is registered afterwards.
+    async fn announce_reply(frame: &[u8], prepare: impl FnOnce(&Registry)) -> (Vec<u8>, bool) {
+        let registry: Registry = Arc::new(RegistryState::default());
+        prepare(&registry);
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut client, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            current_join,
+            ConnectionConfig {
+                idle_timeout: Duration::from_secs(5),
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        client.write_all(frame).await.unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        let registered = lock(&registry).contains_key("node-a");
+        (reply.to_vec(), registered)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_announcing_after_its_eviction_is_told_to_start_over_instead_of_registered() {
+        // The node was evicted: the survivors took over its keys and
+        // accepted writes for them. Registered again with the cache it
+        // held, it would serve the older values, and the reclaim pass on
+        // the survivors would then delete the newer ones.
+        let evicted = |registry: &Registry| record_departed(registry, "node-a");
+        let (reply, registered) = announce_reply(b"P 6 2222 9 G\nnode-atk-node-a", evicted).await;
+        assert_eq!(reply, b"G\n");
+        assert!(!registered, "it must join through J, not be admitted by P");
+
+        // An announce without the `G` (a node of an earlier version, or one
+        // to a standby replica) is admitted as before.
+        let (reply, registered) = announce_reply(b"P 6 2222 9\nnode-atk-node-a", evicted).await;
+        assert_eq!(reply, b"R\n");
+        assert!(registered);
+
+        // No record of a departure (a discovery that has just restarted
+        // and met its running nodes again): admitted at once.
+        let (reply, registered) = announce_reply(b"P 6 2222 9 G\nnode-atk-node-a", |_| {}).await;
+        assert_eq!(reply, b"R\n");
+        assert!(registered);
+
+        // Registered since (it joined again): its announces are refreshes.
+        let (reply, registered) = announce_reply(b"P 6 2222 9 G\nnode-atk-node-a", |registry| {
+            record_departed(registry, "node-a");
+            lock(registry).insert(
+                "node-a".to_string(),
+                NodeInfo::new(
+                    "127.0.0.1:2222".to_string(),
+                    NodeState::Joined,
+                    "tk-node-a".to_string(),
+                ),
+            );
+        })
+        .await;
+        assert_eq!(reply, b"R\n");
+        assert!(registered);
     }
 
     #[tokio::test(flavor = "current_thread")]
