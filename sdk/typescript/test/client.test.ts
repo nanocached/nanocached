@@ -1235,7 +1235,7 @@ describe("NanocachedClient reconnect-on-use", () => {
   });
 
   it("a refused connect is a ConnectionLostError carrying the system error as cause", async () => {
-    const port = await unusedPort();
+    const port = unreachablePort();
     await assert.rejects(NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port }] }), (error: unknown) => {
       assert.ok(error instanceof ConnectionLostError, `got ${String(error)}`);
       assert.ok(error instanceof NanocachedError);
@@ -6936,12 +6936,17 @@ describe("NanocachedClient tolerant bootstrap (issue #67)", () => {
     throw new Error(`no key routes to ${name}`);
   }
 
-  async function startCluster(dead: Set<string>) {
+  /** `revive`: the test later starts a mock node on a dead node's port,
+   * so that port has to be bindable (a released ephemeral port). Otherwise
+   * a dead node gets a port nothing listens on, ever: a released ephemeral
+   * port can be taken by a mock another test starts concurrently, and the
+   * dial then reaches a discovery or proxy mock instead of being refused. */
+  async function startCluster(dead: Set<string>, { revive = false } = {}) {
     const nodes = new Map<string, MockNode>();
     const entries: Array<{ name: string; address: string }> = [];
     for (const name of names) {
       if (dead.has(name)) {
-        const port = await unusedPort();
+        const port = revive ? await unusedPort() : unreachablePort();
         entries.push({ name, address: `127.0.0.1:${port}` });
       } else {
         const node = await startMockNode();
@@ -7009,7 +7014,7 @@ describe("NanocachedClient tolerant bootstrap (issue #67)", () => {
 
   it("redials an unreachable node once the cooldown has passed", async () => {
     const [dead, live] = names;
-    const cluster = await startCluster(new Set([dead]));
+    const cluster = await startCluster(new Set([dead]), { revive: true });
     try {
       const client = await NanocachedClient.connect({
         addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
