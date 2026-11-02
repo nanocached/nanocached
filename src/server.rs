@@ -30167,7 +30167,7 @@ mod tests {
         let registrations = registrations.lock().unwrap();
         assert!(registrations.len() >= 2, "node never re-registered");
         assert_eq!(registrations[0], b"J 9 8356 12\ntest-nodetk-test-node");
-        assert_eq!(registrations[1], b"P 9 8356 12 G\ntest-nodetk-test-node");
+        assert_eq!(registrations[1], b"P 9 8356 12\ntest-nodetk-test-node");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -30272,6 +30272,211 @@ mod tests {
         assert_eq!(
             *events.lock().unwrap(),
             vec!["promoted", "announced:P 9 8356 12\ntest-nodetk-test-node"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_the_primary_sends_back_through_a_join_is_unpromoted_and_leaves_the_standby() {
+        // The primary answers the node's `P` with `G`: it evicted the
+        // name. The node must stop serving keys (`promoted` false, no
+        // membership view) until its `J` is answered, and the standby —
+        // which only lists nodes the primary has promoted — must drop it
+        // for that time and take it again afterwards.
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let standby_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap().to_string();
+        let standby_addr = standby_listener.local_addr().unwrap().to_string();
+        let events: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+
+        let primary_events = Arc::clone(&events);
+        let fake_primary = tokio::spawn(async move {
+            let mut buffer = [0u8; 128];
+            let frame = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+            // The first join: promoted, one heartbeat, then the connection
+            // goes away without an ack.
+            let (mut connection, _) = primary_listener.accept().await.unwrap();
+            let n = connection.read(&mut buffer).await.unwrap();
+            primary_events
+                .lock()
+                .unwrap()
+                .push(format!("first:{}", frame(&buffer[..n])));
+            connection.write_all(b"R\n").await.unwrap();
+            let _ = connection.read(&mut buffer).await;
+            drop(connection);
+            // The announce that follows: told it was evicted.
+            let (mut connection, _) = primary_listener.accept().await.unwrap();
+            let n = connection.read(&mut buffer).await.unwrap();
+            primary_events
+                .lock()
+                .unwrap()
+                .push(format!("second:{}", frame(&buffer[..n])));
+            connection.write_all(b"G\n").await.unwrap();
+            drop(connection);
+            // The join that follows, held until the test lets it through.
+            let (mut connection, _) = primary_listener.accept().await.unwrap();
+            let n = connection.read(&mut buffer).await.unwrap();
+            primary_events
+                .lock()
+                .unwrap()
+                .push(format!("third:{}", frame(&buffer[..n])));
+            let _ = release_rx.await;
+            primary_events.lock().unwrap().push("released".to_string());
+            connection.write_all(b"R\n").await.unwrap();
+            loop {
+                match connection.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        if connection.write_all(b"A\n").await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let standby_events = Arc::clone(&events);
+        let fake_standby = tokio::spawn(async move {
+            loop {
+                let (mut connection, _) = standby_listener.accept().await.unwrap();
+                let events = Arc::clone(&standby_events);
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 128];
+                    let n = connection.read(&mut buffer).await.unwrap_or(0);
+                    events.lock().unwrap().push(format!(
+                        "announced:{}",
+                        String::from_utf8_lossy(&buffer[..n])
+                    ));
+                    if connection.write_all(b"R\n").await.is_err() {
+                        return;
+                    }
+                    loop {
+                        match connection.read(&mut buffer).await {
+                            Ok(0) | Err(_) => {
+                                events.lock().unwrap().push("standby-closed".to_string());
+                                return;
+                            }
+                            Ok(_) => {
+                                if connection.write_all(b"A\n").await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let known_ring: KnownRing = Arc::new(Mutex::new(Some(Arc::new(Membership {
+            ring: Arc::new(HashRing::new(vec![
+                "test-node".to_string(),
+                "other".to_string(),
+            ])),
+            replication: 1,
+        }))));
+        let node_context = test_node_context(
+            "test-node",
+            "tk-test-node",
+            Arc::clone(&known_ring),
+            Arc::new(Mutex::new(None)),
+        );
+        let promoted = Arc::clone(&node_context.promoted);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![primary_addr, standby_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            node_context,
+            mpsc::channel::<RereplicationTask>(4).1,
+            shutdown_rx,
+            mpsc::channel(1).0,
+        ));
+        let seen = |what: &str| events.lock().unwrap().iter().any(|e| e.starts_with(what));
+        let announced = || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("announced:"))
+                .count()
+        };
+        let wait_for = |what: &'static str| {
+            let events = Arc::clone(&events);
+            async move {
+                for _ in 0..1000 {
+                    if events.lock().unwrap().iter().any(|e| e.starts_with(what)) {
+                        return;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+                panic!("never saw {what}: {:?}", events.lock().unwrap());
+            }
+        };
+
+        // The rejoin's `J` is at the primary and unanswered.
+        wait_for("third:").await;
+        // The standby's connection for this node is dropped meanwhile, and
+        // not taken again, and the node serves nothing.
+        wait_for("standby-closed").await;
+        sleep(Duration::from_millis(200)).await;
+        assert!(!seen("released"));
+        assert_eq!(
+            announced(),
+            1,
+            "the standby was announced to again before the primary promoted the node: {:?}",
+            events.lock().unwrap()
+        );
+        assert!(
+            !promoted.load(Ordering::SeqCst),
+            "the node still serves keys while its join is open"
+        );
+        assert!(known_ring.lock().unwrap().is_none());
+
+        // The primary lets the join through: promoted again, and the
+        // standby is told once more.
+        release_tx.send(()).unwrap();
+        for _ in 0..1000 {
+            if announced() == 2 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        fake_primary.abort();
+        fake_standby.abort();
+
+        let events = events.lock().unwrap().clone();
+        assert!(promoted.load(Ordering::SeqCst), "{events:?}");
+        assert_eq!(events[0], "first:J 9 8356 12\ntest-nodetk-test-node");
+        assert!(
+            events.contains(&"second:P 9 8356 12 G\ntest-nodetk-test-node".to_string()),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&"third:J 9 8356 12\ntest-nodetk-test-node".to_string()),
+            "{events:?}"
+        );
+        // The standby is a standby: its announce carries no `G`.
+        assert!(
+            events
+                .iter()
+                .filter(|e| e.starts_with("announced:"))
+                .all(|e| e == "announced:P 9 8356 12\ntest-nodetk-test-node"),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.starts_with("announced:"))
+                .count(),
+            2,
+            "{events:?}"
         );
     }
 
