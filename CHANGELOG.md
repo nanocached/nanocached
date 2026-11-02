@@ -204,6 +204,21 @@ framework adapters at one version, whether or not a component changed.
   (and a multi-key header that outgrows the free 64 KiB takes the largest
   frame's worth at once), so uploads queue for the share and take their
   turns (#1147).
+- `nanocached-proxy`: a node's reply to a 1 MiB `m` (or `y` with `G`) of
+  short keys was refused as "line exceeded its size cap", because the
+  proxy read every backend reply header under the 1 MiB request bound while
+  an `M` header carries a length token per key: 349,000 one-byte keys (the
+  most a frame holds) with two- and three-digit values made a 1,194,009
+  byte header. The refusal poisoned the backend connection, the retry
+  poisoned every other owner's, and the whole batch came back `W` (no hit
+  out of 349,000) with every other request pipelined on those connections
+  failing (8 connections incrementing during five such batches saw 10 `E`,
+  17 replies cut off by the close and 10 reconnects). An `M` header is now
+  read up to 4 MiB, which holds the longest header any frame can be
+  answered with (about 3.1 MB), and the line is charged to the request's
+  in-flight cost at nine bytes a key; every other reply keeps the 1 MiB
+  bound. The same batches now come back with all 349,000 hits, no poisoned
+  connection and no failed increment (#1283).
 
 ### Changed
 
