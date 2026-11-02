@@ -752,13 +752,37 @@ const MAX_FORWARD_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 /// queue for 140,000 pairs).
 const FORWARD_ENTRY_OVERHEAD_BYTES: usize = 320;
 
-/// Whether one frame of `size` bytes is over `MAX_REQUEST_SIZE`. A bound
-/// on a frame, not on the receive buffer: `handle_connection` applies it
-/// to the frame `parse` took, or to the front frame still arriving, never
-/// to the buffer after a read (which also holds what was pipelined
-/// behind that frame).
-fn request_is_too_large(size: usize) -> bool {
-    size > MAX_REQUEST_SIZE
+/// What a frame of the cluster-internal kind (`U`, `u`, `f`) may carry
+/// beyond `MAX_REQUEST_SIZE`. A handoff `U` is the client's `S` for the
+/// same value plus the receiver's 36-byte membership token, its length
+/// field, the namespace length field and an optional ` A` — 40 to 50
+/// bytes more. With one limit for both, a value within that margin of the
+/// client limit was stored by the owner and could then never be moved:
+/// join migration, decommission drain and re-replication all send it as
+/// a `U`, and the receiver refused it as too large. The margin is
+/// generous (the real overhead is under 64 bytes), and costs nothing: a
+/// `U` is only acted on after its token checks, and the receive buffer
+/// is charged against the in-flight budget as it grows, not by this
+/// limit.
+const INTERNAL_FRAME_ALLOWANCE: usize = 4096;
+
+/// The largest frame the node accepts when it starts with `lead`: the
+/// request limit for everything a client sends, and the limit plus
+/// `INTERNAL_FRAME_ALLOWANCE` for the frames only another node sends.
+fn request_limit(lead: Option<u8>) -> usize {
+    match lead {
+        Some(b'U' | b'u' | b'f') => MAX_REQUEST_SIZE + INTERNAL_FRAME_ALLOWANCE,
+        _ => MAX_REQUEST_SIZE,
+    }
+}
+
+/// Whether one frame of `size` bytes, starting with `lead`, is over
+/// `request_limit`. A bound on a frame, not on the receive buffer:
+/// `handle_connection` applies it to the frame `parse` took, or to the
+/// front frame still arriving, never to the buffer after a read (which
+/// also holds what was pipelined behind that frame).
+fn request_is_too_large(size: usize, lead: Option<u8>) -> bool {
+    size > request_limit(lead)
 }
 
 /// A connection this process accepted, plaintext or TLS-terminated.
@@ -2896,6 +2920,7 @@ async fn handle_connection(
         }
 
         let buffered_before = received.len();
+        let lead = received.first().copied();
         let mut parsed = parse_resumable(&mut received, tagged, &mut parse_progress, false);
         // A multi-key frame (`m`, `o`, `y`) is charged for its per-key
         // working memory before the parser builds its key vectors, not
@@ -2911,7 +2936,7 @@ async fn handle_connection(
             frame_len,
         }) = parsed
         {
-            if request_is_too_large(frame_len) {
+            if request_is_too_large(frame_len, lead) {
                 return Err(reject_oversized_request(
                     &mut stream,
                     "request is too large".to_string(),
@@ -2935,7 +2960,7 @@ async fn handle_connection(
             // proxy's shared backend connection, where every client's
             // frames arrive back to back, that poisoned the connection
             // for the other clients.
-            if request_is_too_large(buffered_before - received.len()) {
+            if request_is_too_large(buffered_before - received.len(), lead) {
                 return Err(reject_oversized_request(
                     &mut stream,
                     "request is too large".to_string(),
@@ -4269,7 +4294,7 @@ async fn handle_connection(
                 // so what is buffered here is the front frame alone: the
                 // one place the limit can be applied to a frame still
                 // arriving (the complete-frame case is handled above).
-                if request_is_too_large(received.len()) {
+                if request_is_too_large(received.len(), lead) {
                     return Err(reject_oversized_request(
                         &mut stream,
                         "request is too large".to_string(),
@@ -14464,17 +14489,55 @@ mod tests {
 
     #[test]
     fn request_size_below_limit_is_allowed() {
-        assert!(!request_is_too_large(MAX_REQUEST_SIZE - 1));
+        assert!(!request_is_too_large(MAX_REQUEST_SIZE - 1, Some(b'S')));
     }
 
     #[test]
     fn request_size_at_limit_is_allowed() {
-        assert!(!request_is_too_large(MAX_REQUEST_SIZE));
+        assert!(!request_is_too_large(MAX_REQUEST_SIZE, Some(b'S')));
     }
 
     #[test]
     fn request_size_above_limit_is_rejected() {
-        assert!(request_is_too_large(MAX_REQUEST_SIZE + 1));
+        assert!(request_is_too_large(MAX_REQUEST_SIZE + 1, Some(b'S')));
+    }
+
+    #[test]
+    fn a_cluster_internal_frame_may_exceed_the_request_limit_by_the_allowance() {
+        for lead in [b'U', b'u', b'f'] {
+            assert!(!request_is_too_large(
+                MAX_REQUEST_SIZE + INTERNAL_FRAME_ALLOWANCE,
+                Some(lead)
+            ));
+            assert!(request_is_too_large(
+                MAX_REQUEST_SIZE + INTERNAL_FRAME_ALLOWANCE + 1,
+                Some(lead)
+            ));
+        }
+        // Everything a client sends keeps the plain limit, and so does a
+        // frame whose lead byte is not known yet.
+        for lead in [b'S', b's', b'o', b'k', b'm', b'y'] {
+            assert!(request_is_too_large(MAX_REQUEST_SIZE + 1, Some(lead)));
+        }
+        assert!(request_is_too_large(MAX_REQUEST_SIZE + 1, None));
+    }
+
+    #[test]
+    fn the_allowance_covers_the_worst_handoff_overhead_over_the_set_frame() {
+        // The widest `U` a stored value can need against the widest `s`
+        // that stored it: a 36-byte token, a TTL, `A`, and a namespace.
+        let key = Key::new(Bytes::from_static(b"ns"), Bytes::from_static(b"name"));
+        let value = vec![b'v'; 100_000];
+        let ttl = Some(Duration::from_secs(4_000_000_000));
+        let token = Uuid::nil().to_string();
+        let handoff = handoff_message(&key, &value, ttl, true, &token).len();
+        let set = set_message(&key, &value, ttl).len();
+        assert!(handoff > set);
+        assert!(
+            handoff - set < INTERNAL_FRAME_ALLOWANCE / 8,
+            "overhead {} vs allowance {INTERNAL_FRAME_ALLOWANCE}",
+            handoff - set
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -17306,6 +17369,114 @@ mod tests {
         connection_task.await.unwrap().unwrap();
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    /// Runs a connection with a node context whose token is "tk-self" and
+    /// sends it `request`; returns what the node wrote back before it
+    /// closed, the connection task's result, and the cache the request
+    /// reached.
+    async fn run_handoff_connection(
+        request: Vec<u8>,
+        pending_reads: &[u8],
+    ) -> (Vec<u8>, io::Result<()>, mpsc::Sender<CacheRequest>) {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let node_context = NodeContext {
+            gates: Default::default(),
+            name: "self".to_string(),
+            token: "tk-self".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
+                ring: Arc::new(HashRing::new(vec!["other".to_string()])),
+                replication: 1,
+            })))),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+        };
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+        client.write_all(&request).await.unwrap();
+        client.write_all(pending_reads).await.unwrap();
+        client.shutdown().await.unwrap();
+        let response = read_until_close(&mut client).await;
+        (response, connection_task.await.unwrap(), request_tx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_handoff_of_a_value_near_the_request_limit_is_stored() {
+        // A client `S` is accepted up to `MAX_REQUEST_SIZE`; the `U` that
+        // moves the same value to another node (join migration, drain,
+        // re-replication) is about 45 bytes longer. With one limit for
+        // both, a value that fits was stored and then could never be
+        // moved. Built with `handoff_message`, the frame the senders use.
+        let key = Key::new(Bytes::from_static(b"ns"), Bytes::from_static(b"name"));
+        let value = vec![b'v'; MAX_REQUEST_SIZE - 10];
+        let handoff = handoff_message(&key, &value, Some(Duration::from_secs(60)), true, "tk-self");
+        assert!(
+            handoff.len() > MAX_REQUEST_SIZE,
+            "the frame must be past the client limit for this test to mean anything"
+        );
+        let (response, result, request_tx) = run_handoff_connection(handoff, b"").await;
+        result.unwrap();
+        // The `U` is acknowledged, and the value is in the cache whole.
+        assert_eq!(&response[..], b"S\n");
+        match send_command(&request_tx, Command::PeekEntry { key }).await {
+            Response::Entries(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].1.len(), value.len());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        drop(request_tx);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_handoff_past_the_allowance_is_still_refused() {
+        let key = Key::new(Bytes::from_static(b"ns"), Bytes::from_static(b"name"));
+        let value = vec![b'v'; MAX_REQUEST_SIZE + INTERNAL_FRAME_ALLOWANCE];
+        let handoff = handoff_message(&key, &value, None, false, "tk-self");
+        let (response, result, _request_tx) = run_handoff_connection(handoff, b"").await;
+        assert_eq!(response, b"En\n");
+        assert_eq!(result.unwrap_err().to_string(), "request is too large");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_set_frame_over_the_request_limit_is_refused_even_at_a_handoff_sized_value() {
+        // The allowance is for the frames only a node sends: the `S` that
+        // carries the same value is over the limit by its own size.
+        let value = vec![b'v'; MAX_REQUEST_SIZE];
+        let mut request = format!("S 4 {}\nname", value.len()).into_bytes();
+        request.extend_from_slice(&value);
+        let (response, result, _request_tx) = run_handoff_connection(request, b"").await;
+        assert_eq!(response, b"En\n");
+        assert_eq!(result.unwrap_err().to_string(), "request is too large");
     }
 
     #[tokio::test(flavor = "current_thread")]

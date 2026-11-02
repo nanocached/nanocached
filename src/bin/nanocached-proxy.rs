@@ -193,9 +193,38 @@ const MAX_CLIENT_FRAME_SIZE: usize = MAX_REQUEST_SIZE - BACKEND_TAG_MAX_BYTES;
 /// `finish_multi_get` is held to the same figure.
 const MAX_MULTI_REPLY_VALUE_BYTES: usize = 16 * 1024 * 1024;
 
+/// The most a node's `M` reply header line may take. Such a header has one
+/// token per key, so it grows with the request, not with
+/// `MAX_REQUEST_SIZE`: a 1 MiB `m` of one-byte keys holds about 349,000
+/// keys (three bytes each: ` 1`, the key), and the node answers them with
+/// up to eight digits and a space apiece, about 3.1 MB, with typical
+/// short values already past 1 MiB (349,000 keys with 2-3 digit lengths
+/// make 1.19 MB). Held to the 1 MiB request bound that legitimate reply
+/// poisoned the backend connection and failed the whole batch. The line is
+/// charged to the request's admission cost at
+/// `MULTI_REPLY_HEADER_BYTES_PER_KEY` a key (`multi_request_cost`).
+const MAX_MULTI_REPLY_HEADER_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most one key adds to an `M` reply's header line: a length of up to
+/// eight digits (`MAX_MULTI_REPLY_VALUE_BYTES` is 16 MiB) and its space.
+/// A request that is answered with an `M` is charged this for every key,
+/// on top of `MULTI_KEY_OVERHEAD_BYTES`, for the line read off the wire
+/// (the roster parsed out of it is part of that overhead).
+const MULTI_REPLY_HEADER_BYTES_PER_KEY: usize = 8 + 1;
+
 /// Client connections accepted at once (`--max-connections`); the
 /// default mirrors the node's `MAX_CONNECTIONS`.
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
+// The header cap holds the header of any reply to any frame the proxy
+// accepts: the most keys a frame holds, each at the longest token.
+const _: () = {
+    const SMALLEST_KEY_ON_THE_WIRE: usize = 3; // " 1" and a one-byte key
+    assert!(
+        (MAX_REQUEST_SIZE / SMALLEST_KEY_ON_THE_WIRE + 1) * MULTI_REPLY_HEADER_BYTES_PER_KEY + 64
+            <= MAX_MULTI_REPLY_HEADER_BYTES
+    );
+};
 
 /// Default for `--max-connections-per-ip` (issue #520): how many live
 /// client connections one source IP may hold at once, layered under the
@@ -1031,10 +1060,20 @@ struct ProxyContext {
 /// the whole line. Whatever a read pulled in past the newline stays in `buf`
 /// for `read_exact_into` and the next line.
 async fn read_line<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut BytesMut) -> io::Result<String> {
+    read_line_up_to(stream, buf, MAX_REQUEST_SIZE).await
+}
+
+/// `read_line` with the cap given: a reply header that lists a token per key
+/// outgrows the request bound (`MAX_MULTI_REPLY_HEADER_BYTES`).
+async fn read_line_up_to<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut BytesMut,
+    limit: usize,
+) -> io::Result<String> {
     let mut line = Vec::new();
     infra::read_line_bounded(
         &mut infra::CarryReader::new(stream, buf),
-        MAX_REQUEST_SIZE,
+        limit,
         Instant::now() + UPSTREAM_IO_TIMEOUT,
         &mut line,
     )
@@ -3116,7 +3155,15 @@ async fn read_reply<S: AsyncRead + Unpin>(
     tag: u32,
     expect: Expect,
 ) -> io::Result<NodeReply> {
-    let line = read_line(stream, buf).await?;
+    // Only `M` lists a token that can run to eight digits per key. `O` and
+    // `Y` take two bytes a key, 700 KB for the most keys a frame holds, and
+    // every other header is a few fields, so a backend that rambles on in
+    // answer to a `G` is still cut off at the request bound.
+    let header_limit = match expect {
+        Expect::Multi => MAX_MULTI_REPLY_HEADER_BYTES,
+        _ => MAX_REQUEST_SIZE,
+    };
+    let line = read_line_up_to(stream, buf, header_limit).await?;
     let mut parts = line.split(' ');
     let marker = parts.next().unwrap_or_default();
 
@@ -6527,7 +6574,8 @@ struct ClientBudgets {
 ///   second time before dispatch hashes them);
 /// - a write is re-framed once per owner leg on top of its pinned slice;
 /// - an `m`/`o` key costs `MULTI_KEY_OVERHEAD_BYTES` of bookkeeping
-///   beyond its bytes.
+///   beyond its bytes, and a key of a read that is answered with an `M`
+///   `MULTI_REPLY_HEADER_BYTES_PER_KEY` more for its header line.
 fn request_cost(
     request: &Request,
     frame_bytes: usize,
@@ -6589,9 +6637,12 @@ fn multi_request_cost(
     // most one `MAX_MULTI_REPLY_VALUE_BYTES` reply per primary it reaches
     // (each node caps its own group's reply; nothing caps the replies of
     // different groups against each other until they are merged).
+    // Plus the header line each such `M` is read as, a token per key
+    // (issue #1283: it grows with the keys, not with the request bound).
     let batch_reply = keys
         .saturating_mul(MAX_REQUEST_SIZE)
-        .min(primaries.saturating_mul(MAX_MULTI_REPLY_VALUE_BYTES));
+        .min(primaries.saturating_mul(MAX_MULTI_REPLY_VALUE_BYTES))
+        .saturating_add(keys.saturating_mul(MULTI_REPLY_HEADER_BYTES_PER_KEY));
     let overhead = keys.saturating_mul(MULTI_KEY_OVERHEAD_BYTES);
     match kind {
         MultiKind::Get => frame_bytes
@@ -7853,6 +7904,83 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// A roster of `keys` hits in the shape a 1 MiB `m` of one-byte keys is
+    /// answered with: mostly 10 B values (three header bytes a key) and some
+    /// 100 B ones (four).
+    fn wide_multi_reply(keys: usize, tag: u32) -> (Vec<u8>, usize) {
+        let long = 30_000;
+        let mut header = format!("M {keys}");
+        let mut body = 0;
+        for key in 0..keys {
+            let length = if key < long { 100 } else { 10 };
+            header.push_str(&format!(" {length}"));
+            body += length;
+        }
+        header.push_str(&format!(" {tag}\n"));
+        let mut wire = header.into_bytes();
+        wire.extend(std::iter::repeat_n(b'v', body));
+        (wire, body)
+    }
+
+    // A node answers a 1 MiB `m` of 349,000 short keys with a header of
+    // about 1.08 MB: one length token per key. It used to be refused as
+    // "line exceeded its size cap", which poisoned the backend connection
+    // and failed the whole batch.
+    #[tokio::test]
+    async fn read_reply_accepts_an_m_reply_header_larger_than_the_request_bound() {
+        let (wire, body) = wide_multi_reply(349_000, 7);
+        let header_bytes = wire.len() - body;
+        assert!(header_bytes > MAX_REQUEST_SIZE, "{header_bytes}");
+        let mut stream = std::io::Cursor::new(wire);
+        let mut buf = BytesMut::new();
+
+        let reply = read_reply(&mut stream, &mut buf, 7, Expect::Multi)
+            .await
+            .expect("a roster past 1 MiB is a legitimate reply");
+
+        let NodeReply::Multi(entries) = reply else {
+            panic!("expected a Multi reply");
+        };
+        assert_eq!(entries.len(), 349_000);
+        assert!(
+            matches!(&entries[0], ProxyMultiEntry::Value(v) if v.len() == 100),
+            "{:?}",
+            entries[0]
+        );
+        assert!(matches!(&entries[348_999], ProxyMultiEntry::Value(v) if v.len() == 10));
+    }
+
+    #[tokio::test]
+    async fn read_reply_still_bounds_a_header_line() {
+        // A roster past the batch bound is refused...
+        let mut wire = b"M 1".to_vec();
+        wire.extend(std::iter::repeat_n(b'1', MAX_MULTI_REPLY_HEADER_BYTES));
+        wire.extend_from_slice(b" 7\n");
+        let error = read_reply(
+            &mut std::io::Cursor::new(wire),
+            &mut BytesMut::new(),
+            7,
+            Expect::Multi,
+        )
+        .await
+        .expect_err("a header line past the batch bound is refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        // ...and a reply to anything but a batch keeps the request bound.
+        let mut wire = b"V ".to_vec();
+        wire.extend(std::iter::repeat_n(b'1', MAX_REQUEST_SIZE));
+        wire.extend_from_slice(b" 7\n");
+        let error = read_reply(
+            &mut std::io::Cursor::new(wire),
+            &mut BytesMut::new(),
+            7,
+            Expect::Value,
+        )
+        .await
+        .expect_err("a single-key reply header stays within the request bound");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn client_facing_multi_reply_is_held_to_the_value_budget() {
         let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
@@ -8350,7 +8478,9 @@ mod tests {
         // A small batch can be answered with one value per key...
         assert_eq!(
             request_cost(&small, 20, 1, 1),
-            20 + 3 * MULTI_KEY_OVERHEAD_BYTES + 3 * MAX_REQUEST_SIZE
+            20 + 3 * MULTI_KEY_OVERHEAD_BYTES
+                + 3 * MAX_REQUEST_SIZE
+                + 3 * MULTI_REPLY_HEADER_BYTES_PER_KEY
         );
         let large = Request::MultiGet {
             namespace: Bytes::new(),
@@ -8360,7 +8490,10 @@ mod tests {
         // bookkeeping that dwarfs its wire size.
         assert_eq!(
             request_cost(&large, 200_000, 1, 1),
-            200_000 + 100_000 * MULTI_KEY_OVERHEAD_BYTES + MAX_MULTI_REPLY_VALUE_BYTES
+            200_000
+                + 100_000 * MULTI_KEY_OVERHEAD_BYTES
+                + MAX_MULTI_REPLY_VALUE_BYTES
+                + 100_000 * MULTI_REPLY_HEADER_BYTES_PER_KEY
         );
 
         let multi_set = Request::MultiSet {
@@ -8406,7 +8539,9 @@ mod tests {
         assert!(few * MAX_REQUEST_SIZE < primaries * MAX_MULTI_REPLY_VALUE_BYTES);
         assert_eq!(
             request_cost(&batch(few), 100, 2, primaries),
-            100 + few * MULTI_KEY_OVERHEAD_BYTES + few * MAX_REQUEST_SIZE
+            100 + few * MULTI_KEY_OVERHEAD_BYTES
+                + few * MAX_REQUEST_SIZE
+                + few * MULTI_REPLY_HEADER_BYTES_PER_KEY
         );
 
         // More: a full reply from every primary, however many keys.
@@ -8414,21 +8549,28 @@ mod tests {
             assert!(many * MAX_REQUEST_SIZE > primaries * MAX_MULTI_REPLY_VALUE_BYTES);
             assert_eq!(
                 request_cost(&batch(many), 100, 2, primaries),
-                100 + many * MULTI_KEY_OVERHEAD_BYTES + primaries * MAX_MULTI_REPLY_VALUE_BYTES
+                100 + many * MULTI_KEY_OVERHEAD_BYTES
+                    + primaries * MAX_MULTI_REPLY_VALUE_BYTES
+                    + many * MULTI_REPLY_HEADER_BYTES_PER_KEY
             );
         }
 
         // A single primary keeps the one-reply bound.
         assert_eq!(
             request_cost(&batch(100), 100, 2, 1),
-            100 + 100 * MULTI_KEY_OVERHEAD_BYTES + MAX_MULTI_REPLY_VALUE_BYTES
+            100 + 100 * MULTI_KEY_OVERHEAD_BYTES
+                + MAX_MULTI_REPLY_VALUE_BYTES
+                + 100 * MULTI_REPLY_HEADER_BYTES_PER_KEY
         );
 
         // A get-and-touch batch is charged the same reply on top of its
         // re-framed copies.
         assert_eq!(
             request_cost(&touch(100), 100, 2, primaries),
-            100 * 3 + 100 * MULTI_KEY_OVERHEAD_BYTES + primaries * MAX_MULTI_REPLY_VALUE_BYTES
+            100 * 3
+                + 100 * MULTI_KEY_OVERHEAD_BYTES
+                + primaries * MAX_MULTI_REPLY_VALUE_BYTES
+                + 100 * MULTI_REPLY_HEADER_BYTES_PER_KEY
         );
     }
 
@@ -11705,6 +11847,103 @@ mod tests {
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 3 1 1 -");
         read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
         assert_eq!(&buf.split_to(2)[..], b"12");
+    }
+
+    /// A node that completes the tagged handshake and answers every `m`
+    /// with `reply` (the roster and values of an `M` without its tag),
+    /// built before the request arrives so that the proxy's reply timeout
+    /// (shortened under test) measures the proxy, not this node.
+    async fn start_node_answering_m_with(roster: String, values: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (roster, values) = (roster.clone(), values.clone());
+                tokio::spawn(async move {
+                    let mut buf = BytesMut::new();
+                    let Ok(line) = read_line(&mut stream, &mut buf).await else {
+                        return;
+                    };
+                    let length = line.split(' ').nth(1).unwrap().parse().unwrap();
+                    read_exact_into(&mut stream, &mut buf, length)
+                        .await
+                        .unwrap();
+                    let _ = buf.split_to(length);
+                    stream.write_all(b"OnT\n").await.unwrap();
+                    while let Ok(request) = read_line(&mut stream, &mut buf).await {
+                        let mut fields = request.split(' ');
+                        assert_eq!(fields.next(), Some("m"));
+                        let namespace: usize = fields.next().unwrap().parse().unwrap();
+                        let keys: usize = fields.next().unwrap().parse().unwrap();
+                        let tag = request.rsplit(' ').next().unwrap().to_string();
+                        // One-byte keys, as the test sends.
+                        read_exact_into(&mut stream, &mut buf, namespace + keys)
+                            .await
+                            .unwrap();
+                        let _ = buf.split_to(namespace + keys);
+                        stream
+                            .write_all(format!("M {keys}{roster} {tag}\n").as_bytes())
+                            .await
+                            .unwrap();
+                        stream.write_all(&values).await.unwrap();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    // Through the whole proxy: a 1 MiB `m` of 349,000 one-byte keys is
+    // answered by the node with a header over 1 MiB, and the client gets
+    // every hit rather than 349,000 `W`s with the backend connection
+    // poisoned.
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_get_relays_a_node_reply_header_over_one_mebibyte() {
+        let keys = 349_000;
+        let long_keys = 30_000;
+        let roster: String = (0..keys)
+            .map(|key| if key < long_keys { " 100" } else { " 10" })
+            .collect();
+        let mut values = vec![b'l'; long_keys * 100];
+        values.extend(std::iter::repeat_n(b's', (keys - long_keys) * 10));
+        let node = start_node_answering_m_with(roster, values.clone()).await;
+        let discovery = start_mock_discovery(vec![("node".to_string(), node)], 1).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        let mut frame = format!("m 0 {keys}").into_bytes();
+        for _ in 0..keys {
+            frame.extend_from_slice(b" 1");
+        }
+        frame.push(b'\n');
+        frame.extend(std::iter::repeat_n(b'k', keys));
+        assert!(frame.len() < MAX_CLIENT_FRAME_SIZE, "{}", frame.len());
+        stream.write_all(&frame).await.unwrap();
+
+        let mut header = Vec::new();
+        infra::read_line_bounded(
+            &mut infra::CarryReader::new(&mut stream, &mut buf),
+            MAX_MULTI_REPLY_HEADER_BYTES,
+            Instant::now() + Duration::from_secs(60),
+            &mut header,
+        )
+        .await
+        .unwrap();
+        assert!(header.len() > MAX_REQUEST_SIZE, "{}", header.len());
+        let header = String::from_utf8(header).unwrap();
+        let tokens: Vec<&str> = header.trim_end().split(' ').collect();
+        assert_eq!(tokens.len(), keys + 2, "{}", &header[..40]);
+        assert_eq!(&tokens[..2], ["M", "349000"]);
+        assert!(tokens[2..2 + long_keys].iter().all(|token| *token == "100"));
+        assert!(tokens[2 + long_keys..].iter().all(|token| *token == "10"));
+
+        read_exact_into(&mut stream, &mut buf, values.len())
+            .await
+            .unwrap();
+        assert_eq!(&buf[..values.len()], &values[..]);
     }
 
     #[tokio::test(flavor = "current_thread")]
