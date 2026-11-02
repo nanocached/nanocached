@@ -8,7 +8,7 @@ E="$(cd "$(dirname "$0")" && pwd)"
 source $E/cl.sh
 P=n91; D=$P-disc:8357
 T(){ echo "### $(date +%T) [$P] $*"; }
-cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 cleanup; docker network create $NET >/dev/null
 disc_up $P-disc --replication-factor 2; sleep 1
 i=0; for n in a b c; do i=$((i+1)); node_up $P-$n $D; wait_members $i $D 120 >/dev/null; done

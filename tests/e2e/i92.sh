@@ -7,7 +7,7 @@ E="$(cd "$(dirname "$0")" && pwd)"
 NODE=nanocached-node:0.3.0
 P=n92; F=$P-disc:8357
 T(){ echo "### $(date +%T) [$P] $*"; }
-cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 cleanup; docker network create $NET >/dev/null
 docker run -d --name $P-disc --network $NET -v $E:/w -w /w -e MODE=$MODE e2e-client python fakedisc92.py 8357 >/dev/null
 sleep 1

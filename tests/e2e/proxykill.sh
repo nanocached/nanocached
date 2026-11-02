@@ -7,7 +7,7 @@ SDKP="$(cd "$E/../../sdk/python/src" && pwd)"
 source "$E/cl.sh"
 P=npk; D=$P-disc:8357
 T(){ echo "### $(date -u +%T.%N | cut -c1-12) [$P] $*"; }
-cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 proxies(){ docker run --rm --network $NET -v $E:/w -w /w e2e-client python disc.py $D proxies; }
 RUN=${RUN:-$(date +%H%M%S)}; L="$E/logs/pkill-$RUN"; mkdir -p "$L"
 cleanup; docker network create $NET >/dev/null
@@ -27,7 +27,7 @@ docker wait $P-load >/dev/null
 docker logs $P-load > "$L/load.log" 2>&1; load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1); echo "=== load: $load"
 check=$(docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
 echo "=== check: $check"
-for c in $(docker ps -aq --filter name=$P-); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); echo "$n $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $c)" >> "$L/ipmap.txt"; docker logs -t $c > "$L/$n.log" 2>&1; done
+for c in $(docker ps -aq --filter "name=^/$P-"); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); echo "$n $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $c)" >> "$L/ipmap.txt"; docker logs -t $c > "$L/$n.log" 2>&1; done
 echo "=== WARN/ERROR categories (nodes, proxies, discovery)"; cat "$L"/$P-[abcpd]*.log | grep -v "^.*load" | grep -i "warn\|error\|panic" | sed -E 's/^[^ ]+Z //; s/[0-9a-f]{8}-[0-9a-f-]{27}/UUID/g; s/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+/ADDR/g; s/attempt [0-9]+\/[0-9]+/attempt X/g; s/after [0-9]+ attempt/after N attempt/g; s/[0-9]+ key/N key/g; s/[0-9]+ (entries|dead)/N \1/g' | sort | uniq -c | sort -rn | head -12
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { T "FAIL: untouched-range verify not clean"; fail=1; }
 echo "$load" | grep -q '"corrupt": 0' || { T "FAIL: corrupt"; fail=1; }
