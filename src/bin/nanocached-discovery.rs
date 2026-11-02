@@ -265,9 +265,10 @@
 use bytes::{Bytes, BytesMut};
 use nanocached::infra;
 use nanocached::infra::{
-    ACCEPT_ERROR_BACKOFF, METRICS_MAX_CONNECTIONS, MaybeTls, PerIpConnections, constant_time_eq,
-    load_tls_acceptor, load_tls_connector, per_ip_key, read_http_request_path, reject_over_limit,
-    should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip, write_http_response,
+    ACCEPT_ERROR_BACKOFF, LogLimiter, METRICS_MAX_CONNECTIONS, MaybeTls, PerIpConnections,
+    constant_time_eq, load_tls_acceptor, load_tls_connector, per_ip_key, read_http_request_path,
+    reject_over_limit, should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip,
+    write_http_response,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
@@ -3870,7 +3871,7 @@ pub(crate) async fn run_on_listener(
                 let (stream, address) = match result {
                     Ok(pair) => pair,
                     Err(error) => {
-                        eprintln!("WARN accept failed: {error}");
+                        log_connection(format_args!("WARN accept failed: {error}"));
                         if should_backoff_after_accept_error(&error) {
                             tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                         }
@@ -3918,6 +3919,44 @@ pub(crate) async fn run_on_listener(
     Ok(())
 }
 
+/// Issue #1285: the log lines a peer can cause at will (a connection that
+/// ends in an error, a TLS handshake that fails, a rejected `T`, join,
+/// announce, leave or deregister) are each written at most this many times
+/// a second, as the node does for its own connection lines. One short
+/// connection costs one such line, so without the bound a flood within the
+/// per-IP caps wrote about 5,000 lines a second; and `eprintln!` is a
+/// blocking write on this current-thread runtime, so a log sink that
+/// stalled (a full pipe, a slow journald) stalled accepts and heartbeats
+/// with it. Lines past the budget are counted and reported in one summary
+/// line ahead of the next one written. Connections and rejections have
+/// separate budgets so a flood of one never hides the other.
+const PEER_LOG_LINES_PER_SECOND: u32 = 50;
+static CONNECTION_LOG: LogLimiter =
+    LogLimiter::new(PEER_LOG_LINES_PER_SECOND, Duration::from_secs(1));
+static REJECTION_LOG: LogLimiter =
+    LogLimiter::new(PEER_LOG_LINES_PER_SECOND, Duration::from_secs(1));
+
+/// One line about a connection (accept and TLS failures, a connection that
+/// ended in an error), through `CONNECTION_LOG`.
+fn log_connection(line: std::fmt::Arguments<'_>) {
+    log_limited(&CONNECTION_LOG, "connection log lines", line);
+}
+
+/// One line about a request this replica refused, through `REJECTION_LOG`.
+fn log_rejection(line: std::fmt::Arguments<'_>) {
+    log_limited(&REJECTION_LOG, "rejections", line);
+}
+
+fn log_limited(limiter: &LogLimiter, what: &str, line: std::fmt::Arguments<'_>) {
+    let Some(suppressed) = limiter.admit() else {
+        return;
+    };
+    if suppressed > 0 {
+        eprintln!("WARN {suppressed} more {what} (not logged individually)");
+    }
+    eprintln!("{line}");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_connection(
     stream: TcpStream,
@@ -3943,7 +3982,9 @@ fn dispatch_connection(
     // keepalive makes the kernel fail the read after about 25 s of
     // silence instead; see `infra::TCP_KEEPALIVE_IDLE`.
     if let Err(error) = infra::enable_tcp_keepalive(&stream) {
-        eprintln!("WARN enabling TCP keepalive for {address} failed: {error}");
+        log_connection(format_args!(
+            "WARN enabling TCP keepalive for {address} failed: {error}"
+        ));
     }
 
     // CRITICAL — everything below (the connection-limit check, the TLS
@@ -4009,11 +4050,13 @@ fn dispatch_connection(
             Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                 Ok(Ok(tls_stream)) => MaybeTls::Tls(Box::new(tls_stream)),
                 Ok(Err(error)) => {
-                    eprintln!("WARN TLS handshake with {address} failed: {error}");
+                    log_connection(format_args!(
+                        "WARN TLS handshake with {address} failed: {error}"
+                    ));
                     return;
                 }
                 Err(_) => {
-                    eprintln!("WARN TLS handshake with {address} timed out");
+                    log_connection(format_args!("WARN TLS handshake with {address} timed out"));
                     return;
                 }
             },
@@ -4049,9 +4092,13 @@ fn dispatch_connection(
             // every SDK and node ends a connection) is an error to rustls
             // but not to us — INFO, not a WARN per disconnect.
             if error.to_string().contains("close_notify") {
-                println!("INFO connection from {address} closed without TLS close_notify");
+                log_connection(format_args!(
+                    "INFO connection from {address} closed without TLS close_notify"
+                ));
             } else {
-                eprintln!("WARN connection error from {address}: {error}");
+                log_connection(format_args!(
+                    "WARN connection error from {address}: {error}"
+                ));
             }
         }
 
@@ -5009,10 +5056,10 @@ async fn handle_connection(
                     })
                 };
                 if !authenticated {
-                    eprintln!(
+                    log_rejection(format_args!(
                         "WARN rejected T from {peer_ip}: {name} is not a registered node (or \
                          presented the wrong token)"
-                    );
+                    ));
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "T carried an unrecognized name or the wrong membership token",
@@ -5146,9 +5193,9 @@ async fn handle_connection(
                         continue;
                     }
                     Err(()) => {
-                        eprintln!(
+                        log_rejection(format_args!(
                             "WARN rejected node leave for {name} from {peer_ip}: token mismatch"
-                        );
+                        ));
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "node leave rejected",
@@ -5188,10 +5235,10 @@ async fn handle_connection(
                         continue;
                     }
                     Err(()) => {
-                        eprintln!(
+                        log_rejection(format_args!(
                             "WARN rejected proxy deregister for {name} from {peer_ip}: \
                              token mismatch"
-                        );
+                        ));
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "proxy deregister rejected",
@@ -5244,10 +5291,10 @@ async fn handle_connection(
                     write_response(&mut stream, b"R\n").await?;
                     continue;
                 }
-                eprintln!(
+                log_rejection(format_args!(
                     "WARN rejected proxy announce for {name} from {peer_ip}: token mismatch \
                      or proxy registry full"
-                );
+                ));
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "proxy announce rejected",
@@ -5301,35 +5348,35 @@ async fn handle_connection(
                         ));
                     }
                     Err(JoinRejection::TokenMismatch) => {
-                        eprintln!(
+                        log_rejection(format_args!(
                             "WARN rejected join for {name} from {peer_ip}: wrong token for \
                              an already-registered name — either an impersonation attempt \
                              or a node reusing another's name"
-                        );
+                        ));
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "join with a token that does not match the registered one",
                         ));
                     }
                     Err(JoinRejection::TooManyWaitingFromSource) => {
-                        eprintln!(
+                        log_rejection(format_args!(
                             "WARN rejected join for {name} from {peer_ip}: already has \
                              {MAX_WAITING_PER_SOURCE_IP} Waiting/Joining registrations \
                              outstanding from this source"
-                        );
+                        ));
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "too many pending joins already registered from this source",
                         ));
                     }
                     Err(JoinRejection::MigrateMessageTooLarge { message_len }) => {
-                        eprintln!(
+                        log_rejection(format_args!(
                             "WARN rejected join for {name}: the M message this join would \
                              require ({message_len} bytes) exceeds nanocached-node's own \
                              request-size cap ({NODE_MAX_REQUEST_SIZE} bytes) — the registry \
                              is too large to admit another node without nodes rejecting the \
                              handoff outright; see NODE_MAX_REQUEST_SIZE"
-                        );
+                        ));
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "registry too large to admit a new node: the resulting M message \
@@ -5337,11 +5384,11 @@ async fn handle_connection(
                         ));
                     }
                     Err(JoinRejection::TooManyWaitingTotal) => {
-                        eprintln!(
+                        log_rejection(format_args!(
                             "WARN rejected join for {name} from {peer_ip}: \
                              {MAX_WAITING_TOTAL} Waiting/Joining registrations are already \
                              outstanding cluster-wide"
-                        );
+                        ));
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "too many pending joins already registered cluster-wide",
@@ -5458,13 +5505,13 @@ async fn handle_connection(
                     // called with the registry lock NOT held (see this
                     // arm's own comment above).
                     if !announce_insert_allowed(&config.announce_limiter, peer_ip) {
-                        eprintln!(
+                        log_rejection(format_args!(
                             "WARN rejected announce for {name} from {peer_ip}: more than \
                              {ANNOUNCE_INSERT_BURST} new registrations from this source at \
                              once; one more is allowed every {}s (see \
                              ANNOUNCE_INSERT_BURST / ANNOUNCE_INSERT_COOLDOWN)",
                             ANNOUNCE_INSERT_COOLDOWN.as_secs()
-                        );
+                        ));
                         break 'decide Err("too many new announces from this source; retry \
                                             shortly");
                     }

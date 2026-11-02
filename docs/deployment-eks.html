@@ -274,9 +274,11 @@ scale-in</a>). Capture a leaver's log with <code>kubectl logs -f</code>
 <p>Note what the drain needs: discovery. Deleting the whole namespace
 (as the teardown does) stops discovery and the nodes together, and
 every node then logs <code>decommission: fetching the roster failed
-(Connection refused); leaving without a handoff</code> — correct, since
-there is nobody left to hand off to, but not what a scale-down looks
-like. Under a scale-down discovery stays up, the leaver hands its
+(Connection refused); retrying every 1s until the drain deadline</code>
+and, once <code>--drain-timeout</code> has run out, <code>leaving
+without a handoff</code> — correct, since there is nobody left to hand
+off to (the retry is for a discovery that is only restarting), but not
+what a scale-down looks like. Under a scale-down discovery stays up, the leaver hands its
 entries to the survivors and discovery logs <code>node left the
 cluster</code>.</p>
 

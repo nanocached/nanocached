@@ -23,7 +23,7 @@ RUN=${RUN:-$(date +%H%M%S)}; L="$E/logs/steady-$RUN"; rm -rf "$L"; mkdir -p "$L"
 LOAD_SECS=$(( STABLE + WATCH + 150 ))
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
 tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }
-cleanup(){ docker rm -f $(docker ps -aq --filter name=$P-) >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 client(){ docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python "$@"; }
 entries_of(){ docker run --rm --network $NET e2e-client python -c "import urllib.request;print([l.split()[1] for l in urllib.request.urlopen('http://$1:9100/metrics',timeout=5).read().decode().splitlines() if l.startswith('nanocached_node_entries ')][0])" 2>/dev/null || echo "?"; }
 reclaims_of(){ docker logs $1 2>&1 | grep -c "INFO reclaimed"; }
