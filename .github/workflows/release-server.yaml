@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - 'server/v*'
+  # Re-point `:latest` for the three images without publishing anything:
+  # only the `latest` job runs (see below).
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version to point :latest at, e.g. 0.6.0 (server/v0.6.0 and v0.6.0
+          are accepted too). Empty: the newest stable server/v* tag.
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -19,6 +30,8 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # A manual run only moves `:latest`; it never builds or pushes `:X.Y.Z`.
+    if: ${{ github.event_name == 'push' }}
 
     strategy:
       matrix:
@@ -70,13 +83,58 @@ jobs:
   # re-run of an older tag's workflow, or a tag pushed out of order, must
   # not move `:latest` backwards. The comparison reads the
   # `org.opencontainers.image.version` label the build step writes.
+  #
+  # Also the manual entry point (`workflow_dispatch`) for repairing the
+  # registry when the three `:latest` disagree: `publish` is skipped then,
+  # so the job accepts a skipped `publish` for a manual run only, and takes
+  # the version from the input (default: the newest stable `server/v*` tag)
+  # instead of the ref name, which is a branch for a manual run. The
+  # pre-release check moves into the version step for the same reason.
   latest:
     needs: publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: >-
+      ${{ !cancelled() && (
+        (github.event_name == 'push'
+          && needs.publish.result == 'success'
+          && !contains(github.ref_name, '-'))
+        ||
+        (github.event_name == 'workflow_dispatch'
+          && needs.publish.result == 'skipped')
+      ) }}
 
     steps:
+      - name: Resolve the version to point :latest at
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ github.repository }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            ver="${REF_NAME#server/v}"
+          else
+            ver="${INPUT_VERSION#server/}"
+            ver="${ver#v}"
+            if [ -z "$ver" ]; then
+              ver=$(gh api --paginate "repos/$SLUG/git/matching-refs/tags/server/v" --jq '.[].ref' \
+                | sed 's#^refs/tags/server/v##' \
+                | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+                | sort -V | tail -n1)
+            fi
+            # A manual run is held to the same rule as the tag path: a
+            # pre-release (or anything that is not X.Y.Z) never becomes `:latest`.
+            if ! printf '%s' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::'$ver' is not a stable X.Y.Z version (input: '${INPUT_VERSION}')"
+              exit 1
+            fi
+          fi
+          echo "Pointing :latest at $ver"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -90,9 +148,15 @@ jobs:
       - name: Move :latest for all three images
         env:
           REPO: ghcr.io/${{ github.repository }}
-          VER: ${{ github.ref_name }}
+          VER: ${{ steps.ver.outputs.ver }}
         run: |
-          ver="${VER#server/v}"
+          ver="$VER"
+          # All three `:X.Y.Z` must exist before any `:latest` moves: a
+          # manual run can name a version whose build never finished, and
+          # failing half-way would leave the images on different releases.
+          for component in node discovery proxy; do
+            docker buildx imagetools inspect "$REPO-$component:$ver" > /dev/null
+          done
           # The version `:latest` points at now, from the node image's
           # label (a multi-platform image: `.Image` is keyed by platform).
           # Empty when there is no `:latest` yet or it carries no label,
