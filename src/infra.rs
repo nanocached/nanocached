@@ -520,14 +520,24 @@ impl<S: AsyncRead + Unpin> AsyncBufRead for CarryReader<'_, S> {
 /// stops draining its receive buffer (crashed-but-open, black-holed, or
 /// hostile) would otherwise park the write, and whatever permit or queue
 /// slot the task holds, forever.
+///
+/// The write is flushed too, inside the same bound. `write_all` over TLS
+/// can finish with ciphertext still in the TLS writer's buffer — tokio-rustls
+/// reports a write as done once the plaintext is accepted, even when the
+/// socket was full — and neither a later read nor the end of the task sends
+/// it, so the tail of a reply larger than the socket buffers would never
+/// reach a slow reader. Over plain TCP the flush does nothing.
 pub async fn write_all_within<W: AsyncWrite + Unpin>(
     writer: &mut W,
     data: &[u8],
     limit: Duration,
 ) -> io::Result<()> {
-    timeout(limit, writer.write_all(data))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
+    timeout(limit, async {
+        writer.write_all(data).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
 }
 
 // ─── startup exposure warning ───────────────────────────────────────────
@@ -992,6 +1002,46 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(started.elapsed(), StdDuration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn a_write_is_flushed_before_it_counts_as_done() {
+        // Issue #1279: a TLS writer can accept all the plaintext while
+        // ciphertext is still buffered; only `flush` sends the rest. A
+        // writer that, like that one, keeps what it was given until it is
+        // flushed shows the bytes are out only after `write_all_within`
+        // returns.
+        struct Buffered {
+            pending: Vec<u8>,
+            sent: Vec<u8>,
+        }
+        impl AsyncWrite for Buffered {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.pending.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                let pending = std::mem::take(&mut self.pending);
+                self.sent.extend_from_slice(&pending);
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut writer = Buffered {
+            pending: Vec::new(),
+            sent: Vec::new(),
+        };
+        write_all_within(&mut writer, b"reply", StdDuration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(writer.sent, b"reply");
+        assert!(writer.pending.is_empty());
     }
 
     #[tokio::test]
