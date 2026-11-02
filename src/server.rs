@@ -108,20 +108,30 @@ pub(crate) const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
 /// entries themselves keep (`MULTI_KEY_REPLY_BYTES_PER_KEY` per key) stays
 /// charged until the reply is written, and the rest is released before the
 /// reply's own bytes are charged. A cost above the budget is
-/// clamped to it (a multi-key frame, to what the receive buffers leave
-/// of it), so such a request takes the budget and runs alone rather than
-/// waiting forever; a holder never waits for bytes it
-/// holds itself (a charge taken while another is held asks only for the
-/// rest of the budget), and a connection that cannot get its charge in
-/// time is closed, the way a stalled write or a trickled frame is.
+/// clamped to what the budget has left after the bytes connections are
+/// pinning (`room`: receive buffers and frame charges, whose holders may
+/// themselves be waiting on the budget), so such a request takes that
+/// and runs alone rather than waiting forever; a holder never waits for
+/// bytes it holds itself (a charge taken while another is held asks only
+/// for the rest of the budget), and a connection that cannot get its
+/// charge in time is closed, the way a stalled write or a trickled frame
+/// is.
 #[derive(Clone)]
 pub(crate) struct InFlightBudget {
     permits: Arc<Semaphore>,
     bytes: usize,
-    /// How much of the budget connections currently hold as receive
-    /// buffers (`ReceiveTally`): bytes no waiter can expect to see freed
-    /// by waiting, because their holders are waiting too.
-    receiving: Arc<AtomicUsize>,
+    /// How much of the budget connections currently pin: their receive
+    /// buffers (`ReceiveTally`) and what their multi-key frame charges
+    /// keep for the reply phase (`FrameCharge::pin`). These are the bytes
+    /// no waiter can expect to see freed by waiting, because their holders
+    /// may be waiting on the budget themselves: a receive buffer goes once
+    /// its frame has been served, and serving it may wait for a frame
+    /// charge or a reply charge; the reply-phase remainder is held through
+    /// the wait for the reply's own charge. The rest of a frame's working
+    /// charge is not pinned: it is released once the entries are built,
+    /// which waits on the cache and the forward queues but never on the
+    /// budget, so a waiter can count on it.
+    pinned: Arc<AtomicUsize>,
 }
 
 impl InFlightBudget {
@@ -129,21 +139,24 @@ impl InFlightBudget {
         Self {
             permits: Arc::new(Semaphore::new(bytes)),
             bytes,
-            receiving: Arc::new(AtomicUsize::new(0)),
+            pinned: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// The most a multi-key frame can charge on top of the receive buffer
-    /// its connection holds (`own_receive`): what is left of the budget
-    /// once every connection's receive buffer is counted, not only its
-    /// own. A frame that costs more than that is clamped to it. Issue
-    /// #1262: clamping to "the budget less my own buffer" let two frames
-    /// that each cost more than the budget wait for each other for good,
-    /// since each request needed the other's receive buffer to be gone,
-    /// and a receive buffer is only gone once its frame has been served.
-    fn frame_room(&self, own_receive: usize) -> usize {
-        let receiving = self.receiving.load(Ordering::Relaxed).max(own_receive);
-        self.bytes.saturating_sub(receiving)
+    /// The most a holder can charge on top of what it already pins
+    /// (`own`): what is left of the budget once every connection's pinned
+    /// bytes are counted, not only its own. A cost above that is clamped
+    /// to it. Issue #1262: clamping a frame to "the budget less my own
+    /// buffer" let two frames that each cost more than the budget wait for
+    /// each other for good, since each request needed the other's receive
+    /// buffer to be gone, and a receive buffer is only gone once its frame
+    /// has been served. Issue #1264: a reply clamped to "the budget less
+    /// what I hold" had the same shape against the other connections'
+    /// buffers and the reply-phase remainders of their frame charges,
+    /// which are held through the wait for their own reply charge.
+    fn room(&self, own: usize) -> usize {
+        let pinned = self.pinned.load(Ordering::Relaxed).max(own);
+        self.bytes.saturating_sub(pinned)
     }
 
     /// Reserves `cost` bytes (clamped to the budget), waiting for them.
@@ -179,18 +192,18 @@ impl InFlightBudget {
     }
 }
 
-/// A connection's share of `InFlightBudget::receiving`: what its receive
+/// A connection's share of `InFlightBudget::pinned`: what its receive
 /// buffer is charged, mirrored into the budget's tally and taken back when
 /// the connection ends, whichever way it does.
 struct ReceiveTally {
-    receiving: Arc<AtomicUsize>,
+    pinned: Arc<AtomicUsize>,
     mine: usize,
 }
 
 impl ReceiveTally {
     fn new(budget: &InFlightBudget) -> Self {
         Self {
-            receiving: Arc::clone(&budget.receiving),
+            pinned: Arc::clone(&budget.pinned),
             mine: 0,
         }
     }
@@ -198,11 +211,9 @@ impl ReceiveTally {
     /// Records that the connection's receive buffer is now charged `bytes`.
     fn set(&mut self, bytes: usize) {
         if bytes >= self.mine {
-            self.receiving
-                .fetch_add(bytes - self.mine, Ordering::Relaxed);
+            self.pinned.fetch_add(bytes - self.mine, Ordering::Relaxed);
         } else {
-            self.receiving
-                .fetch_sub(self.mine - bytes, Ordering::Relaxed);
+            self.pinned.fetch_sub(self.mine - bytes, Ordering::Relaxed);
         }
         self.mine = bytes;
     }
@@ -219,10 +230,19 @@ impl Drop for ReceiveTally {
 /// by `keep_reply_phase` to what the reply entries still occupy once they
 /// are built. A semaphore permit cannot give back part of itself, so this
 /// holds the permits itself and returns them to the budget as they go.
+/// What the reply phase will keep of it is mirrored into
+/// `InFlightBudget::pinned` from the start (issue #1264): that remainder
+/// is held through the wait for the reply's own charge, so another
+/// connection's request must not count on it. The working charge above
+/// it is not mirrored — it goes once the entries are built, without a
+/// budget wait.
 #[derive(Debug)]
 struct FrameCharge {
     permits: Arc<Semaphore>,
+    pinned: Arc<AtomicUsize>,
     held: u32,
+    /// How much of `held` is counted in `pinned`.
+    pinned_held: u32,
 }
 
 impl FrameCharge {
@@ -234,7 +254,24 @@ impl FrameCharge {
             self.permits.add_permits(released as usize);
             self.held = keep;
         }
+        if self.pinned_held > keep {
+            self.pinned
+                .fetch_sub((self.pinned_held - keep) as usize, Ordering::Relaxed);
+            self.pinned_held = keep;
+        }
         self.held as usize
+    }
+
+    /// Counts everything still held in `InFlightBudget::pinned`, from now
+    /// until it is given back: called once the charge is down to what the
+    /// reply phase keeps, before the reply's own charge is waited for. The
+    /// usual case pinned that much at creation and this changes nothing.
+    fn pin(&mut self) {
+        if self.held > self.pinned_held {
+            self.pinned
+                .fetch_add((self.held - self.pinned_held) as usize, Ordering::Relaxed);
+            self.pinned_held = self.held;
+        }
     }
 }
 
@@ -242,6 +279,10 @@ impl Drop for FrameCharge {
     fn drop(&mut self) {
         if self.held > 0 {
             self.permits.add_permits(self.held as usize);
+        }
+        if self.pinned_held > 0 {
+            self.pinned
+                .fetch_sub(self.pinned_held as usize, Ordering::Relaxed);
         }
     }
 }
@@ -255,9 +296,14 @@ impl Drop for FrameCharge {
 /// stay alive for the whole write — up to `WRITE_TIMEOUT`, or until the
 /// connection is closed for a client that does not read.
 /// `MULTI_KEY_REPLY_BYTES_PER_KEY` covers them with room for the allocator.
+/// What stays is pinned (`FrameCharge::pin`): it is held through the wait
+/// for the reply's own charge, so other connections' requests must not
+/// count on it (issue #1264).
 fn keep_reply_phase(frame_charge: &mut Option<FrameCharge>, keys: usize) -> usize {
     frame_charge.as_mut().map_or(0, |charge| {
-        charge.shrink_to(keys.saturating_mul(MULTI_KEY_REPLY_BYTES_PER_KEY))
+        let kept = charge.shrink_to(keys.saturating_mul(MULTI_KEY_REPLY_BYTES_PER_KEY));
+        charge.pin();
+        kept
     })
 }
 
@@ -376,10 +422,11 @@ const MULTI_SET_VALUE_BYTES_PER_KEY: usize = 32;
 /// before the reply itself is charged (`write_reply`). It is called before the parser builds the frame's key
 /// vectors (`parse_resumable`'s `ParseError::ChargeRequired`), so a
 /// connection waiting here holds no uncharged per-key memory. A frame
-/// costing more than the budget takes what the receive buffers (its own
-/// and every other connection's) leave of it and runs alone with them
-/// (`InFlightBudget::frame_room`), so it neither waits for its own buffer
-/// nor for buffers whose holders are waiting for it. Waits at most
+/// costing more than the budget takes what the pinned bytes (its own
+/// receive buffer, every other connection's, and what their replies keep
+/// of their frame charges) leave of it and runs alone with them
+/// (`InFlightBudget::room`), so it neither waits for its own buffer nor
+/// for bytes whose holders are waiting for it. Waits at most
 /// `WRITE_TIMEOUT`, like a reply, and fails the connection if the budget
 /// does not free in that time.
 async fn charge_multi_key_frame(
@@ -394,11 +441,11 @@ async fn charge_multi_key_frame(
         } else {
             0
         };
-    // A frame costing more than the budget takes what the receive buffers
-    // leave of it (`InFlightBudget::frame_room`) and runs alone with them.
+    // A frame costing more than the budget takes what the pinned bytes
+    // leave of it (`InFlightBudget::room`) and runs alone with them.
     let cost = keys
         .saturating_mul(per_key)
-        .min(config.in_flight_bytes.frame_room(receive_charged));
+        .min(config.in_flight_bytes.room(receive_charged));
     let permit = timeout(WRITE_TIMEOUT, config.in_flight_bytes.charge_exact(cost))
         .await
         .map_err(|_| {
@@ -409,9 +456,28 @@ async fn charge_multi_key_frame(
         })?;
     let held = u32::try_from(permit.num_permits()).unwrap_or(u32::MAX);
     permit.forget();
+    // What the reply phase will keep of this charge is pinned from the
+    // start (issue #1264): a waiter may count on the working charge above
+    // it being given back, but not on that part, which stays held through
+    // the wait for the reply's own charge. Pinning it only once the reply
+    // is built left a window in which another connection's reply, already
+    // waiting, had counted on it. An `o` keeps nothing across a budget
+    // wait: its ack is written without one.
+    let reply_keeps = if values {
+        0
+    } else {
+        keys.saturating_mul(MULTI_KEY_REPLY_BYTES_PER_KEY)
+    };
+    let pinned_held = u32::try_from(reply_keeps).unwrap_or(u32::MAX).min(held);
+    config
+        .in_flight_bytes
+        .pinned
+        .fetch_add(pinned_held as usize, Ordering::Relaxed);
     Ok(FrameCharge {
         permits: Arc::clone(&config.in_flight_bytes.permits),
+        pinned: Arc::clone(&config.in_flight_bytes.pinned),
         held,
+        pinned_held,
     })
 }
 
@@ -420,10 +486,14 @@ async fn charge_multi_key_frame(
 /// until it has been written. `held` is what the connection already
 /// holds (its receive buffer's charge, and for a multi-key frame what
 /// `keep_reply_phase` left): a reply that would take more than the budget
-/// takes only the rest of it, so the connection ends up holding the whole
-/// budget rather than waiting on its own permit. The caller holds nothing
-/// else by then — a multi-key frame's per-key working charge is released
-/// before its reply is charged, for the same reason.
+/// has room for takes only that room (`InFlightBudget::room`), so the
+/// connection neither waits on its own permit nor on the bytes other
+/// connections pin while they wait for their own reply charge (issue
+/// #1264: asking for "the budget less what I hold" let two such replies
+/// wait for each other's buffers and reply-phase charges for good). The
+/// caller holds nothing else by then — a multi-key frame's per-key
+/// working charge is released before its reply is charged, for the same
+/// reason.
 /// Waits at most `WRITE_TIMEOUT` for the budget — the same bound a
 /// stalled write gets — and fails the connection like one if it runs out.
 async fn write_reply(
@@ -433,10 +503,7 @@ async fn write_reply(
     tag: Option<u32>,
     held: usize,
 ) -> io::Result<()> {
-    let bytes = config
-        .in_flight_bytes
-        .clamp(reply_bytes(response).saturating_add(held))
-        .saturating_sub(held);
+    let bytes = reply_bytes(response).min(config.in_flight_bytes.room(held));
     let _charge = if bytes == 0 {
         None
     } else {
@@ -12476,12 +12543,132 @@ mod tests {
         }
         assert_eq!(budget.available(), MAX_REQUEST_SIZE);
         assert_eq!(
-            budget.receiving.load(Ordering::Relaxed),
+            budget.pinned.load(Ordering::Relaxed),
             0,
-            "a closed connection takes its share back out of the receive tally"
+            "a closed connection takes its share back out of the pinned tally"
         );
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replies_that_each_exceed_the_budget_do_not_wait_on_each_others_pinned_bytes() {
+        // Issue #1264: two `m` replies whose values together exceed the
+        // 1 MiB budget, on connections that each pin their 64 KiB receive
+        // charge and the 64 bytes per key their reply keeps. A reply used
+        // to ask for "the budget less what I hold", which is more than is
+        // free while the other connection pins its own share, and that
+        // share is only released once the other reply has been written:
+        // both waited for WRITE_TIMEOUT and were closed. Each now asks for
+        // what the budget has left after every connection's pinned bytes,
+        // so one is served at once and the other follows when it is done.
+        const KEYS: usize = 100;
+        const KEY_LEN: usize = 1_000;
+        const HITS: usize = 2;
+        const VALUE: usize = 600 * 1024;
+        let frame = {
+            let mut frame = format!("m 0 {KEYS}").into_bytes();
+            frame.extend(std::iter::repeat_n(format!(" {KEY_LEN}").into_bytes(), KEYS).flatten());
+            frame.push(b'\n');
+            frame.extend(std::iter::repeat_n(b'k', KEYS * KEY_LEN));
+            frame
+        };
+        let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+
+        let mut clients = Vec::new();
+        let mut connection_tasks = Vec::new();
+        for _ in 0..2 {
+            let (client, server) = tcp_pair().await;
+            connection_tasks.push(tokio::spawn(handle_connection(
+                ServerStream::Plain(server),
+                test_client_addr(),
+                request_tx.clone(),
+                connection_config_with_budget(&budget, IDLE_TIMEOUT),
+                shutdown_rx.clone(),
+            )));
+            clients.push(client);
+        }
+        // Both frames arrive up to their last bytes, so that both receive
+        // buffers are charged before either reply is.
+        let split = frame.len() - 10;
+        for client in &mut clients {
+            client.write_all(&frame[..split]).await.unwrap();
+        }
+        sleep(Duration::from_millis(300)).await;
+        let pinned = budget.pinned.load(Ordering::Relaxed);
+        assert!(
+            pinned > 0 && HITS * VALUE > MAX_REQUEST_SIZE - pinned,
+            "the receive buffers must be charged ({pinned} bytes) and the values must exceed \
+             what they leave, or the test means nothing"
+        );
+        for client in &mut clients {
+            client.write_all(&frame[split..]).await.unwrap();
+        }
+        // Answer both frames only once both have reached the cache, so the
+        // two replies are charged against each other.
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            requests.push(
+                timeout(Duration::from_secs(5), request_rx.recv())
+                    .await
+                    .expect("both frames reach the cache")
+                    .unwrap(),
+            );
+        }
+        for request in requests {
+            let mut results = vec![MultiEntry::Value(Bytes::from(vec![b'v'; VALUE])); HITS];
+            results.resize(KEYS, MultiEntry::Miss);
+            request
+                .response_tx
+                .send(Response::Multi(results))
+                .ok()
+                .unwrap();
+        }
+
+        // Each client reads its whole reply; both must arrive well inside
+        // WRITE_TIMEOUT, one after the other.
+        let readers: Vec<_> = clients
+            .into_iter()
+            .map(|mut client| {
+                tokio::spawn(async move {
+                    let mut header = [0u8; 6];
+                    client.read_exact(&mut header).await.unwrap();
+                    assert_eq!(&header, b"M 100 ");
+                    let mut rest = Vec::new();
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while rest.len() < HITS * VALUE {
+                        let n = client.read(&mut buf).await.unwrap();
+                        assert!(n > 0, "the reply ends early");
+                        rest.extend_from_slice(&buf[..n]);
+                    }
+                    client
+                })
+            })
+            .collect();
+        let mut clients = Vec::new();
+        for reader in readers {
+            clients.push(
+                timeout(Duration::from_secs(4), reader)
+                    .await
+                    .expect(
+                        "both replies are written, not left waiting for each other's pinned bytes",
+                    )
+                    .unwrap(),
+            );
+        }
+
+        drop(clients);
+        for task in connection_tasks {
+            let _ = timeout(Duration::from_secs(5), task).await;
+        }
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+        assert_eq!(
+            budget.pinned.load(Ordering::Relaxed),
+            0,
+            "closed connections take their reply-phase charges and buffers back out of the pinned tally"
+        );
     }
 
     #[test]
