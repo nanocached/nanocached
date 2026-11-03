@@ -121,6 +121,11 @@ which is why they are three services with three desired counts:</p>
 <p>For example, 40 application tasks × 8 connections = 320 client
 connections: two proxies (capacity 2,048) carry that, and growing the
 dataset changes the node count, not the proxy count.</p>
+<p>The proxy mirrors the node's other per-connection limits: a request is
+at most 1&nbsp;MiB, and a connection idle for 60&nbsp;seconds is closed.
+The idle time is measured from the last complete frame, so a frame
+trickled in a byte at a time does not extend it &mdash; the node's own
+rule.</p>
 
 <h2 id="ecs">On ECS: a third service</h2>
 <p>Everything below assumes the cluster from <a

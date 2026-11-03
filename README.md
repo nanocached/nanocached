@@ -15,266 +15,59 @@
 
 nanocached is a compact in-memory key-value cache server written in Rust. It
 uses a small, binary-safe TCP protocol and supports optional time-to-live
-(TTL) values.
+(TTL) values. One node runs on its own; several nodes form a replicated
+cluster in which the clients do the routing.
 
 > [!NOTE]
 > nanocached is currently experimental and is not ready for production use.
 
+Full documentation is at <https://nanocached.org>.
+
 ## Features
 
-- In-memory storage for binary keys and values
-- `G`, `S`, and `D` commands, and their namespaced forms `g`, `s`, `d`
-  with `c`/`F` to clear one namespace or all of them
-- `i` atomic counters, `t` to refresh or remove a TTL in place (with an
-  optional get), `k`/`x` compare-and-set and compare-and-delete,
-  `m`/`o` batched get and set
-- Optional TTL for stored values
-- Optional shared-secret authentication (`A` command)
-- Optional TLS (required for every connection once configured, no
-  plaintext fallback)
-- Multiple requests per TCP connection
-- Pipelined requests
-- Idle connection timeout
-- Request-size and connection-count limits
+- In-memory storage for binary keys and values, with optional TTL
+- Get, set and delete, their namespaced forms, and clearing one namespace or
+  all of them
+- Atomic counters, in-place TTL refresh, compare-and-set and
+  compare-and-delete, and batched get, set and touch
 - Memory-bounded cache with least-recently-used (LRU) eviction
+- Replicated clusters with client-side routing, a discovery server for
+  membership, and an optional stateless proxy for clients that cannot route
+- Optional shared-secret authentication and optional TLS
+- Multiple and pipelined requests per TCP connection
+- Request-size, connection-count and idle-timeout limits
+- Client SDKs for six languages and seven framework adapters
 
-## Requirements
-
-- Rust 1.96.0
-- `cargo-nextest` for `make test`
-- `cargo-mutants` for mutation testing
-
-The repository includes `rust-toolchain.toml`, so Rustup selects the required
-toolchain and installs the Clippy and rustfmt components automatically.
-
-## Command-line tools
-
-Building the project produces five binaries:
-
-- `ncd` — a thin dispatcher: `ncd node start [options]` runs the cache node,
-  `ncd discovery start [options]` runs the discovery server. Convenient for
-  running a bare-metal build; Docker images run their binary directly
-  instead (see [Docker](#docker) below) so each image only contains what
-  its role needs.
-- `nanocached-node` — the cache server itself.
-- `nanocached-discovery` — the standalone cluster-membership registry (see
-  [Discovery server](#discovery-server) below).
-- `nanocached-proxy` — an optional stateless proxy that routes for clients
-  that cannot hold the cluster's node list themselves (see the
-  [proxy guide](https://nanocached.org/deployment-proxy.html)).
-- `verify-staged-join` — a development tool that drives a staged join
-  against a running cluster; not part of a deployment.
-
-`ncd` looks up `nanocached-node`/`nanocached-discovery` next to its own
-executable, so it only works once both have been built into the same
-`target/` directory (`cargo build` covers this; `cargo run --bin ncd` alone
-does not, since Cargo only builds the binary you asked to run).
-
-## Running the server
-
-### Cargo, for local development
-
-```sh
-cargo run --bin nanocached-node -- --host 0.0.0.0 --port 8356
-```
-
-nanocached listens on `127.0.0.1:8356` by default. Override the bind address
-and port with `--host` and `--port`.
-
-To register with a [discovery server](#discovery-server) so client SDKs can
-find this node, pass `--discovery`:
-
-```sh
-cargo run --bin nanocached-node -- --port 8356 --discovery 127.0.0.1:8357
-```
-
-The node sends a heartbeat every 5 seconds; the discovery server derives
-the node's reachable address from that connection's own source IP plus
-the node's port, so containerized deployments need no address
-configuration. Each heartbeat is acknowledged with the
-discovery server's current member list, so a node's own view of the
-ring — what it uses to answer `W` for keys it doesn't own — follows
-evictions within one heartbeat interval, not only joins. The order to
-upgrade a cluster in is in the
-[operations guide](https://nanocached.org/deployment-operations.html#upgrade).
-Omit `--discovery` to run standalone.
-(Asymmetric port mapping — e.g. Docker's `-p 9999:8356` — is
-unsupported: it is NAT, which the cluster design already excludes.)
-
-`--discovery` accepts a comma-separated list of discovery replicas:
-the node registers with and heartbeats to all of
-them, but only the first — the primary — ever orchestrates its join. Every
-node in a cluster must list the same addresses in the same order:
-
-```sh
-cargo run --bin nanocached-node -- --port 8356 \
-  --discovery 127.0.0.1:8357,127.0.0.1:8358
-```
-
-Joins are serialized: discovery moves one node at a time through its
-staged handoff, so nodes started together (or in quick succession) queue
-and join one after another — each join takes roughly the time its handoff
-needs, and no key is lost to a join that has to be retried (a source keeps
-the copies it handed off until discovery confirms the join).
-A joiner is tracked by its connection to discovery, which enables TCP
-keepalive on it: a joiner whose host vanishes without closing the
-connection (power loss, a partition) is dropped from the queue once
-keepalive gives up, about 25 seconds on Linux, instead of holding up the
-joiners behind it.
-
-Liveness is binary: a node is a member until it misses heartbeats for the
-liveness timeout, and a node that is slow but answering — a saturated
-host, a lossy or high-latency link — is never evicted. Every request that
-touches such a node waits out its full round trip, so with `R` copies on
-`N` nodes roughly `R/N` of all requests do, and the cluster's tail latency
-becomes that node's. Reads can route around it: the SDKs' hedged reads
-(`read_hedge_after` in the Python SDK) send a read to the next owner when
-the primary is silent for longer than a configured interval. Writes cannot
-— every copy must be written — so a slow owner bounds writes to it until
-it is fixed or removed; `fire_and_forget_replicas` keeps only the replica
-legs off the caller's path.
-
-Leaving is graceful: on SIGTERM a clustered node hands every key it owns
-to the node that inherits it (staying a member, and heartbeating, until
-the handoff is done), leaves membership immediately after, and keeps
-forwarding concurrent writes while clients catch up — all within
-`--drain-timeout` seconds (default 25; `0` skips the handoff; at most
-604800). The proxy
-does the same for its role: deregister from discovery, finish in-flight
-requests, exit. `--metrics-port` on any binary serves Prometheus-format
-`/metrics` plus `/healthz` and `/readyz` probes. See the
-[deployment guide](https://nanocached.org/deployment.html) for three
-verified setups: a single node on EC2, and an autoscaled multi-AZ
-cluster on ECS Fargate and on EKS.
-
-### Authentication
-
-Set `NANOCACHED_AUTH_SECRET` to require clients to authenticate with a shared
-secret before issuing any other command (see [A (auth)](#a-auth) below). It's
-an environment variable rather than a CLI flag so the secret doesn't show up
-in `ps` output. Both `nanocached-node` and `nanocached-discovery` read it
-independently, so set it on both to protect a cluster:
-
-```sh
-NANOCACHED_AUTH_SECRET=change-me cargo run --bin nanocached-node -- --port 8356
-NANOCACHED_AUTH_SECRET=change-me cargo run --bin nanocached-discovery -- --port 8357
-```
-
-If a node registers with a discovery server that requires auth, it uses the
-same `NANOCACHED_AUTH_SECRET` value to authenticate its own heartbeats.
-
-Leaving `NANOCACHED_AUTH_SECRET` unset (or empty) disables authentication —
-matching Redis's own `requirepass`-unset default — and `A` becomes a no-op
-that always succeeds. A value that is set but is not valid UTF-8 is refused
-at startup (every SDK sends the secret as UTF-8, so no client could present
-it) rather than treated as unset. This is a secondary layer of defense, not a substitute
-for network isolation: without [TLS](#tls), the protocol has no transport
-encryption, so an attacker who can already observe the connection can read
-the secret and every key/value in cleartext. Bind to `127.0.0.1` or a
-private network interface (the default) and treat authentication as
-protection against other processes/users reachable on that network, not
-against network eavesdropping, unless TLS is also enabled.
-
-### TLS
-
-Pass `--tls-cert`/`--tls-key` (PEM files) to require TLS on every
-connection a node or discovery server accepts — there is no plaintext
-fallback once set, matching how [authentication](#authentication) is
-either fully required or fully off:
-
-```sh
-cargo run --bin nanocached-node -- --port 8356 --tls-cert cert.pem --tls-key key.pem
-cargo run --bin nanocached-discovery -- --port 8357 --tls-cert cert.pem --tls-key key.pem
-```
-
-A node that registers with a TLS-secured discovery server also needs
-`--tls-ca` (a PEM file of CA certificate(s) to trust) so its heartbeat
-connection can verify the discovery server's certificate — only those CAs
-are trusted, not the system trust store, since this is meant for a
-private cluster's own certificates rather than publicly-issued ones:
-
-```sh
-cargo run --bin nanocached-node -- --port 8356 --tls-cert cert.pem --tls-key key.pem \
-  --tls-ca ca.pem --discovery 127.0.0.1:8357
-```
-
-In a cluster, certificates must carry each node's **IP address** in
-`subjectAltName`, not (only) a hostname: discovery advertises a node by
-the source IP of its registration connection, so discovery's own
-connections to a node and every SDK's connections verify the certificate
-against that IP — a DNS-only SAN fails with `certificate not valid for
-name "172.21.0.3"` on discovery and an `IP address mismatch` on clients.
-Where node IPs aren't known ahead of time (plain Docker, ECS tasks), give
-nodes static addresses, put every address the subnet can hand out in one
-SAN, or mint a per-node certificate at start-up. Clients verify the
-discovery server against whatever they were given in `addresses`, so a
-hostname SAN is fine there.
-
-For local development, generate a self-signed certificate with OpenSSL.
-The certificate must have `CA:FALSE` in its basic constraints — a
-self-signed cert generated with defaults is often marked as its own CA,
-which rustls correctly refuses to accept as a server's leaf certificate —
-and a `subjectAltName` matching whatever host/IP clients will actually
-connect to:
-
-```sh
-openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 \
-  -subj "/CN=127.0.0.1" \
-  -addext "subjectAltName=IP:127.0.0.1" \
-  -addext "basicConstraints=critical,CA:FALSE" \
-  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
-  -addext "extendedKeyUsage=serverAuth"
-```
-
-Since this is self-signed, the same `cert.pem` doubles as the `--tls-ca`
-trust anchor for any client (a node's heartbeat, or an SDK's TLS `ca`
-option) connecting to a server using it.
-
-Unlike authentication, TLS has no environment-variable option: certificate
-and key paths aren't secrets themselves (the private key file's contents
-are, but the OS already protects that via file permissions), so there's no
-`ps`-visibility concern with passing paths as CLI flags.
-
-### A built binary, via ncd
-
-```sh
-cargo build --release
-./target/release/ncd node start --host 0.0.0.0 --port 8356
-```
+## Quick start
 
 ### Docker
 
-The included `Dockerfile` builds three separate, minimal Alpine-based
-images via multi-stage targets — each contains only its own binary, not
-`ncd` and not another role's binary:
-
-```sh
-docker build --target node --tag nanocached-node .
-docker run --rm --publish 8356:8356 nanocached-node
-
-docker build --target discovery --tag nanocached-discovery .
-docker run --rm --publish 8357:8357 nanocached-discovery
-
-docker build --target proxy --tag nanocached-proxy .
-docker run --rm --publish 8358:8358 nanocached-proxy --discovery disc:8357
-```
-
-`--target` is required; the Dockerfile has no default final stage.
-
-Images of the latest release are available from GitHub Container
-Registry as `:latest` (and as `:<version>`; the deployment guides pin a
-digest). Every `main` commit that passes CI is also published as `:main`
-and `:sha-<commit>` for trying unreleased changes:
+Images of the latest release are published to GitHub Container Registry as
+`:latest` and `:<version>`. Every `main` commit that passes CI is also
+published as `:main` and `:sha-<commit>`, for trying unreleased changes.
 
 ```sh
 docker pull ghcr.io/nanocached/nanocached-node:latest
 docker run --rm --publish 8356:8356 ghcr.io/nanocached/nanocached-node:latest
-
-docker pull ghcr.io/nanocached/nanocached-discovery:latest
-docker run --rm --publish 8357:8357 ghcr.io/nanocached/nanocached-discovery:latest
 ```
 
-For example, store and retrieve the value `Alice` under the key `name`:
+### From source
+
+Rustup selects the toolchain pinned in `rust-toolchain.toml` automatically.
+
+```sh
+git clone https://github.com/nanocached/nanocached.git
+cd nanocached
+cargo run --bin nanocached-node -- --host 0.0.0.0 --port 8356
+```
+
+A node listens on `127.0.0.1:8356` by default; override that with `--host`
+and `--port`. Run `cargo run --bin nanocached-node -- --help` for every
+option.
+
+### Try it
+
+Store the value `Alice` under the key `name`, then read it back:
 
 ```sh
 printf 'S 4 5\nnameAliceG 4\nname' | nc 127.0.0.1 8356
@@ -288,443 +81,188 @@ V 5
 Alice
 ```
 
-## Protocol
+Each request is an ASCII header ending in `\n`, followed by the key and value
+bytes, whose lengths the header gives. `S 4 5` sets a 4-byte key to a 5-byte
+value, and `G 4` gets a 4-byte key. The [protocol reference](https://nanocached.org/protocol.html)
+lists every command.
 
-Each request starts with an ASCII header terminated by `\n`. The key and
-value bodies immediately follow the header and are read according to their byte
-lengths. Bodies are not terminated by a delimiter and may contain arbitrary
-bytes. One-byte command and status identifiers minimize protocol overhead while
-keeping frames readable during development.
+## Programs
 
-A `<key-length>` of `0` is rejected for every command. There is no dedicated
-maximum key or value length beyond the overall request-size limit below.
+Building the repository (`cargo build`) produces these binaries:
 
-### A (auth)
+| Binary | Role | Default port |
+|---|---|---|
+| `nanocached-node` | The cache server itself | 8356 |
+| `nanocached-discovery` | Cluster-membership registry: nodes announce themselves to it and clients fetch the node list from it | 8357 |
+| `nanocached-proxy` | Optional stateless proxy that routes for clients that cannot hold the node list themselves (see the [proxy guide](https://nanocached.org/deployment-proxy.html)) | 8358 |
+| `ncd` | Thin dispatcher: `ncd node start [options]` and `ncd discovery start [options]` | — |
 
-```text
-A <secret-length>\n<secret>
-```
+`ncd` looks up `nanocached-node` and `nanocached-discovery` next to its own
+executable, so it works once `cargo build` has built them into the same
+`target/` directory; `cargo run --bin ncd` alone does not build them.
 
-Responses:
+## Running a cluster
 
-```text
-On\n
-```
-
-(`Od\n` from a discovery server) or, if the secret doesn't match:
-
-```text
-En\n
-```
-
-(`Ed\n` from a discovery server) immediately followed by the server
-closing the connection. If the server has no auth secret configured, `A`
-always responds `On\n` regardless of what secret is sent. If it does,
-every other command on that connection is rejected until a matching `A`
-has been sent — a node answers `En\n` and closes the connection, a
-discovery server closes it without a reply — and `A` itself is always
-accepted before authentication.
-
-SDKs additionally append a `T` field (`A <secret-length> T\n<secret>`) to
-request response tags; a server that supports them echoes the capability
-in its reply (`OnT\n`/`OdT\n`) and the connection runs in tagged mode —
-see "Response tags" below.
-
-A further optional `R` field (`A <secret-length> [T] R\n<secret>`) declares
-that the client understands the retryable-error
-status: a server may then answer a *transiently* failed request with
-`R\n` (`R <tag>\n` in tagged mode) instead of the fatal
-`E`-and-close — the client retries that one request, bounded, on the
-same connection. Today `nanocached-proxy` is the only emitter (an
-upstream failure that survives its refresh-and-retry); nodes and
-discovery accept the token so the capability probe succeeds everywhere.
-A server that predates the token treats the extended `A` as malformed
-and closes, which the SDKs' existing capability fallback (retry with
-`A ... T`, then plain `A`) already handles.
-
-### G (get)
-
-```text
-G <key-length>\n<key>
-```
-
-Responses:
-
-```text
-V <value-length>\n<value>
-```
-
-or:
-
-```text
-N\n
-```
-
-### S (set)
-
-Without a TTL:
-
-```text
-S <key-length> <value-length>\n<key><value>
-```
-
-With a TTL in seconds:
-
-```text
-S <key-length> <value-length> <ttl-seconds>\n<key><value>
-```
-
-Response:
-
-```text
-S\n
-```
-
-### D (delete)
-
-```text
-D <key-length>\n<key>
-```
-
-Responses:
-
-```text
-D\n
-```
-
-or:
-
-```text
-N\n
-```
-
-### Response tags (tagged mode)
-
-Pipelined clients match responses to requests by order alone — the frames
-above carry nothing to verify against. A connection whose `A` carried the
-`T` flag and was answered `OnT\n` runs in tagged mode: every `G`/`S`/`D`
-header must end with a client-chosen tag (a u32 in decimal), and the
-response echoes it as its own last field, so a client can verify the
-pairing before trusting the answer.
-
-```text
-G <key-length> <tag>\n<key>
-S <key-length> <value-length> <tag>\n<key><value>
-S <key-length> <value-length> <ttl-seconds> <tag>\n<key><value>
-D <key-length> <tag>\n<key>
-```
-
-Responses become `V <value-length> <tag>\n<value>`, `S <tag>\n`,
-`D <tag>\n`, `N <tag>\n`, and `W <tag>\n`; `B\n` stays bare (it is
-unsolicited, sent before authentication). Tagged mode is per connection
-and entirely opt-in — a plain `A` keeps every frame exactly as documented
-above.
-
-When the connection limit has been reached, the server responds with:
-
-```text
-B\n
-```
-
-## SDKs
-
-- [`sdk/typescript`](sdk/typescript/README.md) — a TypeScript/
-  Node.js client (`get`/`set`/`delete`, authentication, TLS, and
-  discovery-based cluster routing with replication).
-- [`sdk/python`](sdk/python/README.md) — an asyncio Python client with
-  the same feature set (Python 3.11+, no runtime dependencies).
-- [`sdk/java`](sdk/java/README.md) — a thread-safe Java client with the
-  same feature set (Java 17+, no runtime dependencies,
-  `org.nanocached:nanocached`).
-- [`sdk/rust`](sdk/rust/README.md) — an async (tokio) Rust client with
-  the same feature set (TLS behind the `tls` feature).
-- [`sdk/dotnet`](sdk/dotnet/README.md) — an async .NET client with the
-  same feature set (.NET 10+, no dependencies, NuGet ID `Nanocached`).
-- [`sdk/go`](sdk/go/README.md) — a Go client with the same feature set
-  (Go 1.26+, standard library only, module
-  `github.com/nanocached/nanocached/sdk/go`).
-
-## Compatibility
-
-The project is pre-1.0: any release may break compatibility, without a
-deprecation cycle. What 1.0.0 will freeze (the client wire protocol and the
-public API of every SDK) is described on the
-[compatibility page](https://nanocached.org/compatibility.html).
-
-## Accepted behaviour
-
-Some behaviours were measured, understood and deliberately left as they
-are, because removing them would cost more than they are worth (most
-would need a version on every write, in the server and every SDK). They
-are collected in one list, one item each with what happens and why it
-stays: the
-[accepted behaviour list](https://nanocached.org/architecture.html#accepted-behaviour)
-on the architecture page. Read it before relying on a cluster during a
-membership change: for example, a counter incremented concurrently by
-several callers in the minute after a node joins can lose a few
-increments, and concurrent writes to one key from several callers can
-leave its replicas disagreeing until the next write.
-
-## Capacity planning
-
-Memory, effective capacity, replication (R), TTL, and hit rate trade off
-against each other — but not all at once: the hit rate is bounded by two
-independent ceilings (one set by capacity, one by TTL), and only the
-binding one responds to tuning. [`tools/capacity-planner.html`](tools/capacity-planner.html)
-is a self-contained, offline estimator (Japanese UI) that makes those
-trade-offs visible. Open it in any browser — no server, no build step:
+A cluster is several nodes plus a discovery server. Start the discovery
+server, then point each node at it with `--discovery`:
 
 ```sh
-open tools/capacity-planner.html
-```
-
-Enter your workload on the left — average key/value sizes, distinct key
-count, request rate, access skew (Zipf exponent), TTL, and the cluster
-shape (nodes × memory ÷ R) — and it estimates:
-
-- the predicted hit rate, and **which constraint is the bottleneck**
-  (adding memory only helps when capacity-bound; extending the TTL only
-  helps when TTL-bound — spend accordingly);
-- hit-rate curves against node memory and against TTL, with your current
-  configuration marked;
-- the minimum TTL and node memory needed to reach a target hit rate, or
-  a warning when the target is unreachable for the workload.
-
-The model is a TTL-extended Che approximation over a Zipf/Poisson
-workload (assumptions are listed at the bottom of the page). Treat the
-numbers as ±a-few-percent estimates for sizing, not guarantees; if they
-diverge from production, re-derive the skew and key count from real
-access logs first.
-
-## Development
-
-Run formatting and static checks:
-
-```sh
-make check
-```
-
-Run the test suite with cargo-nextest:
-
-```sh
-make test
-```
-
-Run mutation tests for the entire codebase or a specific source file:
-
-```sh
-make mutants
-make mutants FILE=src/cache.rs
-```
-
-Run mutation tests only against changes relative to `HEAD`:
-
-```sh
-make mutants-diff
-```
-
-Use `MUTANTS_BASE` to select a different comparison revision and
-`MUTANTS_JOBS` to change the mutation-test concurrency.
-
-```sh
-make mutants-diff MUTANTS_BASE=origin/main MUTANTS_JOBS=2
-```
-
-### Discovery server
-
-`src/bin/nanocached-discovery.rs` is a standalone cluster-membership
-registry that cache nodes and client SDKs use to find each other for
-horizontal scaling. It has no dependency on nanocached's own protocol
-modules.
-
-```sh
-cargo run --bin nanocached-discovery -- --help
 cargo run --bin nanocached-discovery -- --port 8357
+cargo run --bin nanocached-node -- --port 8356 --discovery 127.0.0.1:8357
+cargo run --bin nanocached-node -- --port 8358 --discovery 127.0.0.1:8357
 ```
 
-It supports the same `NANOCACHED_AUTH_SECRET`-based authentication and
-`--tls-cert`/`--tls-key`-based TLS as `nanocached-node` (see
-[Authentication](#authentication) and [TLS](#tls)); nodes speak the same
-`A` handshake and TLS handshake to it as clients do to a cache node.
+Every key lives on `--replication-factor` nodes (default 2, set on the
+discovery server), so one node dying loses no cached data; effective capacity
+is the total memory divided by that factor. Nodes join with a staged data
+handoff, and on SIGTERM a node hands its keys to their next owners before it
+exits. Discovery can run as several independent replicas: list the same
+replicas in the same order on every node and client with
+`--discovery host1:8357,host2:8357`.
 
-`--replication-factor <n>` (default 2, min 1) sets how many nodes hold
-each key (client-side replication): keys are ranked by rendezvous hashing and
-live on their top-R nodes, so any single node death costs no cached data —
-reads fail over to the next owner. Discovery is R's single source of
-truth: clients learn it from the `L` response, nodes from `M`. Effective
-cluster capacity is total memory ÷ R; `--replication-factor 1` restores
-single-copy behavior.
+See [getting started](https://nanocached.org/getting-started.html) for
+replication and discovery replicas in detail, and the
+[deployment guides](https://nanocached.org/deployment.html) for verified
+setups on EC2, ECS Fargate and EKS.
 
-Discovery's registry is soft state, rebuilt from node announces, so it can
-run as several independent replicas with no coordination between them:
-point every node's `--discovery` (and every SDK
-client's `addresses`) at the same list of replicas, and losing any one replica
-— including the primary — costs neither cache traffic nor client
-bootstrap. Only *joins* need the primary up. After a (re)start, a replica
-answers `L` with `B` (busy) for the liveness-timeout window while live
-members re-announce themselves, so a bootstrapping client never sees a
-half-recovered node list; a node asking to join in that window is held
-until it ends, so its handoff comes from the full member set rather than
-from whoever has re-announced so far.
+## Authentication
 
-**Each replica needs its own stable, individually addressable name (or a
-stable IP) — this is an operational requirement the system does not
-verify.** discovery HA's contract is that every node and client holds the
-*same list of replicas in the same order*; a single DNS name that
-round-robins across several replicas (or a multi-value discovery service,
-e.g. AWS Cloud Map's multi-value routing) breaks that, since which
-replica a resolution lands on — and in what order — becomes
-nondeterministic per resolver, per lookup. A bare task/pod IP has the
-same problem in a different shape: it works until that replica restarts
-with a new one, at which point every `--discovery` list silently loses
-it. Give each replica a stable identity instead — on ECS, one Cloud Map
-service (or ALB target group) per replica rather than one round-robin
-service in front of all of them; on Kubernetes, a headless
-Service-per-replica or a StatefulSet's stable per-pod DNS names.
+Set `NANOCACHED_AUTH_SECRET` to require clients to authenticate with a shared
+secret before issuing any other command. It is an environment variable rather
+than a flag so the secret does not show up in `ps` output. Set it on the
+node and the discovery server alike; a node uses the same value to
+authenticate its own heartbeats.
 
-Every replica must be started with the same `--replication-factor`; nothing
-enforces this at startup (replicas don't coordinate), but a node reports the
-replication factor it has learned on every heartbeat, and a replica logs a
-loud `WARN` if that disagrees with its own configured value.
+```sh
+NANOCACHED_AUTH_SECRET=change-me cargo run --bin nanocached-node -- --port 8356
+NANOCACHED_AUTH_SECRET=change-me cargo run --bin nanocached-discovery -- --port 8357
+```
 
-## Current limits
+Leaving it unset or empty disables authentication, and a server that then
+listens on a non-loopback address logs a warning at startup. Authentication
+is a second layer of defense, not a substitute for network isolation:
+without TLS the protocol has no transport encryption, so keep servers on
+`127.0.0.1` or a private network.
 
-### nanocached-node
+## TLS
 
-- Maximum request size: 1 MiB
-- Maximum concurrent connections: 1,024 by default, configurable with
-  `--max-connections <n>`, and at most 256 from any one source IP by
-  default, configurable with `--max-connections-per-ip <n>` (never above
-  the total; an unset per-IP cap shrinks to match a lowered total; an
-  IPv6 source counts per /64 prefix, so one allocation can't multiply its
-  share) — anything that collapses source addresses (Docker Desktop's port
-  publishing, a NAT gateway, Kubernetes pods behind one egress, a load
-  balancer without proxy protocol) makes the per-IP cap the effective
-  limit for everything behind it, so raise it in those deployments. A
-  proxy tier (`nanocached-proxy`) multiplexes all its clients over a
-  handful of node connections, which keeps a node well clear of both
-  caps; a client fleet dialing nodes directly is what runs into them
-- Maximum cache memory usage: 256 MiB by default, configurable with
-  `--max-memory <bytes>` (approximate: sum of stored key and value bytes
-  plus a small per-entry accounting overhead), least-recently-used
-  entries evicted first; `--max-memory` rejects anything below 1 MiB
-  (1,048,576 bytes) — a budget that low can never actually be satisfied
-  (the cache always keeps at least one entry), so it would just evict
-  everything else on every write instead of caching anything
-- In-flight bytes: what client connections hold outside the cache —
-  replies being written and requests still arriving — is bounded
-  node-wide at 256 MiB by default, configurable with
-  `--max-in-flight-bytes <bytes>` (at least 1 MiB). A reply's values
-  are charged before it is built and released once written; a receive
-  buffer's growth past 64 KiB is charged before it is allocated; and a
-  multi-key frame (`m`, `o` or `y`) is charged 256 bytes per key (288
-  for `o`) for the per-key lists the node builds while it runs, taken as
-  soon as the frame is fully received and before those lists exist (a
-  frame of one-byte keys can carry about 350,000 keys, so about 85 MiB).
-  Once the reply is built, 64 bytes per key of that stay charged until
-  the reply is written — the reply's entries and its encoded copy, which
-  a client that does not read keeps alive — and the rest is released. A
-  frame or a reply that costs more than the budget has room for waits
-  for that room — what is left after every connection's receive buffer
-  and the 64 bytes per key its reply keeps, bytes whose holders may be
-  waiting themselves — and then runs alone with it. When receive buffers
-  pin the whole budget, nothing is left to wait for: a connection that
-  holds a buffer itself then takes a single node-wide overdraft slot and
-  answers without a charge, one at a time, because its buffer is only
-  released after the replies it has buffered and two such connections
-  would otherwise wait for each other. That overshoots the budget by one
-  frame or reply, never more, and a connection with no buffer charged
-  keeps waiting for the budget. A connection that cannot get its
-  share in time is closed, like a stalled one. Size a process at
-  `--max-memory` plus this plus headroom
-- Per-namespace caps: `--namespace-budget <ns>=<bytes>` (repeatable)
-  caps one namespace's share — over its cap it evicts from *itself*,
-  oldest first, so a churny namespace (a session store, say) can't
-  evict a small precious one (config lookups) under the shared LRU. A
-  budget is a cap, not a reservation: the global `--max-memory` LRU
-  still evicts the overall-oldest entry regardless of budgets, so
-  protect a small namespace by capping the big churny ones. Uncapped
-  namespaces share whatever remains; a single entry may exceed its
-  namespace's cap, mirroring `--max-memory`'s own floor. Give every
-  node in a cluster the same flags, as with `--max-memory`
-- Idle connection timeout: 60 seconds
+Pass `--tls-cert` and `--tls-key` (PEM files) to require TLS on every
+connection a node or discovery server accepts; there is no plaintext
+fallback once they are set.
 
-### nanocached-proxy
+```sh
+cargo run --bin nanocached-node -- --port 8356 --tls-cert cert.pem --tls-key key.pem
+```
 
-- Maximum request size: 1 MiB (mirrors the node's)
-- Maximum concurrent client connections: 1,024 by default, configurable
-  with `--max-connections <n>`, and at most 256 from any one source IP
-  by default, configurable with `--max-connections-per-ip <n>` — the
-  same two caps and the same rules as the node's (never above the total;
-  an unset per-IP cap shrinks to match a lowered total). The proxy is
-  the tier that faces application clients directly, so the NAT /
-  Kubernetes caveat above applies with more force here: when every
-  application pod reaches the proxy through one egress IP, the per-IP
-  cap is the whole fleet's ceiling — raise it
-- In-flight bytes: a client connection may hold 64 MiB of undelivered
-  requests and replies, counted at their worst case, and the proxy as a
-  whole holds 256 MiB across every connection, configurable with
-  `--max-in-flight-bytes <bytes>` (at least 1 MiB). A batched read can
-  be answered by every node it reaches with up to 16 MiB of values
-  each, so it is charged one value (1 MiB) per key up to 16 MiB for
-  each node in the cluster; on a cluster of four or more nodes one
-  large batched read takes a connection's whole 64 MiB and runs alone,
-  and on a large cluster it can take the proxy's whole budget (at the
-  default 256 MiB, sixteen nodes): raise `--max-in-flight-bytes`, and
-  the proxy's memory with it, as the cluster grows. One source IP, with
-  however many connections, may hold at most a quarter of the proxy-wide
-  budget (64 MiB by default), so a client that reads its replies slowly
-  cannot starve everyone else; behind NAT or on Kubernetes, where
-  clients share a source IP, that quarter is the whole fleet's ceiling.
-  That quarter also sets how many large batched reads one source IP runs
-  at once: on four or more nodes a read of 64 or more keys is charged
-  the whole 64 MiB, so reads from one address run one at a time (about
-  3,400 requests a second against about 12,900 with the flag raised to
-  4 GiB, 16 loopback connections, 100 keys, four nodes). Raise
-  `--max-in-flight-bytes` to four times the number of parallel reads
-  wanted times nodes × 16 MiB (and the proxy's memory with it); the
-  proxy warns at startup when the cluster is large enough for this.
-  A client that pipelines past a budget is read more slowly until its
-  replies have been written. A request that cannot get its bytes within
-  60 seconds is not dispatched: it is answered `R` (`B` to a client that
-  did not declare the retryable-error capability), the connection stays
-  open and the client may retry. While a request waits for its bytes the
-  proxy holds its receive buffer, with the frame of up to 1 MiB in it,
-  outside this budget (a waiting
-  request has not been admitted, and holding the frame's charge while
-  waiting is what let two connections of one source IP stall each other).
-  What waiting requests hold is bounded by a second pool of the budget's
-  size, with the same quarter per source IP: a request that would have to
-  wait while that pool is full is answered `R`/`B` at once rather than
-  after 60 seconds. The proxy's ceiling for request bytes is therefore
-  twice `--max-in-flight-bytes`: the budget, and as much again for frames
-  waiting on it
-- Idle connection timeout: 60 seconds, measured from the last complete
-  frame (a frame trickled in a byte at a time does not extend it), the
-  node's own rule
+A node that registers with a TLS-secured discovery server also needs
+`--tls-ca` (a PEM file of the CA certificate(s) to trust). In a cluster the
+certificates must carry each node's IP address in `subjectAltName`. The
+[getting started](https://nanocached.org/getting-started.html#tls) page has
+an OpenSSL command that generates a certificate for local development, and
+the [TLS guide](https://nanocached.org/deployment-tls.html) covers clusters.
 
-### nanocached-discovery
+## Docker images
 
-- Maximum request size: 4 KiB
-- Maximum concurrent connections: 1,024, and at most 256 from any one
-  source IP (fixed — the node's `--max-connections*` flags don't exist
-  here; discovery serves only brief roster fetches and heartbeats; an
-  IPv6 source counts per /64 prefix, as on the node)
-- New registrations: a source may register up to 64 new node names at
-  once and one more every 2 seconds after that (a node refreshing its own
-  entry is never counted). The source is the peer address, an IPv6 source
-  counting per /64 prefix, so a fleet behind one NAT address or in one
-  IPv6 subnet shares the allowance. After a discovery restart the nodes
-  re-register within the startup grace (`--liveness-timeout`), which
-  admits 64 plus one per 2 seconds of grace from one source: 71 nodes at
-  the default 15 seconds. A larger fleet behind one address is still
-  re-registering when the grace ends, so the first join after it is
-  handed off against a partial roster; the rest follow at one node per
-  2 seconds. Set `--liveness-timeout` to 2 seconds for every node beyond
-  64 (72 seconds for 100; a dead node is then evicted that much later
-  too), or spread the nodes over more source addresses.
-- Idle connection timeout: 60 seconds
+The `Dockerfile` builds a separate minimal image per role. `--target` is
+required; there is no default final stage.
+
+```sh
+docker build --target node --tag nanocached-node .
+docker run --rm --publish 8356:8356 nanocached-node
+
+docker build --target discovery --tag nanocached-discovery .
+docker run --rm --publish 8357:8357 nanocached-discovery
+```
+
+The images set `--host 0.0.0.0` as their default command. Arguments you pass
+to `docker run` replace that default, so pass `--host 0.0.0.0` again
+whenever you pass any other argument, as the proxy needs to:
+
+```sh
+docker build --target proxy --tag nanocached-proxy .
+docker run --rm --publish 8358:8358 nanocached-proxy \
+  --host 0.0.0.0 --discovery disc:8357
+```
+
+(`disc` has to resolve from inside the container; put the containers on a
+shared Docker network.) The prebuilt `nanocached-discovery` and
+`nanocached-proxy` images are at `ghcr.io/nanocached/` next to
+`nanocached-node`.
+
+## Client SDKs
+
+Each SDK talks to a single node or to a discovery-fronted cluster, detects
+which from the server's handshake, and handles authentication, TLS, and
+routing with replication. See the [SDK overview](https://nanocached.org/sdks.html).
+
+| Language | Package | Requires | README |
+|---|---|---|---|
+| TypeScript / Node.js | npm `nanocached` | Node.js 22+ | [`sdk/typescript`](sdk/typescript/README.md) |
+| Python | PyPI `nanocached` | Python 3.11+, no runtime dependencies | [`sdk/python`](sdk/python/README.md) |
+| Java | Maven `org.nanocached:nanocached` | Java 17+, no runtime dependencies | [`sdk/java`](sdk/java/README.md) |
+| Rust | crates.io `nanocached` | Rust 1.88+; `tls` and `compression` are default features | [`sdk/rust`](sdk/rust/README.md) |
+| .NET | NuGet `Nanocached` | .NET 10+, no dependencies | [`sdk/dotnet`](sdk/dotnet/README.md) |
+| Go | `github.com/nanocached/nanocached/sdk/go` | Go 1.26+, standard library only | [`sdk/go`](sdk/go/README.md) |
+
+For example, with the Python SDK (`pip install nanocached`), against the node
+started above:
+
+```python
+import asyncio
+from nanocached import NanocachedClient
+
+async def main():
+    async with await NanocachedClient.connect([("127.0.0.1", 8356)]) as client:
+        await client.set("greeting", "hello", ttl_seconds=60)
+        print(await client.get("greeting"))   # hello
+        print(await client.delete("greeting"))  # True
+
+asyncio.run(main())
+```
+
+Framework adapters (Django, Spring, Spring Boot, JCache, Keyv, cache-manager
+and .NET caching) live under [`adapters/`](adapters); they are described on the
+SDK overview page.
+
+## Limits
+
+Defaults. Where a flag exists it is named; discovery's limits are fixed:
+
+| | `nanocached-node` | `nanocached-discovery` |
+|---|---|---|
+| Maximum request size | 1 MiB | 4 KiB |
+| Concurrent connections | 1,024 (`--max-connections`), at most 256 per source IP (`--max-connections-per-ip`) | 1,024, at most 256 per source IP |
+| Cache memory | 256 MiB (`--max-memory`, at least 1 MiB), LRU eviction | — |
+| In-flight bytes outside the cache | 256 MiB (`--max-in-flight-bytes`) | — |
+| Idle connection timeout | 60 seconds | 60 seconds |
+
+`--max-memory` bounds the cache only. Size the process at `--max-memory` plus
+`--max-in-flight-bytes` plus headroom. For how the in-flight budget is
+charged, see [Sizing a node process](https://nanocached.org/deployment-operations.html#memory-budget);
+the proxy's own limits are in the [proxy guide](https://nanocached.org/deployment-proxy.html).
+
+## More documentation
+
+- [Architecture](https://nanocached.org/architecture.html): routing,
+  replication, joins, and the [accepted behaviour](https://nanocached.org/architecture.html#accepted-behaviour)
+  list. Read the list before relying on a cluster during a membership change.
+- [Protocol](https://nanocached.org/protocol.html): every command and status.
+- [Deployment](https://nanocached.org/deployment.html): EC2, ECS and EKS,
+  [operations](https://nanocached.org/deployment-operations.html) and
+  [metrics](https://nanocached.org/deployment-metrics.html) (`--metrics-port`
+  serves Prometheus `/metrics`, `/healthz` and `/readyz`).
+- [Capacity planner](https://nanocached.org/capacity-planner.html): an
+  offline estimator of hit rate against memory, replication and TTL.
+- [Compatibility](https://nanocached.org/compatibility.html): the project is
+  pre-1.0, so any release may break compatibility; this page describes what
+  1.0.0 will freeze.
+
+## Contributing
+
+Building from source, running the tests and the project's checks are
+described in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-nanocached and all six SDKs are released under the [MIT License](LICENSE).
+nanocached, its six SDKs and its seven framework adapters are released under
+the [MIT License](LICENSE).

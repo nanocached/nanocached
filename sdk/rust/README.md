@@ -633,8 +633,8 @@ let options = Options::new()
 TLS is behind the `tls` feature, enabled by default:
 
 ```toml
-nanocached = "0.2"                                     # tls included
-nanocached = { version = "0.2", default-features = false } # plaintext only, smaller build
+nanocached = "0.6"                                     # tls included
+nanocached = { version = "0.6", default-features = false } # plaintext only, smaller build
 ```
 
 `tls` is a plain bool; `ca` names a PEM file of trusted root

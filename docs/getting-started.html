@@ -148,7 +148,7 @@ second layer of defense, not a substitute for network isolation: without
 TLS there is no transport encryption, so bind to <code>127.0.0.1</code>
 or a private interface and add TLS when the network is not trusted.</p>
 
-<h2>TLS</h2>
+<h2 id="tls">TLS</h2>
 <p>Pass <code>--tls-cert</code>/<code>--tls-key</code> (PEM) to require
 TLS on every accepted connection — no plaintext fallback once set:</p>
 <pre><code>nanocached-node      --port 8356 --tls-cert cert.pem --tls-key key.pem
@@ -190,8 +190,10 @@ and clustered production use identical code. See
     (<code>--max-connections</code>; per source IP 256 by default,
     <code>--max-connections-per-ip</code> — the effective ceiling behind
     NAT or on Kubernetes, where clients share a source IP; an IPv6 source
-    counts per /64 prefix)</td><td>1,024
-    (fixed)</td></tr>
+    counts per /64 prefix)</td><td>1,024, and 256 from any one source IP
+    (both fixed; the <code>--max-connections*</code> flags don't exist here,
+    since discovery serves only brief roster fetches and heartbeats; an
+    IPv6 source counts per /64 prefix)</td></tr>
     <tr><td>Cache memory bound</td><td>256 MiB by default (<code>--max-memory</code>), LRU eviction;
     per-namespace caps via <code>--namespace-budget &lt;ns&gt;=&lt;bytes&gt;</code>
     (a namespace over its cap evicts from itself first)</td><td>—</td></tr>
@@ -212,7 +214,10 @@ and clustered production use identical code. See
 non-default namespace &mdash; both measured on the container image, so a
 node full of tiny entries or namespaces sits at about the bound in
 resident memory);
-least-recently-used entries are evicted first. Use the
+least-recently-used entries are evicted first. How the in-flight budget is
+charged, and how to size a node process around it, is in
+<a href="deployment-operations.html#memory-budget">Sizing a node
+process</a>. Use the
 <a href="capacity-planner.html">capacity planner</a> to size nodes, R,
 and TTL against a target hit rate.</p>
 
