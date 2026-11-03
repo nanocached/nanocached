@@ -2110,6 +2110,133 @@ async fn nodes_evicted_while_discovery_itself_was_stalled_keep_their_caches() {
     assert_eq!(out.lost, 0, "a stall of discovery emptied caches: {out:?}");
 }
 
+/// #1312: the first sweep after discovery was stopped for several liveness
+/// windows must not evict the nodes whose heartbeats it has not yet read.
+/// Before the fix it evicted all three (and `L` answered an empty roster
+/// until they announced themselves again, several seconds later); the clock
+/// is not moved after the jump, so this reads the roster the first sweep
+/// leaves.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn the_first_sweep_after_discovery_was_stopped_leaves_the_roster_as_it_was() {
+    let _spin = spin();
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc) = (Port::reserve(), Port::reserve(), Port::reserve());
+    let keys: Vec<String> = (0..4).map(|i| format!("t{i}")).collect();
+    let Trio {
+        dport,
+        disc,
+        names,
+        nodes: [na, nb, nc],
+        ..
+    } = trio(&mut dp, &mut pa, &mut pb, &mut pc, &keys).await;
+    let before = roster(dport).await;
+    assert_eq!(before.len(), 3, "{before:?}");
+
+    // The clock jumps 50 s, over three liveness windows, in one step.
+    tokio::time::advance(Duration::from_secs(50)).await;
+    settle().await;
+    let after = roster(dport).await;
+    let mut listed: Vec<String> = after.iter().map(|(name, _)| name.clone()).collect();
+    listed.sort();
+    let mut expected = names.to_vec();
+    expected.sort();
+    assert_eq!(
+        listed, expected,
+        "the first sweep after a stall evicted nodes"
+    );
+    disc.abort();
+    na.abort();
+    nb.abort();
+    nc.abort();
+}
+
+/// #1311: the path between every node and discovery is cut for longer than
+/// the liveness window while discovery itself keeps sweeping, so each node
+/// is evicted on its own tick. Nobody was left to move on without them: the
+/// nodes stayed reachable from clients and from each other, no roster change
+/// reached anyone, and nothing was rewritten elsewhere. When the path heals
+/// each node announces itself again, and none may be sent back through a
+/// join (which empties its cache): every copy survives.
+///
+/// `cut_gap` is the delay between one node's heartbeat being held and the
+/// next one's, so the nodes cross the liveness window on different ticks;
+/// `release_gap` the same for letting them through again.
+async fn scenario_all_silent(cut_gap: Duration, release_gap: Duration) -> StallOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc) = (Port::reserve(), Port::reserve(), Port::reserve());
+    let c = pc.number;
+    let keys: Vec<String> = (0..40).map(|i| format!("z{i}")).collect();
+    let Trio {
+        dport,
+        disc,
+        a,
+        b,
+        names,
+        nodes: [na, nb, nc],
+        mut client,
+    } = trio(&mut dp, &mut pa, &mut pb, &mut pc, &keys).await;
+    let ports = [a, b, c];
+    let ring3 = HashRing::new(names.to_vec());
+
+    na.gates.heartbeat.hold();
+    run_for(cut_gap).await;
+    nb.gates.heartbeat.hold();
+    run_for(cut_gap).await;
+    nc.gates.heartbeat.hold();
+    // Long enough for the last of them to be evicted too.
+    run_for(Duration::from_secs(40)).await;
+    na.gates.heartbeat.release();
+    run_for(release_gap).await;
+    nb.gates.heartbeat.release();
+    run_for(release_gap).await;
+    nc.gates.heartbeat.release();
+    run_for(Duration::from_secs(120)).await;
+    run_until_members(dport, 3).await;
+
+    let mut out = StallOutcome { copies: 0, lost: 0 };
+    for key in &keys {
+        for owner in ring3.owners(&Key::unnamespaced(Bytes::from(key.clone())), 2) {
+            let port = ports[names.iter().position(|n| n == owner).unwrap()];
+            out.copies += 1;
+            if client.value(port, key).await.as_deref() != Some("v1") {
+                out.lost += 1;
+            }
+        }
+    }
+    disc.abort();
+    na.abort();
+    nb.abort();
+    nc.abort();
+    out
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn nodes_all_silent_to_discovery_at_once_keep_their_caches() {
+    let _spin = spin();
+    let out = scenario_all_silent(Duration::ZERO, Duration::ZERO).await;
+    eprintln!("{out:?}");
+    assert!(out.copies > 0, "nothing to check: {out:?}");
+    assert_eq!(
+        out.lost, 0,
+        "a partition of every node from discovery emptied caches: {out:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn nodes_silent_to_discovery_on_different_ticks_keep_their_caches() {
+    let _spin = spin();
+    let out = scenario_all_silent(Duration::from_secs(4), Duration::from_secs(7)).await;
+    eprintln!("{out:?}");
+    assert!(out.copies > 0, "nothing to check: {out:?}");
+    assert_eq!(
+        out.lost, 0,
+        "nodes evicted on different ticks and healed one by one emptied caches: {out:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // A node asked to leave while another node's join is still pending.
 // ---------------------------------------------------------------------

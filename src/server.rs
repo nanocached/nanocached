@@ -115,7 +115,10 @@ pub(crate) const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
 /// bytes it holds itself (a charge taken while another is held asks only
 /// for the rest of the budget), and a connection that cannot get its
 /// charge in time is closed, the way a stalled write or a trickled frame
-/// is.
+/// is. When the pinned bytes are the whole budget a holder that pins some
+/// itself takes the overdraft token and runs uncharged, one at a time
+/// (issue #1315, `charge_within_room`): the overshoot is one frame or one
+/// reply.
 #[derive(Clone)]
 pub(crate) struct InFlightBudget {
     permits: Arc<Semaphore>,
@@ -132,6 +135,17 @@ pub(crate) struct InFlightBudget {
     /// which waits on the cache and the forward queues but never on the
     /// budget, so a waiter can count on it.
     pinned: Arc<AtomicUsize>,
+    /// The overdraft token (issue #1315): one permit, node-wide. A holder
+    /// that pins bytes itself and finds nothing left to wait for takes it
+    /// and runs uncharged (`charge_within_room`).
+    overdraft: Arc<Semaphore>,
+}
+
+/// What `charge_within_room` hands back: budget bytes, or the overdraft
+/// token. Dropping either gives it back.
+enum Charge {
+    Budget(tokio::sync::OwnedSemaphorePermit),
+    Overdraft(tokio::sync::OwnedSemaphorePermit),
 }
 
 impl InFlightBudget {
@@ -140,6 +154,7 @@ impl InFlightBudget {
             permits: Arc::new(Semaphore::new(bytes)),
             bytes,
             pinned: Arc::new(AtomicUsize::new(0)),
+            overdraft: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -173,24 +188,58 @@ impl InFlightBudget {
     /// let every waiter through at once as soon as the first byte came
     /// back. The caller bounds the wait (`WRITE_TIMEOUT`, then the
     /// connection is closed).
+    ///
+    /// Issue #1315: that wait is no use to a holder that pins bytes itself
+    /// (`own > 0`). Its receive buffer is only released after every reply
+    /// it has buffered, so two such holders, each in a reply or a frame
+    /// charge with `room == 0`, waited for each other until
+    /// `WRITE_TIMEOUT` and one was closed. They are not waiting for bytes
+    /// that anyone is about to release, so they wait for the overdraft
+    /// token instead, or for a byte, whichever comes first: the holder of
+    /// the token runs uncharged (`Charge::Overdraft`) and the others, all of
+    /// which hold buffers already counted, follow one at a time. That
+    /// bounds the bytes beyond the budget to what one holder's frame and
+    /// reply cost. A holder that pins nothing (`own == 0`) keeps waiting for
+    /// a byte, the #1274 case: there is no reason to let it past, since it
+    /// holds nothing that others wait for.
+    /// `overdraft_held` is for a holder that already has the token (a
+    /// frame's reply after its frame, `FrameCharge::overdraft`): it runs
+    /// under it, uncharged, instead of waiting for itself, and never waits
+    /// for bytes with the token in hand.
     async fn charge_within_room(
         &self,
         cost: usize,
         own: usize,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        if cost == 0 || own >= self.bytes {
+        overdraft_held: bool,
+    ) -> Option<Charge> {
+        if cost == 0 || own >= self.bytes || overdraft_held {
             return None;
         }
         loop {
             let room = self.room(own);
             if room > 0 {
-                return Some(self.charge_exact(cost.min(room)).await);
+                return Some(Charge::Budget(self.charge_exact(cost.min(room)).await));
             }
             // Nothing is left once the pinned bytes are counted. Every
             // pinned byte is held, and a holder lowers the tally before it
             // gives the permits back, so a byte that can be had is a byte
             // that is no longer pinned and the room is looked at again.
-            drop(self.charge_exact(1).await);
+            if own == 0 {
+                drop(self.charge_exact(1).await);
+                continue;
+            }
+            tokio::select! {
+                token = Arc::clone(&self.overdraft).acquire_owned() => {
+                    let token = token.expect("the overdraft token is never closed");
+                    // A byte may have come back while the token was
+                    // awaited: charge it, but never wait for bytes with
+                    // the token in hand.
+                    if self.room(own) == 0 {
+                        return Some(Charge::Overdraft(token));
+                    }
+                }
+                released = self.charge_exact(1) => drop(released),
+            }
         }
     }
 
@@ -278,6 +327,11 @@ struct FrameCharge {
     held: u32,
     /// How much of `held` is counted in `pinned`.
     pinned_held: u32,
+    /// The overdraft token, when the frame was charged nothing because
+    /// nothing was left to charge (issue #1315): held until the frame is
+    /// answered, so that the frame and its reply are the one thing running
+    /// beyond the budget. `held` is 0 then.
+    overdraft: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl FrameCharge {
@@ -403,6 +457,14 @@ fn keep_forward_phase(
     })
 }
 
+/// Whether a multi-key frame's charge holds the overdraft token
+/// (`InFlightBudget::charge_within_room`), which its reply then runs under.
+fn holds_overdraft(frame_charge: &Option<FrameCharge>) -> bool {
+    frame_charge
+        .as_ref()
+        .is_some_and(|charge| charge.overdraft.is_some())
+}
+
 /// Narrows an `o` frame's charge to what its ack keeps until it is
 /// written (`MULTI_ACK_BYTES_PER_KEY`), before the ack is: the write can
 /// block for `WRITE_TIMEOUT`, or until the connection is closed for a
@@ -485,7 +547,7 @@ async fn charge_multi_key_frame(
         WRITE_TIMEOUT,
         config
             .in_flight_bytes
-            .charge_within_room(cost, receive_charged),
+            .charge_within_room(cost, receive_charged, false),
     )
     .await
     .map_err(|_| {
@@ -494,11 +556,19 @@ async fn charge_multi_key_frame(
             "in-flight byte budget exhausted while serving a request",
         )
     })?;
-    let held = permit.map_or(0, |permit| {
-        let held = u32::try_from(permit.num_permits()).unwrap_or(u32::MAX);
-        permit.forget();
-        held
-    });
+    let mut overdraft = None;
+    let held = match permit {
+        Some(Charge::Budget(permit)) => {
+            let held = u32::try_from(permit.num_permits()).unwrap_or(u32::MAX);
+            permit.forget();
+            held
+        }
+        Some(Charge::Overdraft(token)) => {
+            overdraft = Some(token);
+            0
+        }
+        None => 0,
+    };
     // What the reply phase will keep of this charge is pinned from the
     // start (issue #1264): a waiter may count on the working charge above
     // it being given back, but not on that part, which stays held through
@@ -521,6 +591,7 @@ async fn charge_multi_key_frame(
         pinned: Arc::clone(&config.in_flight_bytes.pinned),
         held,
         pinned_held,
+        overdraft,
     })
 }
 
@@ -539,18 +610,21 @@ async fn charge_multi_key_frame(
 /// reason.
 /// Waits at most `WRITE_TIMEOUT` for the budget — the same bound a
 /// stalled write gets — and fails the connection like one if it runs out.
+/// `overdraft_held` says that the frame this answers holds the overdraft
+/// token (`holds_overdraft`), so the reply runs under it (issue #1315).
 async fn write_reply(
     stream: &mut ServerStream,
     config: &ConnectionConfig,
     response: &Response,
     tag: Option<u32>,
     held: usize,
+    overdraft_held: bool,
 ) -> io::Result<()> {
     let _charge = timeout(
         WRITE_TIMEOUT,
         config
             .in_flight_bytes
-            .charge_within_room(reply_bytes(response), held),
+            .charge_within_room(reply_bytes(response), held, overdraft_held),
     )
     .await
     .map_err(|_| {
@@ -3313,7 +3387,7 @@ async fn handle_connection(
                 }
 
                 let response = execute_command(&request_tx, Command::Get { key }).await?;
-                write_reply(&mut stream, &config, &response, tag, receive_charged).await?;
+                write_reply(&mut stream, &config, &response, tag, receive_charged, false).await?;
 
                 continue;
             }
@@ -3395,6 +3469,7 @@ async fn handle_connection(
                     &Response::Multi(entries),
                     tag,
                     receive_charged + kept,
+                    holds_overdraft(&frame_charge),
                 )
                 .await?;
 
@@ -4142,6 +4217,7 @@ async fn handle_connection(
                         &Response::Multi(entries),
                         tag,
                         receive_charged + kept,
+                        holds_overdraft(&frame_charge),
                     )
                     .await?;
                 } else {
@@ -4199,7 +4275,7 @@ async fn handle_connection(
 
                 if get {
                     let reply = Response::Touched(value, remaining_ttl);
-                    write_reply(&mut stream, &config, &reply, tag, receive_charged).await?;
+                    write_reply(&mut stream, &config, &reply, tag, receive_charged, false).await?;
                 } else {
                     write_response(&mut stream, &encode_response(&Response::Stored, tag)).await?;
                 }
@@ -5389,7 +5465,7 @@ async fn register_with_discovery(
 /// so a misbehaving discovery server can't make this node allocate
 /// without bound: mirror `nanocached-discovery`'s own `MAX_REGISTRY_SIZE`
 /// and `MAX_REQUEST_SIZE` (the two binaries share no modules by design).
-const MAX_ROSTER_ENTRIES: usize = 1 << 16;
+const MAX_ROSTER_ENTRIES: usize = crate::command::MAX_ROSTER_ENTRIES;
 const MAX_ROSTER_FIELD_LEN: usize = 4096;
 /// Cap on a single heartbeat-ack *line* — the header `A <count> <repl>\n`
 /// and each entry's `<name-len> <addr-len>\n` length prefix (issue #92).
@@ -5400,7 +5476,7 @@ const MAX_ROSTER_FIELD_LEN: usize = 4096;
 /// heartbeat task memory until it OOMs. The name/addr *bytes* aren't read
 /// this way — they come via a `read_exact` already sized by the
 /// `MAX_ROSTER_FIELD_LEN`-checked lengths below.
-const MAX_ROSTER_LINE_LEN: usize = 64;
+const MAX_ROSTER_LINE_LEN: usize = crate::command::MAX_ROSTER_LINE_LEN;
 
 /// The deadline for reading one outbound exchange's lines: the same bound
 /// `OUTBOUND_IO_TIMEOUT` puts around the whole exchange, so a peer that
@@ -12941,7 +13017,7 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
         let mut server = ServerStream::Plain(server);
         let response = Response::Value(Bytes::from(vec![b'v'; 1000]));
-        let write = write_reply(&mut server, &config, &response, None, 0);
+        let write = write_reply(&mut server, &config, &response, None, 0, false);
         tokio::pin!(write);
         assert!(
             timeout(Duration::from_millis(300), &mut write)
@@ -13022,7 +13098,14 @@ mod tests {
         let response = Response::Value(Bytes::from(vec![b'v'; 1000]));
         timeout(
             Duration::from_secs(2),
-            write_reply(&mut server, &config, &response, None, MAX_REQUEST_SIZE),
+            write_reply(
+                &mut server,
+                &config,
+                &response,
+                None,
+                MAX_REQUEST_SIZE,
+                false,
+            ),
         )
         .await
         .expect("a holder of the whole budget is not left waiting for itself")
@@ -13040,6 +13123,361 @@ mod tests {
         .expect("nor is a frame")
         .unwrap();
         assert_eq!(frame.held, 0);
+    }
+
+    /// Reads `size` value bytes of a `V` reply (header and all) from a
+    /// client, after the `S\n` of its store when `stored` is set.
+    async fn read_value_reply(client: &mut TcpStream, size: usize, stored: bool) {
+        let header = format!("V {size}\n");
+        let mut reply = vec![0u8; usize::from(stored) * 2 + header.len() + size];
+        client.read_exact(&mut reply).await.unwrap();
+        if stored {
+            assert_eq!(&reply[..2], b"S\n");
+        }
+        assert!(reply[usize::from(stored) * 2..].starts_with(header.as_bytes()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipelining_connections_that_pin_the_whole_budget_do_not_wait_for_each_other() {
+        // Issue #1315, first reproduction: two connections each store a
+        // value and pipeline a get behind it, holding back the last 10
+        // bytes until both receive buffers are charged. The buffers add up
+        // to the budget (`room` is 0) and are only released after every
+        // reply a connection has buffered, so a reply that waited for a
+        // byte waited for the other connection's buffer, and the other
+        // for this one's, until WRITE_TIMEOUT: one connection was closed
+        // and the other answered after 10 s.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for (name, size) in [(b'b', 100_000usize), (b'a', 600_000)] {
+            let (mut client, server) = tcp_pair().await;
+            tasks.push(tokio::spawn(handle_connection(
+                ServerStream::Plain(server),
+                test_client_addr(),
+                request_tx.clone(),
+                connection_config_with_budget(&budget, IDLE_TIMEOUT),
+                shutdown_rx.clone(),
+            )));
+            let mut head = format!("s 0 1 {size}\n").into_bytes();
+            head.push(name);
+            head.extend(std::iter::repeat_n(b'v', size - 10));
+            client.write_all(&head).await.unwrap();
+            clients.push((client, name, size));
+            sleep(Duration::from_millis(300)).await;
+        }
+        assert_eq!(
+            budget.room(0),
+            0,
+            "the premise: the receive buffers pin the whole budget"
+        );
+
+        let mut readers = Vec::new();
+        for (mut client, name, size) in clients {
+            let mut tail = vec![b'v'; 10];
+            tail.extend_from_slice(format!("g 0 1\n{}", name as char).as_bytes());
+            client.write_all(&tail).await.unwrap();
+            readers.push(tokio::spawn(async move {
+                read_value_reply(&mut client, size, true).await;
+                client
+            }));
+        }
+        let mut clients = Vec::new();
+        for reader in readers {
+            clients.push(
+                timeout(Duration::from_secs(4), reader)
+                    .await
+                    .expect("both replies arrive, not after WRITE_TIMEOUT")
+                    .unwrap(),
+            );
+        }
+
+        drop(clients);
+        for task in tasks {
+            let _ = timeout(Duration::from_secs(5), task).await;
+        }
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+        assert_eq!(budget.overdraft.available_permits(), 1);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipelined_multi_key_frames_that_pin_the_whole_budget_are_answered_one_after_the_other()
+    {
+        // Issue #1315, the frame side: the same two connections, with an
+        // `m` behind the store instead of a `g`. The frame's charge and its
+        // reply each find `room` at 0 with the connection's own buffer
+        // counted; the frame takes the overdraft token, and its reply has
+        // to run under that token rather than wait for it (which only
+        // WRITE_TIMEOUT would end).
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for size in [100_000usize, 600_000] {
+            let (mut client, server) = tcp_pair().await;
+            tasks.push(tokio::spawn(handle_connection(
+                ServerStream::Plain(server),
+                test_client_addr(),
+                request_tx.clone(),
+                connection_config_with_budget(&budget, IDLE_TIMEOUT),
+                shutdown_rx.clone(),
+            )));
+            let mut head = format!("s 0 1 {size}\nk").into_bytes();
+            head.extend(std::iter::repeat_n(b'v', size - 10));
+            client.write_all(&head).await.unwrap();
+            clients.push((client, size));
+            sleep(Duration::from_millis(300)).await;
+        }
+        assert_eq!(
+            budget.room(0),
+            0,
+            "the premise: the receive buffers pin the whole budget"
+        );
+
+        let mut readers = Vec::new();
+        for (mut client, _) in clients {
+            let mut tail = vec![b'v'; 10];
+            tail.extend_from_slice(&multi_get_frame(2));
+            client.write_all(&tail).await.unwrap();
+            readers.push(tokio::spawn(async move {
+                // `S`, then two hits on the value stored under `k` (by
+                // either connection: at least 100,000 bytes each).
+                let mut reply = vec![0u8; 2 + 2 * 100_000];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply[..2], b"S\n");
+                client
+            }));
+        }
+        let mut clients = Vec::new();
+        for reader in readers {
+            clients.push(
+                timeout(Duration::from_secs(4), reader)
+                    .await
+                    .expect("both frames are answered, not after WRITE_TIMEOUT")
+                    .unwrap(),
+            );
+        }
+
+        drop(clients);
+        for task in tasks {
+            let _ = timeout(Duration::from_secs(5), task).await;
+        }
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+        assert_eq!(budget.overdraft.available_permits(), 1);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pipelined_reply_is_not_held_up_by_its_own_receive_buffer_and_a_pinned_neighbour() {
+        // Issue #1315, second reproduction: B holds a partial 90 KB store
+        // (pinning the buffer it grew), and A sends a 600,000-byte store
+        // with a get behind it in one write. A's own receive buffer is
+        // charged up to what B leaves, so nothing is left for the reply,
+        // which is only freed once the reply is sent. `S` arrived, then
+        // nothing for 10 s.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+
+        let (mut pinner, server) = tcp_pair().await;
+        let pinner_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        let mut partial = b"s 0 1 100000\nk".to_vec();
+        partial.extend(std::iter::repeat_n(b'v', 90_000));
+        pinner.write_all(&partial).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let (mut client, server) = tcp_pair().await;
+        let task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        let mut request = b"s 0 1 600000\nk".to_vec();
+        request.extend(std::iter::repeat_n(b'v', 600_000));
+        request.extend_from_slice(b"g 0 1\nk");
+        client.write_all(&request).await.unwrap();
+        timeout(
+            Duration::from_secs(4),
+            read_value_reply(&mut client, 600_000, true),
+        )
+        .await
+        .expect("the reply arrives at once, not after WRITE_TIMEOUT");
+        drop(client);
+        drop(pinner);
+        let _ = timeout(Duration::from_secs(5), task).await;
+        let _ = timeout(Duration::from_secs(5), pinner_task).await;
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+        assert_eq!(budget.overdraft.available_permits(), 1);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_overdraft_token_lets_one_pinning_holder_through_at_a_time() {
+        // Issue #1315: with the whole budget pinned, a holder that pins
+        // bytes itself runs uncharged under the node-wide token; the next
+        // one waits for the token (bounded by WRITE_TIMEOUT, then the
+        // caller fails the connection) and takes it when the first is
+        // done. A holder that pins nothing still waits for a byte.
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let mut first_pin = ReceiveTally::new(&budget);
+        let mut second_pin = ReceiveTally::new(&budget);
+        first_pin.set(MAX_REQUEST_SIZE / 2);
+        second_pin.set(MAX_REQUEST_SIZE / 2);
+        let _bytes = budget.charge(MAX_REQUEST_SIZE).await;
+        let half = MAX_REQUEST_SIZE / 2;
+
+        let first = timeout(
+            Duration::from_secs(1),
+            budget.charge_within_room(1_000, half, false),
+        )
+        .await
+        .expect("a holder that pins bytes is let through")
+        .expect("and is charged something");
+        assert!(matches!(first, Charge::Overdraft(_)));
+        assert_eq!(budget.overdraft.available_permits(), 0);
+
+        // The second waits behind it, and gives up after WRITE_TIMEOUT
+        // without leaving the token taken.
+        let started = tokio::time::Instant::now();
+        assert!(
+            timeout(WRITE_TIMEOUT, budget.charge_within_room(1_000, half, false))
+                .await
+                .is_err()
+        );
+        assert_eq!(started.elapsed(), WRITE_TIMEOUT);
+
+        // A holder that pins nothing is not let through, token or not.
+        assert!(
+            timeout(
+                Duration::from_secs(1),
+                budget.charge_within_room(1_000, 0, false)
+            )
+            .await
+            .is_err()
+        );
+
+        let waiting = budget.charge_within_room(1_000, half, false);
+        tokio::pin!(waiting);
+        assert!(timeout(Duration::from_secs(1), &mut waiting).await.is_err());
+        drop(first);
+        let second = timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .expect("the token passes on when the first holder is done")
+            .unwrap();
+        assert!(matches!(second, Charge::Overdraft(_)));
+        // A holder that already has the token runs under it.
+        assert!(budget.charge_within_room(1_000, half, true).await.is_none());
+        drop(second);
+        assert_eq!(budget.overdraft.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_waiter_for_the_overdraft_token_takes_a_byte_that_comes_back_instead() {
+        // The token is not the only way out: a byte released while a holder
+        // waits for it is charged normally and the token stays free.
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let mut first_pin = ReceiveTally::new(&budget);
+        let mut second_pin = ReceiveTally::new(&budget);
+        first_pin.set(MAX_REQUEST_SIZE / 2);
+        second_pin.set(MAX_REQUEST_SIZE / 2);
+        let bytes = budget.charge(MAX_REQUEST_SIZE).await;
+        let token = Arc::clone(&budget.overdraft).acquire_owned().await.unwrap();
+
+        let waiting = budget.charge_within_room(1_000, MAX_REQUEST_SIZE / 2, false);
+        tokio::pin!(waiting);
+        assert!(timeout(Duration::from_secs(1), &mut waiting).await.is_err());
+        second_pin.set(0);
+        drop(bytes);
+        let charge = timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .expect("a byte that comes back is taken")
+            .unwrap();
+        assert!(matches!(charge, Charge::Budget(_)));
+        drop(token);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_and_its_reply_run_under_one_overdraft_token() {
+        // Issue #1315: two connections that each pin half the budget and
+        // each send a multi-key frame. The first frame takes the token;
+        // the second waits for it (not for a byte that nobody releases),
+        // and the first's reply runs under the token it holds rather than
+        // waiting for it.
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let mut first_pin = ReceiveTally::new(&budget);
+        let mut second_pin = ReceiveTally::new(&budget);
+        let half = MAX_REQUEST_SIZE / 2;
+        first_pin.set(half);
+        second_pin.set(half);
+        let _bytes = budget.charge(MAX_REQUEST_SIZE).await;
+        let config = connection_config_with_budget(&budget, IDLE_TIMEOUT);
+
+        let mut first = Some(
+            timeout(
+                Duration::from_secs(2),
+                charge_multi_key_frame(&config, half, 1_000, false),
+            )
+            .await
+            .expect("a frame whose holder pins bytes is not left waiting")
+            .unwrap(),
+        );
+        assert_eq!(first.as_ref().unwrap().held, 0);
+        assert!(holds_overdraft(&first));
+
+        let second = charge_multi_key_frame(&config, half, 1_000, false);
+        tokio::pin!(second);
+        assert!(
+            timeout(Duration::from_millis(300), &mut second)
+                .await
+                .is_err(),
+            "one frame at a time runs beyond the budget"
+        );
+
+        let kept = keep_reply_phase(&mut first, 1_000);
+        assert_eq!(kept, 0);
+        let (mut client, server) = tcp_pair().await;
+        let mut server = ServerStream::Plain(server);
+        let response = Response::Multi(vec![MultiEntry::Value(Bytes::from(vec![b'v'; 1000]))]);
+        timeout(
+            Duration::from_secs(2),
+            write_reply(&mut server, &config, &response, None, half, true),
+        )
+        .await
+        .expect("the reply runs under the frame's token, not waiting for it")
+        .unwrap();
+        let mut reply = vec![0u8; 1000];
+        timeout(Duration::from_secs(2), client.read_exact(&mut reply))
+            .await
+            .expect("the reply's bytes arrive")
+            .unwrap();
+
+        drop(first);
+        let second = timeout(Duration::from_secs(2), &mut second)
+            .await
+            .expect("the token passes on when the first frame is answered")
+            .unwrap();
+        assert!(holds_overdraft(&Some(second)));
+        assert_eq!(budget.overdraft.available_permits(), 1);
     }
 
     #[test]
@@ -16428,6 +16866,68 @@ mod tests {
 
         drop(senders);
         cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_m_roster_entry_header_that_never_ends_closes_the_connection() {
+        // A roster entry's `<name-len> <addr-len>` line is at most
+        // `MAX_ROSTER_LINE_LEN` bytes. A sender that keeps adding bytes
+        // without the `\n` used to be answered by a rescan of the whole
+        // buffer per read (and held the connection until the idle timeout);
+        // it is now turned away as soon as the line outgrows the bound.
+        // Plain node, and authenticated one (the secret case is the only
+        // way a node with a secret reaches the parse of an `M`).
+        for with_secret in [false, true] {
+            let (mut client, server) = tcp_pair().await;
+            let (connection_task, cache_task, senders) = if with_secret {
+                spawn_secret_connection(server, b"s3cret", IDLE_TIMEOUT)
+            } else {
+                let (request_tx, request_rx) = mpsc::channel(4);
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let cache_task =
+                    tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+                let connection_task = tokio::spawn(handle_connection(
+                    ServerStream::Plain(server),
+                    test_client_addr(),
+                    request_tx.clone(),
+                    ConnectionConfig {
+                        idle_timeout: IDLE_TIMEOUT,
+                        auth_secret: None,
+                        tls_acceptor: None,
+                        node_context: None,
+                        migration_tx: mpsc::channel(1).0,
+                        forward_tx: mpsc::channel(1).0,
+                        forward_queues: Arc::new(ForwardQueues::default()),
+                        in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+                    },
+                    shutdown_rx,
+                ));
+                (connection_task, cache_task, (request_tx, shutdown_tx))
+            };
+
+            if with_secret {
+                client.write_all(b"A 6\ns3cret").await.unwrap();
+                let mut ok = [0u8; 3];
+                client.read_exact(&mut ok).await.unwrap();
+            }
+            client.write_all(b"M 1 1 1 65536 3 1\ntnaj").await.unwrap();
+            client
+                .write_all(&[b'1'; crate::command::MAX_ROSTER_LINE_LEN + 1])
+                .await
+                .unwrap();
+
+            let mut response = [0u8; 3];
+            timeout(Duration::from_secs(5), client.read_exact(&mut response))
+                .await
+                .expect("En within 5 s")
+                .unwrap();
+            assert_eq!(&response, b"En\n", "with_secret={with_secret}");
+            let error = connection_task.await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+            drop(senders);
+            cache_task.await.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

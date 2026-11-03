@@ -627,7 +627,14 @@ loud `WARN` if that disagrees with its own configured value.
   frame or a reply that costs more than the budget has room for waits
   for that room — what is left after every connection's receive buffer
   and the 64 bytes per key its reply keeps, bytes whose holders may be
-  waiting themselves — and then runs alone with it. A connection that cannot get its
+  waiting themselves — and then runs alone with it. When receive buffers
+  pin the whole budget, nothing is left to wait for: a connection that
+  holds a buffer itself then takes a single node-wide overdraft slot and
+  answers without a charge, one at a time, because its buffer is only
+  released after the replies it has buffered and two such connections
+  would otherwise wait for each other. That overshoots the budget by one
+  frame or reply, never more, and a connection with no buffer charged
+  keeps waiting for the budget. A connection that cannot get its
   share in time is closed, like a stalled one. Size a process at
   `--max-memory` plus this plus headroom
 - Per-namespace caps: `--namespace-budget <ns>=<bytes>` (repeatable)

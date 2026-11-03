@@ -679,6 +679,14 @@ struct NodeInfo {
     /// sentinel for an entry no live connection currently owns, e.g. one
     /// `P` (Announce) created directly, or a test constructs directly.
     owner_connection_id: u64,
+    /// When this entry became `Joined` (issue #1311): set at creation, and
+    /// again by `promote_to_joined`. A `Joined` node never leaves that state
+    /// without leaving the registry, so for a `Joined` entry this is the
+    /// start of its unbroken membership. `announce_needs_rejoin` compares
+    /// it with the moment another node was evicted, to tell a node the
+    /// cluster went on without from one that was evicted along with all the
+    /// others.
+    joined_at: Instant,
 }
 
 impl NodeInfo {
@@ -707,6 +715,7 @@ impl NodeInfo {
             waiting_since: Instant::now(),
             queue_position,
             owner_connection_id: 0,
+            joined_at: Instant::now(),
         }
     }
 }
@@ -2225,17 +2234,35 @@ fn pending_joiner_verdict(registry: &Registry, joiner: &str) -> &'static [u8] {
 }
 
 /// Whether a node announcing itself (`P`) under `name` has to start over:
-/// `name` is on record as departed within `DEPARTED_RETENTION` and is not
-/// registered. Takes the two locks one after the other, never nested.
+/// `name` is on record as departed within `DEPARTED_RETENTION`, is not
+/// registered, and the cluster went on without it. The last needs a `Joined`
+/// node that was already `Joined` when `name` was evicted and has been ever
+/// since (issue #1311): only such a node can have taken over `name`'s keys
+/// and been written to. When every node was evicted together, as when the
+/// path between discovery and all of them was cut, nobody was left to move
+/// on, and sending each back through a join would empty every cache for
+/// nothing; each registers as it announces. Takes the two locks one after
+/// the other, never nested.
 fn announce_needs_rejoin(registry: &Registry, name: &str) -> bool {
     if lock(registry).contains_key(name) {
         return false;
     }
-    registry
-        .departed
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .earns_rejoin(name)
+    let departed_at = {
+        let departed = registry
+            .departed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !departed.earns_rejoin(name) {
+            return false;
+        }
+        departed.departed_at(name)
+    };
+    let Some(departed_at) = departed_at else {
+        return false;
+    };
+    lock(registry)
+        .values()
+        .any(|info| info.state == NodeState::Joined && info.joined_at < departed_at)
 }
 
 fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, NodeInfo>> {
@@ -2848,6 +2875,7 @@ fn promote_to_joined(registry: &Registry, name: &str) {
         let promoted = guard.get_mut(name).map(|info| {
             info.state = NodeState::Joined;
             info.last_heartbeat = Instant::now();
+            info.joined_at = info.last_heartbeat;
             Arc::clone(&info.promoted)
         });
         if promoted.is_some() {
@@ -4579,12 +4607,22 @@ async fn sweep_expired(
                 // registration with nothing behind it), so they're also
                 // reaped here once `waiting_timeout_for` has elapsed.
                 // Issue #122: proxies that stopped re-announcing.
+                //
+                // Issue #1312: after a stall every `last_heartbeat` and
+                // `last_seen` is as old as the stall, so judging them now
+                // would evict (and forget) every healthy node and proxy
+                // before any of them could be read. A stalled tick instead
+                // gives each a fresh window: one that really is gone is
+                // dropped a liveness timeout later.
                 let mut proxies_dropped = false;
                 registry
                     .proxies
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .retain(|name, info| {
+                        if stalled {
+                            info.last_seen = now;
+                        }
                         let keep = now.duration_since(info.last_seen) < liveness_timeout;
                         if !keep {
                             println!("INFO proxy dropped after missed announces: {name}");
@@ -4601,6 +4639,9 @@ async fn sweep_expired(
                 {
                     let mut guard = lock(&registry);
                     guard.retain(|name, info| {
+                        if stalled && info.state == NodeState::Joined {
+                            info.last_heartbeat = now;
+                        }
                         let keep = match info.state {
                             NodeState::Joined => {
                                 now.duration_since(info.last_heartbeat) < liveness_timeout
@@ -4632,6 +4673,18 @@ async fn sweep_expired(
                         bump_roster(&registry);
                     }
                 }
+                if stalled {
+                    eprintln!(
+                        "WARN discovery was not running for {}s before this sweep: every \
+                         node and proxy gets a fresh {}s liveness window instead of being \
+                         judged by heartbeats it could not read",
+                        since_last_tick.as_secs(),
+                        liveness_timeout.as_secs()
+                    );
+                }
+                // Nothing is evicted on a stalled tick, so `stalled` holds
+                // below only as a second guard: should a node be evicted
+                // here all the same, it is not sent back through a join.
                 for name in &heartbeat_evicted {
                     eprintln!(
                         "WARN node evicted: {name} (no heartbeat within {}s)",
@@ -7240,6 +7293,93 @@ mod tests {
         sweep_task.await.unwrap();
     }
 
+    /// Moves the paused clock by `total` in steps of `step`, letting the
+    /// sweep run after each, so no sweep tick sees a gap that looks like a
+    /// stall.
+    async fn advance_in_steps(total: Duration, step: Duration) {
+        let mut moved = Duration::ZERO;
+        while moved < total {
+            tokio::time::advance(step).await;
+            tokio::task::yield_now().await;
+            moved += step;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_first_sweep_after_a_stall_gives_every_node_and_proxy_a_fresh_window() {
+        // Issue #1312: discovery frozen (SIGSTOP, a paused VM) for several
+        // liveness windows finds every `last_heartbeat` that old when it
+        // resumes. Evicting on that sweep emptied the roster `L` answers
+        // and closed every heartbeat connection ("not joined") until the
+        // nodes announced themselves again; they were never silent.
+        let liveness = Duration::from_secs(15);
+        let registry: Registry = Arc::new(RegistryState::default());
+        for name in ["node-a", "node-b"] {
+            lock(&registry).insert(
+                name.to_string(),
+                NodeInfo::new(
+                    "10.0.0.1:9000".to_string(),
+                    NodeState::Joined,
+                    format!("tk-{name}"),
+                ),
+            );
+        }
+        registry.proxies.lock().unwrap().insert(
+            "proxy-a".to_string(),
+            ProxyInfo {
+                address: "10.0.0.2:9100".to_string(),
+                token: "tk-proxy".to_string(),
+                last_seen: Instant::now(),
+            },
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            current_join,
+            None,
+            None,
+            2,
+            Instant::now() + Duration::from_secs(365 * 86_400),
+            liveness,
+            shutdown_rx,
+        ));
+        tokio::task::yield_now().await;
+
+        // One step across several windows: the next sweep tick is the
+        // first in 60 s.
+        tokio::time::advance(4 * liveness).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let members = |registry: &Registry| {
+            let mut names: Vec<String> = lock(registry).keys().cloned().collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            members(&registry),
+            ["node-a", "node-b"],
+            "a stalled sweep evicted nodes that had done nothing wrong"
+        );
+        assert!(registry.proxies.lock().unwrap().contains_key("proxy-a"));
+        assert!(
+            registry.departed.lock().unwrap().at.is_empty(),
+            "nothing is on record as departed"
+        );
+
+        // Nodes that really are silent are still dropped, a window later.
+        advance_in_steps(Duration::from_secs(20), Duration::from_secs(1)).await;
+        assert!(members(&registry).is_empty());
+        assert!(registry.proxies.lock().unwrap().is_empty());
+        assert_eq!(registry.departed.lock().unwrap().at.len(), 2);
+        // Judged by a sweep that was running: they earn the rejoin.
+        assert!(registry.departed.lock().unwrap().unreliable.is_empty());
+
+        shutdown_tx.send_replace(true);
+        sweep_task.await.unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn l_cache_is_invalidated_by_a_join_promotion_an_announce_and_a_leave() {
         // Issue #298: exercises the three real mutation paths that must
@@ -7660,13 +7800,85 @@ mod tests {
         (reply.to_vec(), registered)
     }
 
+    /// How long before the eviction a survivor became `Joined`.
+    const JOINED_BEFORE: Option<Duration> = Some(Duration::from_secs(60));
+
+    /// Registers `name` in `state` as a node that has been in that state
+    /// since `joined_before` ago (`None`: just now).
+    fn insert_survivor(
+        registry: &Registry,
+        name: &str,
+        state: NodeState,
+        joined_before: Option<Duration>,
+    ) {
+        let mut info = NodeInfo::new("127.0.0.1:3333".to_string(), state, format!("tk-{name}"));
+        if let Some(before) = joined_before {
+            info.joined_at = Instant::now() - before;
+        }
+        lock(registry).insert(name.to_string(), info);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_evicted_together_with_every_other_node_is_registered_when_it_announces() {
+        // #1311: nobody was left to move on without it, so there is
+        // nothing its cache is behind. Told to start over, every node of a
+        // cluster that was cut off from discovery as a whole would empty
+        // its cache.
+        let frame = b"P 6 2222 9 G\nnode-atk-node-a";
+        let (reply, registered) = announce_reply(frame, |registry| {
+            record_departed(registry, "node-a");
+        })
+        .await;
+        assert_eq!(reply, b"R\n", "alone in the registry");
+        assert!(registered);
+
+        // Another node registered after this one was evicted (it announced
+        // first when the path healed): it has not been through the
+        // eviction, so it moved nothing on.
+        let (reply, registered) = announce_reply(frame, |registry| {
+            record_departed(registry, "node-a");
+            insert_survivor(registry, "node-b", NodeState::Joined, None);
+        })
+        .await;
+        assert_eq!(
+            reply, b"R\n",
+            "the only other member joined after the eviction"
+        );
+        assert!(registered);
+
+        // A node that is still `Waiting` or `Joining` holds nothing the
+        // evicted one is behind either.
+        for state in [NodeState::Waiting, NodeState::Joining] {
+            let (reply, registered) = announce_reply(frame, |registry| {
+                insert_survivor(registry, "node-b", state, JOINED_BEFORE);
+                record_departed(registry, "node-a");
+            })
+            .await;
+            assert_eq!(reply, b"R\n", "{state:?}");
+            assert!(registered);
+        }
+
+        // One node that has been `Joined` throughout is enough.
+        let (reply, registered) = announce_reply(frame, |registry| {
+            insert_survivor(registry, "node-b", NodeState::Joined, None);
+            insert_survivor(registry, "node-c", NodeState::Joined, JOINED_BEFORE);
+            record_departed(registry, "node-a");
+        })
+        .await;
+        assert_eq!(reply, b"G\n");
+        assert!(!registered);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_node_announcing_after_its_eviction_is_told_to_start_over_instead_of_registered() {
         // The node was evicted: the survivors took over its keys and
         // accepted writes for them. Registered again with the cache it
         // held, it would serve the older values, and the reclaim pass on
         // the survivors would then delete the newer ones.
-        let evicted = |registry: &Registry| record_departed(registry, "node-a");
+        let evicted = |registry: &Registry| {
+            insert_survivor(registry, "node-b", NodeState::Joined, JOINED_BEFORE);
+            record_departed(registry, "node-a");
+        };
         let (reply, registered) = announce_reply(b"P 6 2222 9 G\nnode-atk-node-a", evicted).await;
         assert_eq!(reply, b"G\n");
         assert!(!registered, "it must join through J, not be admitted by P");
@@ -10147,8 +10359,9 @@ mod tests {
         ));
 
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
+        // In steps well under half the 1 s liveness timeout: one jump of 2 s
+        // would be a stalled sweep, which evicts nothing (issue #1312).
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
 
         // node-a's own liveness eviction (well under the migration
         // timeout) must have abandoned the join immediately, not left it
@@ -11996,8 +12209,9 @@ mod tests {
         ));
 
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
+        // In steps well under half the 1 s liveness timeout: one jump of 2 s
+        // would be a stalled sweep, which evicts nothing (issue #1312).
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
 
         assert!(lock(&registry).is_empty());
 
