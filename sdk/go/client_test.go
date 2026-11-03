@@ -110,6 +110,8 @@ type mockNode struct {
 	getDelay               atomic.Int64 // nanoseconds; sleep this long before every G reply
 	conns                  sync.Map     // net.Conn -> struct{}
 	silent                 atomic.Bool  // once true, every G/S/D is read but never answered
+	closed                 atomic.Bool  // set by close(): no connection accepted from now on stays open
+	afterListenerClosed    func()       // test hook: runs in close() between the listener and the connections
 	failClearLeft          atomic.Int32 // issue #106: fail the next N c/F requests (read, then drop the connection with no reply)
 	clearCount             atomic.Int32 // issue #106: how many c/F requests this node has received, failed or not
 	// retryableLeft is issue #125's "answer the next N data requests with
@@ -562,9 +564,20 @@ func (m *mockNode) dropConnections() {
 	})
 }
 
+// close shuts the node down entirely: nobody can connect to it any more
+// and every connection it has is dropped. The listener goes first. With
+// the connections dropped first, a client that noticed its connection die
+// and redialled at once could still reach the open listener, be accepted
+// and served — a node that "closed itself" would then answer the retry,
+// and a test that expects the failure to propagate (the chunked
+// GetMany/SetMany coverage) would see success instead.
 func (m *mockNode) close() {
-	m.dropConnections()
+	m.closed.Store(true)
 	_ = m.listener.Close()
+	if m.afterListenerClosed != nil {
+		m.afterListenerClosed()
+	}
+	m.dropConnections()
 }
 
 func (m *mockNode) acceptLoop() {
@@ -575,6 +588,11 @@ func (m *mockNode) acceptLoop() {
 		}
 		m.connectionCount.Add(1)
 		m.conns.Store(conn, struct{}{})
+		if m.closed.Load() {
+			// Accepted just as close() ran, possibly after it dropped
+			// the connections: drop this one too.
+			_ = conn.Close()
+		}
 		go m.serve(conn)
 	}
 }
@@ -7341,5 +7359,30 @@ func TestCloseTearsDownConnectionsOutsideTheClientLock(t *testing.T) {
 		if held.Load() {
 			t.Fatalf("teardown closed member connection %d while holding Client.mu", i)
 		}
+	}
+}
+
+// TestMockNodeCloseRefusesNewConnectionsBeforeDroppingTheOldOnes pins the
+// order in mockNode.close: the listener is closed before the connections
+// are dropped, so nothing can slip in between and be served by a node that
+// has "closed itself". The hook runs in that gap and dials the node.
+func TestMockNodeCloseRefusesNewConnectionsBeforeDroppingTheOldOnes(t *testing.T) {
+	node := startMockNode(t, nil)
+	var dialErr error
+	var dialed bool
+	node.afterListenerClosed = func() {
+		dialed = true
+		var conn net.Conn
+		conn, dialErr = net.DialTimeout("tcp", node.address(), time.Second)
+		if dialErr == nil {
+			_ = conn.Close()
+		}
+	}
+	node.close()
+	if !dialed {
+		t.Fatal("the hook did not run")
+	}
+	if dialErr == nil {
+		t.Fatal("a client could still connect between the node's listener and its connections being closed")
 	}
 }
