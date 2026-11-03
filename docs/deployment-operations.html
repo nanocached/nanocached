@@ -138,7 +138,11 @@ its cache and joins again as a new node (its log says
 held, because the cluster has moved on without it. At R=1 the keys it held
 and nobody rewrote in the meantime are therefore gone with it, as they were
 when it was evicted. Keep the heartbeat path short enough, and the liveness
-timeout long enough, that a pause you expect does not evict it.</p>
+timeout long enough, that a pause you expect does not evict it. A node
+heartbeats every 5&nbsp;s, so discovery refuses a
+<code>--liveness-timeout</code> below 15&nbsp;s (three heartbeats): with
+less, one lost heartbeat, or a short pause of discovery itself, would
+evict healthy nodes and cost them their caches.</p>
 <h2>Proxy: drain</h2>
 <p>On SIGTERM a proxy deregisters from discovery's proxy roster
 immediately (new clients stop being handed its address), finishes

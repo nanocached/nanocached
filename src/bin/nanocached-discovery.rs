@@ -424,12 +424,25 @@ const ANNOUNCE_INSERT_BURST: u32 = 64;
 /// addresses in one cluster's network.
 const MAX_ANNOUNCE_LIMITER_ENTRIES: usize = 4096;
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
-/// Smallest `--liveness-timeout` accepted, in seconds. A node heartbeats
-/// every 5 s, so a window at or below that evicts live members between two
-/// heartbeats and the membership flaps for good; `0` also made the sweep
-/// tick every millisecond, evict every node on its first tick and set the
-/// startup grace to nothing.
-const MIN_LIVENESS_TIMEOUT_SECS: u64 = 6;
+/// How often a node heartbeats, in seconds. Mirrors
+/// `DEFAULT_HEARTBEAT_INTERVAL_SECS` in `src/main.rs` (the node binary fixes
+/// the interval; discovery does not link `server.rs`, so the value is
+/// repeated here and `node_heartbeat_interval_matches_the_node_binary`
+/// fails if the two drift apart).
+const NODE_HEARTBEAT_INTERVAL_SECS: u64 = 5;
+/// Heartbeats that fit in the smallest accepted liveness window: one that
+/// is due, one that may be late or lost, and one so that the stall guard
+/// (`sweep_was_stalled` treats a sweep gap over half the window as a pause
+/// of discovery itself) still spans a whole interval.
+const MIN_LIVENESS_HEARTBEATS: u64 = 3;
+/// Smallest `--liveness-timeout` accepted, in seconds. Anything at or below
+/// one heartbeat interval evicts live members between two heartbeats and
+/// the membership flaps for good; below three, a pause of discovery shorter
+/// than the stall guard (half the window) or one lost heartbeat is enough to
+/// evict healthy nodes, which then come back to a `G` answer and lose their
+/// caches. `0` also made the sweep tick every millisecond, evict every node
+/// on its first tick and set the startup grace to nothing.
+const MIN_LIVENESS_TIMEOUT_SECS: u64 = NODE_HEARTBEAT_INTERVAL_SECS * MIN_LIVENESS_HEARTBEATS;
 /// Largest `--liveness-timeout` accepted, in seconds (7 days, the node's
 /// own `--drain-timeout` cap). The value is added to `Instant::now()` for
 /// the startup grace and the sweep deadlines, and an unbounded `u64` there
@@ -1445,8 +1458,10 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, ArgsError>
                 if !(MIN_LIVENESS_TIMEOUT_SECS..=MAX_LIVENESS_TIMEOUT_SECS).contains(&secs) {
                     return Err(ArgsError::Invalid(format!(
                         "--liveness-timeout must be between {MIN_LIVENESS_TIMEOUT_SECS} and \
-                         {MAX_LIVENESS_TIMEOUT_SECS} seconds (a node heartbeats every 5 s; \
-                         {secs} would evict live nodes between heartbeats or overflow the clock)"
+                         {MAX_LIVENESS_TIMEOUT_SECS} seconds (a node heartbeats every \
+                         {NODE_HEARTBEAT_INTERVAL_SECS} s and the window must hold at least \
+                         {MIN_LIVENESS_HEARTBEATS} beats; {secs} would evict live nodes on a \
+                         late heartbeat or overflow the clock)"
                     )));
                 }
                 args.liveness_timeout = Duration::from_secs(secs);
@@ -1497,8 +1512,8 @@ Usage: nanocached-discovery [options]
   --host <addr>                 bind address (default 127.0.0.1)
   --port <port>                 bind port (default 8357)
   --liveness-timeout <secs>     drop a node after this many seconds without
-                                 a heartbeat (default 15; at least 6, at most
-                                 604800)
+                                 a heartbeat (default 15; at least 15, three
+                                 node heartbeats; at most 604800)
   --replication-factor <n>      how many nodes hold each key (client-side replication);
                                  distributed to clients via L and to nodes
                                  via M (default 2, min 1)
@@ -13658,10 +13673,13 @@ mod tests {
         let parse = |secs: &str| {
             parse_args_from(["--liveness-timeout".to_string(), secs.to_string()].into_iter())
         };
-        for rejected in ["0", "5", "604801", "18446744073709551615"] {
+        // Below three node heartbeats (15 s): `6` and `14` used to be accepted
+        // and let one lost heartbeat, or a pause of discovery under the stall
+        // guard, evict live nodes.
+        for rejected in ["0", "5", "6", "10", "14", "604801", "18446744073709551615"] {
             match parse(rejected) {
                 Err(ArgsError::Invalid(message)) => assert!(
-                    message.starts_with("--liveness-timeout must be between 6 and 604800 seconds"),
+                    message.starts_with("--liveness-timeout must be between 15 and 604800 seconds"),
                     "{rejected}: {message}"
                 ),
                 Ok(_) => panic!("{rejected} must be refused"),
@@ -13670,7 +13688,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(parse("6").unwrap().liveness_timeout, Duration::from_secs(6));
+        assert_eq!(
+            parse("15").unwrap().liveness_timeout,
+            Duration::from_secs(15)
+        );
         assert_eq!(
             parse("604800").unwrap().liveness_timeout,
             Duration::from_secs(604_800)
@@ -13681,5 +13702,23 @@ mod tests {
                 .liveness_timeout,
             DEFAULT_LIVENESS_TIMEOUT
         );
+    }
+
+    #[test]
+    fn node_heartbeat_interval_matches_the_node_binary() {
+        let node_main = include_str!("../main.rs");
+        let declared =
+            format!("const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = {NODE_HEARTBEAT_INTERVAL_SECS};");
+        assert!(
+            node_main.contains(&declared),
+            "src/main.rs no longer declares `{declared}`; update NODE_HEARTBEAT_INTERVAL_SECS"
+        );
+        // The accepted minimum is derived from it, and the default is not
+        // below it.
+        assert_eq!(
+            MIN_LIVENESS_TIMEOUT_SECS,
+            MIN_LIVENESS_HEARTBEATS * NODE_HEARTBEAT_INTERVAL_SECS
+        );
+        assert!(DEFAULT_LIVENESS_TIMEOUT.as_secs() >= MIN_LIVENESS_TIMEOUT_SECS);
     }
 }
