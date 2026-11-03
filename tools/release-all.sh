@@ -12,6 +12,65 @@
 # SDK tags go first: every adapter's published manifest depends on the SDK
 # release of the same version, so the SDK must exist on its registry before
 # anyone can install the adapter.
+#
+# Releases only a commit that is already the tip of origin/main, in a clean
+# tree (untracked files count), and whose CI run on main is green: a tag push
+# publishes to the registries, and a tag on a commit that is not on a pushed
+# branch, or that CI has not passed, publishes something nobody reviewed.
+
+# The checks are functions so that they can be tried in a scratch repository:
+# `source tools/release-all.sh` defines them and runs nothing else.
+
+# No modified, staged or untracked (not ignored) file.
+check_clean_tree() {
+    local dirty
+    dirty="$(git status --porcelain --untracked-files=all)" || { echo "error: git status failed" >&2; return 1; }
+    if [ -n "$dirty" ]; then
+        echo "error: the working tree is not clean (modified, staged or untracked files); commit and push them, or remove them:" >&2
+        printf '%s\n' "$dirty" | head -10 >&2
+        return 1
+    fi
+}
+
+# Is any release tag of <version> on origin at <sha>?
+release_tag_on_origin_at() {
+    git ls-remote --tags origin "refs/tags/*/v$1" "refs/tags/*/*/v$1" | cut -f1 | grep -qx "$2"
+}
+
+# HEAD must be origin/main as just fetched. The one exception is resuming a
+# release that was already started from HEAD (a tag of this version is on
+# origin at HEAD): main may have moved on since, e.g. with the docs PR.
+check_head_is_origin_main() { # <version>
+    local head main
+    git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main" \
+        || { echo "error: could not fetch origin/main" >&2; return 1; }
+    head="$(git rev-parse HEAD)"; main="$(git rev-parse refs/remotes/origin/main)"
+    [ "$head" = "$main" ] && return 0
+    if git merge-base --is-ancestor "$head" "$main" && release_tag_on_origin_at "$1" "$head"; then
+        echo "note: HEAD is behind origin/main, but a $1 tag is already on origin at HEAD; resuming that release" >&2
+        return 0
+    fi
+    echo "error: HEAD ($head) is not origin/main ($main); push it to main (and let CI pass) first, or check out origin/main" >&2
+    return 1
+}
+
+# The newest CI run (push event) on <sha> must have completed successfully.
+check_ci_green() { # <sha>
+    local res
+    command -v gh >/dev/null || { echo "error: gh is needed to check CI for $1" >&2; return 1; }
+    res="$(gh run list --workflow ci.yaml --commit "$1" --event push --limit 20 --json status,conclusion \
+            --jq 'if length == 0 then "none" else "\(.[0].status) \(.[0].conclusion)" end')" \
+        || { echo "error: could not list CI runs for $1" >&2; return 1; }
+    case "$res" in
+        "completed success") return 0 ;;
+        none) echo "error: no CI run found for $1 (has it been pushed to main?)" >&2 ;;
+        *)    echo "error: the newest CI run on $1 is '$res', not 'completed success'" >&2 ;;
+    esac
+    return 1
+}
+
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -53,10 +112,9 @@ for a in spring jcache spring-boot-starter; do
                                                                || fail "adapters/$a/README.md (install snippet)"
 done
 
-if ! git diff --quiet HEAD; then
-    echo "error: uncommitted changes — commit and push before releasing" >&2
-    exit 1
-fi
+check_clean_tree
+check_head_is_origin_main "$ver"
+check_ci_green "$(git rev-parse HEAD)"
 
 # Resumable: a push that fails partway (network, expired auth) leaves some
 # components released and others not, so a re-run must pick up where it

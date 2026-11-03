@@ -10,7 +10,7 @@ P=c96; D=$P-disc:8357
 T(){ echo "### $(date +%T) [$P] $*"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 cleanup; docker network create $NET >/dev/null
-disc_up $P-disc --replication-factor 1 --liveness-timeout 6; sleep 1
+disc_up $P-disc --replication-factor 1 --liveness-timeout 15; sleep 1
 node_up $P-node0 $D; wait_members 1 $D 60
 docker run -d --name $P-probe ${PROBE_ENV} --network $NET -v $E:/w -w /w e2e-client python churn96.py $D 5 >/dev/null
 sleep 6; T "probe started"; docker logs $P-probe 2>&1 | tail -1

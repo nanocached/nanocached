@@ -27,7 +27,10 @@ OUT=${OUT:-$HERE/results/$RUN/$TOPO-$PATHK$SUFFIX}; WATCHDOG=${WATCHDOG:-900}
 mkdir -p "$OUT"
 case "$TOPO/$PATHK" in single/proxy) echo "no proxy path on a single node (the proxy needs discovery)"; exit 2;; esac
 
-cleanup() { docker rm -f $(docker ps -aq --filter "name=$P-") >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
+# The watchdog is killed with the script (EXIT trap), or it would fire after WATCHDOG s on a run that has long since ended
+# and remove the containers of a later run that reuses this RUN tag. In the watchdog subshell WD is still unset, so this is a no-op there.
+stop_watchdog() { [ -n "${WD:-}" ] || return 0; pkill -P "$WD" >/dev/null 2>&1; kill "$WD" >/dev/null 2>&1; wait "$WD" 2>/dev/null; WD=; }
+cleanup() { stop_watchdog; docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
 trap cleanup EXIT
 ( sleep "$WATCHDOG"; echo "WATCHDOG fired after ${WATCHDOG}s" >&2; cleanup; pkill -P $$ >/dev/null 2>&1 ) 2>/dev/null &
 WD=$!
@@ -59,8 +62,8 @@ VIA=0; [ "$PATHK" = proxy ] && VIA=1
 
 # One client container per SDK and phase; $1 = sdk, $2 = phase.
 run_sdk() {
-  local sdk=$1 phase=$2 img args env
-  env=(-e NANOTEST_ADDRESSES=$ADDR -e NANOTEST_VIA_PROXY=$VIA -v "$REPO:/repo:ro" -v "$OUT:/out" -w /repo/tools/conformance)
+  local sdk=$1 phase=$2 args env
+  env=(-e "NANOTEST_ADDRESSES=$ADDR" -e "NANOTEST_VIA_PROXY=$VIA" -v "$REPO:/repo:ro" -v "$OUT:/out" -w /repo/tools/conformance)
   args="/out/cases.json $phase $PATHK $TOPO"
   case $sdk in
     python)     docker run --rm --name $P-c-$sdk --network "$NET" "${env[@]}" -e PYTHONPATH=/repo/sdk/python/src e2e-client python drivers/python/driver.py $args ;;
@@ -72,6 +75,6 @@ for phase in $PHASES; do for sdk in $SDKS; do echo "== $sdk $phase"; run_sdk "$s
 
 WT=""; [ "$GROUP" = basic ] && [ "$TOPO/$PATHK" = single/direct ] && WT=$P-node:8356; [ "$GROUP" = basic ] && [ "$PATHK" = proxy ] && WT=$P-proxy:8358
 [ -n "$WT" ] && { echo "== wire probe $WT"; docker run --rm --network "$NET" -v "$HERE:/w" -w /w e2e-client python wire_probe.py "$WT" "$TOPO-$PATHK" > "$OUT/wire.txt" 2> "$OUT/wire.err"; }
-kill $WD >/dev/null 2>&1
-mkdir -p "$OUT/logs"; for c in $(docker ps -a --format "{{.Names}}" --filter "name=$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
+stop_watchdog
+mkdir -p "$OUT/logs"; for c in $(docker ps -a --format "{{.Names}}" --filter "name=^/$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
 python3 "$HERE/compare.py" "$OUT"

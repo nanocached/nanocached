@@ -27,7 +27,10 @@ OUT=${OUT:-$HERE/results/$RUN/member-$SCEN-R$R${BUDGET:+-budget}}; WATCHDOG=${WA
 case $SCEN in join|joinjoin|joinfresh) N0=3;; *) N0=4;; esac
 NARGS=(); [ -n "$BUDGET" ] && NARGS=(--namespace-budget nsA=8000000)
 mkdir -p "$OUT"; rm -f "$OUT/ctl"
-cleanup() { exec 3>&- 2>/dev/null; docker rm -f $(docker ps -aq --filter "name=$P-") >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
+# The watchdog is killed with the script (EXIT trap), or it would fire after WATCHDOG s on a run that has long since ended
+# and remove the containers of a later run that reuses this RUN tag. In the watchdog subshell WD is still unset, so this is a no-op there.
+stop_watchdog() { [ -n "${WD:-}" ] || return 0; pkill -P "$WD" >/dev/null 2>&1; kill "$WD" >/dev/null 2>&1; wait "$WD" 2>/dev/null; WD=; }
+cleanup() { stop_watchdog; exec 3>&- 2>/dev/null; docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
 trap cleanup EXIT
 ( sleep "$WATCHDOG"; echo "WATCHDOG fired after ${WATCHDOG}s" >&2; cleanup; pkill -P $$ >/dev/null 2>&1 ) 2>/dev/null &
 WD=$!
@@ -81,7 +84,7 @@ NODES=$(live_nodes)
   echo "quiet_before_s=$Q1 quiet_after_s=$Q2 live=$NODES members=$(members $P-disc:8357)"; } > "$OUT/env.txt"
 docker run --rm --network "$NET" -v "$HERE:/h:ro" -v "$OUT:/out" "$CLIENT" python /h/member_read.py /out "$NODES" "$R" 2>&1 | tee "$OUT/reader.txt"
 VERDICT=${PIPESTATUS[0]}
-kill $WD >/dev/null 2>&1
-mkdir -p "$OUT/logs"; for c in $(docker ps -a --format '{{.Names}}' --filter "name=$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
+stop_watchdog
+mkdir -p "$OUT/logs"; for c in $(docker ps -a --format '{{.Names}}' --filter "name=^/$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
 rm -f "$OUT/ctl"; echo "results in $OUT"
 exit "$VERDICT"

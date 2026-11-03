@@ -22,7 +22,12 @@ NODE=${NODE:-nanocached-node:conformance}; DISC=${DISC:-nanocached-discovery:con
 NET=conf-$RUN-$WHAT; P=cs$RUN-$WHAT
 OUT=${OUT:-$HERE/results/$RUN/$WHAT}; WATCHDOG=${WATCHDOG:-1500}
 mkdir -p "$OUT"
-cleanup() { docker rm -f $(docker ps -aq --filter "name=$P-") >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
+# The watchdog is killed with the script (EXIT trap), or it would fire after WATCHDOG s on a run that has long since ended
+# and remove the containers of a later run that reuses this RUN tag. In the watchdog subshell WD is still unset, so this is a no-op there.
+stop_watchdog() { [ -n "${WD:-}" ] || return 0; pkill -P "$WD" >/dev/null 2>&1; kill "$WD" >/dev/null 2>&1; wait "$WD" 2>/dev/null; WD=; }
+# wait for every background job except the watchdog; an empty job list must not turn into a bare `wait`, which waits for the watchdog too
+wait_clients() { local p; for p in $(jobs -p); do [ "$p" = "${WD:-}" ] || wait "$p" 2>/dev/null; done; }
+cleanup() { stop_watchdog; docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
 trap cleanup EXIT
 ( sleep "$WATCHDOG"; echo "WATCHDOG fired after ${WATCHDOG}s" >&2; cleanup; pkill -P $$ >/dev/null 2>&1 ) 2>/dev/null &
 WD=$!
@@ -41,7 +46,7 @@ wait_http_ok() { for _ in $(seq 1 60); do docker run --rm --network "$NET" "$CLI
 # run one scenario program for one SDK: sc <sdk> <outfile> <addr> <via> <secret> <conn-timeout-s> <scenario> [args]
 sc() {
   local sdk=$1 file=$2 addr=$3 via=$4 secret=$5 limit=$6; shift 6
-  local env=(-e NANOTEST_ADDRESSES=$addr -e NANOTEST_VIA_PROXY=$via -e NANOTEST_SECRET=$secret -e CONN_TIMEOUT_S=$limit -v "$REPO:/repo:ro" -v "$OUT:/out" --network "$NET")
+  local env=(-e "NANOTEST_ADDRESSES=$addr" -e "NANOTEST_VIA_PROXY=$via" -e "NANOTEST_SECRET=$secret" -e "CONN_TIMEOUT_S=$limit" -v "$REPO:/repo:ro" -v "$OUT:/out" --network "$NET")
   case $sdk in
     python) docker run --rm --name $P-c-$sdk "${env[@]}" -w /repo/tools/conformance -e PYTHONPATH=/repo/sdk/python/src "$CLIENT" python drivers/python/scenario.py "$@" ;;
     *) [ -x "$HERE/drivers/$sdk/scenario.sh" ] && "$HERE/drivers/$sdk/scenario.sh" "$P-c-$sdk" "${env[@]}" -- "$@" ;;
@@ -86,7 +91,7 @@ v4)
     ( sc "$sdk" "$OUT/failover.$sdk.jsonl" $P-disc:8357 0 "" 60 gm "$PFX" 3000 40 ) &
   done
   sleep 12; docker kill $P-b >/dev/null; echo "killed b at ~12s"
-  wait $(jobs -p | grep -v "^$WD$") 2>/dev/null ;;
+  wait_clients ;;
 hostile)
   # fixtures/hostile_cases.json is the one table: a port, the driver's arguments and the bounds of every case
   docker run -d --name $P-fx --network "$NET" -v "$HERE/fixtures:/f:ro" "$CLIENT" python /f/hostile_node.py /f/hostile_cases.json >/dev/null
@@ -98,13 +103,13 @@ hostile)
     [ -n "${ONLY:-}" ] && [ "$id" != "$ONLY" ] && [ "$id" != baseline ] && continue
     # the six SDKs at once, each in a container of its own: the case's memory is the container's cgroup peak
     for sdk in $SDKS; do sc "$sdk" "$OUT/$id.$sdk.jsonl" $P-fx:$port 0 "" "${LIMIT:-90}" host "$id" $cargs & done
-    wait $(jobs -p | grep -v "^$WD$")
+    wait_clients
     echo "== $id"
   done < "$OUT/cases.txt"
   python3 "$HERE/hostile_check.py" "$OUT" ${ONLY:+"$ONLY"}; VERDICT=$? ;;
 *) echo "unknown scenario set $WHAT"; exit 2 ;;
 esac
-kill $WD >/dev/null 2>&1
-mkdir -p "$OUT/logs"; for c in $(docker ps -a --format '{{.Names}}' --filter "name=$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
+stop_watchdog
+mkdir -p "$OUT/logs"; for c in $(docker ps -a --format '{{.Names}}' --filter "name=^/$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
 echo "results in $OUT"
 exit "${VERDICT:-0}"
