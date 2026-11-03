@@ -364,8 +364,8 @@ Usage: nanocached-node [options]
   --max-in-flight-bytes <bytes> what client connections may hold outside
                                the cache, node-wide: replies being
                                written, requests still arriving, and
-                               128 bytes per key of a multi-key frame
-                               (m, o, y) until it is answered
+                               256 bytes per key of a multi-key frame
+                               (288 for o; m, o, y) until it is answered
                                (default {} — 256 MiB, minimum {} — 1 MiB).
                                A connection that cannot get its share
                                in time is closed, like a stalled one
@@ -391,10 +391,10 @@ Usage: nanocached-node [options]
         server::MAX_CACHE_MEMORY_BYTES,
         MIN_MAX_MEMORY_BYTES,
         MIN_MAX_MEMORY_BYTES / (1024 * 1024),
-        server::DEFAULT_MAX_CONNECTIONS,
-        server::DEFAULT_MAX_CONNECTIONS_PER_IP,
         server::DEFAULT_MAX_IN_FLIGHT_BYTES,
         server::MIN_MAX_IN_FLIGHT_BYTES,
+        server::DEFAULT_MAX_CONNECTIONS,
+        server::DEFAULT_MAX_CONNECTIONS_PER_IP,
         MIN_NAMESPACE_BUDGET_BYTES,
     )
 }
@@ -600,6 +600,58 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn usage_shows_each_flags_own_default() {
+        // The defaults are positional `format!` arguments: a reordered
+        // argument prints one flag's value under another's name.
+        let text = usage();
+        let entry = |flag: &str| -> String {
+            let start = text.find(&format!("\n  {flag} ")).unwrap();
+            let rest = &text[start + 1..];
+            let end = rest[1..].find("\n  --").map_or(rest.len(), |i| i + 1);
+            rest[..end].to_string()
+        };
+        let expect = |flag: &str, needles: &[String]| {
+            let body = entry(flag);
+            for needle in needles {
+                assert!(
+                    body.contains(needle),
+                    "{flag}: missing {needle:?} in {body}"
+                );
+            }
+        };
+        expect(
+            "--max-memory",
+            &[
+                format!("default {} ", server::MAX_CACHE_MEMORY_BYTES),
+                format!("minimum {} ", MIN_MAX_MEMORY_BYTES),
+            ],
+        );
+        expect(
+            "--max-in-flight-bytes",
+            &[
+                format!("default {} ", server::DEFAULT_MAX_IN_FLIGHT_BYTES),
+                format!("minimum {} ", server::MIN_MAX_IN_FLIGHT_BYTES),
+                "256 bytes per key".to_string(),
+            ],
+        );
+        expect(
+            "--max-connections",
+            &[format!("default {})", server::DEFAULT_MAX_CONNECTIONS)],
+        );
+        expect(
+            "--max-connections-per-ip",
+            &[format!(
+                "default {}, ",
+                server::DEFAULT_MAX_CONNECTIONS_PER_IP
+            )],
+        );
+        expect(
+            "--namespace-budget",
+            &[format!("{MIN_NAMESPACE_BUDGET_BYTES} bytes)")],
+        );
     }
 
     #[test]
