@@ -18,7 +18,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -1411,6 +1411,47 @@ struct NodeContext {
     /// promptly at shutdown without a bespoke parameter thread of its
     /// own.
     shutdown_rx: watch::Receiver<bool>,
+    /// Issue #1333: whether the first shutdown signal has started a drain,
+    /// from that moment and not from the roster fetch that precedes
+    /// `leaving`. See `DrainState`.
+    drain: DrainState,
+}
+
+/// Issue #1333: where this node is in a decommission, readable from the
+/// registration tasks. `leaving` is set only once the drain's roster fetch
+/// has succeeded, and a node that was evicted and then sent SIGTERM keeps
+/// retrying that fetch (issue #1281) while its heartbeat `P` is answered
+/// `G`. The node is leaving either way: dropping its cache and joining
+/// again would only start a join that is abandoned seconds later, so `G`
+/// is not acted on once the drain has begun, and the roster fetch, which
+/// a node discovery no longer lists cannot win, stops retrying.
+#[derive(Clone, Default)]
+struct DrainState(Arc<AtomicU8>);
+
+impl DrainState {
+    const DRAINING: u8 = 1;
+    const EVICTED: u8 = 2;
+
+    /// The first shutdown signal started the decommission.
+    fn begin(&self) {
+        let _ = self
+            .0
+            .compare_exchange(0, Self::DRAINING, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Discovery answered `G`. Returns whether the node is draining, in
+    /// which case it is also marked as evicted.
+    fn note_evicted(&self) -> bool {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                (state != 0).then_some(Self::EVICTED)
+            })
+            .is_ok()
+    }
+
+    fn evicted(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == Self::EVICTED
+    }
 }
 
 /// Issue #124: a decommission in progress. The mirror of
@@ -1793,6 +1834,7 @@ pub(crate) async fn run_with_hooks(
         rereplication_tx: rereplication_tx.clone(),
         rereplication_forward: Arc::new(Mutex::new(None)),
         shutdown_rx: shutdown_rx.clone(),
+        drain: DrainState::default(),
     });
     // After `node_context`: the sweep judges a marked copy by the ring this
     // node has adopted (`Command::Sweep::owned`); standalone it has none.
@@ -2007,6 +2049,9 @@ pub(crate) async fn run_with_hooks(
                         drain_timeout.as_secs()
                     );
                     decommission_started = true;
+                    // Issue #1333: before the task is spawned, so a `G`
+                    // landing in between is already ignored.
+                    node_context.drain.begin();
                     // Issue #1158: heartbeats keep running through the
                     // drain, so a handoff longer than the liveness timeout
                     // does not get this node evicted (survivors adopting a
@@ -5017,8 +5062,8 @@ async fn send_heartbeats(
 /// is put-if-absent, so an old value would win over the survivors' newer
 /// one, and a key deleted meanwhile is not in the handoff at all. The
 /// caller then sends `J`. Returns `false`, touching nothing, while the node
-/// is draining: its cache is what the drain hands to the entrants, and the
-/// node is on its way out.
+/// is draining, from the shutdown signal on (`DrainState`): its cache is
+/// what the drain hands to the entrants, and the node is on its way out.
 async fn discard_state_to_rejoin(node_context: &NodeContext, discovery_addr: &str) -> bool {
     let leaving = node_context
         .leaving
@@ -5026,6 +5071,13 @@ async fn discard_state_to_rejoin(node_context: &NodeContext, discovery_addr: &st
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .is_some();
     if leaving {
+        return false;
+    }
+    if node_context.drain.note_evicted() {
+        eprintln!(
+            "WARN discovery at {discovery_addr} evicted this node earlier; it is draining, so it \
+             keeps its cache and does not join again"
+        );
         return false;
     }
     eprintln!(
@@ -8187,6 +8239,15 @@ async fn fetch_roster_for_leave(
         };
         if !retry || Instant::now() + ROSTER_RETRY_INTERVAL >= deadline {
             return Err(error);
+        }
+        // Issue #1333: discovery answered `G` to this node's `P` during the
+        // drain, so it has evicted the node and lists it in no roster
+        // (`T` is refused to a node that is not a member): retrying until
+        // the drain deadline would only hold the shutdown.
+        if node_context.drain.evicted() {
+            return Err(io::Error::other(
+                "discovery has evicted this node, so it is in no roster",
+            ));
         }
         if !logged {
             logged = true;
@@ -11860,6 +11921,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let started = tokio::time::Instant::now();
@@ -13757,6 +13819,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let target = ForwardTarget {
@@ -13852,6 +13915,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         // Exactly what `migration_target_for` would hand every concurrent
@@ -13939,6 +14003,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         });
         let target = Arc::new(ForwardTarget {
             addr: joining_addr,
@@ -14022,6 +14087,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let target = ForwardTarget {
@@ -14099,6 +14165,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let connection = Arc::new(AsyncMutex::new(None));
         let target = || ForwardTarget {
@@ -14263,6 +14330,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let connection = Arc::new(AsyncMutex::new(None));
         let revoked = Arc::new(AtomicBool::new(false));
@@ -14394,6 +14462,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let connection = Arc::new(AsyncMutex::new(None));
 
@@ -14549,6 +14618,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         // A dedicated forward channel, deliberately tiny (capacity 2) and
@@ -14702,6 +14772,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         // Capacity 1, occupied by an inert filler that's never polled —
@@ -17685,6 +17756,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let scope = ClearScope::Namespace(Bytes::from_static(b"users"));
         let a_key = key(b"k");
@@ -17796,6 +17868,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let scope = ClearScope::Namespace(Bytes::from_static(b"users"));
 
@@ -18067,6 +18140,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
@@ -18181,6 +18255,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let connection_task = tokio::spawn(handle_connection(
@@ -18256,6 +18331,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
@@ -18362,6 +18438,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let connection_task = tokio::spawn(handle_connection(
@@ -18453,6 +18530,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -18638,6 +18716,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -19712,6 +19791,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -19847,6 +19927,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -19972,6 +20053,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -20113,6 +20195,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -20221,6 +20304,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         // No decommission in flight: nothing to forward to.
@@ -20306,6 +20390,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -20437,6 +20522,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -20548,6 +20634,7 @@ mod tests {
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let k = key(b"any");
 
@@ -20627,6 +20714,7 @@ mod tests {
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let adopted = Arc::new(HashRing::new(vec![
             "me".to_string(),
@@ -20697,6 +20785,7 @@ mod tests {
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         assert!(rereplication_clear_targets(&node_context).is_empty());
 
@@ -20763,6 +20852,7 @@ mod tests {
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -20867,6 +20957,7 @@ mod tests {
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -20998,6 +21089,7 @@ mod tests {
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -21282,6 +21374,7 @@ mod tests {
             ring_history: RingHistory::default(),
             rereplication_tx: mpsc::channel(1).0,
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -21391,6 +21484,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -21527,6 +21621,7 @@ mod tests {
             shutdown_rx: watch::channel(false).1,
             latest_published: Arc::new(Mutex::new(None)),
             roster_refresh: Arc::default(),
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -21713,6 +21808,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let slot = Arc::clone(&node_context.active_migration);
 
@@ -21872,6 +21968,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -22047,6 +22144,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         }
     }
 
@@ -22205,6 +22303,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         // The relay `handle_connection` actually talks to: forwards every
@@ -22361,6 +22460,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let (proxy_tx, mut proxy_rx) = mpsc::channel::<CacheRequest>(4);
@@ -22698,6 +22798,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let joined = vec![
@@ -22869,6 +22970,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         // R=1 over {leaver, peer}: every key the leaver owns must move
@@ -23075,16 +23177,34 @@ mod tests {
         node: tokio::task::JoinHandle<io::Result<()>>,
         helpers: Vec<tokio::task::JoinHandle<()>>,
         owned: usize,
+        /// The connection that stored the keys, still open.
+        client: TcpStream,
+        /// The first key the node owns, stored as `v`.
+        first_key: String,
     }
 
     impl DrainingNode {
         async fn start(keys: usize, delay: Duration) -> Self {
+            Self::start_with(keys, delay, spawn_logging_discovery).await
+        }
+
+        async fn start_with(
+            keys: usize,
+            delay: Duration,
+            spawn_discovery: impl FnOnce(
+                TcpListener,
+                String,
+            ) -> (
+                Arc<std::sync::Mutex<Vec<char>>>,
+                tokio::task::JoinHandle<()>,
+            ),
+        ) -> Self {
             let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let peer_addr = peer_listener.local_addr().unwrap().to_string();
             let peer = spawn_slow_peer(peer_listener, delay);
             let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
-            let (log, discovery) = spawn_logging_discovery(discovery_listener, peer_addr);
+            let (log, discovery) = spawn_discovery(discovery_listener, peer_addr);
 
             let node_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let node_port = node_listener.local_addr().unwrap().port();
@@ -23130,6 +23250,7 @@ mod tests {
             let mut client = TcpStream::connect(("127.0.0.1", node_port)).await.unwrap();
             let mut owned = 0;
             let mut index = 0;
+            let mut first_key = String::new();
             while owned < keys {
                 let name = format!("key-{index}");
                 index += 1;
@@ -23140,6 +23261,9 @@ mod tests {
                 client.write_all(request.as_bytes()).await.unwrap();
                 let mut reply = [0u8; 16];
                 assert!(client.read(&mut reply).await.unwrap() > 0);
+                if owned == 0 {
+                    first_key = name;
+                }
                 owned += 1;
             }
 
@@ -23150,6 +23274,8 @@ mod tests {
                 node,
                 helpers: vec![peer, discovery],
                 owned,
+                client,
+                first_key,
             }
         }
 
@@ -23268,6 +23394,177 @@ mod tests {
         );
     }
 
+    /// Issue #1333: a discovery for a node that is cut off from it, then
+    /// evicted. While `partitioned` it closes every connection at the first
+    /// message. After that, with `evicted` set, it answers `P` with `G`
+    /// (logged as `G`), closes `T`/`L` and `H` (it lists no such node), and
+    /// holds the `V` reply for a second so the leaving node stays up.
+    fn spawn_evicting_discovery(
+        listener: TcpListener,
+        partitioned: Arc<AtomicBool>,
+        evicted: Arc<AtomicBool>,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<char>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let log: Arc<std::sync::Mutex<Vec<char>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&log);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = Arc::clone(&recorded);
+                let partitioned = Arc::clone(&partitioned);
+                let evicted = Arc::clone(&evicted);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let Some(position) = buf.iter().position(|byte| *byte == b'\n') else {
+                            let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                            continue;
+                        };
+                        let line: Vec<u8> = buf.drain(..=position).collect();
+                        let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+                        let letter = line.chars().next().unwrap();
+                        if partitioned.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if letter == 'L' {
+                            if evicted.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let _ = stream.write_all(b"N 0 1\n").await;
+                            continue;
+                        }
+                        let fields: Vec<usize> = line
+                            .split(' ')
+                            .skip(1)
+                            .filter_map(|field| field.parse().ok())
+                            .collect();
+                        // `J`/`P`: name-len port token-len; `H`: name-len
+                        // replication token-len; `T`/`V`: name-len
+                        // token-len.
+                        let need = match letter {
+                            'J' | 'P' | 'H' => fields[0] + fields[2],
+                            _ => fields[0] + fields[1],
+                        };
+                        while buf.len() < need {
+                            let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                        }
+                        buf.drain(..need);
+                        let evicted = evicted.load(Ordering::SeqCst);
+                        match letter {
+                            'P' if evicted => {
+                                let _ = stream.write_all(b"G\n").await;
+                                recorded.lock().unwrap().push('G');
+                                continue;
+                            }
+                            'H' | 'T' if evicted => return,
+                            _ => {}
+                        }
+                        recorded.lock().unwrap().push(letter);
+                        match letter {
+                            'J' | 'P' => {
+                                let _ = stream.write_all(b"R\n").await;
+                            }
+                            'H' => {
+                                let _ = stream.write_all(b"A\n").await;
+                            }
+                            'V' => {
+                                sleep(Duration::from_secs(1)).await;
+                                let _ = stream.write_all(b"R\n").await;
+                            }
+                            _ => return,
+                        }
+                    }
+                });
+            }
+        });
+        (log, task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_evicted_node_that_is_draining_ignores_g_and_leaves() {
+        // Issue #1333: a node cut off from discovery long enough to be
+        // evicted, then sent SIGTERM, retries its roster fetch through the
+        // drain (issue #1281). When the path heals, the retrying heartbeat
+        // `P` is answered `G`, and the node used to act on it: clear its
+        // cache and send `J`, a join started by a node that is leaving. It
+        // must keep its cache, not send `J`, and not wait out the drain
+        // budget for a roster that will never list it: `G` is the answer.
+        let partitioned = Arc::new(AtomicBool::new(false));
+        let evicted = Arc::new(AtomicBool::new(false));
+        let node = DrainingNode::start_with(3, Duration::from_millis(10), {
+            let partitioned = Arc::clone(&partitioned);
+            let evicted = Arc::clone(&evicted);
+            move |listener, _| spawn_evicting_discovery(listener, partitioned, evicted)
+        })
+        .await;
+        node.wait_for("two heartbeats", |log| {
+            log.iter().filter(|letter| **letter == 'H').count() >= 2
+        })
+        .await;
+
+        // Stored here, after the promotion: the keys `start_with` writes can
+        // reach the node before discovery has answered its `J`, and are
+        // then refused with `W`.
+        let mut node = node;
+        let request = format!("S {} 1\n{}v", node.first_key.len(), node.first_key);
+        node.client.write_all(request.as_bytes()).await.unwrap();
+        let mut reply = [0u8; 16];
+        let read = node.client.read(&mut reply).await.unwrap();
+        assert_eq!(&reply[..read], b"S\n");
+
+        // Cut off, then SIGTERM while discovery cannot be reached.
+        partitioned.store(true, Ordering::SeqCst);
+        sleep(Duration::from_millis(200)).await;
+        node.first_signal.notify_one();
+        sleep(Duration::from_millis(200)).await;
+
+        // The path heals; discovery evicted the node meanwhile.
+        evicted.store(true, Ordering::SeqCst);
+        partitioned.store(false, Ordering::SeqCst);
+        node.wait_for("the G answer", |log| log.contains(&'G'))
+            .await;
+        sleep(Duration::from_millis(100)).await;
+
+        let request = format!("G {}\n{}", node.first_key.len(), node.first_key);
+        node.client.write_all(request.as_bytes()).await.unwrap();
+        let read = node.client.read(&mut reply).await.unwrap();
+        assert!(
+            reply[..read].starts_with(b"V ") && reply[..read].ends_with(b"v"),
+            "the draining node dropped its cache on `G`: {:?}",
+            String::from_utf8_lossy(&reply[..read])
+        );
+
+        // The roster will never list it: it leaves instead of retrying
+        // until the 60 s budget runs out.
+        node.wait_for("the leave", |log| log.contains(&'V')).await;
+        let log = node.log();
+        assert_eq!(
+            log.iter().filter(|letter| **letter == 'J').count(),
+            1,
+            "a draining node must not start a join: {log:?}"
+        );
+
+        node.second_signal.notify_one();
+        node.finish(Duration::from_secs(5)).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_decommission_leaves_without_a_handoff_when_already_overridden_at_the_start_of_transfer()
      {
@@ -23331,6 +23628,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx,
+            drain: DrainState::default(),
         };
 
         let started = Instant::now();
@@ -23431,6 +23729,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx,
+            drain: DrainState::default(),
         };
 
         let started = Instant::now();
@@ -23533,6 +23832,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx,
+            drain: DrainState::default(),
         };
 
         let before = HashRing::new(vec!["leaver".to_string(), "peer".to_string()]);
@@ -23679,6 +23979,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx,
+            drain: DrainState::default(),
         };
 
         let before = HashRing::new(vec!["leaver".to_string(), "peer".to_string()]);
@@ -24061,6 +24362,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         }
     }
 
@@ -24235,6 +24537,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let before = HashRing::new(vec!["leaver".to_string(), "peer".to_string()]);
@@ -24441,6 +24744,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         let joined = vec![
@@ -24744,6 +25048,7 @@ mod tests {
             rereplication_tx,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         // The `M`'s own roster: discovery's *current* view, which never
@@ -24984,6 +25289,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         }
     }
 
@@ -25492,6 +25798,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         (node_context, after_ring, pre_completion_ring)
     }
@@ -25933,6 +26240,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
 
         *node_context.active_migration.lock().unwrap() = Some(ActiveMigration {
@@ -26362,6 +26670,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         }
     }
 
@@ -26783,6 +27092,7 @@ mod tests {
                     rereplication_tx: mpsc::channel(1).0,
                     rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
+                    drain: DrainState::default(),
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -26933,6 +27243,7 @@ mod tests {
                     rereplication_tx: mpsc::channel(1).0,
                     rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
+                    drain: DrainState::default(),
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -27071,6 +27382,7 @@ mod tests {
                     rereplication_tx: mpsc::channel(1).0,
                     rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
+                    drain: DrainState::default(),
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -27202,6 +27514,7 @@ mod tests {
                     rereplication_tx: mpsc::channel(1).0,
                     rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
+                    drain: DrainState::default(),
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -27391,6 +27704,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let mut stale = completed_forwarding_slot(&["dead"]);
         stale.completed_at = Some(Instant::now() - forwarding_grace(0) - Duration::from_secs(1));
@@ -27515,6 +27829,7 @@ mod tests {
                     rereplication_tx: mpsc::channel(1).0,
                     rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
+                    drain: DrainState::default(),
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -27693,6 +28008,7 @@ mod tests {
                     rereplication_tx: mpsc::channel(1).0,
                     rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
+                    drain: DrainState::default(),
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -27893,6 +28209,7 @@ mod tests {
                     rereplication_tx: mpsc::channel(1).0,
                     rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
+                    drain: DrainState::default(),
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -28040,6 +28357,7 @@ mod tests {
                     rereplication_tx: mpsc::channel(1).0,
                     rereplication_forward: Arc::new(Mutex::new(None)),
                     shutdown_rx: watch::channel(false).1,
+                    drain: DrainState::default(),
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -29024,6 +29342,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         }
     }
 
@@ -29296,6 +29615,7 @@ mod tests {
                 rereplication_tx: mpsc::channel(1).0,
                 rereplication_forward: Arc::new(Mutex::new(None)),
                 shutdown_rx: watch::channel(false).1,
+                drain: DrainState::default(),
             };
 
             let error = fetch_roster_once(&node_context, &discovery_addr)
@@ -29960,6 +30280,7 @@ mod tests {
             rereplication_tx,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: shutdown_rx.clone(),
+            drain: DrainState::default(),
         };
 
         // Moved, not cloned: a lingering clone in this test's own scope
@@ -30620,6 +30941,7 @@ mod tests {
             rereplication_tx,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let revoked = Arc::clone(
             &node_context
@@ -30894,6 +31216,7 @@ mod tests {
             rereplication_tx: mpsc::channel(1).0,
             rereplication_forward: Arc::new(Mutex::new(None)),
             shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
         };
         let joined = vec![
             ("ready-node".to_string(), "127.0.0.1:1".to_string()),
