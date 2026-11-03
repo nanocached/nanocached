@@ -758,22 +758,33 @@ const BUSY_REPLY_DRAIN_LIMIT: usize = 8 * 1024;
 /// reset by peer" and never the reply, on macOS and on Linux alike (the
 /// server test that pins this failed every run without the drain on
 /// both). Draining first makes the close a FIN that follows the reply.
+///
+/// `log` writes the two lines about a reply that could not be sent. It is
+/// the caller's own rate-limited connection log, not `eprintln!`: a peer
+/// that connects past the cap and resets at once makes one such line per
+/// connection (2,934 for 3,000 connections measured), each a blocking write
+/// on the runtime thread.
 pub async fn reject_over_limit(
     mut stream: TcpStream,
     address: SocketAddr,
     tls_acceptor: &Option<TlsAcceptor>,
     tls_handshake_timeout: Duration,
     busy_reply: &[u8],
+    log: fn(std::fmt::Arguments<'_>),
 ) {
     if tls_acceptor.is_none() {
         match timeout(tls_handshake_timeout, stream.write_all(busy_reply)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                eprintln!("WARN failed to send busy response to {address}: {error}");
+                log(format_args!(
+                    "WARN failed to send busy response to {address}: {error}"
+                ));
                 return;
             }
             Err(_) => {
-                eprintln!("WARN sending busy response to {address} timed out");
+                log(format_args!(
+                    "WARN sending busy response to {address} timed out"
+                ));
                 return;
             }
         }
