@@ -123,11 +123,12 @@
 //!   work.
 //! - Limits: `--max-connections` (default 1024) client connections,
 //!   over-limit connections answered `B\n` and closed, mirroring the
-//!   node. No per-IP cap: a proxy typically fronts a NAT'd fleet where
-//!   source IPs are meaningless; put the proxy itself behind one if its
-//!   exposure needs it. Requests are bounded by the node's own 1 MiB
-//!   request cap, enforced here too so a hostile client can't balloon
-//!   proxy memory.
+//!   node. `--max-connections-per-ip` (default 256) caps how many of
+//!   those one source IP may hold, so a single client cannot take the
+//!   whole budget; a fleet behind one NAT or on Kubernetes shares one
+//!   source IP, and there this cap is the effective fleet ceiling, so
+//!   raise it. Requests are bounded by the node's own 1 MiB request cap,
+//!   enforced here too so a hostile client can't balloon proxy memory.
 //! - Failure surface (issue #125): for a client that declared the
 //!   retryable-error capability (`A ... R`), an upstream failure that
 //!   survives one refresh-and-retry answers that request `R` (+tag) and
@@ -5909,9 +5910,12 @@ fn touch_answer(reply: &NodeReply, tag: Option<u32>) -> Option<Vec<u8>> {
 /// with one exception: a `ttl=0` touch expires the key it finds, so a frame
 /// that may have reached the node is not sent again (the second would answer
 /// `N`, and a `G` would lose the value the first one consumed) and its
-/// failure is `OutcomeUnknown`. For the same reason its replica legs were
-/// not enqueued with the primary's (see `enqueue_touch`): they are sent
-/// here, once the primary has answered, by `expire_on_other_owners`.
+/// failure is `OutcomeUnknown`. A node's `W` or `E` to such a frame is not a
+/// failure of that kind: the frame was refused, nothing was expired, and it
+/// is `Fatal::Transient` like a refusal of `i`, `k` or `x`. For the same
+/// reason its replica legs were not enqueued with the primary's (see
+/// `enqueue_touch`): they are sent here, once the primary has answered, by
+/// `expire_on_other_owners`.
 async fn finish_touch(
     context: &ProxyContext,
     namespace: &[u8],
@@ -5954,8 +5958,11 @@ async fn finish_touch(
         Ok(reply) => {
             let answer = touch_answer(reply, tag);
             if expires_at_once(ttl) {
+                // A reply that is no touch answer (`E`; a `W` was handled
+                // above) is a refusal: the node did not expire anything, so
+                // the client may simply send the touch again.
                 let Some(answer) = answer else {
-                    return Err(Fatal::OutcomeUnknown);
+                    return Err(Fatal::Transient);
                 };
                 if let Some(primary) = owners.first() {
                     expire_on_other_owners(context, namespace, key, primary).await;
@@ -6000,7 +6007,9 @@ async fn refan_touch(
             .await
         {
             Ok(reply) => {
-                let answer = touch_answer(&reply, tag).ok_or(Fatal::OutcomeUnknown)?;
+                // `W` and `E` are refusals, not outcomes: nothing was
+                // expired, so a retry-capable client is answered `R`.
+                let answer = touch_answer(&reply, tag).ok_or(Fatal::Transient)?;
                 expire_on_other_owners(context, namespace, key, primary).await;
                 Ok(answer)
             }
@@ -10240,6 +10249,11 @@ mod tests {
         /// instead of replying — the reply lost after the node executed
         /// it. A touch is idempotent, so the proxy must re-send it.
         close_after_touch_apply_once: Arc<AtomicBool>,
+        /// The markers (`"W"`, `"E"`) the next `t` frames are refused with,
+        /// one per frame in order, before any is applied — a stale ring
+        /// that is still stale after a refresh, or a node that fails the
+        /// request. Nothing is logged in `touches` or expired.
+        refuse_touches: Arc<StdMutex<std::collections::VecDeque<&'static str>>>,
         get_delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
         /// Issue #110: set when a request was already buffered before
@@ -10293,6 +10307,7 @@ mod tests {
                 close_after_cas_delete_apply_once: Arc::new(AtomicBool::new(false)),
                 touches: Arc::new(StdMutex::new(Vec::new())),
                 close_after_touch_apply_once: Arc::new(AtomicBool::new(false)),
+                refuse_touches: Arc::new(StdMutex::new(std::collections::VecDeque::new())),
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
                 auth_count: Arc::new(AtomicUsize::new(0)),
                 saw_pipelined: Arc::new(AtomicBool::new(false)),
@@ -10317,6 +10332,7 @@ mod tests {
                 Arc::clone(&node.close_after_cas_delete_apply_once);
             let touches = Arc::clone(&node.touches);
             let close_after_touch_apply_once = Arc::clone(&node.close_after_touch_apply_once);
+            let refuse_touches = Arc::clone(&node.refuse_touches);
             let delay = Arc::clone(&node.get_delay);
             let auth_count = Arc::clone(&node.auth_count);
             let saw_pipelined = Arc::clone(&node.saw_pipelined);
@@ -10351,6 +10367,7 @@ mod tests {
                             ),
                             touches: Arc::clone(&touches),
                             close_after_touch_apply_once: Arc::clone(&close_after_touch_apply_once),
+                            refuse_touches: Arc::clone(&refuse_touches),
                             delay: Arc::clone(&delay),
                             auth_count: Arc::clone(&auth_count),
                             saw_pipelined: Arc::clone(&saw_pipelined),
@@ -10420,6 +10437,7 @@ mod tests {
         /// instead of replying — the reply lost after the node executed
         /// it. A touch is idempotent, so the proxy must re-send it.
         close_after_touch_apply_once: Arc<AtomicBool>,
+        refuse_touches: Arc<StdMutex<std::collections::VecDeque<&'static str>>>,
         delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
         saw_pipelined: Arc<AtomicBool>,
@@ -10459,6 +10477,7 @@ mod tests {
             close_after_cas_delete_apply_once,
             touches,
             close_after_touch_apply_once,
+            refuse_touches,
             delay,
             auth_count,
             saw_pipelined,
@@ -10907,6 +10926,13 @@ mod tests {
                         if wrong_once.swap(false, Ordering::SeqCst) {
                             stream
                                 .write_all(format!("W {}\n", tag(&fields)).as_bytes())
+                                .await?;
+                            continue;
+                        }
+                        let refusal = refuse_touches.lock().unwrap().pop_front();
+                        if let Some(marker) = refusal {
+                            stream
+                                .write_all(format!("{marker} {}\n", tag(&fields)).as_bytes())
                                 .await?;
                             continue;
                         }
@@ -14831,6 +14857,61 @@ mod tests {
             vec![(Some(0), false)],
             "the retried key's other owner is sent the plain touch"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_touch_the_node_refuses_is_r_not_an_unknown_outcome() {
+        // A `W` or `E` means the frame was refused and nothing expired, so it
+        // is no unknown outcome. The ring still being stale after the
+        // refresh, or the node failing the retry, must reach a retry-capable
+        // client as `R` (and the connection must stay usable), not as the
+        // fatal `E` + close of an `i`, `k` or `x` whose outcome is unknown.
+        let cases: [(&str, &[&'static str]); 3] = [
+            ("W on the first send and again on the retry", &["W", "W"]),
+            ("W on the first send, E on the retry", &["W", "E"]),
+            ("E on the first send", &["E"]),
+        ];
+        for (name, refusals) in cases {
+            for get in [false, true] {
+                let (nodes, proxy) = cluster(1).await;
+                let mut stream = TcpStream::connect(&proxy).await.unwrap();
+                stream.write_all(b"A 1 R\nx").await.unwrap();
+                let mut buf = BytesMut::new();
+                assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+                stream.write_all(b"S 3 1\nkeyv").await.unwrap();
+                assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+                for node in &nodes {
+                    node.refuse_touches
+                        .lock()
+                        .unwrap()
+                        .extend(refusals.iter().copied());
+                }
+                let request: &[u8] = if get {
+                    b"t 0 3 0 G\nkey"
+                } else {
+                    b"t 0 3 0\nkey"
+                };
+                stream.write_all(request).await.unwrap();
+                assert_eq!(
+                    read_line(&mut stream, &mut buf).await.unwrap(),
+                    "R",
+                    "{name}, get={get}"
+                );
+                for node in &nodes {
+                    assert!(node.touches().is_empty(), "{name}: a refused touch applied");
+                }
+
+                // The connection stays open and the key was never expired.
+                stream.write_all(request).await.unwrap();
+                let expected = if get { "V 1 0" } else { "S" };
+                assert_eq!(
+                    read_line(&mut stream, &mut buf).await.unwrap(),
+                    expected,
+                    "{name}, get={get}: the retry"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
