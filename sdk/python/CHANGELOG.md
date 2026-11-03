@@ -9,6 +9,8 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-03
+
 ### Fixed
 
 - A key, value or namespace that was not `str` or bytes-like went through `bytes(value)`, so an `int` became that many NUL bytes: `set("k", 42)` stored 42 NULs, `set("visits", 0)` stored an empty value (and the next `incr("visits")` raised `NotNumericError`), `set(7, "x")` stored `b"x"` under a seven-byte NUL key, and `set("big", 100_000_000)` allocated 100 MB before the request-size `ValueError`. `str` is still UTF-8 encoded and `bytes`, `bytearray` and `memoryview` are still copied; anything else now raises `TypeError` naming the argument (key, value or namespace) before anything is allocated or sent, as the TypeScript SDK does. (#1345)
@@ -551,7 +553,8 @@ without a deprecation cycle and are listed below.
 - First tag-driven release of the aligned SDK line (see the repository
   release history for earlier changes).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.6.1...HEAD
+[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.6.2...HEAD
+[0.6.2]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.6.1...sdk/python/v0.6.2
 [0.6.1]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.6.0...sdk/python/v0.6.1
 [0.6.0]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.5.1...sdk/python/v0.6.0
 [0.5.1]: https://github.com/nanocached/nanocached/compare/sdk/python/v0.5.0...sdk/python/v0.5.1
