@@ -1,6 +1,6 @@
 {
   "name": "nanocached-keyv",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Keyv storage adapter for nanocached, a tiny distributed cache with client-side replication — for cache-manager v6+ and NestJS 11's CacheModule",
   "license": "MIT",
   "repository": {
