@@ -12,6 +12,19 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ### Fixed
 
+- With `Options.Ca`, the server certificate's extended key usage was not
+  checked. The SDK replaces `SslStream`'s validation with its own chain build
+  and never set the chain's application policy, so a certificate the private CA
+  had issued for client authentication or code signing only was accepted as a
+  server certificate whenever its SAN matched the dialed address (`ConnectAsync`
+  succeeded for leaves with serverAuth, clientAuth-only and codeSigning-only
+  EKU). The chain now requires the serverAuth purpose, as rustls and the JDK do:
+  clientAuth-only and codeSigning-only leaves are refused with an
+  `AuthenticationException`, while a leaf that lists serverAuth among other
+  purposes, or has no EKU extension at all (valid for any use), still connects.
+  A leaf following the TLS guide (`extendedKeyUsage=serverAuth`) is unaffected.
+  (#1344)
+
 - `Options.ReadHedgeAfter` had no upper bound. `ConnectAsync` only refused a
   value that was not positive, so a hedge interval of about 49.7 days or more
   was accepted and then every hedged read of a key with a second owner threw a

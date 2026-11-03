@@ -521,6 +521,14 @@ public sealed class NanocachedClient : IDisposable
                 chain.ChainPolicy.CustomTrustStore.Clear();
                 chain.ChainPolicy.CustomTrustStore.AddRange(roots);
                 chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                // The certificate must be valid for TLS server use. SslStream's
+                // own validation asks for this, but this custom chain replaces
+                // it, and an empty ApplicationPolicy accepts any extended key
+                // usage — so a client-auth or code-signing certificate the
+                // private CA issued for the same IP would pass. A certificate
+                // with no EKU extension is valid for any use and still passes;
+                // rustls and the JDK refuse the same wrong-purpose leaf.
+                chain.ChainPolicy.ApplicationPolicy.Add(new Oid("1.3.6.1.5.5.7.3.1"));
                 // The intermediates the server sent in the handshake, so a
                 // leaf issued through a subordinate CA (a private CA's usual
                 // shape) chains up to the root in Ca. They go in ExtraStore,
