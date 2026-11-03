@@ -11758,9 +11758,13 @@ mod tests {
     async fn dead_node_cluster() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
         let discovery = start_mock_discovery(vec![("node-dead".to_string(), dead_addr)], 1).await;
-        start_proxy(&discovery, None, 64).await
+        let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports: freed first, the kernel can hand the same port to one of
+        // them and the "dead" node is then alive.
+        drop(listener);
+        proxy
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11789,13 +11793,15 @@ mod tests {
         let live = MockNode::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
         let roster = vec![
             ("node-live".to_string(), live.addr.clone()),
             ("node-dead".to_string(), dead_addr.clone()),
         ];
         let discovery = start_mock_discovery(roster.clone(), 1).await;
         let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports (see `dead_node_cluster`).
+        drop(listener);
 
         let ring = RingView::new(roster, 1);
         let mut on_live = None;
@@ -12179,7 +12185,6 @@ mod tests {
         let live = MockNode::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
 
         let discovery = start_mock_discovery(
             vec![
@@ -12190,6 +12195,9 @@ mod tests {
         )
         .await;
         let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports (see `dead_node_cluster`).
+        drop(listener);
 
         let ring = RingView::new(
             vec![
@@ -12239,7 +12247,6 @@ mod tests {
         let live = MockNode::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
 
         let discovery = start_mock_discovery(
             vec![
@@ -12250,6 +12257,9 @@ mod tests {
         )
         .await;
         let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports (see `dead_node_cluster`).
+        drop(listener);
 
         let ring = RingView::new(
             vec![
@@ -12591,13 +12601,16 @@ mod tests {
         let live = MockNode::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
         let roster = vec![
             ("node-live".to_string(), live.addr.clone()),
             ("node-dead".to_string(), dead_addr),
         ];
         let discovery = start_mock_discovery(roster, 2).await;
-        (live, start_proxy(&discovery, None, 64).await)
+        let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports (see `dead_node_cluster`).
+        drop(listener);
+        (live, proxy)
     }
 
     /// `o` (`touch: false`) or `y` of `keys` one-byte-value keys.
@@ -14543,13 +14556,15 @@ mod tests {
         let live = MockNode::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
         let roster = vec![
             ("node-live".to_string(), live.addr.clone()),
             ("node-dead".to_string(), dead_addr.clone()),
         ];
         let discovery = start_mock_discovery(roster.clone(), 2).await;
         let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports (see `dead_node_cluster`).
+        drop(listener);
         let ring = RingView::new(roster, 2);
         let key = (0..64u8)
             .map(|index| format!("k{index}"))

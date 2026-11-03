@@ -74,8 +74,12 @@ jobs:
           go-version: stable
           cache: false
 
+      # Pinned like every other tool in these workflows. Dependabot does not
+      # see a `go install` in a workflow, so bump the version here by hand;
+      # the vulnerability data it reports against is fetched at run time
+      # either way.
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
 
       # Stdlib-only module: this reports advisories against the Go
       # standard library itself for the toolchain in use.

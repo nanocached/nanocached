@@ -117,7 +117,7 @@ public sealed class NanocachedClient : IDisposable
         /// could desync a connection — but is left to finish detached and
         /// drained by <see cref="Close"/>, the same as a fire-and-forget
         /// replica write. Writes are unaffected. Rejected as invalid
-        /// unless positive.</para></summary>
+        /// unless positive or if it exceeds 365 days.</para></summary>
         public TimeSpan? ReadHedgeAfter { get; set; }
 
         /// <summary>How long, after a reconnect dial to an address fails,
@@ -312,6 +312,16 @@ public sealed class NanocachedClient : IDisposable
     private static void DecrementOpenTarget(string key) =>
         OpenTargets.AddOrUpdate(key, 0, (_, count) => Math.Max(0, count - 1));
 
+    /// <summary>Upper bound for <see cref="Options.ReadHedgeAfter"/>: one
+    /// year, the same bound the Java SDK puts on its duration options.</summary>
+    private static readonly TimeSpan MaxReadHedgeAfter = TimeSpan.FromDays(365);
+
+    /// <summary>The longest delay <see cref="Task.Delay(TimeSpan, CancellationToken)"/>
+    /// takes (uint.MaxValue - 1 ms, ~49.7 days); a longer one throws
+    /// ArgumentOutOfRangeException. A hedge interval beyond it is capped to
+    /// this, which is indistinguishable from never hedging.</summary>
+    private static readonly TimeSpan MaxTaskDelay = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+
     private readonly object _stateLock = new();
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private readonly Dictionary<string, SemaphoreSlim> _redialGates = new();
@@ -445,7 +455,12 @@ public sealed class NanocachedClient : IDisposable
         _backgroundReplicaPermitCount = MaxInFlightBackgroundReplicaWrites;
         _backgroundReplicaPermits = new SemaphoreSlim(_backgroundReplicaPermitCount, _backgroundReplicaPermitCount);
         _readRepair = options.ReadRepair;
-        _readHedgeAfter = options.ReadHedgeAfter;
+        // Validated to <= MaxReadHedgeAfter by ConnectAsync; Task.Delay cannot
+        // wait that long (it throws above ~49.7 days), so cap what the hedge
+        // timer is given.
+        _readHedgeAfter = options.ReadHedgeAfter is TimeSpan hedge && hedge > MaxTaskDelay
+            ? MaxTaskDelay
+            : options.ReadHedgeAfter;
         _reconnectCooldown = options.DisableReconnectCooldown
             ? null
             : options.ReconnectCooldown == TimeSpan.Zero
@@ -506,6 +521,14 @@ public sealed class NanocachedClient : IDisposable
                 chain.ChainPolicy.CustomTrustStore.Clear();
                 chain.ChainPolicy.CustomTrustStore.AddRange(roots);
                 chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                // The certificate must be valid for TLS server use. SslStream's
+                // own validation asks for this, but this custom chain replaces
+                // it, and an empty ApplicationPolicy accepts any extended key
+                // usage — so a client-auth or code-signing certificate the
+                // private CA issued for the same IP would pass. A certificate
+                // with no EKU extension is valid for any use and still passes;
+                // rustls and the JDK refuse the same wrong-purpose leaf.
+                chain.ChainPolicy.ApplicationPolicy.Add(new Oid("1.3.6.1.5.5.7.3.1"));
                 // The intermediates the server sent in the handshake, so a
                 // leaf issued through a subordinate CA (a private CA's usual
                 // shape) chains up to the root in Ca. They go in ExtraStore,
@@ -551,6 +574,16 @@ public sealed class NanocachedClient : IDisposable
             throw new ArgumentOutOfRangeException(
                 nameof(options),
                 "nanocached: ReadHedgeAfter must be a positive duration");
+        }
+        // Without an upper bound a huge value passed connect and then made
+        // every hedged read throw a raw ArgumentOutOfRangeException from
+        // Task.Delay after leg 0 had started. A year is far past any useful
+        // interval and is the bound the Java SDK uses for the same option.
+        if (options.ReadHedgeAfter is TimeSpan hedgeAfterMax && hedgeAfterMax > MaxReadHedgeAfter)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                $"nanocached: ReadHedgeAfter must not exceed {MaxReadHedgeAfter.TotalDays:0} days, got {hedgeAfterMax}");
         }
         // Issue #488: an option that can have no effect in this
         // configuration is a misconfiguration, not something to ignore
