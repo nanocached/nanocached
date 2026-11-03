@@ -96,6 +96,10 @@ jobs:
     if: startsWith(github.ref_name, 'sdk/java/v')
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The Maven Central credentials and the signing key live in the `release`
+    # environment, which needs a reviewer's approval and only accepts the
+    # release tags, so pushing a tag is not enough to reach them.
+    environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -347,6 +351,10 @@ jobs:
     if: startsWith(github.ref_name, 'adapter/spring/v') || startsWith(github.ref_name, 'adapter/jcache/v') || startsWith(github.ref_name, 'adapter/spring-boot-starter/v')
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The Maven Central credentials and the signing key live in the `release`
+    # environment, which needs a reviewer's approval and only accepts the
+    # release tags, so pushing a tag is not enough to reach them.
+    environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
