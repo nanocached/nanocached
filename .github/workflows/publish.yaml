@@ -13,16 +13,49 @@ permissions:
 # One publish at a time. This serialises the pushes; it does not order
 # them — CI runs finish in their own order (and a re-run of an older
 # commit's CI finishes last of all), so the "is this commit still the
-# tip of main?" check below is what keeps `:main` from moving back.
+# tip of main?" check in the `tip` job is what keeps `:main` from moving back.
 concurrency:
   group: publish-image
   cancel-in-progress: false
 
 jobs:
-  publish:
+  # Asks once whether the tested commit is the tip of main, and hands the
+  # answer to the three image builds. Each matrix job used to ask for itself,
+  # so when main advanced between the first and the last of them `:main`
+  # moved to this commit for some images (node) and not for the others
+  # (discovery, proxy), and stayed that way until the next green CI run.
+  tip:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      is_tip: ${{ steps.tip.outputs.is_tip }}
+    steps:
+      # Asked of the API at this moment rather than read from the event:
+      # CI runs for consecutive commits can finish out of order, and a
+      # re-run of an older commit's flaky CI finishes after the newer
+      # commit was already published — both arrive here as a green `push`
+      # run and would otherwise move `:main` back to the older commit
+      # (#1165).
+      - name: Is the tested commit the tip of main?
+        id: tip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq .commit.sha)
+          if [ "$tip" = "$HEAD_SHA" ]; then
+            echo "is_tip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_tip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${HEAD_SHA:0:12} is no longer the tip of main (${tip:0:12}); publishing :sha-${HEAD_SHA:0:12} only"
+          fi
+
+  # Skipped together with `tip` when CI did not succeed on a push.
+  publish:
+    needs: tip
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -55,27 +88,20 @@ jobs:
       # pins one such build. `:latest` is the last release and is moved
       # only by the release workflow, for all three images at once.
       #
-      # `:main` goes only on a build of the commit that is the tip of main
-      # *now*, asked of the API at this moment rather than read from the
-      # event: CI runs for consecutive commits can finish out of order,
-      # and a re-run of an older commit's flaky CI finishes after the
-      # newer commit was already published — both arrive here as a green
-      # `push` run and would otherwise move `:main` back to the older
-      # commit (#1165). A build of a commit that is no longer the tip gets
-      # its `:sha-<id>` tag and nothing else.
+      # `:main` goes only on a build of the commit that was the tip of main
+      # when the `tip` job asked, the same answer for all three images. A
+      # build of a commit that is not the tip gets its `:sha-<id>` tag and
+      # nothing else.
       - name: Image tags
         id: tags
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          IS_TIP: ${{ needs.tip.outputs.is_tip }}
           IMAGE: ghcr.io/${{ github.repository }}-${{ matrix.component }}
         run: |
-          tip=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq .commit.sha)
           tags="${IMAGE}:sha-${HEAD_SHA:0:12}"
-          if [ "$tip" = "$HEAD_SHA" ]; then
+          if [ "$IS_TIP" = "true" ]; then
             tags="${IMAGE}:main"$'\n'"$tags"
-          else
-            echo "::notice::${HEAD_SHA:0:12} is no longer the tip of main (${tip:0:12}); publishing :sha-${HEAD_SHA:0:12} only"
           fi
           {
             echo "list<<EOF"
