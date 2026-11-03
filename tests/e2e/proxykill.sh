@@ -8,6 +8,8 @@ source "$E/cl.sh"
 P=npk; D=$P-disc:8357
 T(){ echo "### $(date -u +%T.%N | cut -c1-12) [$P] $*"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+trap cleanup EXIT  # Ctrl-C or a failed step must not leave the run's containers behind
+tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }  # bounds a command to N seconds
 proxies(){ docker run --rm --network $NET -v $E:/w -w /w e2e-client python disc.py $D proxies; }
 RUN=${RUN:-$(date +%H%M%S)}; L="$E/logs/pkill-$RUN"; mkdir -p "$L"
 cleanup; docker network create $NET >/dev/null
@@ -23,7 +25,7 @@ T "KILL $P-c"; docker kill $P-c >/dev/null
 wait_members 2 $D 60 || { T "FAIL: eviction"; fail=1; }
 T "evicted after $(( $(date +%s)-t0 ))s; restarting $P-c"; docker start $P-c >/dev/null
 wait_members 3 $D 60 || { T "FAIL: rejoin"; fail=1; }; T "rejoined after $(( $(date +%s)-t0 ))s"
-docker wait $P-load >/dev/null
+tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
 docker logs $P-load > "$L/load.log" 2>&1; load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1); echo "=== load: $load"
 check=$(docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
 echo "=== check: $check"

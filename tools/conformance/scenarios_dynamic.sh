@@ -20,7 +20,12 @@ NODE=${NODE:-nanocached-node:conformance}; DISC=${DISC:-nanocached-discovery:con
 NET=conf-$RUN-$WHAT; P=cd$RUN-$WHAT
 OUT=${OUT:-$HERE/results/$RUN/$WHAT}; WATCHDOG=${WATCHDOG:-2400}
 mkdir -p "$OUT"
-cleanup() { docker rm -f $(docker ps -aq --filter "name=$P-") >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
+# The watchdog is killed with the script (EXIT trap), or it would fire after WATCHDOG s on a run that has long since ended
+# and remove the containers of a later run that reuses this RUN tag. In the watchdog subshell WD is still unset, so this is a no-op there.
+stop_watchdog() { [ -n "${WD:-}" ] || return 0; pkill -P "$WD" >/dev/null 2>&1; kill "$WD" >/dev/null 2>&1; wait "$WD" 2>/dev/null; WD=; }
+# wait for every background job except the watchdog; an empty job list must not turn into a bare `wait`, which waits for the watchdog too
+wait_clients() { local p; for p in $(jobs -p); do [ "$p" = "${WD:-}" ] || wait "$p" 2>/dev/null; done; }
+cleanup() { stop_watchdog; docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
 trap cleanup EXIT
 ( sleep "$WATCHDOG"; echo "WATCHDOG fired after ${WATCHDOG}s" >&2; cleanup; pkill -P $$ >/dev/null 2>&1 ) 2>/dev/null &
 WD=$!
@@ -35,7 +40,7 @@ proxy() { docker run -d --name $P-$1 --network "$NET" "$PROXY" --host 0.0.0.0 --
 
 sc() { # sdk outfile addr via secret limit scenario args...
   local sdk=$1 file=$2 addr=$3 via=$4 secret=$5 limit=$6; shift 6
-  local env=(-e NANOTEST_ADDRESSES=$addr -e NANOTEST_VIA_PROXY=$via -e NANOTEST_SECRET=$secret -e CONN_TIMEOUT_S=$limit -v "$REPO:/repo:ro" -v "$OUT:/out" --network "$NET")
+  local env=(-e "NANOTEST_ADDRESSES=$addr" -e "NANOTEST_VIA_PROXY=$via" -e "NANOTEST_SECRET=$secret" -e "CONN_TIMEOUT_S=$limit" -v "$REPO:/repo:ro" -v "$OUT:/out" --network "$NET")
   case $sdk in
     python) docker run --rm --name $P-c-$sdk-$RANDOM "${env[@]}" -w /repo/tools/conformance -e PYTHONPATH=/repo/sdk/python/src e2e-client python drivers/python/scenario.py "$@" ;;
     *) "$HERE/drivers/$sdk/scenario.sh" "$P-c-$sdk-$RANDOM" "${env[@]}" -- "$@" ;;
@@ -57,8 +62,8 @@ v5)
     sleep 12; echo "event join d at +$(( $(now_ms) - START )) ms" | tee -a "$OUT/events-$mode.txt"; node d --discovery $P-disc:8357 --drain-timeout 20
     sleep 20; echo "event decommission a (SIGTERM) at +$(( $(now_ms) - START )) ms" | tee -a "$OUT/events-$mode.txt"; docker stop -t 30 $P-a >/dev/null &
     sleep 16; echo "event kill b (SIGKILL) at +$(( $(now_ms) - START )) ms" | tee -a "$OUT/events-$mode.txt"; docker kill $P-b >/dev/null
-    wait $(jobs -p | grep -v "^$WD$") 2>/dev/null
-    docker rm -f $(docker ps -aq --filter "name=$P-") >/dev/null 2>&1
+    wait_clients
+    docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1
   done ;;
 v7)
   node n1; sleep 2; A=$P-n1:8356
@@ -71,7 +76,7 @@ v7)
     docker rm -f $P-relay >/dev/null
     # reconnect: restart the node while the client polls
     ( sc "$sdk" "$OUT/reconnect.$sdk.jsonl" $A 0 "" 90 life reconnect 14 ) &
-    sleep 4; docker restart -t 1 $P-n1 >/dev/null; wait $(jobs -p | grep -v "^$WD$") 2>/dev/null
+    sleep 4; docker restart -t 1 $P-n1 >/dev/null; wait_clients
     # dial storm: a listener that accepts and closes
     rm -f "$OUT/accepts.log"; fixture storm accept_close; sleep 1
     sc "$sdk" "$OUT/storm.$sdk.jsonl" $P-storm:8356 0 "" 60 life storm 10
@@ -93,6 +98,6 @@ v7x)
   sc dotnet "$OUT/cycles.dotnet.jsonl" $A 0 "" 300 life cycles 300 ;;
 *) echo "unknown $WHAT"; exit 2 ;;
 esac
-kill $WD >/dev/null 2>&1
-mkdir -p "$OUT/logs"; for c in $(docker ps -a --format '{{.Names}}' --filter "name=$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
+stop_watchdog
+mkdir -p "$OUT/logs"; for c in $(docker ps -a --format '{{.Names}}' --filter "name=^/$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
 echo "results in $OUT"

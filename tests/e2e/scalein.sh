@@ -21,6 +21,8 @@ source $E/cl.sh
 P=nsi; D=$P-disc:8357
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+trap cleanup EXIT  # Ctrl-C or a failed step must not leave the run's containers behind
+tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }  # bounds a command to N seconds
 mkdir -p $E/logs
 cleanup; docker network create $NET >/dev/null
 disc_up $P-disc --replication-factor 2; sleep 1
@@ -28,7 +30,9 @@ i=0; for n in a b c; do i=$((i+1)); node_up $P-$n $D --drain-timeout 20; wait_me
 T "seed 30000 keys (R=2): k0..k19999 is the load's keyspace, k20000..k29999 stays untouched for the loss check"
 docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1
 T "start 60s mixed load (8 conns, get 70%)"
-docker run -d --name $P-load --network $NET -v $E:/w -w /w e2e-client python load.py --addr $D --conns 8 --duration 60 --keyspace 20000 --value-size 256 --label scalein --reconnect-on-error >/dev/null
+LOAD_SECS=${LOAD_SECS:-60}
+fail=0
+docker run -d --name $P-load --network $NET -v $E:/w -w /w e2e-client python load.py --addr $D --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label scalein --reconnect-on-error >/dev/null
 sleep 10
 T "docker stop -t 40 node a (SIGTERM; drain budget 20s)"
 t0=$(date +%s)
@@ -37,7 +41,7 @@ rc=$(docker inspect -f '{{.State.ExitCode}}' $P-a)
 T "leaver exited rc=$rc after $(( $(date +%s)-t0 ))s (want rc=0, well under 40s)"
 wait_members 2 $D 30
 T "waiting for the load to finish"
-docker wait $P-load >/dev/null
+tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
 load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)
 echo "=== load: $load"
 T "verify the 10000 untouched keys post-drain (loss/corruption check)"
@@ -45,7 +49,6 @@ check=$(docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.p
 echo "=== check: $check"
 echo "=== leaver (a)"; docker logs $P-a 2>&1 | grep -i "decommission\|shutdown\|warn\|error" | head -8
 echo "=== discovery"; docker logs $P-disc 2>&1 | grep -i "left\|warn\|error" | head -5
-fail=0
 [ "$rc" = 0 ] || { echo "FAIL: leaver exit code $rc"; fail=1; }
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { echo "FAIL: post-drain verify not clean"; fail=1; }
 echo "$load" | grep -q '"corrupt": 0' || { echo "FAIL: load saw corrupt reads"; fail=1; }
