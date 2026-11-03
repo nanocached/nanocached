@@ -134,7 +134,12 @@ unreachable.</p>
   sweep that came after discovery itself had not been running for longer
   than half the liveness timeout (a stopped or suspended discovery process,
   which finds every heartbeat old when it resumes): they were not silent,
-  and nobody moved on without them. A node evicted longer ago than that
+  and nobody moved on without them. Nor are nodes sent back when every one
+  of them was evicted together, as when the path between discovery and the
+  whole fleet was cut: discovery answers <code>G</code> only while some
+  node has been a member without a break since before that node was
+  evicted, since only such a node can have taken its keys over, and
+  otherwise registers the node as it announces. A node evicted longer ago than that
   hour, or by a standby discovery replica (which only lists nodes), is
   registered as before.</li>
 </ul>

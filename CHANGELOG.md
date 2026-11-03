@@ -12,6 +12,10 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-discovery`: when every node stopped reaching discovery for longer than the liveness timeout (a partition between discovery and the whole fleet, with discovery itself sweeping normally), each node was evicted on its own tick, and when the path healed each one announced itself and was answered `G`, so every node dropped its cache and joined again: the whole cache was cleared. `G` says the cluster went on without the node and took writes it does not have, which needs a node that stayed. A `P` from an evicted node is now answered `G` only if some node has been `Joined` continuously since before that node was evicted (`NodeInfo` records when it became `Joined`); otherwise it registers as it announces. A node evicted alone, with the others alive and heartbeating, still gets `G`. Three nodes at R=2 and 40 keys, every heartbeat held for 40 s: 80 of 80 copies lost before, none after, whether the nodes were cut off together or 4 s apart and healed 7 s apart (#1311).
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed
