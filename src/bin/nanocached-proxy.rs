@@ -2988,9 +2988,19 @@ async fn run_backend(
         // nothing would ever bring this task back around to notice it.
         // A write timeout is treated exactly like a write error: poison
         // and stop, so the slot clears and the next `enqueue` redials.
+        //
+        // Flushed inside the same timeout: over TLS, `write_all` can
+        // return with ciphertext still buffered in rustls when the socket
+        // is full, and nothing polls this stream for writing afterwards
+        // (the reader only reads), so the tail of a large frame would
+        // never reach the node, the reply would never come and the
+        // reader's timeout would poison the connection. The client-facing
+        // writes already go through `infra::write_all_within`, which
+        // flushes for the same reason.
         let write_result = timeout(UPSTREAM_IO_TIMEOUT, async {
             write_half.write_all(&header).await?;
-            write_half.write_all(&body).await
+            write_half.write_all(&body).await?;
+            write_half.flush().await
         })
         .await;
         if !matches!(write_result, Ok(Ok(()))) {
@@ -11336,6 +11346,88 @@ mod tests {
         let connector = TlsConnector::from(Arc::new(client_config));
 
         (acceptor, connector)
+    }
+
+    /// A request frame much larger than the kernel's socket buffers,
+    /// written over TLS to a node that drains its (4 KiB) receive
+    /// buffer slowly, must arrive whole. `write_all` over rustls can
+    /// return with ciphertext still buffered inside the TLS stream, and
+    /// nothing polls the stream afterwards, so without a `flush` the
+    /// tail of the frame never reaches the node: the reply never comes,
+    /// the reader times out and poisons the connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_backend_write_over_tls_reaches_a_slow_node_whole() {
+        let (acceptor, connector) = self_signed_tls();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let value = vec![b'v'; 400 * 1024];
+        let frame = frame_set(b"", b"key", &value, None);
+        let (header, body) = substitute_tag(frame.clone(), 0);
+        let expected = header.len() + body.len();
+        let received = Arc::new(AtomicUsize::new(0));
+        let node_received = Arc::clone(&received);
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut buf = [0u8; 4096];
+            // The handshake is `A 5 T\nproxy`.
+            let mut handshake = 0;
+            while handshake < 11 {
+                handshake += tls.read(&mut buf).await.unwrap();
+            }
+            tls.write_all(b"OnT\n").await.unwrap();
+            tls.flush().await.unwrap();
+            // Let both socket buffers fill before draining, then drain
+            // slowly, replying once the whole frame has arrived.
+            sleep(Duration::from_millis(100)).await;
+            while let Ok(n) = tls.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                let total = node_received.fetch_add(n, Ordering::SeqCst) + n;
+                if total >= expected {
+                    let _ = tls.write_all(b"S 0\n").await;
+                    let _ = tls.flush().await;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        });
+        let slot = Arc::new(tokio::sync::Mutex::new(None));
+        let handle = BackendHandle::connect(
+            &addr,
+            &None,
+            &Some(connector),
+            slot,
+            Arc::new(AtomicUsize::new(0)),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        let (reply, outcome) = oneshot::channel();
+        handle
+            .sender
+            .send(BackendRequest {
+                frame,
+                expect: Expect::Stored,
+                reply,
+            })
+            .await
+            .ok()
+            .unwrap();
+        let outcome = timeout(Duration::from_secs(10), outcome)
+            .await
+            .expect("the node never answered: the tail of the frame was left unsent")
+            .unwrap();
+        assert!(
+            matches!(outcome, Ok(NodeReply::Stored)),
+            "unexpected outcome {:?}; the node received {} of {expected} bytes",
+            outcome.map_err(|e| e.to_string()),
+            received.load(Ordering::SeqCst),
+        );
+        assert_eq!(received.load(Ordering::SeqCst), expected);
     }
 
     /// Tenth-pass audit (2026-09-02): like `start_proxy_with_drain`, but
