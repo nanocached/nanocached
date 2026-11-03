@@ -1,9 +1,12 @@
 package nanocached
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 // A replica leg that outlives its call (FireAndForgetReplicas) must send the
@@ -118,4 +121,84 @@ func TestDetachedReplicaLegsDoNotReadTheCallersValueAfterTheCallReturns(t *testi
 			}
 		}
 	})
+}
+
+// The read-repair write-back that outlives GetBytes/GetWithToken must send
+// the bytes the replica returned, not the slice the caller was handed. The
+// primary misses and the replica holds the value; the replica's reply is
+// delayed so the test can take the primary connection's writeMu after the
+// primary's miss was read and before the repair is queued, which holds the
+// repair back. The caller then overwrites the slice it was returned, and only
+// after that is the repair let go. Compression is off, so without a copy the
+// repair would send the caller's own slice.
+func TestReadRepairWriteBackDoesNotReadTheCallersValueAfterTheReadReturns(t *testing.T) {
+	const key = "k"
+	owners := ownersOf(key)
+	original := bytes.Repeat([]byte("A"), 512*1024)
+
+	read := map[string]func(*Client) ([]byte, error){
+		"GetBytes": func(c *Client) ([]byte, error) {
+			v, ok, err := c.GetBytes(key)
+			if err == nil && !ok {
+				err = errors.New("GetBytes: key not found")
+			}
+			return v, err
+		},
+		"GetWithToken": func(c *Client) ([]byte, error) {
+			v, _, ok, err := c.GetWithToken(key)
+			if err == nil && !ok {
+				err = errors.New("GetWithToken: key not found")
+			}
+			return v, err
+		},
+	}
+	for name, get := range read {
+		t.Run(name, func(t *testing.T) {
+			nodes, discovery := startCluster(t, 2)
+			primary, replica := nodes[owners[0]], nodes[owners[1]]
+			replica.store.Store(storeKey{"", key}, bytes.Clone(original))
+			client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ReadRepair: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			closeClient := sync.OnceFunc(func() { client.Close() })
+			t.Cleanup(closeClient)
+
+			replica.delayGets(500 * time.Millisecond)
+			held := make(chan func(), 1)
+			go func() {
+				for primary.getCount.Load() == 0 {
+					time.Sleep(time.Millisecond)
+				}
+				held <- holdReplica(t, client, owners[0])
+			}()
+
+			value, err := get(client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var release func()
+			select {
+			case release = <-held:
+			case <-time.After(5 * time.Second):
+				t.Fatal("never held the primary connection")
+			}
+			if !bytes.Equal(value, original) {
+				release()
+				t.Fatal("the caller was returned a different value than the replica holds")
+			}
+			for i := range value { // the caller owns what it was returned
+				value[i] = 'B'
+			}
+			release()
+			closeClient() // waits for the background repair
+			stored, ok := primary.store.Load(storeKey{"", key})
+			if !ok {
+				t.Fatal("the primary was never repaired")
+			}
+			if got := stored.([]byte); !bytes.Equal(got, original) {
+				t.Fatalf("the primary was repaired with %d of %d bytes changed by the caller", bytes.Count(got, []byte("B")), len(got))
+			}
+		})
+	}
 }
