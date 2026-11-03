@@ -397,8 +397,19 @@ async def _dial_roster(
     return [outcome for outcome in outcomes if outcome is not None]
 
 
-def _to_bytes(value: str | bytes) -> bytes:
-    return value.encode("utf-8") if isinstance(value, str) else bytes(value)
+def _to_bytes(value: str | bytes, role: str = "key") -> bytes:
+    """Converts a key, value or namespace argument to the bytes sent on the
+    wire. ``str`` is UTF-8 encoded; ``bytes``, ``bytearray`` and
+    ``memoryview`` are copied to ``bytes``. Anything else is a ``TypeError``
+    naming ``role`` — in particular ``bytes(42)`` is 42 NUL bytes and
+    ``bytes(0)`` is ``b""``, so an ``int`` must never reach ``bytes()``
+    (``set("k", 42)`` would store 42 NULs, and ``set("big", 10**8)`` would
+    allocate 100 MB before the size check ran)."""
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    raise TypeError(f"nanocached: {role} must be str or bytes, got {type(value).__name__}")
 
 
 def _check_key(key_bytes: bytes, namespace: bytes = b"") -> None:
@@ -1245,7 +1256,7 @@ class NanocachedClient:
         """The namespace-carrying implementation behind set() and
         Namespace.set() (issue #105) — see _get_bytes()."""
         _check_ttl_seconds(ttl_seconds)
-        key_bytes, value_bytes = _to_bytes(key), _to_bytes(value)
+        key_bytes, value_bytes = _to_bytes(key), _to_bytes(value, "value")
         # Validate the *original* value's size before compressing, matching
         # Rust's and Go's Set — an oversized value must be rejected outright,
         # not silently forwarded just because DEFLATE happens to shrink it
@@ -1807,7 +1818,7 @@ class NanocachedClient:
         value_bytes_list: list[bytes] = []
         seen: dict[bytes, str | bytes] = {}
         for original, value in values.items():
-            key_bytes, value_bytes = _to_bytes(original), _to_bytes(value)
+            key_bytes, value_bytes = _to_bytes(original), _to_bytes(value, "value")
             # See _set()'s own comment: validated before compressing, and
             # re-checked after, purely as a defense-in-depth backstop.
             _check_key_and_value(key_bytes, value_bytes, namespace)
@@ -2692,7 +2703,7 @@ class NanocachedClient:
         successful ``k`` must go through this client's own compression
         pipeline, or a later plain get() would fail to decompress it)."""
         _check_ttl_seconds(ttl_seconds)
-        key_bytes, value_bytes = _to_bytes(key), _to_bytes(value)
+        key_bytes, value_bytes = _to_bytes(key), _to_bytes(value, "value")
         _check_key_and_value(key_bytes, value_bytes, namespace)
         if self._compress:
             value_bytes = compress_value(value_bytes, self._compression_threshold)
@@ -2895,7 +2906,7 @@ class NanocachedClient:
         client's connections; it does not become invalid until this
         client does, at which point its operations raise the same
         AlreadyClosedError get/set/delete already would."""
-        return Namespace(self, _to_bytes(ns))
+        return Namespace(self, _to_bytes(ns, "namespace"))
 
     async def close(self) -> None:
         """Idempotent; later get/set/delete raise AlreadyClosedError. A

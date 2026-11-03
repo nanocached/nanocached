@@ -11519,6 +11519,11 @@ async fn report_complete(
                 generation,
             ))
             .await?;
+        // Over TLS `write_all` can return with ciphertext still held back in
+        // rustls (a full socket buffer); without a flush the peer never sees
+        // the whole `C` and the ack below is waited for until the timeout.
+        // Every other outbound write in this file flushes for the same reason.
+        stream.flush().await?;
 
         let mut ack = [0u8; 2];
         stream.read_exact(&mut ack).await?;
@@ -27977,18 +27982,22 @@ mod tests {
         )
         .await;
 
+        // A fake discovery server: must receive nothing — a migration
+        // that permanently failed to transfer a key must not report
+        // completion. Bound first and kept alive while the dead port is
+        // picked below: the other way round, the kernel can hand the port
+        // just freed for the dead address to this listener, the migration's
+        // first connect is then accepted, and the test fails on a port
+        // collision instead of on the behaviour it checks.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+
         // A joining node address nothing is listening on: every connect
         // attempt fails immediately, so `run_migration` exhausts
         // `KEY_TRANSFER_ATTEMPTS` and gives up on the whole migration.
         let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let joining_addr = dead_listener.local_addr().unwrap().to_string();
         drop(dead_listener);
-
-        // A fake discovery server: must receive nothing — a migration
-        // that permanently failed to transfer a key must not report
-        // completion.
-        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
 
         let (mut client, server) = tcp_pair().await;
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);

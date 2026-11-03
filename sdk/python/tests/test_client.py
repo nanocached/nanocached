@@ -98,6 +98,55 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_bytes_like_keys_and_values_are_accepted(self):
+        client = await self.connect()
+        try:
+            await client.set(bytearray(b"ba"), memoryview(b"mv"))
+            self.assertEqual(await client.get_bytes(b"ba"), b"mv")
+            await client.set(memoryview(b"mk"), bytearray(b"bv"))
+            self.assertEqual(await client.get("mk"), "bv")
+            self.assertEqual(client.namespace(bytearray(b"ns")).namespace, b"ns")
+        finally:
+            await client.close()
+
+    async def test_an_int_key_value_or_namespace_is_a_type_error_not_nul_bytes(self):
+        # bytes(42) is 42 NUL bytes and bytes(0) is b"": set("k", 42) used
+        # to store 42 NULs, set("visits", 0) stored an empty value (so the
+        # next incr failed with NotNumericError), set(7, "x") stored "x"
+        # under seven NUL bytes, and set("big", 10**8) allocated 100 MB
+        # before the size check ran.
+        client = await self.connect()
+        try:
+            for bad in (42, 0, 10**8, 1.5, None, ["a"], True):
+                with self.subTest(bad=bad):
+                    with self.assertRaisesRegex(TypeError, "value must be str or bytes"):
+                        await client.set("k", bad)
+                    with self.assertRaisesRegex(TypeError, "key must be str or bytes"):
+                        await client.set(bad, "x")
+                    with self.assertRaisesRegex(TypeError, "key must be str or bytes"):
+                        await client.get(bad)
+                    with self.assertRaisesRegex(TypeError, "key must be str or bytes"):
+                        await client.delete(bad)
+                    with self.assertRaisesRegex(TypeError, "key must be str or bytes"):
+                        await client.incr(bad)
+                    with self.assertRaisesRegex(TypeError, "namespace must be str or bytes"):
+                        client.namespace(bad)
+            with self.assertRaisesRegex(TypeError, "value must be str or bytes"):
+                await client.set_many({"a": "ok", "b": 7})
+            with self.assertRaisesRegex(TypeError, "key must be str or bytes"):
+                await client.set_many({7: "x"})
+            with self.assertRaisesRegex(TypeError, "key must be str or bytes"):
+                await client.get_many(["a", 7])
+            with self.assertRaisesRegex(TypeError, "value must be str or bytes"):
+                await client.put_if_absent("k", 0)
+            # Nothing reached the node: no NUL-byte key or empty value was stored.
+            self.assertEqual(self.node.store, {})
+            # The incr case from the report: "visits" can still be counted.
+            await client.set("visits", "0")
+            self.assertEqual(await client.incr("visits"), 1)
+        finally:
+            await client.close()
+
     async def test_handles_binary_and_empty_values(self):
         client = await self.connect()
         try:
