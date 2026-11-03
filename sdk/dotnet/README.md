@@ -508,7 +508,8 @@ single copy there is nobody to hedge to. Writes are unaffected — every
 copy must be written, so a slow owner bounds writes to it regardless
 (`FireAndForgetReplicas` moves only the replica legs off the caller's
 path). The losing leg of a hedge is left to finish and is drained by
-`Close()`. Rejected by `ConnectAsync` together with [SDK proxy
+`Close()`. `ConnectAsync` rejects a value that is not positive or is longer than a
+year (the Java SDK's bound too). Rejected by `ConnectAsync` together with [SDK proxy
 mode](#sdk-proxy-mode) (`ViaProxy`): a proxy connection has no ring and
 nobody else to hedge to.
 

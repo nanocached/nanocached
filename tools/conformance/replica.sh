@@ -17,7 +17,12 @@ NET=conf-$RUN-rep; P=cr$RUN
 OPTSTAG=""; [ -n "${NANOTEST_OPTS:-}" ] && OPTSTAG="-$(echo "$NANOTEST_OPTS" | tr ',=' '--')"
 OUT=${OUT:-$HERE/results/$RUN/replica-R$R-N$N-$PATHK-$MODE$OPTSTAG}; WATCHDOG=${WATCHDOG:-3000}
 mkdir -p "$OUT"
-cleanup() { docker rm -f $(docker ps -aq --filter "name=$P-") >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
+# The watchdog is killed with the script (EXIT trap), or it would fire after WATCHDOG s on a run that has long since ended
+# and remove the containers of a later run that reuses this RUN tag. In the watchdog subshell WD is still unset, so this is a no-op there.
+stop_watchdog() { [ -n "${WD:-}" ] || return 0; pkill -P "$WD" >/dev/null 2>&1; kill "$WD" >/dev/null 2>&1; wait "$WD" 2>/dev/null; WD=; }
+# wait for every background job except the watchdog; an empty job list must not turn into a bare `wait`, which waits for the watchdog too
+wait_clients() { local p; for p in $(jobs -p); do [ "$p" = "${WD:-}" ] || wait "$p" 2>/dev/null; done; }
+cleanup() { stop_watchdog; docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1; }
 trap cleanup EXIT
 ( sleep "$WATCHDOG"; echo "WATCHDOG fired after ${WATCHDOG}s" >&2; cleanup; pkill -P $$ >/dev/null 2>&1 ) 2>/dev/null &
 WD=$!
@@ -67,7 +72,7 @@ else
   drive python "$i"
   python3 "$HERE/make_cases.py" "$RUN-mix" --group repmix > "$d/cases.json"; python3 "$HERE/make_cases.py" "$RUN-mix" --group repmix --tsv > "$d/cases.tsv"
   for sdk in $SDKS; do ( drive "$sdk" "$d" ) & done
-  wait $(jobs -p | grep -v "^$WD$") 2>/dev/null
+  wait_clients
   # the init keys are part of the same key space: the reader needs them too
   python3 - "$d" "$i" <<'PY'
 import json,sys
@@ -77,6 +82,6 @@ json.dump(doc,open(d+'/cases.json','w'))
 PY
   sleep 2; read_owners "$d" --mix
 fi
-kill $WD >/dev/null 2>&1
-mkdir -p "$OUT/logs"; for c in $(docker ps -a --format '{{.Names}}' --filter "name=$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
+stop_watchdog
+mkdir -p "$OUT/logs"; for c in $(docker ps -a --format '{{.Names}}' --filter "name=^/$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
 echo "results in $OUT"
