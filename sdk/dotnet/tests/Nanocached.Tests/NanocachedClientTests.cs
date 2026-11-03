@@ -5387,6 +5387,77 @@ public class NanocachedClientTests
         }
     }
 
+    private const string ServerAuthOid = "1.3.6.1.5.5.7.3.1";
+    private const string ClientAuthOid = "1.3.6.1.5.5.7.3.2";
+    private const string CodeSigningOid = "1.3.6.1.5.5.7.3.3";
+
+    [Theory]
+    [InlineData(ServerAuthOid)]
+    [InlineData(ClientAuthOid + "," + ServerAuthOid)]
+    [InlineData("")] // no EKU extension: valid for any use
+    public async Task TlsAcceptsALeafValidForServerUse(string ekuList)
+    {
+        string[] leafEkus = ekuList.Length == 0 ? Array.Empty<string>() : ekuList.Split(',');
+        var (root, intermediate, leaf) = Tls.GenerateChain(
+            IPAddress.Loopback, leafExtendedKeyUsages: leafEkus);
+        string pemPath = Tls.WritePemCertificate(root);
+        try
+        {
+            using MockNode node = MockNode.WithTls(leaf, new X509Certificate2Collection { intermediate });
+
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+            {
+                Addresses = { ("127.0.0.1", node.Port) },
+                Tls = true,
+                Ca = pemPath,
+            });
+            await client.SetAsync("k", "v");
+            Assert.Equal("v", await client.GetAsync("k"));
+        }
+        finally
+        {
+            File.Delete(pemPath);
+            root.Dispose();
+            intermediate.Dispose();
+            leaf.Dispose();
+        }
+    }
+
+    [Theory]
+    [InlineData(ClientAuthOid)]
+    [InlineData(CodeSigningOid)]
+    public async Task TlsRejectsALeafNotValidForServerUse(string ekuList)
+    {
+        string[] leafEkus = ekuList.Split(',');
+        // With Options.Ca the SDK builds its own chain, and used to leave
+        // ChainPolicy.ApplicationPolicy empty, so a certificate the private
+        // CA had issued for client authentication (or code signing) was
+        // accepted as a server certificate whenever its SAN matched the
+        // dialed address. rustls and the JDK both refuse such a leaf.
+        var (root, intermediate, leaf) = Tls.GenerateChain(
+            IPAddress.Loopback, leafExtendedKeyUsages: leafEkus);
+        string pemPath = Tls.WritePemCertificate(root);
+        try
+        {
+            using MockNode node = MockNode.WithTls(leaf, new X509Certificate2Collection { intermediate });
+
+            await Assert.ThrowsAsync<AuthenticationException>(() =>
+                NanocachedClient.ConnectAsync(new NanocachedClient.Options
+                {
+                    Addresses = { ("127.0.0.1", node.Port) },
+                    Tls = true,
+                    Ca = pemPath,
+                }));
+        }
+        finally
+        {
+            File.Delete(pemPath);
+            root.Dispose();
+            intermediate.Dispose();
+            leaf.Dispose();
+        }
+    }
+
     // ── ヘッジ読み取り (Hedged reads, issue #64) ─────────────────────
 
     // Generous versus the FireAndForgetReplicas suite's 20ms — hedging's

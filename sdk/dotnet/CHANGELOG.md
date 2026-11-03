@@ -10,6 +10,21 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- With `Options.Ca`, the server certificate's extended key usage was not
+  checked. The SDK replaces `SslStream`'s validation with its own chain build
+  and never set the chain's application policy, so a certificate the private CA
+  had issued for client authentication or code signing only was accepted as a
+  server certificate whenever its SAN matched the dialed address (`ConnectAsync`
+  succeeded for leaves with serverAuth, clientAuth-only and codeSigning-only
+  EKU). The chain now requires the serverAuth purpose, as rustls and the JDK do:
+  clientAuth-only and codeSigning-only leaves are refused with an
+  `AuthenticationException`, while a leaf that lists serverAuth among other
+  purposes, or has no EKU extension at all (valid for any use), still connects.
+  A leaf following the TLS guide (`extendedKeyUsage=serverAuth`) is unaffected.
+  (#1344)
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed
