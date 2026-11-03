@@ -14,6 +14,41 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: the architecture and SDK documentation said a proxy
+  serialises the writes of one key, so that routing through it removes the
+  disagreement between owners that concurrent same-key writes leave behind
+  with direct clients. It never did: a write is sent to the owners
+  concurrently and nothing orders two requests' sends across owners. The
+  documentation now says so and lists the proxy under the same accepted
+  behaviour as the SDKs; through one proxy in front of a 2-node,
+  2-replica cluster, 24 connections writing one key for 6,000 rounds left
+  8 and 57 rounds with the owners disagreeing in two runs (16 connections
+  for 3,000 rounds: 2; 8 for 300: none). The code is unchanged: ordering
+  the sends would take a per-key lock on every write (#1317).
+- `nanocached-proxy`: the backend writer never flushed, so over TLS the tail
+  of a large request could stay inside rustls (`write_all` returns once the
+  plaintext is accepted, and nothing polls the stream for writing
+  afterwards) while the node waited for the rest: the reply never came, the
+  reader's timeout poisoned the connection, and every request on it failed;
+  an `incr` or `cas` caught in the stuck tail reported an unknown outcome
+  though the node never saw the frame. The write is now flushed inside the
+  same timeout. A 400 KiB `S` over TLS to a node with a 4 KiB receive buffer
+  that drains slowly used to reach it incomplete and end in a read timeout
+  (about 359,500 of 409,616 bytes arrived) and now arrives whole and is answered.
+  Plain TCP was not affected (#1316).
+- `nanocached-proxy`: the connection-level log lines (`accept failed`, a
+  failed or timed-out TLS handshake, `connection error from <peer>`) were
+  written once per connection with no bound, and each is reachable without
+  authenticating: a flood of short connections within the connection caps
+  produced thousands of lines a second, and `eprintln!` is a blocking write
+  on a runtime worker, so a log sink that pushed back stalled the accept
+  loop and the backend tasks with it. They now share the node's and
+  discovery's limiter: 50 lines a second, the rest counted and reported in
+  one `WARN <n> more connection log lines (not logged individually)` line
+  ahead of the next one written. 3,000 plaintext connections to a TLS proxy
+  used to write 3,000 lines in half a second and now write 50; 3,000
+  connections that send 3 bytes and reset used to write 2,684 and now write
+  50. A reset is still logged, within the same budget (#1318).
 - `nanocached-node`: an `M` frame's roster-entry header (`<name-len> <addr-len>`) was searched for its newline from the start of the entry to the end of the buffer on every read, with nothing bounding its length but the 1 MiB frame limit, so a sender that never ended the header and added one byte at a time cost the node the whole buffered roster per byte: one such connection took most of the thread (sequential `g` on another connection fell from 32,574 to 2,721 req/s with one attacker and 557 req/s with four; about 2.4 s of CPU for 10,000 trickled bytes behind a 600 KB prefix, 4.6 s for 20,000). An entry header is a short line (at most 64 bytes, the bound the heartbeat ack's roster lines already use), so the search now looks that far and a header with no newline within it is refused and the connection closed. The same trickle now ends at the 65th header byte with no CPU use, and `g` stays at 29,000 to 33,000 req/s with 0, 1 and 4 such connections (#1313).
 
 ## [0.6.1] - 2026-11-02
