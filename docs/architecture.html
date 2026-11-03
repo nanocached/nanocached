@@ -130,11 +130,12 @@ unreachable.</p>
   the keys it owns now. What it held before the eviction is not kept,
   at any replication factor. A discovery that has just been restarted
   remembers nothing, and the nodes that kept heartbeating through the
-  restart re-register at once, as before. So do the nodes evicted by a
+  restart re-register at once, as before. Nodes are not evicted by a
   sweep that came after discovery itself had not been running for longer
   than half the liveness timeout (a stopped or suspended discovery process,
-  which finds every heartbeat old when it resumes): they were not silent,
-  and nobody moved on without them. Nor are nodes sent back when every one
+  which finds every heartbeat old when it resumes): that sweep gives every
+  node and proxy a fresh liveness window instead, since they were not
+  silent and nobody moved on without them. Nor are nodes sent back when every one
   of them was evicted together, as when the path between discovery and the
   whole fleet was cut: discovery answers <code>G</code> only while some
   node has been a member without a break since before that node was
