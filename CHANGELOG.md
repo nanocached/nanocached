@@ -36,6 +36,19 @@ framework adapters at one version, whether or not a component changed.
   that drains slowly used to reach it incomplete and end in a read timeout
   (about 359,500 of 409,616 bytes arrived) and now arrives whole and is answered.
   Plain TCP was not affected (#1316).
+- `nanocached-proxy`: the connection-level log lines (`accept failed`, a
+  failed or timed-out TLS handshake, `connection error from <peer>`) were
+  written once per connection with no bound, and each is reachable without
+  authenticating: a flood of short connections within the connection caps
+  produced thousands of lines a second, and `eprintln!` is a blocking write
+  on a runtime worker, so a log sink that pushed back stalled the accept
+  loop and the backend tasks with it. They now share the node's and
+  discovery's limiter: 50 lines a second, the rest counted and reported in
+  one `WARN <n> more connection log lines (not logged individually)` line
+  ahead of the next one written. 3,000 plaintext connections to a TLS proxy
+  used to write 3,000 lines in half a second and now write 50; 3,000
+  connections that send 3 bytes and reset used to write 2,684 and now write
+  50. A reset is still logged, within the same budget (#1318).
 
 ## [0.6.1] - 2026-11-02
 
