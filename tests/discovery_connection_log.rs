@@ -345,14 +345,14 @@ fn a_flood_of_invalid_handoff_reports_on_one_connection_is_logged_in_a_bounded_n
     });
 
     let port = free_port();
-    let discovery = start_discovery_with(port, &["--liveness-timeout", "6"]);
+    let discovery = start_discovery_with(port, &["--liveness-timeout", "15"]);
     wait_until_listening(port);
     register_node_a(port, node_port);
     let heartbeats = TcpStream::connect(("127.0.0.1", port)).unwrap();
     drain_in_background(heartbeats.try_clone().unwrap());
     let keep_alive = thread::spawn(move || {
         let mut heartbeats = heartbeats;
-        for _ in 0..16 {
+        for _ in 0..28 {
             if heartbeats.write_all(b"H 1 2 1\nab").is_err() {
                 break;
             }
@@ -363,8 +363,9 @@ fn a_flood_of_invalid_handoff_reports_on_one_connection_is_logged_in_a_bounded_n
     let mut joiner = TcpStream::connect(("127.0.0.1", port)).unwrap();
     joiner.write_all(b"J 1 9 1\nxy").unwrap();
     drain_in_background(joiner.try_clone().unwrap());
-    // Past the grace, so the join has started.
-    thread::sleep(Duration::from_millis(8_000));
+    // Past the grace (15 s, the smallest `--liveness-timeout`), so the join
+    // has started.
+    thread::sleep(Duration::from_millis(17_500));
 
     // A report is `C <name-len> <joining-len> <token-len>` with the reporter,
     // the joining node and the token as the body: `z` is not a ready member
