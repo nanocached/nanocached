@@ -14,6 +14,17 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: the architecture and SDK documentation said a proxy
+  serialises the writes of one key, so that routing through it removes the
+  disagreement between owners that concurrent same-key writes leave behind
+  with direct clients. It never did: a write is sent to the owners
+  concurrently and nothing orders two requests' sends across owners. The
+  documentation now says so and lists the proxy under the same accepted
+  behaviour as the SDKs; through one proxy in front of a 2-node,
+  2-replica cluster, 24 connections writing one key for 6,000 rounds left
+  8 and 57 rounds with the owners disagreeing in two runs (16 connections
+  for 3,000 rounds: 2; 8 for 300: none). The code is unchanged: ordering
+  the sends would take a per-key lock on every write (#1317).
 - `nanocached-proxy`: the backend writer never flushed, so over TLS the tail
   of a large request could stay inside rustls (`write_all` returns once the
   plaintext is accepted, and nothing polls the stream for writing
