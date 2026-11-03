@@ -2,6 +2,17 @@
   <img src="docs/assets/logo.jpg" alt="nanocached" width="100%">
 </p>
 
+<p align="center">
+  <a href="https://github.com/nanocached/nanocached/actions/workflows/ci.yaml"><img src="https://github.com/nanocached/nanocached/actions/workflows/ci.yaml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/nanocached/nanocached/actions/workflows/chaos-nightly.yaml"><img src="https://github.com/nanocached/nanocached/actions/workflows/chaos-nightly.yaml/badge.svg?branch=main" alt="Chaos nightly"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/nanocached/nanocached" alt="License: MIT"></a>
+  <a href="https://crates.io/crates/nanocached"><img src="https://img.shields.io/crates/v/nanocached?label=crates.io" alt="crates.io"></a>
+  <a href="https://www.npmjs.com/package/nanocached"><img src="https://img.shields.io/npm/v/nanocached?label=npm" alt="npm"></a>
+  <a href="https://pypi.org/project/nanocached/"><img src="https://img.shields.io/pypi/v/nanocached?label=PyPI" alt="PyPI"></a>
+  <a href="https://www.nuget.org/packages/Nanocached"><img src="https://img.shields.io/nuget/v/Nanocached?label=NuGet" alt="NuGet"></a>
+  <a href="https://central.sonatype.com/artifact/org.nanocached/nanocached"><img src="https://img.shields.io/maven-central/v/org.nanocached/nanocached?label=Maven%20Central" alt="Maven Central"></a>
+</p>
+
 nanocached is a compact in-memory key-value cache server written in Rust. It
 uses a small, binary-safe TCP protocol and supports optional time-to-live
 (TTL) values.
