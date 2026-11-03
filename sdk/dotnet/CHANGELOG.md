@@ -25,6 +25,16 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
   A leaf following the TLS guide (`extendedKeyUsage=serverAuth`) is unaffected.
   (#1344)
 
+- `Options.ReadHedgeAfter` had no upper bound. `ConnectAsync` only refused a
+  value that was not positive, so a hedge interval of about 49.7 days or more
+  was accepted and then every hedged read of a key with a second owner threw a
+  raw `ArgumentOutOfRangeException` from `Task.Delay`, after the primary leg had
+  already been started (30 days worked, 60 days threw on the first `GetAsync`).
+  `ConnectAsync` now throws `ArgumentOutOfRangeException` for a value above one
+  year, the bound the Java SDK uses; a value `Task.Delay` cannot take (past
+  about 49.7 days) is capped to that when the timer is armed, which is
+  indistinguishable from never hedging. (#1343)
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed

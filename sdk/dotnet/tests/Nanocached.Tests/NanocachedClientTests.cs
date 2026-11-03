@@ -5493,6 +5493,46 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task ReadHedgeAfterIsBoundedAtConnect()
+    {
+        // Task.Delay throws ArgumentOutOfRangeException for a delay above
+        // ~49.7 days, so an unbounded ReadHedgeAfter used to pass connect and
+        // then make every hedged read throw a raw exception after leg 0 had
+        // already started. The bound is the Java SDK's: one year; a value
+        // Task.Delay cannot take (60 days here) must still read.
+        using Cluster cluster = StartCluster(replication: 2);
+
+        foreach (TimeSpan accepted in new[] { TimeSpan.FromDays(30), TimeSpan.FromDays(60), TimeSpan.FromDays(365) })
+        {
+            NanocachedClient ok = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+            {
+                Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+                ReadHedgeAfter = accepted,
+            });
+            try
+            {
+                await ok.SetAsync("k", "v");
+                Assert.Equal("v", await ok.GetAsync("k"));
+            }
+            finally
+            {
+                ok.Close();
+            }
+        }
+
+        foreach (TimeSpan tooLong in new[] { TimeSpan.FromDays(366), TimeSpan.MaxValue })
+        {
+            var error = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+                NanocachedClient.ConnectAsync(new NanocachedClient.Options
+                {
+                    Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+                    ReadHedgeAfter = tooLong,
+                }));
+            Assert.Contains("ReadHedgeAfter", error.Message);
+        }
+    }
+
+    [Fact]
     public async Task AHitFromTheReplicaWinsOverASlowPrimary()
     {
         using Cluster cluster = StartCluster(replication: 2);
