@@ -11519,6 +11519,11 @@ async fn report_complete(
                 generation,
             ))
             .await?;
+        // Over TLS `write_all` can return with ciphertext still held back in
+        // rustls (a full socket buffer); without a flush the peer never sees
+        // the whole `C` and the ack below is waited for until the timeout.
+        // Every other outbound write in this file flushes for the same reason.
+        stream.flush().await?;
 
         let mut ack = [0u8; 2];
         stream.read_exact(&mut ack).await?;
