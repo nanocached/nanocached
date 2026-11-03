@@ -441,7 +441,8 @@ jobs:
           done
 
   e2e-scripts:
-    # Lints the E2E scenario scripts under tests/e2e — it never runs them
+    # Lints the E2E scenario scripts under tests/e2e and the conformance
+    # scripts under tools/conformance — it never runs them
     # (they need Docker, minutes-to-an-hour, netem; the hostile-load suite
     # runs on a schedule in its own workflow). Just keeps them
     # syntactically valid and shellcheck-clean so they stay runnable.
@@ -463,6 +464,14 @@ jobs:
           # one-liner helpers). Real errors (missing shebang, bad redirect
           # order, undefined-var typos) are still caught.
           shellcheck -e SC1091,SC2086,SC2046,SC2155 *.sh hostile/*.sh
+
+      # The conformance scripts (two nightly workflows run them) get the same
+      # treatment, with the same intentional exclusions.
+      - name: Conformance scripts - shell syntax and shellcheck
+        working-directory: tools/conformance
+        run: |
+          for f in *.sh drivers/*/*.sh; do bash -n "$f"; done
+          shellcheck -e SC1091,SC2086,SC2046,SC2155 *.sh drivers/*/*.sh
 
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
