@@ -22,6 +22,8 @@ source $E/cl.sh
 P=npd; D=$P-disc:8357
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+trap cleanup EXIT  # Ctrl-C or a failed step must not leave the run's containers behind
+tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }  # bounds a command to N seconds
 proxies(){ docker run --rm --network $NET -v $E:/w -w /w e2e-client python disc.py $D proxies; }
 mkdir -p $E/logs
 cleanup; docker network create $NET >/dev/null
@@ -36,7 +38,9 @@ T "2 proxies registered in Q"
 T "seed 15000 keys (R=2): k0..k9999 is the load's keyspace, k10000..k14999 stays untouched for the loss check"
 docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py seed --addr $D,$D --n 15000 --size 256 | tail -1
 T "start 45s via_proxy load (8 conns — random proxy per conn)"
-docker run -d --name $P-load --network $NET -v $E:/w -v $SDKP:/sdk -e PYTHONPATH=/sdk -w /w e2e-client python load.py --addr $D --via-proxy --conns 8 --duration 45 --keyspace 10000 --value-size 256 --label pdrain --reconnect-on-error >/dev/null
+LOAD_SECS=${LOAD_SECS:-45}
+fail=0
+docker run -d --name $P-load --network $NET -v $E:/w -v $SDKP:/sdk -e PYTHONPATH=/sdk -w /w e2e-client python load.py --addr $D --via-proxy --conns 8 --duration $LOAD_SECS --keyspace 10000 --value-size 256 --label pdrain --reconnect-on-error >/dev/null
 sleep 10
 T "docker stop -t 30 proxy p1 (SIGTERM)"
 t0=$(date +%s%N)
@@ -50,7 +54,7 @@ wait $STOP
 rc=$(docker inspect -f '{{.State.ExitCode}}' $P-p1)
 T "proxy exited rc=$rc after $(( ($(date +%s%N)-t0)/1000000 ))ms (want rc=0, well under 30s)"
 T "waiting for the load to finish"
-docker wait $P-load >/dev/null
+tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
 load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)
 echo "=== load: $load"
 T "verify the 5000 untouched keys post-drain (loss/corruption check)"
@@ -58,7 +62,6 @@ check=$(docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.p
 echo "=== check: $check"
 echo "=== proxy p1"; docker logs $P-p1 2>&1 | grep -i "drain\|deregister\|shutdown\|warn\|error" | head -8
 echo "=== discovery"; docker logs $P-disc 2>&1 | grep -i "proxy\|warn\|error" | head -6
-fail=0
 [ "$rc" = 0 ] || { echo "FAIL: proxy exit code $rc"; fail=1; }
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { echo "FAIL: post-drain verify not clean"; fail=1; }
 echo "$load" | grep -q '"corrupt": 0' || { echo "FAIL: load saw corrupt reads"; fail=1; }
