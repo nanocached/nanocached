@@ -9359,7 +9359,7 @@ mod tests {
         a.write_all(&fifty_kb_multi_get_frame(b'a')).await.unwrap();
         sleep(Duration::from_millis(50)).await;
         let mut parked = Vec::new();
-        for tag in [b'b', b'c', b'd'] {
+        for tag in *b"bcd" {
             let (mut stream, buf) = connect_and_auth(&proxy).await;
             stream
                 .write_all(&fifty_kb_multi_get_frame(tag))
