@@ -1083,9 +1083,9 @@ func (c *Client) tryReadRepair(namespace, key []byte) (value []byte, ok bool) {
 		}
 		if len(names) > 0 {
 			primary := names[0]
-			repair := func() {
+			repair := func(repairValue []byte) {
 				if err := c.applyReconnecting(primary, func(conn *connection) error {
-					return conn.setNS(namespace, key, v, readRepairTTL)
+					return conn.setNS(namespace, key, repairValue, readRepairTTL)
 				}); err != nil {
 					c.stats.readRepairFailures.Add(1)
 				}
@@ -1103,10 +1103,23 @@ func (c *Client) tryReadRepair(namespace, key []byte) (value []byte, ok bool) {
 				if !c.closed {
 					c.backgroundReplicaWG.Add(1)
 					c.mu.Unlock()
+					// The repair outlives this call and v is returned to
+					// the caller, who may write to it (without Compress it
+					// is the very slice the caller gets back), so the repair
+					// sends a copy made now — only once the repair is
+					// certain to run, so a skipped one pays nothing. With
+					// Compress on, the caller is handed a freshly
+					// decompressed buffer and v stays ours. namespace and
+					// key are the client's own: a Namespace handle's bytes
+					// and a []byte copy of the caller's key string.
+					repairValue := v
+					if !c.compress {
+						repairValue = bytes.Clone(v)
+					}
 					go func() {
 						defer c.backgroundReplicaWG.Done()
 						defer func() { <-c.backgroundReplicaSem }()
-						repair()
+						repair(repairValue)
 					}()
 				} else {
 					c.mu.Unlock()
