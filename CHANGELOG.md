@@ -12,6 +12,10 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-node`: an `M` frame kept a 32-byte span per roster entry across reads, and its `joined_count` was bounded only by the frame size, so a connection that sent about 1 MB of the smallest entries (`1 1\nab`) and held the socket open cost the node about 6 MiB (166,000 spans, about 8 MB of vector capacity) while `--max-in-flight-bytes` was charged its 1 MiB receive buffer: 100 such connections took the node to 622 MiB RSS, against 44 MiB for 100 connections holding an incomplete `s` frame of the same size. The parse now remembers only a position and an entry count and reads the entries again once the whole roster has arrived, and a `joined_count` above the 65,536 entries discovery's registry can hold is refused at the header. The 100-connection case is now refused at the header (3 MiB), and 100 connections holding a roster of the largest size (65,536 entries, 393 KB) without its last entry take 44 MiB, the same as the control (252 MiB before) (#1314).
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed

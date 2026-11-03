@@ -5387,7 +5387,7 @@ async fn register_with_discovery(
 /// so a misbehaving discovery server can't make this node allocate
 /// without bound: mirror `nanocached-discovery`'s own `MAX_REGISTRY_SIZE`
 /// and `MAX_REQUEST_SIZE` (the two binaries share no modules by design).
-const MAX_ROSTER_ENTRIES: usize = 1 << 16;
+const MAX_ROSTER_ENTRIES: usize = crate::command::MAX_ROSTER_ENTRIES;
 const MAX_ROSTER_FIELD_LEN: usize = 4096;
 /// Cap on a single heartbeat-ack *line* — the header `A <count> <repl>\n`
 /// and each entry's `<name-len> <addr-len>\n` length prefix (issue #92).

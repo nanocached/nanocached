@@ -17,6 +17,14 @@ use std::time::Duration;
 /// well under the SDKs' 64 MiB multi-get response cap.
 pub const MAX_MULTI_REPLY_VALUE_BYTES: usize = 16 * 1024 * 1024;
 
+/// The most entries a roster can hold: `nanocached-discovery`'s registry
+/// size (`MAX_REGISTRY_SIZE`), which bounds every `L`, `T`, heartbeat-ack
+/// and `M` roster it sends (the binaries share no modules by design, so the
+/// value is mirrored). `server.rs` bounds the rosters this node reads from
+/// discovery by the same constant, and an `M` frame's `joined_count` by it
+/// here.
+pub(crate) const MAX_ROSTER_ENTRIES: usize = 1 << 16;
+
 /// One membership this node's ownership of a key is judged against
 /// (issue #582): the ring, this node's name in it and the replication
 /// factor it came with. Compared by ring identity, not contents: two
@@ -867,7 +875,11 @@ pub fn parse_resumable(
 }
 
 /// How far `parse_migrate`'s read-only roster scan got before running out
-/// of buffered bytes — see `parse_resumable`. Only meaningful while the
+/// of buffered bytes — see `parse_resumable`. It records a position and a
+/// count, never per-entry data: a span per entry (32 bytes, 5 MB for a
+/// 1 MiB frame of the smallest entries) would be memory the connection
+/// holds outside the in-flight budget for as long as the frame is
+/// unfinished. Only meaningful while the
 /// same `M` frame is still the front of the buffer, which `header_end`
 /// and `joined_count` guard against (a different frame at the front is
 /// vanishingly unlikely to match both, and `input.len() >= cursor` is
@@ -886,7 +898,8 @@ pub struct MigrateProgress {
     header_end: usize,
     joined_count: usize,
     cursor: usize,
-    entry_spans: Vec<(usize, usize, usize, usize)>,
+    /// How many entries lie before `cursor`.
+    entries_done: usize,
     line_end: Option<usize>,
     line_scanned_to: usize,
     /// Where an `m`/`o` frame ends, once its header has been parsed in
@@ -1730,6 +1743,15 @@ fn parse_with_mode(
                 .transpose()?
                 .map(|generation| generation as u64);
 
+            // A roster never has more entries than the registry holds, so a
+            // larger count is not one discovery sent. Refused here, before
+            // anything is buffered for it, rather than left to be bounded
+            // only by the frame size (166,000 of the smallest entries fit
+            // in 1 MiB).
+            if joined_count > MAX_ROSTER_ENTRIES {
+                return Err(ParseError::InvalidLength);
+            }
+
             // R=0 could never be meant (nothing would own any key) and
             // would make every ownership check vacuously reject.
             if replication == 0 {
@@ -1834,36 +1856,38 @@ fn parse_migrate(
         return Err(ParseError::Incomplete);
     }
 
-    // Read-only pass: record each entry's span and advance `cursor`,
-    // without mutating `input`, so a still-arriving trailing entry leaves
-    // `input` untouched.
+    // Read-only pass: advance over each fully buffered entry without
+    // mutating `input`, so a still-arriving trailing entry leaves `input`
+    // untouched. Only the position reached and the number of entries
+    // passed are remembered (see `MigrateProgress`); the entries
+    // themselves are read again once the whole roster is buffered.
     //
-    // `joined_count` is attacker-controlled and unbounded (a header number,
-    // not tied to the buffered byte count), and this parse runs before the
-    // connection authenticates, so it must not size an allocation: a tiny
-    // `M 3 3 <huge>\n...` would otherwise make `Vec::with_capacity` request
-    // terabytes and abort the process. Grow as real entries are confirmed
-    // present instead — capacity then tracks the buffer, which is bounded.
+    // `joined_count` is attacker-controlled (a header number, not tied to
+    // the buffered byte count, though at most `MAX_ROSTER_ENTRIES`), and
+    // this parse runs before the connection authenticates, so it must not
+    // size an allocation: a tiny `M 3 3 <huge>\n...` would otherwise make
+    // `Vec::with_capacity` request terabytes and abort the process.
     //
     // Resume from wherever the previous attempt's scan stopped when it is
     // still describing this very frame (see `MigrateProgress`); otherwise
     // start over from the first entry.
+    let entries_start = cursor;
     let resumable = progress.header_end == header_end
         && progress.joined_count == joined_count
         && progress.cursor >= cursor
-        && progress.entry_spans.len() <= joined_count
+        && progress.entries_done <= joined_count
         && input.len() >= progress.cursor;
-    let mut entry_spans = if resumable {
+    let entries_done = if resumable {
         cursor = progress.cursor;
-        std::mem::take(&mut progress.entry_spans)
+        progress.entries_done
     } else {
-        Vec::new()
+        0
     };
     *progress = MigrateProgress {
         header_end,
         joined_count,
         cursor,
-        entry_spans: Vec::new(),
+        entries_done,
         // The top-level header line is this same `header_end` — keep it
         // cached so a still-trickling roster doesn't also re-trigger the
         // header-line scan on the next attempt.
@@ -1873,19 +1897,14 @@ fn parse_migrate(
         frame_keys: 0,
     };
 
-    let scanned = scan_joined_entries(input, cursor, joined_count, &mut entry_spans);
-
     // Whatever got confirmed stays confirmed (`Incomplete` included): the
     // next attempt resumes after the last complete entry.
-    progress.cursor = entry_spans
-        .last()
-        .map_or(cursor, |(_, _, addr_start, addr_length)| {
-            addr_start + addr_length
-        });
-    progress.entry_spans = entry_spans;
-
-    cursor = scanned?;
-    let entry_spans = std::mem::take(&mut progress.entry_spans);
+    while progress.entries_done < joined_count {
+        let entry = next_joined_entry(input, progress.cursor)?;
+        progress.cursor = entry.end;
+        progress.entries_done += 1;
+    }
+    cursor = progress.cursor;
 
     // Everything needed is present: consume the whole frame in one go and
     // decode each field from the now-owned `frame`.
@@ -1897,10 +1916,13 @@ fn parse_migrate(
     let joining_token = decode_field(&frame, joining_token_start, joining_token_length)?;
 
     let mut joined = Vec::with_capacity(joined_count);
-    for (name_start, name_length, addr_start, addr_length) in entry_spans {
-        let name = decode_field(&frame, name_start, name_length)?;
-        let addr = decode_field(&frame, addr_start, addr_length)?;
+    let mut at = entries_start;
+    for _ in 0..joined_count {
+        let entry = next_joined_entry(&frame, at)?;
+        let name = decode_field(&frame, entry.name_start, entry.name_length)?;
+        let addr = decode_field(&frame, entry.addr_start, entry.addr_length)?;
         joined.push((name, addr));
+        at = entry.end;
     }
 
     Ok(Command::Migrate {
@@ -1914,45 +1936,49 @@ fn parse_migrate(
     })
 }
 
-/// `parse_migrate`'s read-only roster scan: appends one span per fully
-/// buffered entry to `entry_spans`, starting after the ones already there,
-/// and returns the cursor just past the last one. On `Incomplete`,
-/// `entry_spans` holds every entry confirmed so far.
-fn scan_joined_entries(
-    input: &[u8],
-    mut cursor: usize,
-    joined_count: usize,
-    entry_spans: &mut Vec<(usize, usize, usize, usize)>,
-) -> Result<usize, ParseError> {
-    for _ in entry_spans.len()..joined_count {
-        let entry_header_end = cursor + find_lf(&input[cursor..]).ok_or(ParseError::Incomplete)?;
-        let mut entry_parts = input[cursor..entry_header_end].split(|byte| *byte == b' ');
-        let name_length = entry_parts.next().ok_or(ParseError::InvalidLength)?;
-        let addr_length = entry_parts.next().ok_or(ParseError::InvalidLength)?;
+/// Where one roster entry's fields lie in the buffer.
+struct JoinedEntry {
+    name_start: usize,
+    name_length: usize,
+    addr_start: usize,
+    addr_length: usize,
+    /// One past the entry's last byte: where the next entry starts.
+    end: usize,
+}
 
-        if entry_parts.next().is_some() {
-            return Err(ParseError::InvalidLength);
-        }
+/// Reads the roster entry that starts at `cursor`, or reports
+/// `Incomplete` while it is not all buffered.
+fn next_joined_entry(input: &[u8], cursor: usize) -> Result<JoinedEntry, ParseError> {
+    let entry_header_end = cursor + find_lf(&input[cursor..]).ok_or(ParseError::Incomplete)?;
+    let mut entry_parts = input[cursor..entry_header_end].split(|byte| *byte == b' ');
+    let name_length = entry_parts.next().ok_or(ParseError::InvalidLength)?;
+    let addr_length = entry_parts.next().ok_or(ParseError::InvalidLength)?;
 
-        let name_length = parse_length(name_length)?;
-        let addr_length = parse_length(addr_length)?;
-
-        if name_length == 0 || addr_length == 0 {
-            return Err(ParseError::EmptyField);
-        }
-
-        let name_start = entry_header_end + 1;
-        let [addr_start, entry_end] = field_ends(name_start, [name_length, addr_length])?;
-
-        if input.len() < entry_end {
-            return Err(ParseError::Incomplete);
-        }
-
-        entry_spans.push((name_start, name_length, addr_start, addr_length));
-        cursor = entry_end;
+    if entry_parts.next().is_some() {
+        return Err(ParseError::InvalidLength);
     }
 
-    Ok(cursor)
+    let name_length = parse_length(name_length)?;
+    let addr_length = parse_length(addr_length)?;
+
+    if name_length == 0 || addr_length == 0 {
+        return Err(ParseError::EmptyField);
+    }
+
+    let name_start = entry_header_end + 1;
+    let [addr_start, end] = field_ends(name_start, [name_length, addr_length])?;
+
+    if input.len() < end {
+        return Err(ParseError::Incomplete);
+    }
+
+    Ok(JoinedEntry {
+        name_start,
+        name_length,
+        addr_start,
+        addr_length,
+        end,
+    })
 }
 
 fn decode_field(frame: &[u8], start: usize, length: usize) -> Result<String, ParseError> {
@@ -3059,12 +3085,9 @@ mod tests {
 
             match parse_resumable(&mut input, false, &mut progress, true) {
                 Err(ParseError::Incomplete) => {
-                    // Never regresses: the recorded spans only grow.
-                    assert!(
-                        progress.entry_spans.len() >= entries_seen,
-                        "at byte {index}"
-                    );
-                    entries_seen = progress.entry_spans.len();
+                    // Never regresses: the entries passed only grow.
+                    assert!(progress.entries_done >= entries_seen, "at byte {index}");
+                    entries_seen = progress.entries_done;
                 }
                 Ok((command, None)) => {
                     parsed = Some(command);
@@ -3082,7 +3105,7 @@ mod tests {
         // Consumed the frame (the trailing `G` hasn't been fed yet) and
         // reset for whatever comes next.
         assert!(input.is_empty());
-        assert_eq!(progress.entry_spans.len(), 0);
+        assert_eq!(progress.entries_done, 0);
         assert_eq!(progress.cursor, 0);
     }
 
@@ -3092,7 +3115,7 @@ mod tests {
             header_end: 12,
             joined_count: 2,
             cursor: 1_000_000,
-            entry_spans: vec![(0, 0, 0, 0)],
+            entries_done: 1,
             ..MigrateProgress::default()
         };
         let mut input = buf(
@@ -3315,6 +3338,53 @@ mod tests {
     }
 
     #[test]
+    fn migrate_progress_holds_no_per_entry_memory() {
+        // A span per roster entry (32 bytes) was kept here across reads,
+        // outside the in-flight budget: 5 MB for a 1 MiB frame of the
+        // smallest entries, per connection. The progress is now a position
+        // and a count, so it owns no heap memory at all.
+        assert!(!std::mem::needs_drop::<MigrateProgress>());
+    }
+
+    #[test]
+    fn migrate_refuses_a_joined_count_above_the_roster_limit() {
+        let header = format!("M 1 1 1 {} 3 1\ntnaj", MAX_ROSTER_ENTRIES + 1);
+        let mut input = BytesMut::from(header.as_bytes());
+
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn migrate_with_a_roster_of_the_largest_size_still_parses() {
+        // `MAX_ROSTER_ENTRIES` of the smallest entries, trickled in a few
+        // reads the way a slow sender would deliver them.
+        let mut frame = format!("M 1 1 1 {MAX_ROSTER_ENTRIES} 3 1\ntnaj").into_bytes();
+        for _ in 0..MAX_ROSTER_ENTRIES {
+            frame.extend_from_slice(b"1 1\nab");
+        }
+
+        let mut input = BytesMut::new();
+        let mut progress = MigrateProgress::default();
+        let mut parsed = None;
+        for chunk in frame.chunks(frame.len() / 7 + 1) {
+            input.extend_from_slice(chunk);
+            match parse_resumable(&mut input, false, &mut progress, true) {
+                Err(ParseError::Incomplete) => {}
+                other => parsed = Some(other),
+            }
+        }
+
+        match parsed {
+            Some(Ok((Command::Migrate { joined, .. }, None))) => {
+                assert_eq!(joined.len(), MAX_ROSTER_ENTRIES);
+                assert!(joined.iter().all(|(name, addr)| name == "a" && addr == "b"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(input.is_empty());
+    }
+
+    #[test]
     fn rejects_an_empty_joining_name_in_migrate() {
         let mut input = buf(b"M 0 14 5 0 2 5\ntok-b127.0.0.1:8357");
 
@@ -3339,12 +3409,17 @@ mod tests {
 
     #[test]
     fn migrate_with_a_huge_joined_count_reports_incomplete_without_pre_allocating() {
-        // `joined_count` is attacker-controlled and unbounded; parsing must
-        // not size an allocation from it (a `Vec::with_capacity` on this value
-        // would request terabytes and abort the process). With the joining
-        // node's own fields present but no entries buffered, this must simply
-        // report `Incomplete` — cheaply, without touching that huge number.
+        // `joined_count` is attacker-controlled; parsing must not size an
+        // allocation from it (a `Vec::with_capacity` on a count like
+        // 999999999999 would request terabytes and abort the process), and
+        // one above the roster limit is refused outright. With the joining
+        // node's own fields present but no entries buffered, the largest
+        // count there can be must simply report `Incomplete`.
         let mut input = buf(b"M 6 14 5 999999999999 2 5\ntok-bnode-b127.0.0.1:8357tok-j");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+
+        let header = format!("M 6 14 5 {MAX_ROSTER_ENTRIES} 2 5\ntok-bnode-b127.0.0.1:8357tok-j");
+        let mut input = buf(header.as_bytes());
 
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
     }
