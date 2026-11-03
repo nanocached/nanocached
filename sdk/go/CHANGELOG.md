@@ -10,6 +10,10 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Fixed
+
+- With `ReadRepair`, the background write-back to the primary sent the same slice that `GetBytes` and `GetWithToken` returned to the caller when `Compress` is off, so a caller that wrote to the slice it was returned while the repair was still queued or being written stored its own bytes on the primary (a 512 KiB value of `'A'` found on a replica, overwritten with `'B'` by the caller, left the primary with 46,330 to 324,657 `'B'` bytes in 6 of 6 runs while the replica kept all `'A'`; `go test -race` reported a data race). The repair now sends a copy made once the repair is certain to run (after the permit and closed checks), so a skipped repair pays no copy; with `Compress` on the caller already gets a freshly decompressed buffer and no copy is made (#1320).
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed

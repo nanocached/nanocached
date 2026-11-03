@@ -135,7 +135,12 @@ unreachable.</p>
   than half the liveness timeout (a stopped or suspended discovery process,
   which finds every heartbeat old when it resumes): that sweep gives every
   node and proxy a fresh liveness window instead, since they were not
-  silent and nobody moved on without them. A node evicted longer ago than that
+  silent and nobody moved on without them. Nor are nodes sent back when every one
+  of them was evicted together, as when the path between discovery and the
+  whole fleet was cut: discovery answers <code>G</code> only while some
+  node has been a member without a break since before that node was
+  evicted, since only such a node can have taken its keys over, and
+  otherwise registers the node as it announces. A node evicted longer ago than that
   hour, or by a standby discovery replica (which only lists nodes), is
   registered as before.</li>
 </ul>
@@ -607,9 +612,14 @@ here.</p>
   raced keys with 8 concurrent writers per key from one client. Accepted
   2026-10-20: ordering it would need a version on every write in the
   server and every SDK, and a per-key lock inside one SDK would not
-  cover two clients. A proxy serialises the writes of one key, so routing
-  through <code>nanocached-proxy</code> removes it; compare-and-set runs on
-  the primary alone and showed no disagreement between owners in the
+  cover two clients. <code>nanocached-proxy</code> does not remove it: it
+  sends each write to the owners concurrently and orders nothing between
+  two requests, so two connections writing one key can reach one owner in
+  one order and the other owner in the other. Through one proxy in front
+  of a 2-node, 2-replica cluster, 8 connections writing one key for 300
+  rounds left no owners disagreeing, 16 for 3,000 rounds left 2 rounds, and
+  24 for 6,000 rounds left 8 and 57 in two runs. Compare-and-set runs on the
+  primary alone and showed no disagreement between owners in the
   measurements below (about 34,000 acknowledged replaces in three runs).
   A counter is exposed in one case, the next item.</li>
   <li>Re-replication handoff carries no version: when two survivors hold
