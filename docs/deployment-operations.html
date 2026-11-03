@@ -89,6 +89,56 @@ a node that is down does not fill the log; the counter counts every leg.</p>
 counters — not scaling signals, but the first thing to graph when a
 scale event misbehaves.</p>
 
+<h2 id="memory-budget">Sizing a node process</h2>
+<p>Size a node process at <code>--max-memory</code> (the cache only) plus
+<code>--max-in-flight-bytes</code> plus headroom. The in-flight budget is
+what client connections hold outside the cache, node-wide, 256&nbsp;MiB by
+default (at least 1&nbsp;MiB):</p>
+<ul>
+  <li>A reply's values are charged before it is built and released once it
+  is written.</li>
+  <li>A receive buffer's growth past 64&nbsp;KiB is charged before it is
+  allocated.</li>
+  <li>A multi-key frame (<code>m</code>, <code>o</code> or <code>y</code>)
+  is charged 256 bytes per key (288 for <code>o</code>) for the per-key
+  lists the node builds while it runs, taken as soon as the frame is fully
+  received and before those lists exist &mdash; a frame of one-byte keys
+  can carry about 350,000 keys, so about 85&nbsp;MiB. Once the reply is
+  built, 64 bytes per key of that stay charged until the reply is written
+  (the reply's entries and its encoded copy, which a client that does not
+  read keeps alive), and the rest is released.</li>
+</ul>
+<p>A frame or a reply that costs more than the budget has room for waits
+for that room &mdash; what is left after every connection's receive buffer
+and the 64 bytes per key its reply keeps, bytes whose holders may be
+waiting themselves &mdash; and then runs alone with it. When receive
+buffers pin the whole budget, nothing is left to wait for: a connection
+that holds a buffer itself then takes a single node-wide overdraft slot
+and answers without a charge, one at a time, because its buffer is only
+released after the replies it has buffered and two such connections would
+otherwise wait for each other. That overshoots the budget by one frame or
+reply, never more, and a connection with no buffer charged keeps waiting
+for the budget. A connection that cannot get its share in time is closed,
+like a stalled one.</p>
+
+<h2 id="discovery-registration">Discovery: registration pacing</h2>
+<p>A discovery server paces how fast one source can add new node names. A
+source may register up to 64 new names at once and one more every
+2&nbsp;seconds after that; a node refreshing its own entry is never
+counted. The source is the peer address, with an IPv6 source counting per
+/64 prefix, so a fleet behind one NAT address or in one IPv6 subnet shares
+the allowance.</p>
+<p>After a discovery restart the nodes re-register within the startup
+grace (<code>--liveness-timeout</code>, 15&nbsp;seconds by default), which
+admits 64 plus one per 2&nbsp;seconds of grace from one source: 71 nodes
+at the default. A larger fleet behind one address is still re-registering
+when the grace ends, so the first join after it is handed off against a
+partial roster; the rest follow at one node per 2&nbsp;seconds. Set
+<code>--liveness-timeout</code> to 2&nbsp;seconds per node beyond 64
+(72&nbsp;seconds for 100 nodes, since 36 nodes are beyond 64; a dead node
+is then evicted that much later too; the minimum is 15), or spread the
+nodes over more source addresses.</p>
+
 <h2 id="graceful-scale-in">Graceful scale-in</h2>
 <p>Scale-in terminates instances that are <em>not</em> dead, and
 orchestrators signal that with SIGTERM followed by SIGKILL after a
