@@ -520,3 +520,73 @@ fn a_flood_of_joins_that_leave_at_once_is_logged_in_a_bounded_number_of_lines() 
         "{registered} registrations logged individually; log:\n{log}"
     );
 }
+
+/// Sends `request` on a fresh connection and returns what discovery answers
+/// before it closes (or the read times out).
+fn request_and_read(port: u16, request: &[u8]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("a connection was refused");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(request).unwrap();
+    let mut reply = Vec::new();
+    let mut chunk = [0u8; 64];
+    // `R\n` leaves the connection open for heartbeats, `G\n` closes it:
+    // stop after the first line either way.
+    while !reply.ends_with(b"\n") {
+        match stream.read(&mut chunk) {
+            Ok(read) if read > 0 => reply.extend_from_slice(&chunk[..read]),
+            _ => break,
+        }
+    }
+    reply
+}
+
+#[test]
+fn a_flood_of_announces_from_an_evicted_node_is_logged_in_a_bounded_number_of_lines() {
+    let _serial = serial();
+    let port = free_port();
+    let discovery = start_discovery(port);
+    wait_until_listening(port);
+
+    // `c` announced after `a`, then left: it is on record as departed while
+    // `a` has been `Joined` since before that, so an announce from `c` that
+    // says it can start over (`G`) is answered `G` and registers nothing.
+    assert_eq!(request_and_read(port, b"P 1 9 1\nab"), b"R\n");
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(request_and_read(port, b"P 1 9 1\ncd"), b"R\n");
+    assert_eq!(request_and_read(port, b"V 1 1\ncd"), b"R\n");
+    thread::sleep(Duration::from_millis(1_200));
+
+    let announce = b"P 1 9 1 G\ncd";
+    for _ in 0..UNAUTHENTICATED {
+        assert_eq!(request_and_read(port, announce), b"G\n");
+    }
+    thread::sleep(Duration::from_millis(1_200));
+    assert_eq!(request_and_read(port, announce), b"G\n");
+    thread::sleep(Duration::from_millis(500));
+
+    let log = discovery.stdout.lock().unwrap().clone();
+    let individually = log
+        .lines()
+        .filter(|line| line.starts_with("INFO node announced after its eviction: "))
+        .count();
+    let counted: usize = log
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("INFO ")?
+                .strip_suffix(" more node announces (not logged individually)")?
+                .parse::<usize>()
+                .ok()
+        })
+        .sum();
+    assert!(
+        counted > 0 && individually <= 2 * BUDGET + 1,
+        "{individually} lines logged individually, {counted} counted; log:\n{log}"
+    );
+    assert_eq!(
+        individually + counted,
+        UNAUTHENTICATED + 1,
+        "every announce is either logged or counted; log:\n{log}"
+    );
+}
