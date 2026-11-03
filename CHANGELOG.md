@@ -12,6 +12,10 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-node`: two connections pipelining requests behind each other waited for each other for the full 10 s when receive buffers pinned the whole `--max-in-flight-bytes` budget (two ordinary clients at the 1 MiB minimum, about 270 proxy backend connections with 1 MiB buffers at the default 256 MiB): a reply or multi-key frame charge found nothing left, waited for a byte, and the only bytes there were were the other connection's receive buffer, which is released after every reply that connection has buffered. One connection was closed with "in-flight byte budget exhausted while answering", the other answered at 10.0 s (a 600,000-byte store with a get behind it: `S`, then nothing for 10.0 s, then EOF). A holder that pins a buffer itself now takes a node-wide single-slot overdraft token in that situation and answers uncharged, one at a time, a frame keeping the token for its reply; it still waits at most `WRITE_TIMEOUT` for the token or for a freed byte. The overshoot is one frame or reply: by the budget's own accounting at most `--max-in-flight-bytes` (1,048,576 at the minimum), and in memory at most a single 1 MiB frame of one-byte keys, 349,525 keys at 256 bytes (89,478,400), the same figure a frame costing more than the budget has always run with. A connection with no buffer charged still waits, so 200 connections that never read a 1 MB reply still peak at 9 MiB of RSS with the budget fully pinned, not 204 MiB (#1315).
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed
