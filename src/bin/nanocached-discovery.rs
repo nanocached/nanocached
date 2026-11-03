@@ -4557,12 +4557,22 @@ async fn sweep_expired(
                 // registration with nothing behind it), so they're also
                 // reaped here once `waiting_timeout_for` has elapsed.
                 // Issue #122: proxies that stopped re-announcing.
+                //
+                // Issue #1312: after a stall every `last_heartbeat` and
+                // `last_seen` is as old as the stall, so judging them now
+                // would evict (and forget) every healthy node and proxy
+                // before any of them could be read. A stalled tick instead
+                // gives each a fresh window: one that really is gone is
+                // dropped a liveness timeout later.
                 let mut proxies_dropped = false;
                 registry
                     .proxies
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .retain(|name, info| {
+                        if stalled {
+                            info.last_seen = now;
+                        }
                         let keep = now.duration_since(info.last_seen) < liveness_timeout;
                         if !keep {
                             println!("INFO proxy dropped after missed announces: {name}");
@@ -4579,6 +4589,9 @@ async fn sweep_expired(
                 {
                     let mut guard = lock(&registry);
                     guard.retain(|name, info| {
+                        if stalled && info.state == NodeState::Joined {
+                            info.last_heartbeat = now;
+                        }
                         let keep = match info.state {
                             NodeState::Joined => {
                                 now.duration_since(info.last_heartbeat) < liveness_timeout
@@ -4610,6 +4623,18 @@ async fn sweep_expired(
                         bump_roster(&registry);
                     }
                 }
+                if stalled {
+                    eprintln!(
+                        "WARN discovery was not running for {}s before this sweep: every \
+                         node and proxy gets a fresh {}s liveness window instead of being \
+                         judged by heartbeats it could not read",
+                        since_last_tick.as_secs(),
+                        liveness_timeout.as_secs()
+                    );
+                }
+                // Nothing is evicted on a stalled tick, so `stalled` holds
+                // below only as a second guard: should a node be evicted
+                // here all the same, it is not sent back through a join.
                 for name in &heartbeat_evicted {
                     eprintln!(
                         "WARN node evicted: {name} (no heartbeat within {}s)",
@@ -7213,6 +7238,93 @@ mod tests {
             b"N 0 2\n",
             "the Waiting eviction must invalidate the cache"
         );
+
+        shutdown_tx.send_replace(true);
+        sweep_task.await.unwrap();
+    }
+
+    /// Moves the paused clock by `total` in steps of `step`, letting the
+    /// sweep run after each, so no sweep tick sees a gap that looks like a
+    /// stall.
+    async fn advance_in_steps(total: Duration, step: Duration) {
+        let mut moved = Duration::ZERO;
+        while moved < total {
+            tokio::time::advance(step).await;
+            tokio::task::yield_now().await;
+            moved += step;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_first_sweep_after_a_stall_gives_every_node_and_proxy_a_fresh_window() {
+        // Issue #1312: discovery frozen (SIGSTOP, a paused VM) for several
+        // liveness windows finds every `last_heartbeat` that old when it
+        // resumes. Evicting on that sweep emptied the roster `L` answers
+        // and closed every heartbeat connection ("not joined") until the
+        // nodes announced themselves again; they were never silent.
+        let liveness = Duration::from_secs(15);
+        let registry: Registry = Arc::new(RegistryState::default());
+        for name in ["node-a", "node-b"] {
+            lock(&registry).insert(
+                name.to_string(),
+                NodeInfo::new(
+                    "10.0.0.1:9000".to_string(),
+                    NodeState::Joined,
+                    format!("tk-{name}"),
+                ),
+            );
+        }
+        registry.proxies.lock().unwrap().insert(
+            "proxy-a".to_string(),
+            ProxyInfo {
+                address: "10.0.0.2:9100".to_string(),
+                token: "tk-proxy".to_string(),
+                last_seen: Instant::now(),
+            },
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            current_join,
+            None,
+            None,
+            2,
+            Instant::now() + Duration::from_secs(365 * 86_400),
+            liveness,
+            shutdown_rx,
+        ));
+        tokio::task::yield_now().await;
+
+        // One step across several windows: the next sweep tick is the
+        // first in 60 s.
+        tokio::time::advance(4 * liveness).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let members = |registry: &Registry| {
+            let mut names: Vec<String> = lock(registry).keys().cloned().collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            members(&registry),
+            ["node-a", "node-b"],
+            "a stalled sweep evicted nodes that had done nothing wrong"
+        );
+        assert!(registry.proxies.lock().unwrap().contains_key("proxy-a"));
+        assert!(
+            registry.departed.lock().unwrap().at.is_empty(),
+            "nothing is on record as departed"
+        );
+
+        // Nodes that really are silent are still dropped, a window later.
+        advance_in_steps(Duration::from_secs(20), Duration::from_secs(1)).await;
+        assert!(members(&registry).is_empty());
+        assert!(registry.proxies.lock().unwrap().is_empty());
+        assert_eq!(registry.departed.lock().unwrap().at.len(), 2);
+        // Judged by a sweep that was running: they earn the rejoin.
+        assert!(registry.departed.lock().unwrap().unreliable.is_empty());
 
         shutdown_tx.send_replace(true);
         sweep_task.await.unwrap();
@@ -10125,8 +10237,9 @@ mod tests {
         ));
 
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
+        // In steps well under half the 1 s liveness timeout: one jump of 2 s
+        // would be a stalled sweep, which evicts nothing (issue #1312).
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
 
         // node-a's own liveness eviction (well under the migration
         // timeout) must have abandoned the join immediately, not left it
@@ -11974,8 +12087,9 @@ mod tests {
         ));
 
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
+        // In steps well under half the 1 s liveness timeout: one jump of 2 s
+        // would be a stalled sweep, which evicts nothing (issue #1312).
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
 
         assert!(lock(&registry).is_empty());
 

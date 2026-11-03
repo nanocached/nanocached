@@ -12,6 +12,10 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-discovery`: the first sweep after discovery itself had been frozen (SIGSTOP, a paused VM) for longer than half the liveness timeout still evicted every node whose last heartbeat was older than that, which was all of them, though none had been silent: only the `G` answer was suppressed for them. `L` then answered an empty roster until the nodes announced themselves again (up to the 5 s heartbeat interval), every heartbeat connection was closed ("heartbeat from a node that has not joined"), and a join in progress was abandoned. A stalled sweep tick now evicts nothing and gives every `Joined` node and every proxy a fresh liveness window; one that really is gone is dropped a liveness timeout later. With `--liveness-timeout 8`, three nodes heartbeating every 2 s and discovery stopped for 12 s: `L` answered `N 0 2` 0.26 s after the resume, with three evictions, before; the roster stayed `N 3 2` and nothing was evicted after (#1312).
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed

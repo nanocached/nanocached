@@ -2110,6 +2110,46 @@ async fn nodes_evicted_while_discovery_itself_was_stalled_keep_their_caches() {
     assert_eq!(out.lost, 0, "a stall of discovery emptied caches: {out:?}");
 }
 
+/// #1312: the first sweep after discovery was stopped for several liveness
+/// windows must not evict the nodes whose heartbeats it has not yet read.
+/// Before the fix it evicted all three (and `L` answered an empty roster
+/// until they announced themselves again, several seconds later); the clock
+/// is not moved after the jump, so this reads the roster the first sweep
+/// leaves.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn the_first_sweep_after_discovery_was_stopped_leaves_the_roster_as_it_was() {
+    let _spin = spin();
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc) = (Port::reserve(), Port::reserve(), Port::reserve());
+    let keys: Vec<String> = (0..4).map(|i| format!("t{i}")).collect();
+    let Trio {
+        dport,
+        disc,
+        names,
+        nodes: [na, nb, nc],
+        ..
+    } = trio(&mut dp, &mut pa, &mut pb, &mut pc, &keys).await;
+    let before = roster(dport).await;
+    assert_eq!(before.len(), 3, "{before:?}");
+
+    // The clock jumps 50 s, over three liveness windows, in one step.
+    tokio::time::advance(Duration::from_secs(50)).await;
+    settle().await;
+    let after = roster(dport).await;
+    let mut listed: Vec<String> = after.iter().map(|(name, _)| name.clone()).collect();
+    listed.sort();
+    let mut expected = names.to_vec();
+    expected.sort();
+    assert_eq!(
+        listed, expected,
+        "the first sweep after a stall evicted nodes"
+    );
+    disc.abort();
+    na.abort();
+    nb.abort();
+    nc.abort();
+}
+
 // ---------------------------------------------------------------------
 // A node asked to leave while another node's join is still pending.
 // ---------------------------------------------------------------------
