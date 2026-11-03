@@ -123,11 +123,12 @@
 //!   work.
 //! - Limits: `--max-connections` (default 1024) client connections,
 //!   over-limit connections answered `B\n` and closed, mirroring the
-//!   node. No per-IP cap: a proxy typically fronts a NAT'd fleet where
-//!   source IPs are meaningless; put the proxy itself behind one if its
-//!   exposure needs it. Requests are bounded by the node's own 1 MiB
-//!   request cap, enforced here too so a hostile client can't balloon
-//!   proxy memory.
+//!   node. `--max-connections-per-ip` (default 256) caps how many of
+//!   those one source IP may hold, so a single client cannot take the
+//!   whole budget; a fleet behind one NAT or on Kubernetes shares one
+//!   source IP, and there this cap is the effective fleet ceiling, so
+//!   raise it. Requests are bounded by the node's own 1 MiB request cap,
+//!   enforced here too so a hostile client can't balloon proxy memory.
 //! - Failure surface (issue #125): for a client that declared the
 //!   retryable-error capability (`A ... R`), an upstream failure that
 //!   survives one refresh-and-retry answers that request `R` (+tag) and
@@ -149,13 +150,14 @@
 //! handling, accept-loop backoff) *is* shared, via `nanocached::infra` —
 //! see that crate's own module docs for exactly where the line is drawn.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use nanocached::infra::{
     ACCEPT_ERROR_BACKOFF, LogLimiter, METRICS_MAX_CONNECTIONS, PerIpConnections,
     read_http_request_path, should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip,
     write_http_response,
 };
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -3442,11 +3444,22 @@ fn frame_get(namespace: &[u8], key: &[u8]) -> Bytes {
     frame.into()
 }
 
+/// `" <len>"` for every key, in one `String`: building it from a `format!`
+/// per key allocated once per key (about 350,000 times for a 1 MiB frame of
+/// one-byte keys).
+fn key_length_fields(keys: &[Bytes]) -> String {
+    let mut fields = String::with_capacity(keys.len() * 2);
+    for key in keys {
+        let _ = write!(fields, " {}", key.len());
+    }
+    fields
+}
+
 /// Issue #128 measurement prototype: one sub-frame per owner, carrying
 /// only that owner's slice of the original request's keys — see
 /// `dispatch_request`'s `Request::MultiGet` arm.
 fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Bytes {
-    let key_lengths: String = keys.iter().map(|key| format!(" {}", key.len())).collect();
+    let key_lengths = key_length_fields(keys);
     let mut frame = format!(
         "m {} {}{key_lengths} {TAG_PLACEHOLDER}\n",
         namespace.len(),
@@ -3465,9 +3478,11 @@ fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Bytes {
 /// address rather than by rank (a batch's keys can put the same node in
 /// different roles). One shared `ttl` for the whole frame.
 fn frame_multi_set(namespace: &[u8], keys: &[Bytes], values: &[Bytes], ttl: Option<u64>) -> Bytes {
-    let mut lengths = String::new();
+    // One growing `String`, not one per pair: a 1 MiB frame holds up to
+    // ~175,000 pairs.
+    let mut lengths = String::with_capacity(keys.len() * 4);
     for (key, value) in keys.iter().zip(values) {
-        lengths.push_str(&format!(" {} {}", key.len(), value.len()));
+        let _ = write!(lengths, " {} {}", key.len(), value.len());
     }
     let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
     let mut frame = format!(
@@ -3488,7 +3503,7 @@ fn frame_multi_set(namespace: &[u8], keys: &[Bytes], values: &[Bytes], ttl: Opti
 /// `plan_multi_touch`. No `ttl` asks the node to remove the TTL; `get` adds
 /// the `G` token.
 fn frame_multi_touch(namespace: &[u8], keys: &[Bytes], ttl: Option<u64>, get: bool) -> Bytes {
-    let key_lengths: String = keys.iter().map(|key| format!(" {}", key.len())).collect();
+    let key_lengths = key_length_fields(keys);
     let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
     let get_field = if get { " G" } else { "" };
     let mut frame = format!(
@@ -4195,8 +4210,7 @@ fn respond_multi(entries: &[ProxyMultiEntry], tag: Option<u32>) -> Vec<u8> {
     for entry in entries {
         match entry {
             ProxyMultiEntry::Value(value) => {
-                header.push(' ');
-                header.push_str(&value.len().to_string());
+                let _ = write!(header, " {}", value.len());
                 values_len += value.len();
             }
             ProxyMultiEntry::Miss => header.push_str(" -"),
@@ -5909,9 +5923,12 @@ fn touch_answer(reply: &NodeReply, tag: Option<u32>) -> Option<Vec<u8>> {
 /// with one exception: a `ttl=0` touch expires the key it finds, so a frame
 /// that may have reached the node is not sent again (the second would answer
 /// `N`, and a `G` would lose the value the first one consumed) and its
-/// failure is `OutcomeUnknown`. For the same reason its replica legs were
-/// not enqueued with the primary's (see `enqueue_touch`): they are sent
-/// here, once the primary has answered, by `expire_on_other_owners`.
+/// failure is `OutcomeUnknown`. A node's `W` or `E` to such a frame is not a
+/// failure of that kind: the frame was refused, nothing was expired, and it
+/// is `Fatal::Transient` like a refusal of `i`, `k` or `x`. For the same
+/// reason its replica legs were not enqueued with the primary's (see
+/// `enqueue_touch`): they are sent here, once the primary has answered, by
+/// `expire_on_other_owners`.
 async fn finish_touch(
     context: &ProxyContext,
     namespace: &[u8],
@@ -5954,8 +5971,11 @@ async fn finish_touch(
         Ok(reply) => {
             let answer = touch_answer(reply, tag);
             if expires_at_once(ttl) {
+                // A reply that is no touch answer (`E`; a `W` was handled
+                // above) is a refusal: the node did not expire anything, so
+                // the client may simply send the touch again.
                 let Some(answer) = answer else {
-                    return Err(Fatal::OutcomeUnknown);
+                    return Err(Fatal::Transient);
                 };
                 if let Some(primary) = owners.first() {
                     expire_on_other_owners(context, namespace, key, primary).await;
@@ -6000,7 +6020,9 @@ async fn refan_touch(
             .await
         {
             Ok(reply) => {
-                let answer = touch_answer(&reply, tag).ok_or(Fatal::OutcomeUnknown)?;
+                // `W` and `E` are refusals, not outcomes: nothing was
+                // expired, so a retry-capable client is answered `R`.
+                let answer = touch_answer(&reply, tag).ok_or(Fatal::Transient)?;
                 expire_on_other_owners(context, namespace, key, primary).await;
                 Ok(answer)
             }
@@ -7298,7 +7320,15 @@ async fn handle_client(
         let grown = match frame_end {
             Some(end) => (end > buf.capacity()).then_some(end),
             None if buf.capacity() - buf.len() >= READ_CHUNK => None,
-            None if buf.capacity() >= REQUEST_BUFFER_SHRINK_THRESHOLD => {
+            // A header still arriving doubles the buffer only while the
+            // doubling stays within the free threshold; past it, it takes
+            // the largest frame's worth in one step. (It used to reach
+            // that step by accident: doubling from 65,456 bytes to 130,912
+            // was shrunk back the moment a 4 KiB-aligned read left exactly
+            // 64 KiB in it, which a read of whatever had arrived did not.)
+            None if buf.capacity() >= REQUEST_BUFFER_SHRINK_THRESHOLD
+                || buf.capacity() * 2 > REQUEST_BUFFER_SHRINK_THRESHOLD =>
+            {
                 let max_frame = if authenticated {
                     MAX_CLIENT_FRAME_SIZE
                 } else {
@@ -7360,11 +7390,16 @@ async fn handle_client(
             buf = grown_buf;
         }
 
-        // Not past the end of a frame whose buffer was sized to it.
-        let room = frame_end.map_or(READ_CHUNK, |end| (end - buf.len()).min(READ_CHUNK));
-        let mut chunk = [0u8; READ_CHUNK];
+        // Straight into the buffer's own spare room — which is what was
+        // charged above, so a read cannot grow it — and not past the end of
+        // a frame whose buffer was sized to it. (A 4 KiB stack chunk copied
+        // out cost 256 reads and copies for a 1 MiB frame; `room` is never
+        // 0, the growth above leaves at least `READ_CHUNK` spare or the
+        // frame's remainder.)
+        let room = frame_end.map_or(buf.capacity() - buf.len(), |end| end - buf.len());
+        let mut window = (&mut buf).limit(room);
         let read = tokio::select! {
-            read = tokio::time::timeout_at(read_deadline, read_half.read(&mut chunk[..room])) => read,
+            read = tokio::time::timeout_at(read_deadline, read_half.read_buf(&mut window)) => read,
             () = drained(&mut drain) => break 'connection Ok(()),
             // The writer returning drops the FIFO's receiver: stop at once
             // instead of sitting in `read` for `IDLE_TIMEOUT` holding the
@@ -7373,7 +7408,7 @@ async fn handle_client(
         };
         match read {
             Err(_) | Ok(Ok(0)) => break Ok(()),
-            Ok(Ok(bytes_read)) => buf.extend_from_slice(&chunk[..bytes_read]),
+            Ok(Ok(_)) => {}
             Ok(Err(error)) => break Err(error),
         }
     };
@@ -10240,6 +10275,11 @@ mod tests {
         /// instead of replying — the reply lost after the node executed
         /// it. A touch is idempotent, so the proxy must re-send it.
         close_after_touch_apply_once: Arc<AtomicBool>,
+        /// The markers (`"W"`, `"E"`) the next `t` frames are refused with,
+        /// one per frame in order, before any is applied — a stale ring
+        /// that is still stale after a refresh, or a node that fails the
+        /// request. Nothing is logged in `touches` or expired.
+        refuse_touches: Arc<StdMutex<std::collections::VecDeque<&'static str>>>,
         get_delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
         /// Issue #110: set when a request was already buffered before
@@ -10293,6 +10333,7 @@ mod tests {
                 close_after_cas_delete_apply_once: Arc::new(AtomicBool::new(false)),
                 touches: Arc::new(StdMutex::new(Vec::new())),
                 close_after_touch_apply_once: Arc::new(AtomicBool::new(false)),
+                refuse_touches: Arc::new(StdMutex::new(std::collections::VecDeque::new())),
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
                 auth_count: Arc::new(AtomicUsize::new(0)),
                 saw_pipelined: Arc::new(AtomicBool::new(false)),
@@ -10317,6 +10358,7 @@ mod tests {
                 Arc::clone(&node.close_after_cas_delete_apply_once);
             let touches = Arc::clone(&node.touches);
             let close_after_touch_apply_once = Arc::clone(&node.close_after_touch_apply_once);
+            let refuse_touches = Arc::clone(&node.refuse_touches);
             let delay = Arc::clone(&node.get_delay);
             let auth_count = Arc::clone(&node.auth_count);
             let saw_pipelined = Arc::clone(&node.saw_pipelined);
@@ -10351,6 +10393,7 @@ mod tests {
                             ),
                             touches: Arc::clone(&touches),
                             close_after_touch_apply_once: Arc::clone(&close_after_touch_apply_once),
+                            refuse_touches: Arc::clone(&refuse_touches),
                             delay: Arc::clone(&delay),
                             auth_count: Arc::clone(&auth_count),
                             saw_pipelined: Arc::clone(&saw_pipelined),
@@ -10420,6 +10463,7 @@ mod tests {
         /// instead of replying — the reply lost after the node executed
         /// it. A touch is idempotent, so the proxy must re-send it.
         close_after_touch_apply_once: Arc<AtomicBool>,
+        refuse_touches: Arc<StdMutex<std::collections::VecDeque<&'static str>>>,
         delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
         saw_pipelined: Arc<AtomicBool>,
@@ -10459,6 +10503,7 @@ mod tests {
             close_after_cas_delete_apply_once,
             touches,
             close_after_touch_apply_once,
+            refuse_touches,
             delay,
             auth_count,
             saw_pipelined,
@@ -10907,6 +10952,13 @@ mod tests {
                         if wrong_once.swap(false, Ordering::SeqCst) {
                             stream
                                 .write_all(format!("W {}\n", tag(&fields)).as_bytes())
+                                .await?;
+                            continue;
+                        }
+                        let refusal = refuse_touches.lock().unwrap().pop_front();
+                        if let Some(marker) = refusal {
+                            stream
+                                .write_all(format!("{marker} {}\n", tag(&fields)).as_bytes())
                                 .await?;
                             continue;
                         }
@@ -11732,9 +11784,13 @@ mod tests {
     async fn dead_node_cluster() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
         let discovery = start_mock_discovery(vec![("node-dead".to_string(), dead_addr)], 1).await;
-        start_proxy(&discovery, None, 64).await
+        let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports: freed first, the kernel can hand the same port to one of
+        // them and the "dead" node is then alive.
+        drop(listener);
+        proxy
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11763,13 +11819,15 @@ mod tests {
         let live = MockNode::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
         let roster = vec![
             ("node-live".to_string(), live.addr.clone()),
             ("node-dead".to_string(), dead_addr.clone()),
         ];
         let discovery = start_mock_discovery(roster.clone(), 1).await;
         let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports (see `dead_node_cluster`).
+        drop(listener);
 
         let ring = RingView::new(roster, 1);
         let mut on_live = None;
@@ -12153,7 +12211,6 @@ mod tests {
         let live = MockNode::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
 
         let discovery = start_mock_discovery(
             vec![
@@ -12164,6 +12221,9 @@ mod tests {
         )
         .await;
         let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports (see `dead_node_cluster`).
+        drop(listener);
 
         let ring = RingView::new(
             vec![
@@ -12213,7 +12273,6 @@ mod tests {
         let live = MockNode::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
 
         let discovery = start_mock_discovery(
             vec![
@@ -12224,6 +12283,9 @@ mod tests {
         )
         .await;
         let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports (see `dead_node_cluster`).
+        drop(listener);
 
         let ring = RingView::new(
             vec![
@@ -12565,13 +12627,16 @@ mod tests {
         let live = MockNode::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
         let roster = vec![
             ("node-live".to_string(), live.addr.clone()),
             ("node-dead".to_string(), dead_addr),
         ];
         let discovery = start_mock_discovery(roster, 2).await;
-        (live, start_proxy(&discovery, None, 64).await)
+        let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports (see `dead_node_cluster`).
+        drop(listener);
+        (live, proxy)
     }
 
     /// `o` (`touch: false`) or `y` of `keys` one-byte-value keys.
@@ -14117,6 +14182,61 @@ mod tests {
     }
 
     #[test]
+    fn the_multi_get_and_multi_set_frames_to_a_node_are_byte_for_byte_the_wire_form() {
+        // The key-length fields are built in one `String` (no allocation
+        // per key); this pins the bytes they produce, including lengths of
+        // more than one digit and an empty set of optional fields.
+        let long = Bytes::from(vec![b'k'; 123]);
+        let keys = [
+            Bytes::from_static(b"a"),
+            long.clone(),
+            Bytes::from_static(b"bc"),
+        ];
+        let mut get = format!("m 2 3 1 123 2 {TAG_PLACEHOLDER}\nns").into_bytes();
+        get.extend_from_slice(b"a");
+        get.extend_from_slice(&long);
+        get.extend_from_slice(b"bc");
+        assert_eq!(&frame_multi_get(b"ns", &keys)[..], &get[..]);
+
+        let values = [
+            Bytes::from_static(b"v"),
+            Bytes::from(vec![b'x'; 1000]),
+            Bytes::new(),
+        ];
+        for ttl in [None, Some(60)] {
+            let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
+            let mut set =
+                format!("o 0 3 1 1 123 1000 2 0{ttl_field} {TAG_PLACEHOLDER}\n").into_bytes();
+            set.extend_from_slice(b"a");
+            set.extend_from_slice(b"v");
+            set.extend_from_slice(&long);
+            set.extend_from_slice(&[b'x'; 1000]);
+            set.extend_from_slice(b"bc");
+            assert_eq!(&frame_multi_set(b"", &keys, &values, ttl)[..], &set[..]);
+        }
+    }
+
+    #[test]
+    fn the_client_m_reply_is_byte_for_byte_the_wire_form() {
+        let entries = [
+            ProxyMultiEntry::Value(Bytes::from_static(b"abc")),
+            ProxyMultiEntry::Miss,
+            ProxyMultiEntry::WrongNode,
+            ProxyMultiEntry::Value(Bytes::from(vec![b'z'; 1234])),
+            ProxyMultiEntry::Value(Bytes::new()),
+        ];
+        let mut expected = b"M 5 3 - W 1234 0 7\n".to_vec();
+        expected.extend_from_slice(b"abc");
+        expected.extend_from_slice(&[b'z'; 1234]);
+        assert_eq!(respond_multi(&entries, Some(7)), expected);
+        expected.splice(
+            ..b"M 5 3 - W 1234 0 7\n".len(),
+            b"M 5 3 - W 1234 0\n".iter().copied(),
+        );
+        assert_eq!(respond_multi(&entries, None), expected);
+    }
+
+    #[test]
     fn a_batch_touch_with_get_is_charged_for_the_values_it_can_return() {
         let plain = multi_touch_request(b"", &[b"a", b"b"], Some(1), false);
         let get = multi_touch_request(b"", &[b"a", b"b"], Some(1), true);
@@ -14517,13 +14637,15 @@ mod tests {
         let live = MockNode::start().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
         let roster = vec![
             ("node-live".to_string(), live.addr.clone()),
             ("node-dead".to_string(), dead_addr.clone()),
         ];
         let discovery = start_mock_discovery(roster.clone(), 2).await;
         let proxy = start_proxy(&discovery, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports (see `dead_node_cluster`).
+        drop(listener);
         let ring = RingView::new(roster, 2);
         let key = (0..64u8)
             .map(|index| format!("k{index}"))
@@ -14816,6 +14938,61 @@ mod tests {
             vec![(Some(0), false)],
             "the retried key's other owner is sent the plain touch"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_touch_the_node_refuses_is_r_not_an_unknown_outcome() {
+        // A `W` or `E` means the frame was refused and nothing expired, so it
+        // is no unknown outcome. The ring still being stale after the
+        // refresh, or the node failing the retry, must reach a retry-capable
+        // client as `R` (and the connection must stay usable), not as the
+        // fatal `E` + close of an `i`, `k` or `x` whose outcome is unknown.
+        let cases: [(&str, &[&'static str]); 3] = [
+            ("W on the first send and again on the retry", &["W", "W"]),
+            ("W on the first send, E on the retry", &["W", "E"]),
+            ("E on the first send", &["E"]),
+        ];
+        for (name, refusals) in cases {
+            for get in [false, true] {
+                let (nodes, proxy) = cluster(1).await;
+                let mut stream = TcpStream::connect(&proxy).await.unwrap();
+                stream.write_all(b"A 1 R\nx").await.unwrap();
+                let mut buf = BytesMut::new();
+                assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+                stream.write_all(b"S 3 1\nkeyv").await.unwrap();
+                assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+                for node in &nodes {
+                    node.refuse_touches
+                        .lock()
+                        .unwrap()
+                        .extend(refusals.iter().copied());
+                }
+                let request: &[u8] = if get {
+                    b"t 0 3 0 G\nkey"
+                } else {
+                    b"t 0 3 0\nkey"
+                };
+                stream.write_all(request).await.unwrap();
+                assert_eq!(
+                    read_line(&mut stream, &mut buf).await.unwrap(),
+                    "R",
+                    "{name}, get={get}"
+                );
+                for node in &nodes {
+                    assert!(node.touches().is_empty(), "{name}: a refused touch applied");
+                }
+
+                // The connection stays open and the key was never expired.
+                stream.write_all(request).await.unwrap();
+                let expected = if get { "V 1 0" } else { "S" };
+                assert_eq!(
+                    read_line(&mut stream, &mut buf).await.unwrap(),
+                    expected,
+                    "{name}, get={get}: the retry"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

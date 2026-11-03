@@ -1629,7 +1629,8 @@ internal static class Tls
     /// its private key; the root and intermediate are returned without
     /// theirs, as a server would hold them.</summary>
     internal static (X509Certificate2 Root, X509Certificate2 Intermediate, X509Certificate2 Leaf) GenerateChain(
-        IPAddress sanIpAddress, string rootName = "nanocached test root")
+        IPAddress sanIpAddress, string rootName = "nanocached test root",
+        string[]? leafExtendedKeyUsages = null)
     {
         using RSA rootKey = RSA.Create(2048);
         var rootRequest = new CertificateRequest(
@@ -1665,8 +1666,15 @@ internal static class Tls
         leafRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, false));
         leafRequest.CertificateExtensions.Add(new X509KeyUsageExtension(
             X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
-        leafRequest.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
-            new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, false));
+        // null = serverAuth (a normal server certificate); an empty array =
+        // no extended key usage extension at all (valid for any use).
+        string[] ekuOids = leafExtendedKeyUsages ?? new[] { "1.3.6.1.5.5.7.3.1" };
+        if (ekuOids.Length > 0)
+        {
+            var ekus = new OidCollection();
+            foreach (string oid in ekuOids) ekus.Add(new Oid(oid));
+            leafRequest.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(ekus, false));
+        }
         leafRequest.CertificateExtensions.Add(
             X509AuthorityKeyIdentifierExtension.CreateFromCertificate(intermediateWithKey, true, false));
         using X509Certificate2 leafWithKey = leafRequest

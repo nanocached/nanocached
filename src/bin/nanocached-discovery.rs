@@ -208,6 +208,53 @@
 //!                             is still possible and is not rejected for
 //!                             lacking `generation`.
 //!
+//!   V <name-length> <token-length>\n<name><token>   Leave: the node
+//!                             removes itself from membership, in any state
+//!                             (a `Joined` member that has finished handing
+//!                             its keys off, or a `Waiting`/`Joining` node
+//!                             aborting its own join, which ends the join),
+//!                             so the next `L`, heartbeat ack and `T` serve
+//!                             the roster without it at once instead of
+//!                             after the liveness timeout. Response: `R\n`
+//!                             (also for a name that is not registered, so
+//!                             a repeat is harmless). A `token` that does
+//!                             not match the registered one closes the
+//!                             connection with no response. Served during
+//!                             the startup grace.
+//!
+//!   Y <name-length> <port> <token-length>\n<name><token>   Proxy
+//!                             announce: a `nanocached-proxy` registering,
+//!                             or refreshing, itself in the proxy roster
+//!                             that `Q` lists (the address is composed from
+//!                             this connection's source IP and `port`, like
+//!                             `J`'s). The proxy repeats it to stay listed;
+//!                             one not heard from for `--liveness-timeout`
+//!                             is dropped. Response: `R\n`, and the
+//!                             connection stays open for the next command. A
+//!                             `token` that differs from the registered
+//!                             one for `name` (a name hijack), or a full
+//!                             roster (`MAX_PROXY_ENTRIES`), closes the
+//!                             connection with no response. Proxies are not
+//!                             cache nodes: they never appear in `L`, hold
+//!                             no keys and take part in no join. Served
+//!                             during the startup grace.
+//!
+//!   Z <name-length> <token-length>\n<name><token>   Proxy deregister:
+//!                             a draining proxy leaves the proxy roster at
+//!                             once instead of lingering until the liveness
+//!                             timeout. Response: `R\n` (also for a name
+//!                             that is not listed). A `token` that does not
+//!                             match closes the connection with no
+//!                             response. Served during the startup grace.
+//!
+//!   Q\n                       List the proxies announced with `Y`.
+//!                             Response: `N <count>\n` followed by `count`
+//!                             entries, each `<name-length> <addr-length>\n
+//!                             <name><addr>\n`. Answered `B\n` (connection
+//!                             closed) during the startup grace, like `L`:
+//!                             an empty list there would read as "no
+//!                             proxies exist".
+//!
 //!   A <secret-length>\n<secret>   Authenticate. Response: `Od\n` on success,
 //!                             `Ed\n` (then the connection closes) if a
 //!                             secret is configured and this doesn't match
@@ -230,8 +277,13 @@
 //! grace period (discovery HA, one liveness-timeout long): after a restart the
 //! registry re-fills from `P` announces within about one heartbeat
 //! interval, and until the grace has passed a fresh client must not build
-//! a ring from the partial list. All other commands work during the grace
-//! — recovery itself depends on them.
+//! a ring from the partial list. `T` and `Q` are answered the same way
+//! (`B\n`, connection closed), and `H` is acknowledged with a bare `A\n`
+//! (no roster, see above). The commands recovery depends on work during
+//! the grace: `P`, `Y`, `V`, `Z`, `C`, `A` and `J` are served as usual,
+//! except that a `J` is only registered (`Waiting`): its join does not
+//! start until the grace has passed, so that it is handed off against the
+//! re-filled registry rather than a partial one.
 //!
 //! A node moves through three states (staged node join): `Waiting` (registered via
 //! `J`, but either another join is already in progress or its handoff
@@ -424,12 +476,25 @@ const ANNOUNCE_INSERT_BURST: u32 = 64;
 /// addresses in one cluster's network.
 const MAX_ANNOUNCE_LIMITER_ENTRIES: usize = 4096;
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
-/// Smallest `--liveness-timeout` accepted, in seconds. A node heartbeats
-/// every 5 s, so a window at or below that evicts live members between two
-/// heartbeats and the membership flaps for good; `0` also made the sweep
-/// tick every millisecond, evict every node on its first tick and set the
-/// startup grace to nothing.
-const MIN_LIVENESS_TIMEOUT_SECS: u64 = 6;
+/// How often a node heartbeats, in seconds. Mirrors
+/// `DEFAULT_HEARTBEAT_INTERVAL_SECS` in `src/main.rs` (the node binary fixes
+/// the interval; discovery does not link `server.rs`, so the value is
+/// repeated here and `node_heartbeat_interval_matches_the_node_binary`
+/// fails if the two drift apart).
+const NODE_HEARTBEAT_INTERVAL_SECS: u64 = 5;
+/// Heartbeats that fit in the smallest accepted liveness window: one that
+/// is due, one that may be late or lost, and one so that the stall guard
+/// (`sweep_was_stalled` treats a sweep gap over half the window as a pause
+/// of discovery itself) still spans a whole interval.
+const MIN_LIVENESS_HEARTBEATS: u64 = 3;
+/// Smallest `--liveness-timeout` accepted, in seconds. Anything at or below
+/// one heartbeat interval evicts live members between two heartbeats and
+/// the membership flaps for good; below three, a pause of discovery shorter
+/// than the stall guard (half the window) or one lost heartbeat is enough to
+/// evict healthy nodes, which then come back to a `G` answer and lose their
+/// caches. `0` also made the sweep tick every millisecond, evict every node
+/// on its first tick and set the startup grace to nothing.
+const MIN_LIVENESS_TIMEOUT_SECS: u64 = NODE_HEARTBEAT_INTERVAL_SECS * MIN_LIVENESS_HEARTBEATS;
 /// Largest `--liveness-timeout` accepted, in seconds (7 days, the node's
 /// own `--drain-timeout` cap). The value is added to `Instant::now()` for
 /// the startup grace and the sweep deadlines, and an unbounded `u64` there
@@ -1445,8 +1510,10 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, ArgsError>
                 if !(MIN_LIVENESS_TIMEOUT_SECS..=MAX_LIVENESS_TIMEOUT_SECS).contains(&secs) {
                     return Err(ArgsError::Invalid(format!(
                         "--liveness-timeout must be between {MIN_LIVENESS_TIMEOUT_SECS} and \
-                         {MAX_LIVENESS_TIMEOUT_SECS} seconds (a node heartbeats every 5 s; \
-                         {secs} would evict live nodes between heartbeats or overflow the clock)"
+                         {MAX_LIVENESS_TIMEOUT_SECS} seconds (a node heartbeats every \
+                         {NODE_HEARTBEAT_INTERVAL_SECS} s and the window must hold at least \
+                         {MIN_LIVENESS_HEARTBEATS} beats; {secs} would evict live nodes on a \
+                         late heartbeat or overflow the clock)"
                     )));
                 }
                 args.liveness_timeout = Duration::from_secs(secs);
@@ -1497,8 +1564,8 @@ Usage: nanocached-discovery [options]
   --host <addr>                 bind address (default 127.0.0.1)
   --port <port>                 bind port (default 8357)
   --liveness-timeout <secs>     drop a node after this many seconds without
-                                 a heartbeat (default 15; at least 6, at most
-                                 604800)
+                                 a heartbeat (default 15; at least 15, three
+                                 node heartbeats; at most 604800)
   --replication-factor <n>      how many nodes hold each key (client-side replication);
                                  distributed to clients via L and to nodes
                                  via M (default 2, min 1)
@@ -3816,21 +3883,27 @@ pub(crate) async fn run_on_listener(
         ));
     }
 
-    // Issue #421(a): kept alongside the originals (moved into the spawn
-    // below) so the watchdog arm in the main select! loop can respawn
-    // sweep_task after a panic without needing to reconstruct these.
-    let sweep_auth_secret = auth_secret.clone();
-    let sweep_tls_connector = tls_connector.clone();
-    let mut sweep_task = tokio::spawn(sweep_expired(
-        Arc::clone(&cluster_state.registry),
-        Arc::clone(&cluster_state.current_join),
-        auth_secret,
-        tls_connector,
-        replication,
-        list_ready_at,
-        liveness_timeout,
-        shutdown_rx.clone(),
-    ));
+    // Issue #421(a): the sweep task is watched and respawned when it exits
+    // (a panic anywhere in its own body would otherwise silently stop
+    // membership maintenance while the process kept serving). The watching
+    // and the back-off between respawns live in `supervise_sweep`.
+    let sweep_task = tokio::spawn(supervise_sweep(shutdown_rx.clone(), {
+        let registry = Arc::clone(&cluster_state.registry);
+        let current_join = Arc::clone(&cluster_state.current_join);
+        let shutdown_rx = shutdown_rx.clone();
+        move || {
+            sweep_expired(
+                Arc::clone(&registry),
+                Arc::clone(&current_join),
+                auth_secret.clone(),
+                tls_connector.clone(),
+                replication,
+                list_ready_at,
+                liveness_timeout,
+                shutdown_rx.clone(),
+            )
+        }
+    }));
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -3850,43 +3923,6 @@ pub(crate) async fn run_on_listener(
                 if let Some(Err(error)) = result {
                     eprintln!("WARN connection task failed: {error}");
                 }
-            }
-
-            // Issue #421(a): sweep_task's JoinHandle used to be joined only
-            // at shutdown (see the `timeout(SHUTDOWN_TIMEOUT, sweep_task)`
-            // below) — unlike connection_tasks above, nothing in this loop
-            // ever polled it, so a panic anywhere in sweep_expired's own
-            // body (dead-node eviction, stalled-join reaping — the join
-            // fan-outs it starts run on their own tasks and report a
-            // panic themselves) silently killed just that task while the
-            // process kept serving normally, with no signal that
-            // membership maintenance had gone dark. Watch it here and
-            // respawn on exit so it comes back with a loud WARN instead.
-            // sweep_expired only ever returns (`Ok(())`) via its own
-            // `shutdown_rx.changed()` branch, which fires only after
-            // `shutdown_tx.send_replace(true)` just above — by which point
-            // this loop has already broken, so this arm observing `Ok(())`
-            // would itself be unexpected; treat it the same as a panic
-            // rather than assume it's safe to ignore.
-            result = &mut sweep_task => {
-                match result {
-                    Ok(()) => {
-                        eprintln!("WARN sweep task exited unexpectedly; respawning");
-                    }
-                    Err(error) => {
-                        eprintln!("WARN sweep task panicked: {error}; respawning");
-                    }
-                }
-                sweep_task = tokio::spawn(sweep_expired(
-                    Arc::clone(&cluster_state.registry),
-                    Arc::clone(&cluster_state.current_join),
-                    sweep_auth_secret.clone(),
-                    sweep_tls_connector.clone(),
-                    replication,
-                    list_ready_at,
-                    liveness_timeout,
-                    shutdown_rx.clone(),
-                ));
             }
 
             result = listener.accept() => {
@@ -3949,6 +3985,85 @@ pub(crate) async fn run_on_listener(
     Ok(())
 }
 
+/// First pause before the sweep task is respawned after it exited.
+const SWEEP_RESPAWN_BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// The pause doubles on each consecutive failure up to this.
+const SWEEP_RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// A sweep task that stayed up this long counts as healthy again: the next
+/// failure starts the back-off over instead of continuing it.
+const SWEEP_RESPAWN_HEALTHY_AFTER: Duration = Duration::from_secs(60);
+/// The respawn notices are few by construction (the back-off bounds them),
+/// but they go through a limiter like every other line the runtime thread
+/// writes, so a log sink that stalls cannot stall the supervisor either.
+static SWEEP_RESPAWN_LOG: LogLimiter = LogLimiter::new(5, Duration::from_secs(60));
+
+/// How long to wait before respawning a sweep task that keeps exiting.
+#[derive(Default)]
+struct SweepRespawnBackoff {
+    consecutive_failures: u32,
+}
+
+impl SweepRespawnBackoff {
+    /// The pause before the next respawn, given how long the task that just
+    /// exited had been running: `BASE`, doubling per consecutive failure up
+    /// to `MAX`, starting over after a run of `HEALTHY_AFTER` or more.
+    fn next_delay(&mut self, ran_for: Duration) -> Duration {
+        if ran_for >= SWEEP_RESPAWN_HEALTHY_AFTER {
+            self.consecutive_failures = 0;
+        }
+        let delay = SWEEP_RESPAWN_BACKOFF_BASE
+            .saturating_mul(1u32 << self.consecutive_failures.min(16))
+            .min(SWEEP_RESPAWN_BACKOFF_MAX);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        delay
+    }
+}
+
+/// Runs the sweep (`make` builds one run of it) until shutdown, starting it
+/// again when it exits. Until shutdown it has no reason to: a panic is the
+/// only way out, and a sweep that panics on every pass would otherwise be
+/// respawned in a hot loop (its interval's first tick is immediate), each
+/// pass writing a line. The respawns back off exponentially, and the lines
+/// go through `SWEEP_RESPAWN_LOG`.
+async fn supervise_sweep<F, Fut>(mut shutdown_rx: watch::Receiver<bool>, mut make: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut backoff = SweepRespawnBackoff::default();
+    loop {
+        let started = Instant::now();
+        let outcome = tokio::spawn(make()).await;
+        // `sweep_expired` returns normally only for the shutdown signal.
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        let delay = backoff.next_delay(started.elapsed());
+        match outcome {
+            Ok(()) => log_limited(
+                &SWEEP_RESPAWN_LOG,
+                "sweep task respawns",
+                format_args!(
+                    "WARN sweep task exited unexpectedly; respawning in {}s",
+                    delay.as_secs()
+                ),
+            ),
+            Err(error) => log_limited(
+                &SWEEP_RESPAWN_LOG,
+                "sweep task respawns",
+                format_args!(
+                    "WARN sweep task panicked: {error}; respawning in {}s",
+                    delay.as_secs()
+                ),
+            ),
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown_rx.wait_for(|stop| *stop) => return,
+        }
+    }
+}
+
 /// Issue #1285: the log lines a peer can cause at will (a connection that
 /// ends in an error, a TLS handshake that fails, a rejected `T`, join,
 /// announce, leave or deregister) are each written at most this many times
@@ -3972,6 +4087,12 @@ static REJECTION_LOG: LogLimiter =
 /// other way round; and on standard output, where the line has always been.
 static REGISTRATION_LOG: LogLimiter =
     LogLimiter::new(PEER_LOG_LINES_PER_SECOND, Duration::from_secs(1));
+/// The same for the two `INFO node announced` lines a `P` writes (one when
+/// it re-registers a node, one when it is answered `G` for a node evicted
+/// earlier): a peer that loops `P` wrote one per connection. Its own budget,
+/// on standard output like the registration line.
+static ANNOUNCE_LOG: LogLimiter =
+    LogLimiter::new(PEER_LOG_LINES_PER_SECOND, Duration::from_secs(1));
 
 /// One line about a connection (accept and TLS failures, a connection that
 /// ended in an error), through `CONNECTION_LOG`.
@@ -3986,11 +4107,22 @@ fn log_rejection(line: std::fmt::Arguments<'_>) {
 
 /// One `INFO node registered` line, through `REGISTRATION_LOG`.
 fn log_registration(line: std::fmt::Arguments<'_>) {
-    let Some(suppressed) = REGISTRATION_LOG.admit() else {
+    log_info_limited(&REGISTRATION_LOG, "node registrations", line);
+}
+
+/// One `INFO node announced ...` line (a `P` that re-registered a node, or
+/// one answered `G` for a node evicted earlier), through `ANNOUNCE_LOG`.
+fn log_announce(line: std::fmt::Arguments<'_>) {
+    log_info_limited(&ANNOUNCE_LOG, "node announces", line);
+}
+
+/// The standard-output counterpart of `log_limited`.
+fn log_info_limited(limiter: &LogLimiter, what: &str, line: std::fmt::Arguments<'_>) {
+    let Some(suppressed) = limiter.admit() else {
         return;
     };
     if suppressed > 0 {
-        println!("INFO {suppressed} more node registrations (not logged individually)");
+        println!("INFO {suppressed} more {what} (not logged individually)");
     }
     println!("{line}");
 }
@@ -5505,10 +5637,10 @@ async fn handle_connection(
                 // that said it can (`rejoin_capable`): an older node would
                 // read the reply as a failure and ask again forever.
                 if rejoin_capable && announce_needs_rejoin(&registry, &name) {
-                    println!(
+                    log_announce(format_args!(
                         "INFO node announced after its eviction: {name} must clear its cache and \
                          join again"
-                    );
+                    ));
                     write_response(&mut stream, b"G\n").await?;
                     return Ok(());
                 }
@@ -5611,7 +5743,9 @@ async fn handle_connection(
                         break 'decide Err("registry is full");
                     }
 
-                    println!("INFO node announced: {name} at {addr} (re-registered)");
+                    log_announce(format_args!(
+                        "INFO node announced: {name} at {addr} (re-registered)"
+                    ));
                     forget_departed(&registry, &name);
                     guard.insert(
                         name.clone(),
@@ -13654,14 +13788,91 @@ mod tests {
     }
 
     #[test]
+    fn sweep_respawn_backoff_doubles_to_a_cap_and_starts_over_after_a_healthy_run() {
+        let mut backoff = SweepRespawnBackoff::default();
+        let quick = Duration::ZERO;
+        let delays: Vec<u64> = (0..8)
+            .map(|_| backoff.next_delay(quick).as_secs())
+            .collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
+        // A run that stayed up long enough forgives the failures before it.
+        assert_eq!(
+            backoff.next_delay(SWEEP_RESPAWN_HEALTHY_AFTER),
+            SWEEP_RESPAWN_BACKOFF_BASE
+        );
+        assert_eq!(backoff.next_delay(quick), 2 * SWEEP_RESPAWN_BACKOFF_BASE);
+        // A run just under that does not.
+        assert_eq!(
+            backoff.next_delay(SWEEP_RESPAWN_HEALTHY_AFTER - Duration::from_millis(1)),
+            4 * SWEEP_RESPAWN_BACKOFF_BASE
+        );
+        // Many consecutive failures neither overflow nor exceed the cap.
+        for _ in 0..1_000 {
+            assert!(backoff.next_delay(quick) <= SWEEP_RESPAWN_BACKOFF_MAX);
+        }
+        assert_eq!(backoff.next_delay(quick), SWEEP_RESPAWN_BACKOFF_MAX);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_sweep_that_panics_every_time_is_not_respawned_faster_than_the_back_off() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let supervisor = tokio::spawn(supervise_sweep(shutdown_rx, {
+            let runs = Arc::clone(&runs);
+            move || {
+                let runs = Arc::clone(&runs);
+                async move {
+                    runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    panic!("sweep panics on every pass");
+                }
+            }
+        }));
+        let runs_so_far = || runs.load(std::sync::atomic::Ordering::SeqCst);
+        let advance = |seconds: u64| async move {
+            // In steps, letting the spawned tasks run between them.
+            for _ in 0..seconds * 10 {
+                tokio::time::advance(Duration::from_millis(100)).await;
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+
+        // Without a back-off this is thousands of runs a second.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runs_so_far(), 1, "the first run starts at once");
+        // Runs start at 0 s, then 1 s, 3 s, 7 s and 15 s after the first.
+        advance(10).await;
+        assert_eq!(runs_so_far(), 4, "after 10 s");
+        advance(6).await;
+        assert_eq!(runs_so_far(), 5, "after 16 s");
+        // At the cap, one run every 30 s.
+        advance(30).await;
+        assert_eq!(runs_so_far(), 6, "after 46 s");
+
+        // Shutdown ends the supervisor at once, from inside a back-off pause.
+        shutdown_tx.send_replace(true);
+        timeout(Duration::from_secs(1), supervisor)
+            .await
+            .expect("the supervisor stops at shutdown")
+            .unwrap();
+        assert_eq!(runs_so_far(), 6, "no run starts after shutdown");
+    }
+
+    #[test]
     fn liveness_timeout_is_bounded_below_and_above() {
         let parse = |secs: &str| {
             parse_args_from(["--liveness-timeout".to_string(), secs.to_string()].into_iter())
         };
-        for rejected in ["0", "5", "604801", "18446744073709551615"] {
+        // Below three node heartbeats (15 s): `6` and `14` used to be accepted
+        // and let one lost heartbeat, or a pause of discovery under the stall
+        // guard, evict live nodes.
+        for rejected in ["0", "5", "6", "10", "14", "604801", "18446744073709551615"] {
             match parse(rejected) {
                 Err(ArgsError::Invalid(message)) => assert!(
-                    message.starts_with("--liveness-timeout must be between 6 and 604800 seconds"),
+                    message.starts_with("--liveness-timeout must be between 15 and 604800 seconds"),
                     "{rejected}: {message}"
                 ),
                 Ok(_) => panic!("{rejected} must be refused"),
@@ -13670,7 +13881,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(parse("6").unwrap().liveness_timeout, Duration::from_secs(6));
+        assert_eq!(
+            parse("15").unwrap().liveness_timeout,
+            Duration::from_secs(15)
+        );
         assert_eq!(
             parse("604800").unwrap().liveness_timeout,
             Duration::from_secs(604_800)
@@ -13681,5 +13895,23 @@ mod tests {
                 .liveness_timeout,
             DEFAULT_LIVENESS_TIMEOUT
         );
+    }
+
+    #[test]
+    fn node_heartbeat_interval_matches_the_node_binary() {
+        let node_main = include_str!("../main.rs");
+        let declared =
+            format!("const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = {NODE_HEARTBEAT_INTERVAL_SECS};");
+        assert!(
+            node_main.contains(&declared),
+            "src/main.rs no longer declares `{declared}`; update NODE_HEARTBEAT_INTERVAL_SECS"
+        );
+        // The accepted minimum is derived from it, and the default is not
+        // below it.
+        assert_eq!(
+            MIN_LIVENESS_TIMEOUT_SECS,
+            MIN_LIVENESS_HEARTBEATS * NODE_HEARTBEAT_INTERVAL_SECS
+        );
+        assert!(DEFAULT_LIVENESS_TIMEOUT.as_secs() >= MIN_LIVENESS_TIMEOUT_SECS);
     }
 }

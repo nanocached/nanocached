@@ -186,11 +186,13 @@ jobs:
 
       - name: Pack and publish to NuGet
         working-directory: sdk/dotnet
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
         run: |
           ver="${GITHUB_REF_NAME#sdk/dotnet/v}"
           dotnet pack src/Nanocached/Nanocached.csproj -c Release -o out
           dotnet nuget push "out/Nanocached.$ver.nupkg" \
-            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+            --api-key "$NUGET_API_KEY" \
             --source https://api.nuget.org/v3/index.json
 
   # ── framework adapters ──────────────────────────────────────────────
@@ -213,12 +215,28 @@ jobs:
         id: tag
         run: |
           rest="${GITHUB_REF_NAME#adapter/}"
-          echo "name=${rest%/v*}" >> "$GITHUB_OUTPUT"
-          echo "ver=${rest#*/v}" >> "$GITHUB_OUTPUT"
+          name="${rest%/v*}"
+          ver="${rest#*/v}"
+          # A tag name may hold shell syntax (`git check-ref-format` accepts
+          # `adapter/keyv/v1";id${IFS}x;"`), so nothing later may see a
+          # value that has not passed this check.
+          if ! printf '%s' "$name" | grep -Eq '^(cache-manager|keyv)$'; then
+            echo "::error::'$name' is not an adapter this job releases"
+            exit 1
+          fi
+          if ! printf '%s' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "::error::'$ver' is not a version (X.Y.Z or X.Y.Z-pre)"
+            exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
 
       - name: Verify tag matches manifest version
+        env:
+          NAME: ${{ steps.tag.outputs.name }}
+          VER: ${{ steps.tag.outputs.ver }}
         run: |
-          test "$(node -p 'require("./adapters/${{ steps.tag.outputs.name }}/package.json").version')" = "${{ steps.tag.outputs.ver }}"
+          test "$(node -p 'require("./adapters/" + process.env.NAME + "/package.json").version')" = "$VER"
 
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
@@ -247,11 +265,13 @@ jobs:
       # prepublishOnly (which would re-run them) with --ignore-scripts.
       - name: Build and publish to npm
         working-directory: adapters/${{ steps.tag.outputs.name }}
+        env:
+          VER: ${{ steps.tag.outputs.ver }}
         run: |
           pnpm install --frozen-lockfile
           pnpm test
           pnpm build
-          npm pkg set "dependencies.nanocached=^${{ steps.tag.outputs.ver }}"
+          npm pkg set "dependencies.nanocached=^$VER"
           npm publish --access public --ignore-scripts
 
   adapter-pypi:
@@ -314,11 +334,13 @@ jobs:
       # built, not packed) and writes it as a dependency on Nanocached.
       - name: Pack and publish to NuGet
         working-directory: adapters/dotnet
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
         run: |
           ver="${GITHUB_REF_NAME#adapter/dotnet/v}"
           dotnet pack src/Nanocached.Caching/Nanocached.Caching.csproj -c Release -o out
           dotnet nuget push "out/Nanocached.Caching.$ver.nupkg" \
-            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+            --api-key "$NUGET_API_KEY" \
             --source https://api.nuget.org/v3/index.json
 
   adapter-maven:
@@ -332,12 +354,28 @@ jobs:
         id: tag
         run: |
           rest="${GITHUB_REF_NAME#adapter/}"
-          echo "name=${rest%/v*}" >> "$GITHUB_OUTPUT"
-          echo "ver=${rest#*/v}" >> "$GITHUB_OUTPUT"
+          name="${rest%/v*}"
+          ver="${rest#*/v}"
+          # A tag name may hold shell syntax (`git check-ref-format` accepts
+          # `adapter/keyv/v1";id${IFS}x;"`), so nothing later may see a
+          # value that has not passed this check.
+          if ! printf '%s' "$name" | grep -Eq '^(spring|jcache|spring-boot-starter)$'; then
+            echo "::error::'$name' is not an adapter this job releases"
+            exit 1
+          fi
+          if ! printf '%s' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "::error::'$ver' is not a version (X.Y.Z or X.Y.Z-pre)"
+            exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
 
       - name: Verify tag matches manifest version
+        env:
+          NAME: ${{ steps.tag.outputs.name }}
+          VER: ${{ steps.tag.outputs.ver }}
         run: |
-          grep -q "^version = '${{ steps.tag.outputs.ver }}'$" adapters/${{ steps.tag.outputs.name }}/build.gradle
+          grep -q "^version = '$VER'$" "adapters/$NAME/build.gradle"
 
       - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:

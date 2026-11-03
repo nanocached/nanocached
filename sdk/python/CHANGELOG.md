@@ -9,6 +9,10 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Fixed
+
+- A key, value or namespace that was not `str` or bytes-like went through `bytes(value)`, so an `int` became that many NUL bytes: `set("k", 42)` stored 42 NULs, `set("visits", 0)` stored an empty value (and the next `incr("visits")` raised `NotNumericError`), `set(7, "x")` stored `b"x"` under a seven-byte NUL key, and `set("big", 100_000_000)` allocated 100 MB before the request-size `ValueError`. `str` is still UTF-8 encoded and `bytes`, `bytearray` and `memoryview` are still copied; anything else now raises `TypeError` naming the argument (key, value or namespace) before anything is allocated or sent, as the TypeScript SDK does. (#1345)
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed

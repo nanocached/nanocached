@@ -17,6 +17,8 @@ source "$E/cl.sh"
 P=nrd; D=$P-disc:8357
 T(){ echo "### $(date -u +%T.%N | cut -c1-12) [$P] $*"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+trap cleanup EXIT  # Ctrl-C or a failed step must not leave the run's containers behind
+tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }  # bounds a command to N seconds
 RUN=${RUN:-$(date +%H%M%S)}; L="$E/logs/rdiag-$RUN"; mkdir -p "$L"
 cleanup; docker network create $NET >/dev/null
 disc_up $P-disc --replication-factor 2; sleep 1
@@ -43,7 +45,7 @@ docker start $n5 >/dev/null
 T "docker start returned"
 wait_members 5 $D 60 || T "FAIL: rejoin"
 T "rejoined after $(( $(date +%s)-t0 ))s"; ipmap ipmap2
-docker wait $P-load >/dev/null
+tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; docker kill $P-load >/dev/null 2>&1; }
 docker logs -t $P-load > "$L/load.log" 2>&1; load=$(grep '"label"' "$L/load.log" | tail -1)
 echo "=== load: $load"
 check=$(docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
