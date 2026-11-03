@@ -13,6 +13,8 @@ source "$E/cl.sh"
 P=nfr; D=$P-disc:8357; MODE=${MODE:-decom-fresh}; GAP=${GAP:-3}
 T(){ echo "### $(date -u +%T.%N | cut -c1-12) [$P] $*"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+trap cleanup EXIT  # Ctrl-C or a failed step must not leave the run's containers behind
+tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }  # bounds a command to N seconds
 RUN=${RUN:-$(date +%H%M%S)}; L="$E/logs/fresh-$RUN"; mkdir -p "$L"
 cleanup; docker network create $NET >/dev/null
 disc_up $P-disc --replication-factor 2; sleep 1
@@ -29,7 +31,7 @@ if [ "$MODE" = decom-join ]; then
   wait $STOP; rc=$(docker inspect -f '{{.State.ExitCode}}' $P-n1); T "leaver $P-n1 exited rc=$rc after $(( $(date +%s)-t0 ))s"; [ "$rc" = 0 ] || { T "FAIL: leaver rc=$rc"; fail=1; }
   wait_members 3 $D 120 || { T "FAIL: membership (want 3 = n2 n3 n4)"; fail=1; }; T "members settled after $(( $(date +%s)-t0 ))s"
   docker logs -t $P-n1 > "$L/$P-n1.log" 2>&1
-  docker wait $P-load >/dev/null
+  tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
 else
 spawn; n4=$spawned; T "JOIN $n4"; wait_members 4 $D 60 || { T "FAIL: join n4"; fail=1; }
 members=4
@@ -49,7 +51,7 @@ case $MODE in
     wait_members $members $D 60 || { T "FAIL: rejoin"; fail=1; }; T "rejoined after $(( $(date +%s)-t0 ))s"
     if [[ "$MODE" == *rejoin ]]; then sleep ${REJOIN_AFTER:-10}; spawn; T "JOIN $spawned after the restart"; wait_members $((members+1)) $D 60 || { T "FAIL: extra join"; fail=1; }; fi;;
 esac
-docker wait $P-load >/dev/null
+tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
 fi
 docker logs $P-load > "$L/load.log" 2>&1; load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1); echo "=== load: $load"
 check=$(docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
