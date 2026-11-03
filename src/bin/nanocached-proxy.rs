@@ -7726,6 +7726,34 @@ struct ClientAdmission {
     in_flight: InFlightAdmission,
 }
 
+/// How many connection-level log lines (a failed accept, a failed or
+/// timed-out TLS handshake, a connection that ended in an error) the
+/// proxy writes per second; the rest are counted and reported in one
+/// summary line ahead of the next one written. Every one of these is
+/// reachable by a peer that has not authenticated, one short connection
+/// per line, and `eprintln!` is a blocking write on a runtime worker: a
+/// flood within the connection caps wrote thousands of lines a second,
+/// and a log sink that pushed back stalled the accept loop and the
+/// backend tasks with it. The node and discovery bound their own the
+/// same way.
+const CONNECTION_LOG_LINES_PER_SECOND: u32 = 50;
+
+static CONNECTION_LOG: LogLimiter =
+    LogLimiter::new(CONNECTION_LOG_LINES_PER_SECOND, Duration::from_secs(1));
+
+/// One connection-level line, through `CONNECTION_LOG`: written when the
+/// budget allows, with the count of the lines dropped since the last one
+/// ahead of it; otherwise only counted.
+fn log_connection(line: std::fmt::Arguments<'_>) {
+    let Some(suppressed) = CONNECTION_LOG.admit() else {
+        return;
+    };
+    if suppressed > 0 {
+        eprintln!("WARN {suppressed} more connection log lines (not logged individually)");
+    }
+    eprintln!("{line}");
+}
+
 async fn serve(
     listener: TcpListener,
     context: Arc<ProxyContext>,
@@ -7762,7 +7790,7 @@ async fn serve(
                 // only a backoff (fd exhaustion specifically) changes the
                 // loop's pace, never its continuation — matches the
                 // metrics accept loop and discovery's accept loop.
-                eprintln!("WARN accept failed: {error}");
+                log_connection(format_args!("WARN accept failed: {error}"));
                 if should_backoff_after_accept_error(&error) {
                     sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
@@ -7812,18 +7840,22 @@ async fn serve(
                     match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                         Ok(Ok(tls)) => MaybeTls::Tls(Box::new(tls)),
                         Ok(Err(error)) => {
-                            eprintln!("WARN TLS handshake with {peer} failed: {error}");
+                            log_connection(format_args!(
+                                "WARN TLS handshake with {peer} failed: {error}"
+                            ));
                             return;
                         }
                         Err(_) => {
-                            eprintln!("WARN TLS handshake with {peer} timed out");
+                            log_connection(format_args!(
+                                "WARN TLS handshake with {peer} timed out"
+                            ));
                             return;
                         }
                     }
                 }
             };
             if let Err(error) = handle_client(stream, context, budgets).await {
-                eprintln!("WARN connection error from {peer}: {error}");
+                log_connection(format_args!("WARN connection error from {peer}: {error}"));
             }
         });
 
