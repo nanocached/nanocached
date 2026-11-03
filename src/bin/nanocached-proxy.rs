@@ -149,13 +149,14 @@
 //! handling, accept-loop backoff) *is* shared, via `nanocached::infra` —
 //! see that crate's own module docs for exactly where the line is drawn.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use nanocached::infra::{
     ACCEPT_ERROR_BACKOFF, LogLimiter, METRICS_MAX_CONNECTIONS, PerIpConnections,
     read_http_request_path, should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip,
     write_http_response,
 };
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -3442,11 +3443,22 @@ fn frame_get(namespace: &[u8], key: &[u8]) -> Bytes {
     frame.into()
 }
 
+/// `" <len>"` for every key, in one `String`: building it from a `format!`
+/// per key allocated once per key (about 350,000 times for a 1 MiB frame of
+/// one-byte keys).
+fn key_length_fields(keys: &[Bytes]) -> String {
+    let mut fields = String::with_capacity(keys.len() * 2);
+    for key in keys {
+        let _ = write!(fields, " {}", key.len());
+    }
+    fields
+}
+
 /// Issue #128 measurement prototype: one sub-frame per owner, carrying
 /// only that owner's slice of the original request's keys — see
 /// `dispatch_request`'s `Request::MultiGet` arm.
 fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Bytes {
-    let key_lengths: String = keys.iter().map(|key| format!(" {}", key.len())).collect();
+    let key_lengths = key_length_fields(keys);
     let mut frame = format!(
         "m {} {}{key_lengths} {TAG_PLACEHOLDER}\n",
         namespace.len(),
@@ -3465,9 +3477,11 @@ fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Bytes {
 /// address rather than by rank (a batch's keys can put the same node in
 /// different roles). One shared `ttl` for the whole frame.
 fn frame_multi_set(namespace: &[u8], keys: &[Bytes], values: &[Bytes], ttl: Option<u64>) -> Bytes {
-    let mut lengths = String::new();
+    // One growing `String`, not one per pair: a 1 MiB frame holds up to
+    // ~175,000 pairs.
+    let mut lengths = String::with_capacity(keys.len() * 4);
     for (key, value) in keys.iter().zip(values) {
-        lengths.push_str(&format!(" {} {}", key.len(), value.len()));
+        let _ = write!(lengths, " {} {}", key.len(), value.len());
     }
     let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
     let mut frame = format!(
@@ -3488,7 +3502,7 @@ fn frame_multi_set(namespace: &[u8], keys: &[Bytes], values: &[Bytes], ttl: Opti
 /// `plan_multi_touch`. No `ttl` asks the node to remove the TTL; `get` adds
 /// the `G` token.
 fn frame_multi_touch(namespace: &[u8], keys: &[Bytes], ttl: Option<u64>, get: bool) -> Bytes {
-    let key_lengths: String = keys.iter().map(|key| format!(" {}", key.len())).collect();
+    let key_lengths = key_length_fields(keys);
     let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
     let get_field = if get { " G" } else { "" };
     let mut frame = format!(
@@ -4195,8 +4209,7 @@ fn respond_multi(entries: &[ProxyMultiEntry], tag: Option<u32>) -> Vec<u8> {
     for entry in entries {
         match entry {
             ProxyMultiEntry::Value(value) => {
-                header.push(' ');
-                header.push_str(&value.len().to_string());
+                let _ = write!(header, " {}", value.len());
                 values_len += value.len();
             }
             ProxyMultiEntry::Miss => header.push_str(" -"),
@@ -7298,7 +7311,15 @@ async fn handle_client(
         let grown = match frame_end {
             Some(end) => (end > buf.capacity()).then_some(end),
             None if buf.capacity() - buf.len() >= READ_CHUNK => None,
-            None if buf.capacity() >= REQUEST_BUFFER_SHRINK_THRESHOLD => {
+            // A header still arriving doubles the buffer only while the
+            // doubling stays within the free threshold; past it, it takes
+            // the largest frame's worth in one step. (It used to reach
+            // that step by accident: doubling from 65,456 bytes to 130,912
+            // was shrunk back the moment a 4 KiB-aligned read left exactly
+            // 64 KiB in it, which a read of whatever had arrived did not.)
+            None if buf.capacity() >= REQUEST_BUFFER_SHRINK_THRESHOLD
+                || buf.capacity() * 2 > REQUEST_BUFFER_SHRINK_THRESHOLD =>
+            {
                 let max_frame = if authenticated {
                     MAX_CLIENT_FRAME_SIZE
                 } else {
@@ -7360,11 +7381,16 @@ async fn handle_client(
             buf = grown_buf;
         }
 
-        // Not past the end of a frame whose buffer was sized to it.
-        let room = frame_end.map_or(READ_CHUNK, |end| (end - buf.len()).min(READ_CHUNK));
-        let mut chunk = [0u8; READ_CHUNK];
+        // Straight into the buffer's own spare room — which is what was
+        // charged above, so a read cannot grow it — and not past the end of
+        // a frame whose buffer was sized to it. (A 4 KiB stack chunk copied
+        // out cost 256 reads and copies for a 1 MiB frame; `room` is never
+        // 0, the growth above leaves at least `READ_CHUNK` spare or the
+        // frame's remainder.)
+        let room = frame_end.map_or(buf.capacity() - buf.len(), |end| end - buf.len());
+        let mut window = (&mut buf).limit(room);
         let read = tokio::select! {
-            read = tokio::time::timeout_at(read_deadline, read_half.read(&mut chunk[..room])) => read,
+            read = tokio::time::timeout_at(read_deadline, read_half.read_buf(&mut window)) => read,
             () = drained(&mut drain) => break 'connection Ok(()),
             // The writer returning drops the FIFO's receiver: stop at once
             // instead of sitting in `read` for `IDLE_TIMEOUT` holding the
@@ -7373,7 +7399,7 @@ async fn handle_client(
         };
         match read {
             Err(_) | Ok(Ok(0)) => break Ok(()),
-            Ok(Ok(bytes_read)) => buf.extend_from_slice(&chunk[..bytes_read]),
+            Ok(Ok(_)) => {}
             Ok(Err(error)) => break Err(error),
         }
     };
@@ -14114,6 +14140,61 @@ mod tests {
             &frame_multi_touch(b"ns", &keys, Some(60), true)[..],
             format!("y 2 2 1 2 60 G {TAG_PLACEHOLDER}\nnsabc").as_bytes()
         );
+    }
+
+    #[test]
+    fn the_multi_get_and_multi_set_frames_to_a_node_are_byte_for_byte_the_wire_form() {
+        // The key-length fields are built in one `String` (no allocation
+        // per key); this pins the bytes they produce, including lengths of
+        // more than one digit and an empty set of optional fields.
+        let long = Bytes::from(vec![b'k'; 123]);
+        let keys = [
+            Bytes::from_static(b"a"),
+            long.clone(),
+            Bytes::from_static(b"bc"),
+        ];
+        let mut get = format!("m 2 3 1 123 2 {TAG_PLACEHOLDER}\nns").into_bytes();
+        get.extend_from_slice(b"a");
+        get.extend_from_slice(&long);
+        get.extend_from_slice(b"bc");
+        assert_eq!(&frame_multi_get(b"ns", &keys)[..], &get[..]);
+
+        let values = [
+            Bytes::from_static(b"v"),
+            Bytes::from(vec![b'x'; 1000]),
+            Bytes::new(),
+        ];
+        for ttl in [None, Some(60)] {
+            let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
+            let mut set =
+                format!("o 0 3 1 1 123 1000 2 0{ttl_field} {TAG_PLACEHOLDER}\n").into_bytes();
+            set.extend_from_slice(b"a");
+            set.extend_from_slice(b"v");
+            set.extend_from_slice(&long);
+            set.extend_from_slice(&[b'x'; 1000]);
+            set.extend_from_slice(b"bc");
+            assert_eq!(&frame_multi_set(b"", &keys, &values, ttl)[..], &set[..]);
+        }
+    }
+
+    #[test]
+    fn the_client_m_reply_is_byte_for_byte_the_wire_form() {
+        let entries = [
+            ProxyMultiEntry::Value(Bytes::from_static(b"abc")),
+            ProxyMultiEntry::Miss,
+            ProxyMultiEntry::WrongNode,
+            ProxyMultiEntry::Value(Bytes::from(vec![b'z'; 1234])),
+            ProxyMultiEntry::Value(Bytes::new()),
+        ];
+        let mut expected = b"M 5 3 - W 1234 0 7\n".to_vec();
+        expected.extend_from_slice(b"abc");
+        expected.extend_from_slice(&[b'z'; 1234]);
+        assert_eq!(respond_multi(&entries, Some(7)), expected);
+        expected.splice(
+            ..b"M 5 3 - W 1234 0 7\n".len(),
+            b"M 5 3 - W 1234 0\n".iter().copied(),
+        );
+        assert_eq!(respond_multi(&entries, None), expected);
     }
 
     #[test]
