@@ -1335,10 +1335,10 @@ fn apply_announce_to_existing(
         // would let anyone abort an in-progress join by announcing its
         // name).
         Some(info) if !constant_time_eq(info.token.as_bytes(), token.as_bytes()) => {
-            eprintln!(
+            log_rejection(format_args!(
                 "WARN rejected announce for {name} from {peer_ip}: wrong token — either \
                  an impersonation attempt or a node reusing another's name"
-            );
+            ));
             Some(Err(
                 "announce with a token that does not match the registered one",
             ))
@@ -3063,7 +3063,9 @@ async fn start_join(
 
         let newly_registered = !guard.contains_key(name);
         if newly_registered {
-            println!("INFO node registered: {name} at {address} (waiting to join)");
+            log_registration(format_args!(
+                "INFO node registered: {name} at {address} (waiting to join)"
+            ));
         }
         // Captured once, at registration, for `waiting_timeout_for` — see
         // `NodeInfo::queue_position`'s doc comment for why this must not
@@ -3315,13 +3317,13 @@ async fn handle_complete(
         if let Some(reported_generation) = generation
             && pending.generation != reported_generation
         {
-            eprintln!(
+            log_rejection(format_args!(
                 "WARN ignored handoff-complete report from {reporting_name} for \
                  {for_joining_name}: generation {reported_generation} does not match the \
                  in-progress join's generation {} — a stale report from a since-abandoned, \
                  superseded incarnation of this join",
                 pending.generation
-            );
+            ));
             return false;
         }
 
@@ -3339,19 +3341,19 @@ async fn handle_complete(
         // mid-join-eviction handling in `sweep_expired` below — is
         // rejected the same way `contains_key` already would have.
         let Some(expected_token) = pending.expected.get(reporting_name) else {
-            eprintln!(
+            log_rejection(format_args!(
                 "WARN ignored handoff-complete report from {reporting_name} for \
                  {for_joining_name}: not a ready member of this join"
-            );
+            ));
             return false;
         };
         if !constant_time_eq(expected_token.as_bytes(), token.as_bytes()) {
-            eprintln!(
+            log_rejection(format_args!(
                 "WARN ignored handoff-complete report from {reporting_name} for \
                  {for_joining_name}: presented token does not match the one recorded \
                  when this join started — either a forged report or a stale one from a \
                  node that re-registered under this name since"
-            );
+            ));
             return false;
         }
 
@@ -3935,6 +3937,13 @@ static CONNECTION_LOG: LogLimiter =
     LogLimiter::new(PEER_LOG_LINES_PER_SECOND, Duration::from_secs(1));
 static REJECTION_LOG: LogLimiter =
     LogLimiter::new(PEER_LOG_LINES_PER_SECOND, Duration::from_secs(1));
+/// Issue #1319: the `INFO node registered` line a `J` writes is also one
+/// per connection for a peer that connects, sends `J` and leaves in a loop
+/// (1,057 lines in 5.9 s, with ten names), so it is bounded too. On its own
+/// budget so that a flood of registrations never hides a refusal, and the
+/// other way round; and on standard output, where the line has always been.
+static REGISTRATION_LOG: LogLimiter =
+    LogLimiter::new(PEER_LOG_LINES_PER_SECOND, Duration::from_secs(1));
 
 /// One line about a connection (accept and TLS failures, a connection that
 /// ended in an error), through `CONNECTION_LOG`.
@@ -3945,6 +3954,17 @@ fn log_connection(line: std::fmt::Arguments<'_>) {
 /// One line about a request this replica refused, through `REJECTION_LOG`.
 fn log_rejection(line: std::fmt::Arguments<'_>) {
     log_limited(&REJECTION_LOG, "rejections", line);
+}
+
+/// One `INFO node registered` line, through `REGISTRATION_LOG`.
+fn log_registration(line: std::fmt::Arguments<'_>) {
+    let Some(suppressed) = REGISTRATION_LOG.admit() else {
+        return;
+    };
+    if suppressed > 0 {
+        println!("INFO {suppressed} more node registrations (not logged individually)");
+    }
+    println!("{line}");
 }
 
 fn log_limited(limiter: &LogLimiter, what: &str, line: std::fmt::Arguments<'_>) {
@@ -4016,6 +4036,7 @@ fn dispatch_connection(
                     &config.tls_acceptor,
                     TLS_HANDSHAKE_TIMEOUT,
                     b"B\n",
+                    log_connection,
                 )
                 .await;
                 return;
@@ -4040,6 +4061,7 @@ fn dispatch_connection(
                         &config.tls_acceptor,
                         TLS_HANDSHAKE_TIMEOUT,
                         b"B\n",
+                        log_connection,
                     )
                     .await;
                     return;
@@ -4942,7 +4964,7 @@ async fn handle_connection(
                 if let Some(reported) = replication
                     && reported != config.replication
                 {
-                    eprintln!(
+                    log_rejection(format_args!(
                         "WARN node {name} reports replication factor {reported}, but this \
                          discovery replica is configured with --replication-factor \
                          {} — every replica must agree, since replicas never reconcile \
@@ -4950,7 +4972,7 @@ async fn handle_connection(
                          or node that learned R from a different replica may be running \
                          with a different fan-out/failover width right now",
                         config.replication
-                    );
+                    ));
                 }
 
                 // Issue #61: carry the current `Joined` roster so the node

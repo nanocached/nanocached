@@ -2195,6 +2195,7 @@ fn dispatch_connection(
                     &config.tls_acceptor,
                     TLS_HANDSHAKE_TIMEOUT,
                     &Response::Busy.encode(),
+                    log_connection_warning,
                 )
                 .await;
                 return;
@@ -2217,6 +2218,7 @@ fn dispatch_connection(
                         &config.tls_acceptor,
                         TLS_HANDSHAKE_TIMEOUT,
                         &Response::Busy.encode(),
+                        log_connection_warning,
                     )
                     .await;
                     return;

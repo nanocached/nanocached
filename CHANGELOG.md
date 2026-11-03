@@ -12,6 +12,10 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-discovery`: several log lines an unauthenticated peer can trigger at will were still written one per request, bypassing the rate limit added in 0.6.1, and `eprintln!` blocks the single-threaded runtime when the log sink is slow. They now go through the limiter like the rest: the wrong-token announce rejection (3,000 `P` gave 3,000 lines), the three ignored-`C` reports (20,000 invalid `C` pipelined on one connection gave 20,000 lines; the connection stays open and answers `A` each time), the heartbeat replication-factor mismatch warning (alternating two wrong factors 20,000 times gave 20,000), the `INFO node registered` line of a `J` (3,000 connect, `J`, leave gave 3,000 lines) and the two "busy response" failure lines of `infra::reject_over_limit` (3,000 connections past the per-IP cap that reset at once gave 2,333 lines in 1.4 s, 35 after). `reject_over_limit`, shared with the node, takes the caller's connection log as a parameter, and the node's two call sites pass its own. Lines past the budget (50 a second per kind) are counted and reported in one summary line (#1319).
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed
