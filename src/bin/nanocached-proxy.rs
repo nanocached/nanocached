@@ -2988,9 +2988,19 @@ async fn run_backend(
         // nothing would ever bring this task back around to notice it.
         // A write timeout is treated exactly like a write error: poison
         // and stop, so the slot clears and the next `enqueue` redials.
+        //
+        // Flushed inside the same timeout: over TLS, `write_all` can
+        // return with ciphertext still buffered in rustls when the socket
+        // is full, and nothing polls this stream for writing afterwards
+        // (the reader only reads), so the tail of a large frame would
+        // never reach the node, the reply would never come and the
+        // reader's timeout would poison the connection. The client-facing
+        // writes already go through `infra::write_all_within`, which
+        // flushes for the same reason.
         let write_result = timeout(UPSTREAM_IO_TIMEOUT, async {
             write_half.write_all(&header).await?;
-            write_half.write_all(&body).await
+            write_half.write_all(&body).await?;
+            write_half.flush().await
         })
         .await;
         if !matches!(write_result, Ok(Ok(()))) {
@@ -7726,6 +7736,34 @@ struct ClientAdmission {
     in_flight: InFlightAdmission,
 }
 
+/// How many connection-level log lines (a failed accept, a failed or
+/// timed-out TLS handshake, a connection that ended in an error) the
+/// proxy writes per second; the rest are counted and reported in one
+/// summary line ahead of the next one written. Every one of these is
+/// reachable by a peer that has not authenticated, one short connection
+/// per line, and `eprintln!` is a blocking write on a runtime worker: a
+/// flood within the connection caps wrote thousands of lines a second,
+/// and a log sink that pushed back stalled the accept loop and the
+/// backend tasks with it. The node and discovery bound their own the
+/// same way.
+const CONNECTION_LOG_LINES_PER_SECOND: u32 = 50;
+
+static CONNECTION_LOG: LogLimiter =
+    LogLimiter::new(CONNECTION_LOG_LINES_PER_SECOND, Duration::from_secs(1));
+
+/// One connection-level line, through `CONNECTION_LOG`: written when the
+/// budget allows, with the count of the lines dropped since the last one
+/// ahead of it; otherwise only counted.
+fn log_connection(line: std::fmt::Arguments<'_>) {
+    let Some(suppressed) = CONNECTION_LOG.admit() else {
+        return;
+    };
+    if suppressed > 0 {
+        eprintln!("WARN {suppressed} more connection log lines (not logged individually)");
+    }
+    eprintln!("{line}");
+}
+
 async fn serve(
     listener: TcpListener,
     context: Arc<ProxyContext>,
@@ -7762,7 +7800,7 @@ async fn serve(
                 // only a backoff (fd exhaustion specifically) changes the
                 // loop's pace, never its continuation — matches the
                 // metrics accept loop and discovery's accept loop.
-                eprintln!("WARN accept failed: {error}");
+                log_connection(format_args!("WARN accept failed: {error}"));
                 if should_backoff_after_accept_error(&error) {
                     sleep(ACCEPT_ERROR_BACKOFF).await;
                 }
@@ -7812,18 +7850,22 @@ async fn serve(
                     match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                         Ok(Ok(tls)) => MaybeTls::Tls(Box::new(tls)),
                         Ok(Err(error)) => {
-                            eprintln!("WARN TLS handshake with {peer} failed: {error}");
+                            log_connection(format_args!(
+                                "WARN TLS handshake with {peer} failed: {error}"
+                            ));
                             return;
                         }
                         Err(_) => {
-                            eprintln!("WARN TLS handshake with {peer} timed out");
+                            log_connection(format_args!(
+                                "WARN TLS handshake with {peer} timed out"
+                            ));
                             return;
                         }
                     }
                 }
             };
             if let Err(error) = handle_client(stream, context, budgets).await {
-                eprintln!("WARN connection error from {peer}: {error}");
+                log_connection(format_args!("WARN connection error from {peer}: {error}"));
             }
         });
 
@@ -11336,6 +11378,88 @@ mod tests {
         let connector = TlsConnector::from(Arc::new(client_config));
 
         (acceptor, connector)
+    }
+
+    /// A request frame much larger than the kernel's socket buffers,
+    /// written over TLS to a node that drains its (4 KiB) receive
+    /// buffer slowly, must arrive whole. `write_all` over rustls can
+    /// return with ciphertext still buffered inside the TLS stream, and
+    /// nothing polls the stream afterwards, so without a `flush` the
+    /// tail of the frame never reaches the node: the reply never comes,
+    /// the reader times out and poisons the connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_backend_write_over_tls_reaches_a_slow_node_whole() {
+        let (acceptor, connector) = self_signed_tls();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let value = vec![b'v'; 400 * 1024];
+        let frame = frame_set(b"", b"key", &value, None);
+        let (header, body) = substitute_tag(frame.clone(), 0);
+        let expected = header.len() + body.len();
+        let received = Arc::new(AtomicUsize::new(0));
+        let node_received = Arc::clone(&received);
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut buf = [0u8; 4096];
+            // The handshake is `A 5 T\nproxy`.
+            let mut handshake = 0;
+            while handshake < 11 {
+                handshake += tls.read(&mut buf).await.unwrap();
+            }
+            tls.write_all(b"OnT\n").await.unwrap();
+            tls.flush().await.unwrap();
+            // Let both socket buffers fill before draining, then drain
+            // slowly, replying once the whole frame has arrived.
+            sleep(Duration::from_millis(100)).await;
+            while let Ok(n) = tls.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                let total = node_received.fetch_add(n, Ordering::SeqCst) + n;
+                if total >= expected {
+                    let _ = tls.write_all(b"S 0\n").await;
+                    let _ = tls.flush().await;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        });
+        let slot = Arc::new(tokio::sync::Mutex::new(None));
+        let handle = BackendHandle::connect(
+            &addr,
+            &None,
+            &Some(connector),
+            slot,
+            Arc::new(AtomicUsize::new(0)),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        let (reply, outcome) = oneshot::channel();
+        handle
+            .sender
+            .send(BackendRequest {
+                frame,
+                expect: Expect::Stored,
+                reply,
+            })
+            .await
+            .ok()
+            .unwrap();
+        let outcome = timeout(Duration::from_secs(10), outcome)
+            .await
+            .expect("the node never answered: the tail of the frame was left unsent")
+            .unwrap();
+        assert!(
+            matches!(outcome, Ok(NodeReply::Stored)),
+            "unexpected outcome {:?}; the node received {} of {expected} bytes",
+            outcome.map_err(|e| e.to_string()),
+            received.load(Ordering::SeqCst),
+        );
+        assert_eq!(received.load(Ordering::SeqCst), expected);
     }
 
     /// Tenth-pass audit (2026-09-02): like `start_proxy_with_drain`, but

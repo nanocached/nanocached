@@ -5398,7 +5398,7 @@ const MAX_ROSTER_FIELD_LEN: usize = 4096;
 /// heartbeat task memory until it OOMs. The name/addr *bytes* aren't read
 /// this way — they come via a `read_exact` already sized by the
 /// `MAX_ROSTER_FIELD_LEN`-checked lengths below.
-const MAX_ROSTER_LINE_LEN: usize = 64;
+const MAX_ROSTER_LINE_LEN: usize = crate::command::MAX_ROSTER_LINE_LEN;
 
 /// The deadline for reading one outbound exchange's lines: the same bound
 /// `OUTBOUND_IO_TIMEOUT` puts around the whole exchange, so a peer that
@@ -16426,6 +16426,68 @@ mod tests {
 
         drop(senders);
         cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_m_roster_entry_header_that_never_ends_closes_the_connection() {
+        // A roster entry's `<name-len> <addr-len>` line is at most
+        // `MAX_ROSTER_LINE_LEN` bytes. A sender that keeps adding bytes
+        // without the `\n` used to be answered by a rescan of the whole
+        // buffer per read (and held the connection until the idle timeout);
+        // it is now turned away as soon as the line outgrows the bound.
+        // Plain node, and authenticated one (the secret case is the only
+        // way a node with a secret reaches the parse of an `M`).
+        for with_secret in [false, true] {
+            let (mut client, server) = tcp_pair().await;
+            let (connection_task, cache_task, senders) = if with_secret {
+                spawn_secret_connection(server, b"s3cret", IDLE_TIMEOUT)
+            } else {
+                let (request_tx, request_rx) = mpsc::channel(4);
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let cache_task =
+                    tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+                let connection_task = tokio::spawn(handle_connection(
+                    ServerStream::Plain(server),
+                    test_client_addr(),
+                    request_tx.clone(),
+                    ConnectionConfig {
+                        idle_timeout: IDLE_TIMEOUT,
+                        auth_secret: None,
+                        tls_acceptor: None,
+                        node_context: None,
+                        migration_tx: mpsc::channel(1).0,
+                        forward_tx: mpsc::channel(1).0,
+                        forward_queues: Arc::new(ForwardQueues::default()),
+                        in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+                    },
+                    shutdown_rx,
+                ));
+                (connection_task, cache_task, (request_tx, shutdown_tx))
+            };
+
+            if with_secret {
+                client.write_all(b"A 6\ns3cret").await.unwrap();
+                let mut ok = [0u8; 3];
+                client.read_exact(&mut ok).await.unwrap();
+            }
+            client.write_all(b"M 1 1 1 65536 3 1\ntnaj").await.unwrap();
+            client
+                .write_all(&[b'1'; crate::command::MAX_ROSTER_LINE_LEN + 1])
+                .await
+                .unwrap();
+
+            let mut response = [0u8; 3];
+            timeout(Duration::from_secs(5), client.read_exact(&mut response))
+                .await
+                .expect("En within 5 s")
+                .unwrap();
+            assert_eq!(&response, b"En\n", "with_secret={with_secret}");
+            let error = connection_task.await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+            drop(senders);
+            cache_task.await.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
