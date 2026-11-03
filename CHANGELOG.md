@@ -12,6 +12,10 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-node`: an `M` frame's roster-entry header (`<name-len> <addr-len>`) was searched for its newline from the start of the entry to the end of the buffer on every read, with nothing bounding its length but the 1 MiB frame limit, so a sender that never ended the header and added one byte at a time cost the node the whole buffered roster per byte: one such connection took most of the thread (sequential `g` on another connection fell from 32,574 to 2,721 req/s with one attacker and 557 req/s with four; about 2.4 s of CPU for 10,000 trickled bytes behind a 600 KB prefix, 4.6 s for 20,000). An entry header is a short line (at most 64 bytes, the bound the heartbeat ack's roster lines already use), so the search now looks that far and a header with no newline within it is refused and the connection closed. The same trickle now ends at the 65th header byte with no CPU use, and `g` stays at 29,000 to 33,000 req/s with 0, 1 and 4 such connections (#1313).
+
 ## [0.6.1] - 2026-11-02
 
 ### Fixed

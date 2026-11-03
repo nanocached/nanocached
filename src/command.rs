@@ -17,6 +17,15 @@ use std::time::Duration;
 /// well under the SDKs' 64 MiB multi-get response cap.
 pub const MAX_MULTI_REPLY_VALUE_BYTES: usize = 16 * 1024 * 1024;
 
+/// The longest roster line the node reads: `A <count> <repl>\n` or an
+/// entry's `<name-len> <addr-len>\n`. Both are two decimal integers (the
+/// real maximum, `A 65536 65536\n` or `4096 4096\n`, is 14 bytes at most),
+/// so 64 is generous. An `M` frame's roster entries use the same line, and
+/// the parser gives up on one that is longer rather than keep searching it
+/// for its `\n` on every read; `server.rs` bounds the heartbeat ack's
+/// lines by the same constant.
+pub(crate) const MAX_ROSTER_LINE_LEN: usize = 64;
+
 /// One membership this node's ownership of a key is judged against
 /// (issue #582): the ring, this node's name in it and the replication
 /// factor it came with. Compared by ring identity, not contents: two
@@ -1925,7 +1934,19 @@ fn scan_joined_entries(
     entry_spans: &mut Vec<(usize, usize, usize, usize)>,
 ) -> Result<usize, ParseError> {
     for _ in entry_spans.len()..joined_count {
-        let entry_header_end = cursor + find_lf(&input[cursor..]).ok_or(ParseError::Incomplete)?;
+        // The entry header is a short line (`MAX_ROSTER_LINE_LEN`), so look
+        // for its `\n` only that far: searching to the end of the buffer on
+        // every read made a header that never ends cost the whole buffered
+        // roster per byte received, quadratic in a frame that may reach
+        // 1 MiB. A header with no `\n` within the bound is malformed.
+        let window_end = input.len().min(cursor + MAX_ROSTER_LINE_LEN + 1);
+        let entry_header_end = match find_lf(&input[cursor..window_end]) {
+            Some(offset) => cursor + offset,
+            None if input.len() - cursor > MAX_ROSTER_LINE_LEN => {
+                return Err(ParseError::InvalidLength);
+            }
+            None => return Err(ParseError::Incomplete),
+        };
         let mut entry_parts = input[cursor..entry_header_end].split(|byte| *byte == b' ');
         let name_length = entry_parts.next().ok_or(ParseError::InvalidLength)?;
         let addr_length = entry_parts.next().ok_or(ParseError::InvalidLength)?;
@@ -3311,6 +3332,94 @@ mod tests {
             lf_scan_bytes(),
             header_len,
             "the body's bytes should never reach find_lf"
+        );
+    }
+
+    /// An `M` frame whose joining-node fields are present and whose roster
+    /// entries have not started yet: `entries` follow it.
+    const MIGRATE_PREFIX: &[u8] = b"M 1 1 1 1000000000 3 1\ntnaj";
+
+    #[test]
+    fn migrate_roster_entry_header_without_a_newline_is_refused_at_the_line_bound() {
+        // A header that never ends used to be searched for its `\n` from
+        // the entry's start to the end of the buffer on every read — the
+        // cost of a byte grew with everything buffered before it. Now it is
+        // refused once it outgrows `MAX_ROSTER_LINE_LEN`, and the search
+        // never looks further than that.
+        let mut input = BytesMut::from(MIGRATE_PREFIX);
+        // A long roster of well-formed entries first, so a scan that
+        // restarted at the roster's front would be visible in the count.
+        for _ in 0..2000 {
+            input.extend_from_slice(b"1 1\nab");
+        }
+        let mut progress = MigrateProgress::default();
+        assert_eq!(
+            parse_resumable(&mut input, false, &mut progress, true),
+            Err(ParseError::Incomplete)
+        );
+        reset_lf_scan_counter();
+
+        let mut refused_at = None;
+        for sent in 1..=MAX_ROSTER_LINE_LEN + 10 {
+            input.extend_from_slice(b"1");
+            let before = lf_scan_bytes();
+            match parse_resumable(&mut input, false, &mut progress, true) {
+                Err(ParseError::Incomplete) => {}
+                Err(ParseError::InvalidLength) => {
+                    refused_at = Some(sent);
+                    break;
+                }
+                other => panic!("unexpected {other:?} after {sent} header bytes"),
+            }
+            assert!(
+                lf_scan_bytes() - before <= MAX_ROSTER_LINE_LEN + 1,
+                "byte {sent}: the entry header search must stay within its bound"
+            );
+        }
+
+        assert_eq!(refused_at, Some(MAX_ROSTER_LINE_LEN + 1));
+    }
+
+    #[test]
+    fn migrate_accepts_a_roster_entry_header_of_exactly_the_line_bound() {
+        // The longest header a roster entry may have is
+        // `MAX_ROSTER_LINE_LEN` bytes before its `\n` (zero-padded lengths
+        // stand in for a long one); one more is refused.
+        let padded = |width: usize| format!("{:0>width$} 1\nab", 1);
+        for (width, accepted) in [
+            (MAX_ROSTER_LINE_LEN - 2, true),
+            (MAX_ROSTER_LINE_LEN - 1, false),
+        ] {
+            let mut input = BytesMut::from(&b"M 1 1 1 1 3 1\ntnaj"[..]);
+            input.extend_from_slice(padded(width).as_bytes());
+            let parsed = parse(&mut input);
+            if accepted {
+                assert!(
+                    matches!(parsed, Ok(Command::Migrate { ref joined, .. }) if joined.len() == 1),
+                    "{parsed:?}"
+                );
+            } else {
+                assert_eq!(parsed, Err(ParseError::InvalidLength));
+            }
+        }
+    }
+
+    #[test]
+    fn migrate_with_the_longest_real_roster_entries_still_parses() {
+        // The largest entry discovery can list: a name at its 128-byte cap
+        // and an address at the 4096-byte request cap.
+        let mut input = BytesMut::from(&b"M 1 1 1 2 3 1\ntnaj"[..]);
+        for _ in 0..2 {
+            input.extend_from_slice(b"128 4000\n");
+            input.extend_from_slice(&[b'n'; 128]);
+            input.extend_from_slice(&[b'a'; 4000]);
+        }
+
+        let parsed = parse(&mut input);
+
+        assert!(
+            matches!(parsed, Ok(Command::Migrate { ref joined, .. }) if joined.len() == 2),
+            "{parsed:?}"
         );
     }
 
