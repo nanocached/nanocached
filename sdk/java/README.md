@@ -533,7 +533,7 @@ joining the cluster ring:
 
 ```java
 NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
-        .addresses(List.of(new Address("discovery.internal", 8358)))
+        .addresses(List.of(new Address("discovery.internal", 8357)))
         .viaProxy(true));
 ```
 

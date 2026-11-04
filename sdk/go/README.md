@@ -152,7 +152,7 @@ the cluster instead of joining the ring directly:
 
 ```go
 client, err := nanocached.Connect(nanocached.Config{
-    Addresses: []nanocached.Address{{Host: "discovery.internal", Port: 8356}},
+    Addresses: []nanocached.Address{{Host: "discovery.internal", Port: 8357}},
     ViaProxy:  true,
 })
 ```
