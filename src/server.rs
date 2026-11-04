@@ -1443,7 +1443,7 @@ impl DrainState {
     /// which case it is also marked as evicted.
     fn note_evicted(&self) -> bool {
         self.0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
                 (state != 0).then_some(Self::EVICTED)
             })
             .is_ok()

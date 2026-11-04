@@ -1155,11 +1155,22 @@ fn take_wrong_node(state: &NodeState) -> bool {
 }
 
 fn take_one(counter: &AtomicUsize) -> bool {
-    counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
-            (pending > 0).then(|| pending - 1)
-        })
-        .is_ok()
+    // A compare_exchange loop rather than `fetch_update` (deprecated from
+    // Rust 1.99) or its replacement `try_update` (stable only from 1.95,
+    // above this crate's `rust-version`).
+    let mut pending = counter.load(Ordering::SeqCst);
+    while pending > 0 {
+        match counter.compare_exchange_weak(
+            pending,
+            pending - 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(seen) => pending = seen,
+        }
+    }
+    false
 }
 
 /// Reads a namespace+key pair off the wire for `G`/`D` and their
