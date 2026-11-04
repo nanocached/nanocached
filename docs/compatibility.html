@@ -73,8 +73,10 @@ announce, handoff and leave, node roster (see
 <a href="protocol.html#cluster">cluster-internal commands</a>) — are
 versioned with the server and may change in any release, including a patch
 release. Run one server version across a cluster; a mixed-version cluster
-is only a transient rolling-upgrade state, in the order the changelog
-gives.</p>
+is only a transient rolling-upgrade state, in the order given under
+<a href="deployment-operations.html#upgrade">Upgrading a cluster</a>
+(discovery first, then the nodes, then the proxies); a release&rsquo;s
+changelog notes any exception to it.</p>
 
 <h2 id="sdk">SDK public API: all six SDKs</h2>
 <p>From 1.0.0 the public API of each of the Rust, Go, TypeScript, Python,
