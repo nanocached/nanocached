@@ -182,7 +182,8 @@ overwritten. A key that is missing is a miss and is not created. A policy
 whose access duration is zero expires the entries on read, in the same
 step. A server older than the touch commands makes `get()` (without the
 batched form, `t`) or `getAll` (`y`) fail with the SDK's `ServerTooOld`
-(wrapped in a `CacheException`) under such a policy; the default policies
+(wrapped in a `CacheException`) under such a policy (a server before 0.4.8
+closes the connection without a reply instead); the default policies
 never touch. Upgrade every server before the adapters that use such a
 policy: `getAll` sends the batch to all owning nodes before it reports the
 old ones, so in a mixed cluster the nodes that were upgraded have already

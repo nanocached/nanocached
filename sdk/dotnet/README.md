@@ -137,8 +137,8 @@ Namespaces also enter cluster routing: a key's owners are computed from
 different namespaces can land on different owners — this is what keeps a
 common key (e.g. a per-tenant `config`) from piling every namespace's
 copy onto the same few nodes. Namespaced frames need a server that
-understands them; talking `g`/`s`/`d` to a pre-namespace node gets `En\n`
-and a closed connection, so upgrade every node before using namespaces.
+understands them; talking `g`/`s`/`d` to a pre-namespace node (0.3.0 or earlier) gets a
+closed connection with no reply, so upgrade every node before using namespaces.
 
 `ClearAsync()` drops every entry in a namespace in one call — one
 sub-map removal on each node, with the entries freed off the node's
@@ -373,7 +373,7 @@ touch.
 
 Against a node older than the release that added the command, both throw
 `ServerTooOldException`: such a node answers `En` and closes the
-connection. Upgrade every node before using them.
+connection (a node before 0.4.8 closes it without a reply). Upgrade every node before using them.
 
 ### Many keys at once (TouchManyAsync / GetManyAndTouchAsync)
 

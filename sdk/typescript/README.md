@@ -76,7 +76,7 @@ On a cluster, namespace participates in routing: `(namespace, key)` hashes
 together, so the same key name in different namespaces can land on
 different owners — this is consensus-critical, and every SDK and the
 server pin the same test vectors for it. A pre-namespace `nanocached-node`
-answers a namespaced request with `En` and closes the connection, so every
+(0.3.0 or earlier) closes the connection on a namespaced request without a reply, so every
 node in a cluster must be upgraded before clients start using namespaces.
 
 `handle.clear()` drops every entry in that namespace, and
@@ -473,7 +473,7 @@ retry paths. `touchMany` and `getManyAndTouch` do the same: primary frames
 first, then one plain frame per replica for the keys a primary answered.
 
 Against a node older than the release that added the command, both throw
-`ServerTooOldError`: such a node answers `En` and closes the connection.
+`ServerTooOldError`: such a node answers `En` and closes the connection (a node before 0.4.8 closes it without a reply).
 Upgrade every node before using them.
 
 ### Many keys at once (`touchMany` / `getManyAndTouch`)
