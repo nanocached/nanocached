@@ -346,7 +346,7 @@ jobs:
         with:
           toolchain: 1.88.0
 
-      # The repo-root `rust-toolchain.toml` pins 1.96, which shadows any
+      # The repo-root `rust-toolchain.toml` pins 1.97, which shadows any
       # toolchain requested here unless overridden — without this, the
       # steps above never actually exercise the crate's declared
       # `rust-version = "1.88"` (Cargo.toml), so it could silently drift

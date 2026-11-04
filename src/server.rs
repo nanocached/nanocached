@@ -15364,7 +15364,7 @@ mod tests {
 
     #[test]
     fn a_cluster_internal_frame_may_exceed_the_request_limit_by_the_allowance() {
-        for lead in [b'U', b'u', b'f'] {
+        for lead in *b"Uuf" {
             assert!(!request_is_too_large(
                 MAX_REQUEST_SIZE + INTERNAL_FRAME_ALLOWANCE,
                 Some(lead)
@@ -15376,7 +15376,7 @@ mod tests {
         }
         // Everything a client sends keeps the plain limit, and so does a
         // frame whose lead byte is not known yet.
-        for lead in [b'S', b's', b'o', b'k', b'm', b'y'] {
+        for lead in *b"Ssokmy" {
             assert!(request_is_too_large(MAX_REQUEST_SIZE + 1, Some(lead)));
         }
         assert!(request_is_too_large(MAX_REQUEST_SIZE + 1, None));
