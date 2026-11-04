@@ -75,7 +75,7 @@ standard library, except Rust: its client uses tokio, futures-util and
 sha2, plus flate2 and rustls behind the default <code>compression</code>
 and <code>tls</code> cargo features, which can be compiled out.</p>
 
-<div class="note">The SDKs are pre-1.0 (currently 0.4.x), and all of them ship
+<div class="note">The SDKs are pre-1.0, and all of them ship
 at one version together with the server; what 1.0.0 will promise is on the
 <a href="compatibility.html">compatibility</a> page. Every SDK also builds directly from the
 <a href="https://github.com/nanocached/nanocached">repository</a>.</div>
@@ -112,6 +112,9 @@ asyncio.run(main())</code></pre>
 <pre><code>import org.nanocached.NanocachedClient;
 import org.nanocached.NanocachedClient.Address;
 import org.nanocached.NanocachedClient.Options;
+
+import java.util.List;
+import java.util.Optional;
 
 try (NanocachedClient client = NanocachedClient.connect(
         new Options().addresses(List.of(new Address("127.0.0.1", 8357))))) {
