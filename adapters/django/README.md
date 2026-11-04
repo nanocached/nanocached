@@ -20,7 +20,8 @@ and friends run against a nanocached cluster.
   TTL; `0` or a negative timeout is "don't cache", so the entry is
   deleted, as `set()` does. In a cluster it goes to every owner. Against
   a node that predates the touch command the SDK raises
-  `ServerTooOldError`.
+  `ServerTooOldError` (a node before 0.4.8 closes the connection without a
+  reply, which shows up as a lost connection instead).
 - **`add`** is atomic: it is the wire's put-if-absent, evaluated by the
   key's primary owner alone, so of several racing `add()` calls exactly
   one returns `True`.

@@ -98,8 +98,8 @@ has run (the same `AlreadyClosed` a direct call raises).
 when passing a handle around generically.
 
 Talking to a namespace uses the `g`/`s`/`d` wire commands, additive to
-the pre-namespace protocol; a pre-namespace server answers `En` and
-closes the connection, so every node in the cluster must be upgraded
+the pre-namespace protocol; a pre-namespace server (0.3.0 or earlier) closes
+the connection without a reply, so every node in the cluster must be upgraded
 before namespaces are used. The un-namespaced API is unchanged and
 remains the default — every existing key keeps its placement across the
 upgrade.
@@ -350,7 +350,7 @@ the other owners are sent the plain touch.
 
 Against a node older than the release that added the command, both throw
 `NanocachedException.ServerTooOld`: such a node answers `En` and closes the
-connection. Upgrade every node before using them.
+connection (a node before 0.4.8 closes it without a reply). Upgrade every node before using them.
 
 ### Many keys at once (touchMany / getManyAndTouch)
 

@@ -332,7 +332,7 @@ on a miss) and the other owners are sent the plain touch.
 
 Against a node older than the release that added the command, both return
 `Error::ServerTooOld { command: "t" }`: such a node answers `En` and closes
-the connection. Upgrade every node before using them.
+the connection (a node before 0.4.8 closes it without a reply). Upgrade every node before using them.
 
 ### Many keys at once (touch_many / get_many_and_touch)
 

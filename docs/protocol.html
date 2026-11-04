@@ -129,7 +129,7 @@ is</p>
 </ul>
 <p>Every SDK and the server pin the same test vectors for both forms.
 Namespaced frames need a server that understands them; a pre-namespace
-node answers <code>En\n</code> and closes the connection, so upgrade
+node (0.3.0 or earlier) closes the connection without a reply, so upgrade
 every node before clients start using namespaces.</p>
 
 <h2 id="clear">c / F — clear a namespace, flush everything</h2>
@@ -344,9 +344,10 @@ joiner may not hold the key yet. As for every forwarded write, that
 unconditional copy can land after a later write to the key and bring
 back the earlier value &mdash; see
 <a href="architecture.html#accepted-behaviour">accepted behaviour</a>.</p>
-<p><code>t</code> needs a node that knows it: an older node answers
-<code>En\n</code> and closes the connection, so upgrade every node
-before clients start sending it.</p>
+<p><code>t</code> needs a node that knows it: an older node closes the
+connection (from 0.4.8 on it answers <code>En\n</code> first; before that
+it closed without a reply), so upgrade every node before clients start
+sending it.</p>
 
 <h2 id="multi-touch">y — batched touch</h2>
 <pre><code>y &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt; [&lt;ttl-seconds&gt;] [G]\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;</code></pre>
@@ -406,9 +407,10 @@ node did touch: a value past the merged budget is left out of the reply
 although the node applied the TTL (and, with a TTL of <code>0</code>,
 expired the entry). The <em>left untouched</em> rule above holds for a
 node's own reply only.</p>
-<p><code>y</code> needs a node that knows it: an older node answers
-<code>En\n</code> and closes the connection, so upgrade every node before
-clients start sending it.</p>
+<p><code>y</code> needs a node that knows it: an older node closes the
+connection (from 0.4.8 on it answers <code>En\n</code> first; before that
+it closed without a reply), so upgrade every node before clients start
+sending it.</p>
 
 <h2 id="multi">m / o — batched get and set</h2>
 <pre><code>m &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt;\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;</code></pre>
@@ -565,8 +567,8 @@ window is the same one the pre-tags protocol always had.</p>
     retried shortly <em>on the same connection</em>; nothing is torn
     down. Sent only to clients that declared the capability by
     appending <code>R</code> to their <code>A</code> frame
-    (<code>A &lt;len&gt; [T] R</code>); legacy clients keep getting the
-    fatal <code>E</code>-and-close. A proxy never answers <code>R</code>
+    (<code>A &lt;len&gt; [T] R</code>); for an upstream failure legacy clients
+    keep getting the fatal <code>E</code>-and-close. A proxy never answers <code>R</code>
     for an <code>i</code>, <code>k</code> or <code>x</code> whose outcome
     it cannot know — its connection to the node failed after the command
     may have reached it — because a re-send could apply the command
@@ -578,7 +580,9 @@ window is the same one the pre-tags protocol always had.</p>
     source IP and proxy-wide) stayed full, and at once to a request that
     would have to wait while the pool for waiting requests' frames (the
     budget's size again) is full; the request was not dispatched, so any
-    command is safe to retry. Tagged connections receive
+    command is safe to retry. A client that did not declare the capability
+    gets a bare <code>B\n</code> in these cases instead, and its connection
+    stays open. Tagged connections receive
     <code>R &lt;tag&gt;\n</code>. Today the proxy is the only emitter —
     nodes and discovery accept the capability token but have no
     transient per-request failure to report.</td></tr>

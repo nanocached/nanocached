@@ -310,7 +310,8 @@ existed, err := client.Delete("greeting")</code></pre>
   reroute would then find nothing where the value was); those legs run
   outside the request order a pipelined connection otherwise keeps. Against
   a node that predates the command the SDK
-  raises a "server too old" error; upgrade every node before using it.
+  raises a "server too old" error (a node before 0.4.8 closes the
+  connection without a reply instead); upgrade every node before using it.
   See <a href="protocol.html#touch">t</a>.
   <br>For many keys at once, <code>touchMany</code> and
   <code>getManyAndTouch</code> (<code>touch_many</code>/<code>get_many_and_touch</code>,

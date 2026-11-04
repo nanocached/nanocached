@@ -332,7 +332,7 @@ the other owners are sent the plain touch.
 
 Against a node older than the release that added the command, both return
 `ErrServerTooOld` (`errors.Is`-matchable): such a node answers `En` and
-closes the connection. Upgrade every node before using them.
+closes the connection (a node before 0.4.8 closes it without a reply). Upgrade every node before using them.
 
 ### Many keys at once (TouchMany / GetManyAndTouch)
 
