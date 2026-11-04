@@ -591,7 +591,10 @@ window is the same one the pre-tags protocol always had.</p>
     <code>A</code>, a command sent before authentication, the
     request was malformed (an unknown command, a bad length or TTL, an
     empty key), or it was over the request-size limit. Usually followed
-    by the server closing the connection.</td></tr>
+    by the server closing the connection. <code>nanocached-proxy</code>
+    answers a failed <code>A</code> <code>En\n</code> like a node and every
+    other such error with a bare <code>E\n</code> (<code>E &lt;tag&gt;\n</code>
+    in tagged mode).</td></tr>
   </tbody>
 </table>
 </div>

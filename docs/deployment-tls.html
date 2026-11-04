@@ -51,7 +51,9 @@ The two are independent. A process that dials anything with only one
 of them set warns at start-up that the other direction is plaintext
 (a proxy or a discovery server always does; a node does when it has a
 <code>--discovery</code> to register with &mdash; a standalone node with
-only a certificate dials nothing and stays quiet), and what a
+only a certificate dials nothing and stays quiet; with only
+<code>--tls-ca</code>, a node, a discovery server or a proxy warns that
+what it accepts is plaintext, whether or not it dials anything), and what a
 half-configured proxy looks like from outside is described in the
 proxy section below. The SDKs take the
 same two pieces as options: <code>tls</code> and, for anything that is
@@ -155,10 +157,17 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout ca-key.pem -out ca.
 IP=10.0.0.11
 openssl req -new -newkey rsa:2048 -nodes -keyout host-$IP-key.pem -out host-$IP.csr \
   -subj "/CN=nanocached-$IP"
-printf 'subjectAltName=IP:%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' \
+printf 'subjectAltName=IP:%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n' \
   $IP &gt; host-$IP.ext
 openssl x509 -req -in host-$IP.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -days 365 \
   -extfile host-$IP.ext -out host-$IP-cert.pem</code></pre>
+<p>The last two lines of the extension file are for the Python SDK:
+Python 3.13 and later verify certificates strictly by default and refuse
+a leaf with no authority key identifier
+(<code>CERTIFICATE_VERIFY_FAILED &hellip; Missing Authority Key
+Identifier</code>), and <code>openssl x509 -req</code> does not add one on
+its own. The other five SDKs do not need it, and neither does a
+self-signed leaf (the section above).</p>
 <p>A host serves its leaf alone (no chain: the dialler trusts the CA
 directly), and a leaf from this CA and a self-signed leaf from the
 section above do not trust each other, so a deployment picks one model.
@@ -681,7 +690,7 @@ printf '%s\n' "$NANOCACHED_TLS_CA" &gt; ca.pem
 printf '%s\n' "$NANOCACHED_TLS_SIGNING_CERT" &gt; signing-cert.pem
 printf '%s\n' "$NANOCACHED_TLS_SIGNING_KEY" &gt; signing-key.pem
 openssl req -new -newkey rsa:2048 -nodes -keyout key.pem -out leaf.csr -subj "/CN=nanocached-$IP" 2&gt;/dev/null
-printf 'subjectAltName=IP:%s%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' "$IP" "${TLS_EXTRA_SAN:-}" &gt; leaf.ext
+printf 'subjectAltName=IP:%s%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n' "$IP" "${TLS_EXTRA_SAN:-}" &gt; leaf.ext
 openssl x509 -req -in leaf.csr -CA signing-cert.pem -CAkey signing-key.pem -CAcreateserial -days 365 -extfile leaf.ext -out cert.pem 2&gt;/dev/null
 rm -f signing-cert.pem signing-key.pem leaf.csr leaf.ext signing-cert.srl
 chown 10001:10001 ca.pem cert.pem key.pem; chmod 644 ca.pem cert.pem; chmod 600 key.pem
@@ -822,7 +831,7 @@ apk add --no-cache openssl &gt;/dev/null
 cd /tls
 cp /tls-ca/ca.pem ca.pem
 openssl req -new -newkey rsa:2048 -nodes -keyout key.pem -out leaf.csr -subj "/CN=nanocached-$POD_IP" 2&gt;/dev/null
-printf 'subjectAltName=IP:%s%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' "$POD_IP" "${TLS_EXTRA_SAN:-}" &gt; leaf.ext
+printf 'subjectAltName=IP:%s%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n' "$POD_IP" "${TLS_EXTRA_SAN:-}" &gt; leaf.ext
 openssl x509 -req -in leaf.csr -CA /tls-signing/signing-cert.pem -CAkey /tls-signing/signing-key.pem -days 365 -extfile leaf.ext -out cert.pem 2&gt;/dev/null
 rm -f leaf.csr leaf.ext
 chown 10001:10001 ca.pem cert.pem key.pem; chmod 644 ca.pem cert.pem; chmod 600 key.pem
@@ -865,7 +874,7 @@ spec:
                 cd /tls
                 cp /tls-ca/ca.pem ca.pem
                 openssl req -new -newkey rsa:2048 -nodes -keyout key.pem -out leaf.csr -subj "/CN=nanocached-$POD_IP" 2&gt;/dev/null
-                printf 'subjectAltName=IP:%s%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' "$POD_IP" "${TLS_EXTRA_SAN:-}" &gt; leaf.ext
+                printf 'subjectAltName=IP:%s%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n' "$POD_IP" "${TLS_EXTRA_SAN:-}" &gt; leaf.ext
                 openssl x509 -req -in leaf.csr -CA /tls-signing/signing-cert.pem -CAkey /tls-signing/signing-key.pem -days 365 -extfile leaf.ext -out cert.pem 2&gt;/dev/null
                 rm -f leaf.csr leaf.ext
                 chown 10001:10001 ca.pem cert.pem key.pem; chmod 644 ca.pem cert.pem; chmod 600 key.pem
@@ -1059,9 +1068,9 @@ twice: at start-up, <code>WARN TLS is enabled for client connections
 only (no --tls-ca): connections to discovery and to every node
 &mdash; and the shared secret they carry &mdash; go out in
 plaintext</code>, and then on every failed refresh, <code>roster
-refresh failed: connection closed mid-frame (sent in plaintext; a
-peer that requires TLS closes the connection like this &mdash; is
---tls-ca missing?)</code>. A service would keep replacing such a
+refresh failed: connection closed before the end of the line (sent in
+plaintext; a peer that requires TLS closes the connection like this
+&mdash; is --tls-ca missing?)</code>. A service would keep replacing such a
 task; the health check catches it, and both the proxy&rsquo;s and
 discovery&rsquo;s logs name it. The node logs carried no TLS
 failure at any point in the run (the only lines mentioning TLS were
@@ -1106,7 +1115,7 @@ spec:
                 cd /tls
                 cp /tls-ca/ca.pem ca.pem
                 openssl req -new -newkey rsa:2048 -nodes -keyout key.pem -out leaf.csr -subj "/CN=nanocached-$POD_IP" 2&gt;/dev/null
-                printf 'subjectAltName=IP:%s%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' "$POD_IP" "${TLS_EXTRA_SAN:-}" &gt; leaf.ext
+                printf 'subjectAltName=IP:%s%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n' "$POD_IP" "${TLS_EXTRA_SAN:-}" &gt; leaf.ext
                 openssl x509 -req -in leaf.csr -CA /tls-signing/signing-cert.pem -CAkey /tls-signing/signing-key.pem -days 365 -extfile leaf.ext -out cert.pem 2&gt;/dev/null
                 rm -f leaf.csr leaf.ext
                 chown 10001:10001 ca.pem cert.pem key.pem; chmod 644 ca.pem cert.pem; chmod 600 key.pem
