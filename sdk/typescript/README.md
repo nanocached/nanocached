@@ -76,7 +76,7 @@ On a cluster, namespace participates in routing: `(namespace, key)` hashes
 together, so the same key name in different namespaces can land on
 different owners — this is consensus-critical, and every SDK and the
 server pin the same test vectors for it. A pre-namespace `nanocached-node`
-answers a namespaced request with `E` and closes the connection, so every
+answers a namespaced request with `En` and closes the connection, so every
 node in a cluster must be upgraded before clients start using namespaces.
 
 `handle.clear()` drops every entry in that namespace, and
