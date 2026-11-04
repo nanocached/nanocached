@@ -1825,7 +1825,7 @@ fn parse_cas_condition_field(field: &str, allow_absent_present: bool) -> io::Res
     let bytes = field.as_bytes();
     if bytes.len() == 32 {
         let mut digest = [0u8; 16];
-        for (byte, chunk) in digest.iter_mut().zip(bytes.chunks_exact(2)) {
+        for (byte, chunk) in digest.iter_mut().zip(bytes.as_chunks::<2>().0) {
             *byte = (hex_nibble_field(chunk[0])? << 4) | hex_nibble_field(chunk[1])?;
         }
         return Ok(CasCondition::Digest(digest));
@@ -2194,7 +2194,7 @@ fn parse_request_body(
             };
 
             let mut lengths_pairs = Vec::with_capacity(count);
-            for pair in pairs.chunks_exact(2) {
+            for pair in pairs.as_chunks::<2>().0 {
                 let (key_length, value_length) = (pair[0], pair[1]);
                 if key_length == 0 {
                     return Err(invalid("empty key in multi-set"));
