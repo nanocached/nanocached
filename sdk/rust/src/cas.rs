@@ -88,7 +88,7 @@ impl CasToken {
         }
         let mut digest = [0u8; 16];
         let bytes = hex.as_bytes();
-        for (byte, chunk) in digest.iter_mut().zip(bytes.chunks_exact(2)) {
+        for (byte, chunk) in digest.iter_mut().zip(bytes.as_chunks::<2>().0) {
             let hi = hex_nibble(chunk[0]).ok_or_else(invalid)?;
             let lo = hex_nibble(chunk[1]).ok_or_else(invalid)?;
             *byte = (hi << 4) | lo;

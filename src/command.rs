@@ -2129,7 +2129,7 @@ fn parse_cas_condition(
     }
     if field.len() == 32 {
         let mut digest = [0u8; 16];
-        for (byte, chunk) in digest.iter_mut().zip(field.chunks_exact(2)) {
+        for (byte, chunk) in digest.iter_mut().zip(field.as_chunks::<2>().0) {
             *byte = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
         }
         return Ok(CasCondition::Digest(digest));
