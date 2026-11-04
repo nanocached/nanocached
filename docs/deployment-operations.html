@@ -161,6 +161,14 @@ reclaim all get the graceful path with no extra hooks.</p>
   <li>It keeps serving and forwards writes it no longer owns for the
   rest of the budget while clients catch up, then exits 0.</li>
 </ol>
+<p>The budget is checked <em>between</em> keys, so it is a soft limit.
+A key that is being sent when the budget runs out is given up only
+after up to three attempts of 10&nbsp;s each, and every key after it is
+left behind. A receiver that refuses the connection fails at once, but
+one that stops answering without closing it (a suspended process, a
+saturated host) can stretch the leave by up to 30&nbsp;s past the
+budget; the node still logs the entries it could not hand off and exits
+0.</p>
 <p><code>--drain-timeout 0</code> skips the handoff (the old
 crash-equivalent shutdown) — acceptable for fast restarts at
 R&nbsp;≥&nbsp;2, where replicas cover the gap.</p>
@@ -207,7 +215,10 @@ href="deployment-proxy.html">its own page</a>.</p>
 <strong>set ECS <code>stopTimeout</code> / Kubernetes
 <code>terminationGracePeriodSeconds</code> to at least
 <code>--drain-timeout</code> plus a margin</strong> (twice it is a
-comfortable rule). A node's handoff time scales with the data it holds
+comfortable rule while the nodes answer or refuse promptly; to cover a
+receiver that stops answering, which can add up to 30&nbsp;s to the
+leave as described above, use the budget plus 30&nbsp;s — for a 20&nbsp;s
+budget, 50&nbsp;s). A node's handoff time scales with the data it holds
 — a 20&nbsp;s budget drains hundreds of MB comfortably on an
 in-network transfer, but measure with your value sizes; keys that miss
 the budget are logged and left to the surviving replicas. The default
