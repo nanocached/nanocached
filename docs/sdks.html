@@ -247,8 +247,9 @@ existed, err := client.Delete("greeting")</code></pre>
   increment; the SDK writes the <em>result</em> to the remaining owners
   as an ordinary <code>set</code>, never by replaying the increment
   itself (replaying it could drift a replica from the primary). For
-  about a minute after a node joins, a counter incremented concurrently
-  by several callers can lose a few increments (a replicated result
+  at least a minute after a node joins (the old owners forward writes for
+  60 s from the end of their handoff, plus 5 ms for each entry they sent),
+  a counter incremented concurrently by several callers can lose a few increments (a replicated result
   forwarded back to the primary lands after a later increment). The same
   holds for one caller whose increments follow each other within a few
   milliseconds, since a forward can lag that long; with spacing well above
