@@ -71,6 +71,16 @@ managedNodeGroups:
 kubectl get nodes -L topology.kubernetes.io/zone
 # ip-192-168-27-95.ec2.internal    Ready   us-east-1a
 # ip-192-168-38-195.ec2.internal   Ready   us-east-1b</code></pre>
+<p><b>The Kubernetes version.</b> This guide was run on
+<code>1.33</code>. EKS prices a version at the standard rate for 14
+months after its release and then for 12 more months with an extra
+charge per cluster hour (on by default); <code>1.33</code> moved from
+standard to extended support on 29&nbsp;July 2026. The manifests below
+use only stable API versions (<code>v1</code>, <code>apps/v1</code>), but
+the guide has not been run on another version; if you change
+<code>version</code>, pick one that is in standard support
+(<code>aws eks describe-cluster-versions</code> prints each version's
+status and end dates) and check the result with the commands below.</p>
 <p>Two worker nodes, one per zone, is the minimum for the zone spread
 below to mean anything. The node group is pinned at two because
 growth here is in <em>pods</em>: four 1&nbsp;GiB node pods fit on two
