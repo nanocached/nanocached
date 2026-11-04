@@ -130,8 +130,10 @@ force a new deployment of both services (<code>aws ecs update-service
 <h2>IAM</h2>
 <p>The execution role is what ECS itself uses to pull the image, write
 logs and read the secret — the tasks have no role of their own, since
-nanocached calls no AWS API. The instance role is for the throwaway
-client below, as in the EC2 guide.</p>
+nanocached calls no AWS API. The instance role is for an optional
+client instance, as in the EC2 guides: launch one in the app subnet with
+<code>--subnet-id $APP_SUBNET_ID --security-group-ids $APP_SG --iam-instance-profile Name=$NAME-ec2</code>
+and keep its ID in <code>APP_ID</code> (the checks below were run from one).</p>
 <pre><code>aws iam create-role --role-name $NAME-ecs-execution --tags Key=Project,Value=$NAME \
   --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
     "Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
@@ -355,7 +357,7 @@ leaver's log, not just the exit code.</p>
   aws ecs delete-service --cluster $NAME --service $s --force
 done
 aws ecs wait services-inactive --cluster $NAME --services node discovery
-aws ec2 terminate-instances --instance-ids $APP_ID
+[ -z "${APP_ID:-}" ] || aws ec2 terminate-instances --instance-ids $APP_ID   # only if you launched a client instance
 
 for arn in $(aws ecs list-task-definitions --family-prefix $NAME- --query taskDefinitionArns --output text); do
   aws ecs deregister-task-definition --task-definition $arn
@@ -382,7 +384,7 @@ aws iam detach-role-policy --role-name $NAME-ec2 \
   --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 aws iam delete-role --role-name $NAME-ec2
 
-aws ec2 wait instance-terminated --instance-ids $APP_ID
+[ -z "${APP_ID:-}" ] || aws ec2 wait instance-terminated --instance-ids $APP_ID
 # stopped tasks' ENIs linger for a minute or two; the security group can't go until they have
 until [ "$(aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=$VPC_ID \
   --query 'length(NetworkInterfaces)' --output text)" = 0 ]; do sleep 5; done
