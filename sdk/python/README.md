@@ -594,6 +594,13 @@ rejected by `connect()` — it is almost always a forgotten
 `tls=True`. An unreadable or unparseable CA file is a connect-time error
 too.
 
+Python 3.13 and later verify certificates strictly by default, which
+includes refusing a CA-signed server certificate that has no Authority Key
+Identifier (`CERTIFICATE_VERIFY_FAILED ... Missing Authority Key
+Identifier`). Give leaves signed by a private CA `subjectKeyIdentifier=hash`
+and `authorityKeyIdentifier=keyid` (`openssl x509 -req` adds neither); a
+self-signed leaf is not affected.
+
 ## Value compression
 
 Off by default. When enabled, values at or above `compression_threshold`
