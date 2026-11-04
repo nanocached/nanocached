@@ -58,9 +58,14 @@ carried, and a value stored at the limit must still be movable.</p>
 the server closing the connection (<code>Od\n</code>/<code>Ed\n</code>
 from a discovery server — the second byte always names the server type,
 see the note below). If the server has no auth secret
-configured, <code>A</code> always succeeds. If it does, every other
-command is rejected with <code>E\n</code> (and the connection closed)
-until a matching <code>A</code> has been sent.</p>
+configured, any well-formed <code>A</code> succeeds (an empty secret,
+<code>A 0</code>, is malformed and answered <code>En\n</code> like any
+other). If it does, every other
+command is rejected with <code>En\n</code> (and the connection closed)
+until a matching <code>A</code> has been sent. Until then the node
+accepts a frame of at most 4096 bytes, which bounds the <code>A</code>
+frame itself (header and secret); a server refuses to start with a
+secret too long to fit.</p>
 <div class="note">The second byte (<code>n</code>/<code>d</code> —
 node/discovery) is how a client discovers what kind of server it
 reached and adapts, with no configuration; it is sent whether or not
@@ -134,9 +139,10 @@ F\n</code></pre>
 one namespace — a <code>&lt;namespace-length&gt;</code> of 0 clears the
 default namespace — and <code>F</code> drops every namespace, the
 default one included. On the node this is a single sub-map removal (no
-key scan); the map's entries are then freed on a thread of their own,
-so neither command stalls other requests the way a scan-and-delete
-would. The memory is returned over the moments that follow, in
+key scan); a map of 4096 entries or more is then freed on a thread of
+its own (a smaller one inline, which takes a fraction of a
+millisecond), so neither command stalls other requests the way a
+scan-and-delete would. The memory is returned over the moments that follow, in
 proportion to the entries dropped (about 0.3 µs per small entry), and
 until it is the node can sit above its memory limit by the amount it
 just dropped. Neither is
@@ -193,7 +199,8 @@ by replaying <code>i</code> itself. Re-running the increment on a
 replica could drift it from the primary (an eviction, or a replica leg
 that missed an earlier write, leaves it starting from a different base),
 so every replica always ends up with the exact bytes the primary
-computed. One exposure remains: for about a minute after a node joins,
+computed. One exposure remains: for at least a minute after a node joins
+(60 s from the end of its handoff, plus 5 ms for each entry it sent),
 an old owner forwards every write it receives to the joiner, the
 replicated result of an increment included, and that unconditional
 forward can land after a later increment and rewind the counter &mdash;
@@ -495,7 +502,8 @@ t &lt;namespace-length&gt; &lt;key-length&gt; [&lt;ttl-seconds&gt;] [G] &lt;tag&
 k &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; &lt;cond&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;
 x &lt;namespace-length&gt; &lt;key-length&gt; &lt;cond&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
 m &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;
-o &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; &lt;value-length-1&gt; ... &lt;key-length-n&gt; &lt;value-length-n&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n&lt;namespace&gt;&lt;key-1&gt;&lt;value-1&gt;...&lt;key-n&gt;&lt;value-n&gt;</code></pre>
+o &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; &lt;value-length-1&gt; ... &lt;key-length-n&gt; &lt;value-length-n&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n&lt;namespace&gt;&lt;key-1&gt;&lt;value-1&gt;...&lt;key-n&gt;&lt;value-n&gt;
+y &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt; [&lt;ttl-seconds&gt;] [G] &lt;tag&gt;\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;</code></pre>
 <p>Responses become <code>V &lt;value-length&gt; &lt;tag&gt;\n</code>,
 <code>S &lt;tag&gt;\n</code>, <code>D &lt;tag&gt;\n</code>,
 <code>N &lt;tag&gt;\n</code>, <code>W &lt;tag&gt;\n</code>, and
@@ -513,13 +521,13 @@ tagging them needs no new shape. <code>t</code>'s reply is
 <code>G</code> <code>V &lt;value-length&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n</code>
 (the tag after the optional TTL, as for <code>i</code>). <code>m</code>'s reply is
 <code>M &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt; &lt;tag&gt;\n&lt;hit values&gt;</code>,
-<code>o</code>'s is <code>O &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt; &lt;tag&gt;\n</code> —
+<code>o</code>'s is <code>O &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt; &lt;tag&gt;\n</code>,
+<code>y</code>'s is <code>Y &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt; &lt;tag&gt;\n</code>
+or, with <code>G</code>, <code>m</code>'s <code>M</code> reply —
 same roster shape as the untagged form, with the tag appended as the
 header's own last field. Tagged mode is per connection and
 entirely opt-in — a plain <code>A</code> keeps every frame exactly as
-documented above. See
-Echoed response tags
-for the design.</p>
+documented above.</p>
 
 <h3 id="untagged-desync">What an untagged connection cannot promise</h3>
 <p>Without tags, an SDK pairs each response with the oldest request
@@ -543,7 +551,10 @@ window is the same one the pre-tags protocol always had.</p>
     <tr><td><code>B\n</code></td><td>Busy. From a node: the connection
     limit is reached. From a discovery server: it is inside its startup
     grace after a restart, re-learning membership — retry shortly or try
-    another replica.</td></tr>
+    another replica. From <code>nanocached-proxy</code>: it has no
+    member list yet (it has not reached discovery) — a client that
+    declared the <code>R</code> capability below gets <code>R</code>
+    instead.</td></tr>
     <tr><td><code>W\n</code></td><td>Wrong node (clusters only): per the
     node's own view of membership it does not own this key, so the
     client's routing table is stale. SDKs respond by refreshing the node
@@ -562,7 +573,7 @@ window is the same one the pre-tags protocol always had.</p>
     twice: that case is the fatal <code>E</code>, and the client reads
     the key to learn what happened. A <code>t</code> is idempotent, so a
     proxy that cannot reach its node answers it <code>R</code>. A proxy
-    also answers <code>R</code> to a request it could not admit within
+    also answers <code>R</code> while it has no member list yet, and to a request it could not admit within
     60 seconds because the in-flight byte budgets (per connection, per
     source IP and proxy-wide) stayed full, and at once to a request that
     would have to wait while the pool for waiting requests' frames (the
@@ -577,8 +588,7 @@ window is the same one the pre-tags protocol always had.</p>
     overflow one.</td></tr>
     <tr><td><code>E\n</code></td><td>Error — <code>En\n</code> from a
     node, <code>Ed\n</code> from a discovery server: a failed
-    <code>A</code>, a command sent before authentication (a discovery
-    server closes such a connection with no reply instead), the
+    <code>A</code>, a command sent before authentication, the
     request was malformed (an unknown command, a bad length or TTL, an
     empty key), or it was over the request-size limit. Usually followed
     by the server closing the connection.</td></tr>
