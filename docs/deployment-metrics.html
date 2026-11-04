@@ -44,8 +44,8 @@ built, checked and torn down as shown.</p>
 <p><code>GET /metrics</code> on <code>--metrics-port</code> answers in
 Prometheus text format (the endpoint, with its two probe paths, is
 described under <a href="deployment-operations.html#ops">what every
-deployment needs</a>). A node exports fourteen series plus two per
-namespace, a discovery server six; the ones to scale on are listed under
+deployment needs</a>). A node exports eighteen series plus two per
+namespace (three where a namespace has a budget), a discovery server six; the ones to scale on are listed under
 <a href="deployment-operations.html#metrics">metrics to scale on</a>,
 and <code>curl -s http://127.0.0.1:9356/metrics | grep -v '^#'</code>
 prints the full set with its current values. Three things about them
@@ -261,7 +261,8 @@ the same 200 keys), so every number CloudWatch returned could be
 checked against <code>/metrics</code>:</p>
 <ul>
   <li><code>list-metrics</code> showed fourteen metrics under
-  <code>host</code> and two under <code>host,namespace</code> with
+  <code>host</code> (before the node had touch counters; the allow-list
+  above publishes sixteen now) and two under <code>host,namespace</code> with
   <code>namespace=orders</code>; the default namespace&rsquo;s two
   series were, as said above, not published.</li>
   <li>Gauges matched the endpoint: <code>nanocached_node_entries</code>
@@ -513,7 +514,7 @@ instance:</p>
   <li>The discovery task&rsquo;s six series were listed under its task
   ID about two minutes after its collector started, with the first
   datapoints in the collector&rsquo;s start minute; the node
-  tasks&rsquo; fourteen, plus two for <code>orders</code>, likewise
+  tasks&rsquo; fourteen (sixteen once the touch counters were added), plus two for <code>orders</code>, likewise
   carried their start minute and were readable at the first query made
   two and a half minutes later (not polled finer than that).</li>
   <li>Gauges matched per task: <code>nanocached_node_entries</code>
