@@ -6148,7 +6148,8 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
   }
 
   afterEach(() => {
-    HEDGE_READ_TUNING.maxLoserLegs = 32;
+    HEDGE_READ_TUNING.maxLoserLegs = 256;
+    HEDGE_READ_TUNING.suspectLateLegs = 32;
   });
 
   it("rejects readHedgeAfterMs together with viaProxy (issue #488)", async () => {
@@ -6241,6 +6242,125 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
       assert.equal((client as any).hedgedReads.size, 0);
       assert.equal(primary.mock.getCount(), 3);
     } finally {
+      await cluster.close();
+    }
+  });
+
+  it("tries a silent primary last once it has enough late legs", async () => {
+    HEDGE_READ_TUNING.suspectLateLegs = 2;
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readHedgeAfterMs: 200,
+    });
+    try {
+      await client.set("k", "v");
+      const { primary, replica } = cluster.ownerOf("k");
+      primary.mock.delayGets(800);
+
+      // Two concurrent reads: both hedge to the replica after the
+      // interval, leaving two late legs on the silent primary.
+      assert.deepEqual(await Promise.all([client.get("k"), client.get("k")]), ["v", "v"]);
+      assert.equal((client as any).lateHedgeLegs.get(primary.name), 2);
+
+      const primaryGetsBefore = primary.mock.getCount();
+      const [value, elapsed] = await timed(client.get("k"));
+
+      assert.equal(value, "v");
+      assert.ok(elapsed < 100, `elapsed was ${elapsed}: the replica should have been tried first`);
+      assert.equal(replica.mock.getCount(), 3);
+      assert.equal(
+        primary.mock.getCount(),
+        primaryGetsBefore,
+        "the third read must not add a leg to the silent primary",
+      );
+
+      const deadline = Date.now() + 5000;
+      while ((client as any).lateHedgeLegs.size > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal((client as any).lateHedgeLegs.size, 0, "the late legs should release their counts");
+    } finally {
+      await client.close();
+      await cluster.close();
+    }
+  });
+
+  it("still waits for the primary to settle a miss when it is tried last", async () => {
+    HEDGE_READ_TUNING.suspectLateLegs = 1;
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readHedgeAfterMs: 200,
+    });
+    const releases: Array<() => void> = [];
+    try {
+      const { primary, replica } = cluster.ownerOf("absent");
+      for (let i = 0; i < 5; i++) {
+        // as if the primary had stopped answering
+        (client as any).countLateLeg(primary.name, new Promise<void>((resolve) => releases.push(resolve)));
+      }
+      primary.mock.delayGets(300);
+
+      const [value, elapsed] = await timed(client.get("absent"));
+
+      assert.equal(value, null);
+      assert.equal(replica.mock.getCount(), 1);
+      assert.equal(primary.mock.getCount(), 1, "a replica's miss is provisional");
+      assert.ok(elapsed >= 300 - TIMING_TOLERANCE_MS, `elapsed was ${elapsed}: the primary's answer is waited for`);
+    } finally {
+      for (const release of releases) release();
+      await client.close();
+      await cluster.close();
+    }
+  });
+
+  it("does not reorder when every owner is silent or none is", async () => {
+    HEDGE_READ_TUNING.suspectLateLegs = 2;
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readHedgeAfterMs: 200,
+    });
+    try {
+      const c = client as any;
+      const names = ["a", "b"];
+      assert.deepEqual(c.demoteSilentOwners(names), names);
+      c.lateHedgeLegs.set("a", 1);
+      assert.deepEqual(c.demoteSilentOwners(names), names);
+      c.lateHedgeLegs.set("a", 2);
+      assert.deepEqual(c.demoteSilentOwners(names), ["b", "a"]);
+      assert.deepEqual(names, ["a", "b"], "the caller's array is untouched");
+      c.lateHedgeLegs.set("b", 2);
+      assert.deepEqual(c.demoteSilentOwners(names), names);
+      c.lateHedgeLegs.clear();
+    } finally {
+      await client.close();
+      await cluster.close();
+    }
+  });
+
+  it("a burst of reads to a healthy node demotes nothing", async () => {
+    // Legs are counted only once late, so concurrency alone must not push
+    // a healthy owner behind its replica.
+    HEDGE_READ_TUNING.suspectLateLegs = 2;
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readHedgeAfterMs: 200,
+    });
+    try {
+      await client.set("k", "v");
+      const { primary, replica } = cluster.ownerOf("k");
+
+      const values = await Promise.all(Array.from({ length: 100 }, () => client.get("k")));
+
+      assert.deepEqual(values, Array(100).fill("v"));
+      assert.equal((client as any).lateHedgeLegs.size, 0);
+      assert.equal(primary.mock.getCount(), 100);
+      assert.equal(replica.mock.getCount(), 0);
+    } finally {
+      await client.close();
       await cluster.close();
     }
   });

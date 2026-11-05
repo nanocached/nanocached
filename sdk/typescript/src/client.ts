@@ -348,16 +348,28 @@ const READ_REPAIR_TTL_SECONDS = 60;
  * KEEPALIVE_TUNING. */
 export const FIRE_AND_FORGET_TUNING = { maxInFlight: 32 };
 
-/** Bounds how many hedged-read losing legs a single client may have
+/** Hedged reads (issue #64): an owner that has stopped answering is tried
+ * last. A hedge "fires" when the interval elapses with no answer; every leg
+ * still unanswered at that moment is a *late* leg of its node
+ * (`suspectLateLegs` below). A node with that many late legs outstanding is
+ * treated as not answering, and a read that has another owner tries that
+ * owner first, so the silent node stops collecting a new leg per read. Legs
+ * are counted only once they are late, not while merely in flight, so a
+ * burst of concurrent reads to a healthy node never demotes it.
+ *
+ * `maxLoserLegs` bounds how many hedged-read legs a single client may have
  * running in the background at once (issue #276), analogous to
  * FIRE_AND_FORGET_TUNING above but tracked against `hedgedReads` — a
- * separate pool, not shared with `backgroundReplicaWrites`. Once the cap
- * is reached, a further losing leg is awaited synchronously right there
- * (readHedged's resolveLosers) instead of being left detached, the same
- * "fall back to synchronous" shape FIRE_AND_FORGET_TUNING's cap uses. A
- * mutable object only so tests can shrink it, mirroring
+ * separate pool, not shared with `backgroundReplicaWrites`. It is the
+ * backstop for when trying a silent owner last is not enough because every
+ * owner of the key is slow: past it, a further losing leg is awaited
+ * synchronously right there (readHedged's resolveLosers) instead of being
+ * left detached, the same "fall back to synchronous" shape
+ * FIRE_AND_FORGET_TUNING's cap uses. It must sit well above `suspectLateLegs`
+ * times the replication factor, or it would fire before a slow node has
+ * been demoted. A mutable object only so tests can shrink them, mirroring
  * FIRE_AND_FORGET_TUNING. */
-export const HEDGE_READ_TUNING = { maxLoserLegs: 32 };
+export const HEDGE_READ_TUNING = { maxLoserLegs: 256, suspectLateLegs: 32 };
 
 /** Keep-alive is always on and internal (issue #27): every interval, a
  * lightweight request goes out on each connection real traffic has left
@@ -940,6 +952,9 @@ export class NanocachedClient {
    * rejection, and drained by close() exactly like
    * `backgroundReplicaWrites`. See `readHedged`. */
   private readonly hedgedReads = new Set<Promise<unknown>>();
+  /** Late hedge legs outstanding per node name (see HEDGE_READ_TUNING); an
+   * entry exists only while it is positive. */
+  private readonly lateHedgeLegs = new Map<string, number>();
 
   static async connect(options: NanocachedClientOptions): Promise<NanocachedClient> {
     const addresses = options.addresses ?? [];
@@ -3142,12 +3157,18 @@ export class NanocachedClient {
    * instead (issue #276) — see resolveLosers below. */
   private async readHedged<T>(
     op: (connection: Connection) => Promise<T>,
-    names: string[],
+    ownerNames: string[],
   ): Promise<T> {
     const hedgeAfterMs = this.readHedgeAfterMs;
     if (hedgeAfterMs === undefined) {
       throw new NanocachedError("nanocached: internal error — readHedged called without readHedgeAfterMs");
     }
+
+    // A miss is final only from the key's primary, which is tracked by
+    // name: `names` below may put a silent owner last.
+    const primaryName = ownerNames[0];
+    const names = this.demoteSilentOwners(ownerNames);
+    const lateCounted = new Set<number>();
 
     type Outcome = { index: number; ok: true; value: T } | { index: number; ok: false; error: unknown };
 
@@ -3226,8 +3247,15 @@ export class NanocachedClient {
       if (timer !== null) clearTimeout(timer);
 
       if (winner === "timeout") {
-        // Hedge interval elapsed with no answer: one more owner, no
-        // change to `pending` for the legs already in flight.
+        // Hedge interval elapsed with no answer: every leg still pending
+        // is late; then one more owner, no change to `pending` for the
+        // legs already in flight.
+        for (const leg of pending) {
+          if (!lateCounted.has(leg.index)) {
+            lateCounted.add(leg.index);
+            this.countLateLeg(names[leg.index], leg.promise);
+          }
+        }
         pending.push({ promise: start(nextIndex), index: nextIndex });
         nextIndex++;
         continue;
@@ -3241,7 +3269,7 @@ export class NanocachedClient {
           throw winner.error;
         }
         lastError = winner.error;
-      } else if (winner.value !== null || winner.index === 0) {
+      } else if (winner.value !== null || names[winner.index] === primaryName) {
         await resolveLosers(pending);
         return winner.value;
       } else {
@@ -3259,6 +3287,30 @@ export class NanocachedClient {
 
     if (replicaMissed) return null as T;
     throw lastError ?? new ConnectionLostError("nanocached: no owner is reachable for this key");
+  }
+
+  /** `names` with the owners that have stopped answering (see
+   * HEDGE_READ_TUNING.suspectLateLegs) moved to the end, order otherwise
+   * kept. Returned unchanged when none, or all, of the owners are in that
+   * state: with no healthy owner to prefer there is nothing to reorder. */
+  private demoteSilentOwners(names: string[]): string[] {
+    if (this.lateHedgeLegs.size === 0) return names;
+    const threshold = HEDGE_READ_TUNING.suspectLateLegs;
+    const silent = names.filter((name) => (this.lateHedgeLegs.get(name) ?? 0) >= threshold);
+    if (silent.length === 0 || silent.length === names.length) return names;
+    return [...names.filter((name) => !silent.includes(name)), ...silent];
+  }
+
+  /** Counts `leg` as a late leg of `name` until it settles, however it
+   * settles. `leg` never rejects (readHedged wraps failures into
+   * outcomes), so the release below runs exactly once. */
+  private countLateLeg(name: string, leg: Promise<unknown>): void {
+    this.lateHedgeLegs.set(name, (this.lateHedgeLegs.get(name) ?? 0) + 1);
+    void leg.then(() => {
+      const remaining = (this.lateHedgeLegs.get(name) ?? 0) - 1;
+      if (remaining > 0) this.lateHedgeLegs.set(name, remaining);
+      else this.lateHedgeLegs.delete(name);
+    });
   }
 
   /** Cluster write (client-side replication): fan the operation out to every owner in
