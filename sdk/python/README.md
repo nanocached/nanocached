@@ -492,6 +492,19 @@ path). The losing leg of a hedge is left to finish and is drained by
 `close()`. Rejected by `connect()` together with `via_proxy` (see Proxy
 mode) — a proxy connection has no replicas of its own to hedge to either.
 
+An owner that stops answering is tried last. Once an owner has 32 hedge
+legs that were still unanswered when the hedge interval elapsed, reads
+for keys it shares with another owner go to that other owner first, and
+the silent one is asked only if the first does not answer, or to settle a
+miss (the primary's answer is still waited for, as above). So while an
+owner is slow, its replicas answer more of the reads, and a read no
+longer pays the hedge interval or adds one more leg to the slow owner.
+Legs that are merely in flight, as in a burst of concurrent reads to a
+healthy owner, do not count. When every owner of a key is in that state
+the order is unchanged, and past 256 hedge legs in flight a read waits
+for its own remaining legs instead of leaving them running, which bounds
+what a client can accumulate against a cluster that is slow throughout.
+
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps
