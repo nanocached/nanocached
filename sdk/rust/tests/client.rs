@@ -7409,6 +7409,173 @@ async fn finished_hedge_legs_are_reaped_instead_of_accumulating() {
     }
 }
 
+// Hedged reads: an owner that has stopped answering is tried last. The
+// threshold is read once per connect, so a test lowers it just around the
+// connect call and puts it back.
+async fn connect_with_suspect_threshold(
+    port: u16,
+    hedge_after: Duration,
+    threshold: usize,
+) -> NanocachedClient {
+    // The static is process-wide and tests run in parallel: hold a lock from
+    // setting it until the client has captured it.
+    static SUSPECT_THRESHOLD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = SUSPECT_THRESHOLD_LOCK.lock().await;
+    let default = nanocached::HEDGE_SUSPECT_LATE_LEGS.load(Ordering::SeqCst);
+    nanocached::HEDGE_SUSPECT_LATE_LEGS.store(threshold, Ordering::SeqCst);
+    let client = NanocachedClient::connect(options(port).read_hedge_after(hedge_after))
+        .await
+        .unwrap();
+    nanocached::HEDGE_SUSPECT_LATE_LEGS.store(default, Ordering::SeqCst);
+    client
+}
+
+#[tokio::test]
+async fn a_silent_primary_is_tried_last_once_it_has_enough_late_legs() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client =
+        connect_with_suspect_threshold(discovery.port, Duration::from_millis(200), 2).await;
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    primary.state.gets_delay_ms.store(800, Ordering::SeqCst);
+
+    // Two concurrent reads: both hedge to the replica after the interval,
+    // leaving two late legs on the silent primary.
+    let (a, b) = tokio::join!(client.get("k"), client.get("k"));
+    assert_eq!(a.unwrap(), Some("v".to_string()));
+    assert_eq!(b.unwrap(), Some("v".to_string()));
+    assert_eq!(client.late_hedge_legs_of(&owners[0]), 2);
+
+    let primary_gets_before = primary.state.gets.load(Ordering::SeqCst);
+    let start = tokio::time::Instant::now();
+    let value = client.get("k").await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(value, Some("v".to_string()));
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "the replica should have been tried first: elapsed = {elapsed:?}"
+    );
+    assert_eq!(replica.state.gets.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        primary.state.gets.load(Ordering::SeqCst),
+        primary_gets_before,
+        "the third read must not add a leg to the silent primary"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while client.late_hedge_legs_total() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        client.late_hedge_legs_total(),
+        0,
+        "the late legs should release their counts"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_miss_still_waits_for_the_primary_when_it_is_tried_last() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client =
+        connect_with_suspect_threshold(discovery.port, Duration::from_millis(200), 1).await;
+
+    let owners = owners_of("absent");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    client.set_late_hedge_legs_for_test(&owners[0], 5); // as if it had stopped answering
+    primary.state.gets_delay_ms.store(300, Ordering::SeqCst);
+
+    let start = tokio::time::Instant::now();
+    let value = client.get("absent").await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(value, None);
+    assert_eq!(replica.state.gets.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        primary.state.gets.load(Ordering::SeqCst),
+        1,
+        "a replica's miss is provisional"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(300) - HEDGE_TIMING_TOLERANCE,
+        "the primary's answer is waited for: elapsed = {elapsed:?}"
+    );
+
+    client.set_late_hedge_legs_for_test(&owners[0], 0);
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn hedge_order_is_unchanged_when_every_owner_is_silent_or_none_is() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client =
+        connect_with_suspect_threshold(discovery.port, Duration::from_millis(200), 2).await;
+
+    let names = vec!["a".to_string(), "b".to_string()];
+    assert_eq!(client.hedge_order_for_test(names.clone()), names);
+    client.set_late_hedge_legs_for_test("a", 1);
+    assert_eq!(client.hedge_order_for_test(names.clone()), names);
+    client.set_late_hedge_legs_for_test("a", 2);
+    assert_eq!(
+        client.hedge_order_for_test(names.clone()),
+        vec!["b".to_string(), "a".to_string()]
+    );
+    client.set_late_hedge_legs_for_test("b", 2);
+    assert_eq!(client.hedge_order_for_test(names.clone()), names);
+    client.set_late_hedge_legs_for_test("a", 0);
+    client.set_late_hedge_legs_for_test("b", 0);
+    assert_eq!(client.late_hedge_legs_total(), 0);
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_burst_of_reads_to_a_healthy_node_demotes_nothing() {
+    // Legs are counted only once late, so concurrency alone must not push a
+    // healthy owner behind its replica.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client =
+        connect_with_suspect_threshold(discovery.port, Duration::from_millis(200), 2).await;
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+
+    let reads = (0..100).map(|_| client.get("k"));
+    for result in futures_util::future::join_all(reads).await {
+        assert_eq!(result.unwrap(), Some("v".to_string()));
+    }
+
+    assert_eq!(client.late_hedge_legs_total(), 0);
+    assert_eq!(primary.state.gets.load(Ordering::SeqCst), 100);
+    assert_eq!(replica.state.gets.load(Ordering::SeqCst), 0);
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
 #[tokio::test]
 async fn hedge_losers_fall_back_to_synchronous_past_the_cap() {
     // Issue #276: hedged_reads had no bound, unlike

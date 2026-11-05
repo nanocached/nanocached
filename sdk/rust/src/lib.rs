@@ -14,6 +14,8 @@ mod open_targets;
 
 pub use cas::{content_digest, CasToken};
 #[doc(hidden)]
+pub use client::HEDGE_SUSPECT_LATE_LEGS;
+#[doc(hidden)]
 pub use client::KEEPALIVE_INTERVAL_MS;
 #[doc(hidden)]
 pub use client::MAX_CONCURRENT_DIALS;

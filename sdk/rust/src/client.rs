@@ -336,20 +336,36 @@ pub static MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES: AtomicUsize = AtomicUsize::ne
 /// 256 MiB cap as the other five SDKs.
 const MAX_MULTIGET_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Hedged reads (issue #64): an owner that has stopped answering is tried
+/// last. A hedge "fires" when the interval elapses with no answer; every leg
+/// still unanswered at that moment is a *late* leg of its node. A node with
+/// this many late legs outstanding is treated as not answering, and a read
+/// that has another owner tries that owner first, so the silent node stops
+/// collecting a new leg per read. Legs are counted only once they are late,
+/// not while merely in flight, so a burst of concurrent reads to a healthy
+/// node never demotes it. Read once per `connect`; public-but-hidden purely
+/// as a test hook, mirroring `MAX_INFLIGHT_HEDGE_LOSER_LEGS`.
+#[doc(hidden)]
+pub static HEDGE_SUSPECT_LATE_LEGS: AtomicUsize = AtomicUsize::new(32);
+
 /// Hedged reads' losing legs (issue #64), analogous to
 /// `MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES` above (issue #276): a losing
 /// leg is normally left running detached in `hedged_reads`, drained by
 /// `close()` — with no bound, a client issuing many concurrent hedged
-/// reads against a slow owner could accumulate an unbounded number of
-/// them. Tracked against `hedged_reads`' own length, not a separate
-/// permit pool shared with `background_replica_permits` — past this cap,
-/// a read's remaining legs are awaited synchronously right there instead
-/// of being left detached, the same "fall back to synchronous" shape
-/// `background_replica_permits` uses past its own cap. Read once per
+/// reads against slow owners could accumulate an unbounded number of
+/// them. This is the backstop for when trying a silent owner last
+/// (`HEDGE_SUSPECT_LATE_LEGS`) is not enough because every owner of the
+/// key is slow: tracked against `hedged_reads`' own length, not a separate
+/// permit pool shared with `background_replica_permits`, a read's
+/// remaining legs are awaited synchronously right there past this cap
+/// instead of being left detached, the same "fall back to synchronous"
+/// shape `background_replica_permits` uses past its own cap. It must sit
+/// well above `HEDGE_SUSPECT_LATE_LEGS` times the replication factor, or it
+/// would fire before a slow node has been demoted. Read once per
 /// `connect`; public-but-hidden purely as a test hook, mirroring
 /// `MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES`.
 #[doc(hidden)]
-pub static MAX_INFLIGHT_HEDGE_LOSER_LEGS: AtomicUsize = AtomicUsize::new(32);
+pub static MAX_INFLIGHT_HEDGE_LOSER_LEGS: AtomicUsize = AtomicUsize::new(256);
 
 /// How many of a roster's nodes `connect`'s bootstrap dials at once.
 /// Discovery may list up to 65536 nodes; polling every dial together
@@ -913,6 +929,107 @@ struct HedgeLegGuard {
     tx: mpsc::UnboundedSender<HedgeOutcome>,
     index: usize,
     sent: bool,
+    late: Arc<LateHedgeLeg>,
+}
+
+/// One hedge leg's share in `LateHedgeLegs`. `state` is 0 while the leg
+/// runs, 1 once the hedge timer found it unanswered (it is then counted
+/// against `node`), 2 when it has finished: the timer's compare-exchange
+/// (under the counts' lock) and the finishing leg's swap make exactly one
+/// of them responsible for the count, so no exit path of the read can leak
+/// it.
+struct LateHedgeLeg {
+    state: std::sync::atomic::AtomicU8,
+    node: String,
+    counts: Arc<LateHedgeLegs>,
+}
+
+/// Late hedge legs outstanding per node name (see `HEDGE_SUSPECT_LATE_LEGS`);
+/// an entry exists only while it is positive. `total` is the sum, so a read
+/// can skip the lock while no node has any. Adding a leg and releasing it
+/// both take the lock, so a leg finishing at the very moment it is counted
+/// is always released after it was added.
+struct LateHedgeLegs {
+    legs: std::sync::Mutex<HashMap<String, usize>>,
+    total: AtomicUsize,
+    /// Owners with at least this many late legs are tried last.
+    threshold: usize,
+}
+
+impl LateHedgeLegs {
+    fn new(threshold: usize) -> Arc<Self> {
+        Arc::new(Self {
+            legs: std::sync::Mutex::new(HashMap::new()),
+            total: AtomicUsize::new(0),
+            threshold,
+        })
+    }
+
+    fn new_leg(self: &Arc<Self>, node: String) -> Arc<LateHedgeLeg> {
+        Arc::new(LateHedgeLeg {
+            state: std::sync::atomic::AtomicU8::new(0),
+            node,
+            counts: Arc::clone(self),
+        })
+    }
+
+    /// `owners` with the ones that have stopped answering (at least
+    /// `threshold` late legs outstanding) moved to the end, order otherwise
+    /// kept. Returned unchanged when none, or all, of the owners are in that
+    /// state: with no healthy owner to prefer there is nothing to reorder.
+    fn demote(&self, owners: Vec<String>) -> Vec<String> {
+        if self.total.load(Ordering::SeqCst) == 0 {
+            return owners;
+        }
+        let silent: Vec<bool> = {
+            let legs = self.legs.lock().unwrap_or_else(|e| e.into_inner());
+            owners
+                .iter()
+                .map(|name| legs.get(name).copied().unwrap_or(0) >= self.threshold)
+                .collect()
+        };
+        let silent_count = silent.iter().filter(|&&s| s).count();
+        if silent_count == 0 || silent_count == owners.len() {
+            return owners;
+        }
+        let mut ordered = Vec::with_capacity(owners.len());
+        for want_silent in [false, true] {
+            ordered.extend(
+                owners
+                    .iter()
+                    .zip(&silent)
+                    .filter(|(_, &s)| s == want_silent)
+                    .map(|(name, _)| name.clone()),
+            );
+        }
+        ordered
+    }
+
+    /// Counts `leg` as late, unless it has finished meanwhile.
+    fn add(&self, leg: &LateHedgeLeg) {
+        let mut legs = self.legs.lock().unwrap_or_else(|e| e.into_inner());
+        if leg
+            .state
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            *legs.entry(leg.node.clone()).or_insert(0) += 1;
+            self.total.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Removes the count `add` made once the leg finished, however it
+    /// finished.
+    fn release(&self, node: &str) {
+        let mut legs = self.legs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = legs.get_mut(node) {
+            *count -= 1;
+            if *count == 0 {
+                legs.remove(node);
+            }
+            self.total.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 impl HedgeLegGuard {
@@ -928,6 +1045,9 @@ impl HedgeLegGuard {
 
 impl Drop for HedgeLegGuard {
     fn drop(&mut self) {
+        if self.late.state.swap(2, Ordering::SeqCst) == 1 {
+            self.late.counts.release(&self.late.node);
+        }
         if !self.sent {
             // Dropped without a result and not by `catch_unwind`'s path
             // (that one sends): the task was cancelled, e.g. by the runtime
@@ -1053,6 +1173,9 @@ struct Inner {
     /// `MAX_INFLIGHT_HEDGE_LOSER_LEGS` at `connect`, mirroring
     /// `background_replica_cap`.
     hedge_loser_cap: usize,
+    /// Late hedge legs per node (see `HEDGE_SUSPECT_LATE_LEGS`, captured
+    /// once at `connect`).
+    late_hedge: Arc<LateHedgeLegs>,
     stats: StatsCounters,
     /// SDK proxy mode (issue #122): see [`Options::via_proxy`]. When set,
     /// `target` is always `Target::Single` (a proxy is single-connection
@@ -1634,6 +1757,7 @@ impl NanocachedClient {
 
         let background_replica_cap = MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES.load(Ordering::SeqCst);
         let hedge_loser_cap = MAX_INFLIGHT_HEDGE_LOSER_LEGS.load(Ordering::SeqCst);
+        let hedge_suspect_late_legs = HEDGE_SUSPECT_LATE_LEGS.load(Ordering::SeqCst);
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
                 target,
@@ -1657,6 +1781,7 @@ impl NanocachedClient {
             read_hedge_after: options.read_hedge_after,
             hedged_reads: Mutex::new(tokio::task::JoinSet::new()),
             hedge_loser_cap,
+            late_hedge: LateHedgeLegs::new(hedge_suspect_late_legs),
             stats: StatsCounters {
                 replica_write_failures: AtomicU64::new(0),
                 read_repair_failures: AtomicU64::new(0),
@@ -1843,6 +1968,53 @@ impl NanocachedClient {
     #[doc(hidden)]
     pub async fn hedged_reads_len(&self) -> usize {
         self.inner.hedged_reads.lock().await.len()
+    }
+
+    /// Late hedge legs currently counted, summed over every node (see
+    /// `HEDGE_SUSPECT_LATE_LEGS`). Public-but-hidden purely as a test hook.
+    #[doc(hidden)]
+    pub fn late_hedge_legs_total(&self) -> usize {
+        self.inner.late_hedge.total.load(Ordering::SeqCst)
+    }
+
+    /// Late hedge legs currently counted for `node`. Public-but-hidden
+    /// purely as a test hook.
+    #[doc(hidden)]
+    pub fn late_hedge_legs_of(&self, node: &str) -> usize {
+        let legs = self
+            .inner
+            .late_hedge
+            .legs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        legs.get(node).copied().unwrap_or(0)
+    }
+
+    /// Sets the late-leg count for `node`, as if that many legs had gone
+    /// unanswered. Public-but-hidden purely as a test hook; a count set
+    /// here is not released by any leg, so a test sets it back to zero.
+    #[doc(hidden)]
+    pub fn set_late_hedge_legs_for_test(&self, node: &str, count: usize) {
+        let late = &self.inner.late_hedge;
+        let mut legs = late.legs.lock().unwrap_or_else(|e| e.into_inner());
+        let before = legs.get(node).copied().unwrap_or(0);
+        if count == 0 {
+            legs.remove(node);
+        } else {
+            legs.insert(node.to_string(), count);
+        }
+        if count >= before {
+            late.total.fetch_add(count - before, Ordering::SeqCst);
+        } else {
+            late.total.fetch_sub(before - count, Ordering::SeqCst);
+        }
+    }
+
+    /// The order a hedged read would try `owners` in right now. Public-but-
+    /// hidden purely as a test hook.
+    #[doc(hidden)]
+    pub fn hedge_order_for_test(&self, owners: Vec<String>) -> Vec<String> {
+        self.inner.late_hedge.demote(owners)
     }
 
     /// Number of per-address reconnect-cooldown entries currently held
@@ -4434,8 +4606,9 @@ impl NanocachedClient {
     /// settles the read. The first answer decides:
     ///
     /// - a hit (`Ok(Some(_))`) from any owner is final;
-    /// - a miss (`Ok(None)`) is final only from the primary (`index ==
-    ///   0`) — a replica's miss is provisional (it may simply lack the
+    /// - a miss (`Ok(None)`) is final only from the primary (the owner
+    ///   named first by the ring, wherever `owners` now places it) — a
+    ///   replica's miss is provisional (it may simply lack the
     ///   copy) and does not by itself end the read; it is accepted only
     ///   once every owner has answered or failed (`replica_missed` with no
     ///   owner left to try);
@@ -4444,6 +4617,10 @@ impl NanocachedClient {
     /// - any other error hedges onward immediately (the next owner, if
     ///   any, starts right away rather than waiting out the rest of the
     ///   interval) and is remembered as `last_error`.
+    ///
+    /// An owner with `HEDGE_SUSPECT_LATE_LEGS` late legs outstanding is
+    /// tried last (`LateHedgeLegs::demote`), while the primary stays
+    /// the owner whose miss is final.
     ///
     /// Every leg — including the ones still in flight once this method
     /// returns — is spawned via `spawn_hedge_leg` onto `hedged_reads`,
@@ -4459,18 +4636,26 @@ impl NanocachedClient {
         owners: Vec<String>,
         hedge_after: Duration,
     ) -> Result<Option<Vec<u8>>> {
+        // A miss is final only from the key's primary, which is tracked by
+        // name: `owners` below may put a silent owner last.
+        let primary = owners[0].clone();
+        let owners = self.inner.late_hedge.demote(owners);
+        // One entry per started leg, by index: see `LateHedgeLeg`.
+        let mut legs: Vec<Arc<LateHedgeLeg>> = Vec::with_capacity(owners.len());
         let owned_namespace: Arc<[u8]> = Arc::from(namespace.to_vec());
         let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
         let (tx, mut rx) = mpsc::unbounded_channel::<HedgeOutcome>();
 
-        self.spawn_hedge_leg(
-            Arc::clone(&owned_namespace),
-            Arc::clone(&owned_key),
-            owners[0].clone(),
-            0,
-            tx.clone(),
-        )
-        .await?;
+        legs.push(
+            self.spawn_hedge_leg(
+                Arc::clone(&owned_namespace),
+                Arc::clone(&owned_key),
+                owners[0].clone(),
+                0,
+                tx.clone(),
+            )
+            .await?,
+        );
         let mut next_index = 1usize;
         // How many legs are currently in flight (spawned, no outcome
         // received yet) — once this hits zero with owners left to try,
@@ -4490,15 +4675,21 @@ impl NanocachedClient {
                     Ok(None) => break,
                     Err(_elapsed) => {
                         // The hedge interval elapsed with no answer yet:
-                        // one more owner, right away.
-                        self.spawn_hedge_leg(
-                            Arc::clone(&owned_namespace),
-                            Arc::clone(&owned_key),
-                            owners[next_index].clone(),
-                            next_index,
-                            tx.clone(),
-                        )
-                        .await?;
+                        // every leg still running is late; then one more
+                        // owner, right away.
+                        for leg in &legs {
+                            self.inner.late_hedge.add(leg);
+                        }
+                        legs.push(
+                            self.spawn_hedge_leg(
+                                Arc::clone(&owned_namespace),
+                                Arc::clone(&owned_key),
+                                owners[next_index].clone(),
+                                next_index,
+                                tx.clone(),
+                            )
+                            .await?,
+                        );
                         next_index += 1;
                         in_flight += 1;
                         continue;
@@ -4523,7 +4714,7 @@ impl NanocachedClient {
                     self.resolve_hedge_losers(&mut rx, in_flight).await;
                     return Ok(Some(value));
                 }
-                Ok(None) if outcome.index == 0 => {
+                Ok(None) if owners[outcome.index] == primary => {
                     self.resolve_hedge_losers(&mut rx, in_flight).await;
                     return Ok(None);
                 }
@@ -4541,14 +4732,16 @@ impl NanocachedClient {
             // instead of waiting out the rest of the interval.
             if in_flight == 0 {
                 if next_index < owners.len() {
-                    self.spawn_hedge_leg(
-                        Arc::clone(&owned_namespace),
-                        Arc::clone(&owned_key),
-                        owners[next_index].clone(),
-                        next_index,
-                        tx.clone(),
-                    )
-                    .await?;
+                    legs.push(
+                        self.spawn_hedge_leg(
+                            Arc::clone(&owned_namespace),
+                            Arc::clone(&owned_key),
+                            owners[next_index].clone(),
+                            next_index,
+                            tx.clone(),
+                        )
+                        .await?,
+                    );
                     next_index += 1;
                     in_flight += 1;
                 } else {
@@ -4614,8 +4807,10 @@ impl NanocachedClient {
         name: String,
         index: usize,
         tx: mpsc::UnboundedSender<HedgeOutcome>,
-    ) -> Result<()> {
+    ) -> Result<Arc<LateHedgeLeg>> {
         let client = self.clone();
+        let late = self.inner.late_hedge.new_leg(name.clone());
+        let guard_late = Arc::clone(&late);
         let mut hedged = self.inner.hedged_reads.lock().await;
         // Reap legs that finished since the last time anyone looked
         // (issue #180): nothing else calls `join_next` outside `close()`,
@@ -4645,6 +4840,7 @@ impl NanocachedClient {
                 tx,
                 index,
                 sent: false,
+                late: guard_late,
             };
             let leg = async {
                 if PANIC_HEDGE_LEG_ARMED.load(Ordering::SeqCst)
@@ -4678,7 +4874,7 @@ impl NanocachedClient {
                 ),
             }
         });
-        Ok(())
+        Ok(late)
     }
 
     async fn write<T, F, Fut>(
@@ -5789,6 +5985,7 @@ mod tests {
             tx,
             index: 3,
             sent: false,
+            late: LateHedgeLegs::new(32).new_leg("n".to_string()),
         };
         drop(guard);
         let outcome = rx.recv().await.expect("the guard must send on drop");
@@ -5806,10 +6003,55 @@ mod tests {
             tx,
             index: 0,
             sent: false,
+            late: LateHedgeLegs::new(32).new_leg("n".to_string()),
         }
         .send(Ok(None), false);
         assert!(matches!(rx.recv().await.unwrap().result, Ok(None)));
         assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn late_hedge_legs_are_counted_until_the_leg_finishes() {
+        let late = LateHedgeLegs::new(2);
+        let leg = late.new_leg("n".to_string());
+        late.add(&leg);
+        assert_eq!(late.total.load(Ordering::SeqCst), 1);
+        // The finishing leg's swap releases exactly what the timer added.
+        assert_eq!(leg.state.swap(2, Ordering::SeqCst), 1);
+        late.release(&leg.node);
+        assert_eq!(late.total.load(Ordering::SeqCst), 0);
+        assert!(late.legs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_leg_that_finished_before_the_timer_is_never_counted() {
+        let late = LateHedgeLegs::new(2);
+        let leg = late.new_leg("n".to_string());
+        assert_eq!(leg.state.swap(2, Ordering::SeqCst), 0);
+        late.add(&leg);
+        assert_eq!(late.total.load(Ordering::SeqCst), 0);
+        assert!(late.legs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn silent_owners_move_to_the_end_in_order() {
+        let late = LateHedgeLegs::new(1);
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let a = late.new_leg("a".to_string());
+        late.add(&a);
+        assert_eq!(
+            late.demote(names(&["a", "b", "c"])),
+            names(&["b", "c", "a"])
+        );
+        let b = late.new_leg("b".to_string());
+        let c = late.new_leg("c".to_string());
+        late.add(&b);
+        late.add(&c);
+        // every owner silent: the original order stands
+        assert_eq!(
+            late.demote(names(&["a", "b", "c"])),
+            names(&["a", "b", "c"])
+        );
     }
 
     #[tokio::test]
