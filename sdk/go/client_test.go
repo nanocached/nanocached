@@ -5678,6 +5678,212 @@ func TestHedgedReadFallsBackToSynchronousPastTheCap(t *testing.T) {
 	}
 }
 
+// lateHedgeLegsOf is the client's late-leg count for a node, for the tests
+// below.
+func lateHedgeLegsOf(c *Client, name string) int32 {
+	c.lateHedgeMu.Lock()
+	defer c.lateHedgeMu.Unlock()
+	return c.lateHedgeLegs[name]
+}
+
+func TestASilentPrimaryIsTriedLastOnceItHasEnoughLateLegs(t *testing.T) {
+	original := hedgeSuspectLateLegs
+	defer func() { hedgeSuspectLateLegs = original }()
+	hedgeSuspectLateLegs = 2
+
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{
+		Addresses:      []Address{addr(discovery.address())},
+		ReadHedgeAfter: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownersOf("k")
+	primary, replica := owners[0], owners[1]
+	nodes[primary].delayGets(800 * time.Millisecond)
+
+	// Two concurrent reads: both hedge to the replica after the interval,
+	// leaving two late legs on the silent primary.
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if value, ok, err := client.Get("k"); err != nil || !ok || value != "v" {
+				t.Errorf("Get = %q, %v, %v", value, ok, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := lateHedgeLegsOf(client, primary); got != 2 {
+		t.Fatalf("late legs on the silent primary = %d, want 2", got)
+	}
+
+	primaryGetsBefore := nodes[primary].getCount.Load()
+	start := time.Now()
+	value, ok, err := client.Get("k")
+	elapsed := time.Since(start)
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get = %q, %v, %v", value, ok, err)
+	}
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("elapsed = %v, want well under the 200ms hedge interval (the replica should have been tried first)", elapsed)
+	}
+	if got := nodes[replica].getCount.Load(); got != 3 {
+		t.Fatalf("replica getCount = %d, want 3", got)
+	}
+	if got := nodes[primary].getCount.Load(); got != primaryGetsBefore {
+		t.Fatalf("primary getCount went %d -> %d: the third read must not add a leg to the silent primary", primaryGetsBefore, got)
+	}
+
+	if !waitUntil(t, 5*time.Second, func() bool {
+		return client.lateHedgeTotal.Load() == 0 && lateHedgeLegsOf(client, primary) == 0
+	}) {
+		t.Fatalf("the late legs never released their counts: %v", client.lateHedgeLegs)
+	}
+}
+
+func TestAMissStillWaitsForThePrimaryWhenItIsTriedLast(t *testing.T) {
+	original := hedgeSuspectLateLegs
+	defer func() { hedgeSuspectLateLegs = original }()
+	hedgeSuspectLateLegs = 1
+
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{
+		Addresses:      []Address{addr(discovery.address())},
+		ReadHedgeAfter: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	owners := ownersOf("absent")
+	primary, replica := owners[0], owners[1]
+	for i := 0; i < 5; i++ { // as if the primary had stopped answering
+		client.addLateHedgeLeg(primary)
+	}
+	defer func() {
+		for i := 0; i < 5; i++ {
+			client.releaseLateHedgeLeg(primary)
+		}
+	}()
+	nodes[primary].delayGets(300 * time.Millisecond)
+
+	start := time.Now()
+	value, ok, err := client.Get("absent")
+	elapsed := time.Since(start)
+	if err != nil || ok || value != "" {
+		t.Fatalf("Get = %q, %v, %v, want a plain miss", value, ok, err)
+	}
+	if got := nodes[replica].getCount.Load(); got != 1 {
+		t.Fatalf("replica getCount = %d, want 1", got)
+	}
+	if got := nodes[primary].getCount.Load(); got != 1 {
+		t.Fatalf("primary getCount = %d, want 1 (a replica's miss is provisional)", got)
+	}
+	if elapsed < 300*time.Millisecond-hedgeTimingTolerance {
+		t.Fatalf("elapsed = %v, want at least the primary's 300ms delay (its answer is waited for)", elapsed)
+	}
+}
+
+func TestNoReorderingWhenEveryOwnerIsSilentOrNoneIs(t *testing.T) {
+	original := hedgeSuspectLateLegs
+	defer func() { hedgeSuspectLateLegs = original }()
+	hedgeSuspectLateLegs = 2
+
+	c := &Client{}
+	names := []string{"a", "b"}
+	same := func(got, want []string) bool {
+		if len(got) != len(want) {
+			return false
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	}
+	if got := c.demoteSilentOwners(names); !same(got, names) {
+		t.Fatalf("no late legs: %v", got)
+	}
+	c.addLateHedgeLeg("a")
+	if got := c.demoteSilentOwners(names); !same(got, names) {
+		t.Fatalf("one late leg, under the threshold: %v", got)
+	}
+	c.addLateHedgeLeg("a")
+	if got := c.demoteSilentOwners(names); !same(got, []string{"b", "a"}) {
+		t.Fatalf("a at the threshold: %v, want [b a]", got)
+	}
+	if !same(names, []string{"a", "b"}) {
+		t.Fatalf("the caller's slice was modified: %v", names)
+	}
+	c.addLateHedgeLeg("b")
+	c.addLateHedgeLeg("b")
+	if got := c.demoteSilentOwners(names); !same(got, names) {
+		t.Fatalf("every owner silent: %v, want the original order", got)
+	}
+	for i := 0; i < 2; i++ {
+		c.releaseLateHedgeLeg("a")
+		c.releaseLateHedgeLeg("b")
+	}
+	if c.lateHedgeTotal.Load() != 0 || len(c.lateHedgeLegs) != 0 {
+		t.Fatalf("counts not back to zero: %d, %v", c.lateHedgeTotal.Load(), c.lateHedgeLegs)
+	}
+}
+
+func TestABurstOfReadsToAHealthyNodeDemotesNothing(t *testing.T) {
+	// Legs are counted only once late, so concurrency alone must not push
+	// a healthy owner behind its replica.
+	original := hedgeSuspectLateLegs
+	defer func() { hedgeSuspectLateLegs = original }()
+	hedgeSuspectLateLegs = 2
+
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{
+		Addresses:      []Address{addr(discovery.address())},
+		ReadHedgeAfter: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownersOf("k")
+	primary, replica := owners[0], owners[1]
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if value, ok, err := client.Get("k"); err != nil || !ok || value != "v" {
+				t.Errorf("Get = %q, %v, %v", value, ok, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := client.lateHedgeTotal.Load(); got != 0 {
+		t.Fatalf("late legs after a burst to a healthy node = %d, want 0", got)
+	}
+	if got := nodes[primary].getCount.Load(); got != 100 {
+		t.Fatalf("primary getCount = %d, want 100", got)
+	}
+	if got := nodes[replica].getCount.Load(); got != 0 {
+		t.Fatalf("replica getCount = %d, want 0", got)
+	}
+}
+
 func waitUntil(t *testing.T, timeout time.Duration, condition func() bool) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

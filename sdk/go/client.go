@@ -330,13 +330,28 @@ func validateNamespaceForClear(namespace []byte) error {
 // same as with the option off. A variable only so tests can shrink it.
 var maxInFlightBackgroundReplicaWrites = 32
 
+// hedgeSuspectLateLegs is how many late hedge legs an owner may have
+// outstanding before reads try it last. A hedge fires when the interval
+// elapses with no answer; every leg still unanswered at that moment is a
+// late leg of its node. A node with this many late legs is treated as not
+// answering, and a read that has another owner tries that owner first, so
+// the silent node stops collecting a new leg per read. Legs are counted
+// only once they are late, not while merely in flight, so a burst of
+// concurrent reads to a healthy node never demotes it. A variable only so
+// tests can shrink it.
+var hedgeSuspectLateLegs int32 = 32
+
 // maxInFlightHedgeReadLosers bounds how many hedged-read legs may be left
 // running detached in the background at once (issue #276), mirroring
 // maxInFlightBackgroundReplicaWrites above but for readHedged's losing
-// legs instead of fire-and-forget replica writes. Unlike a replica leg, a
-// hedge leg can't be deferred before it starts running — it has to race
-// the primary concurrently to actually hedge anything — so this can't
-// gate a leg's start the way backgroundReplicaSem does. Instead it bounds
+// legs instead of fire-and-forget replica writes. It is the backstop for
+// when trying a silent owner last (hedgeSuspectLateLegs) is not enough
+// because every owner of the key is slow, and it must sit well above
+// hedgeSuspectLateLegs times the replication factor or it would fire
+// before a slow node has been demoted. Unlike a replica leg, a hedge leg
+// can't be deferred before it starts running — it has to race the primary
+// concurrently to actually hedge anything — so this can't gate a leg's
+// start the way backgroundReplicaSem does. Instead it bounds
 // hedgedReadsInFlight, a live count of every hedge leg currently racing
 // from start to finish (mirroring the Python SDK's
 // _MAX_INFLIGHT_HEDGE_LOSER_LEGS check against len(self._hedged_reads),
@@ -348,7 +363,7 @@ var maxInFlightBackgroundReplicaWrites = 32
 // before returning — the same "fall back to synchronous" shape
 // fanReplicas uses past its own cap. A variable only so tests can shrink
 // it, mirroring maxInFlightBackgroundReplicaWrites.
-var maxInFlightHedgeReadLosers = 32
+var maxInFlightHedgeReadLosers = 256
 
 // maxConcurrentDials bounds how many of a roster's nodes openCluster dials
 // at once. Discovery may list up to 65536 nodes; one goroutine and socket
@@ -469,6 +484,18 @@ type Client struct {
 	readHedgeAfter      time.Duration
 	hedgedReadsWG       sync.WaitGroup
 	hedgedReadsInFlight atomic.Int32
+
+	// lateHedgeLegs counts, per node name, the hedge legs that were still
+	// unanswered when the hedge interval elapsed and have not finished
+	// (see hedgeSuspectLateLegs). lateHedgeTotal is the sum, so a read
+	// can skip the lock while no node has any. An entry exists only
+	// while it is positive; an add/release pair can run in either order
+	// for a leg finishing at the very moment it is counted, which at
+	// worst leaves a count of -1 for an instant and never reaches the
+	// threshold.
+	lateHedgeMu    sync.Mutex
+	lateHedgeLegs  map[string]int32
+	lateHedgeTotal atomic.Int32
 
 	// targetKey is the address this client's connect() ultimately settled
 	// on — a node's own address in single mode, the winning discovery
@@ -2832,6 +2859,10 @@ func (c *Client) readFromOwner(slot string, op func(*connection) ([]byte, bool, 
 // no owner ever produced even a provisional miss does the last error
 // propagate.
 //
+// An owner with hedgeSuspectLateLegs late legs outstanding is tried last
+// (demoteSilentOwners), while the primary stays the owner whose miss is
+// final.
+//
 // Losing legs are never cancelled — cancelling mid-write would poison a
 // shared connection (see connection.request) — they run to completion
 // detached, their outcome discarded, tracked on hedgedReadsWG so Close()
@@ -2844,7 +2875,16 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 		err   error
 	}
 
+	// A miss is final only from the key's primary, which is tracked by
+	// name: names below may put a silent owner last.
+	primaryName := names[0]
+	names = c.demoteSilentOwners(names)
+
 	results := make(chan legResult, len(names))
+	// legState[i] is 0 while leg i runs, 1 once it has been counted as late,
+	// 2 when it has finished; the swap on finish and the CAS on counting
+	// make exactly one of them responsible for the count.
+	legState := make([]atomic.Int32, len(names))
 	// start registers a leg on hedgedReadsWG and launches it, reporting
 	// whether it actually started. c.closed is rechecked under c.mu
 	// immediately before the Add — Close() flips closed under the same
@@ -2873,6 +2913,9 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 			defer c.hedgedReadsWG.Done()
 			defer c.hedgedReadsInFlight.Add(-1)
 			v, o, e := c.readFromOwner(names[index], op)
+			if legState[index].Swap(2) == 1 {
+				c.releaseLateHedgeLeg(names[index])
+			}
 			results <- legResult{index: index, value: v, ok: o, err: e}
 		}()
 		return true
@@ -2950,7 +2993,7 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 					return nil, false, res.err
 				}
 				lastError = res.err
-			case res.ok || res.index == 0:
+			case res.ok || names[res.index] == primaryName:
 				finishHedge(pending)
 				return res.value, res.ok, nil
 			default:
@@ -2961,8 +3004,14 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 				tryStartNext()
 			}
 		case <-timeout:
-			// The hedge interval elapsed with no answer: one more owner,
-			// without waiting for the legs already in flight.
+			// The hedge interval elapsed with no answer: every leg still
+			// running is late; then one more owner, without waiting for
+			// the legs already in flight.
+			for i := 0; i < nextIndex; i++ {
+				if legState[i].CompareAndSwap(0, 1) {
+					c.addLateHedgeLeg(names[i])
+				}
+			}
 			tryStartNext()
 		}
 	}
@@ -2974,6 +3023,74 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 		lastError = connectionLost("no owner is reachable for this key", nil)
 	}
 	return nil, false, lastError
+}
+
+// demoteSilentOwners returns names with the owners that have stopped
+// answering (hedgeSuspectLateLegs late legs outstanding) moved to the end,
+// order otherwise kept, in a new slice. names itself is returned unchanged
+// when none, or all, of the owners are in that state: with no healthy owner
+// to prefer there is nothing to reorder.
+func (c *Client) demoteSilentOwners(names []string) []string {
+	if c.lateHedgeTotal.Load() <= 0 {
+		return names
+	}
+	c.lateHedgeMu.Lock()
+	var silent map[string]bool
+	for _, n := range names {
+		if c.lateHedgeLegs[n] >= hedgeSuspectLateLegs {
+			if silent == nil {
+				silent = make(map[string]bool)
+			}
+			silent[n] = true
+		}
+	}
+	c.lateHedgeMu.Unlock()
+	if len(silent) == 0 || len(silent) == len(names) {
+		return names
+	}
+	ordered := make([]string, 0, len(names))
+	for _, n := range names {
+		if !silent[n] {
+			ordered = append(ordered, n)
+		}
+	}
+	for _, n := range names {
+		if silent[n] {
+			ordered = append(ordered, n)
+		}
+	}
+	return ordered
+}
+
+// addLateHedgeLeg counts one more late leg for the node.
+func (c *Client) addLateHedgeLeg(name string) {
+	c.lateHedgeMu.Lock()
+	if c.lateHedgeLegs == nil {
+		c.lateHedgeLegs = make(map[string]int32)
+	}
+	if n := c.lateHedgeLegs[name] + 1; n == 0 {
+		delete(c.lateHedgeLegs, name)
+	} else {
+		c.lateHedgeLegs[name] = n
+	}
+	c.lateHedgeMu.Unlock()
+	c.lateHedgeTotal.Add(1)
+}
+
+// releaseLateHedgeLeg removes the count addLateHedgeLeg added once the leg
+// has finished, however it finished.
+func (c *Client) releaseLateHedgeLeg(name string) {
+	c.lateHedgeMu.Lock()
+	if c.lateHedgeLegs == nil {
+		c.lateHedgeLegs = make(map[string]int32)
+	}
+	if n := c.lateHedgeLegs[name] - 1; n == 0 {
+		delete(c.lateHedgeLegs, name)
+	} else {
+		c.lateHedgeLegs[name] = n
+	}
+	c.lateHedgeMu.Unlock()
+	c.lateHedgeTotal.Add(-1)
 }
 
 // write runs op against every owner of the key; op's second argument
