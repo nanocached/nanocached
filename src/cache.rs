@@ -1848,7 +1848,7 @@ impl Cache {
     /// here; left as a documented limitation (issue #449, closed as
     /// such). Measured in release builds at roughly 25 ms per million
     /// live keys (200k: 5 ms, 1M: 25 ms, 2M: 52 ms), so at the default
-    /// `--max-memory` of 256 MiB — on the order of 2–3M small entries —
+    /// `--max-memory` of 256 MiB — on the order of 1.4M small entries —
     /// one ring change costs a single stall of a few tens of
     /// milliseconds, the same order as `sweep`'s own refill. See
     /// `docs/architecture.html` ("Known limits").
