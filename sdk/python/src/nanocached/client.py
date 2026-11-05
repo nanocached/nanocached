@@ -235,18 +235,31 @@ _KEEPALIVE_INTERVAL = 30.0
 # _KEEPALIVE_INTERVAL.
 _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES = 32
 
+# Hedged reads (issue #64): an owner that has stopped answering is tried
+# last. A hedge "fires" when the timer elapses with no answer; every leg
+# still unanswered at that moment is a *late* leg for its node. A node
+# with this many late legs outstanding is treated as not answering, and
+# reads that have another owner try that owner first, so the silent node
+# stops collecting a new leg per read. Legs are counted only once they are
+# late, not while merely in flight, so a burst of concurrent reads to a
+# healthy node never demotes it. Mutable only so tests can shrink it,
+# mirroring _KEEPALIVE_INTERVAL.
+_HEDGE_SUSPECT_LATE_LEGS = 32
+
 # Hedged reads' losing legs (issue #64), analogous to
 # _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES above (issue #192): a losing leg
 # is normally left running detached in self._hedged_reads, drained by
 # close() — with no bound, a client issuing many concurrent hedged reads
-# against a slow owner could accumulate an unbounded number of them.
-# Tracked against the same set fire_and_forget's cap is *not* shared
-# with (self._hedged_reads, not self._background_replica_writes); past
-# this cap, a read's remaining legs are awaited synchronously right
-# there instead of being detached — the same "fall back to synchronous"
-# shape as fire_and_forget_replicas past its own cap. Mutable only so
+# against slow owners could accumulate an unbounded number of them.
+# This is the backstop for when trying a silent owner last is not enough
+# (every owner of the key is slow): past this many legs tracked in
+# self._hedged_reads, a read's remaining legs are awaited synchronously
+# right there instead of being detached — the same "fall back to
+# synchronous" shape as fire_and_forget_replicas past its own cap. It must
+# sit well above _HEDGE_SUSPECT_LATE_LEGS times the replication factor, or
+# it would fire before a slow node has been demoted. Mutable only so
 # tests can shrink it, mirroring _KEEPALIVE_INTERVAL.
-_MAX_INFLIGHT_HEDGE_LOSER_LEGS = 32
+_MAX_INFLIGHT_HEDGE_LOSER_LEGS = 256
 
 # The longest a request header can ever legally be: marker + space + up to
 # 10-digit key length + space + up to 10-digit value length + space + up
@@ -657,6 +670,9 @@ class NanocachedClient:
         # (the losers); finished detached, drained by close() exactly like
         # _background_replica_writes.
         self._hedged_reads: set[asyncio.Task[object]] = set()
+        # Late hedge legs outstanding per node name (see
+        # _HEDGE_SUSPECT_LATE_LEGS); an entry exists only while it is > 0.
+        self._late_hedge_legs: dict[str, int] = {}
         # SDK proxy mode (issue #122): set once, at connect(), when
         # via_proxy is true — never flips back. Gates the reconnect
         # fallback in _open_node_connection (retry the same proxy, then
@@ -3111,13 +3127,22 @@ class NanocachedClient:
           WrongNodeError) just hedges onward immediately;
         - WrongNodeError propagates as in _read().
 
+        An owner with _HEDGE_SUSPECT_LATE_LEGS late legs outstanding (see
+        _demote_silent_owners) is tried last, while the primary stays the
+        owner whose miss is final.
+
         The losing legs are never cancelled — cancelling mid-write poisons
         a connection (see Connection._request) — but left to finish
         detached in ``_hedged_reads``, their outcome retrieved, and
         drained by close()."""
         hedge_after = self._read_hedge_after
         assert hedge_after is not None
+        # A miss is final only from the key's primary, which is tracked by
+        # name: `names` below may put a silent owner last.
+        primary_name = names[0]
+        names = self._demote_silent_owners(names)
         legs: dict[asyncio.Task[object], int] = {}
+        late_counted: set[asyncio.Task[object]] = set()
 
         def start(index: int) -> asyncio.Task[object]:
             # Recheck self._closed immediately before registering, exactly
@@ -3196,7 +3221,12 @@ class NanocachedClient:
                     pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
                 )
                 if not done:
-                    # Hedge interval elapsed with no answer: one more owner.
+                    # Hedge interval elapsed with no answer: every leg
+                    # still pending is late; then one more owner.
+                    for task in pending:
+                        if task not in late_counted:
+                            late_counted.add(task)
+                            self._count_late_leg(names[legs[task]], task)
                     pending.add(start(next_index))
                     next_index += 1
                     continue
@@ -3236,7 +3266,7 @@ class NanocachedClient:
                     else:
                         if value is not None:
                             hit_value = value
-                        elif index == 0:
+                        elif names[index] == primary_name:
                             primary_missed = True
                         else:
                             replica_missed = True
@@ -3280,6 +3310,35 @@ class NanocachedClient:
         raise last_error if last_error is not None else ConnectionError(
             "nanocached: no owner is reachable for this key"
         )
+
+    def _demote_silent_owners(self, names: list[str]) -> list[str]:
+        """``names`` with the owners that have stopped answering (see
+        _HEDGE_SUSPECT_LATE_LEGS) moved to the end, order otherwise kept.
+        Unchanged when none, or all, of the owners are in that state:
+        with no healthy owner to prefer there is nothing to reorder."""
+        late = self._late_hedge_legs
+        if not late:
+            return names
+        silent = [n for n in names if late.get(n, 0) >= _HEDGE_SUSPECT_LATE_LEGS]
+        if not silent or len(silent) == len(names):
+            return names
+        return [n for n in names if n not in silent] + silent
+
+    def _count_late_leg(self, name: str, task: asyncio.Task[object]) -> None:
+        """Counts ``task`` as a late leg of ``name`` until it finishes,
+        however it finishes (a done callback runs exactly once, so no exit
+        path of the read can leak the count)."""
+        late = self._late_hedge_legs
+        late[name] = late.get(name, 0) + 1
+
+        def release(_task: asyncio.Task[object]) -> None:
+            remaining = late.get(name, 0) - 1
+            if remaining > 0:
+                late[name] = remaining
+            else:
+                late.pop(name, None)
+
+        task.add_done_callback(release)
 
     def _dispatch_replica_writes(self, names: list[str], op) -> list[asyncio.Task[None]]:
         """Admits each name in ``names`` as a replica leg running ``op`` —

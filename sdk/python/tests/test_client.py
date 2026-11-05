@@ -5515,6 +5515,182 @@ class HedgedReadInflightCapTests(unittest.IsolatedAsyncioTestCase):
                 await node.close()
 
 
+class HedgedReadSilentOwnerTests(unittest.IsolatedAsyncioTestCase):
+    """An owner that has stopped answering is tried last: once a node has
+    _HEDGE_SUSPECT_LATE_LEGS hedge legs still unanswered after the hedge
+    interval, reads that have another owner try that owner first instead of
+    adding one more leg to the silent node per read."""
+
+    HEDGE_AFTER_S = 0.2
+    SILENT_FOR_S = 0.8
+
+    def setUp(self):
+        from nanocached import client as client_module
+
+        self._client_module = client_module
+        self._default_threshold = client_module._HEDGE_SUSPECT_LATE_LEGS
+        self._default_cap = client_module._MAX_INFLIGHT_HEDGE_LOSER_LEGS
+
+    def tearDown(self):
+        self._client_module._HEDGE_SUSPECT_LATE_LEGS = self._default_threshold
+        self._client_module._MAX_INFLIGHT_HEDGE_LOSER_LEGS = self._default_cap
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    async def stop_cluster(self, nodes, discovery):
+        await discovery.close()
+        for node in nodes.values():
+            await node.close()
+
+    async def test_silent_primary_is_tried_last_once_it_has_enough_late_legs(self):
+        self._client_module._HEDGE_SUSPECT_LATE_LEGS = 2
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=self.HEDGE_AFTER_S
+            )
+            try:
+                await client.set("k", "v")
+                primary, replica = self.owners_of("k")
+                nodes[primary].delay_gets(self.SILENT_FOR_S)
+
+                # Two concurrent reads: both hedge to the replica after the
+                # interval, leaving two late legs on the silent primary.
+                first = await asyncio.gather(client.get("k"), client.get("k"))
+                self.assertEqual(first, ["v", "v"])
+                self.assertEqual(client._late_hedge_legs, {primary: 2})
+
+                primary_gets_before = nodes[primary].get_count
+                start = asyncio.get_running_loop().time()
+                value = await client.get("k")
+                elapsed = asyncio.get_running_loop().time() - start
+
+                self.assertEqual(value, "v")
+                self.assertLess(
+                    elapsed, self.HEDGE_AFTER_S / 2, "the replica should have been tried first"
+                )
+                self.assertEqual(nodes[replica].get_count, 3)
+                self.assertEqual(
+                    nodes[primary].get_count,
+                    primary_gets_before,
+                    "the third read must not have added a leg to the silent primary",
+                )
+
+                await wait_for(
+                    lambda: client._late_hedge_legs == {} and client._hedged_reads == set(),
+                    "the late legs to finish and release their counts",
+                )
+            finally:
+                await client.close()
+        finally:
+            await self.stop_cluster(nodes, discovery)
+
+    async def test_a_miss_still_waits_for_the_primary_when_it_is_tried_last(self):
+        self._client_module._HEDGE_SUSPECT_LATE_LEGS = 1
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=self.HEDGE_AFTER_S
+            )
+            try:
+                primary, replica = self.owners_of("absent")
+                client._late_hedge_legs[primary] = 5  # as if it had stopped answering
+                nodes[primary].delay_gets(0.3)
+
+                start = asyncio.get_running_loop().time()
+                value = await client.get("absent")
+                elapsed = asyncio.get_running_loop().time() - start
+
+                self.assertIsNone(value)
+                self.assertEqual(nodes[replica].get_count, 1)
+                self.assertEqual(nodes[primary].get_count, 1, "a replica's miss is provisional")
+                self.assertGreaterEqual(elapsed, 0.3 - 0.03, "the primary's answer is waited for")
+                client._late_hedge_legs.pop(primary)
+            finally:
+                await client.close()
+        finally:
+            await self.stop_cluster(nodes, discovery)
+
+    async def test_no_reordering_when_every_owner_is_silent_or_none_is(self):
+        self._client_module._HEDGE_SUSPECT_LATE_LEGS = 2
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=self.HEDGE_AFTER_S
+            )
+            try:
+                names = list(NAMES)
+                self.assertEqual(client._demote_silent_owners(names), names)
+                client._late_hedge_legs.update({names[0]: 2, names[1]: 2})
+                self.assertEqual(client._demote_silent_owners(names), names)
+                client._late_hedge_legs.clear()
+                client._late_hedge_legs[names[0]] = 2
+                self.assertEqual(client._demote_silent_owners(names), [names[1], names[0]])
+                client._late_hedge_legs[names[0]] = 1
+                self.assertEqual(client._demote_silent_owners(names), names)
+                client._late_hedge_legs.clear()
+            finally:
+                await client.close()
+        finally:
+            await self.stop_cluster(nodes, discovery)
+
+    async def test_a_burst_of_reads_to_a_healthy_node_demotes_nothing(self):
+        # Legs are counted only once late, so concurrency alone must not
+        # push a healthy owner behind its replica.
+        self._client_module._HEDGE_SUSPECT_LATE_LEGS = 2
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=self.HEDGE_AFTER_S
+            )
+            try:
+                await client.set("k", "v")
+                primary, replica = self.owners_of("k")
+                results = await asyncio.gather(*[client.get("k") for _ in range(100)])
+                self.assertEqual(results, ["v"] * 100)
+                self.assertEqual(client._late_hedge_legs, {})
+                self.assertEqual(nodes[primary].get_count, 100)
+                self.assertEqual(nodes[replica].get_count, 0)
+            finally:
+                await client.close()
+        finally:
+            await self.stop_cluster(nodes, discovery)
+
+    async def test_the_count_is_released_when_the_caller_gives_up(self):
+        self._client_module._HEDGE_SUSPECT_LATE_LEGS = 5
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.05
+            )
+            try:
+                await client.set("k", "v")
+                primary, replica = self.owners_of("k")
+                nodes[primary].delay_gets(0.4)
+                nodes[replica].delay_gets(0.4)
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(client.get("k"), timeout=0.15)
+                self.assertGreaterEqual(sum(client._late_hedge_legs.values()), 1)
+                await wait_for(
+                    lambda: client._late_hedge_legs == {},
+                    "the abandoned legs to finish and release their counts",
+                )
+            finally:
+                await client.close()
+        finally:
+            await self.stop_cluster(nodes, discovery)
+
+
 class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
     """Issue #67: connect() must tolerate a node that discovery still lists
     but that can't be reached (dead, not yet evicted), the way steady-state
