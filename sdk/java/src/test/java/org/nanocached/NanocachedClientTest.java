@@ -5551,7 +5551,8 @@ class NanocachedClientTest {
 
     @org.junit.jupiter.api.AfterEach
     void resetMaxInFlightHedgeLoserLegs() {
-        NanocachedClient.maxInFlightHedgeLoserLegs = 32;
+        NanocachedClient.maxInFlightHedgeLoserLegs = 256;
+        NanocachedClient.hedgeSuspectLateLegs = 32;
     }
 
     @Test
@@ -5589,6 +5590,172 @@ class NanocachedClientTest {
                 Set<?> hedgedReads = (Set<?>) hedgedReadsField.get(client);
                 assertTrue(hedgedReads.isEmpty(),
                         "the awaited loser must already be gone, not left for close() to drain");
+            }
+        }
+    }
+
+    /** {@code count} keys, none of them stored, whose primary is {@code
+     * primary} (replication 2 over the cluster's two nodes). */
+    private static List<String> keysWithPrimary(String primary, int count) {
+        HashRing ring = new HashRing(NAMES);
+        List<String> keys = new ArrayList<>();
+        for (int i = 0; keys.size() < count; i++) {
+            String key = "late-" + i;
+            if (ring.owners(key.getBytes(StandardCharsets.UTF_8), 2).get(0).equals(primary)) {
+                keys.add(key);
+            }
+        }
+        return keys;
+    }
+
+    /** Reads {@code keys} in turn from a client hedging after 50 ms against
+     * a primary that takes {@code delayMillis} to answer, so that each read
+     * leaves one late leg behind. */
+    private static void leaveLateLegs(NanocachedClient client, List<String> keys) {
+        for (String key : keys) {
+            assertEquals(Optional.of("v"), client.get(key));
+        }
+    }
+
+    // The mock serves one connection's requests one after another, so a
+    // primary that delays every answer holds all of its late legs: they
+    // finish one delay apart, the first not before the delay is over.
+    private static final long LATE_HEDGE_AFTER_MILLIS = 200;
+    private static final long LATE_PRIMARY_DELAY_MILLIS = 1200;
+
+    /** Elapsed milliseconds of a fourth read after three reads that each
+     * left a late leg on the primary, with the threshold set to {@code
+     * threshold}; also reports how many late legs the primary had. */
+    private long fourthReadMillis(int threshold, int[] lateLegsOut) throws Exception {
+        NanocachedClient.hedgeSuspectLateLegs = threshold;
+        try (Cluster cluster = startCluster(2)) {
+            String primary = new HashRing(NAMES).owners("late-0".getBytes(StandardCharsets.UTF_8), 2).get(0);
+            List<String> keys = keysWithPrimary(primary, 4);
+            try (NanocachedClient client =
+                    connectWithReadHedgeAfter(cluster.discovery().port(), LATE_HEDGE_AFTER_MILLIS)) {
+                for (String key : keys) {
+                    client.set(key, "v");
+                }
+                cluster.nodes().get(primary).delayGets(LATE_PRIMARY_DELAY_MILLIS);
+                leaveLateLegs(client, keys.subList(0, 3));
+                lateLegsOut[0] = client.lateHedgeLegs.getOrDefault(primary, 0);
+
+                long start = System.nanoTime();
+                assertEquals(Optional.of("v"), client.get(keys.get(3)));
+                return (System.nanoTime() - start) / 1_000_000;
+            }
+        }
+    }
+
+    @Test
+    void aSilentPrimaryIsTriedLastOnceItHasEnoughLateLegs() throws Exception {
+        int[] late = new int[1];
+        long elapsedMillis = fourthReadMillis(3, late);
+        assertEquals(3, late[0]);
+        assertTrue(elapsedMillis < LATE_HEDGE_AFTER_MILLIS - HEDGE_TIMING_TOLERANCE_MILLIS,
+                "expected the replica's answer without the hedge interval, took " + elapsedMillis + "ms");
+    }
+
+    @Test
+    void anOwnerBelowTheThresholdIsStillAskedFirst() throws Exception {
+        int[] late = new int[1];
+        long elapsedMillis = fourthReadMillis(4, late);
+        assertEquals(3, late[0]);
+        assertTrue(elapsedMillis >= LATE_HEDGE_AFTER_MILLIS - HEDGE_TIMING_TOLERANCE_MILLIS,
+                "three late legs are below the threshold of four, so the primary is asked first and the "
+                        + "replica only after the hedge interval, took " + elapsedMillis + "ms");
+    }
+
+    @Test
+    void aMissStillWaitsForTheDemotedPrimary() throws Exception {
+        NanocachedClient.hedgeSuspectLateLegs = 2;
+        try (Cluster cluster = startCluster(2)) {
+            String primary = new HashRing(NAMES).owners("late-0".getBytes(StandardCharsets.UTF_8), 2).get(0);
+            String replica = primary.equals(NAMES.get(0)) ? NAMES.get(1) : NAMES.get(0);
+            List<String> keys = keysWithPrimary(primary, 3);
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
+                client.set(keys.get(0), "v");
+                client.set(keys.get(1), "v");
+                cluster.nodes().get(primary).delayGets(300);
+                leaveLateLegs(client, keys.subList(0, 2));
+                assertEquals(2, client.lateHedgeLegs.get(primary));
+
+                int replicaBefore = cluster.nodes().get(replica).getCount.get();
+                long start = System.nanoTime();
+                assertEquals(Optional.empty(), client.get(keys.get(2)));
+                long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+                assertEquals(replicaBefore + 1, cluster.nodes().get(replica).getCount.get(),
+                        "the replica is asked first and its miss is only provisional");
+                assertTrue(elapsedMillis >= 300 - HEDGE_TIMING_TOLERANCE_MILLIS,
+                        "the primary's answer is still waited for, took " + elapsedMillis + "ms");
+            }
+        }
+    }
+
+    @Test
+    void demotingKeepsTheOrderWhenNoOwnerOrEveryOwnerIsSilent() throws Exception {
+        NanocachedClient.hedgeSuspectLateLegs = 2;
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                List<String> names = List.of("a", "b", "c");
+                assertSame(names, client.demoteSilentOwners(names), "nobody is late");
+
+                client.lateHedgeLegs.put("b", 1);
+                assertEquals(names, client.demoteSilentOwners(names), "below the threshold");
+
+                client.lateHedgeLegs.put("a", 2);
+                assertEquals(List.of("b", "c", "a"), client.demoteSilentOwners(names));
+
+                client.lateHedgeLegs.put("c", 5);
+                assertEquals(List.of("b", "a", "c"), client.demoteSilentOwners(names),
+                        "silent owners keep their relative order");
+
+                client.lateHedgeLegs.put("b", 2);
+                assertEquals(names, client.demoteSilentOwners(names), "every owner is silent");
+                client.lateHedgeLegs.clear();
+            }
+        }
+    }
+
+    @Test
+    void aBurstOfReadsToAHealthyClusterDemotesNobody() throws Exception {
+        NanocachedClient.hedgeSuspectLateLegs = 2;
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 500)) {
+                client.set("k", "v");
+                ExecutorService pool = Executors.newFixedThreadPool(32);
+                try {
+                    List<Future<Optional<String>>> reads = new ArrayList<>();
+                    for (int i = 0; i < 200; i++) {
+                        reads.add(pool.submit(() -> client.get("k")));
+                    }
+                    for (Future<Optional<String>> read : reads) {
+                        assertEquals(Optional.of("v"), read.get());
+                    }
+                } finally {
+                    pool.shutdownNow();
+                }
+                assertTrue(client.lateHedgeLegs.isEmpty(),
+                        "reads that are in flight but not late count for nothing: " + client.lateHedgeLegs);
+            }
+        }
+    }
+
+    @Test
+    void lateLegsAreNoLongerCountedOnceTheyHaveFinished() throws Exception {
+        NanocachedClient.hedgeSuspectLateLegs = 3;
+        try (Cluster cluster = startCluster(2)) {
+            String primary = new HashRing(NAMES).owners("late-0".getBytes(StandardCharsets.UTF_8), 2).get(0);
+            List<String> keys = keysWithPrimary(primary, 3);
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
+                for (String key : keys) {
+                    client.set(key, "v");
+                }
+                cluster.nodes().get(primary).delayGets(150);
+                leaveLateLegs(client, keys);
+                assertFalse(client.lateHedgeLegs.isEmpty(), "the primary's legs are still running");
+                waitFor(() -> client.lateHedgeLegs.isEmpty(), "the late legs to be released");
             }
         }
     }
