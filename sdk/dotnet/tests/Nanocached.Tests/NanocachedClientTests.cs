@@ -5615,6 +5615,173 @@ public class NanocachedClientTests
         }
     }
 
+    // The mock serves one connection's requests one after another, so a
+    // primary that delays every answer holds all of its late legs: they
+    // finish one delay apart, the first not before the delay is over.
+    private const int LateHedgeAfterMillis = 200;
+    private const int LatePrimaryDelayMillis = 1200;
+
+    /// <summary>Restores the hedge tunables a test lowers.</summary>
+    private sealed class HedgeTuning : IDisposable
+    {
+        private readonly int _cap = NanocachedClient.MaxInFlightHedgeLoserLegs;
+        private readonly int _suspect = NanocachedClient.HedgeSuspectLateLegs;
+
+        public void Dispose()
+        {
+            NanocachedClient.MaxInFlightHedgeLoserLegs = _cap;
+            NanocachedClient.HedgeSuspectLateLegs = _suspect;
+        }
+    }
+
+    /// <summary><paramref name="count"/> keys whose primary is
+    /// <paramref name="primary"/> (replication 2 over two nodes).</summary>
+    private static List<string> KeysWithPrimary(string primary, int count)
+    {
+        var keys = new List<string>();
+        for (int i = 0; keys.Count < count; i++)
+        {
+            string key = $"late-{i}";
+            if (OwnersOf(key)[0] == primary) keys.Add(key);
+        }
+        return keys;
+    }
+
+    private static async Task<NanocachedClient> ConnectHedging(Cluster cluster, int hedgeAfterMillis) =>
+        await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadHedgeAfter = TimeSpan.FromMilliseconds(hedgeAfterMillis),
+        });
+
+    /// <summary>Elapsed milliseconds of a fourth read after three reads that
+    /// each left a late leg on the primary, with the threshold set to
+    /// <paramref name="threshold"/>; also the primary's late legs.</summary>
+    private static async Task<(long Elapsed, int Late)> FourthReadAfterThreeLateLegs(int threshold)
+    {
+        using var tuning = new HedgeTuning();
+        NanocachedClient.HedgeSuspectLateLegs = threshold;
+        using Cluster cluster = StartCluster(replication: 2);
+        string primary = OwnersOf("late-0")[0];
+        List<string> keys = KeysWithPrimary(primary, 4);
+        using NanocachedClient client = await ConnectHedging(cluster, LateHedgeAfterMillis);
+        foreach (string key in keys) await client.SetAsync(key, "v");
+        cluster.Nodes[primary].DelayGets(LatePrimaryDelayMillis);
+        for (int i = 0; i < 3; i++) Assert.Equal("v", await client.GetAsync(keys[i]));
+        int late = client.LateHedgeLegsOf(primary);
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        Assert.Equal("v", await client.GetAsync(keys[3]));
+        return (stopwatch.ElapsedMilliseconds, late);
+    }
+
+    [Fact]
+    public async Task ASilentPrimaryIsTriedLastOnceItHasEnoughLateLegs()
+    {
+        (long elapsed, int late) = await FourthReadAfterThreeLateLegs(threshold: 3);
+        Assert.Equal(3, late);
+        Assert.True(elapsed < LateHedgeAfterMillis - HedgeTimingToleranceMillis,
+            $"expected the replica's answer without the hedge interval, took {elapsed}ms");
+    }
+
+    [Fact]
+    public async Task AnOwnerBelowTheThresholdIsStillAskedFirst()
+    {
+        (long elapsed, int late) = await FourthReadAfterThreeLateLegs(threshold: 4);
+        Assert.Equal(3, late);
+        Assert.True(elapsed >= LateHedgeAfterMillis - HedgeTimingToleranceMillis,
+            $"three late legs are below the threshold of four, so the primary is asked first and the replica only after the hedge interval, took {elapsed}ms");
+    }
+
+    [Fact]
+    public async Task AMissStillWaitsForTheDemotedPrimary()
+    {
+        using var tuning = new HedgeTuning();
+        NanocachedClient.HedgeSuspectLateLegs = 2;
+        using Cluster cluster = StartCluster(replication: 2);
+        string primary = OwnersOf("late-0")[0];
+        string replica = OwnersOf("late-0")[1];
+        List<string> keys = KeysWithPrimary(primary, 3);
+        using NanocachedClient client = await ConnectHedging(cluster, 50);
+        await client.SetAsync(keys[0], "v");
+        await client.SetAsync(keys[1], "v");
+        cluster.Nodes[primary].DelayGets(300);
+        Assert.Equal("v", await client.GetAsync(keys[0]));
+        Assert.Equal("v", await client.GetAsync(keys[1]));
+        Assert.Equal(2, client.LateHedgeLegsOf(primary));
+
+        int replicaBefore = cluster.Nodes[replica].GetCount;
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        Assert.Null(await client.GetAsync(keys[2]));
+        stopwatch.Stop();
+
+        Assert.Equal(replicaBefore + 1, cluster.Nodes[replica].GetCount);
+        Assert.True(stopwatch.ElapsedMilliseconds >= 300 - HedgeTimingToleranceMillis,
+            $"the primary's answer is still waited for, took {stopwatch.ElapsedMilliseconds}ms");
+    }
+
+    [Fact]
+    public async Task DemotingKeepsTheOrderWhenNoOwnerOrEveryOwnerIsSilent()
+    {
+        using var tuning = new HedgeTuning();
+        NanocachedClient.HedgeSuspectLateLegs = 2;
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client = await ConnectHedging(cluster, 50);
+        IReadOnlyList<string> names = new[] { "a", "b", "c" };
+
+        Assert.Same(names, client.DemoteSilentOwners(names));
+
+        client.SetLateHedgeLegsForTest("b", 1);
+        Assert.Equal(names, client.DemoteSilentOwners(names));
+
+        client.SetLateHedgeLegsForTest("a", 2);
+        Assert.Equal(new[] { "b", "c", "a" }, client.DemoteSilentOwners(names));
+
+        client.SetLateHedgeLegsForTest("c", 5);
+        Assert.Equal(new[] { "b", "a", "c" }, client.DemoteSilentOwners(names));
+
+        client.SetLateHedgeLegsForTest("b", 2);
+        Assert.Equal(names, client.DemoteSilentOwners(names));
+
+        foreach (string name in names) client.SetLateHedgeLegsForTest(name, 0);
+        Assert.Equal(0, client.LateHedgeLegsTotal);
+    }
+
+    [Fact]
+    public async Task ABurstOfReadsToAHealthyClusterDemotesNobody()
+    {
+        using var tuning = new HedgeTuning();
+        NanocachedClient.HedgeSuspectLateLegs = 2;
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client = await ConnectHedging(cluster, 500);
+        await client.SetAsync("k", "v");
+
+        string?[] values = await Task.WhenAll(
+            Enumerable.Range(0, 200).Select(_ => Task.Run(() => client.GetAsync("k"))));
+
+        Assert.All(values, value => Assert.Equal("v", value));
+        Assert.Equal(0, client.LateHedgeLegsTotal);
+    }
+
+    [Fact]
+    public async Task LateLegsAreNoLongerCountedOnceTheyHaveFinished()
+    {
+        using var tuning = new HedgeTuning();
+        NanocachedClient.HedgeSuspectLateLegs = 3;
+        using Cluster cluster = StartCluster(replication: 2);
+        string primary = OwnersOf("late-0")[0];
+        List<string> keys = KeysWithPrimary(primary, 3);
+        using NanocachedClient client = await ConnectHedging(cluster, 50);
+        foreach (string key in keys) await client.SetAsync(key, "v");
+        cluster.Nodes[primary].DelayGets(150);
+        foreach (string key in keys) Assert.Equal("v", await client.GetAsync(key));
+        Assert.NotEqual(0, client.LateHedgeLegsTotal);
+
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (client.LateHedgeLegsTotal != 0 && DateTime.UtcNow < deadline) await Task.Delay(10);
+        Assert.Equal(0, client.LateHedgeLegsTotal);
+    }
+
     [Fact]
     public async Task HedgeLegRacingCloseIsRefusedNotRegistered()
     {
