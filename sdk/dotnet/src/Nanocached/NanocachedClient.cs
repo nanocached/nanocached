@@ -386,6 +386,13 @@ public sealed class NanocachedClient : IDisposable
     // the set empty. Held only briefly on both sides (never across a leg's
     // own await), so it doesn't serialize the reads themselves.
     private readonly object _hedgedReadsLock = new();
+    // Per owner, the hedge legs that were still unanswered when the hedge
+    // interval elapsed and have not finished since (see DemoteSilentOwners).
+    // An entry is removed when its count reaches 0; _lateHedgeTotal lets a
+    // read skip the lock while no owner has any.
+    private readonly Dictionary<string, int> _lateHedgeLegs = new();
+    private readonly object _lateHedgeLock = new();
+    private int _lateHedgeTotal;
     private readonly CancellationTokenSource _lifetime = new();
 
     // Observability for failures this client swallows by design — see
@@ -4225,7 +4232,13 @@ public sealed class NanocachedClient : IDisposable
     private async Task<T> ReadHedgedAsync<T>(
         Func<Connection, Task<T>> op, IReadOnlyList<string> names, TimeSpan hedgeAfter)
     {
+        // The primary is tracked by name: DemoteSilentOwners may move it away
+        // from index 0, and only its miss is final.
+        string primary = names[0];
+        names = DemoteSilentOwners(names);
         var legIndex = new Dictionary<Task<T>, int>();
+        // Legs already counted as late, so each is counted once.
+        var lateCounted = new HashSet<Task<T>>();
 
         Task<T> StartLeg(int index)
         {
@@ -4278,7 +4291,13 @@ public sealed class NanocachedClient : IDisposable
                 Task winner = await Task.WhenAny(waitable).ConfigureAwait(false);
                 if (winner == timer)
                 {
-                    // Hedge interval elapsed with no answer: one more owner.
+                    // Hedge interval elapsed with no answer: every leg still
+                    // unanswered is late, which is what marks its owner as
+                    // silent; then one more owner.
+                    foreach (Task<T> leg in pending)
+                    {
+                        if (lateCounted.Add(leg)) CountLateLeg(names[legIndex[leg]], leg);
+                    }
                     pending.Add(StartLeg(nextIndex));
                     nextIndex++;
                     continue;
@@ -4323,7 +4342,7 @@ public sealed class NanocachedClient : IDisposable
                 continue;
             }
 
-            if (value is not null || index == 0)
+            if (value is not null || names[index] == primary)
             {
                 await ResolveHedgeLosersAsync(pending).ConfigureAwait(false);
                 return value;
@@ -4342,6 +4361,81 @@ public sealed class NanocachedClient : IDisposable
 
         if (replicaMissed) return default!;
         throw lastError ?? new ConnectionLostException("nanocached: no owner is reachable for this key");
+    }
+
+    /// <summary>Moves owners that have stopped answering to the end of
+    /// <paramref name="names"/>, keeping the relative order of both groups:
+    /// an owner with at least <see cref="HedgeSuspectLateLegs"/> late hedge
+    /// legs outstanding is one whose reads are mostly being answered by its
+    /// replica anyway, so the replica is asked first. The order is left
+    /// alone when no owner or every owner is in that state: with none there
+    /// is nothing to demote, and with all of them the primary's position
+    /// still decides which answer is final.</summary>
+    internal IReadOnlyList<string> DemoteSilentOwners(IReadOnlyList<string> names)
+    {
+        if (Volatile.Read(ref _lateHedgeTotal) == 0) return names;
+        int threshold = HedgeSuspectLateLegs;
+        var answering = new List<string>(names.Count);
+        var silent = new List<string>();
+        lock (_lateHedgeLock)
+        {
+            foreach (string name in names)
+            {
+                if (_lateHedgeLegs.TryGetValue(name, out int late) && late >= threshold)
+                {
+                    silent.Add(name);
+                }
+                else
+                {
+                    answering.Add(name);
+                }
+            }
+        }
+        if (silent.Count == 0 || answering.Count == 0) return names;
+        answering.AddRange(silent);
+        return answering;
+    }
+
+    /// <summary>Counts <paramref name="leg"/> as late for
+    /// <paramref name="name"/> until it completes. The release is a
+    /// continuation, so it runs exactly once whether the leg is still
+    /// running, finishes right now, or has already finished.</summary>
+    private void CountLateLeg(string name, Task leg)
+    {
+        lock (_lateHedgeLock)
+        {
+            _lateHedgeLegs[name] = _lateHedgeLegs.GetValueOrDefault(name) + 1;
+            _lateHedgeTotal++;
+        }
+        leg.ContinueWith(
+            _ =>
+            {
+                lock (_lateHedgeLock)
+                {
+                    int late = _lateHedgeLegs[name];
+                    if (late <= 1) _lateHedgeLegs.Remove(name);
+                    else _lateHedgeLegs[name] = late - 1;
+                    _lateHedgeTotal--;
+                }
+            },
+            TaskScheduler.Default);
+    }
+
+    internal int LateHedgeLegsOf(string name)
+    {
+        lock (_lateHedgeLock) return _lateHedgeLegs.GetValueOrDefault(name);
+    }
+
+    internal int LateHedgeLegsTotal => Volatile.Read(ref _lateHedgeTotal);
+
+    internal void SetLateHedgeLegsForTest(string name, int count)
+    {
+        lock (_lateHedgeLock)
+        {
+            _lateHedgeTotal += count - _lateHedgeLegs.GetValueOrDefault(name);
+            if (count <= 0) _lateHedgeLegs.Remove(name);
+            else _lateHedgeLegs[name] = count;
+        }
     }
 
     /// <summary>issue #276: <paramref name="tasks"/> is this read's own
@@ -5103,7 +5197,22 @@ public sealed class NanocachedClient : IDisposable
     // slow owner can't accumulate unbounded background legs. Internal and
     // mutable only so tests can shrink it, mirroring
     // MaxInFlightBackgroundReplicaWrites.
-    internal static int MaxInFlightHedgeLoserLegs = 32;
+    //
+    // 256, well above HedgeSuspectLateLegs times the replication factor: a
+    // cap this low used to be the only thing standing between a read and a
+    // stopped owner, and every read past it waited for that owner's request
+    // timeout. Now an owner that has stopped answering is moved to the end of
+    // the order first (see DemoteSilentOwners), so the cap only binds when
+    // every owner of a key is slow.
+    internal static int MaxInFlightHedgeLoserLegs = 256;
+
+    // An owner with this many hedge legs that were still unanswered when the
+    // hedge interval elapsed is treated as having stopped answering and is
+    // asked last (see DemoteSilentOwners). Counts legs that are late, not
+    // merely in flight: a burst of concurrent reads to a healthy owner has
+    // many in flight and none late. Internal and mutable only so tests can
+    // lower it.
+    internal static int HedgeSuspectLateLegs = 32;
 
 
     private void StartKeepAlive()
