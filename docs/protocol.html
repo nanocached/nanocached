@@ -603,9 +603,53 @@ window is the same one the pre-tags protocol always had.</p>
 </table>
 </div>
 
+<h2 id="lq">L / Q — list nodes, list proxies</h2>
+<pre><code>L\n
+Q\n</code></pre>
+<p>These two are sent to a <em>discovery server</em>, not to a cache node
+(a node answers them <code>En\n</code>). They take no arguments: anything
+after the letter, or a lowercase <code>l</code>, is a malformed request,
+answered <code>Ed\n</code> with the connection closed. When the discovery
+server has an auth secret, send <code>A</code> first, as for any other
+command; without one, <code>Ed\n</code>.</p>
+<p><code>L</code> lists the cache nodes currently in the cluster:</p>
+<pre><code>N &lt;count&gt; &lt;replication&gt;\n
+&lt;name-length&gt; &lt;address-length&gt;\n&lt;name&gt;&lt;address&gt;\n    (&lt;count&gt; times)</code></pre>
+<p><code>Q</code> lists the proxies registered with it, in the same shape
+without the replication field:</p>
+<pre><code>N &lt;count&gt;\n
+&lt;name-length&gt; &lt;address-length&gt;\n&lt;name&gt;&lt;address&gt;\n    (&lt;count&gt; times)</code></pre>
+<p><code>&lt;replication&gt;</code> is the cluster&rsquo;s replication factor, the
+number of nodes that hold each key. <code>&lt;name&gt;</code> is the
+node&rsquo;s identity: an opaque string, chosen by the node, that the
+client hashes to place the node on the ring; it is not an address and
+carries no meaning of its own. <code>&lt;address&gt;</code> is
+<code>host:port</code> and is only for opening a connection. Both lengths
+are in bytes. Every entry ends with a <code>\n</code> that neither length
+counts, so the next entry&rsquo;s header starts right after it. An empty list
+is <code>N 0\n</code> for <code>Q</code>. For example, one node and no
+proxies, with replication factor 2:</p>
+<pre><code>L
+N 1 2
+36 15
+5b5e966a-925e-44ff-ba6e-1859cce25af6127.0.0.1:19456
+
+Q
+N 0</code></pre>
+<p>While a discovery server is inside its startup grace after a restart,
+<code>L</code> and <code>Q</code> are answered <code>B\n</code> and the
+connection is closed, because a partial list would read as a cluster that
+has fewer nodes (or no proxies) than it does; retry shortly. <code>L</code>
+is answered the same way while most of the nodes that reported a
+replication factor disagree with the discovery server&rsquo;s own. Several
+requests can follow one another on a connection and are answered in
+order. The replies are never <a href="#tags">tagged</a>: a connection that
+asked for tags is answered <code>OdT</code> to its <code>A</code> and still
+gets the plain <code>N</code> reply, which has no tag field.</p>
+
 <h2 id="cluster">Cluster-internal commands</h2>
 <p>Nodes, discovery servers, and SDKs additionally exchange membership
-and migration frames — <code>L</code> (node list),
+and migration frames — <code>L</code> (node list, <a href="#lq">above</a>),
 <code>J</code>/<code>H</code>/<code>P</code> (join, heartbeat,
 announce), <code>M</code>/<code>X</code>/<code>C</code> (migrate,
 cancel, complete), <code>Y</code>/<code>Z</code>/<code>Q</code> (proxy
@@ -657,8 +701,8 @@ abandoned, and not registered since), and on <code>G</code> the node
 abandons that handoff. A sender that put the field in must read that
 line. Two of these are part of what SDKs send and are frozen by the
 <a href="compatibility.html">compatibility policy</a> like the caching
-commands: <code>L</code> (the node list) and <code>Q</code> (the proxy
-list). The rest are versioned with the server and not part of the
+commands: <a href="#lq"><code>L</code> (the node list) and <code>Q</code> (the proxy
+list)</a>. The rest are versioned with the server and not part of the
 public caching API, so the
 <a href="compatibility.html#internal">compatibility policy</a> does not
 freeze them; the server source documents them in detail.</p>
