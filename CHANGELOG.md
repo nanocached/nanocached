@@ -12,6 +12,13 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nanocached-discovery`: a request that did not parse (an unknown command,
+  `A 0`, a length that is not a number, a stray token) closed the
+  connection without a byte. It is now answered `Ed\n` before the close,
+  as the protocol page lists it and as a node answers `En\n` (#1408).
+
 ## [0.6.2] - 2026-11-03
 
 ### Fixed
