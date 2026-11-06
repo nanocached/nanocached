@@ -40,6 +40,13 @@ stay readable during development.</p>
 <a href="compatibility.html#wire">compatibility policy</a> says what that
 covers.</p>
 
+<p>The transcripts on this page show the bytes on the wire: a line
+starting with <code>&gt;</code> is sent, a line starting with
+<code>&lt;</code> is what the server answers, <code>\n</code> stands for a
+newline and <code>\0</code> for a zero byte, a line starting with
+<code>#</code> is a comment, and <code>= closed</code> means the server then
+closes the connection. A line ending carries no newline of its own.</p>
+
 <p>Multiple requests per connection and pipelining are both supported. A
 <code>&lt;key-length&gt;</code> of <code>0</code> is rejected for every
 command; there is no dedicated key or value length limit beyond the
@@ -84,6 +91,16 @@ leading zero other than a lone <code>0</code>, within the range of an
 discovery server read numbers the same way (the proxy answers a bare
 <code>E\n</code> where a node answers <code>En\n</code>).</p>
 
+<pre class="session"><code>&gt; S 4 5\nnameAlice
+&lt; S\n
+# leading zeros are the same number
+&gt; G 04\nname
+&lt; V 5\nAlice
+# a delta takes none
+&gt; i 0 4 007\nname
+&lt; En\n
+= closed</code></pre>
+
 <h2 id="a">A — authenticate</h2>
 <pre><code>A &lt;secret-length&gt;\n&lt;secret&gt;</code></pre>
 <p>Responds <code>On\n</code> on success or <code>En\n</code> followed by
@@ -121,6 +138,21 @@ SDKs additionally append
 a <code>T</code> field (<code>A &lt;secret-length&gt; T\n</code>) to
 request <a href="#tags">response tags</a>; a server that supports them
 echoes the capability as <code>OnT</code>/<code>OdT</code>.</div>
+<p>A server with no secret, asked for tags with the placeholder secret:</p>
+<pre class="session"><code>&gt; A 1 T R\n\0
+&lt; OnT\n</code></pre>
+<p>A server started with the secret <code>hunter2</code>:</p>
+<pre class="session" data-secret="hunter2"><code>&gt; G 1\nk
+&lt; En\n
+= closed</code></pre>
+<pre class="session" data-secret="hunter2"><code>&gt; A 7\nhunter2
+&lt; On\n
+&gt; G 1\nk
+&lt; N\n</code></pre>
+<pre class="session" data-secret="hunter2"><code>&gt; A 5\nwrong
+&lt; En\n
+= closed</code></pre>
+
 
 <h2 id="g">G — get</h2>
 <pre><code>G &lt;key-length&gt;\n&lt;key&gt;</code></pre>
@@ -144,11 +176,33 @@ a <code>&lt;key-length&gt;</code> of <code>0</code> is not allowed). It is
 stored like any other, by <code>S</code> or by a batched <code>o</code>:
 <code>G</code> answers <code>V 0\n</code> — a hit with no bytes after the
 header, not a miss — and <code>m</code> a result of <code>0</code>.</p>
+<p>A TTL of <code>0</code> has already elapsed, and an empty value is a hit:</p>
+<pre class="session"><code>&gt; S 4 5 0\nnameAlice
+&lt; S\n
+&gt; G 4\nname
+&lt; N\n
+&gt; S 5 0\nempty
+&lt; S\n
+&gt; G 5\nempty
+&lt; V 0\n</code></pre>
+
 
 <h2 id="d">D — delete</h2>
 <pre><code>D &lt;key-length&gt;\n&lt;key&gt;</code></pre>
 <p>Responds <code>D\n</code> if the key existed, <code>N\n</code>
 otherwise.</p>
+
+<p>Set, read, delete, and read again:</p>
+<pre class="session"><code>&gt; S 4 5\nnameAlice
+&lt; S\n
+&gt; G 4\nname
+&lt; V 5\nAlice
+&gt; D 4\nname
+&lt; D\n
+&gt; D 4\nname
+&lt; N\n
+&gt; G 4\nname
+&lt; N\n</code></pre>
 
 <h2 id="namespaces">g / s / d — namespaced get, set, delete</h2>
 <p>A <em>namespace</em> is a flat, opaque byte string that scopes a key:
@@ -185,6 +239,16 @@ Namespaced frames need a server that understands them; a pre-namespace
 node (0.3.0 or earlier) closes the connection without a reply, so upgrade
 every node before clients start using namespaces.</p>
 
+<p>The same key name in the default namespace and in <code>users</code>:</p>
+<pre class="session"><code>&gt; s 5 4 5\nusersnameAlice
+&lt; S\n
+&gt; g 5 4\nusersname
+&lt; V 5\nAlice
+&gt; G 4\nname
+&lt; N\n
+&gt; d 5 4\nusersname
+&lt; D\n</code></pre>
+
 <h2 id="clear">c / F — clear a namespace, flush everything</h2>
 <pre><code>c &lt;namespace-length&gt;\n&lt;namespace&gt;
 F\n</code></pre>
@@ -205,6 +269,15 @@ spread over all of them by rendezvous hashing) and each node clears its
 own share. A node that is mid-handoff to a joining node replays the
 clear there too, in order with the keys it is still sending, so a clear
 racing a join can't leave stale entries on the joiner.</p>
+
+<pre class="session"><code>&gt; s 5 4 5\nusersnameAlice
+&lt; S\n
+&gt; c 5\nusers
+&lt; C\n
+&gt; g 5 4\nusersname
+&lt; N\n
+&gt; F\n
+&lt; C\n</code></pre>
 
 <h2 id="incr">i — increment/decrement a counter</h2>
 <pre><code>i &lt;namespace-length&gt; &lt;key-length&gt; &lt;delta&gt;\n&lt;namespace&gt;&lt;key&gt;</code></pre>
@@ -268,6 +341,16 @@ the primary, because each writes its result to the replica on its own and
 the writes are not ordered.
 See <a href="architecture.html#accepted-behaviour">accepted
 behaviour</a>.</p>
+
+<p>A counter is an ordinary entry holding decimal text; <code>i</code> never creates one:</p>
+<pre class="session"><code>&gt; S 7 1\ncounter5
+&lt; S\n
+&gt; i 0 7 3\ncounter
+&lt; I 1\n8
+&gt; i 0 7 -10\ncounter
+&lt; I 2\n-2
+&gt; i 0 5 1\nother
+&lt; N\n</code></pre>
 
 <h2 id="cas">k / x — compare-and-set</h2>
 <pre><code>k &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; &lt;cond&gt; [&lt;ttl-seconds&gt;]\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;</code></pre>
@@ -348,6 +431,23 @@ SDK (or <code>nanocached-proxy</code> in proxy mode) writes the
 condition against its own possibly-different copy could reach a
 different outcome than the primary just did.</p>
 
+<p>Using the digest of the test vector above, and the digest of <code>v4</code>:</p>
+<pre class="session"><code>&gt; S 1 21\nknanocached-cas-vector
+&lt; S\n
+# the digest matches: replaced
+&gt; k 0 1 2 36287141940ca57acbd7695ccdde9d43\nkv2
+&lt; S\n
+# the key now holds v2, so the same digest no longer matches
+&gt; k 0 1 2 36287141940ca57acbd7695ccdde9d43\nkv3
+&lt; N\n
+# A: only if absent; P: only if present
+&gt; k 0 1 2 A\nkv4
+&lt; N\n
+&gt; k 0 1 2 P\nkv4
+&lt; S\n
+&gt; x 0 1 8e38a1ea5c681c8e9a08f1af465f1f07\nk
+&lt; D\n</code></pre>
+
 <h2 id="touch">t — refresh or remove an entry's TTL</h2>
 <pre><code>t &lt;namespace-length&gt; &lt;key-length&gt; [&lt;ttl-seconds&gt;] [G]\n&lt;namespace&gt;&lt;key&gt;</code></pre>
 <p>Replaces the TTL of an existing entry in place, without rewriting its
@@ -403,6 +503,23 @@ back the earlier value &mdash; see
 connection (from 0.4.8 on it answers <code>En\n</code> first; before that
 it closed without a reply), so upgrade every node before clients start
 sending it.</p>
+
+<pre class="session"><code>&gt; S 4 5\nnameAlice
+&lt; S\n
+&gt; t 0 4 60\nname
+&lt; S\n
+# with G: the value, and the TTL now in effect
+&gt; t 0 4 60 G\nname
+&lt; V 5 60\nAlice
+# no TTL removes it; 0 expires the entry at once
+&gt; t 0 4\nname
+&lt; S\n
+&gt; t 0 4 0\nname
+&lt; S\n
+&gt; G 4\nname
+&lt; N\n
+&gt; t 0 4 60\nname
+&lt; N\n</code></pre>
 
 <h2 id="multi-touch">y — batched touch</h2>
 <pre><code>y &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt; [&lt;ttl-seconds&gt;] [G]\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;</code></pre>
@@ -466,6 +583,11 @@ node's own reply only.</p>
 connection (from 0.4.8 on it answers <code>En\n</code> first; before that
 it closed without a reply), so upgrade every node before clients start
 sending it.</p>
+
+<pre class="session"><code>&gt; o 0 2 1 1 1 1\nkalb
+&lt; O 2 S S\n
+&gt; y 0 2 1 1 60\nkl
+&lt; Y 2 S S\n</code></pre>
 
 <h2 id="multi">m / o — batched get and set</h2>
 <pre><code>m &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt;\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;</code></pre>
@@ -545,6 +667,12 @@ primary's outcome decides a key's client-facing status, replica outcomes
 being logged and swallowed exactly like a plain <code>S</code>'s
 replication already is.</p>
 
+<p>Two keys set in one frame, then three read — the third is missing:</p>
+<pre class="session"><code>&gt; o 0 2 1 1 1 1\nkalb
+&lt; O 2 S S\n
+&gt; m 0 3 1 1 1\nklz
+&lt; M 3 1 1 -\nab</code></pre>
+
 <h2 id="tags">Response tags (tagged mode)</h2>
 <p>Pipelined clients match responses to requests by order alone — the
 frames above carry nothing to verify against. A connection whose
@@ -596,6 +724,16 @@ same roster shape as the untagged form, with the tag appended as the
 header's own last field. Tagged mode is per connection and
 entirely opt-in — a plain <code>A</code> keeps every frame exactly as
 documented above.</p>
+
+<p>Every request ends its header with a tag and every reply echoes it:</p>
+<pre class="session"><code>&gt; A 1 T\n\0
+&lt; OnT\n
+&gt; S 4 5 7\nnameAlice
+&lt; S 7\n
+&gt; G 4 8\nname
+&lt; V 5 8\nAlice
+&gt; G 7 9\nmissing
+&lt; N 9\n</code></pre>
 
 <h3 id="untagged-desync">What an untagged connection cannot promise</h3>
 <p>Without tags, an SDK pairs each response with the oldest request
@@ -668,6 +806,14 @@ window is the same one the pre-tags protocol always had.</p>
   </tbody>
 </table>
 </div>
+
+<p>A request the server cannot parse, or a key of length 0:</p>
+<pre class="session"><code>&gt; G 0\n
+&lt; En\n
+= closed</code></pre>
+<pre class="session"><code>&gt; X\n
+&lt; En\n
+= closed</code></pre>
 
 <h2 id="lq">L / Q — list nodes, list proxies</h2>
 <pre><code>L\n
@@ -774,7 +920,7 @@ public caching API, so the
 freeze them; the server source documents them in detail.</p>
 
 <h2 id="example">A complete session</h2>
-<pre><code>$ printf 'S 4 5\nnameAliceG 4\nname' | nc 127.0.0.1 8356
+<pre class="shell"><code>$ printf 'S 4 5\nnameAliceG 4\nname' | nc 127.0.0.1 8356
 S
 V 5
 Alice</code></pre>
