@@ -500,7 +500,21 @@ public final class NanocachedClient implements AutoCloseable {
     // synchronous" shape maxInFlightBackgroundReplicaWrites uses past its
     // own cap. Mutable only so tests can shrink it, mirroring
     // maxInFlightBackgroundReplicaWrites.
-    static volatile int maxInFlightHedgeLoserLegs = 32;
+    //
+    // 256, well above hedgeSuspectLateLegs times the replication factor: a
+    // cap this low used to be the only thing standing between a read and a
+    // stopped owner, and every read past it waited for that owner's request
+    // timeout. Now an owner that has stopped answering is moved to the end of
+    // the order first (see demoteSilentOwners), so the cap only binds when
+    // every owner of a key is slow.
+    static volatile int maxInFlightHedgeLoserLegs = 256;
+
+    // An owner with this many hedge legs that were still unanswered when the
+    // hedge interval elapsed is treated as having stopped answering and is
+    // asked last (see demoteSilentOwners). Counts legs that are late, not
+    // merely in flight: a burst of concurrent reads to a healthy owner has
+    // many in flight and none late. Mutable only so tests can lower it.
+    static volatile int hedgeSuspectLateLegs = 32;
 
     // Cap on the throwaway dialer pool openCluster spins up to bootstrap-
     // dial every discovered node concurrently (issue #178). Node counts are
@@ -585,6 +599,11 @@ public final class NanocachedClient implements AutoCloseable {
      * (never across a leg's own {@code join()}), so it doesn't serialize
      * the reads themselves. */
     private final Object hedgedReadsLock = new Object();
+
+    /** Per owner, the hedge legs that were still unanswered when the hedge
+     * interval elapsed and have not finished since. See {@link
+     * #demoteSilentOwners}. An entry is removed when its count reaches 0. */
+    final ConcurrentHashMap<String, Integer> lateHedgeLegs = new ConcurrentHashMap<>();
     /** Per-address reconnect cooldown (see {@link Options#reconnectCooldown}):
      * the address of the most recently failed dial, and how long it stays
      * "down" before another dial to it is attempted. Keyed by address, not
@@ -5045,7 +5064,13 @@ public final class NanocachedClient implements AutoCloseable {
      * #hedgedReads} exactly like a {@code fireAndForgetReplicas} write.
      */
     private <T> T readHedged(ConnectionOp<T> op, List<String> names) {
+        // The primary is tracked by name: demoteSilentOwners may move it
+        // away from index 0, and only its miss is final.
+        String primary = names.get(0);
+        names = demoteSilentOwners(names);
         HedgeSettlement<T> settlement = new HedgeSettlement<>(names.size());
+        // Legs already counted as late, so each is counted once.
+        Set<Integer> lateCounted = new HashSet<>();
         // Every leg started so far, keyed by index, so that once this read
         // decides its outcome the legs it leaves behind can be resolved
         // (issue #276) -- see resolveLosers. Plain HashMap: only ever
@@ -5084,8 +5109,15 @@ public final class NanocachedClient implements AutoCloseable {
             }
 
             if (index < 0) {
-                // Hedge interval elapsed with no answer: one more owner,
-                // without waiting for any leg already in flight.
+                // Hedge interval elapsed with no answer: every leg still
+                // unanswered is late, which is what marks its owner as
+                // silent; then one more owner, without waiting for any leg
+                // already in flight.
+                for (Map.Entry<Integer, CompletableFuture<Void>> leg : legFutures.entrySet()) {
+                    if (lateCounted.add(leg.getKey())) {
+                        countLateLeg(names.get(leg.getKey()), leg.getValue());
+                    }
+                }
                 legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
                 pendingCount++;
                 nextIndex++;
@@ -5115,7 +5147,7 @@ public final class NanocachedClient implements AutoCloseable {
                 throw outcome.fatal;
             } else if (outcome.failure != null) {
                 lastError = outcome.failure;
-            } else if (outcome.value != null || index == 0) {
+            } else if (outcome.value != null || names.get(index).equals(primary)) {
                 resolveLosers(legFutures.values());
                 return outcome.value;
             } else {
@@ -5136,6 +5168,45 @@ public final class NanocachedClient implements AutoCloseable {
         throw lastError != null
                 ? lastError
                 : new NanocachedException("nanocached: no owner is reachable for this key");
+    }
+
+    /** Moves owners that have stopped answering to the end of {@code names},
+     * keeping the relative order of both groups: an owner with at least
+     * {@link #hedgeSuspectLateLegs} late hedge legs outstanding is one
+     * whose reads are mostly being answered by its replica anyway, so the
+     * replica is asked first. The order is left alone when no owner or every
+     * owner is in that state: with none there is nothing to demote, and with
+     * all of them the primary's position still decides which answer is
+     * final. */
+    List<String> demoteSilentOwners(List<String> names) {
+        if (lateHedgeLegs.isEmpty()) {
+            return names;
+        }
+        int threshold = hedgeSuspectLateLegs;
+        List<String> answering = new ArrayList<>(names.size());
+        List<String> silent = new ArrayList<>();
+        for (String name : names) {
+            Integer late = lateHedgeLegs.get(name);
+            if (late != null && late >= threshold) {
+                silent.add(name);
+            } else {
+                answering.add(name);
+            }
+        }
+        if (silent.isEmpty() || answering.isEmpty()) {
+            return names;
+        }
+        answering.addAll(silent);
+        return answering;
+    }
+
+    /** Counts {@code leg} as late for {@code name} until it completes. The
+     * release is a completion callback, so it runs exactly once whether the
+     * leg is still running, finishes right now, or has already finished. */
+    private void countLateLeg(String name, CompletableFuture<Void> leg) {
+        lateHedgeLegs.merge(name, 1, Integer::sum);
+        leg.whenComplete((ignoredResult, ignoredError) ->
+                lateHedgeLegs.computeIfPresent(name, (key, late) -> late <= 1 ? null : late - 1));
     }
 
     /** Issue #276: {@link #readHedged} has already decided its outcome,
