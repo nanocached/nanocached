@@ -118,9 +118,9 @@ accepts a frame of at most 4096 bytes, which bounds the <code>A</code>
 frame itself (header and secret); a server refuses to start with a
 secret too long to fit.</p>
 <p>A failed <code>A</code> that asked for tags (a <code>T</code> field) is
-answered <code>EnT\n</code> by a node and <code>EdT\n</code> by a discovery
-server, echoing the capability as a success does; the proxy answers a plain
-<code>En\n</code>. Either way the connection is then closed.</p>
+answered <code>EnT\n</code> by a node and by the proxy and
+<code>EdT\n</code> by a discovery server, echoing the capability as a success
+does. Either way the connection is then closed.</p>
 <p>Send <code>A</code> once, as the first frame. A node and a discovery
 server accept a later <code>A</code> too and run it afresh: a matching one
 is answered <code>On</code>/<code>OnT</code> (<code>Od</code>/<code>OdT</code>)

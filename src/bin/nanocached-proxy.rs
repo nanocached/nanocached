@@ -7050,6 +7050,11 @@ async fn handle_client(
                         tagged = tagging;
                         retry_capable = retryable;
                         if tagging { b"OnT\n" } else { b"On\n" }
+                    } else if tagging {
+                        // A refusal echoes the `T` the client asked for, as
+                        // a node's does, so a client reads the same three
+                        // or four bytes whichever of the two it dialed.
+                        b"EnT\n"
                     } else {
                         b"En\n"
                     };
@@ -12820,6 +12825,18 @@ mod tests {
         let mut buf = BytesMut::new();
         stream.write_all(b"A 5\nwrong").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "En");
+
+        // Wrong secret from a client that asked for tags (with and without
+        // the retry capability): the refusal echoes the `T`, as a node's.
+        for frame in [&b"A 5 T\nwrong"[..], &b"A 5 T R\nwrong"[..]] {
+            let mut stream = TcpStream::connect(&proxy).await.unwrap();
+            let mut buf = BytesMut::new();
+            stream.write_all(frame).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "EnT");
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).await.unwrap();
+            assert!(rest.is_empty(), "closed after the refusal: {rest:?}");
+        }
 
         // No auth at all: E, closed.
         let mut stream = TcpStream::connect(&proxy).await.unwrap();
