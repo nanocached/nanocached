@@ -7001,6 +7001,7 @@ async fn handle_client(
     // the same way.
     let mut deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
 
+    let mut drain_rejected = false;
     let result: io::Result<()> = 'connection: loop {
         // Parse everything already buffered before reading more.
         loop {
@@ -7242,6 +7243,14 @@ async fn handle_client(
                     }
                 }
                 Err(_) => {
+                    // A request this proxy refuses to read on (over the
+                    // size limit, or malformed) has usually been sent in
+                    // part or whole behind its header. Once the client has
+                    // authenticated, the `E` is followed by a bounded read
+                    // of what is still arriving (`drain_rejected_request`,
+                    // below the loop); before that, a peer does not get to
+                    // hold its connection for that long.
+                    drain_rejected = authenticated;
                     let (response_tx, response_rx) = oneshot::channel();
                     let _ = response_tx.send(Err(Fatal::Transient));
                     let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
@@ -7415,8 +7424,42 @@ async fn handle_client(
 
     // Closing the FIFO lets the writer drain what's pending, then stop.
     drop(fifo_tx);
-    let _ = writer.await;
+    let writer_result = writer.await;
+    if drain_rejected && let Ok(mut write_half) = writer_result {
+        drain_rejected_request(&mut read_half, &mut write_half).await;
+    }
     result
+}
+
+/// How long `drain_rejected_request` keeps reading after the `E` for the
+/// client to close first. The node's `REJECTED_REQUEST_DRAIN_WINDOW`.
+const REJECTED_REQUEST_DRAIN_WINDOW: Duration = Duration::from_secs(1);
+
+/// After a refused request's `E`: half-close the write side (the client
+/// sees the reply and EOF at once), then read and discard what is still
+/// arriving, until the client closes, for at most
+/// `REJECTED_REQUEST_DRAIN_WINDOW` and a request's worth of bytes. Closing
+/// a socket that still has unread bytes in its receive buffer sends a
+/// reset, which can discard the `E` on the client's side before it is
+/// read; a client that keeps writing the body of an oversized request is
+/// exactly that. The node does the same for the same limit.
+async fn drain_rejected_request<R, W>(read_half: &mut R, write_half: &mut W)
+where
+    R: AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let _ = write_half.shutdown().await;
+    let drain = async {
+        let mut sink = [0_u8; 8192];
+        let mut discarded = 0;
+        while discarded < MAX_REQUEST_SIZE {
+            match read_half.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => discarded += n,
+            }
+        }
+    };
+    let _ = timeout(REJECTED_REQUEST_DRAIN_WINDOW, drain).await;
 }
 
 // ─── main ────────────────────────────────────────────────────────────
@@ -11961,6 +12004,38 @@ mod tests {
             },
             "no further replies after the fatal E"
         );
+    }
+
+    /// A request whose declared size is over the limit is answered `E` and
+    /// the connection closed; a client that keeps writing the body must
+    /// still be able to read that `E`. Closing a socket with unread bytes
+    /// in its receive buffer sends a reset, which can discard the reply on
+    /// the client's side, so the proxy reads what is still arriving (a
+    /// bounded amount, for a bounded time) before it drops the socket, as
+    /// the node does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_client_still_writing_an_oversized_request_reads_the_e() {
+        let (_nodes, proxy) = cluster(1).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        let declared = 2 * MAX_REQUEST_SIZE;
+        stream
+            .write_all(format!("S 3 {declared}\nkey").as_bytes())
+            .await
+            .unwrap();
+        // Half a MiB of the body keeps coming after the proxy has made its
+        // decision (within what it drains: a request's worth). A write
+        // error here (the proxy gone) is what the old behaviour looked
+        // like; the reply is what is checked.
+        let body = vec![b'v'; 64 * 1024];
+        for _ in 0..8 {
+            if stream.write_all(&body).await.is_err() {
+                break;
+            }
+        }
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+        let n = stream.read_buf(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "the proxy closes after the E");
     }
 
     #[tokio::test(flavor = "current_thread")]

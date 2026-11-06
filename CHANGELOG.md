@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a request whose declared size was over the 1 MiB
+  limit was answered `E` and the connection closed at once, with the rest
+  of the request still unread. Closing a socket with unread bytes sends a
+  reset, which could discard the `E` before a client that was still
+  writing the body read it. After an authenticated client's refused
+  request the proxy now half-closes, reads what is still arriving (at
+  most a request's worth, for at most one second) and then closes, as the
+  node does (#1408).
 - `nanocached-discovery`: a request that did not parse (an unknown command,
   `A 0`, a length that is not a number, a stray token) closed the
   connection without a byte. It is now answered `Ed\n` before the close,
