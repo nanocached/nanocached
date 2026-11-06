@@ -100,7 +100,9 @@ hostile)
   python3 -c 'import json,sys; [print(c["id"], c["port"], *c["args"]) for c in json.load(open(sys.argv[1]))["cases"]]' "$HERE/fixtures/hostile_cases.json" > "$OUT/cases.txt"
   while read -r id port cargs; do
     # the baseline is the memory reference the other cases are judged against
-    [ -n "${ONLY:-}" ] && [ "$id" != "$ONLY" ] && [ "$id" != baseline ] && continue
+    # ONLY is a glob on purpose (ONLY='tagged_*')
+    # shellcheck disable=SC2053
+    [ -n "${ONLY:-}" ] && [[ "$id" != $ONLY ]] && [ "$id" != baseline ] && continue
     # the six SDKs at once, each in a container of its own: the case's memory is the container's cgroup peak
     for sdk in $SDKS; do sc "$sdk" "$OUT/$id.$sdk.jsonl" $P-fx:$port 0 "" "${LIMIT:-90}" host "$id" $cargs & done
     wait_clients

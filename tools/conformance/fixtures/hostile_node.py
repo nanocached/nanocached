@@ -14,6 +14,22 @@ that port says. Only the cases of hostile_cases.json are served; the case ids pi
   bomb                   a 1 MiB raw-DEFLATE value (marker 0x01) that expands to 1 GiB
   backpressure           completes the handshake and then reads nothing at all
 
+  reply_unknown_status   `Z\\n`, a status letter no command has
+  reply_error_En         `En\\n`
+  reply_len_garbage      `V abc\\n`
+  reply_len_negative     `V -1\\n`
+  reply_len_missing      `V\\n`
+  reply_header_flood     1 MiB of bytes without a newline
+  reply_eof              closes the connection without a reply
+  reply_empty_line       `\\n`
+  tagged_baseline        the handshake is answered `OnT` (tag capability) and the get with `V 1024 <tag>`
+  tagged_unknown_status  `Z <tag>`
+  tagged_error           `E <tag>`
+  tagged_wrong_tag       `V 1 <another tag>` and one byte
+  tagged_missing_tag     `V 1` and one byte, in a connection that negotiated tags
+  tagged_len_garbage     `V abc <tag>`
+  reply_len_leading_zero `V 0001\\n` and one byte (a number with leading zeros, which the server accepts in a request)
+
   roster_count_over      (discovery) `N 65537 2`: one more node than the SDKs accept
   roster_bytes_over      (discovery) entries of 64 KiB + 64 KiB until the client hangs up, past the 16 MiB cap
   roster_unreachable     (discovery) 128 entries, none of them reachable (TEST-NET-3 addresses)
@@ -75,13 +91,14 @@ async def serve(case_id, reader, writer):
             request = await read_request(reader)
             if request is None:
                 return
-            cmd, _ = request
+            cmd, fields = request
             if cmd == b"A":
-                writer.write(b"Od\n" if case_id.startswith("roster_") else b"On\n")
+                tagged = case_id.startswith("tagged_")
+                writer.write(b"Od\n" if case_id.startswith("roster_") else (b"OnT\n" if tagged else b"On\n"))
             elif cmd == b"S":
-                writer.write(b"S\n")
+                writer.write(b"S %s\n" % fields[-1] if case_id.startswith("tagged_") else b"S\n")
             elif cmd == b"G":
-                await answer_get(case_id, writer)
+                await answer_get(case_id, writer, fields[-1] if case_id.startswith("tagged_") else b"")
             elif cmd == b"L":
                 await answer_list(case_id, writer)
             await writer.drain()
@@ -91,7 +108,7 @@ async def serve(case_id, reader, writer):
         writer.close()
 
 
-async def answer_get(case_id, writer):
+async def answer_get(case_id, writer, tag=b""):
     if case_id == "baseline":
         writer.write(b"V 1024\n" + b"x" * 1024)
     elif case_id == "trickle_ok":
@@ -119,6 +136,39 @@ async def answer_get(case_id, writer):
         await asyncio.sleep(3600)
     elif case_id == "bomb":
         writer.write(b"V %d\n" % len(BOMB) + BOMB)
+    elif case_id == "tagged_baseline":
+        writer.write(b"V 1024 %s\n" % tag + b"x" * 1024)
+    elif case_id == "tagged_unknown_status":
+        writer.write(b"Z %s\n" % tag)
+    elif case_id == "tagged_error":
+        writer.write(b"E %s\n" % tag)
+    elif case_id == "tagged_wrong_tag":
+        writer.write(b"V 1 %d\nx" % (int(tag) + 1000))
+    elif case_id == "tagged_missing_tag":
+        writer.write(b"V 1\nx")
+    elif case_id == "tagged_len_garbage":
+        writer.write(b"V abc %s\nxxx" % tag)
+    elif case_id == "reply_unknown_status":
+        writer.write(b"Z\n")
+    elif case_id == "reply_error_En":
+        writer.write(b"En\n")
+    elif case_id == "reply_len_garbage":
+        writer.write(b"V abc\nxxx")
+    elif case_id == "reply_len_negative":
+        writer.write(b"V -1\nx")
+    elif case_id == "reply_len_missing":
+        writer.write(b"V\n")
+    elif case_id == "reply_header_flood":
+        for _ in range(16):
+            writer.write(b"V " + b"9" * (65536 - 2))
+            await writer.drain()
+        await asyncio.sleep(3600)
+    elif case_id == "reply_eof":
+        writer.close()
+    elif case_id == "reply_empty_line":
+        writer.write(b"\n")
+    elif case_id == "reply_len_leading_zero":
+        writer.write(b"V 0001\nx")
 
 
 def entry(name, addr):

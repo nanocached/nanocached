@@ -221,6 +221,18 @@ async Task<Dictionary<string, object>> One(Step s)
             var keys = s.X.TryGetValue("keys", out var ks) && ks.Length > 0 ? ks.Split(',').Select(Latin).ToList() : new List<string>();
             return Many((Dictionary<string, byte[]>)await t.GetManyBytesAsync(keys), false);
         }
+        case "touch": case "get_touch": case "touch_many": case "get_many_touch":
+        {
+            // touch: "-" removes the TTL, 0 expires at once (unlike set, where both mean no expiry)
+            long? tt = s.Ttl == "-" ? null : ttl;
+            if (s.Op == "touch") return new() { ["outcome"] = "ok", ["result"] = (bool)await t.TouchAsync(key, tt) };
+            if (s.Op == "get_touch") return Hit((byte[]?)await t.GetAndTouchBytesAsync(key, tt));
+            var tkeys = s.X.TryGetValue("keys", out var tks) && tks.Length > 0 ? tks.Split(',').Select(Latin).ToList() : new List<string>();
+            if (s.Op == "get_many_touch") return Many((Dictionary<string, byte[]>)await t.GetManyAndTouchBytesAsync(tkeys, tt), false);
+            var touched = (Dictionary<string, bool>)await t.TouchManyAsync(tkeys, tt);
+            var titems = touched.OrderBy(e => e.Key, StringComparer.Ordinal).Select(e => new[] { Convert.ToBase64String(Encoding.Latin1.GetBytes(e.Key)), e.Value ? "S" : "N" }).ToList();
+            return new() { ["outcome"] = "ok", ["items"] = titems };
+        }
         case "many_set_gen":
         {
             int n = int.Parse(s.X["n"]), vlen = int.Parse(s.X["vlen"]); var prefix = Latin(s.X["prefix"]);
