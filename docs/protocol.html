@@ -43,10 +43,16 @@ covers.</p>
 <p>Multiple requests per connection and pipelining are both supported. A
 <code>&lt;key-length&gt;</code> of <code>0</code> is rejected for every
 command; there is no dedicated key or value length limit beyond the
-overall request-size limit (1 MiB per request on a node, counted per
-frame: what is pipelined behind a frame does not count towards it). A
-request over it, like one the server cannot parse, is answered
-<code>En\n</code> and the connection closed. The frames only another node
+overall request-size limit: 1 MiB (1,048,576 bytes) per request on a node,
+the header line and the bodies together, counted per frame (what is
+pipelined behind a frame does not count towards it). A request over it,
+like one the server cannot parse, is answered <code>En\n</code> and the
+connection closed. The header line has no limit of its own: a header that
+runs past the limit without its <code>\n</code> is refused the same way. Through
+<code>nanocached-proxy</code> the limit is 11 bytes lower, 1,048,565: the
+proxy puts a tag on the frame it passes to a node, and the node&rsquo;s
+limit still has to hold for the longer frame; the proxy answers a bare
+<code>E\n</code>. The frames only another node
 sends (<code>U</code>, <code>u</code>, <code>f</code>) may exceed it by
 4 KiB: the <code>U</code> that moves a value to another node carries the
 receiver&rsquo;s token on top of what the client&rsquo;s <code>S</code>
@@ -60,8 +66,9 @@ or <code>-</code>), hex, an exponent, a non-ASCII digit, an empty field
 and a number too large for its field are each a malformed request,
 answered <code>En\n</code> with the connection closed. Fields are
 separated by exactly one space, so a doubled or trailing space leaves an
-empty field and is malformed too. A TTL goes up to 2<sup>64</sup>&minus;1
-and a tag up to 2<sup>32</sup>&minus;1; a length or count has no limit of its
+empty field and is malformed too. A TTL (on <code>S</code>, <code>s</code>,
+<code>o</code>, <code>k</code>, <code>t</code> and <code>y</code>) goes up to
+2<sup>64</sup>&minus;1 and a tag up to 2<sup>32</sup>&minus;1; a length or count has no limit of its
 own beyond the request-size limit above.</p>
 <p><strong>Leading zeros are accepted</strong> and mean the same number:
 <code>G 01</code> is <code>G 1</code>, a TTL of <code>007</code> is 7, and
@@ -85,12 +92,27 @@ from a discovery server — the second byte always names the server type,
 see the note below). If the server has no auth secret
 configured, any well-formed <code>A</code> succeeds (an empty secret,
 <code>A 0</code>, is malformed and answered <code>En\n</code> like any
-other). If it does, every other
+other). A client that has no secret therefore sends a one-byte
+placeholder: every SDK sends a single NUL byte, <code>A 1 T R\n</code>
+followed by <code>\0</code>. If the server does have a secret, every other
 command is rejected with <code>En\n</code> (and the connection closed)
 until a matching <code>A</code> has been sent. Until then the node
 accepts a frame of at most 4096 bytes, which bounds the <code>A</code>
 frame itself (header and secret); a server refuses to start with a
 secret too long to fit.</p>
+<p>A failed <code>A</code> that asked for tags (a <code>T</code> field) is
+answered <code>EnT\n</code> by a node and <code>EdT\n</code> by a discovery
+server, echoing the capability as a success does; the proxy answers a plain
+<code>En\n</code>. Either way the connection is then closed.</p>
+<p>Send <code>A</code> once, as the first frame. A node and a discovery
+server accept a later <code>A</code> too and run it afresh: a matching one
+is answered <code>On</code>/<code>OnT</code> (<code>Od</code>/<code>OdT</code>)
+again, and the connection continues in the mode that <em>latest</em>
+<code>A</code> asked for, tags or none; a failing one is answered
+<code>En</code> and the connection is closed, even if an earlier
+<code>A</code> had succeeded. <code>nanocached-proxy</code> accepts no
+second <code>A</code> at all: it answers a bare <code>E\n</code>, even for
+a correct secret, and closes the connection.</p>
 <div class="note">The second byte (<code>n</code>/<code>d</code> —
 node/discovery) is how a client discovers what kind of server it
 reached and adapts, with no configuration; it is sent whether or not
@@ -116,6 +138,12 @@ until evicted (LRU under the memory bound) or deleted; with one it also
 expires <code>&lt;ttl-seconds&gt;</code> after the write — a literal
 <code>0</code> is a TTL that has already elapsed, so the entry expires
 immediately (the next access sees a miss).</p>
+
+<p>A value may be empty (<code>&lt;value-length&gt;</code> of <code>0</code>;
+a <code>&lt;key-length&gt;</code> of <code>0</code> is not allowed). It is
+stored like any other, by <code>S</code> or by a batched <code>o</code>:
+<code>G</code> answers <code>V 0\n</code> — a hit with no bytes after the
+header, not a miss — and <code>m</code> a result of <code>0</code>.</p>
 
 <h2 id="d">D — delete</h2>
 <pre><code>D &lt;key-length&gt;\n&lt;key&gt;</code></pre>
@@ -453,6 +481,17 @@ The <code>R</code> status and the fatal <code>E</code> still apply to
 the whole frame, but <code>W</code> never does — a <code>&lt;key-length&gt;</code>
 being wrong for one key out of a thousand doesn't invalidate the other
 999.</p>
+<p><code>n</code> is at least 1: an <code>n</code> of <code>0</code>, or a
+header that does not list exactly <code>n</code> lengths, is a malformed
+request (likewise for <code>o</code> below and <code>y</code> above). There is no
+upper bound of its own, only the request-size limit, which a frame of
+one-byte keys reaches at about 349,000 of them; the SDKs send at most 400
+keys in a frame. The reply header carries one token per key, so it grows
+with <code>n</code>. A key may appear more than once in a frame; every
+occurrence is handled on its own, in order, and answered at its own
+position. <code>m</code> answers each occurrence of a hit with the value; with
+<code>o</code> the later occurrence overwrites the earlier, so the last value
+stays; <code>y</code> applies its TTL in order, once per occurrence.</p>
 <p>The hit values in one <code>M</code> reply total at most 16 MiB (the
 reply may therefore be larger than the 1 MiB request limit). Hits past
 that budget are answered <code>-</code> (a miss), in place, so a batch
