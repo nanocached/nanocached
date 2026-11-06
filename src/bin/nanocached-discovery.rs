@@ -264,7 +264,10 @@
 //!                             no-op that always succeeds. If a secret is
 //!                             configured, every other command is rejected
 //!                             with `Ed\n` until a matching `A` has been
-//!                             sent on the connection. The `d` distinguishes
+//!                             sent on the connection. A request that does
+//!                             not parse (an unknown command, a bad length,
+//!                             a stray token) is answered `Ed\n` as well,
+//!                             and the connection closes. The `d` distinguishes
 //!                             this response from nanocached-node's own
 //!                             `On\n`/`En\n`, letting a client tell the two
 //!                             apart from the response to the same `A`
@@ -5831,6 +5834,13 @@ async fn handle_connection(
             }
             Err(ParseError::Incomplete) => {}
             Err(error) => {
+                // `Ed\n` before the close, as for a failed `A` and for a
+                // command sent before authenticating: the protocol page
+                // lists an unknown command or a malformed request as `Ed`,
+                // and a client that gets nothing but EOF cannot tell this
+                // from a dropped connection. Best effort — the peer may be
+                // gone already, and the parse error is what gets logged.
+                let _ = write_response(&mut stream, b"Ed\n").await;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("{error:?}"),
@@ -11893,6 +11903,64 @@ mod tests {
 
         let error = connection_task.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// A request that does not parse is answered `Ed\n` and the connection
+    /// closed, before and after authenticating, whatever the fault: an
+    /// unknown command, an empty secret, a length that is not a number, a
+    /// stray token. The protocol page lists these as `Ed`; they used to
+    /// close without a byte.
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_answers_ed_to_a_request_that_does_not_parse() {
+        for frame in [
+            &b"~ 1\nx"[..],
+            b"A 0\n",
+            b"A abc\nxyz",
+            b"Q extra\n",
+            b"L x\n",
+        ] {
+            for secret in [None, Some(&b"correct-secret"[..])] {
+                let (mut client, server) = tcp_pair().await;
+                let registry: Registry = Arc::new(RegistryState::default());
+                let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+                let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+                let connection_task = tokio::spawn(handle_connection(
+                    MaybeTls::Plain(server),
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    registry,
+                    current_join,
+                    ConnectionConfig {
+                        idle_timeout: IDLE_TIMEOUT,
+                        list_ready_at: Instant::now(),
+                        replication: 2,
+                        auth_secret: secret.map(Bytes::copy_from_slice),
+                        tls_acceptor: None,
+                        tls_connector: None,
+                        announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+                    },
+                    shutdown_rx,
+                    Arc::new(std::sync::Mutex::new(None)),
+                ));
+                if secret.is_some() {
+                    client.write_all(b"A 14\ncorrect-secret").await.unwrap();
+                    let mut ok = [0u8; 3];
+                    client.read_exact(&mut ok).await.unwrap();
+                    assert_eq!(&ok, b"Od\n");
+                }
+                client.write_all(frame).await.unwrap();
+                let mut response = Vec::new();
+                client.read_to_end(&mut response).await.unwrap();
+                assert_eq!(
+                    response,
+                    b"Ed\n",
+                    "frame {:?}, secret {:?}",
+                    String::from_utf8_lossy(frame),
+                    secret.is_some()
+                );
+                let error = connection_task.await.unwrap().unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
