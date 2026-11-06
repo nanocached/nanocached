@@ -184,6 +184,7 @@ existed, err := client.Delete("greeting")</code></pre>
   <li><b>Tuning knobs that tests can turn</b> — each SDK exposes a handful
   of production constants (request timeout, keep-alive interval, the
   in-flight budgets for fire-and-forget replica writes and hedge legs,
+  the late-leg count at which a hedged read tries an owner last,
   the batch-decompression cap) as mutable, documented-but-hidden values
   so its own test suite can shrink them. That is a deliberate convention,
   not an API: they are not part of any SDK's public

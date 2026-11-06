@@ -230,7 +230,11 @@ trip — with <em>R</em> copies on <em>N</em> nodes, about <em>R/N</em> of
 them. The SDKs' hedged reads (opt-in) send a read to the next owner once
 the primary has been silent for a configured interval and take the first
 answer, so reads route around a slow owner; writes cannot, since every
-copy must be written.</p>
+copy must be written. An owner that keeps leaving hedged reads unanswered
+(32 legs still waiting when the interval elapsed) is tried last, so reads
+for its keys go to the replica first instead of paying the interval each
+time; its answer is still waited for to settle a miss. Merely having many
+reads in flight to a healthy owner does not count.</p>
 <p>Node identity is a random per-process name, decoupled from the
 network address — routing hashes the name, connections use the address —
 so a node restarting on the same address is correctly treated as a new
