@@ -99,6 +99,20 @@ async function one(client, s) {
       const { pairs } = manyFields(await t.getManyBytes(keys));
       return { outcome: "ok", items: pairs.map(([k, h]) => [k.toString("base64"), h]) };
     }
+    case "touch": case "get_touch": case "touch_many": case "get_many_touch": {
+      // touch: "-" removes the TTL, 0 expires at once (unlike set, where both mean no expiry)
+      const tt = s.ttl === "-" ? null : Number(s.ttl);
+      const keys = s.x.keys ? s.x.keys.split(",").map(text) : [];
+      if (s.op === "touch") return { outcome: "ok", result: Boolean(await t.touch(key, tt)) };
+      if (s.op === "get_touch") return hit(await t.getAndTouchBytes(key, tt));
+      if (s.op === "touch_many") {
+        const touched = await t.touchMany(keys, tt);
+        const items = [...touched.entries()].map(([k, v]) => [Buffer.from(k), v ? "S" : "N"]).sort((a, b) => Buffer.compare(a[0], b[0]));
+        return { outcome: "ok", items: items.map(([k, r]) => [k.toString("base64"), r]) };
+      }
+      const { pairs } = manyFields(await t.getManyAndTouchBytes(keys, tt));
+      return { outcome: "ok", items: pairs.map(([k, h]) => [k.toString("base64"), h]) };
+    }
     case "many_set_gen": {
       const prefix = Buffer.from(s.x.prefix, "base64").toString("latin1"); const rec = {};
       for (let i = 0; i < Number(s.x.n); i++) rec[prefix + i] = genValue(i, Number(s.x.vlen));

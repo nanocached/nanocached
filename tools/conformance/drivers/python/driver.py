@@ -43,6 +43,12 @@ def emit(record, meta):
     print(json.dumps(record, separators=(",", ":")), flush=True)
 
 
+def touch_ttl(step):
+    """touch / y: None removes the TTL, 0 expires at once (unlike set, where None and 0 both mean no expiry)."""
+    ttl = step.get("ttl")
+    return None if ttl is None else int(ttl)
+
+
 def ttl_arg(ttl):
     if ttl is None:
         return 0
@@ -160,6 +166,17 @@ async def one(client, step):
         return {"outcome": "ok"}
     if op == "many_get":
         found = await t.get_many_bytes([key_bytes(k) for k in step["keys"]])
+        pairs, _ = many_fields(found)
+        return {"outcome": "ok", "items": [[base64.b64encode(k).decode(), h] for k, h in pairs]}
+    if op == "touch":
+        return {"outcome": "ok", "result": bool(await t.touch(key, touch_ttl(step)))}
+    if op == "get_touch":
+        return hit(await t.get_and_touch_bytes(key, touch_ttl(step)))
+    if op == "touch_many":
+        touched = await t.touch_many([key_bytes(k) for k in step["keys"]], touch_ttl(step))
+        return {"outcome": "ok", "items": sorted([base64.b64encode(k).decode(), "S" if v else "N"] for k, v in touched.items())}
+    if op == "get_many_touch":
+        found = await t.get_many_and_touch_bytes([key_bytes(k) for k in step["keys"]], touch_ttl(step))
         pairs, _ = many_fields(found)
         return {"outcome": "ok", "items": [[base64.b64encode(k).decode(), h] for k, h in pairs]}
     if op == "many_set_gen":

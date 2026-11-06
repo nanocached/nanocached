@@ -105,6 +105,128 @@
       "args": [],
       "expect": "returns",
       "max_wall_s": 60
+    },
+    {
+      "id": "reply_unknown_status",
+      "port": 8421,
+      "what": "the node answers a get with an unknown status letter, `Z`: the client treats it as an error and does not wait for more",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5
+    },
+    {
+      "id": "reply_error_En",
+      "port": 8422,
+      "what": "the node answers a get with `En` (the error reply of the protocol)",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5
+    },
+    {
+      "id": "reply_len_garbage",
+      "port": 8423,
+      "what": "`V abc`: a value length that is not a number",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5
+    },
+    {
+      "id": "reply_len_negative",
+      "port": 8424,
+      "what": "`V -1`: a negative value length",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5
+    },
+    {
+      "id": "reply_len_missing",
+      "port": 8425,
+      "what": "`V` with no value length",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5
+    },
+    {
+      "id": "reply_header_flood",
+      "port": 8426,
+      "what": "a header that never ends: 1 MiB of bytes without a newline",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5,
+      "max_peak_over_baseline_mib": 64
+    },
+    {
+      "id": "reply_eof",
+      "port": 8427,
+      "what": "the node reads the request and closes the connection without a reply",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5
+    },
+    {
+      "id": "reply_empty_line",
+      "port": 8428,
+      "what": "an empty line (`\\n`) where a reply header belongs",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5
+    },
+    {
+      "id": "reply_len_leading_zero",
+      "port": 8429,
+      "what": "`V 0001` + 1 byte: a number written with leading zeros (the server accepts them in a request)",
+      "args": [],
+      "expect": "returns",
+      "max_wall_s": 5
+    },
+    {
+      "id": "tagged_baseline",
+      "port": 8431,
+      "what": "tagged mode (`OnT`): an honest `V 1024 <tag>` reply",
+      "args": [],
+      "expect": "ok",
+      "max_wall_s": 10,
+      "len": 1024
+    },
+    {
+      "id": "tagged_unknown_status",
+      "port": 8432,
+      "what": "tagged mode: `Z <tag>`, a status letter no command has",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5
+    },
+    {
+      "id": "tagged_error",
+      "port": 8433,
+      "what": "tagged mode: `E <tag>`, the proxy's error reply",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5
+    },
+    {
+      "id": "tagged_wrong_tag",
+      "port": 8434,
+      "what": "tagged mode: a value reply whose tag matches no outstanding request",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 40
+    },
+    {
+      "id": "tagged_missing_tag",
+      "port": 8435,
+      "what": "tagged mode: `V 1` with no tag field",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5
+    },
+    {
+      "id": "tagged_len_garbage",
+      "port": 8436,
+      "what": "tagged mode: `V abc <tag>`, a value length that is not a number",
+      "args": [],
+      "expect": "error",
+      "max_wall_s": 5
     }
   ]
 }

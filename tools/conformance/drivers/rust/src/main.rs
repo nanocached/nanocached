@@ -266,6 +266,36 @@ macro_rules! ops {
                     Err(e) => err(e),
                 }
             }
+            "touch" | "get_touch" | "touch_many" | "get_many_touch" => {
+                // touch: "-" removes the TTL (None), 0 expires at once (unlike set, where both mean no expiry)
+                let tt: Option<u64> = if s.ttl == "-" { None } else { s.ttl.parse().ok() };
+                let keys: Vec<String> = s.x.get("keys").filter(|k| !k.is_empty()).map(|k| k.split(',').map(latin).collect()).unwrap_or_default();
+                match s.op.as_str() {
+                    "touch" => match t.touch(&key, tt).await { Ok(b) => { let mut f = ok(); f.push(("result", b.to_string())); f } Err(e) => err(e) },
+                    "get_touch" => match t.get_and_touch_bytes(&key, tt).await { Ok(v) => hit(v), Err(e) => err(e) },
+                    "touch_many" => match t.touch_many(&keys, tt).await {
+                        Ok(touched) => {
+                            let mut rows: Vec<(String, bool)> = touched.into_iter().collect();
+                            rows.sort();
+                            let body: Vec<String> = rows.iter().map(|(k, v)| format!("[{},{}]", esc(&B64.encode(k.as_bytes())), esc(if *v { "S" } else { "N" }))).collect();
+                            let mut f = ok();
+                            f.push(("items", format!("[{}]", body.join(","))));
+                            f
+                        }
+                        Err(e) => err(e),
+                    },
+                    _ => match t.get_many_and_touch_bytes(&keys, tt).await {
+                        Ok(found) => {
+                            let (pairs, _) = many_fields(&found);
+                            let body: Vec<String> = pairs.iter().map(|(k, h)| format!("[{},{}]", esc(k), esc(h))).collect();
+                            let mut f = ok();
+                            f.push(("items", format!("[{}]", body.join(","))));
+                            f
+                        }
+                        Err(e) => err(e),
+                    },
+                }
+            }
             "many_set_gen" => {
                 let (n, vlen): (usize, usize) = (s.x["n"].parse().unwrap(), s.x["vlen"].parse().unwrap());
                 let prefix = latin(&s.x["prefix"]);

@@ -46,6 +46,10 @@ type kvAPI interface {
 	Replace(key string, token nanocached.CasToken, newValue []byte, ttlSeconds int64) (bool, error)
 	DeleteIfMatches(key string, token nanocached.CasToken) (bool, error)
 	PutIfAbsent(key string, value []byte, ttlSeconds int64) (bool, error)
+	Touch(key string, ttlSeconds int64) (bool, error)
+	GetAndTouchBytes(key string, ttlSeconds int64) ([]byte, bool, error)
+	TouchMany(keys []string, ttlSeconds int64) (map[string]bool, error)
+	GetManyAndTouchBytes(keys []string, ttlSeconds int64) (map[string][]byte, error)
 	ReplaceIfPresent(key string, value []byte, ttlSeconds int64) (bool, error)
 	GetManyBytes(keys []string) (map[string][]byte, error)
 	SetManyBytes(values map[string][]byte, ttlSeconds int64) (map[string]bool, error)
@@ -388,6 +392,62 @@ func one(c *nanocached.Client, s step) map[string]any {
 			items = append(items, []string{p[0], p[1]})
 		}
 		return map[string]any{"outcome": "ok", "items": items}
+	case "touch", "get_touch", "touch_many", "get_many_touch":
+		// touch: "-" removes the TTL, 0 expires at once (unlike set, where both mean no expiry)
+		tt := int64(nanocached.RemoveTTL)
+		if s.ttl != "-" {
+			tt, _ = strconv.ParseInt(s.ttl, 10, 64)
+		}
+		var keys []string
+		if k := s.x["keys"]; k != "" {
+			for _, item := range strings.Split(k, ",") {
+				keys = append(keys, string(b64d(item)))
+			}
+		}
+		switch s.op {
+		case "touch":
+			existed, err := t.Touch(key, tt)
+			if err != nil {
+				return errRec(err)
+			}
+			return map[string]any{"outcome": "ok", "result": existed}
+		case "get_touch":
+			v, ok, err := t.GetAndTouchBytes(key, tt)
+			if err != nil {
+				return errRec(err)
+			}
+			return hit(v, ok)
+		case "touch_many":
+			touched, err := t.TouchMany(keys, tt)
+			if err != nil {
+				return errRec(err)
+			}
+			names := make([]string, 0, len(touched))
+			for k := range touched {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			items := make([][]string, 0, len(names))
+			for _, k := range names {
+				r := "N"
+				if touched[k] {
+					r = "S"
+				}
+				items = append(items, []string{base64.StdEncoding.EncodeToString([]byte(k)), r})
+			}
+			return map[string]any{"outcome": "ok", "items": items}
+		default:
+			found, err := t.GetManyAndTouchBytes(keys, tt)
+			if err != nil {
+				return errRec(err)
+			}
+			pairs, _ := manyFields(found)
+			items := make([][]string, 0, len(pairs))
+			for _, p := range pairs {
+				items = append(items, []string{p[0], p[1]})
+			}
+			return map[string]any{"outcome": "ok", "items": items}
+		}
 	case "many_set_gen":
 		n, _ := strconv.Atoi(s.x["n"])
 		vlen, _ := strconv.Atoi(s.x["vlen"])

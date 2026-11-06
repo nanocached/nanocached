@@ -17,7 +17,11 @@ tools/conformance/drivers/build.sh
 ## Cases
 
 `make_cases.py` defines the cases once; every driver in `drivers/<sdk>/`
-reads the JSON it prints and reports the outcome of each step.
+reads the JSON it prints and reports the outcome of each step. `GROUP=<name>`
+picks the case group: `basic` (the default: set / get / delete, TTLs, sizes,
+keys), `ns` (namespaces), `ctr` (incr / decr and compare-and-set), `many`
+(batched get / set) and `touch` (touch, get-and-touch and their batched forms
+with a TTL, no TTL and TTL 0).
 `compare.py` checks the reports against each step's `expect` and the six
 reports against each other.
 
@@ -71,6 +75,16 @@ ONLY=oversize_huge tools/conformance/scenarios.sh hostile go rust
 | `oversize_huge` | declares 4294967295 B and sends none | fail on the header | 5 s; peak 64 MiB over the baseline |
 | `bomb` | a 1 MiB DEFLATE value that expands to 1 GiB, to a `compress` client | fail (the decompression cap is 64 MiB) | 10 s; peak 320 MiB over the baseline (five times the cap: a buffer that grows by doubling or append still holds the garbage of its smaller sizes when the peak is read) |
 | `backpressure` | reads nothing after the handshake; 256 concurrent sets of 512 KiB | return every call, ok or failed | 70 s (a set may be sent again once, each attempt gets the 30 s timeout); peak 96 MiB over the baseline |
+| `reply_unknown_status` | answers a get with a status letter no command has (`Z`) | fail | 5 s |
+| `reply_error_En` | answers with `En` | fail | 5 s |
+| `reply_len_garbage`, `reply_len_negative`, `reply_len_missing` | `V abc`, `V -1`, `V` with no length | fail | 5 s each |
+| `reply_header_flood` | 1 MiB of bytes without a newline where a header belongs | fail on the header cap | 5 s; peak 64 MiB over the baseline |
+| `reply_eof`, `reply_empty_line` | closes the connection without a reply; answers an empty line | fail | 5 s each |
+| `reply_len_leading_zero` | `V 0001` and one byte | come back (all six accept it) | 5 s |
+| `tagged_baseline` | the same fixture, but the handshake is answered `OnT` and every reply carries the request's tag | return the value | 10 s |
+| `tagged_unknown_status`, `tagged_error`, `tagged_len_garbage` | `Z <tag>`, `E <tag>`, `V abc <tag>` | fail | 5 s each |
+| `tagged_missing_tag` | `V 1` without a tag in a connection that negotiated tags | fail | 5 s |
+| `tagged_wrong_tag` | a value reply whose tag matches no outstanding request | fail (and drop the connection) | 40 s |
 | `roster_count_over` | a discovery server answers the node list with `N 65537 2` | fail on the header (the SDKs accept 65536 nodes) | 2 s (a client without the cap waits for the 5 s identify deadline); peak 64 MiB over the baseline |
 | `roster_bytes_over` | a discovery server sends 64 KiB + 64 KiB entries without end | fail once the response passes 16 MiB | 10 s; peak 64 MiB over the baseline |
 | `roster_unreachable` | a discovery server lists 128 nodes, none of which answers | come back (with an error) | 60 s: the dials run in waves, each into its 5 s deadline, 64 at a time (Java: 16), so 10 s (Java: 40 s); one after the other would take 640 s |

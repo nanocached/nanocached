@@ -22,6 +22,7 @@ hostile_check.py <run-dir> <case> judges that one case only (`ONLY=<case> scenar
 `baseline` for the memory reference); the others have no record in such a run and are not listed.
 """
 import collections
+import fnmatch
 import json
 import os
 import sys
@@ -90,7 +91,7 @@ def judge(case, ev, baseline_peak):
 def main(run_dir, only=None):
     cases = json.load(open(BOUNDS))["cases"]
     if only is not None:
-        cases = [case for case in cases if case["id"] == only]
+        cases = [case for case in cases if fnmatch.fnmatchcase(case["id"], only)]
         if not cases:
             sys.exit(f"hostile_check.py: no case {only!r} in {BOUNDS}")
     rows, details = [], []

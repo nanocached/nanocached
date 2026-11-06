@@ -20,6 +20,8 @@ Step ops: set | get | get_text | delete | sleep | probe
     delete {key}                 reports deleted
     sleep {ms}
     probe                        set+get a tiny key: is the connection usable?
+Further ops of the other groups: incr decr cas_* put_if_absent replace_if_present many_* clear flush, and
+    touch / get_touch / touch_many / get_many_touch   {key|keys, ns, ttl}: ttl null removes the TTL, 0 expires at once
 Expectations (``expect``):
     {"ok": true} | {"hit": true, "value": spec} | {"hit": false}
     | {"deleted": bool} | "any" (implementation-defined; six-way agreement only)
@@ -451,7 +453,76 @@ def build_many(run):
     return cases
 
 
-GROUPS = {"ns": build_ns, "ctr": build_ctr, "many": build_many}
+def build_touch(run):
+    """t / y (touch, get-and-touch, batched forms): the TTL argument is None (remove the TTL), 0 (expire at once) or seconds."""
+    key, nsb, step, case = _kit(run)
+    cases = []
+    A = nsb(f"{run}-touch")
+    kb = lambda name: b64(f"{run}:{name}".encode())
+    sha = lambda b: hashlib.sha256(b).hexdigest()
+    V = lambda n: f"value-{n}".encode()
+
+    def put(names, ns, ttl=None):
+        return step("many_set", kv=[(kb(n), {"b64": b64(V(n))}) for n in names], ns=ns, ttl=ttl)
+
+    def got(names, ns):
+        return step("many_get", keys=[kb(n) for n in names], ns=ns, expect={"items": {kb(n): sha(V(n)) for n in names}})
+
+    def gone(names, ns):
+        return step("many_get", keys=[kb(n) for n in names], ns=ns, expect={"items": {}})
+
+    for label, ns in (("", None), (".ns", A)):
+        k = lambda n: {"b64": kb(n + label)}
+        v = lambda n: {"b64": b64(V(n + label))}
+        hitv = lambda n: {"hit": True, "value": v(n)}
+        case(cases, "touch.set_ttl" + label, "touch with a TTL on a key that has none: it expires, the value is unchanged until then",
+             [step("set", key=k("a"), ns=ns, value=v("a"), ttl=None), step("touch", key=k("a"), ns=ns, ttl=1, expect={"result": True}),
+              step("get", key=k("a"), ns=ns, expect=hitv("a")), {"op": "sleep", "ms": 2500, "expect": {"ok": True}}, step("get", key=k("a"), ns=ns, expect={"hit": False})])
+        case(cases, "touch.remove_ttl" + label, "touch without a TTL removes the expiry of a key that had one",
+             [step("set", key=k("b"), ns=ns, value=v("b"), ttl=1), step("touch", key=k("b"), ns=ns, ttl=None, expect={"result": True}),
+              {"op": "sleep", "ms": 2500, "expect": {"ok": True}}, step("get", key=k("b"), ns=ns, expect=hitv("b"))])
+        case(cases, "touch.zero" + label, "touch with TTL 0 expires the key at once",
+             [step("set", key=k("c"), ns=ns, value=v("c"), ttl=None), step("touch", key=k("c"), ns=ns, ttl=0, expect={"result": True}),
+              step("get", key=k("c"), ns=ns, expect={"hit": False})])
+        case(cases, "touch.missing" + label, "touch of an absent key reports false and creates nothing",
+             [step("touch", key=k("nokey"), ns=ns, ttl=60, expect={"result": False}), step("get", key=k("nokey"), ns=ns, expect={"hit": False})])
+        case(cases, "get_touch.hit" + label, "get-and-touch returns the value and sets the TTL",
+             [step("set", key=k("d"), ns=ns, value=v("d"), ttl=None), step("get_touch", key=k("d"), ns=ns, ttl=1, expect=hitv("d")),
+              {"op": "sleep", "ms": 2500, "expect": {"ok": True}}, step("get", key=k("d"), ns=ns, expect={"hit": False})])
+        case(cases, "get_touch.remove" + label, "get-and-touch without a TTL returns the value and removes the expiry",
+             [step("set", key=k("e"), ns=ns, value=v("e"), ttl=1), step("get_touch", key=k("e"), ns=ns, ttl=None, expect=hitv("e")),
+              {"op": "sleep", "ms": 2500, "expect": {"ok": True}}, step("get", key=k("e"), ns=ns, expect=hitv("e"))])
+        case(cases, "get_touch.zero" + label, "get-and-touch with TTL 0 returns the value once, then the key is gone",
+             [step("set", key=k("f"), ns=ns, value=v("f"), ttl=None), step("get_touch", key=k("f"), ns=ns, ttl=0, expect=hitv("f")),
+              step("get", key=k("f"), ns=ns, expect={"hit": False})])
+        case(cases, "get_touch.miss" + label, "get-and-touch of an absent key is a miss",
+             [step("get_touch", key=k("nokey2"), ns=ns, ttl=60, expect={"hit": False})])
+        names = [f"t{i}" + label for i in range(5)]
+        absent = ["gone1" + label, "gone2" + label]
+        case(cases, "touch_many.basic" + label, "touch_many on 5 live keys and 2 absent ones: S for the live keys, N for the absent",
+             [put(names, ns), step("touch_many", keys=[kb(n) for n in names + absent], ns=ns, ttl=30,
+                                   expect={"items": {**{kb(n): "S" for n in names}, **{kb(n): "N" for n in absent}}}),
+              got(names, ns)])
+        case(cases, "touch_many.expire" + label, "touch_many with a TTL expires every touched key",
+             [put(names, ns), step("touch_many", keys=[kb(n) for n in names], ns=ns, ttl=1, expect={"items": {kb(n): "S" for n in names}}),
+              {"op": "sleep", "ms": 2500, "expect": {"ok": True}}, gone(names, ns)])
+        case(cases, "touch_many.remove" + label, "touch_many without a TTL removes the expiry of every key",
+             [put(names, ns, ttl=1), step("touch_many", keys=[kb(n) for n in names], ns=ns, ttl=None, expect={"items": {kb(n): "S" for n in names}}),
+              {"op": "sleep", "ms": 2500, "expect": {"ok": True}}, got(names, ns)])
+        case(cases, "touch_many.zero" + label, "touch_many with TTL 0 expires every key at once",
+             [put(names, ns), step("touch_many", keys=[kb(n) for n in names], ns=ns, ttl=0, expect={"items": {kb(n): "S" for n in names}}), gone(names, ns)])
+        case(cases, "get_many_touch.basic" + label, "get_many_and_touch returns the hits (misses absent) and sets the TTL",
+             [put(names, ns), step("get_many_touch", keys=[kb(n) for n in names + absent], ns=ns, ttl=1, expect={"items": {kb(n): sha(V(n)) for n in names}}),
+              {"op": "sleep", "ms": 2500, "expect": {"ok": True}}, gone(names, ns)])
+        case(cases, "get_many_touch.remove" + label, "get_many_and_touch without a TTL removes the expiry",
+             [put(names, ns, ttl=1), step("get_many_touch", keys=[kb(n) for n in names], ns=ns, ttl=None, expect={"items": {kb(n): sha(V(n)) for n in names}}),
+              {"op": "sleep", "ms": 2500, "expect": {"ok": True}}, got(names, ns)])
+        case(cases, "get_many_touch.zero" + label, "get_many_and_touch with TTL 0 returns the values once, then the keys are gone",
+             [put(names, ns), step("get_many_touch", keys=[kb(n) for n in names], ns=ns, ttl=0, expect={"items": {kb(n): sha(V(n)) for n in names}}), gone(names, ns)])
+    return cases
+
+
+GROUPS = {"ns": build_ns, "ctr": build_ctr, "many": build_many, "touch": build_touch}
 
 def build_rep(run, K=30):
     """Cases for the replica-convergence verification: one SDK, its own keys (the run id carries the SDK)."""

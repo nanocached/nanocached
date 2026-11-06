@@ -200,6 +200,19 @@ public final class Driver {
                 if (s.x.containsKey("keys") && !s.x.get("keys").isEmpty()) for (String item : s.x.get("keys").split(",", -1)) keys.add(latin(item));
                 return many((Map<String, byte[]>) call(t, "getManyBytes", new Class<?>[]{List.class}, keys), false);
             }
+            case "touch": case "get_touch": case "touch_many": case "get_many_touch": {
+                // touch: "-" removes the TTL, 0 expires at once (unlike set, where both mean no expiry)
+                long tt = s.ttl.equals("-") ? NanocachedClient.REMOVE_TTL : ttl;
+                if (s.op.equals("touch")) { Map<String, Object> m = ok(); m.put("result", call(t, "touch", new Class<?>[]{byte[].class, long.class}, key, tt)); return m; }
+                if (s.op.equals("get_touch")) return hit(((Optional<byte[]>) call(t, "getAndTouchBytes", new Class<?>[]{byte[].class, long.class}, key, tt)).orElse(null));
+                List<String> keys = new ArrayList<>();
+                if (s.x.containsKey("keys") && !s.x.get("keys").isEmpty()) for (String item : s.x.get("keys").split(",", -1)) keys.add(latin(item));
+                if (s.op.equals("get_many_touch")) return many((Map<String, byte[]>) call(t, "getManyAndTouchBytes", new Class<?>[]{List.class, long.class}, keys, tt), false);
+                TreeMap<String, Boolean> touched = new TreeMap<>((Map<String, Boolean>) call(t, "touchMany", new Class<?>[]{List.class, long.class}, keys, tt));
+                StringBuilder b = new StringBuilder("[");
+                for (var e : touched.entrySet()) { if (b.length() > 1) b.append(','); b.append('[').append(esc(Base64.getEncoder().encodeToString(e.getKey().getBytes(StandardCharsets.ISO_8859_1)))).append(',').append(esc(e.getValue() ? "S" : "N")).append(']'); }
+                Map<String, Object> m = ok(); m.put("items", new Raw(b.append(']').toString())); return m;
+            }
             case "many_set_gen": {
                 int n = Integer.parseInt(s.x.get("n")), vlen = Integer.parseInt(s.x.get("vlen")); String prefix = latin(s.x.get("prefix"));
                 Map<String, byte[]> rec = new HashMap<>(); for (int i = 0; i < n; i++) rec.put(prefix + i, genValue(i, vlen));
