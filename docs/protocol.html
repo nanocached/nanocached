@@ -52,6 +52,31 @@ sends (<code>U</code>, <code>u</code>, <code>f</code>) may exceed it by
 receiver&rsquo;s token on top of what the client&rsquo;s <code>S</code>
 carried, and a value stored at the limit must still be movable.</p>
 
+<h2 id="numbers">Numbers in headers</h2>
+<p>Every number in a header — a length, an entry count, a TTL, a tag, a
+namespace length — is an unsigned decimal: one or more ASCII digits
+<code>0</code>&ndash;<code>9</code> and nothing else. A sign (<code>+</code>
+or <code>-</code>), hex, an exponent, a non-ASCII digit, an empty field
+and a number too large for its field are each a malformed request,
+answered <code>En\n</code> with the connection closed. Fields are
+separated by exactly one space, so a doubled or trailing space leaves an
+empty field and is malformed too. A TTL goes up to 2<sup>64</sup>&minus;1
+and a tag up to 2<sup>32</sup>&minus;1; a length or count has no limit of its
+own beyond the request-size limit above.</p>
+<p><strong>Leading zeros are accepted</strong> and mean the same number:
+<code>G 01</code> is <code>G 1</code>, a TTL of <code>007</code> is 7, and
+the tag <code>007</code> is echoed back as <code>7</code>. No SDK sends
+them and no server does, but they are part of the frozen protocol: a
+server keeps accepting them.</p>
+<p><code>i</code>&rsquo;s <code>&lt;delta&gt;</code> is the one exception. It
+is signed and is held to the grammar of a stored counter (see
+<a href="#incr">i</a>): an optional <code>-</code>, then digits with no
+leading zero other than a lone <code>0</code>, within the range of an
+<code>i64</code>. <code>-0</code> is accepted (it is 0); <code>+3</code>,
+<code>007</code> and <code>-007</code> are malformed. The proxy and the
+discovery server read numbers the same way (the proxy answers a bare
+<code>E\n</code> where a node answers <code>En\n</code>).</p>
+
 <h2 id="a">A — authenticate</h2>
 <pre><code>A &lt;secret-length&gt;\n&lt;secret&gt;</code></pre>
 <p>Responds <code>On\n</code> on success or <code>En\n</code> followed by
@@ -163,10 +188,12 @@ new value:</p>
 <p>or <code>N\n</code> if the key is missing or expired (<code>INCR</code>
 never creates a key), or <code>T\n</code> if the key exists but its
 stored value isn't a decimal-ASCII <code>i64</code> — or applying
-<code>&lt;delta&gt;</code> would overflow one. Values must match the same
+<code>&lt;delta&gt;</code> would overflow one. Values, and the <code>&lt;delta&gt;</code>, must match the same
 grammar <code>INCR</code> itself writes back: an optional leading
 <code>-</code>, then digits with no leading zero (other than a lone
-<code>0</code>) — no <code>+</code>, no internal sign, no whitespace.
+<code>0</code>) — no <code>+</code>, no internal sign, no whitespace. A
+leading zero is refused here although it is accepted in every other
+number (see <a href="#numbers">numbers in headers</a>).
 <code>&lt;namespace-length&gt;</code> is always present, unlike
 <code>G</code>/<code>S</code>/<code>D</code>: <code>INCR</code> has no
 pre-namespace legacy form, so a <code>&lt;namespace-length&gt;</code> of 0
