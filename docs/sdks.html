@@ -378,6 +378,41 @@ existed, err := client.Delete("greeting")</code></pre>
   each SDK's README has a "Read repair" section.</li>
 </ul>
 
+<h2 id="differences">Where the SDKs differ on purpose</h2>
+<p>The SDKs behave the same; their surfaces follow each language. These
+differences are intended and part of what the
+<a href="compatibility.html#sdk">compatibility page</a> covers:</p>
+<ul>
+  <li><b>Naming and units</b> &mdash; option and method names use each
+  language&rsquo;s case. Durations are a duration type in Rust, Go, Java and
+  .NET; TypeScript takes milliseconds (a <code>Ms</code> suffix) and Python
+  takes seconds.</li>
+  <li><b>Zero in Go&rsquo;s <code>Config</code></b> &mdash; a Go struct cannot
+  tell &ldquo;not set&rdquo; from zero, so there <code>CompressionThreshold: 0</code>
+  means the default (256 bytes; use <code>1</code> to compress every non-empty
+  value), and a negative <code>ReconnectCooldown</code> switches the cooldown
+  off. Every other SDK reads a compression threshold of <code>0</code>
+  literally (compress everything) and has a separate switch for the cooldown
+  (<code>disableReconnectCooldown</code> or its language&rsquo;s spelling),
+  with <code>0</code> meaning the default.</li>
+  <li><b>Closed state</b> &mdash; <code>isClosed()</code> (TypeScript, Java),
+  <code>IsClosed()</code> (Go), <code>is_closed()</code> (Rust) and the
+  property <code>closed</code> (Python, as on <code>io</code> and
+  <code>asyncio</code> objects). The .NET client has none; it is
+  <code>IDisposable</code>.</li>
+  <li><b>Errors</b> &mdash; Rust returns one <code>Error</code> enum and Go
+  matches sentinels with <code>errors.Is</code>; the others raise exception
+  classes. A caller mistake caught before anything is sent is
+  <code>Error::InvalidArgument</code> / <code>ErrInvalidArgument</code> in
+  those two and the language&rsquo;s own argument error elsewhere
+  (<code>RangeError</code>, <code>ValueError</code>,
+  <code>IllegalArgumentException</code>, <code>ArgumentException</code>), not
+  a nanocached error type.</li>
+  <li><b>Public surface</b> &mdash; only what an SDK&rsquo;s package exports
+  is API. Internals (for example <code>HashRing</code>) are not exported in
+  any SDK.</li>
+</ul>
+
 </main>
 
 <footer class="site-footer">
