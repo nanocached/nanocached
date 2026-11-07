@@ -57,6 +57,11 @@ pub enum Error {
     /// effect the server already committed — and surface it to their own
     /// caller as a plain `ConnectionLost` instead. No public method ever
     /// returns this variant; if one does, that's a bug.
+    ///
+    /// Hidden from the documentation and **not part of the API**: do not
+    /// match on it. It is how the client passes this fact between its own
+    /// layers, and may be removed or renamed in any release.
+    #[doc(hidden)]
     ConnectionLostAfterSend(String),
     /// Internal-only sibling of [`Self::ConnectionLost`]: the request
     /// deadline expired with this request still unanswered. The peer was
@@ -67,6 +72,10 @@ pub enum Error {
     /// request timeout) and would re-send a write the peer may still
     /// apply. Folded back into a plain `ConnectionLost` before any public
     /// method returns it, exactly like [`Self::ConnectionLostAfterSend`].
+    ///
+    /// Hidden from the documentation and **not part of the API**, for the
+    /// same reason.
+    #[doc(hidden)]
     ConnectionLostTimedOut(String),
     /// `touch`/`get_and_touch` (issue #825) against a node that predates
     /// the `t` command, and (issue #871) `touch_many`/`get_many_and_touch`
@@ -101,7 +110,10 @@ pub enum Error {
     /// sharing this key (value compression's compatibility caveat: every
     /// client touching a given keyspace must agree on `compress`), not a
     /// transient failure.
-    #[cfg(feature = "compression")]
+    ///
+    /// Present whether or not the `compression` feature is on, so the set of
+    /// variants does not depend on which features other crates in the build
+    /// enable.
     Decompression(String),
     /// `incr`/`decr` (issue #321) on a client constructed with `compress`
     /// enabled: the protocol has no marker byte on an INCR result, so a
@@ -213,7 +225,6 @@ impl fmt::Display for Error {
             Error::InvalidUtf8(error) => {
                 write!(f, "nanocached: value is not valid UTF-8: {error}")
             }
-            #[cfg(feature = "compression")]
             Error::Decompression(message) => write!(f, "{message}"),
             Error::PartialServerTooOld(_) | Error::PartialServerTooOldText(_) => write!(
                 f,

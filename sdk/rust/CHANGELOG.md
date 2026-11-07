@@ -8,6 +8,7 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Changed
 
+- `Error::ConnectionLostAfterSend` and `Error::ConnectionLostTimedOut` are `#[doc(hidden)]` and documented as not part of the API: they are how the client passes "the frame was written" and "the deadline expired" between its own layers, and no public method returns them (every path folds them into `ConnectionLost`; a test now covers `set`, `incr` and `delete`). They may be removed or renamed in any release. `Error::Decompression` no longer depends on the `compression` feature, so the set of variants is the same whichever features the build enables.
 - **Breaking:** `HashRing` and `DiscoveredNode` are no longer public, and neither are `Options::keep_alive_interval` and `Options::request_timeout` (the keep-alive interval and the 30 s request timeout stay as they were, just not settable) or the `#[doc(hidden)]` statics and `NanocachedClient` methods that existed for this crate's own tests. No public method took or returned `HashRing` or `DiscoveredNode`. The tests reach them through a new `__test_hooks` Cargo feature (enabled by the crate's own dev-dependency); it is not an API and nothing else should enable it.
 - **Breaking:** `Error` and `Stats` are now `#[non_exhaustive]`. A later release can add a variant or a counter without a new major version, so a `match` on `Error` needs a wildcard arm and a `Stats` is read by field, not built with a struct literal.
 
