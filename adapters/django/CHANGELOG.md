@@ -9,6 +9,11 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** an `OPTIONS` key the backend does not know now raises `ImproperlyConfigured` when the cache is created. Before, it was ignored, so a misspelled `"Tls": True` left TLS off and sent the secret in the clear. Django's own `MAX_ENTRIES` and `CULL_FREQUENCY` (either case) are still accepted.
+- **Breaking:** `nanocached_django.__version__` is gone. It read `"0.1.0"` while the package was 0.6.2 and nothing kept it current; use `importlib.metadata.version("nanocached-django")`.
+
 ## [0.6.2] - 2026-11-03
 
 No changes. Version aligned with the rest of the project: every release

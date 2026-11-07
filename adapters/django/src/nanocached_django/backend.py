@@ -85,6 +85,16 @@ _CONNECT_OPTION_KWARGS: dict[str, str] = {
     "RECONNECT_COOLDOWN": "reconnect_cooldown",
 }
 
+# Every OPTIONS key this backend reads, plus the ones Django's own
+# ``BaseCache`` reads (``MAX_ENTRIES``/``CULL_FREQUENCY``, either case; they
+# mean nothing to nanocached but are valid in any CACHES entry). A key outside
+# this set is a mistake, and it must not be ignored quietly: ``"Tls": True``
+# would otherwise leave TLS off and send the secret in the clear.
+_KNOWN_OPTION_KEYS: frozenset[str] = frozenset(
+    {"NAMESPACE", "SECRET", "CLOSE_ON_REQUEST", "MAX_ENTRIES", "max_entries", "CULL_FREQUENCY", "cull_frequency"}
+    | set(_CONNECT_OPTION_KWARGS)
+)
+
 # issue #185: how many times _run() re-tries _ensure_started() when a
 # concurrent shutdown()/close() raced it out from under a snapshot of
 # (loop, namespace handle) — see _run()'s own docstring. One retry covers
@@ -522,6 +532,12 @@ class NanocachedCache(BaseCache):
         super().__init__(params)
         self._addresses = _parse_addresses(server)
         options = params.get("OPTIONS", {})
+        unknown = sorted(str(key) for key in options if key not in _KNOWN_OPTION_KEYS)
+        if unknown:
+            raise ImproperlyConfigured(
+                f"nanocached: unknown OPTIONS key(s) {', '.join(unknown)}; "
+                f"valid keys are {', '.join(sorted(_KNOWN_OPTION_KEYS - {'max_entries', 'cull_frequency'}))}"
+            )
         self._namespace = options.get("NAMESPACE", _DEFAULT_NAMESPACE)
         self._secret = options.get("SECRET")
         # See the module docs' lifecycle note: Django close()es every
