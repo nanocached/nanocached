@@ -618,16 +618,6 @@ connection, requests for its keys fail over per request exactly as they
 would after a mid-life death, and it is redialed after the cooldown.
 Only a cluster with no reachable node at all fails `connect()`.
 
-Every `get`/`set`/`delete` also carries its own 30-second wall-clock
-timeout, measured from when that request is issued, so a half-open
-server (one that accepts the connection but stops answering) can't hang
-a caller forever. This is a deliberate difference from the Go SDK, whose
-timeout is connection-level and progress-based — it resets whenever any
-response arrives on the connection, not per request. Under deep
-pipelining against a slow-but-healthy server the two SDKs can therefore
-time out differently for the same workload; that's intentional, not a
-bug, in both SDKs.
-
 `close()` also releases a caller whose request is still being written
 to a peer that has stopped reading (its receive window is full): that
 caller, and every one queued behind it for the connection, fails with
@@ -729,7 +719,7 @@ plain integer on the wire.
 - Every failure is a variant of the one `Error` enum. Caller mistakes
   are `Error::InvalidArgument` — this SDK's `Result`-based idiom for
   what the other SDKs raise as host-language builtins;
-  authentication failure surfaces as `Error::Protocol`. `Error::Retryable`
+  authentication failure surfaces as `Error::Authentication`. `Error::Retryable`
   is the one variant that's never a sign of a real problem with the
   connection — see "Transient retries and `Error::Retryable`" above.
 

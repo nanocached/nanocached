@@ -22,11 +22,11 @@ namespace Nanocached;
 /// are redialed lazily on use (with one transparent retry — a socket only
 /// learns of a peer FIN on I/O; the retry is skipped for the non-idempotent
 /// counter and compare-and-set operations once the request may have been
-/// sent, see issue #225), and an opt-in keep-alive can hold connections
-/// open across the server's 60s idle timeout.
+/// sent, see issue #225), and a keep-alive that is always on holds
+/// connections open across the server's 60s idle timeout.
 ///
-/// Thread-safe. Requests are serialized per connection; concurrent
-/// callers queue.
+/// Thread-safe. Requests are pipelined per connection; concurrent
+/// callers share it.
 /// </summary>
 public sealed class NanocachedClient : IDisposable
 {

@@ -166,8 +166,8 @@ including Spring's `NullValue`. Plug in JSON/Kryo when values are shared
 with non-JVM readers — such a serializer must handle `NullValue` if null
 caching stays enabled.
 
-Keys: pluggable `CacheKeyConverter`. The default maps `byte[]` through
-untouched; `String`, boxed numbers, `Boolean`, `Character` and `UUID` to a
+Keys: pluggable `CacheKeyConverter`. The default maps `byte[]` to its bytes
+behind a one-byte `0x00` marker; `String`, boxed numbers, `Boolean`, `Character` and `UUID` to a
 type-prefixed canonical string (so `"42"` and `42L` stay distinct); and
 everything else (Spring's `SimpleKey` included) through JDK serialization.
 Key bytes must be canonical across every JVM sharing the cache — prefer

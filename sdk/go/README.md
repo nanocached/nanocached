@@ -662,13 +662,14 @@ a counter or a compressed value — see "Incr and Decr" above.
   the TypeScript/Python/Java/Rust/.NET SDKs also assert.
 - Errors: `ErrClosed`, `ErrWrongNode`, `ErrDiscoveryBusy`,
   `ErrConnectionLost`, `ErrAuthenticationFailed`, `ErrDecompression`,
+  `ErrProtocol`, `ErrInvalidArgument`, `ErrServerTooOld` (and
+  `ErrServerTooOldBatch`, which also matches it),
   `ErrNotNumeric` (see "Incr and Decr" above), `ErrCompressIncompatible`
   (see "Incr and Decr" above), and `ErrRetryable` (see "Transient
-  retries" above) are sentinels for `errors.Is`. Caller
-  mistakes (an invalid TTL, an empty address list)
-  surface as ordinary errors outside the sentinel set — they indicate a
-  bug in the calling code, not a nanocached failure; this convention is
-  shared across the SDKs.
+  retries" above) are sentinels for `errors.Is`. A caller mistake caught
+  before anything is sent, such as an invalid TTL, matches
+  `ErrInvalidArgument`; it indicates a bug in the calling code, not a
+  nanocached failure.
 - `Close()` is idempotent; calling it a second time warns to stderr
   instead of erroring. `Connect()` also warns to stderr if it's called
   for a single address that a previous, still-open connection from this
