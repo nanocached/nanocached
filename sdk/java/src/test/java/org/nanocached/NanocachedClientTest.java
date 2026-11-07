@@ -56,23 +56,23 @@ class NanocachedClientTest {
     }
 
     /** Calls {@code get} until it fails with a {@link
-     * NanocachedException.ConnectionFailed} (see
+     * NanocachedException.ConnectionLost} (see
      * reconnectCooldownSkipsARedialToAKnownDeadAddress for why the first
      * call after a node closes is not asserted on directly), returning
      * that failure. */
-    private static NanocachedException.ConnectionFailed firstConnectionFailure(NanocachedClient client)
+    private static NanocachedException.ConnectionLost firstConnectionFailure(NanocachedClient client)
             throws InterruptedException {
         return firstConnectionFailure(client, -1);
     }
 
-    private static NanocachedException.ConnectionFailed firstConnectionFailure(NanocachedClient client, int port)
+    private static NanocachedException.ConnectionLost firstConnectionFailure(NanocachedClient client, int port)
             throws InterruptedException {
         long deadline = System.nanoTime() + 5_000_000_000L;
         Object lastResult = null;
         while (true) {
             try {
                 lastResult = client.get("k");
-            } catch (NanocachedException.ConnectionFailed failure) {
+            } catch (NanocachedException.ConnectionLost failure) {
                 return failure;
             }
             if (System.nanoTime() > deadline) {
@@ -514,7 +514,7 @@ class NanocachedClientTest {
         // connection failure on the SECOND `m` sub-frame — after the
         // first already succeeded, and after the client's own built-in
         // reconnect-and-retry also failed (the node is fully torn down
-        // by then) — propagate as a bare ConnectionFailed, discarding
+        // by then) — propagate as a bare ConnectionLost, discarding
         // everything the first sub-frame had already resolved.
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
@@ -527,8 +527,8 @@ class NanocachedClientTest {
                 client.set(keys[0], firstValue);
 
                 node.closeAfterNextMultiGet();
-                NanocachedException.PartialConnectionFailedRaw failure = assertThrows(
-                        NanocachedException.PartialConnectionFailedRaw.class, () -> client.getManyBytes(keys));
+                NanocachedException.PartialConnectionLostRaw failure = assertThrows(
+                        NanocachedException.PartialConnectionLostRaw.class, () -> client.getManyBytes(keys));
 
                 assertEquals(1, node.multiGetCount.get(),
                         "the node must have answered exactly the first sub-frame before it went down");
@@ -551,8 +551,8 @@ class NanocachedClientTest {
                 client.set("k0", "first-chunk-value");
 
                 node.closeAfterNextMultiGet();
-                NanocachedException.PartialConnectionFailed failure = assertThrows(
-                        NanocachedException.PartialConnectionFailed.class, () -> client.getManyBytes(keys));
+                NanocachedException.PartialConnectionLost failure = assertThrows(
+                        NanocachedException.PartialConnectionLost.class, () -> client.getManyBytes(keys));
 
                 assertEquals("first-chunk-value",
                         new String(failure.partialValues.get("k0"), StandardCharsets.UTF_8));
@@ -573,8 +573,8 @@ class NanocachedClientTest {
                 client.set("k0", "first-chunk-value");
 
                 node.closeAfterNextMultiGet();
-                NanocachedException.PartialConnectionFailedStrings failure = assertThrows(
-                        NanocachedException.PartialConnectionFailedStrings.class, () -> client.getMany(keys));
+                NanocachedException.PartialConnectionLostStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class, () -> client.getMany(keys));
 
                 assertEquals(Map.of("k0", "first-chunk-value"), failure.partialValues);
             }
@@ -594,8 +594,8 @@ class NanocachedClientTest {
                 }
 
                 node.closeAfterNextMultiSet();
-                NanocachedException.PartialConnectionFailedSetRaw failure = assertThrows(
-                        NanocachedException.PartialConnectionFailedSetRaw.class,
+                NanocachedException.PartialConnectionLostSetRaw failure = assertThrows(
+                        NanocachedException.PartialConnectionLostSetRaw.class,
                         () -> client.setManyBytes(keys, values));
 
                 assertEquals(1, node.multiSetCount.get(),
@@ -623,8 +623,8 @@ class NanocachedClientTest {
                 }
 
                 node.closeAfterNextMultiSet();
-                NanocachedException.PartialConnectionFailedSet failure = assertThrows(
-                        NanocachedException.PartialConnectionFailedSet.class, () -> client.setManyBytes(values));
+                NanocachedException.PartialConnectionLostSet failure = assertThrows(
+                        NanocachedException.PartialConnectionLostSet.class, () -> client.setManyBytes(values));
 
                 assertEquals(400, failure.succeededKeys.size());
                 assertTrue(failure.succeededKeys.contains("k0"));
@@ -636,11 +636,11 @@ class NanocachedClientTest {
     }
 
     @Test
-    void chunkedConnectionFailureOnTheFirstSubFrameStaysAPlainConnectionFailed() throws Exception {
+    void chunkedConnectionFailureOnTheFirstSubFrameStaysAPlainConnectionLost() throws Exception {
         // issue #411's fix only wraps a chunk's connection failure into a
         // Partial* exception once an earlier chunk has already succeeded
         // — the very first (and, here, only) chunk failing must keep
-        // throwing the exact same plain ConnectionFailed it always has,
+        // throwing the exact same plain ConnectionLost it always has,
         // not some Partial* subclass.
         try (MockNode node = new MockNode()) {
             int port = node.port();
@@ -648,15 +648,15 @@ class NanocachedClientTest {
                 node.close();
                 firstConnectionFailure(client, port); // establishes the node is reliably down
 
-                NanocachedException.ConnectionFailed getFailure = assertThrows(
-                        NanocachedException.ConnectionFailed.class,
+                NanocachedException.ConnectionLost getFailure = assertThrows(
+                        NanocachedException.ConnectionLost.class,
                         () -> client.getManyBytes(new byte[][] {{1}, {2}}));
-                assertSame(NanocachedException.ConnectionFailed.class, getFailure.getClass());
+                assertSame(NanocachedException.ConnectionLost.class, getFailure.getClass());
 
-                NanocachedException.ConnectionFailed setFailure = assertThrows(
-                        NanocachedException.ConnectionFailed.class,
+                NanocachedException.ConnectionLost setFailure = assertThrows(
+                        NanocachedException.ConnectionLost.class,
                         () -> client.setManyBytes(new byte[][] {{1}, {2}}, new byte[][] {{9}, {9}}));
-                assertSame(NanocachedException.ConnectionFailed.class, setFailure.getClass());
+                assertSame(NanocachedException.ConnectionLost.class, setFailure.getClass());
             }
         }
     }
@@ -841,13 +841,13 @@ class NanocachedClientTest {
         // connection dies before its `I` reply arrives — the request
         // definitely reached the server, so a blind retry here would
         // double-apply the increment. The client must surface
-        // ConnectionFailed instead of resending it, and the counter must
+        // ConnectionLost instead of resending it, and the counter must
         // have moved exactly once.
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("counter", "10");
                 node.dropReplyAfterNextIncr();
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.incr("counter", 5));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.incr("counter", 5));
                 assertEquals(Optional.of("15"), client.get("counter"));
             }
         }
@@ -988,7 +988,7 @@ class NanocachedClientTest {
     @Test
     void touchAppliedButAcknowledgementLostIsResentUnlikeIncr() throws Exception {
         // A touch is idempotent, so a lost reply is resent like get/set/
-        // delete — where INCR throws ConnectionFailed instead.
+        // delete — where INCR throws ConnectionLost instead.
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "v", 100);
@@ -998,7 +998,7 @@ class NanocachedClientTest {
 
                 client.set("counter", "10");
                 node.dropReplyAfterNextIncr();
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.incr("counter", 5));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.incr("counter", 5));
             }
         }
     }
@@ -1016,7 +1016,7 @@ class NanocachedClientTest {
 
                 client.set(key, "payload", 100);
                 primary.dropReplyAfterNextTouch();
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.touch(key, 0));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.touch(key, 0));
                 assertEquals(1, primary.touchFrames.size(), "the applied touch was not sent again");
             }
         }
@@ -1032,7 +1032,7 @@ class NanocachedClientTest {
 
                 client.set(key, "payload", 100);
                 primary.dropReplyAfterNextTouch();
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.getAndTouch(key, 0));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.getAndTouch(key, 0));
                 assertEquals(1, primary.touchFrames.size(), "the applied get-and-touch was not sent again");
             }
         }
@@ -1044,7 +1044,7 @@ class NanocachedClientTest {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "payload", 100);
                 node.dropReplyAfterNextTouch();
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.getAndTouch("k", 0));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.getAndTouch("k", 0));
                 assertEquals(1, node.touchFrames.size());
             }
         }
@@ -1458,17 +1458,17 @@ class NanocachedClientTest {
                 client.set(keys[0], first);
 
                 node.failMultiTouchAfter(1);
-                NanocachedException.PartialConnectionFailedRaw failure = assertThrows(
-                        NanocachedException.PartialConnectionFailedRaw.class,
+                NanocachedException.PartialConnectionLostRaw failure = assertThrows(
+                        NanocachedException.PartialConnectionLostRaw.class,
                         () -> client.getManyAndTouchBytes(keys, 30));
                 assertEquals(keys.length, failure.partialValues.length);
                 assertArrayEquals(first, failure.partialValues[0]);
                 assertArrayEquals(new int[] {400}, failure.unresolvedIndices);
 
                 // touchMany carries no partial result: the whole batch is idempotent, send it again.
-                NanocachedException.ConnectionFailed bare = assertThrows(
-                        NanocachedException.ConnectionFailed.class, () -> client.touchMany(keys, 30));
-                assertFalse(bare instanceof NanocachedException.PartialConnectionFailedRaw);
+                NanocachedException.ConnectionLost bare = assertThrows(
+                        NanocachedException.ConnectionLost.class, () -> client.touchMany(keys, 30));
+                assertFalse(bare instanceof NanocachedException.PartialConnectionLostRaw);
             }
         }
     }
@@ -1494,8 +1494,8 @@ class NanocachedClientTest {
                 List<String> keys = new ArrayList<>();
                 for (int i = 0; i < 401; i++) keys.add("k" + i);
 
-                NanocachedException.PartialConnectionFailedStrings failure = assertThrows(
-                        NanocachedException.PartialConnectionFailedStrings.class,
+                NanocachedException.PartialConnectionLostStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class,
                         () -> client.getManyAndTouch(keys, 0));
                 assertEquals(400, failure.partialValues.size());
                 assertEquals("x", failure.partialValues.get("k0"));
@@ -1560,11 +1560,11 @@ class NanocachedClientTest {
                 List<Throwable> thrown = expiringTouchesAnsweredWith(reply, tagged);
                 for (Throwable error : thrown) {
                     String what = "tagged=" + tagged + " reply=" + reply.trim() + " threw " + error;
-                    assertTrue(error instanceof NanocachedException.ConnectionFailed, what);
+                    assertTrue(error instanceof NanocachedException.ConnectionLost, what);
                     assertFalse(error instanceof NanocachedException.ServerTooOld, what);
-                    assertEquals(NanocachedException.ConnectionFailed.class, error.getClass(), what);
+                    assertEquals(NanocachedException.ConnectionLost.class, error.getClass(), what);
                     // Written, then lost: never marked as unsent, so nothing resends it.
-                    assertFalse(((NanocachedException.ConnectionFailed) error).notSent(), what);
+                    assertFalse(((NanocachedException.ConnectionLost) error).notSent(), what);
                 }
             }
         }
@@ -1584,7 +1584,7 @@ class NanocachedClientTest {
         // resent, so the connection failure is what surfaces after the retry.
         try (ScriptedNode node = new ScriptedNode(header -> "E\n")) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.touch("k", 30));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.touch("k", 30));
             }
         }
     }
@@ -1641,7 +1641,7 @@ class NanocachedClientTest {
                     cluster.nodes().get(NAMES.get(0)).close();
                     Thread.sleep(100);
 
-                    assertThrows(NanocachedException.ConnectionFailed.class,
+                    assertThrows(NanocachedException.ConnectionLost.class,
                             () -> { if (get) client.getAndTouch(key, 0); else client.touch(key, 0); });
                     assertEquals(List.of(), replica.touchFrames, "the replica was not touched");
                     assertEquals("v", new String(replica.store.get(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))),
@@ -1685,7 +1685,7 @@ class NanocachedClientTest {
                 MockNode replica = cluster.nodes().get(NAMES.get(1));
                 primary.dropReplyAfterNextTouch();
 
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.touch(key, 0));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.touch(key, 0));
                 assertEquals(1, primary.touchFrames.size());
                 assertEquals(List.of(), replica.touchFrames, "the primary never answered");
             }
@@ -1825,7 +1825,7 @@ class NanocachedClientTest {
                     cluster.nodes().get(NAMES.get(0)).close();
                     Thread.sleep(100);
 
-                    assertThrows(NanocachedException.ConnectionFailed.class,
+                    assertThrows(NanocachedException.ConnectionLost.class,
                             () -> { if (get) client.getManyAndTouch(keysA, 0); else client.touchMany(keysA, 0); });
                     assertEquals(List.of(), replica.multiTouchFrames, "no primary answered, so no replica leg");
                     assertEquals(keysA.size(), replica.store.size());
@@ -1847,7 +1847,7 @@ class NanocachedClientTest {
                     client.setMany(values);
                     nodeA.dropReplyAfterNextTouch();
 
-                    assertThrows(NanocachedException.ConnectionFailed.class,
+                    assertThrows(NanocachedException.ConnectionLost.class,
                             () -> { if (get) client.getManyAndTouch(keysA, 0); else client.touchMany(keysA, 0); });
                     assertEquals(1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
                     assertEquals(List.of(), replica.multiTouchFrames, "the primary never answered");
@@ -2060,7 +2060,7 @@ class NanocachedClientTest {
                 client.setMany(values);
 
                 nodeA.dropReplyAfterNextTouch();
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.touchMany(all, 0));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.touchMany(all, 0));
                 assertEquals(1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
             }
         }
@@ -2079,8 +2079,8 @@ class NanocachedClientTest {
                 client.setMany(values);
 
                 nodeA.dropReplyAfterNextTouch();
-                NanocachedException.PartialConnectionFailedStrings partial = assertThrows(
-                        NanocachedException.PartialConnectionFailedStrings.class,
+                NanocachedException.PartialConnectionLostStrings partial = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class,
                         () -> client.getManyAndTouch(all, 0));
                 Map<String, String> resolved = new java.util.LinkedHashMap<>();
                 for (String key : keysB) resolved.put(key, values.get(key));
@@ -2287,16 +2287,16 @@ class NanocachedClientTest {
                 Thread.sleep(50); // let the FIN land
 
                 NanocachedException touchFailure = assertThrows(
-                        NanocachedException.ConnectionFailed.class, () -> client.touchMany(all, 30));
+                        NanocachedException.ConnectionLost.class, () -> client.touchMany(all, 30));
                 assertFalse(touchFailure instanceof NanocachedException.WrongNode);
 
-                NanocachedException.PartialConnectionFailedStrings failure = assertThrows(
-                        NanocachedException.PartialConnectionFailedStrings.class,
+                NanocachedException.PartialConnectionLostStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class,
                         () -> client.getManyAndTouch(all, 30));
                 Map<String, String> live = new java.util.LinkedHashMap<>();
                 for (String key : liveKeys) live.put(key, values.get(key));
                 assertEquals(live, failure.partialValues);
-                assertTrue(failure.getCause() instanceof NanocachedException.ConnectionFailed,
+                assertTrue(failure.getCause() instanceof NanocachedException.ConnectionLost,
                         "cause = " + failure.getCause());
             }
         }
@@ -2530,14 +2530,14 @@ class NanocachedClientTest {
         // its `S` reply arrives. A blind retry would resend `k` with the
         // *old* token, which the just-written value no longer matches —
         // reporting an already-succeeded replace as a mismatch (`false`).
-        // The client must surface ConnectionFailed instead, and the
+        // The client must surface ConnectionLost instead, and the
         // value must have been written exactly once.
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "v1");
                 String token = client.getWithToken("k").orElseThrow().token();
                 node.dropReplyAfterNextCasSet();
-                assertThrows(NanocachedException.ConnectionFailed.class,
+                assertThrows(NanocachedException.ConnectionLost.class,
                         () -> client.replace("k", token, "v2"));
                 assertEquals(Optional.of("v2"), client.get("k"));
             }
@@ -2738,7 +2738,7 @@ class NanocachedClientTest {
         // would reach the wire as an explicit zero-length secret, which
         // the server rejects (EmptySecret) and closes without replying —
         // turning what should be "no auth configured" into an opaque
-        // ConnectionFailed instead of a normal connect against a
+        // ConnectionLost instead of a normal connect against a
         // no-auth-required server.
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = NanocachedClient.connect(
@@ -2995,7 +2995,7 @@ class NanocachedClientTest {
                 // poll stays as a belt-and-braces guard, since all the
                 // cooldown assertions below need is that the failure
                 // shows up promptly.
-                NanocachedException.ConnectionFailed firstError = firstConnectionFailure(client, port);
+                NanocachedException.ConnectionLost firstError = firstConnectionFailure(client, port);
 
                 // A listener now sits on the same port and answers
                 // immediately with bytes the identify handshake rejects
@@ -3030,8 +3030,8 @@ class NanocachedClientTest {
                     // cached failure — the very same exception instance —
                     // near-instantly, without dialing the listener at all.
                     long started = System.nanoTime();
-                    NanocachedException.ConnectionFailed secondError = assertThrows(
-                            NanocachedException.ConnectionFailed.class, () -> client.get("k"));
+                    NanocachedException.ConnectionLost secondError = assertThrows(
+                            NanocachedException.ConnectionLost.class, () -> client.get("k"));
                     long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
                     assertTrue(elapsedMillis < 500,
                             "expected a cooldown-fast rejection, took " + elapsedMillis + "ms");
@@ -3094,7 +3094,7 @@ class NanocachedClientTest {
                     // Immediately after the failure: with the default (not
                     // disabled) 1s cooldown, this must be rejected from the
                     // cached failure without a redial at all.
-                    assertThrows(NanocachedException.ConnectionFailed.class, () -> client.get("k"));
+                    assertThrows(NanocachedException.ConnectionLost.class, () -> client.get("k"));
                     assertEquals(0, connections.get(),
                             "Duration.ZERO must select the default cooldown, not disable it");
                 }
@@ -3494,8 +3494,8 @@ class NanocachedClientTest {
         // the same connection-lost exception type.
         try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
             discovery.rawListResponse = "N " + "9".repeat(8192); // never terminates
-            NanocachedException.ConnectionFailed error = assertThrows(
-                    NanocachedException.ConnectionFailed.class,
+            NanocachedException.ConnectionLost error = assertThrows(
+                    NanocachedException.ConnectionLost.class,
                     () -> connect("127.0.0.1", discovery.port()));
             assertTrue(error.getMessage().contains("header line too long"), error.getMessage());
         }
@@ -3715,12 +3715,12 @@ class NanocachedClientTest {
                 Thread.sleep(50); // let the FIN land
 
                 NanocachedException failure = assertThrows(
-                        NanocachedException.PartialConnectionFailedStrings.class,
+                        NanocachedException.PartialConnectionLostStrings.class,
                         () -> client.getMany(new ArrayList<>(values.keySet())));
                 assertFalse(failure instanceof NanocachedException.WrongNode);
                 assertEquals(liveValues,
-                        ((NanocachedException.PartialConnectionFailedStrings) failure).partialValues);
-                assertTrue(failure.getCause() instanceof NanocachedException.ConnectionFailed,
+                        ((NanocachedException.PartialConnectionLostStrings) failure).partialValues);
+                assertTrue(failure.getCause() instanceof NanocachedException.ConnectionLost,
                         "cause = " + failure.getCause());
             }
         }
@@ -4219,7 +4219,7 @@ class NanocachedClientTest {
         // retry isn't the only layer that could double-apply INCR — the
         // outer withWrongNodeRetry (which refreshes the ring and re-runs
         // the WHOLE incr call on a W or a dead primary) must also refuse
-        // to retry once a ConnectionFailed reaches it, since by then the
+        // to retry once a ConnectionLost reaches it, since by then the
         // primary may already have applied the op. This is a cluster (2
         // owners, replication 2) counterpart of the single-node
         // incrAppliedButAcknowledgementLostIsNeverReplayed above,
@@ -4234,7 +4234,7 @@ class NanocachedClientTest {
                 String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
 
                 primary.dropReplyAfterNextIncr();
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.incr(key, 5));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.incr(key, 5));
 
                 // The outer withWrongNodeRetry must not have re-run
                 // incrPrimaryThenReplicate: only the one `i` frame the
@@ -4884,7 +4884,7 @@ class NanocachedClientTest {
                         try {
                             client.set("k" + index, "v");
                         } catch (NanocachedException expected) {
-                            // AlreadyClosed/ConnectionFailed once close() wins — fine.
+                            // AlreadyClosed/ConnectionLost once close() wins — fine.
                         } catch (Throwable other) {
                             unexpected.add(other);
                             return;
@@ -4964,7 +4964,7 @@ class NanocachedClientTest {
                         try {
                             client.getBytes("k");
                         } catch (NanocachedException expected) {
-                            // AlreadyClosed/ConnectionFailed once close() wins — fine.
+                            // AlreadyClosed/ConnectionLost once close() wins — fine.
                         } catch (Throwable other) {
                             unexpected.add(other);
                             return;
@@ -6007,7 +6007,7 @@ class NanocachedClientTest {
                             if (onReplicaWriterThread()) {
                                 throw new ClassCastException("injected programming bug");
                             }
-                            throw new NanocachedException.ConnectionFailed(
+                            throw new NanocachedException.ConnectionLost(
                                     "nanocached: simulated primary failure", null);
                         });
 
@@ -6035,7 +6035,7 @@ class NanocachedClientTest {
                 cluster.nodes().get(owners.get(1)).close();
                 Thread.sleep(50);
 
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.set(key, "v"));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.set(key, "v"));
             }
         }
     }
@@ -6161,7 +6161,7 @@ class NanocachedClientTest {
     @Test
     void connectFailsOnlyWhenEveryNodeIsUnreachable() throws Exception {
         try (TolerantCluster cluster = startClusterWithDeadNodes(NAMES)) {
-            assertThrows(NanocachedException.ConnectionFailed.class,
+            assertThrows(NanocachedException.ConnectionLost.class,
                     () -> connect("127.0.0.1", cluster.discovery().port()));
         }
     }
@@ -6222,8 +6222,8 @@ class NanocachedClientTest {
             accepting.setDaemon(true);
             accepting.start();
 
-            NanocachedException.ConnectionFailed error = assertThrows(
-                    NanocachedException.ConnectionFailed.class,
+            NanocachedException.ConnectionLost error = assertThrows(
+                    NanocachedException.ConnectionLost.class,
                     () -> connect("127.0.0.1", server.getLocalPort()));
             assertTrue(error.getMessage().contains("connection limit"), error.getMessage());
             assertEquals(1, dials.get(), "a busy reply is not a legacy door-slam to retry");
@@ -6416,7 +6416,7 @@ class NanocachedClientTest {
      * real Connection over a loopback socket pair, mirroring
      * incrRequestFrameBytesAndUntaggedResponseDecoding above; a rejected
      * body must poison the connection (subsequent use throws
-     * ConnectionFailed) rather than silently coercing. */
+     * ConnectionLost) rather than silently coercing. */
     @Test
     void parseCounterValueAcceptsALeadingMinusButRejectsEverythingElseNonDigit() throws Exception {
         try (java.net.ServerSocket server = new java.net.ServerSocket(0);
@@ -6445,8 +6445,8 @@ class NanocachedClientTest {
                     InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
                             () -> parseCounterValue.invoke(connection, (Object) body),
                             "parseCounterValue(\"" + testCase + "\") should reject");
-                    assertTrue(thrown.getCause() instanceof NanocachedException.ConnectionFailed,
-                            "expected ConnectionFailed, got " + thrown.getCause());
+                    assertTrue(thrown.getCause() instanceof NanocachedException.ConnectionLost,
+                            "expected ConnectionLost, got " + thrown.getCause());
                 }
             } finally {
                 connection.close();
@@ -6664,7 +6664,7 @@ class NanocachedClientTest {
                     serverOut.flush();
 
                     ExecutionException wrapped = assertThrows(ExecutionException.class, future::get);
-                    assertTrue(wrapped.getCause() instanceof NanocachedException.ConnectionFailed,
+                    assertTrue(wrapped.getCause() instanceof NanocachedException.ConnectionLost,
                             String.valueOf(wrapped.getCause()));
                     assertTrue(wrapped.getCause().getMessage().contains("exceeds"),
                             wrapped.getCause().getMessage());
@@ -7011,7 +7011,7 @@ class NanocachedClientTest {
                             .ca(cert.pemCert())));
             // Surfaces as an ordinary connection failure — never a silent
             // fallback to an unverified connection.
-            assertTrue(error instanceof NanocachedException.ConnectionFailed, error.toString());
+            assertTrue(error instanceof NanocachedException.ConnectionLost, error.toString());
         }
     }
 
@@ -7995,8 +7995,8 @@ class NanocachedClientTest {
             assertTrue(closed.await(5, java.util.concurrent.TimeUnit.SECONDS),
                     "the reader thread's RuntimeException did not poison the connection");
             assertTrue(socket.isClosed(), "poison() closes the socket");
-            NanocachedException.ConnectionFailed error = assertThrows(
-                    NanocachedException.ConnectionFailed.class,
+            NanocachedException.ConnectionLost error = assertThrows(
+                    NanocachedException.ConnectionLost.class,
                     () -> connection.get(new byte[0], "k".getBytes(StandardCharsets.UTF_8)));
             // A poisoned connection refuses at once (notSent=true: the frame
             // never touched the wire) — no 30 s watchdog wait.
@@ -8127,8 +8127,8 @@ class NanocachedClientTest {
                 }
                 assertTrue(!primaryOnA.isEmpty() && primaryOnA.size() < 12, "want keys with each primary");
 
-                NanocachedException.PartialConnectionFailedSet failure = assertThrows(
-                        NanocachedException.PartialConnectionFailedSet.class, () -> client.setMany(batch));
+                NanocachedException.PartialConnectionLostSet failure = assertThrows(
+                        NanocachedException.PartialConnectionLostSet.class, () -> client.setMany(batch));
                 assertEquals(primaryOnA, failure.succeededKeys);
                 assertEquals(12, nodeA.multiSetKeyCount.get(), "every key sent to A exactly once");
                 assertEquals(12, nodeA.store.size());
@@ -8234,8 +8234,8 @@ class NanocachedClientTest {
         try (Cluster cluster = startCluster(1)) {
             cluster.discovery().listByteDelayMillis = 100; // the roster is >100 bytes: >10 s untreated
             long started = System.nanoTime();
-            NanocachedException.ConnectionFailed error = assertThrows(
-                    NanocachedException.ConnectionFailed.class,
+            NanocachedException.ConnectionLost error = assertThrows(
+                    NanocachedException.ConnectionLost.class,
                     () -> connect("127.0.0.1", cluster.discovery().port()));
             long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
             assertTrue(elapsedMillis < 2_000, "connect took " + elapsedMillis + "ms");

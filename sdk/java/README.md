@@ -156,7 +156,7 @@ anything you can't afford to silently lose to eviction).
 Unlike `get`/`set`/`delete`, `incr`/`decr` is never blindly resent after
 a connection failure: if the connection dies after the primary already
 applied the delta but before its reply arrived, the SDK throws
-`NanocachedException.ConnectionFailed` rather than risk applying the
+`NanocachedException.ConnectionLost` rather than risk applying the
 delta twice. See [Reconnect and keep-alive](#reconnect-and-keep-alive)
 for the full rule.
 
@@ -227,17 +227,17 @@ try {
 ```
 
 If some keys' every owner was unreachable, `getMany`/`getManyBytes`
-throw `NanocachedException.PartialConnectionFailed` (`partialValues`
+throw `NanocachedException.PartialConnectionLost` (`partialValues`
 the keys that did resolve, the cause the last connection failure; the
-decoded counterpart is `PartialConnectionFailedStrings`, the positional
-one `PartialConnectionFailedRaw` with `unresolvedIndices`), or the bare
+decoded counterpart is `PartialConnectionLostStrings`, the positional
+one `PartialConnectionLostRaw` with `unresolvedIndices`), or the bare
 connection failure when nothing resolved — a connection loss is never
 reported as a wrong-node answer. `setMany`/`setManyBytes` have nothing
 to return on success, so they just throw a plain
 `NanocachedException.WrongNode` on the wrong-node condition — every
 other key in the batch was still stored; a key whose primary could not
 be reached at all (no `W` was ever received) throws
-`NanocachedException.PartialConnectionFailedSet` instead, with the keys
+`NanocachedException.PartialConnectionLostSet` instead, with the keys
 whose primary did acknowledge in `succeededKeys`. In single-node/proxy
 mode a `W` propagates immediately, exactly like `get`/`set`'s own
 single-mode behavior — there is no ring to refresh against.
@@ -314,7 +314,7 @@ reporting an already-succeeded call as a mismatch (`false`) instead of
 the `true` it actually was. So none of `putIfAbsent`/`replaceIfPresent`/
 `replace`/`deleteIfMatches` is retried after a connection failure that
 happens once the request may have reached the server — they throw
-`NanocachedException.ConnectionFailed` instead. See
+`NanocachedException.ConnectionLost` instead. See
 [Reconnect and keep-alive](#reconnect-and-keep-alive) for the full rule.
 
 ## Touch and getAndTouch
@@ -343,7 +343,7 @@ A touch never changes the value, so it cannot overwrite a write that lands
 at the same time. Unlike `incr` and the compare-and-set family it is
 idempotent: it goes to every owner of the key like a `set`, and a request
 whose reply was lost is retried like `get`/`set`/`delete`, never thrown as
-`ConnectionFailed`. `getAndTouch` is a read that writes, so it goes to the
+`ConnectionLost`. `getAndTouch` is a read that writes, so it goes to the
 primary like a write (one refresh and retry on a wrong-node answer or a
 connection failure; no hedging, and no fallback to a replica on a miss) and
 the other owners are sent the plain touch.
@@ -384,10 +384,10 @@ left untouched and reads as a miss.
 
 Failures follow `getMany`: `getManyAndTouch` throws
 `PartialWrongNodeStrings` (keys whose primary still answers a wrong-node
-after one refresh and retry) or `PartialConnectionFailedStrings` (a primary
+after one refresh and retry) or `PartialConnectionLostStrings` (a primary
 that cannot be reached on both passes), each carrying the keys that did
 resolve; the raw and positional forms throw the matching `PartialWrongNode`,
-`PartialConnectionFailed` and `...Raw` classes. A primary being down never
+`PartialConnectionLost` and `...Raw` classes. A primary being down never
 reads as a wrong-node. `touchMany` carries no partial result: it throws a
 plain `WrongNode` or the connection failure, and since a touch is idempotent
 the whole batch can simply be sent again. Against a node that has `t` but not
@@ -501,7 +501,7 @@ that matters. `incr`/`decr`/`putIfAbsent`/`replaceIfPresent`/`replace`/
 *after* the request reached the server — the primary applied it but the
 reply was lost — the SDK does not resend it (that would double-apply an
 INCR, or report an already-succeeded CAS/delete-if-matches as a
-mismatch); it throws `NanocachedException.ConnectionFailed` instead,
+mismatch); it throws `NanocachedException.ConnectionLost` instead,
 leaving the caller unable to tell "definitely not applied" from
 "applied, but the ack was lost" — at-least-once, not exactly-once,
 and not something this SDK smooths over.

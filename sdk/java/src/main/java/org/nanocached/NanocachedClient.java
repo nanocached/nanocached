@@ -101,7 +101,7 @@ public final class NanocachedClient implements AutoCloseable {
          * literally, an empty string would reach the wire as an explicit
          * zero-length secret, which the server rejects (EmptySecret) and
          * closes without replying — turning what should be "no auth
-         * configured" into an opaque {@link NanocachedException.ConnectionFailed}
+         * configured" into an opaque {@link NanocachedException.ConnectionLost}
          * instead of the clear {@link NanocachedException.AuthenticationFailed}
          * a missing secret against a server that requires one already
          * gives. */
@@ -799,7 +799,7 @@ public final class NanocachedClient implements AutoCloseable {
             } catch (IOException | RuntimeException error) {
                 lastError = error instanceof RuntimeException runtime
                         ? runtime
-                        : new NanocachedException.ConnectionFailed(error.getMessage(), error);
+                        : new NanocachedException.ConnectionLost(error.getMessage(), error);
                 continue;
             }
 
@@ -832,7 +832,7 @@ public final class NanocachedClient implements AutoCloseable {
                 return client;
             } catch (IOException error) {
                 client.teardown();
-                throw new NanocachedException.ConnectionFailed(error.getMessage(), error);
+                throw new NanocachedException.ConnectionLost(error.getMessage(), error);
             } catch (RuntimeException error) {
                 client.teardown();
                 throw error;
@@ -879,7 +879,7 @@ public final class NanocachedClient implements AutoCloseable {
             } catch (IOException | RuntimeException error) {
                 lastError = error instanceof RuntimeException runtime
                         ? runtime
-                        : new NanocachedException.ConnectionFailed(error.getMessage(), error);
+                        : new NanocachedException.ConnectionLost(error.getMessage(), error);
                 continue;
             }
 
@@ -987,7 +987,7 @@ public final class NanocachedClient implements AutoCloseable {
             context.init(null, trustManagerFactory.getTrustManagers(), null);
             return context;
         } catch (IOException | GeneralSecurityException error) {
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     "nanocached: could not load ca file " + ca + ": " + error.getMessage(), error);
         }
     }
@@ -1052,7 +1052,7 @@ public final class NanocachedClient implements AutoCloseable {
         } catch (IOException | RuntimeException error) {
             return DialOutcome.tolerable(error instanceof RuntimeException runtime
                     ? runtime
-                    : new NanocachedException.ConnectionFailed(
+                    : new NanocachedException.ConnectionLost(
                             "nanocached: could not connect to " + address + ": " + error.getMessage(), error));
         }
 
@@ -1064,7 +1064,7 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             return DialOutcome.success(newTrackedConnection(nodeTarget.socket(), nodeTarget.tagged()));
         } catch (IOException error) {
-            return DialOutcome.tolerable(new NanocachedException.ConnectionFailed(
+            return DialOutcome.tolerable(new NanocachedException.ConnectionLost(
                     "nanocached: could not connect to " + address + ": " + error.getMessage(), error));
         }
     }
@@ -1941,8 +1941,8 @@ public final class NanocachedClient implements AutoCloseable {
             return decodeMany(getManyBytes(namespace, keys));
         } catch (NanocachedException.PartialWrongNode partial) {
             throw new NanocachedException.PartialWrongNodeStrings(decodeMany(partial.partialValues));
-        } catch (NanocachedException.PartialConnectionFailed partial) {
-            throw new NanocachedException.PartialConnectionFailedStrings(
+        } catch (NanocachedException.PartialConnectionLost partial) {
+            throw new NanocachedException.PartialConnectionLostStrings(
                     partial.getMessage(), partial.getCause(), decodeMany(partial.partialValues));
         }
     }
@@ -1972,7 +1972,7 @@ public final class NanocachedClient implements AutoCloseable {
      * holds every key that DID resolve, rather than discarding a
      * mostly-successful batch over a handful of stale placements. If some
      * keys' every owner was unreachable, throws {@link
-     * NanocachedException.PartialConnectionFailed} (its {@code
+     * NanocachedException.PartialConnectionLost} (its {@code
      * partialValues} the keys that did resolve, its cause the last
      * connection failure), or the bare connection failure when nothing
      * resolved — a connection loss is never reported as a wrong-node
@@ -2001,8 +2001,8 @@ public final class NanocachedClient implements AutoCloseable {
             return spliceMany(keys, getManyBytes(namespace, keyBytes));
         } catch (NanocachedException.PartialWrongNodeRaw partial) {
             throw new NanocachedException.PartialWrongNode(spliceMany(keys, partial.partialValues));
-        } catch (NanocachedException.PartialConnectionFailedRaw partial) {
-            throw new NanocachedException.PartialConnectionFailed(
+        } catch (NanocachedException.PartialConnectionLostRaw partial) {
+            throw new NanocachedException.PartialConnectionLost(
                     partial.getMessage(), partial.getCause(), spliceMany(keys, partial.partialValues));
         }
     }
@@ -2074,8 +2074,8 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException.PartialWrongNodeRaw(
                     expandPositions(partial.partialValues, distinctOf),
                     expandIndices(partial.unresolvedIndices, distinctOf));
-        } catch (NanocachedException.PartialConnectionFailedRaw partial) {
-            throw new NanocachedException.PartialConnectionFailedRaw(
+        } catch (NanocachedException.PartialConnectionLostRaw partial) {
+            throw new NanocachedException.PartialConnectionLostRaw(
                     partial.getMessage(), partial.getCause(),
                     expandPositions(partial.partialValues, distinctOf),
                     expandIndices(partial.unresolvedIndices, distinctOf));
@@ -2129,7 +2129,7 @@ public final class NanocachedClient implements AutoCloseable {
             try {
                 entries = multiGetChunked(this::singleConnection, namespace, keys);
             } catch (ChunkedConnectionFailure partial) {
-                throw partialConnectionFailedRaw(partial, values, budget);
+                throw partialConnectionLostRaw(partial, values, budget);
             }
             List<Integer> unresolved = new ArrayList<>();
             for (int i = 0; i < entries.size(); i++) {
@@ -2181,13 +2181,13 @@ public final class NanocachedClient implements AutoCloseable {
                 }
             }
             if (!anyResolved) throw lastError;
-            throw new NanocachedException.PartialConnectionFailedRaw(
+            throw new NanocachedException.PartialConnectionLostRaw(
                     lastError.getMessage(), lastError, values, outcome.unreachable);
         }
         return values;
     }
 
-    /** Builds {@link NanocachedException.PartialConnectionFailedRaw} from a
+    /** Builds {@link NanocachedException.PartialConnectionLostRaw} from a
      * {@link ChunkedConnectionFailure} escaping single-mode {@link
      * #multiGetChunked} (issue #411): splices every already-resolved entry
      * from the chunk(s) before the failure into {@code values} exactly like
@@ -2195,7 +2195,7 @@ public final class NanocachedClient implements AutoCloseable {
      * resolve — a per-key {@code W} within an already-completed chunk, or
      * any position from the failing chunk onward — into {@code
      * unresolvedIndices}. */
-    private NanocachedException.PartialConnectionFailedRaw partialConnectionFailedRaw(
+    private NanocachedException.PartialConnectionLostRaw partialConnectionLostRaw(
             ChunkedConnectionFailure failure, byte[][] values, long[] budget) {
         List<Integer> unresolved = new ArrayList<>();
         List<Connection.MultiEntry> entries = failure.partialEntries;
@@ -2207,7 +2207,7 @@ public final class NanocachedClient implements AutoCloseable {
                 values[i] = decompressForBatch(entry.value(), budget);
             }
         }
-        return new NanocachedException.PartialConnectionFailedRaw(
+        return new NanocachedException.PartialConnectionLostRaw(
                 failure.cause.getMessage(), failure.cause, values, unresolved);
     }
 
@@ -2261,23 +2261,23 @@ public final class NanocachedClient implements AutoCloseable {
      * redial-and-retry couldn't recover from: carries every earlier
      * chunk's already-resolved {@link Connection.MultiEntry} results (the
      * failing chunk's own positions, and every chunk after it, stay {@code
-     * null}) plus the {@link NanocachedException.ConnectionFailed} that
+     * null}) plus the {@link NanocachedException.ConnectionLost} that
      * escaped, so a caller can build a partial-success exception instead
      * of losing that data. Never thrown when the very first chunk fails —
      * there's nothing partial to carry then, so the plain {@code
-     * ConnectionFailed} propagates unwrapped, exactly as it always has.
+     * ConnectionLost} propagates unwrapped, exactly as it always has.
      *
      * <p>Purely internal plumbing: every direct caller of {@link
      * #multiGetChunked}/{@link #multiSetChunked} must catch this
-     * alongside {@link NanocachedException.ConnectionFailed} — it must
+     * alongside {@link NanocachedException.ConnectionLost} — it must
      * never itself escape a public API method.
      */
     private static final class ChunkedConnectionFailure extends RuntimeException {
         final List<Connection.MultiEntry> partialEntries;
-        final NanocachedException.ConnectionFailed cause;
+        final NanocachedException.ConnectionLost cause;
 
         ChunkedConnectionFailure(
-                List<Connection.MultiEntry> partialEntries, NanocachedException.ConnectionFailed cause) {
+                List<Connection.MultiEntry> partialEntries, NanocachedException.ConnectionLost cause) {
             super(cause);
             this.partialEntries = partialEntries;
             this.cause = cause;
@@ -2288,7 +2288,7 @@ public final class NanocachedClient implements AutoCloseable {
      * {@link ChunkedConnectionFailure}'s twin for {@link #multiTouchChunked},
      * whose {@code cause} may also be a {@link
      * NanocachedException.RetryableError}: the proxy's {@code R} (issue
-     * #937), which is not a {@link NanocachedException.ConnectionFailed}.
+     * #937), which is not a {@link NanocachedException.ConnectionLost}.
      * The entries of the chunks that did resolve ride along, as they do for
      * a connection failure — with {@code ttl == 0} those chunks expired
      * their keys and the values they returned are gone. Purely internal:
@@ -2328,9 +2328,9 @@ public final class NanocachedClient implements AutoCloseable {
      * error {@link #applyReconnecting} couldn't recover from, throws
      * {@link ChunkedConnectionFailure} carrying every earlier chunk's
      * results instead of just letting the bare {@link
-     * NanocachedException.ConnectionFailed} propagate and discard them —
+     * NanocachedException.ConnectionLost} propagate and discard them —
      * every caller must catch it. The very first chunk failing still
-     * throws the plain {@code ConnectionFailed} unwrapped, since there is
+     * throws the plain {@code ConnectionLost} unwrapped, since there is
      * nothing partial to carry. */
     private List<Connection.MultiEntry> multiGetChunked(
             java.util.function.Supplier<Connection> connectionFor, byte[] namespace, byte[][] keys) {
@@ -2343,7 +2343,7 @@ public final class NanocachedClient implements AutoCloseable {
             try {
                 chunkEntries = applyReconnecting(
                         connectionFor, connection -> connection.multiGet(namespace, chunk));
-            } catch (NanocachedException.ConnectionFailed failure) {
+            } catch (NanocachedException.ConnectionLost failure) {
                 if (start == 0) throw failure;
                 throw new ChunkedConnectionFailure(entries, failure);
             }
@@ -2669,14 +2669,14 @@ public final class NanocachedClient implements AutoCloseable {
      *
      * <p>Unlike INCR and the compare-and-set family a touch is idempotent,
      * so a request whose reply was lost is retried like get/set/delete are,
-     * never thrown as {@link NanocachedException.ConnectionFailed} -- with
+     * never thrown as {@link NanocachedException.ConnectionLost} -- with
      * one exception (issue #901): {@code 0} expires the entry, so a resend
      * after the node already applied it would answer {@code false} for a
      * key that existed. With {@code ttlSeconds == 0} the request is
      * retried only when it provably never reached the wire (a wrong-node
      * answer, a failed dial, a connection already known dead); a
      * connection lost after it was sent is thrown as {@link
-     * NanocachedException.ConnectionFailed}, as INCR's is, and the entry
+     * NanocachedException.ConnectionLost}, as INCR's is, and the entry
      * may or may not have expired. In a cluster it goes to every owner,
      * like a set, and the primary's answer is returned; with {@code
      * ttlSeconds == 0} the other owners are sent it only after the primary
@@ -2728,7 +2728,7 @@ public final class NanocachedClient implements AutoCloseable {
      * the most recently used.
      *
      * <p>With {@code ttlSeconds == 0} a connection lost after the request
-     * was sent is thrown as {@link NanocachedException.ConnectionFailed}
+     * was sent is thrown as {@link NanocachedException.ConnectionLost}
      * instead of being resent (issue #901): the node may have expired the
      * entry and consumed its value, and a resend would report a miss.
      *
@@ -2898,7 +2898,7 @@ public final class NanocachedClient implements AutoCloseable {
             if (outcome.wrongNode) throw new NanocachedException.WrongNode();
             throw outcome.cause != null
                     ? outcome.cause
-                    : new NanocachedException.ConnectionFailed("nanocached: no owner is reachable for these keys", null);
+                    : new NanocachedException.ConnectionLost("nanocached: no owner is reachable for these keys", null);
         }
         boolean[] touched = new boolean[keys.length];
         for (int i = 0; i < keys.length; i++) {
@@ -2927,7 +2927,7 @@ public final class NanocachedClient implements AutoCloseable {
      * one bounded refresh-and-retry throw {@link
      * NanocachedException.PartialWrongNodeStrings}, and keys whose primary
      * was unreachable on both passes throw {@link
-     * NanocachedException.PartialConnectionFailedStrings} (the bare
+     * NanocachedException.PartialConnectionLostStrings} (the bare
      * connection failure when nothing resolved), each carrying the keys
      * that did resolve. Unlike {@code getMany} a key is not tried on its
      * next owner when its primary is down — a replica's answer would leave
@@ -2937,9 +2937,9 @@ public final class NanocachedClient implements AutoCloseable {
      * those keys throw at once instead of reading as misses.
      *
      * <p>For that reason, with {@code ttlSeconds == 0} the keys a {@link
-     * NanocachedException.PartialConnectionFailedStrings} (or {@link
-     * NanocachedException.PartialConnectionFailed}, {@link
-     * NanocachedException.PartialConnectionFailedRaw}) leaves out of its
+     * NanocachedException.PartialConnectionLostStrings} (or {@link
+     * NanocachedException.PartialConnectionLost}, {@link
+     * NanocachedException.PartialConnectionLostRaw}) leaves out of its
      * result are not all "never asked": they include keys whose frame was
      * sent and whose outcome is unknown, and the exception cannot tell
      * them apart from keys that were never sent. They must not be fetched
@@ -2970,8 +2970,8 @@ public final class NanocachedClient implements AutoCloseable {
         } catch (NanocachedException.PartialServerTooOld partial) {
             throw new NanocachedException.PartialServerTooOldStrings(
                     partial.getCause(), decodeMany(partial.partialValues));
-        } catch (NanocachedException.PartialConnectionFailed partial) {
-            throw new NanocachedException.PartialConnectionFailedStrings(
+        } catch (NanocachedException.PartialConnectionLost partial) {
+            throw new NanocachedException.PartialConnectionLostStrings(
                     partial.getMessage(), partial.getCause(), decodeMany(partial.partialValues));
         }
     }
@@ -2979,7 +2979,7 @@ public final class NanocachedClient implements AutoCloseable {
     /** The raw-bytes companion to {@link #getManyAndTouch(List, long)}: no
      * decoding. Transparently decompresses when {@code compress} is
      * enabled. Failures are {@link NanocachedException.PartialWrongNode}
-     * and {@link NanocachedException.PartialConnectionFailed}, as for
+     * and {@link NanocachedException.PartialConnectionLost}, as for
      * {@link #getManyBytes(List)}. */
     public Map<String, byte[]> getManyAndTouchBytes(List<String> keys, long ttlSeconds) {
         return getManyAndTouchBytes(EMPTY_NAMESPACE, keys, ttlSeconds);
@@ -3002,8 +3002,8 @@ public final class NanocachedClient implements AutoCloseable {
         } catch (NanocachedException.PartialServerTooOldRaw partial) {
             throw new NanocachedException.PartialServerTooOld(
                     partial.getCause(), spliceMany(keys, partial.partialValues));
-        } catch (NanocachedException.PartialConnectionFailedRaw partial) {
-            throw new NanocachedException.PartialConnectionFailed(
+        } catch (NanocachedException.PartialConnectionLostRaw partial) {
+            throw new NanocachedException.PartialConnectionLost(
                     partial.getMessage(), partial.getCause(), spliceMany(keys, partial.partialValues));
         }
     }
@@ -3014,10 +3014,10 @@ public final class NanocachedClient implements AutoCloseable {
      * keys[i]}'s raw value, or {@code null} for a miss. The partial-failure
      * exceptions are the positional {@link
      * NanocachedException.PartialWrongNodeRaw} and {@link
-     * NanocachedException.PartialConnectionFailedRaw}, as for {@link
+     * NanocachedException.PartialConnectionLostRaw}, as for {@link
      * #getManyBytes(byte[][])}, whose {@code unresolvedIndices} name the
      * positions that did not resolve. With {@code ttlSeconds == 0} the
-     * {@code unresolvedIndices} of a {@code PartialConnectionFailedRaw}
+     * {@code unresolvedIndices} of a {@code PartialConnectionLostRaw}
      * include positions whose frame was sent and whose outcome is unknown,
      * not only positions that were never sent; do not fetch them again with
      * {@code 0} (see {@link #getManyAndTouch(List, long)}). */
@@ -3049,9 +3049,9 @@ public final class NanocachedClient implements AutoCloseable {
                     partial.getCause(),
                     expandPositions(partial.partialValues, distinct.positionOf),
                     expandIndices(partial.unresolvedIndices, distinct.positionOf));
-        } catch (NanocachedException.PartialConnectionFailedRaw partial) {
+        } catch (NanocachedException.PartialConnectionLostRaw partial) {
             if (!distinct.repeated) throw partial;
-            throw new NanocachedException.PartialConnectionFailedRaw(
+            throw new NanocachedException.PartialConnectionLostRaw(
                     partial.getMessage(), partial.getCause(),
                     expandPositions(partial.partialValues, distinct.positionOf),
                     expandIndices(partial.unresolvedIndices, distinct.positionOf));
@@ -3088,9 +3088,9 @@ public final class NanocachedClient implements AutoCloseable {
         // failure when nothing resolved, as getManyDistinct does.
         NanocachedException cause = outcome.cause != null
                 ? outcome.cause
-                : new NanocachedException.ConnectionFailed("nanocached: no owner is reachable for these keys", null);
+                : new NanocachedException.ConnectionLost("nanocached: no owner is reachable for these keys", null);
         if (!anyHit) throw cause;
-        throw new NanocachedException.PartialConnectionFailedRaw(cause.getMessage(), cause, values, outcome.unresolved);
+        throw new NanocachedException.PartialConnectionLostRaw(cause.getMessage(), cause, values, outcome.unresolved);
     }
 
     /** The distinct keys of a batch, and where each caller position's key
@@ -3212,7 +3212,7 @@ public final class NanocachedClient implements AutoCloseable {
             } catch (ChunkedTouchFailure partial) {
                 entries = partial.partialEntries;
                 failure = partial.cause;
-            } catch (NanocachedException.ConnectionFailed bare) {
+            } catch (NanocachedException.ConnectionLost bare) {
                 entries = Collections.nCopies(keys.length, null);
                 failure = bare;
             }
@@ -3301,7 +3301,7 @@ public final class NanocachedClient implements AutoCloseable {
                 chunkEntries = expiring
                         ? applyReconnectingUnlessSent(connectionFor, chunkOp)
                         : applyReconnecting(connectionFor, chunkOp, true);
-            } catch (NanocachedException.ConnectionFailed failure) {
+            } catch (NanocachedException.ConnectionLost failure) {
                 // Issue #901: with ttl 0 a chunk whose frame may have been
                 // applied (not provably unsent, and not an `En`, which
                 // applied nothing) must not be resent; later chunks were
@@ -3587,19 +3587,19 @@ public final class NanocachedClient implements AutoCloseable {
         }
         try {
             setManyBytes(namespace, keyBytes, valueBytes, ttlSeconds);
-        } catch (NanocachedException.PartialConnectionFailedSetRaw partial) {
-            throw new NanocachedException.PartialConnectionFailedSet(
+        } catch (NanocachedException.PartialConnectionLostSetRaw partial) {
+            throw new NanocachedException.PartialConnectionLostSet(
                     partial.getMessage(), partial.getCause(), spliceKeys(keyList, partial.succeededIndices));
         }
     }
 
     /** Re-keys a positional {@link
-     * NanocachedException.PartialConnectionFailedSetRaw#succeededIndices}
+     * NanocachedException.PartialConnectionLostSetRaw#succeededIndices}
      * (or the same shape from any other positions-into-keys splice) by the
      * original {@code String} keys those positions came from — {@link
      * #setManyBytes(byte[], Map, long)}'s counterpart to {@link
      * #spliceMany} on the read side. A {@link Set} rather than a list:
-     * {@link NanocachedException.PartialConnectionFailedSet#succeededKeys}
+     * {@link NanocachedException.PartialConnectionLostSet#succeededKeys}
      * only needs "was this key confirmed stored", not positional order. */
     private static Set<String> spliceKeys(List<String> keys, int[] indices) {
         Set<String> succeeded = new LinkedHashSet<>(indices.length);
@@ -3655,7 +3655,7 @@ public final class NanocachedClient implements AutoCloseable {
             try {
                 entries = multiSetChunked(this::singleConnection, namespace, keys, valueBytes, wireTtlSeconds);
             } catch (ChunkedConnectionFailure partial) {
-                throw partialConnectionFailedSetRaw(partial);
+                throw partialConnectionLostSetRaw(partial);
             }
             for (Connection.MultiEntry entry : entries) {
                 if (entry.wrongNode()) throw new NanocachedException.WrongNode();
@@ -3683,12 +3683,12 @@ public final class NanocachedClient implements AutoCloseable {
         }
         NanocachedException cause = tracker.lastCause.get();
         if (cause == null) {
-            cause = new NanocachedException.ConnectionFailed(
+            cause = new NanocachedException.ConnectionLost(
                     "nanocached: no owner is reachable for these keys", null);
         }
         List<Integer> succeeded = new ArrayList<>(tracker.primaryAcknowledged);
         Collections.sort(succeeded);
-        throw new NanocachedException.PartialConnectionFailedSetRaw(cause.getMessage(), cause, succeeded);
+        throw new NanocachedException.PartialConnectionLostSetRaw(cause.getMessage(), cause, succeeded);
     }
 
     /** What one {@link #setManyBytes(byte[], byte[][], byte[][], long)}
@@ -3721,14 +3721,14 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Builds {@link NanocachedException.PartialConnectionFailedSetRaw}
+    /** Builds {@link NanocachedException.PartialConnectionLostSetRaw}
      * from a {@link ChunkedConnectionFailure} escaping single-mode {@link
      * #multiSetChunked} (issue #411): every position the chunk(s) before
      * the failure actually confirmed stored ({@code entry.ok()}) goes into
      * {@code succeededIndices} — a position whose chunk never even ran
      * ({@code null}) or that came back {@code W} isn't "succeeded", so it's
      * left out. */
-    private NanocachedException.PartialConnectionFailedSetRaw partialConnectionFailedSetRaw(
+    private NanocachedException.PartialConnectionLostSetRaw partialConnectionLostSetRaw(
             ChunkedConnectionFailure failure) {
         List<Integer> succeeded = new ArrayList<>();
         List<Connection.MultiEntry> entries = failure.partialEntries;
@@ -3736,7 +3736,7 @@ public final class NanocachedClient implements AutoCloseable {
             Connection.MultiEntry entry = entries.get(i);
             if (entry != null && entry.ok()) succeeded.add(i);
         }
-        return new NanocachedException.PartialConnectionFailedSetRaw(
+        return new NanocachedException.PartialConnectionLostSetRaw(
                 failure.cause.getMessage(), failure.cause, succeeded);
     }
 
@@ -3764,7 +3764,7 @@ public final class NanocachedClient implements AutoCloseable {
                 chunkEntries = applyReconnecting(
                         connectionFor,
                         connection -> connection.multiSet(namespace, keyChunk, valueChunk, ttlSeconds));
-            } catch (NanocachedException.ConnectionFailed failure) {
+            } catch (NanocachedException.ConnectionLost failure) {
                 if (start == 0) throw failure;
                 throw new ChunkedConnectionFailure(entries, failure);
             }
@@ -4101,7 +4101,7 @@ public final class NanocachedClient implements AutoCloseable {
     // unlike get/set/delete it is never blindly replayed after a
     // connection failure. If the primary applies the increment but the
     // connection drops before its reply arrives, this throws
-    // NanocachedException.ConnectionFailed — leaving the caller unable to
+    // NanocachedException.ConnectionLost — leaving the caller unable to
     // tell "definitely not applied" from "applied, but the ack was lost"
     // — rather than silently resending the delta and risking a double
     // increment. A redial-and-retry only ever happens when the request
@@ -4208,7 +4208,7 @@ public final class NanocachedClient implements AutoCloseable {
     // get/set/delete — none is blindly replayed after a connection
     // failure. If the primary applies the store/delete but the connection
     // drops before its reply arrives, these throw
-    // NanocachedException.ConnectionFailed instead of resending the
+    // NanocachedException.ConnectionLost instead of resending the
     // request: a blind resend of `k`/`x` after a lost reply would
     // re-evaluate <cond> against the value it just wrote, almost always
     // reporting an already-succeeded op as a mismatch (`false`). A
@@ -4689,14 +4689,14 @@ public final class NanocachedClient implements AutoCloseable {
      *
      * <p>INCR/CAS/delete-if-matches (issue #225) pass {@code
      * retryConnectionFailure} false: by the time a {@code
-     * ConnectionFailed} reaches here for one of those, {@link
+     * ConnectionLost} reaches here for one of those, {@link
      * #applyReconnectingNonIdempotent} has already redialed and retried
      * it once for the one case that's safe (the request never reached the
      * wire) — reaching here at all means the primary may already have
      * applied it, and resending the whole operation, possibly to that
      * very same primary if discovery hasn't yet dropped it, risks
      * double-applying a non-idempotent op. So this must not retry it
-     * again; the caller sees {@code ConnectionFailed} instead.
+     * again; the caller sees {@code ConnectionLost} instead.
      */
     private <T> T withWrongNodeRetry(java.util.function.Supplier<T> operation, boolean retryConnectionFailure) {
         try {
@@ -4705,7 +4705,7 @@ public final class NanocachedClient implements AutoCloseable {
             if (ring == null) throw error;
             maybeRefresh(true);
             return operation.get();
-        } catch (NanocachedException.ConnectionFailed error) {
+        } catch (NanocachedException.ConnectionLost error) {
             if (ring == null || !retryConnectionFailure) throw error;
             maybeRefresh(true);
             return operation.get();
@@ -4727,7 +4727,7 @@ public final class NanocachedClient implements AutoCloseable {
             if (ring == null) throw error;
             maybeRefresh(true);
             return operation.get();
-        } catch (NanocachedException.ConnectionFailed error) {
+        } catch (NanocachedException.ConnectionLost error) {
             // An `En` is final (issue #902): a node that predates the
             // command would answer it again after the refresh.
             if (error instanceof NanocachedException.ServerRejected) throw error;
@@ -4789,7 +4789,7 @@ public final class NanocachedClient implements AutoCloseable {
             java.util.function.Supplier<Connection> source, ConnectionOp<T> op, boolean rejectionIsFinal) {
         try {
             return op.apply(source.get());
-        } catch (NanocachedException.ConnectionFailed retryable) {
+        } catch (NanocachedException.ConnectionLost retryable) {
             if (rejectionIsFinal && retryable instanceof NanocachedException.ServerRejected) throw retryable;
             // A request timeout is not the idle-FIN case this retry exists
             // for: the peer accepted the frame and simply never answered
@@ -4807,7 +4807,7 @@ public final class NanocachedClient implements AutoCloseable {
      * As {@link #applyReconnecting}, but for {@code op}s that are
      * <em>not</em> idempotent — {@code i}/{@code k}/{@code x} (INCR, CAS,
      * delete-if-matches, issue #225). {@link
-     * NanocachedException.ConnectionFailed#notSent()} is what tells apart
+     * NanocachedException.ConnectionLost#notSent()} is what tells apart
      * the one case where a redial-and-retry is still safe from every case
      * where it isn't: {@code true} means this connection was already
      * known dead — the idle-FIN case {@link #applyReconnecting}'s own doc
@@ -4817,14 +4817,14 @@ public final class NanocachedClient implements AutoCloseable {
      * else — the write itself failing partway, a request timeout, or the
      * reply simply never arriving after a successful write — leaves the
      * request's fate genuinely unknown (the primary may well have applied
-     * it), so this surfaces {@link NanocachedException.ConnectionFailed}
+     * it), so this surfaces {@link NanocachedException.ConnectionLost}
      * to the caller instead of ever resending it.
      */
     private <T> T applyReconnectingNonIdempotent(
             java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
         try {
             return op.apply(source.get());
-        } catch (NanocachedException.ConnectionFailed retryable) {
+        } catch (NanocachedException.ConnectionLost retryable) {
             if (!retryable.notSent()) throw retryable;
             return op.apply(source.get());
         }
@@ -4834,7 +4834,7 @@ public final class NanocachedClient implements AutoCloseable {
      * As {@link #applyReconnectingNonIdempotent}, for a touch whose TTL
      * expires the entry (issue #901): a resend after the node applied it
      * would find the key gone. Same boundary as INCR/CAS -- {@link
-     * NanocachedException.ConnectionFailed#notSent()} -- with one addition:
+     * NanocachedException.ConnectionLost#notSent()} -- with one addition:
      * a failure to obtain the connection at all (a dial that failed, a
      * member with no connection) is itself proof that nothing was sent, so
      * it is flagged {@code notSent} too and the caller may route around the
@@ -4844,7 +4844,7 @@ public final class NanocachedClient implements AutoCloseable {
             java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
         try {
             return op.apply(connectionNotSent(source));
-        } catch (NanocachedException.ConnectionFailed retryable) {
+        } catch (NanocachedException.ConnectionLost retryable) {
             if (!retryable.notSent()) throw retryable;
             return op.apply(connectionNotSent(source));
         }
@@ -4853,11 +4853,11 @@ public final class NanocachedClient implements AutoCloseable {
     private static Connection connectionNotSent(java.util.function.Supplier<Connection> source) {
         try {
             return source.get();
-        } catch (NanocachedException.ConnectionFailed dialFailure) {
-            if (dialFailure.getClass() != NanocachedException.ConnectionFailed.class || dialFailure.notSent()) {
+        } catch (NanocachedException.ConnectionLost dialFailure) {
+            if (dialFailure.getClass() != NanocachedException.ConnectionLost.class || dialFailure.notSent()) {
                 throw dialFailure;
             }
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     dialFailure.getMessage(), dialFailure.getCause(), true, dialFailure.timedOut());
         }
     }
@@ -4876,7 +4876,7 @@ public final class NanocachedClient implements AutoCloseable {
         // failure — a replica hedges against a dead holder, not a miss.
         // Narrowed to NanocachedException, matching write()'s replicaWrite
         // catch (~line 836): WrongNode is already peeled off by the catch
-        // above, so this only ever sees ConnectionFailed/AlreadyClosed/etc,
+        // above, so this only ever sees ConnectionLost/AlreadyClosed/etc,
         // and a genuine programming bug (e.g. a NullPointerException)
         // propagates instead of being treated identically to a dead owner
         // and silently retried against the next one (audit finding,
@@ -5609,7 +5609,7 @@ public final class NanocachedClient implements AutoCloseable {
      * primary leg above has already returned successfully, that retry
      * only ever re-runs the primary leg again (a second, freshly routed
      * primary attempt), never a duplicate replica fan-out. It is NOT
-     * retried on {@code ConnectionFailed} (issue #225 —
+     * retried on {@code ConnectionLost} (issue #225 —
      * {@code retryConnectionFailure} false): INCR isn't idempotent, so
      * the primary leg below already owns the only safe retry, via {@link
      * #applyReconnectingNonIdempotent}; see its doc for why a redial is
@@ -5780,7 +5780,7 @@ public final class NanocachedClient implements AutoCloseable {
      * on {@code W} (stale routing) — since replication only ever runs
      * after the primary leg above has already returned successfully, that
      * retry only ever re-runs the primary leg again, never a duplicate
-     * replica fan-out. It is NOT retried on {@code ConnectionFailed}
+     * replica fan-out. It is NOT retried on {@code ConnectionLost}
      * (issue #225 — {@code retryConnectionFailure} false): a CAS store
      * isn't idempotent (a successful-but-unacknowledged store must not be
      * replayed only to be reported as a mismatch), so the primary leg
@@ -5830,7 +5830,7 @@ public final class NanocachedClient implements AutoCloseable {
      * old)}: a success's replica leg is an ordinary (unconditional)
      * delete, since the primary's own successful digest match already
      * proved the key existed. As {@link #casPrimaryThenReplicate}, not
-     * retried on {@code ConnectionFailed} by {@link #withWrongNodeRetry}
+     * retried on {@code ConnectionLost} by {@link #withWrongNodeRetry}
      * (issue #225): a successful-but-unacknowledged delete must not be
      * replayed only to be reported as a mismatch/missing key, so the
      * primary leg below already owns the only safe retry, via {@link
@@ -6179,7 +6179,7 @@ public final class NanocachedClient implements AutoCloseable {
             // Connection-classified (issue #8): the usual cause is a
             // refresh racing this operation, which the refresh-and-retry
             // layer heals.
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     "nanocached: " + name + " has no open connection", null);
         }
         // member.connection is null for a member listed by discovery but
@@ -6194,7 +6194,7 @@ public final class NanocachedClient implements AutoCloseable {
             synchronized (stateLock) {
                 Member current = members.get(name);
                 if (current == null) {
-                    throw new NanocachedException.ConnectionFailed(
+                    throw new NanocachedException.ConnectionLost(
                             "nanocached: " + name + " left the cluster while reconnecting", null);
                 }
                 member = current;
@@ -6216,7 +6216,7 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             return openNodeConnection(address);
         } catch (IOException error) {
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     "nanocached: could not connect to " + address + ": " + error.getMessage(), error);
         }
     }
@@ -6250,7 +6250,7 @@ public final class NanocachedClient implements AutoCloseable {
             // Connection-classified (issue #8): a topology change, healed
             // by the refresh-and-retry layer — unlike an auth failure,
             // which stays a plain (non-retryable) exception.
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     "nanocached: " + address + " no longer identifies as a cache node", null);
         }
         if (closed) {

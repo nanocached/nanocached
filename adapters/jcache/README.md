@@ -225,7 +225,7 @@ module.
 ## When the node is unreachable
 
 Every operation fails fast with a `CacheException` whose cause is the
-SDK's `NanocachedException.ConnectionFailed`; nothing hangs. The same
+SDK's `NanocachedException.ConnectionLost`; nothing hangs. The same
 `CacheException` wrapping applies to every backend failure, as the
 `javax.cache.Cache` contract asks: a value that cannot be read back
 (a class missing from the manager's class loader, a serial-filter

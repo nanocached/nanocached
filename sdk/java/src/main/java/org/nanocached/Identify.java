@@ -332,7 +332,7 @@ final class Identify {
         // legacy-signal classification never sees it.
         byte[] head = readExactly(in, 2);
         if (head[0] == 'B' && head[1] == '\n') {
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     "nanocached: the server is at its connection limit (busy)", null);
         }
         byte[] ack = new byte[] {head[0], head[1], readExactly(in, 1)[0]};
@@ -609,7 +609,7 @@ final class Identify {
         StringBuilder line = new StringBuilder();
         for (int b = read(in); b != '\n'; b = read(in)) {
             if (line.length() >= Connection.MAX_HEADER_LINE_LENGTH) {
-                throw new NanocachedException.ConnectionFailed(
+                throw new NanocachedException.ConnectionLost(
                         "nanocached: response header line too long", null);
             }
             line.append((char) b);
