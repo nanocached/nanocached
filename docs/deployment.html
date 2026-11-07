@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Deployment — nanocached</title>
-<meta name="description" content="Verified nanocached deployments, one page per shape: a single node on EC2, a cluster on EC2 grown from an AMI, and autoscaled multi-AZ clusters on ECS Fargate and on EKS — plus what every deployment needs from the binaries.">
+<meta name="description" content="What every nanocached deployment needs from the binaries: the operations endpoint and graceful scale-in, TLS, metrics collection, and the proxy tier.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="icon" href="favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -30,12 +30,11 @@
 <main>
 
 <h1>Deployment</h1>
-<p class="lede">Every guide here was built from an empty AWS account
-with the commands shown, checked against a real cluster, and torn down
-with the commands at its end. Start with what every deployment needs,
-then pick the shape that matches how you run things.</p>
+<p class="lede">These pages cover what the binaries need from any
+deployment, whatever runs them: the operations endpoint and the drain
+that makes scale-in lossless, TLS, metrics collection, and the proxy
+tier.</p>
 
-<h2>Before any shape</h2>
 <ul>
   <li><a href="deployment-operations.html">What every deployment needs</a>
   — the operations endpoint (<code>/healthz</code>, <code>/readyz</code>,
@@ -43,40 +42,15 @@ then pick the shape that matches how you run things.</p>
   drain that makes scale-in lossless.</li>
   <li><a href="deployment-tls.html">TLS</a> &mdash; which segments
   each flag encrypts, why node certificates carry IP addresses,
-  self-signed certificates and a private CA through Parameter Store,
-  leaf and CA rotation, and the single-node EC2, clustered EC2, ECS
-  and EKS shapes and the proxy tier run with TLS end to end.</li>
+  self-signed certificates and a private CA, how to distribute them,
+  and leaf and CA rotation.</li>
   <li><a href="deployment-metrics.html">Metrics collection</a> &mdash;
-  what <code>/metrics</code> exports, how gauges and counters behave
-  once collected, and the three cluster shapes&rsquo; collectors: the
-  CloudWatch Agent on a single EC2 node, the OpenTelemetry collector
-  as an ECS sidecar, and a Prometheus server on EKS.</li>
-</ul>
-
-<h2>Shapes</h2>
-<ul>
-  <li><a href="deployment-ec2-single.html">Single node on EC2</a> — one
-  node, no discovery, no replication: a cache whose contents are lost
-  with the instance and nothing else. Network, security groups, an
-  SSM-only role, systemd from user-data.</li>
-  <li><a href="deployment-ec2-cluster.html">Cluster on EC2</a> — one
-  seed instance running discovery and a node at a fixed address, any
-  number of identical nodes, grown by launching more from an image of a
-  node; planned removal with <code>systemctl stop</code>. No
-  orchestrator, no Auto Scaling group.</li>
-  <li><a href="deployment-ecs.html">Cluster on ECS (Fargate,
-  multi-AZ)</a> — discovery and nodes as services behind Cloud Map
-  across two zones, grown by the node service's desired count, with a
-  drain through SIGTERM on the way down.</li>
-  <li><a href="deployment-eks.html">Cluster on EKS (multi-AZ)</a> — the
-  same cluster as Kubernetes manifests: an eksctl cluster from one
-  config file, a Deployment per role, grown by the node Deployment's
-  replica count, the same drain.</li>
+  what <code>/metrics</code> exports and how gauges and counters behave
+  once collected.</li>
   <li><a href="deployment-proxy.html">The proxy tier</a> — when a
   cluster needs <code>nanocached-proxy</code>, where it runs (with the
-  cluster, in the cluster's own shape: a third ECS service, a third
-  Deployment), how many, and how applications reach it; verified on
-  ECS, with the EKS manifests and the sidecar alternative.</li>
+  cluster, in the cluster's own shape), how many, how applications
+  reach it, and the sidecar alternative.</li>
 </ul>
 
 </main>

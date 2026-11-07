@@ -31,8 +31,8 @@
 
 <h1>What every deployment needs</h1>
 <p class="lede">The three things an orchestrator — or a person with a
-shell — needs from nanocached before any of the shapes in the <a
-href="deployment.html">deployment guides</a>: probes to route around
+shell — needs from nanocached before anything else on the <a
+href="deployment.html">deployment pages</a>: probes to route around
 instances that aren't ready, metrics to scale on, and a SIGTERM-driven
 drain so scale-in never loses data.</p>
 
@@ -212,8 +212,9 @@ href="deployment-proxy.html">its own page</a>.</p>
 
 <h2>Sizing the stop grace</h2>
 <p>The orchestrator's grace period must outlast the drain:
-<strong>set ECS <code>stopTimeout</code> / Kubernetes
-<code>terminationGracePeriodSeconds</code> to at least
+<strong>set the orchestrator&rsquo;s stop grace (a container
+service&rsquo;s <code>stopTimeout</code>, Kubernetes&rsquo;
+<code>terminationGracePeriodSeconds</code>) to at least
 <code>--drain-timeout</code> plus a margin</strong> (twice it is a
 comfortable rule while the nodes answer or refuse promptly; to cover a
 receiver that stops answering, which can add up to 30&nbsp;s to the
