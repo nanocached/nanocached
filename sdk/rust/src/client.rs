@@ -384,6 +384,7 @@ pub static MAX_CONCURRENT_DIALS: AtomicUsize = AtomicUsize::new(64);
 /// visible symptom until reads start missing more often than expected.
 /// Returned by [`NanocachedClient::stats`]; never reset.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Stats {
     pub replica_write_failures: u64,
     pub read_repair_failures: u64,
