@@ -230,7 +230,7 @@ same key twice.
 
 ## When the node is unreachable
 
-Every operation fails fast with the SDK's `NanocachedException.ConnectionFailed`
+Every operation fails fast with the SDK's `NanocachedException.ConnectionLost`
 (a `RuntimeException`); nothing hangs. Spring's default is fail-closed:
 the exception propagates out of the `@Cacheable` method. Configure a
 `CachingConfigurer.errorHandler()` to degrade instead — the handler

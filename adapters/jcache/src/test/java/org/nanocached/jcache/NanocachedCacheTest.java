@@ -443,7 +443,7 @@ class NanocachedCacheTest {
                 assertThrows(javax.cache.CacheException.class, () -> expiring.getAll(seed.keySet()));
 
         assertTrue(
-                error.getCause() instanceof NanocachedException.PartialConnectionFailedRaw,
+                error.getCause() instanceof NanocachedException.PartialConnectionLostRaw,
                 "cause: " + error.getCause());
         assertEquals(
                 2,
@@ -631,7 +631,7 @@ class NanocachedCacheTest {
     void getAllRetriesAndMergesTheRemainderAfterAMidBatchConnectionDrop() {
         // A connection dying mid-batch used to discard the whole getAll
         // too, same as #415's ring-change regression above but for
-        // NanocachedException.PartialConnectionFailedRaw instead of
+        // NanocachedException.PartialConnectionLostRaw instead of
         // PartialWrongNodeRaw: it carries every key the earlier,
         // already-succeeded chunk(s) resolved, but getAll used to let
         // that exception propagate uncaught, losing the resolved data
@@ -646,7 +646,7 @@ class NanocachedCacheTest {
         node.multiGetCount.set(0);
         // chunk 1 succeeds; both of chunk 2's attempts (the SDK's own
         // original attempt plus its one internal reconnect-and-retry) are
-        // dropped, so the SDK throws PartialConnectionFailedRaw; the
+        // dropped, so the SDK throws PartialConnectionLostRaw; the
         // adapter's own single follow-up retry (request #4) then
         // succeeds since the drop budget is exhausted by then.
         node.armMultiGetDrop(1, 2);
@@ -678,13 +678,13 @@ class NanocachedCacheTest {
 
         javax.cache.CacheException error =
                 assertThrows(javax.cache.CacheException.class, () -> cache.getAll(seed.keySet()));
-        assertTrue(error.getCause() instanceof NanocachedException.ConnectionFailed, "cause: " + error.getCause());
+        assertTrue(error.getCause() instanceof NanocachedException.ConnectionLost, "cause: " + error.getCause());
     }
 
     @Test
     void getAllKeepsResolvingWhenTheFollowUpAfterAConnectionDropMeetsARingChange() {
         // Chunk 2's two attempts drop, so the SDK throws
-        // PartialConnectionFailedRaw and the adapter makes its one
+        // PartialConnectionLostRaw and the adapter makes its one
         // follow-up call for the remainder. That call meets a ring
         // change: the SDK throws PartialWrongNodeRaw, which used to
         // escape getAll raw (not a CacheException) with chunk 1's 400
@@ -732,7 +732,7 @@ class NanocachedCacheTest {
     void putAllRetriesTheRemainderAfterAMidBatchConnectionDropOnSet() {
         // Analogous to getAllRetriesAndMergesTheRemainderAfterAMidBatchConnectionDrop
         // above, but for putAll/setManyBytes: NanocachedException.
-        // PartialConnectionFailedSetRaw names the positions already
+        // PartialConnectionLostSetRaw names the positions already
         // confirmed stored (the inverse of the get side's convention —
         // see the exception's own doc), so putAll must retry only the
         // still-unconfirmed remainder once rather than discarding it.
@@ -767,7 +767,7 @@ class NanocachedCacheTest {
 
         javax.cache.CacheException error =
                 assertThrows(javax.cache.CacheException.class, () -> cache.putAll(seed));
-        assertTrue(error.getCause() instanceof NanocachedException.ConnectionFailed, "cause: " + error.getCause());
+        assertTrue(error.getCause() instanceof NanocachedException.ConnectionLost, "cause: " + error.getCause());
     }
 
     /** creation → 60 s, update → 30 s: two distinct TTLs within one putAll. */

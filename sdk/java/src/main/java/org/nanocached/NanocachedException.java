@@ -59,16 +59,16 @@ public class NanocachedException extends RuntimeException {
      *
      * <p>Not {@code final} — mirroring {@link WrongNode}'s own stance, for
      * exactly the same reason (issue #411): {@link
-     * PartialConnectionFailed}/{@link PartialConnectionFailedStrings}/
-     * {@link PartialConnectionFailedRaw}/{@link PartialConnectionFailedSet}/
-     * {@link PartialConnectionFailedSetRaw} extend this so a batch's
+     * PartialConnectionLost}/{@link PartialConnectionLostStrings}/
+     * {@link PartialConnectionLostRaw}/{@link PartialConnectionLostSet}/
+     * {@link PartialConnectionLostSetRaw} extend this so a batch's
      * already-succeeded chunks (see {@link
      * NanocachedClient#getManyBytes(List)}/{@link
      * NanocachedClient#setManyBytes(Map, long)}'s batch chunking, issue
      * #222) aren't silently discarded when a later chunk's connection
      * failure escapes the client's own built-in reconnect-and-retry.
      */
-    public static class ConnectionFailed extends NanocachedException {
+    public static class ConnectionLost extends NanocachedException {
         /**
          * Issue #225 / #484: {@code true} only when this connection can
          * prove no complete frame of the failed request reached the
@@ -82,7 +82,7 @@ public class NanocachedException extends RuntimeException {
          * resending a <em>non-idempotent</em> request
          * (INCR/CAS/delete-if-matches) safe — see {@link
          * NanocachedClient}'s {@code applyReconnectingNonIdempotent}.
-         * Every other {@code ConnectionFailed} (a request timeout —
+         * Every other {@code ConnectionLost} (a request timeout —
          * including a write that failed because the timeout watchdog
          * closed the socket under it — or the reply simply never arriving
          * after a successful write) leaves the request's fate genuinely
@@ -105,15 +105,15 @@ public class NanocachedException extends RuntimeException {
          * public two-argument constructor. */
         private final boolean timedOut;
 
-        public ConnectionFailed(String message, Throwable cause) {
+        public ConnectionLost(String message, Throwable cause) {
             this(message, cause, false, false);
         }
 
-        ConnectionFailed(String message, Throwable cause, boolean notSent) {
+        ConnectionLost(String message, Throwable cause, boolean notSent) {
             this(message, cause, notSent, false);
         }
 
-        ConnectionFailed(String message, Throwable cause, boolean notSent, boolean timedOut) {
+        ConnectionLost(String message, Throwable cause, boolean notSent, boolean timedOut) {
             super(message, cause);
             this.notSent = notSent;
             this.timedOut = timedOut;
@@ -132,14 +132,14 @@ public class NanocachedException extends RuntimeException {
 
     /**
      * The node answered {@code En} and is closing the connection (issue
-     * #825). A {@link ConnectionFailed}, so every command other than
+     * #825). A {@link ConnectionLost}, so every command other than
      * touch, getAndTouch, touchMany or getManyAndTouch sees exactly the
      * failure it always did; those four turn it into {@link ServerTooOld}.
      * Only the node's {@code En} is this (issue #939): the proxy's bare
      * {@code E} (a request whose outcome it could not determine) stays a
-     * plain {@link ConnectionFailed}.
+     * plain {@link ConnectionLost}.
      */
-    static final class ServerRejected extends ConnectionFailed {
+    static final class ServerRejected extends ConnectionLost {
         ServerRejected() {
             super("nanocached: unexpected response from server: E", null);
         }
@@ -203,7 +203,7 @@ public class NanocachedException extends RuntimeException {
      * briefly unreachable and survived its own one refresh-and-retry; this
      * is the signal that even that didn't resolve in time.
      *
-     * <p>Unlike {@link ConnectionFailed} or {@link WrongNode}, this never
+     * <p>Unlike {@link ConnectionLost} or {@link WrongNode}, this never
      * closes or redials the connection — it stays open and usable for the
      * next call. Every {@code R} answer, including the three that led
      * here, is counted in {@link NanocachedClient.ClientStats#transientRetries()}.
@@ -315,7 +315,7 @@ public class NanocachedException extends RuntimeException {
      * it just throws a plain {@link WrongNode} on the same wrong-node
      * condition — there's no partial payload worth attaching there. (A
      * connection failure mid-batch is different: see {@link
-     * PartialConnectionFailedSet}.)
+     * PartialConnectionLostSet}.)
      *
      * <p>A separate, non-generic class from {@link PartialWrongNodeStrings}
      * rather than one class parameterized over the value type: the JLS
@@ -376,18 +376,18 @@ public class NanocachedException extends RuntimeException {
      * that data isn't silently discarded behind what would otherwise look
      * like a batch that wrote/read nothing at all. Never thrown when the
      * very first chunk fails — there is nothing partial to carry then, so
-     * a plain {@link ConnectionFailed} propagates instead, exactly as it
+     * a plain {@link ConnectionLost} propagates instead, exactly as it
      * always has.
      *
-     * <p>A subclass of {@link ConnectionFailed} (not {@link WrongNode}),
-     * so existing {@code catch (ConnectionFailed)} handling keeps working
+     * <p>A subclass of {@link ConnectionLost} (not {@link WrongNode}),
+     * so existing {@code catch (ConnectionLost)} handling keeps working
      * unchanged and this is trivially distinguishable from a total-failure
-     * plain {@link ConnectionFailed}.
+     * plain {@link ConnectionLost}.
      */
-    public static final class PartialConnectionFailed extends ConnectionFailed {
+    public static final class PartialConnectionLost extends ConnectionLost {
         public final java.util.Map<String, byte[]> partialValues;
 
-        public PartialConnectionFailed(
+        public PartialConnectionLost(
                 String message, Throwable cause, java.util.Map<String, byte[]> partialValues) {
             super(message, cause);
             this.partialValues = partialValues;
@@ -395,17 +395,17 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * As {@link PartialConnectionFailed}, but raised by {@link
+     * As {@link PartialConnectionLost}, but raised by {@link
      * NanocachedClient#getMany} — the UTF-8-decoded counterpart, thrown
-     * once the raw {@link PartialConnectionFailed} its {@code
+     * once the raw {@link PartialConnectionLost} its {@code
      * getManyBytes} call underneath threw has had its {@code
      * partialValues} decoded the same way a successful {@code getMany}
      * decodes {@code getManyBytes}' own result.
      */
-    public static final class PartialConnectionFailedStrings extends ConnectionFailed {
+    public static final class PartialConnectionLostStrings extends ConnectionLost {
         public final java.util.Map<String, String> partialValues;
 
-        public PartialConnectionFailedStrings(
+        public PartialConnectionLostStrings(
                 String message, Throwable cause, java.util.Map<String, String> partialValues) {
             super(message, cause);
             this.partialValues = partialValues;
@@ -413,7 +413,7 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * As {@link PartialConnectionFailed}, but raised by the positional,
+     * As {@link PartialConnectionLost}, but raised by the positional,
      * {@code byte[]}-keyed {@link NanocachedClient#getManyBytes(byte[][])}
      * (issue #160's positional form). {@code partialValues} is the same
      * positional array a successful call would have returned ({@code
@@ -432,11 +432,11 @@ public class NanocachedException extends RuntimeException {
      * positions must not be sent again with {@code 0}: a second attempt
      * answers them as misses and the values they held are lost.
      */
-    public static final class PartialConnectionFailedRaw extends ConnectionFailed {
+    public static final class PartialConnectionLostRaw extends ConnectionLost {
         public final byte[][] partialValues;
         public final int[] unresolvedIndices;
 
-        public PartialConnectionFailedRaw(
+        public PartialConnectionLostRaw(
                 String message, Throwable cause, byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
             super(message, cause);
             this.partialValues = partialValues;
@@ -458,33 +458,33 @@ public class NanocachedException extends RuntimeException {
      * confirmed stored by the chunk(s) that completed before the failure,
      * so a caller doesn't have to assume the whole batch was lost. Never
      * thrown when the very first chunk fails — a plain {@link
-     * ConnectionFailed} propagates instead, exactly as it always has.
+     * ConnectionLost} propagates instead, exactly as it always has.
      */
-    public static final class PartialConnectionFailedSet extends ConnectionFailed {
+    public static final class PartialConnectionLostSet extends ConnectionLost {
         public final java.util.Set<String> succeededKeys;
 
-        public PartialConnectionFailedSet(String message, Throwable cause, java.util.Set<String> succeededKeys) {
+        public PartialConnectionLostSet(String message, Throwable cause, java.util.Set<String> succeededKeys) {
             super(message, cause);
             this.succeededKeys = succeededKeys;
         }
     }
 
     /**
-     * As {@link PartialConnectionFailedSet}, but raised by the positional,
+     * As {@link PartialConnectionLostSet}, but raised by the positional,
      * {@code byte[]}-keyed {@link
      * NanocachedClient#setManyBytes(byte[][], byte[][], long)} (issue
      * #160's positional form) — {@code succeededIndices} lists (ascending)
      * the positions the earlier, already-succeeded chunk(s) confirmed
      * stored (the inverse of {@link PartialWrongNodeRaw#unresolvedIndices}
-     * /{@link PartialConnectionFailedRaw#unresolvedIndices}: those name
+     * /{@link PartialConnectionLostRaw#unresolvedIndices}: those name
      * what's still outstanding, this names what's already done, since a
      * successful {@code setManyBytes} has no positional array of its own
      * to splice a "did this position resolve" answer into).
      */
-    public static final class PartialConnectionFailedSetRaw extends ConnectionFailed {
+    public static final class PartialConnectionLostSetRaw extends ConnectionLost {
         public final int[] succeededIndices;
 
-        public PartialConnectionFailedSetRaw(String message, Throwable cause, java.util.List<Integer> succeededIndices) {
+        public PartialConnectionLostSetRaw(String message, Throwable cause, java.util.List<Integer> succeededIndices) {
             super(message, cause);
             this.succeededIndices = succeededIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
         }

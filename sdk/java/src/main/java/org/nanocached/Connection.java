@@ -234,7 +234,7 @@ final class Connection {
         // close the socket *before* trying to poison: poison() takes the
         // monitor, and a writer wedged in out.write holds it — only the
         // close itself can unblock that writer (and the blocked reader).
-        timedOutError = new NanocachedException.ConnectionFailed(
+        timedOutError = new NanocachedException.ConnectionLost(
                 "nanocached: no response from server within " + requestTimeoutMillis
                         + "ms (request timed out)",
                 null, false, true);
@@ -255,7 +255,7 @@ final class Connection {
     }
 
     void close() {
-        poison(new NanocachedException.ConnectionFailed("nanocached: connection closed", null));
+        poison(new NanocachedException.ConnectionLost("nanocached: connection closed", null));
     }
 
     byte[] get(byte[] key) {
@@ -467,7 +467,7 @@ final class Connection {
                 // fall through to poison below
             }
         }
-        NanocachedException error = new NanocachedException.ConnectionFailed(
+        NanocachedException error = new NanocachedException.ConnectionLost(
                 "nanocached: invalid INCR value in response (connection desynced)", null);
         poison(error);
         throw error;
@@ -547,7 +547,7 @@ final class Connection {
      * Connection (request pipelining), not something this SDK introduces.
      */
     private NanocachedException mismatch(int marker) {
-        NanocachedException error = new NanocachedException.ConnectionFailed(
+        NanocachedException error = new NanocachedException.ConnectionLost(
                 "nanocached: response '" + (char) marker + "' does not match the request (connection desynced)",
                 null);
         poison(error);
@@ -561,7 +561,7 @@ final class Connection {
      * the same way.
      */
     private NanocachedException desyncedEntryCount(String op, int got, int want) {
-        NanocachedException error = new NanocachedException.ConnectionFailed(
+        NanocachedException error = new NanocachedException.ConnectionLost(
                 "nanocached: " + op + " response roster length " + got
                         + " does not match request key count " + want + " (connection desynced)",
                 null);
@@ -945,7 +945,7 @@ final class Connection {
             // the wire — the connection was already dead (e.g. an
             // idle-timeout FIN the reader thread already noticed), so a
             // non-idempotent caller may safely redial and resend.
-            throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null, true);
+            throw new NanocachedException.ConnectionLost("nanocached: connection is closed", null, true);
         }
 
         PreparedRequest prepared = null;
@@ -963,7 +963,7 @@ final class Connection {
                         // hasn't been written; only a concurrent poison() (or
                         // an 'R' retry racing a close) landed between the
                         // check above and this one.
-                        throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null, true);
+                        throw new NanocachedException.ConnectionLost("nanocached: connection is closed", null, true);
                     }
                     lastUsedNanos = System.nanoTime();
                     if (prepared == null) {
@@ -1012,9 +1012,9 @@ final class Connection {
                     // fully sent.
                     boolean timedOut = timedOutError != null;
                     boolean notSent = !timedOut;
-                    poison(new NanocachedException.ConnectionFailed(
+                    poison(new NanocachedException.ConnectionLost(
                             "nanocached: connection failed: " + error.getMessage(), error));
-                    throw new NanocachedException.ConnectionFailed(
+                    throw new NanocachedException.ConnectionLost(
                             "nanocached: connection failed: " + error.getMessage(), error, notSent, timedOut);
                 }
             }
@@ -1025,7 +1025,7 @@ final class Connection {
             } catch (CompletionException wrapped) {
                 Throwable cause = wrapped.getCause();
                 if (cause instanceof NanocachedException nanocachedError) throw nanocachedError;
-                throw new NanocachedException.ConnectionFailed("nanocached: connection failed", cause);
+                throw new NanocachedException.ConnectionLost("nanocached: connection failed", cause);
             }
 
             if (response.marker != 'R') return response;
@@ -1131,7 +1131,7 @@ final class Connection {
         try {
             dispatchResponses();
         } catch (RuntimeException error) {
-            poison(new NanocachedException.ConnectionFailed(
+            poison(new NanocachedException.ConnectionLost(
                     "nanocached: connection failed: " + error, error));
         }
     }
@@ -1142,7 +1142,7 @@ final class Connection {
             try {
                 response = readResponse();
             } catch (IOException error) {
-                poison(new NanocachedException.ConnectionFailed(
+                poison(new NanocachedException.ConnectionLost(
                         "nanocached: connection failed: " + error.getMessage(), error));
                 return;
             } catch (NanocachedException error) {
@@ -1173,12 +1173,12 @@ final class Connection {
             // the connection; it isn't an answer to anything we sent
             // (mirrors the TypeScript SDK's Connection.onData).
             if (response.marker == 'B' && wasEmpty) {
-                poison(new NanocachedException.ConnectionFailed(
+                poison(new NanocachedException.ConnectionLost(
                         "nanocached: server rejected the connection (connection limit reached)", null));
                 return;
             }
             if (waiter == null) {
-                poison(new NanocachedException.ConnectionFailed(
+                poison(new NanocachedException.ConnectionLost(
                         "nanocached: unsolicited response '" + (char) response.marker
                                 + "' from server (connection desynced)",
                         null));
@@ -1191,7 +1191,7 @@ final class Connection {
             // the caller-side kind check (mismatch()), catching it here
             // stops the misdelivery instead of merely noticing it later.
             if (tagged && response.tag != waiter.tag()) {
-                NanocachedException error = new NanocachedException.ConnectionFailed(
+                NanocachedException error = new NanocachedException.ConnectionLost(
                         "nanocached: response tag " + response.tag + " does not answer request tag "
                                 + waiter.tag() + " (connection desynced)",
                         null);
@@ -1218,24 +1218,24 @@ final class Connection {
             int marker, String what, java.util.function.Function<String, MultiEntry> entryOf) throws IOException {
         String[] fields = readLine().split(" ");
         if (fields.length < 1) {
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     "nanocached: invalid " + what + " header in response", null);
         }
         int count = parseNonNegativeInt(fields[0]);
         if (count < 0) {
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     "nanocached: invalid " + what + " count in response", null);
         }
         int wantFields = 1 + count + (tagged ? 1 : 0);
         if (fields.length != wantFields) {
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     "nanocached: invalid " + what + " header in response", null);
         }
         List<MultiEntry> entries = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             MultiEntry entry = entryOf.apply(fields[1 + i]);
             if (entry == null) {
-                throw new NanocachedException.ConnectionFailed(
+                throw new NanocachedException.ConnectionLost(
                         "nanocached: invalid " + what + " result token in response", null);
             }
             entries.add(entry);
@@ -1255,7 +1255,7 @@ final class Connection {
                 String[] fields = readLine().split(" ");
                 int valueFields = tagged ? 2 : 1;
                 if (fields.length != valueFields && fields.length != valueFields + 1) {
-                    throw new NanocachedException.ConnectionFailed(
+                    throw new NanocachedException.ConnectionLost(
                             "nanocached: invalid value header in response", null);
                 }
                 // A non-numeric (issue #462: including a leading '+'),
@@ -1265,14 +1265,14 @@ final class Connection {
                 // redial/retry layer handles it (issue #8).
                 int length = parseNonNegativeInt(fields[0]);
                 if (length < 0 || length > MAX_VALUE_LENGTH) {
-                    throw new NanocachedException.ConnectionFailed(
+                    throw new NanocachedException.ConnectionLost(
                             "nanocached: invalid value length in response", null);
                 }
                 Long valueTtl = null;
                 if (fields.length == valueFields + 1) {
                     long parsedTtl = parseNonNegativeLong(fields[1]);
                     if (parsedTtl < 0) {
-                        throw new NanocachedException.ConnectionFailed(
+                        throw new NanocachedException.ConnectionLost(
                                 "nanocached: invalid ttl in response", null);
                     }
                     valueTtl = parsedTtl;
@@ -1292,12 +1292,12 @@ final class Connection {
                 int fieldsWithoutTtl = tagged ? 2 : 1;
                 int fieldsWithTtl = tagged ? 3 : 2;
                 if (fields.length != fieldsWithoutTtl && fields.length != fieldsWithTtl) {
-                    throw new NanocachedException.ConnectionFailed(
+                    throw new NanocachedException.ConnectionLost(
                             "nanocached: invalid incr value header in response", null);
                 }
                 int length = parseNonNegativeInt(fields[0]);
                 if (length < 0 || length > MAX_VALUE_LENGTH) {
-                    throw new NanocachedException.ConnectionFailed(
+                    throw new NanocachedException.ConnectionLost(
                             "nanocached: invalid value length in response", null);
                 }
                 Long ttlSeconds = null;
@@ -1307,7 +1307,7 @@ final class Connection {
                     // (issue #462) via parseNonNegativeLong instead.
                     long parsedTtl = parseNonNegativeLong(fields[1]);
                     if (parsedTtl < 0) {
-                        throw new NanocachedException.ConnectionFailed(
+                        throw new NanocachedException.ConnectionLost(
                                 "nanocached: invalid ttl in response", null);
                     }
                     ttlSeconds = parsedTtl;
@@ -1346,17 +1346,17 @@ final class Connection {
             case 'M' -> {
                 String[] fields = readLine().split(" ");
                 if (fields.length < 1) {
-                    throw new NanocachedException.ConnectionFailed(
+                    throw new NanocachedException.ConnectionLost(
                             "nanocached: invalid multi-get header in response", null);
                 }
                 int count = parseNonNegativeInt(fields[0]);
                 if (count < 0) {
-                    throw new NanocachedException.ConnectionFailed(
+                    throw new NanocachedException.ConnectionLost(
                             "nanocached: invalid multi-get count in response", null);
                 }
                 int wantFields = 1 + count + (tagged ? 1 : 0);
                 if (fields.length != wantFields) {
-                    throw new NanocachedException.ConnectionFailed(
+                    throw new NanocachedException.ConnectionLost(
                             "nanocached: invalid multi-get header in response", null);
                 }
                 List<MultiEntry> entries = new ArrayList<>(count);
@@ -1369,12 +1369,12 @@ final class Connection {
                         default -> {
                             int length = parseNonNegativeInt(token);
                             if (length < 0 || length > MAX_VALUE_LENGTH) {
-                                throw new NanocachedException.ConnectionFailed(
+                                throw new NanocachedException.ConnectionLost(
                                         "nanocached: invalid multi-get result length in response", null);
                             }
                             totalBytes += length;
                             if (totalBytes > maxMultiGetResponseBytes) {
-                                throw new NanocachedException.ConnectionFailed(
+                                throw new NanocachedException.ConnectionLost(
                                         "nanocached: multi-get response exceeds "
                                                 + maxMultiGetResponseBytes + " bytes", null);
                             }
@@ -1423,7 +1423,7 @@ final class Connection {
             }
             // `En\n`: the node rejects the request and is closing the
             // connection. Told apart from other unexpected bytes so a touch
-            // can report "server too old" (issue #825); a ConnectionFailed
+            // can report "server too old" (issue #825); a ConnectionLost
             // either way, so every other command is unaffected.
             //
             // Only the node's `En` (the `n` server-type byte right after
@@ -1441,16 +1441,16 @@ final class Connection {
                 } catch (IOException unreadable) {
                     // Not even the end of the line arrived, so `En` is not
                     // confirmed: treat it as the unspecific failure.
-                    throw new NanocachedException.ConnectionFailed(
+                    throw new NanocachedException.ConnectionLost(
                             "nanocached: unexpected response from server: E", unreadable);
                 }
                 if (rest.equals("n") || rest.startsWith("n ")) {
                     throw new NanocachedException.ServerRejected();
                 }
-                throw new NanocachedException.ConnectionFailed(
+                throw new NanocachedException.ConnectionLost(
                         "nanocached: unexpected response from server: E", null);
             }
-            default -> throw new NanocachedException.ConnectionFailed(
+            default -> throw new NanocachedException.ConnectionLost(
                     "nanocached: unexpected response from server: " + (char) marker, null);
         }
     }
@@ -1464,13 +1464,13 @@ final class Connection {
      * connection-classified so the redial/retry layer handles it. */
     private static int parseTag(String field) {
         if (!isDigitsOnly(field)) {
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     "nanocached: invalid response tag", null);
         }
         try {
             return Integer.parseUnsignedInt(field);
         } catch (NumberFormatException malformed) {
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     "nanocached: invalid response tag", null);
         }
     }
@@ -1491,7 +1491,7 @@ final class Connection {
     private void expectLf() throws IOException {
         int value = readByte();
         if (value != '\n') {
-            throw new NanocachedException.ConnectionFailed(
+            throw new NanocachedException.ConnectionLost(
                     "nanocached: unexpected byte after response marker (connection desynced)", null);
         }
     }
@@ -1504,7 +1504,7 @@ final class Connection {
         ByteArrayOutputStream line = new ByteArrayOutputStream();
         for (int b = readByte(); b != '\n'; b = readByte()) {
             if (line.size() >= MAX_HEADER_LINE_LENGTH) {
-                throw new NanocachedException.ConnectionFailed(
+                throw new NanocachedException.ConnectionLost(
                         "nanocached: response header line too long", null);
             }
             line.write(b);

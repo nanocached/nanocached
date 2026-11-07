@@ -11,6 +11,10 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `NanocachedException.ConnectionFailed` is now `ConnectionLost`, and `PartialConnectionFailed`, `PartialConnectionFailedStrings`, `PartialConnectionFailedRaw`, `PartialConnectionFailedSet` and `PartialConnectionFailedSetRaw` are now `PartialConnectionLost`, `PartialConnectionLostStrings`, `PartialConnectionLostRaw`, `PartialConnectionLostSet` and `PartialConnectionLostSetRaw`. The other five SDKs call this failure `ConnectionLost`; the old names are gone, with no alias. Entries below that name the old classes describe earlier releases.
+
 ### Fixed
 
 - Hedged reads (`readHedgeAfter`) stalled once an owner had stopped answering: after 32 hedge legs were left running against it, the next read waited for the request timeout (30 s) for one of them instead of returning the replica's answer, and against an owner that was only slow the limit made hedging ineffective at moderate read rates (about 400 reads per second and up against an owner answering in a few hundred milliseconds). An owner that has 32 hedge legs unanswered after the hedge interval is now tried last, so reads go to its replica first; a miss still waits for the primary. The limit on hedge legs in flight, which waits for a read's remaining legs, is raised from 32 to 256 and now only applies when every owner of a key is slow. (#1390)

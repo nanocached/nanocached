@@ -326,12 +326,12 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * layer instead of just letting the exception propagate and throwing
      * away an otherwise-successful batch.
      *
-     * <p>Issue #439: {@link NanocachedException.PartialConnectionFailedRaw}
+     * <p>Issue #439: {@link NanocachedException.PartialConnectionLostRaw}
      * gets the same "don't discard the already-resolved data" treatment,
      * but not the same bounded, repeat-until-resolved loop as the
      * wrong-node case — a stale ring view is something retrying can be
      * expected to fix on a subsequent attempt, but by the time this method
-     * sees a {@code PartialConnectionFailedRaw} the SDK has already tried
+     * sees a {@code PartialConnectionLostRaw} the SDK has already tried
      * the failing chunk twice (its own original attempt plus one internal
      * reconnect-and-retry, see {@code applyReconnecting} in {@code
      * NanocachedClient}) and failed both times, so there is no reason to
@@ -359,7 +359,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * touch is idempotent, so retrying the remainder is as safe as for a
      * plain read — with one exception, {@code expiring}: a batched touch
      * with a zero TTL (an access expiry of {@code Duration.ZERO}) expires
-     * every key it finds, and the SDK's {@code PartialConnectionFailedRaw}
+     * every key it finds, and the SDK's {@code PartialConnectionLostRaw}
      * for it lists as unresolved the keys of a frame that was sent and whose
      * connection was then lost, keys the node may well have expired
      * already. Fetching them again would ask for values the first frame
@@ -395,7 +395,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 if (attempt >= MAX_BULK_WRONG_NODE_RETRIES) {
                     throw Wire.failure(error);
                 }
-            } catch (NanocachedException.PartialConnectionFailedRaw partial) {
+            } catch (NanocachedException.PartialConnectionLostRaw partial) {
                 for (int i = 0; i < positions.length; i++) {
                     result[positions[i]] = partial.partialValues[i];
                 }
@@ -750,7 +750,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * duplicate write of the exact same value/TTL this call was already
      * going to make.
      *
-     * <p>Issue #439: {@link NanocachedException.PartialConnectionFailedSetRaw}
+     * <p>Issue #439: {@link NanocachedException.PartialConnectionLostSetRaw}
      * gets a narrower retry than the wrong-node branch above, not the
      * "resend the whole group" treatment — a connection failure mid-batch
      * only reaches here after the SDK has already retried the failing
@@ -780,7 +780,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 if (attempt >= MAX_BULK_WRONG_NODE_RETRIES) {
                     throw Wire.failure(error);
                 }
-            } catch (NanocachedException.PartialConnectionFailedSetRaw partial) {
+            } catch (NanocachedException.PartialConnectionLostSetRaw partial) {
                 if (connectionRetried) {
                     throw Wire.failure(partial);
                 }
@@ -1200,7 +1200,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * the way {@link javax.cache.Cache}'s contract asks: as a {@link
      * CacheException} that carries the SDK's own exception as its cause.
      * Without this a stopped node surfaced as the SDK's {@code
-     * ConnectionFailed} and an over-size value as {@code
+     * ConnectionLost} and an over-size value as {@code
      * IllegalArgumentException}, neither of which a JCache caller can
      * be expected to catch. The two bulk calls let the SDK's partial
      * and wrong-node outcomes through unwrapped: {@link
@@ -1226,8 +1226,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
         private static RuntimeException wrappedUnlessBulkOutcome(RuntimeException error) {
             boolean bulkOutcome = error instanceof NanocachedException.PartialWrongNodeRaw
-                    || error instanceof NanocachedException.PartialConnectionFailedRaw
-                    || error instanceof NanocachedException.PartialConnectionFailedSetRaw
+                    || error instanceof NanocachedException.PartialConnectionLostRaw
+                    || error instanceof NanocachedException.PartialConnectionLostSetRaw
                     || error instanceof NanocachedException.WrongNode;
             return bulkOutcome ? error : wrapped(error);
         }
