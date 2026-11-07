@@ -9,6 +9,10 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** a `nanocached.*` property the provider does not read (for example a mistyped `nanocached.tsl`) is now a `CacheException` naming it, where it used to be ignored: a mistyped TLS key left TLS off and sent the secret in the clear. Properties outside the `nanocached.` prefix are still left alone.
+
 ## [0.6.2] - 2026-11-03
 
 No changes. Version aligned with the rest of the project: every release

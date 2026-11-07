@@ -83,7 +83,23 @@ public final class NanocachedCachingProvider implements CachingProvider {
         return winner[0];
     }
 
+    /** Every {@code nanocached.*} property this provider reads. */
+    private static final java.util.Set<String> KNOWN_PROPERTIES = java.util.Set.of(
+            "nanocached.addresses", "nanocached.secret", "nanocached.tls", "nanocached.ca",
+            "nanocached.compress", "nanocached.compression-threshold",
+            "nanocached.fire-and-forget-replicas", "nanocached.read-repair",
+            "nanocached.reconnect-cooldown-millis", "nanocached.read-hedge-after-millis");
+
     private static NanocachedClient connect(Properties properties) {
+        // A mistyped key (say nanocached.tsl) must not be ignored quietly: it
+        // would leave TLS off and send the secret in the clear. Properties
+        // outside the nanocached. prefix belong to the caller and are left alone.
+        for (String name : properties.stringPropertyNames()) {
+            if (name.startsWith("nanocached.") && !KNOWN_PROPERTIES.contains(name)) {
+                throw new CacheException("nanocached-jcache: unknown property \"" + name
+                        + "\"; the keys this provider reads are " + new java.util.TreeSet<>(KNOWN_PROPERTIES));
+            }
+        }
         String addresses = properties.getProperty("nanocached.addresses");
         if (addresses == null || addresses.isBlank()) {
             throw new CacheException(
