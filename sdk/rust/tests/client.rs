@@ -2953,6 +2953,39 @@ async fn a_request_to_a_half_open_server_fails_within_the_timeout_and_close_retu
     node.stop();
 }
 
+// The two internal signals the client passes between its layers (a reply lost
+// after the frame was written; a request deadline that expired) never reach
+// a caller: every public method returns a plain `ConnectionLost`, for the
+// idempotent and the non-idempotent paths alike.
+#[tokio::test]
+async fn a_timeout_surfaces_as_a_plain_connection_lost_on_every_path() {
+    let node = MockNode::start().await;
+    let client =
+        NanocachedClient::connect(options(node.port).request_timeout(Duration::from_millis(300)))
+            .await
+            .unwrap();
+    node.state.silent.store(true, Ordering::SeqCst);
+
+    let set = client.set("k", "v", 0).await;
+    assert!(
+        matches!(set, Err(Error::ConnectionLost(_))),
+        "set = {set:?}"
+    );
+    let incr = client.incr("n", 1).await;
+    assert!(
+        matches!(incr, Err(Error::ConnectionLost(_))),
+        "incr = {incr:?}"
+    );
+    let delete = client.delete("k").await;
+    assert!(
+        matches!(delete, Err(Error::ConnectionLost(_))),
+        "delete = {delete:?}"
+    );
+
+    client.close().await;
+    node.stop();
+}
+
 // ── addresses ─────────────────────────────────────────────────────────
 
 #[tokio::test]
