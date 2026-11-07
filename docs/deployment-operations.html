@@ -45,7 +45,7 @@ three paths on it (plain HTTP, on <code>--host</code>):</p>
   <tbody>
     <tr><td><code>GET /metrics</code></td><td>Prometheus text format.</td></tr>
     <tr><td><code>GET /healthz</code></td><td><code>200</code> while the process is serving — a liveness probe.</td></tr>
-    <tr><td><code>GET /readyz</code></td><td><code>200</code> only when the instance can do useful work — a readiness probe. A node is ready once it has adopted cluster membership; a proxy once it has a node roster; a discovery server once its startup grace period is over.</td></tr>
+    <tr><td><code>GET /readyz</code></td><td><code>200</code> only when the instance can do useful work — a readiness probe. A node is ready once it has adopted cluster membership; a proxy once it has a node roster, and it stops being ready as soon as it starts draining; a discovery server once its startup grace period is over.</td></tr>
   </tbody>
 </table>
 </div>
