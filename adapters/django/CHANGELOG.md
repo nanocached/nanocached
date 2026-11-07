@@ -9,6 +9,13 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Added
+
+- `OPTIONS["DISABLE_RECONNECT_COOLDOWN"]` is passed through to the SDK as
+  `disable_reconnect_cooldown`. Since the SDK started reading
+  `reconnect_cooldown=0` as the default, this switch is the only way to turn
+  the reconnect cooldown off, and the backend did not forward it.
+
 ### Changed
 
 - **Breaking:** an `OPTIONS` key the backend does not know now raises `ImproperlyConfigured` when the cache is created. Before, it was ignored, so a misspelled `"Tls": True` left TLS off and sent the secret in the clear. Django's own `MAX_ENTRIES` and `CULL_FREQUENCY` (either case) are still accepted.

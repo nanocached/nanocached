@@ -83,6 +83,7 @@ _CONNECT_OPTION_KWARGS: dict[str, str] = {
     "READ_REPAIR": "read_repair",
     "READ_HEDGE_AFTER": "read_hedge_after",
     "RECONNECT_COOLDOWN": "reconnect_cooldown",
+    "DISABLE_RECONNECT_COOLDOWN": "disable_reconnect_cooldown",
 }
 
 # Every OPTIONS key this backend reads, plus the ones Django's own
