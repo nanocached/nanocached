@@ -158,10 +158,11 @@ release may add a flag or an environment variable.</p>
   <code>--replication-factor</code>). Set the ones your deployment depends
   on explicitly; the changelog notes a changed default;</li>
   <li>the wording of <code>--help</code>, log lines and error messages;</li>
-  <li><code>NANOCACHED_SECRET</code>, which only the proxy reads, as a legacy
-  name for <code>NANOCACHED_AUTH_SECRET</code>. It prints a warning and is
-  already slated to go; use <code>NANOCACHED_AUTH_SECRET</code> on all three
-  binaries;</li>
+  <li><code>NANOCACHED_SECRET</code>, the proxy's old name for
+  <code>NANOCACHED_AUTH_SECRET</code>. It is no longer read: a proxy that
+  has only the old name set refuses to start and says so, rather than run
+  without authentication. Use <code>NANOCACHED_AUTH_SECRET</code> on all
+  three binaries;</li>
   <li><code>NANOCACHED_TRACE_PREFIX</code>, which only a build with the
   <code>trace</code> feature reads. The released images are built without
   it.</li>
