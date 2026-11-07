@@ -42,7 +42,7 @@ namespace Nanocached.Caching;
 /// already read is returned, and the failure is counted in
 /// <see cref="SlidingRenewalFailures"/>.</para>
 /// </summary>
-public class NanocachedDistributedCache : IDistributedCache
+public sealed class NanocachedDistributedCache : IDistributedCache, IDisposable
 {
     // Envelope layout (see the class doc comment): 1 version byte, a
     // 4-byte big-endian sliding-seconds field (0 = no sliding), an 8-byte
@@ -110,13 +110,21 @@ public class NanocachedDistributedCache : IDistributedCache
         _namespace = client.Namespace(@namespace);
     }
 
-    /// <summary>As the <c>(client, namespace)</c> constructor, taking the
-    /// namespace from <paramref name="options"/> — used directly, or via
-    /// <see cref="ServiceCollectionExtensions"/>' DI registration.</summary>
-    public NanocachedDistributedCache(NanocachedClient client, NanocachedCacheOptions options)
-        : this(client, (options ?? throw new ArgumentNullException(nameof(options))).Namespace)
+    /// <summary>As the public constructor, for the registration that created
+    /// <paramref name="client"/> itself: disposing the cache (the container does
+    /// it) then closes the client. A cache built with the public constructor
+    /// never closes the client it was handed.</summary>
+    internal NanocachedDistributedCache(NanocachedClient client, string @namespace, bool ownsClient)
+        : this(client, @namespace)
     {
+        if (ownsClient) _ownedClient = client;
     }
+
+    private readonly NanocachedClient? _ownedClient;
+
+    // Explicit, so the type's public methods stay exactly the IDistributedCache
+    // ones; a container that disposes what it created still finds IDisposable.
+    void IDisposable.Dispose() => _ownedClient?.Close();
 
     public byte[]? Get(string key) => GetAsync(key).GetAwaiter().GetResult();
 
@@ -126,7 +134,7 @@ public class NanocachedDistributedCache : IDistributedCache
         token.ThrowIfCancellationRequested();
 
         byte[] keyBytes = KeyBytes(key);
-        (byte[] Value, string Token)? read = await _namespace.GetBytesWithTokenAsync(keyBytes).ConfigureAwait(false);
+        (byte[] Value, string Token)? read = await _namespace.GetBytesWithTokenAsync(keyBytes, token).ConfigureAwait(false);
         if (read is not { } hit) return null;
 
         Envelope envelope = Envelope.Parse(hit.Value);
@@ -146,7 +154,7 @@ public class NanocachedDistributedCache : IDistributedCache
             // catches up. Conditional on the token (issue #391) so a
             // concurrent Set that just replaced the entry isn't deleted
             // along with the expired bytes this call actually read.
-            await _namespace.DeleteIfMatchesAsync(keyBytes, hit.Token).ConfigureAwait(false);
+            await _namespace.DeleteIfMatchesAsync(keyBytes, hit.Token, token).ConfigureAwait(false);
             return null;
         }
         if (envelope.SlidingSeconds == 0) return envelope.Payload; // fixed TTL (or none) — nothing to renew
@@ -163,7 +171,7 @@ public class NanocachedDistributedCache : IDistributedCache
         long wireTtl = envelope.WireTtlSeconds(now);
         try
         {
-            await _namespace.ReplaceAsync(keyBytes, hit.Token, envelope.ToBytes(), wireTtl).ConfigureAwait(false);
+            await _namespace.ReplaceAsync(keyBytes, hit.Token, envelope.ToBytes(), wireTtl, token).ConfigureAwait(false);
         }
         catch (NanocachedException error)
         {
@@ -198,7 +206,7 @@ public class NanocachedDistributedCache : IDistributedCache
         DateTimeOffset now = DateTimeOffset.UtcNow;
         Envelope envelope = Envelope.FromOptions(options, value, now);
         long wireTtl = envelope.WireTtlSeconds(now);
-        await _namespace.SetAsync(KeyBytes(key), envelope.ToBytes(), wireTtl).ConfigureAwait(false);
+        await _namespace.SetAsync(KeyBytes(key), envelope.ToBytes(), wireTtl, token).ConfigureAwait(false);
     }
 
     public void Refresh(string key) => RefreshAsync(key).GetAwaiter().GetResult();
@@ -209,7 +217,7 @@ public class NanocachedDistributedCache : IDistributedCache
         token.ThrowIfCancellationRequested();
 
         byte[] keyBytes = KeyBytes(key);
-        (byte[] Value, string Token)? read = await _namespace.GetBytesWithTokenAsync(keyBytes).ConfigureAwait(false);
+        (byte[] Value, string Token)? read = await _namespace.GetBytesWithTokenAsync(keyBytes, token).ConfigureAwait(false);
         // A missing key is a no-op, per IDistributedCache's contract —
         // not a miss error.
         if (read is not { } hit) return;
@@ -227,7 +235,7 @@ public class NanocachedDistributedCache : IDistributedCache
             // absolute expiry must not be floored to a 1-second TTL and
             // resurrected by this refresh. Token-conditional for the same
             // reason as there (issue #391).
-            await _namespace.DeleteIfMatchesAsync(keyBytes, hit.Token).ConfigureAwait(false);
+            await _namespace.DeleteIfMatchesAsync(keyBytes, hit.Token, token).ConfigureAwait(false);
             return;
         }
 
@@ -235,7 +243,7 @@ public class NanocachedDistributedCache : IDistributedCache
         // condition means a concurrent writer just refreshed the entry,
         // so there is nothing left for this renewal to do.
         long wireTtl = envelope.WireTtlSeconds(now);
-        await _namespace.ReplaceAsync(keyBytes, hit.Token, envelope.ToBytes(), wireTtl).ConfigureAwait(false);
+        await _namespace.ReplaceAsync(keyBytes, hit.Token, envelope.ToBytes(), wireTtl, token).ConfigureAwait(false);
     }
 
     public void Remove(string key) => RemoveAsync(key).GetAwaiter().GetResult();
@@ -244,7 +252,7 @@ public class NanocachedDistributedCache : IDistributedCache
     {
         ArgumentNullException.ThrowIfNull(key);
         token.ThrowIfCancellationRequested();
-        await _namespace.DeleteAsync(KeyBytes(key)).ConfigureAwait(false);
+        await _namespace.DeleteAsync(KeyBytes(key), token).ConfigureAwait(false);
     }
 
     /// <summary>

@@ -138,7 +138,10 @@ is skipped, the entry expires on its old schedule, and the skipped renewal
 is counted in `NanocachedDistributedCache.SlidingRenewalFailures` (the first
 one is also written to stderr). `Refresh`, whose only job is the renewal,
 throws instead. The `CancellationToken` of the `IDistributedCache` methods
-is checked on entry only; the SDK's calls take no token to pass it to.
+is passed to the SDK calls: a token that is already cancelled sends nothing, and
+cancelling a call in flight abandons the wait with `OperationCanceledException`
+while the operation may still complete on the cluster (see the SDK's
+Cancellation section). `NanocachedDistributedCache` is `sealed`.
 
 Whole-second TTLs only reach the wire: a positive sub-second remainder
 always rounds **up** to 1 second, never down to 0 (which would mean "no

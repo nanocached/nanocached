@@ -543,6 +543,44 @@ public sealed class NanocachedDistributedCacheTests
     // ── Namespaces ───────────────────────────────────────────────────
 
     [Fact]
+    public async Task A_cancelled_token_reaches_the_client_and_abandons_the_wait()
+    {
+        using var node = new MockNode();
+        var client = await NanocachedClient.ConnectAsync(
+            new NanocachedClient.Options { Addresses = { ("127.0.0.1", node.Port) } });
+        try
+        {
+            var cache = new NanocachedDistributedCache(client);
+            await cache.SetAsync("k", new byte[] { 1, 2, 3 }, new DistributedCacheEntryOptions());
+
+            node.GetDelayMillis = 600;
+            using var cts = new CancellationTokenSource();
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            Task<byte[]?> read = cache.GetAsync("k", cts.Token);
+            cts.CancelAfter(50);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => read);
+            Assert.True(watch.ElapsedMilliseconds < 500, $"the wait was not abandoned: {watch.ElapsedMilliseconds} ms");
+
+            // The connection is still usable and still paired with its own replies.
+            node.GetDelayMillis = 0;
+            Assert.Equal(new byte[] { 1, 2, 3 }, await cache.GetAsync("k"));
+        }
+        finally
+        {
+            client.Close();
+        }
+    }
+
+    [Fact]
+    public void The_cache_type_is_sealed_and_has_no_options_constructor()
+    {
+        Assert.True(typeof(NanocachedDistributedCache).IsSealed);
+        Assert.DoesNotContain(
+            typeof(NanocachedDistributedCache).GetConstructors(),
+            constructor => constructor.GetParameters().Any(parameter => parameter.ParameterType == typeof(NanocachedCacheOptions)));
+    }
+
+    [Fact]
     public async Task Default_namespace_is_distributed_cache()
     {
         using var node = new MockNode();
