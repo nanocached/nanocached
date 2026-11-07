@@ -202,8 +202,20 @@ public sealed class NanocachedClient : IDisposable
     /// or an upstream (e.g. behind a proxy) degrading before it ever
     /// surfaces as a hard failure.
     /// </summary>
-    public readonly record struct ClientStats(
-        long ReplicaWriteFailures, long ReadRepairFailures, long RefreshFailures, long TransientRetries);
+    public sealed record ClientStats
+    {
+        /// <summary>Replica writes (client-side replication, fire-and-forget) that failed.</summary>
+        public long ReplicaWriteFailures { get; init; }
+
+        /// <summary>Read-repair write-backs to the primary that failed.</summary>
+        public long ReadRepairFailures { get; init; }
+
+        /// <summary>Node-list refresh attempts or per-node reconnects that failed.</summary>
+        public long RefreshFailures { get; init; }
+
+        /// <summary>Every <c>R</c> (transient-failure) response received.</summary>
+        public long TransientRetries { get; init; }
+    }
 
     // The server rejects (and drops the connection for) any request frame
     // over MAX_REQUEST_SIZE (src/server.rs), 1 MiB — a hard cap on the
@@ -952,11 +964,13 @@ public sealed class NanocachedClient : IDisposable
     /// replication silently degrading or a node-list refresh that is
     /// stuck failing.
     /// </summary>
-    public ClientStats Stats() => new(
-        Interlocked.Read(ref _replicaWriteFailures),
-        Interlocked.Read(ref _readRepairFailures),
-        Interlocked.Read(ref _refreshFailures),
-        Interlocked.Read(ref _transientRetries));
+    public ClientStats Stats() => new()
+    {
+        ReplicaWriteFailures = Interlocked.Read(ref _replicaWriteFailures),
+        ReadRepairFailures = Interlocked.Read(ref _readRepairFailures),
+        RefreshFailures = Interlocked.Read(ref _refreshFailures),
+        TransientRetries = Interlocked.Read(ref _transientRetries),
+    };
 
     /// <summary>
     /// issue #105 — first-class namespaces: a lightweight handle scoping

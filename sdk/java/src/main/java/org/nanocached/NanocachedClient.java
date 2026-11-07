@@ -338,7 +338,7 @@ public final class NanocachedClient implements AutoCloseable {
      * notice replication silently degrading or a node-list refresh stuck
      * failing.
      *
-     * @param backgroundWriteBugs a genuine programming bug (never an
+     * <p>{@link #backgroundWriteBugs()} counts a genuine programming bug (never an
      * expected failure — those are already counted above) that escaped a
      * background replica write or read-repair write-back. Unlike the
      * other counters, this must never legitimately increase; it exists so
@@ -346,7 +346,7 @@ public final class NanocachedClient implements AutoCloseable {
      * silently the way an ignored {@code CompletableFuture.whenComplete}
      * error previously could (audit finding). Also logged to
      * stderr when it happens — see {@link #reportBackgroundWriteBug}.
-     * @param transientRetries every {@code R} (transient-failure, issue
+     * <p>{@link #transientRetries()} counts every {@code R} (transient-failure, issue
      * #125) response this client has received across every connection,
      * including the final one on any request that went on to exhaust its
      * bounded retry budget and raise {@link
@@ -357,8 +357,62 @@ public final class NanocachedClient implements AutoCloseable {
      * an operator can see how often it's happening even when every
      * individual occurrence resolved fine.
      */
-    public record ClientStats(long replicaWriteFailures, long readRepairFailures, long refreshFailures,
-            long backgroundWriteBugs, long transientRetries) {}
+    public static final class ClientStats {
+        private final long replicaWriteFailures;
+        private final long readRepairFailures;
+        private final long refreshFailures;
+        private final long backgroundWriteBugs;
+        private final long transientRetries;
+
+        ClientStats(long replicaWriteFailures, long readRepairFailures, long refreshFailures,
+                long backgroundWriteBugs, long transientRetries) {
+            this.replicaWriteFailures = replicaWriteFailures;
+            this.readRepairFailures = readRepairFailures;
+            this.refreshFailures = refreshFailures;
+            this.backgroundWriteBugs = backgroundWriteBugs;
+            this.transientRetries = transientRetries;
+        }
+
+        /** Replica writes (client-side replication, fire-and-forget) that failed. */
+        public long replicaWriteFailures() { return replicaWriteFailures; }
+
+        /** Read-repair write-backs to the primary that failed. */
+        public long readRepairFailures() { return readRepairFailures; }
+
+        /** Node-list refresh attempts or per-node reconnects that failed. */
+        public long refreshFailures() { return refreshFailures; }
+
+        /** Programming bugs that escaped a background write; must never increase. */
+        public long backgroundWriteBugs() { return backgroundWriteBugs; }
+
+        /** Every {@code R} (transient-failure) response received. */
+        public long transientRetries() { return transientRetries; }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof ClientStats that
+                    && replicaWriteFailures == that.replicaWriteFailures
+                    && readRepairFailures == that.readRepairFailures
+                    && refreshFailures == that.refreshFailures
+                    && backgroundWriteBugs == that.backgroundWriteBugs
+                    && transientRetries == that.transientRetries;
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(replicaWriteFailures, readRepairFailures, refreshFailures,
+                    backgroundWriteBugs, transientRetries);
+        }
+
+        @Override
+        public String toString() {
+            return "ClientStats[replicaWriteFailures=" + replicaWriteFailures
+                    + ", readRepairFailures=" + readRepairFailures
+                    + ", refreshFailures=" + refreshFailures
+                    + ", backgroundWriteBugs=" + backgroundWriteBugs
+                    + ", transientRetries=" + transientRetries + "]";
+        }
+    }
 
     private static final int DEFAULT_COMPRESSION_THRESHOLD = 256;
 

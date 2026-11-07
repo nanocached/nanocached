@@ -27,7 +27,7 @@ namespace Nanocached;
 /// namespace is exactly the empty-namespace case (a thin wrapper), so
 /// existing callers are unaffected.</para>
 /// </summary>
-public sealed class HashRing
+internal sealed class HashRing
 {
     private readonly string[] _nodes;
     private readonly ulong[] _nodeHashes;

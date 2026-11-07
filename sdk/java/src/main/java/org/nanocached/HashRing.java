@@ -45,7 +45,7 @@ import java.util.Set;
  * keys (e.g. {@code config}) onto the same nodes.
  * </ul>
  */
-public final class HashRing {
+final class HashRing {
     /** The default namespace — every un-namespaced key routes as if
      * namespaced by this, and {@link #keyHash} treats it identically to
      * "no namespace at all" (the legacy {@code fnv1a(key)} form). */

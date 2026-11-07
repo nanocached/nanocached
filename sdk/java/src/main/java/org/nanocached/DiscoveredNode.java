@@ -6,4 +6,4 @@ package org.nanocached;
  * Node identity decoupled from address: {@code name} is what routing hashes; {@code address}
  * is only for opening a connection.
  */
-public record DiscoveredNode(String name, String address) {}
+record DiscoveredNode(String name, String address) {}
