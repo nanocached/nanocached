@@ -10,6 +10,11 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `HashRing` and `DiscoveredNode` are now `internal`. No public member took or returned either.
+- **Breaking:** `NanocachedClient.ClientStats` is now a sealed record class with `init` properties instead of a positional `readonly record struct`, so a new counter can be added in a minor release without breaking code that builds or deconstructs it. The four property names are unchanged; reading `client.Stats().ReplicaWriteFailures` and the like compiles as before.
+
 ### Fixed
 
 - Hedged reads (`ReadHedgeAfter`) stalled once an owner had stopped answering: after 32 hedge legs were left running against it, the next read waited for the request timeout (30 s) for one of them instead of returning the replica's answer, and against an owner that was only slow the limit made hedging ineffective at moderate read rates (about 400 reads per second and up against an owner answering in a few hundred milliseconds). An owner that has 32 hedge legs unanswered after the hedge interval is now tried last, so reads go to its replica first; a miss still waits for the primary. The limit on hedge legs in flight, which waits for a read's remaining legs, is raised from 32 to 256 and now only applies when every owner of a key is slow. (#1390)

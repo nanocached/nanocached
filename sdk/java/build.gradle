@@ -40,6 +40,15 @@ java {
     }
 }
 
+// The module name other jars and module-path users see. Without it the JVM
+// derives one from the jar's file name, so renaming or versioning the file
+// would rename the module.
+jar {
+    manifest {
+        attributes 'Automatic-Module-Name': 'org.nanocached'
+    }
+}
+
 repositories {
     mavenCentral()
 }

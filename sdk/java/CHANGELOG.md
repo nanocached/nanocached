@@ -13,6 +13,10 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Changed
 
+- **Breaking:** `HashRing` and `DiscoveredNode` are no longer public (package-private). No public method took or returned either.
+- **Breaking:** `NanocachedClient.ClientStats` is now a final class, not a record: a new counter can be added in a minor release without breaking callers who build or deconstruct it. The five accessors (`replicaWriteFailures()` ... `transientRetries()`), `equals`, `hashCode` and `toString` are the same; the constructor is no longer public.
+- The jar now declares `Automatic-Module-Name: org.nanocached`. Without it the module name was derived from the jar's file name.
+
 - **Breaking:** `NanocachedException.ConnectionFailed` is now `ConnectionLost`, and `PartialConnectionFailed`, `PartialConnectionFailedStrings`, `PartialConnectionFailedRaw`, `PartialConnectionFailedSet` and `PartialConnectionFailedSetRaw` are now `PartialConnectionLost`, `PartialConnectionLostStrings`, `PartialConnectionLostRaw`, `PartialConnectionLostSet` and `PartialConnectionLostSetRaw`. The other five SDKs call this failure `ConnectionLost`; the old names are gone, with no alias. Entries below that name the old classes describe earlier releases.
 
 ### Fixed

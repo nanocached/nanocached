@@ -11,7 +11,7 @@ namespace Nanocached;
 /// Node identity decoupled from address: <see cref="Name"/> is what routing hashes;
 /// <see cref="Address"/> is only for opening a connection.
 /// </summary>
-public sealed record DiscoveredNode(string Name, string Address);
+internal sealed record DiscoveredNode(string Name, string Address);
 
 /// <summary>
 /// Connect-and-identify: dials <c>host:port</c>, authenticates, and
