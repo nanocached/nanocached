@@ -4,7 +4,8 @@ and-forget replica writes, read repair, hedged reads or a non-default
 reconnect cooldown — every other adapter exposes at least tls/ca/
 compress. This module asserts each of OPTIONS.TLS/CA/COMPRESS/
 COMPRESSION_THRESHOLD/FIRE_AND_FORGET_REPLICAS/READ_REPAIR/
-READ_HEDGE_AFTER/RECONNECT_COOLDOWN reaches NanocachedClient.connect()
+READ_HEDGE_AFTER/RECONNECT_COOLDOWN/DISABLE_RECONNECT_COOLDOWN reaches
+NanocachedClient.connect()
 as its matching keyword argument, and that an OPTIONS key the CACHES
 entry never mentions is simply absent from the connect() call — so the
 SDK's own default stays in force there, rather than this backend
@@ -88,6 +89,14 @@ class ConnectOptionsTests(unittest.TestCase):
             self._connect_kwargs(RECONNECT_COOLDOWN=2.5), {"reconnect_cooldown": 2.5}
         )
 
+    def test_disable_reconnect_cooldown(self) -> None:
+        # The SDK reads reconnect_cooldown=0 as the default, so this switch
+        # is the only way to turn the cooldown off through OPTIONS.
+        self.assertEqual(
+            self._connect_kwargs(DISABLE_RECONNECT_COOLDOWN=True),
+            {"disable_reconnect_cooldown": True},
+        )
+
     def test_a_falsy_but_explicit_option_is_still_forwarded(self) -> None:
         # OPTIONS.TLS=False is a deliberate choice, not the same as
         # OPTIONS never mentioning TLS at all — `in options`, not
@@ -104,7 +113,8 @@ class ConnectOptionsTests(unittest.TestCase):
                 FIRE_AND_FORGET_REPLICAS=True,
                 READ_REPAIR=True,
                 READ_HEDGE_AFTER=0.1,
-                RECONNECT_COOLDOWN=1.0,
+                RECONNECT_COOLDOWN=0,
+                DISABLE_RECONNECT_COOLDOWN=True,
             ),
             {
                 "tls": True,
@@ -114,7 +124,8 @@ class ConnectOptionsTests(unittest.TestCase):
                 "fire_and_forget_replicas": True,
                 "read_repair": True,
                 "read_hedge_after": 0.1,
-                "reconnect_cooldown": 1.0,
+                "reconnect_cooldown": 0,
+                "disable_reconnect_cooldown": True,
             },
         )
 

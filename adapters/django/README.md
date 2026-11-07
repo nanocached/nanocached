@@ -75,6 +75,7 @@ CACHES = {
             "READ_REPAIR": True,              # optional; connect() read_repair
             "READ_HEDGE_AFTER": 0.05,         # optional; connect() read_hedge_after (seconds)
             "RECONNECT_COOLDOWN": 1.0,        # optional; connect() reconnect_cooldown (seconds)
+            "DISABLE_RECONNECT_COOLDOWN": False,  # optional; connect() disable_reconnect_cooldown
         },
         "TIMEOUT": 300,               # Django's own key, honored as usual
         "KEY_PREFIX": "...",
@@ -90,11 +91,13 @@ handshake. A `LOCATION` list is one address per entry; a single string may
 also carry more than one address separated by `,`/`;`.
 
 `TLS`/`CA`/`COMPRESS`/`COMPRESSION_THRESHOLD`/`FIRE_AND_FORGET_REPLICAS`/
-`READ_REPAIR`/`READ_HEDGE_AFTER`/`RECONNECT_COOLDOWN` are forwarded
+`READ_REPAIR`/`READ_HEDGE_AFTER`/`RECONNECT_COOLDOWN`/
+`DISABLE_RECONNECT_COOLDOWN` are forwarded
 straight through to the matching `NanocachedClient.connect()` keyword
 (`tls`, `ca`, `compress`, `compression_threshold`,
 `fire_and_forget_replicas`, `read_repair`, `read_hedge_after`,
-`reconnect_cooldown` — see that method's docstring for what each one
+`reconnect_cooldown`, `disable_reconnect_cooldown` — see that method's
+docstring for what each one
 does) — each is optional and, when the OPTIONS entry omits it, the SDK's
 own default is what actually takes effect, not some second default
 chosen by this backend. An `OPTIONS` key this backend does not know (a typo such as `"Tls"`) raises
@@ -103,7 +106,10 @@ Django's own `MAX_ENTRIES` and `CULL_FREQUENCY` are accepted. `CA` is a filesyst
 `TLS` to be true: a `CA` without `TLS` raises `ValueError` at the first
 cache operation, not at startup. `READ_HEDGE_AFTER` and
 `RECONNECT_COOLDOWN` are seconds (`float`); everything else here is a
-`bool` except `COMPRESSION_THRESHOLD`, an `int` byte count.
+`bool` except `COMPRESSION_THRESHOLD`, an `int` byte count. A
+`RECONNECT_COOLDOWN` of `0` means the SDK's default, not off;
+`DISABLE_RECONNECT_COOLDOWN: True` is what switches the cooldown off, and
+the SDK rejects it next to a non-zero `RECONNECT_COOLDOWN`.
 
 ## The sync/async bridge
 
