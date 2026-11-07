@@ -76,7 +76,7 @@ impl Default for ConnectionLimits {
 
 /// Default for `--max-memory` (issue #19): the cap was previously a fixed
 /// constant with no way to tune it, even though the capacity planner
-/// (`tools/capacity-planner.html`) already modeled capacity as a function
+/// (`docs/capacity-planner.html`) already modeled capacity as a function
 /// of it.
 pub(crate) const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
