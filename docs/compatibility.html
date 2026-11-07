@@ -107,9 +107,18 @@ open:</p>
   <li>metric names and the operations endpoints (<code>/healthz</code>,
   <code>/readyz</code>, <code>/metrics</code>);</li>
   <li>the container image layout and tags other than the version tag;</li>
-  <li>anything under the <code>tests/</code> and <code>tools/</code>
-  directories.</li>
 </ul>
+
+<h3 id="tests-tools">Outside the promise: <code>tests/</code> and <code>tools/</code></h3>
+<p>Nothing under the repository&rsquo;s <code>tests/</code> and
+<code>tools/</code> directories is covered, at any version: the E2E,
+chaos and oracle scripts, the conformance harness, the AWS harness, the
+benchmarks and the copy of the capacity planner kept there. Their
+arguments, environment variables, output formats and file layout may
+change in any release, including a patch release. The scale-in scenarios
+that <a href="deployment-operations.html#verifying">Verifying a
+deployment</a> points to are examples of how the drain behaves, not an
+interface to script against.</p>
 
 <h2 id="pre-1">Before 1.0.0</h2>
 <p>On the 0.x line none of the above is promised. A breaking change may

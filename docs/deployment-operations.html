@@ -259,7 +259,7 @@ changes nothing and the run ends green with a notice. Check the result with
 <code>docker buildx imagetools inspect ghcr.io/nanocached/nanocached-node:latest</code>
 (and the same for the other two): the digests match the version tag's.</p>
 
-<h2>Verifying a deployment</h2>
+<h2 id="verifying">Verifying a deployment</h2>
 <p>The repository ships runnable scale-in scenarios under
 <a href="https://github.com/nanocached/nanocached/tree/main/tests/e2e"><code>tests/e2e</code></a>:
 <code>scalein.sh</code> (a node leaves under load at R=2 — zero loss,
@@ -267,7 +267,10 @@ zero corruption, membership follows) and <code>proxydrain.sh</code> (a
 proxy drains under via-proxy load — immediate roster removal, exit 0,
 clients reconnect). They document the exact guarantees the drain makes
 and are the fastest way to see the choreography before wiring up an
-autoscaler.</p>
+autoscaler. Read them as examples: nothing under <code>tests/</code> or
+<code>tools/</code> carries a compatibility promise (see
+<a href="compatibility.html#tests-tools">Compatibility</a>), so copy what you
+need rather than calling them from your own automation.</p>
 </main>
 
 <footer class="site-footer">

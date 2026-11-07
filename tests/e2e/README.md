@@ -11,6 +11,10 @@ published images. CI only *lints* the scripts (shell syntax + `shellcheck`,
 Python `py_compile`) so they stay runnable; it never executes them. Run them
 by hand when investigating or verifying a fix.
 
+Script arguments, environment variables and output formats here may change in
+any release; nothing under `tests/` or `tools/` carries a compatibility
+promise (see `docs/compatibility.html`).
+
 ## Prerequisites
 
 - Docker.
