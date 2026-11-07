@@ -8,6 +8,7 @@ use std::fmt;
 /// verbatim to every caller that hits the cooldown window, instead of
 /// only the dial's own original caller ever seeing it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Error {
     /// get/set/delete after `close()`; `close()` itself is idempotent.
     AlreadyClosed,
