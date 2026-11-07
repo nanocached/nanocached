@@ -474,8 +474,19 @@ here.</p>
   compare-and-set 2026-10-28: the stale
   is bounded by TTL and needs a membership change, a double write with
   changed content and a lagging forward to coincide, and removing it
-  would need versioned writes in the server and every SDK. Revisit if a
-  versioned write path is adopted for other reasons.</li>
+  would need versioned writes in the server and every SDK. Versioned writes
+  are not part of 1.0.0. The plan is a capability a client opts into on its
+  <code>A</code> frame (<a href="protocol.html#a-capabilities">token
+  <code>V</code></a>), which a 1.x release can add without touching any frame
+  the protocol freezes: the primary of a key stamps each write with a hybrid
+  logical clock, replica legs and forwards carry the stamp and apply a write
+  only if it is newer, a tombstone keeps the stamp of its delete, and a clear
+  becomes &ldquo;remove what is older than this time&rdquo;, so a copy of it
+  applied late cannot drop a newer write. The price is one extra round trip on
+  replicated writes that do not run fire-and-forget, about 8 bytes per entry
+  and a stamp on each write. The six oracles in <code>tests/e2e</code> already
+  print the anomaly of each item on this list; an item counts as closed when its
+  printed counter is 0 over the nightly chaos matrix with the capability on.</li>
   <li>Two clients incrementing the same counter at the same time can leave
   a replica behind the primary, with no membership change involved. The
   primary applies the increments in one order, but each client writes the
