@@ -9,6 +9,13 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Added
+
+- `disableReconnectCooldown` is passed through to the SDK. Since the SDK
+  started reading `reconnectCooldownMs: 0` as the default, this switch is the
+  only way to turn the reconnect cooldown off, and the store did not forward
+  it.
+
 ## [0.6.2] - 2026-11-03
 
 No changes. Version aligned with the rest of the project: every release
