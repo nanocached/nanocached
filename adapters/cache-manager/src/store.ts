@@ -3,11 +3,15 @@ import {
   PartialWrongNodeError,
   PartialConnectionLostError,
   WrongNodeError,
-  MAX_BATCH_KEYS,
   type NanocachedAddress,
   type NanocachedNamespace,
 } from "nanocached";
 import type { Config, Milliseconds, Store } from "cache-manager";
+
+/** How many keys one batched call (`mget`, `mset`, `mdel`) hands the SDK at a
+ * time. The SDK splits a batch the same way, so a larger bound gains nothing;
+ * it is this store's own tuning value, not an SDK export. */
+const MAX_BATCH_KEYS = 400;
 
 // cache-manager convention (matching its own Redis store): a store binds
 // to one implicit "keyspace". nanocached's equivalent is a namespace

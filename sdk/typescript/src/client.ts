@@ -341,11 +341,11 @@ const DEFAULT_RECONNECT_COOLDOWN_MS = 1_000;
 export function resolveReconnectCooldownMs(options: NanocachedClientOptions): number {
   const configured = options.reconnectCooldownMs;
   if (configured !== undefined && !(Number.isFinite(configured) && configured >= 0)) {
-    throw new NanocachedError("nanocached: reconnectCooldownMs must be a non-negative number of milliseconds");
+    throw new RangeError("nanocached: reconnectCooldownMs must be a non-negative number of milliseconds");
   }
   if (options.disableReconnectCooldown === true) {
     if (configured !== undefined && configured !== 0) {
-      throw new NanocachedError(
+      throw new RangeError(
         "nanocached: disableReconnectCooldown contradicts a non-zero reconnectCooldownMs; unset one of them",
       );
     }
@@ -355,6 +355,11 @@ export function resolveReconnectCooldownMs(options: NanocachedClientOptions): nu
 }
 
 const DEFAULT_COMPRESSION_THRESHOLD = 256;
+
+/** Longest `readHedgeAfterMs` accepted: 24 hours, as in the Rust SDK. Anything
+ * above 2^31-1 would also overflow `setTimeout`, which then fires after about
+ * a millisecond and turns hedging into an immediate second request. */
+const MAX_READ_HEDGE_AFTER_MS = 24 * 60 * 60 * 1000;
 
 // TTL a read-repair write uses (read repair), in whole seconds —
 // the protocol's TTL unit throughout (see encodeSet in protocol.ts). The
@@ -935,14 +940,17 @@ export class NanocachedClient {
    * nodes this instance currently holds a connection to in cluster mode —
    * kept current by maybeRefreshNodeList(), which reconciles `target`'s
    * ring/connections to match (see refreshNodeList). */
-  nodeUrls: readonly string[];
+  get nodeUrls(): readonly string[] {
+    return this.nodeUrlList;
+  }
+  private nodeUrlList: readonly string[];
 
   private constructor(
     private target: Target,
     /** The address that answered connect() — a node's own address in
      * single mode (which is also what a lazy reconnect redials), the
      * winning discovery server's address in cluster mode. */
-    readonly url: string,
+    private readonly url: string,
     nodeUrls: readonly string[],
     /** Every configured address (discovery HA) — what fetchNodeList walks on a
      * refresh, not just the address that happened to win the initial
@@ -962,7 +970,7 @@ export class NanocachedClient {
     /** See `NanocachedClientOptions.readHedgeAfterMs`. */
     private readonly readHedgeAfterMs: number | undefined,
   ) {
-    this.nodeUrls = nodeUrls;
+    this.nodeUrlList = nodeUrls;
     this.startKeepAlive(KEEPALIVE_TUNING.intervalMs);
   }
 
@@ -984,20 +992,20 @@ export class NanocachedClient {
   static async connect(options: NanocachedClientOptions): Promise<NanocachedClient> {
     const addresses = options.addresses ?? [];
     if (addresses.length === 0) {
-      throw new NanocachedError("nanocached: connect() needs a non-empty addresses list");
+      throw new RangeError("nanocached: connect() needs a non-empty addresses list");
     }
-    if (options.readHedgeAfterMs !== undefined && !(options.readHedgeAfterMs > 0)) {
-      throw new NanocachedError("nanocached: readHedgeAfterMs must be a positive number of milliseconds");
+    if (options.readHedgeAfterMs !== undefined && !(options.readHedgeAfterMs > 0 && options.readHedgeAfterMs <= MAX_READ_HEDGE_AFTER_MS)) {
+      throw new RangeError(`nanocached: readHedgeAfterMs must be a positive number of milliseconds, at most ${MAX_READ_HEDGE_AFTER_MS}`);
     }
     // Issue #488: an option that can have no effect in this configuration
     // is a misconfiguration, not something to ignore quietly.
     if (options.viaProxy === true && options.readHedgeAfterMs !== undefined) {
-      throw new NanocachedError(
+      throw new RangeError(
         "nanocached: readHedgeAfterMs has no effect with viaProxy (a proxy connection has no replicas to hedge to); unset one of them",
       );
     }
     if (options.ca !== undefined && options.tls !== true) {
-      throw new NanocachedError("nanocached: ca is only used when tls is true; enable tls or unset ca");
+      throw new RangeError("nanocached: ca is only used when tls is true; enable tls or unset ca");
     }
 
     // ca is meaningful only paired with tls: true (checked above). Read
@@ -4142,7 +4150,7 @@ export class NanocachedClient {
       members,
       replication: identified.replication,
     };
-    this.nodeUrls = nodes.filter((node) => members.has(node.name)).map((node) => node.address);
+    this.nodeUrlList = nodes.filter((node) => members.has(node.name)).map((node) => node.address);
     this.lastNodeListFetch = Date.now();
   }
 
@@ -4275,7 +4283,7 @@ export class NanocachedClient {
 
       trackOpenTarget(this.url, [identified.socket]);
       this.target = { kind: "proxy", connection: new Connection(identified.socket, identified.tagged, () => this.transientRetries++), address: proxy.address };
-      this.nodeUrls = [proxy.address];
+      this.nodeUrlList = [proxy.address];
       this.lastNodeListFetch = Date.now();
       // In proxy mode `target.address` is the only address this client
       // ever dials, so reconnectCooldowns should hold at most that one

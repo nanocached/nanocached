@@ -634,7 +634,7 @@ describe("NanocachedClient discovery addresses", () => {
         ],
       });
       try {
-        assert.equal(client.url, `127.0.0.1:${discovery.port}`);
+        assert.equal((client as unknown as { url: string }).url, `127.0.0.1:${discovery.port}`);
         await client.set("k", "v");
         assert.equal(await client.get("k"), "v");
       } finally {
@@ -660,7 +660,7 @@ describe("NanocachedClient discovery addresses", () => {
         ],
       });
       try {
-        assert.equal(client.url, `127.0.0.1:${healthy.port}`);
+        assert.equal((client as unknown as { url: string }).url, `127.0.0.1:${healthy.port}`);
         await client.set("k", "v");
         assert.equal(await client.get("k"), "v");
       } finally {
@@ -6161,14 +6161,14 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
   it("rejects readHedgeAfterMs together with viaProxy (issue #488)", async () => {
     await assert.rejects(
       () => NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: 1 }], viaProxy: true, readHedgeAfterMs: 50 }),
-      (error: Error) => error instanceof NanocachedError && error.message.includes("readHedgeAfterMs has no effect with viaProxy"),
+      (error: Error) => error instanceof RangeError && error.message.includes("readHedgeAfterMs has no effect with viaProxy"),
     );
   });
 
   it("rejects ca without tls (issue #488)", async () => {
     await assert.rejects(
       () => NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: 1 }], ca: "/nonexistent/ca.pem" }),
-      (error: Error) => error instanceof NanocachedError && error.message.includes("ca is only used when tls is true"),
+      (error: Error) => error instanceof RangeError && error.message.includes("ca is only used when tls is true"),
     );
   });
 
@@ -6176,7 +6176,7 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
     for (const bad of [0, -1]) {
       await assert.rejects(
         () => NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: 1 }], readHedgeAfterMs: bad }),
-        NanocachedError,
+        RangeError,
       );
     }
   });
@@ -8035,7 +8035,7 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
             viaProxy: true,
             readHedgeAfterMs: 10,
           }),
-        (error: Error) => error instanceof NanocachedError && error.message.includes("readHedgeAfterMs has no effect with viaProxy"),
+        (error: Error) => error instanceof RangeError && error.message.includes("readHedgeAfterMs has no effect with viaProxy"),
       );
       // Nothing was dialed: the rejection is a configuration check, ahead of any socket.
       assert.equal(proxy.getCount(), 0);
@@ -8515,6 +8515,19 @@ describe("reconnect cooldown option", () => {
     assert.equal(resolveReconnectCooldownMs({ ...base, reconnectCooldownMs: 50 }), 50);
     assert.equal(resolveReconnectCooldownMs({ ...base, disableReconnectCooldown: true }), 0);
     assert.equal(resolveReconnectCooldownMs({ ...base, disableReconnectCooldown: true, reconnectCooldownMs: 0 }), 0);
+  });
+
+  it("rejects a readHedgeAfterMs above 24 hours (setTimeout would overflow and fire at once)", async () => {
+    await rejects({ readHedgeAfterMs: 2 ** 31 }, /readHedgeAfterMs must be a positive number of milliseconds, at most 86400000/);
+    await rejects({ readHedgeAfterMs: 24 * 60 * 60 * 1000 + 1 }, /readHedgeAfterMs must be a positive/);
+  });
+
+  it("throws a RangeError, not a NanocachedError, for caller mistakes in the options", async () => {
+    await assert.rejects(NanocachedClient.connect({ addresses: [] }), RangeError);
+    await assert.rejects(
+      NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: 1 }], reconnectCooldownMs: -1 }),
+      (error: Error) => error instanceof RangeError && !(error instanceof NanocachedError),
+    );
   });
 
   it("rejects disableReconnectCooldown combined with a non-zero reconnectCooldownMs", async () => {
