@@ -433,6 +433,27 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
             await reader.close()
 
 
+class ReconnectCooldownOptionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_zero_and_omitted_mean_the_default_and_only_the_switch_turns_it_off(self):
+        from nanocached.client import _DEFAULT_RECONNECT_COOLDOWN as default, _resolve_reconnect_cooldown as resolve
+
+        self.assertEqual(resolve(None, False), default)
+        self.assertEqual(resolve(0, False), default)
+        self.assertEqual(resolve(0.0, False), default)
+        self.assertEqual(resolve(0.05, False), 0.05)
+        self.assertEqual(resolve(None, True), 0.0)
+        self.assertEqual(resolve(0, True), 0.0)
+
+    async def test_rejects_negative_non_finite_and_contradictory_values(self):
+        for bad in (-1, float("nan"), float("inf")):
+            with self.assertRaisesRegex(ValueError, "reconnect_cooldown must be a non-negative number"):
+                await NanocachedClient.connect([("127.0.0.1", 1)], reconnect_cooldown=bad)
+        with self.assertRaisesRegex(ValueError, "contradicts a non-zero reconnect_cooldown"):
+            await NanocachedClient.connect(
+                [("127.0.0.1", 1)], reconnect_cooldown=0.5, disable_reconnect_cooldown=True
+            )
+
+
 class ReconnectTests(unittest.IsolatedAsyncioTestCase):
     async def test_transparently_reconnects_after_a_server_fin(self):
         node = await MockNode().start()

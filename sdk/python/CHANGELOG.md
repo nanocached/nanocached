@@ -9,6 +9,10 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `reconnect_cooldown=0` no longer switches the reconnect cooldown off; like omitting it, it now means the default (1.0 s), which is how the Go, Rust, Java and .NET SDKs read `0`. A negative or non-finite value now raises `ValueError`. To switch the cooldown off, use the new `disable_reconnect_cooldown=True` (combining it with a non-zero `reconnect_cooldown` raises `ValueError`).
+
 ### Fixed
 
 - Hedged reads (`read_hedge_after`) stalled once an owner had stopped answering: after 32 hedge legs were left running against it, the next read waited for the request timeout (30 s) for one of them instead of returning the replica's answer, and against an owner that was only slow the limit made hedging ineffective at moderate read rates (about 400 reads per second and up against an owner answering in a few hundred milliseconds). An owner that has 32 hedge legs unanswered after the hedge interval is now tried last, so reads go to its replica first; a miss still waits for the primary. The limit on hedge legs in flight, which waits for a read's remaining legs, is raised from 32 to 256 and now only applies when every owner of a key is slow. (#1390)

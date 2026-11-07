@@ -27,6 +27,7 @@ contract that gives it the same all-or-nothing guarantee a keyed write's
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import random
 import re
@@ -200,6 +201,23 @@ _MAX_CONCURRENT_DIALS = 64
 # proved unreachable. Keep well under _NODE_LIST_STALE_AFTER so a node
 # that genuinely recovers isn't shut out for long.
 _DEFAULT_RECONNECT_COOLDOWN = 1.0
+
+
+def _resolve_reconnect_cooldown(reconnect_cooldown: float | None, disable: bool) -> float:
+    """The cooldown connect() runs with, in seconds: 0 when it is switched
+    off, otherwise the configured value, where 0 means the default (the same
+    reading as Go, Rust, Java and .NET). A negative or non-finite value, or a
+    non-zero value together with the switch, is a caller mistake."""
+    if reconnect_cooldown is not None and not (math.isfinite(reconnect_cooldown) and reconnect_cooldown >= 0):
+        raise ValueError("nanocached: reconnect_cooldown must be a non-negative number of seconds")
+    if disable:
+        if reconnect_cooldown not in (None, 0):
+            raise ValueError(
+                "nanocached: disable_reconnect_cooldown contradicts a non-zero reconnect_cooldown; "
+                "unset one of them"
+            )
+        return 0.0
+    return _DEFAULT_RECONNECT_COOLDOWN if not reconnect_cooldown else reconnect_cooldown
 
 # TTL (whole seconds — the protocol's TTL unit throughout, see
 # _encode_set in _connection.py) a read-repair write uses
@@ -715,12 +733,14 @@ class NanocachedClient:
         compression_threshold: int = _DEFAULT_COMPRESSION_THRESHOLD,
         fire_and_forget_replicas: bool = False,
         read_repair: bool = False,
-        reconnect_cooldown: float = _DEFAULT_RECONNECT_COOLDOWN,
+        reconnect_cooldown: float | None = None,
+        disable_reconnect_cooldown: bool = False,
         read_hedge_after: float | None = None,
         via_proxy: bool = False,
     ) -> "NanocachedClient":
         if not addresses:
             raise ValueError("nanocached: connect() needs a non-empty addresses list")
+        resolved_reconnect_cooldown = _resolve_reconnect_cooldown(reconnect_cooldown, disable_reconnect_cooldown)
         if read_hedge_after is not None and not read_hedge_after > 0:
             raise ValueError("nanocached: read_hedge_after must be a positive number of seconds")
         # Issue #488: an option that can have no effect in this
@@ -742,7 +762,7 @@ class NanocachedClient:
         client._compression_threshold = compression_threshold
         client._fire_and_forget_replicas = fire_and_forget_replicas
         client._read_repair = read_repair
-        client._reconnect_cooldown = reconnect_cooldown
+        client._reconnect_cooldown = resolved_reconnect_cooldown
         client._read_hedge_after = read_hedge_after
 
         # SDK proxy mode (issue #122): a separate connect path — fetch the
