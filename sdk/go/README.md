@@ -654,6 +654,23 @@ to tell a compressed value from a plain counter, so `Compress: true`
 makes `Incr`/`Decr` return `ErrCompressIncompatible` rather than corrupt
 a counter or a compressed value — see "Incr and Decr" above.
 
+## Which errors are worth retrying
+
+The SDK already redials and retries once on its own where that is safe, and
+retries a transient `R` a bounded number of times. What reaches you is what is
+left; this is how to read it.
+
+| Error (`errors.Is`) | Retry the call? |
+|---|---|
+| `ErrConnectionLost` | `Get`/`Set`/`Delete`/`Clear`/`Touch` and the batched forms: yes, they are idempotent. `Incr`/`Decr`, `PutIfAbsent`, `ReplaceIfPresent`, `Replace`, `DeleteIfMatches`: **the outcome is unknown** (the request may have been applied before the reply was lost), so read the key first, or accept a possible double apply. A request that timed out is `ErrConnectionLost` too; the node was reachable and did not answer in time. |
+| `ErrRetryable` | Yes, later. The connection is fine and stays open; the SDK has already retried this request a few times. |
+| `ErrDiscoveryBusy` | Yes, shortly, or with another discovery address. |
+| `ErrWrongNode` | The SDK refreshed the node list and retried once already; it escapes when that failed too, or in single-node mode. A retry helps only once membership has settled. |
+| `ErrClosed`, `ErrAuthenticationFailed`, `ErrInvalidArgument`, `ErrNotNumeric`, `ErrDecompression`, `ErrCompressIncompatible`, `ErrServerTooOld` (and `ErrServerTooOldBatch`), `ErrProtocol` | No. They come from the call, the configuration, the stored data or the server version; the same call fails the same way. |
+
+Several batch calls (see their sections) return the entries that did succeed
+together with the error; retry only the keys that are missing from them.
+
 ## Notes
 
 - This SDK speaks the current wire protocol (rendezvous hashing,

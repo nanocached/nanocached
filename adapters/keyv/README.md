@@ -73,7 +73,12 @@ expose, and the shared secret, renamed `secret` here
 convention.
 
 `nanocachedKeyvStore` connects a fresh `NanocachedClient` every call — it
-never reuses a client the caller already has.
+never reuses a client the caller already has. To share a client you already
+hold, build the store yourself: `new NanocachedKeyvStore(client, namespace)`.
+`store.disconnect()` then closes that client for every user of it, so close
+the client yourself when you are done with all of them. The members `opts`,
+`namespace` and `on()` exist only because Keyv's adapter protocol asks for
+them; do not use them.
 
 ### With `cache-manager` v6+
 
@@ -284,6 +289,10 @@ compression when `compress` is on. Under Keyv's default error policy
 that `RangeError` is the same `error` event plus `set` resolving `false`
 described above, so an oversize value is silently not cached unless
 `throwOnErrors` is on or an `error` listener is attached.
+
+## Stored format
+
+Values are stored as whatever string Keyv hands the store: Keyv's own serialization, not this package's. That format is **not covered** by the compatibility promise: a release may change it, and says so in its changelog. Plan a rolling deploy accordingly: while old and new workers share a namespace, one side may fail to read what the other wrote (see the [compatibility page](https://nanocached.org/compatibility.html)).
 
 ## Requirements
 

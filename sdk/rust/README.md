@@ -701,6 +701,21 @@ of the original.
 no marker byte, so there is no way to tell a compressed value from a
 plain integer on the wire.
 
+## Which errors are worth retrying
+
+The SDK already redials and retries once on its own where that is safe, and
+retries a transient `R` a bounded number of times. What reaches you is what is
+left; this is how to read it.
+
+| `Error` | Retry the call? |
+|---|---|
+| `ConnectionLost` | `get`/`set`/`delete`/`clear`/`touch` and the batched forms: yes, they are idempotent. `incr`/`decr`, `put_if_absent`, `replace_if_present`, `replace`, `delete_if_matches`: **the outcome is unknown** (the request may have been applied before the reply was lost), so read the key first, or accept a possible double apply. A request that timed out is `ConnectionLost` too; the node was reachable and did not answer in time. |
+| `Retryable` | Yes, later. The connection is fine and stays open; the SDK has already retried this request a few times. |
+| `DiscoveryBusy` | Yes, shortly, or with another discovery address. |
+| `WrongNode` | The SDK refreshed the node list and retried once already; it escapes when that failed too, or in single-node mode. A retry helps only once membership has settled. |
+| `PartialConnectionLost*`, `PartialWrongNode*`, `PartialServerTooOld*` | They carry what succeeded. Retry only the keys that are not in it (for the batch calls that are idempotent), after the cause is retryable by the rules above. |
+| `AlreadyClosed`, `Authentication`, `InvalidArgument`, `InvalidUtf8`, `NotNumeric`, `Decompression`, `CompressionIncompatible`, `ServerTooOld`, `Protocol` | No. They come from the call, the configuration, the stored data or the server version; the same call fails the same way. |
+
 ## Notes
 
 - Requires Rust 1.88 or newer (`rust-version` in `Cargo.toml`; checked in

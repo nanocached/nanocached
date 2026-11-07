@@ -468,7 +468,7 @@ Off by default. A read goes to the key's primary owner and moves on to
 the next owner only when the primary *fails* — so one slow-but-alive
 node (a saturated host, a bad link) makes every read that touches it
 wait out its full round trip, and with `R` copies on `N` nodes that is
-roughly `R/N` of all reads. Setting `read_hedge_after` (seconds) sends
+roughly `R/N` of all reads. Setting `read_hedge_after` (seconds, more than 0 and at most 24 hours; anything else is a `ValueError`) sends
 the same read to the next owner as well once the primary has been
 silent for that long, and takes the first answer:
 

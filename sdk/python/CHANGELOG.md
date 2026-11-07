@@ -11,6 +11,7 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ### Changed
 
+- `read_hedge_after` above 24 hours (86400 seconds) is now a `ValueError`, as in the Rust and TypeScript SDKs.
 - **Breaking:** the `nanocached.client` module is now `nanocached._client`. Only the names `nanocached` exports are public; `Connection`, `NodeTarget`, `ClusterTarget`, `compress_value` and the other module-level names that `nanocached.client` happened to expose are no longer reachable under a public path.
 - **Breaking:** `HashRing` and `DiscoveredNode` are no longer exported from `nanocached`. No public method took or returned either; `nanocached._hashring` still holds the ring for the repository's own tests.
 - The package ships a `py.typed` marker, so type checkers use the SDK's annotations.

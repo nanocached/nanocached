@@ -203,6 +203,10 @@ _MAX_CONCURRENT_DIALS = 64
 # that genuinely recovers isn't shut out for long.
 _DEFAULT_RECONNECT_COOLDOWN = 1.0
 
+# Longest read_hedge_after connect() accepts: 24 hours, as in the Rust and
+# TypeScript SDKs.
+_MAX_READ_HEDGE_AFTER = 24 * 60 * 60
+
 
 def _resolve_reconnect_cooldown(reconnect_cooldown: float | None, disable: bool) -> float:
     """The cooldown connect() runs with, in seconds: 0 when it is switched
@@ -742,8 +746,10 @@ class NanocachedClient:
         if not addresses:
             raise ValueError("nanocached: connect() needs a non-empty addresses list")
         resolved_reconnect_cooldown = _resolve_reconnect_cooldown(reconnect_cooldown, disable_reconnect_cooldown)
-        if read_hedge_after is not None and not read_hedge_after > 0:
-            raise ValueError("nanocached: read_hedge_after must be a positive number of seconds")
+        if read_hedge_after is not None and not 0 < read_hedge_after <= _MAX_READ_HEDGE_AFTER:
+            raise ValueError(
+                f"nanocached: read_hedge_after must be a positive number of seconds, at most {_MAX_READ_HEDGE_AFTER}"
+            )
         # Issue #488: an option that can have no effect in this
         # configuration is a misconfiguration, not something to ignore
         # quietly.
