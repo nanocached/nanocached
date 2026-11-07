@@ -31,6 +31,7 @@
 
 use std::collections::HashSet;
 
+#[cfg(any(test, feature = "__test_hooks"))]
 use crate::error::{Error, Result};
 
 pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
@@ -145,6 +146,7 @@ impl HashRing {
     /// (there is no node to name as primary), matching how every other
     /// public entry point in this crate reports "the caller passed
     /// something that could never be meant" rather than aborting.
+    #[cfg(any(test, feature = "__test_hooks"))]
     pub fn route(&self, namespace: &[u8], key: &[u8]) -> Result<&str> {
         self.owners(namespace, key, 1)
             .into_iter()

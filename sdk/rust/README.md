@@ -572,8 +572,9 @@ even though most of those requests still ultimately succeed.
 its connections warm automatically, pinging any connection that real
 traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
-restart, a network blip) redials and retries once transparently (all
-operations are idempotent). There is nothing to configure. A request
+restart, a network blip) redials and retries once transparently (an
+idempotent request always; `incr`/`decr` and the compare-and-set methods only
+when the SDK can prove nothing was sent). There is nothing to configure. A request
 that timed out (no reply within the request deadline) is never redialed
 and resent: the node was reachable and simply did not answer, so a
 second attempt would most likely wait out another deadline — a `set`
@@ -603,7 +604,7 @@ can't tell "not specified" apart from "explicitly zero"); call
 request that finds a dead connection pays its own full dial attempt) —
 the Go SDK's equivalent is a negative `Config.ReconnectCooldown`.
 
-The per-request timeout (30 s by default; `Options::request_timeout`)
+The per-request timeout (30 s, not configurable)
 is progress-based, as in the Go SDK: when a request's
 timer fires it is only given up if the connection received no response
 at all within the last window — a server that is still answering, just

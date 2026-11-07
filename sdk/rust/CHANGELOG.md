@@ -8,6 +8,7 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Changed
 
+- **Breaking:** `HashRing` and `DiscoveredNode` are no longer public, and neither are `Options::keep_alive_interval` and `Options::request_timeout` (the keep-alive interval and the 30 s request timeout stay as they were, just not settable) or the `#[doc(hidden)]` statics and `NanocachedClient` methods that existed for this crate's own tests. No public method took or returned `HashRing` or `DiscoveredNode`. The tests reach them through a new `__test_hooks` Cargo feature (enabled by the crate's own dev-dependency); it is not an API and nothing else should enable it.
 - **Breaking:** `Error` and `Stats` are now `#[non_exhaustive]`. A later release can add a variant or a counter without a new major version, so a `match` on `Error` needs a wildcard arm and a `Stats` is read by field, not built with a struct literal.
 
 ### Fixed

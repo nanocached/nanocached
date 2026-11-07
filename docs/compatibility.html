@@ -101,6 +101,10 @@ README says about them, and may change in any release:</p>
   explicitly. The changelog notes a changed default;</li>
   <li>text an SDK or adapter writes to standard error, the console or a
   log;</li>
+  <li>anything an SDK hides from its own public documentation or names with
+  a leading underscore: Rust&rsquo;s <code>#[doc(hidden)]</code> items and the
+  <code>__test_hooks</code> Cargo feature, Python&rsquo;s underscore-prefixed
+  modules and names, and the like;</li>
   <li>how an adapter behaves where it depends on a third-party framework
   (Spring, Django, cache-manager, Keyv, .NET dependency injection). The
   READMEs describe what was observed with the framework versions they name;
