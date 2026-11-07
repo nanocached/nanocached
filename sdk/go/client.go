@@ -10,10 +10,11 @@
 // out to each key's top-R owners (the primary's result decides; a dead
 // replica never fails a write), reads ask the primary and fall over to
 // the next owner only when the holder is unreachable. Dead connections
-// are redialed lazily on use (with one transparent retry — a socket only
-// learns of a peer FIN on I/O, and every operation is idempotent), and an
-// opt-in keep-alive can hold connections open across the server's 60s
-// idle timeout.
+// are redialed lazily on use (with one transparent retry when that is safe —
+// a socket only learns of a peer FIN on I/O; Incr, Decr and the
+// compare-and-set calls are replayed only when provably not sent), and a
+// keep-alive that is always on holds connections open across the server's
+// 60s idle timeout.
 //
 // The Client is safe for concurrent use. Requests are pipelined per
 // connection (request pipelining): concurrent callers on the same

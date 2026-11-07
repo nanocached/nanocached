@@ -89,6 +89,26 @@ describes as a limit or as unspecified is not covered.</p>
 <p>The framework adapters (Spring, Spring Boot starter, JCache, Django,
 cache-manager, Keyv, and <code>Nanocached.Caching</code> for .NET) ship at the same version and follow the
 same rule for their public API and configuration keys.</p>
+<p>Within an SDK or adapter, these are <em>not</em> covered, whatever a
+README says about them, and may change in any release:</p>
+<ul>
+  <li>tuning values and internal limits: the defaults of timeouts,
+  cooldowns, thresholds and size limits, the number of background writes or
+  hedged reads in flight, keys per frame, the size cap on a batch reply,
+  retry counts and delays, the read-repair TTL and the keep-alive interval.
+  The options that set them &mdash; name, unit, accepted range and meaning
+  &mdash; are covered; their defaults are not, so set the ones you depend on
+  explicitly. The changelog notes a changed default;</li>
+  <li>text an SDK or adapter writes to standard error, the console or a
+  log;</li>
+  <li>how an adapter behaves where it depends on a third-party framework
+  (Spring, Django, cache-manager, Keyv, .NET dependency injection). The
+  READMEs describe what was observed with the framework versions they name;
+  a framework release can change it;</li>
+  <li>the format in which an adapter stores a value (for example Django&rsquo;s
+  pickle, the .NET envelope, JSON). A release that changes one says so in the
+  changelog; plan a rolling deploy accordingly.</li>
+</ul>
 
 <h2 id="deprecation">No deprecation period</h2>
 <p>nanocached does not deprecate before it removes. There is no release

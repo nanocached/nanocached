@@ -75,7 +75,8 @@ addresses, tried in order, exactly like
 `NanocachedClientOptions.addresses` in the SDK. Every other SDK connect
 option is passed through under the same name (`tls`, `ca`, `compress`,
 `compressionThreshold`, `fireAndForgetReplicas`, `readRepair`,
-`readHedgeAfterMs`, `reconnectCooldownMs`), except the shared secret,
+`readHedgeAfterMs`, `reconnectCooldownMs`), except `viaProxy`, which this
+store does not expose, and the shared secret,
 renamed `secret` here (`authSecret` in the SDK) to match the shorter name
 `cache-manager`'s own stores use for the equivalent setting.
 

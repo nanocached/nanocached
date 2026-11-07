@@ -347,8 +347,9 @@ for the node list.
 its connections warm automatically, pinging any connection that real
 traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
-restart, a network blip) redials and retries once transparently (all
-operations are idempotent). Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.
+restart, a network blip) redials and retries once transparently (an
+idempotent request always; `incr`/`decr` and the compare-and-set calls only
+when the SDK can prove nothing was sent — see "What never sent means" below). Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.
 
 An address whose redial just failed is treated as still down for
 `reconnectCooldownMs` (default 1000): requests routed to it during that

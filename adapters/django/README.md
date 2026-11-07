@@ -97,8 +97,9 @@ straight through to the matching `NanocachedClient.connect()` keyword
 `reconnect_cooldown` — see that method's docstring for what each one
 does) — each is optional and, when the OPTIONS entry omits it, the SDK's
 own default is what actually takes effect, not some second default
-chosen by this backend. `CA` is a filesystem path to a CA bundle and only
-matters when `TLS` is also true. `READ_HEDGE_AFTER` and
+chosen by this backend. `CA` is a filesystem path to a CA bundle and requires
+`TLS` to be true: a `CA` without `TLS` raises `ValueError` at the first
+cache operation, not at startup. `READ_HEDGE_AFTER` and
 `RECONNECT_COOLDOWN` are seconds (`float`); everything else here is a
 `bool` except `COMPRESSION_THRESHOLD`, an `int` byte count.
 

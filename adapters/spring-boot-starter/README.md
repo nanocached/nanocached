@@ -46,8 +46,9 @@ class Application { }
 
 No `@Bean` methods. The autoconfiguration registers a `NanocachedClient`
 (closed with the context) and a `CacheManager` on top of it, both
-`@ConditionalOnMissingBean` — define either yourself and the starter backs
-off just that one, leaving the other autoconfigured.
+`@ConditionalOnMissingBean`. Both exist only when `nanocached.addresses` is
+set; with it set, define either yourself and the starter backs off just that
+one, leaving the other autoconfigured.
 
 **Inert without `nanocached.addresses`.** The autoconfiguration is gated on
 that property (a `Binder`-based condition that accepts both the YAML-list

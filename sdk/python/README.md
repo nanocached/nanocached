@@ -511,8 +511,9 @@ what a client can accumulate against a cluster that is slow throughout.
 its connections warm automatically, pinging any connection that real
 traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
-restart, a network blip) redials and retries once transparently (all
-operations are idempotent).
+restart, a network blip) redials and retries once transparently (an
+idempotent request always; `incr`/`decr` and the compare-and-set calls only
+when the SDK can prove nothing was sent — see "What never sent means" below).
 
 `connect()` itself tolerates a node that discovery still lists but that
 can't be reached — typically one that just died and hasn't been evicted

@@ -54,11 +54,11 @@ import javax.net.ssl.TrustManagerFactory;
  * out to each key's top-R owners (the primary's result decides; a dead
  * replica never fails a write), reads ask the primary and fall over to
  * the next owner only when the holder is unreachable. Dead connections
- * are redialed lazily on use, and an opt-in keep-alive can hold
+ * are redialed lazily on use, and a keep-alive that is always on holds
  * connections open across the server's 60s idle timeout.
  *
- * <p>Thread-safe. Requests are serialized per connection (see
- * {@link Connection}); concurrent callers queue.
+ * <p>Thread-safe. Requests are pipelined per connection (see
+ * {@link Connection}); concurrent callers share it.
  */
 public final class NanocachedClient implements AutoCloseable {
 
@@ -301,8 +301,8 @@ public final class NanocachedClient implements AutoCloseable {
          * per-node connections, no ring view, and no hedged reads — a
          * proxy is the only owner on this one connection, so there is
          * nobody to hedge to, and a configured {@link #readHedgeAfter} is
-         * simply inert here (never rejected — it may still apply to a
-         * different client sharing these {@code Options}). Namespaces,
+         * rejected here: {@code connect} throws
+         * {@code IllegalArgumentException} when both are set). Namespaces,
          * clear/clearAll, tags, keep-alive, and compression all work
          * unchanged; {@code close()} is unchanged too. From here on this
          * client behaves exactly like single-node mode, because a proxy

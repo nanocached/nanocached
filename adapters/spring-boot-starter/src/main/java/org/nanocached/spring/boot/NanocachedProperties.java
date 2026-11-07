@@ -32,8 +32,9 @@ public class NanocachedProperties {
      * SDK default. */
     private boolean tls;
 
-    /** Path to a CA certificate file trusted for TLS, in addition to the
-     * platform trust store. Only meaningful with {@code tls: true}. */
+    /** Path to a CA certificate file trusted for TLS; it replaces the platform
+     * trust store rather than adding to it. Requires {@code tls: true}: the
+     * client refuses to connect with a CA and TLS off. */
     private String ca;
 
     /** Whether values are transparently compressed. Unset defers to the
