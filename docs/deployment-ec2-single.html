@@ -54,7 +54,7 @@ firewall one. No NAT gateway: both subnets
 are public, and outbound (image pull, package installs, Systems
 Manager) goes straight out through the internet gateway.</p>
 
-<pre><code>export AWS_REGION=us-east-1
+<pre><code>export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1   # AWS CLI v1 reads only the second
 NAME=nanocached
 TAG="{Key=Project,Value=$NAME}"     # every resource carries it — see teardown</code></pre>
 
@@ -210,14 +210,17 @@ NODE_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.small \
 aws ec2 wait instance-running --instance-ids $NODE_ID
 NODE_IP=$(aws ec2 describe-instances --instance-ids $NODE_ID \
   --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)</code></pre>
-<p>From launch to a ready node took about 70&nbsp;s (Docker install
-plus the image pull), and the instance was registered with Systems
-Manager by then, so Run Command could reach it as soon as it was
-useful.</p>
+<p>From launch to a ready node took about 80&nbsp;s (Docker install
+plus the image pull). The instance registers with Systems Manager well
+before that (about 30&nbsp;s), so Run Command can reach it while
+user-data is still running.</p>
 
 <h2>Verifying</h2>
 <p>On the node itself (<code>aws ssm start-session --target $NODE_ID</code>
-for a shell, or <code>aws ssm send-command</code> as below):</p>
+for a shell, or <code>aws ssm send-command</code> as below). Give it the
+80&nbsp;s first: while user-data is still installing Docker the unit
+does not exist yet, and the command answers <code>inactive</code> /
+<code>healthz=000</code> / <code>readyz=000</code> and exits 7.</p>
 <pre><code>aws ssm send-command --instance-ids $NODE_ID --document-name AWS-RunShellScript \
   --parameters 'commands=["systemctl is-active nanocached-node",
     "curl -s -o /dev/null -w healthz=%{http_code}\\\\n http://127.0.0.1:9356/healthz",
@@ -228,10 +231,11 @@ instance carries the app group: the SDK's configuration is the node's
 private IP (<code>$NODE_IP</code>), port 8356 and the secret, and
 nothing else — see <a href="sdks.html">the SDKs</a> for each
 language and the framework adapters. This node was exercised that way
-from an instance in the app subnet with all six SDKs at 0.4.1 (Python,
-TypeScript, Go, Java, .NET and Rust): set / get / delete succeed with
-the secret, and a wrong secret is rejected with each SDK's
-authentication error.</p>
+from an instance in the app subnet. The latest run used the Python SDK
+at 0.6.2: set / get / delete succeed with the secret, and a wrong
+secret, or none, is rejected with <code>AuthenticationError</code>. An
+earlier run did the same with all six SDKs at 0.4.1 (Python,
+TypeScript, Go, Java, .NET and Rust).</p>
 <p>The operations endpoint answers from anywhere inside the VPC:</p>
 <pre><code>curl -s http://$NODE_IP:9356/metrics | grep -v '^#' | head -3
 # nanocached_node_memory_used_bytes 0

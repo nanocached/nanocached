@@ -76,7 +76,7 @@ this is the shape for a handful of instances that people operate; the
 href="deployment-eks.html">EKS</a> shapes are the ones that scale on
 their own.</p>
 
-<pre><code>export AWS_REGION=us-east-1
+<pre><code>export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1   # AWS CLI v1 reads only the second
 NAME=nanocached
 TAG="{Key=Project,Value=$NAME}"     # every resource carries it — see teardown</code></pre>
 

@@ -51,7 +51,7 @@ the execution role so it appears in no task definition; a health check
 on <code>/readyz</code> so the scheduler only routes to nodes that have
 joined; and <code>stopTimeout</code> sized to the drain.</p>
 
-<pre><code>export AWS_REGION=us-east-1
+<pre><code>export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1   # AWS CLI v1 reads only the second
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 NAME=nanocached
 TAG="{Key=Project,Value=$NAME}"</code></pre>
