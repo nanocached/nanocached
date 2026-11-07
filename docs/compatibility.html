@@ -102,11 +102,47 @@ you read the changelog.</p>
 <p>These have no compatibility promise yet; a decision for each is still
 open:</p>
 <ul>
-  <li>command-line flags and environment variables of the server
-  binaries;</li>
   <li>metric names and the operations endpoints (<code>/healthz</code>,
   <code>/readyz</code>, <code>/metrics</code>);</li>
   <li>the container image layout and tags other than the version tag;</li>
+</ul>
+
+<h3 id="cli">Command-line flags and environment variables</h3>
+<p>From 1.0.0 the command line of <code>nanocached-node</code>,
+<code>nanocached-proxy</code> and <code>nanocached-discovery</code> is
+covered, because deployment guides, container manifests and task
+definitions are written against it:</p>
+<ul>
+  <li>the name of every flag each binary lists in <code>--help</code>, the
+  syntax of its value and what it means;</li>
+  <li>the environment variable <code>NANOCACHED_AUTH_SECRET</code>;</li>
+  <li>the defaults of <code>--host</code> and <code>--port</code>
+  (<code>127.0.0.1</code> and 8356, 8357 and 8358 for node, discovery and
+  proxy), since clients and health checks connect there;</li>
+  <li>the component names and <code>start</code> of
+  <code>ncd &lt;component&gt; start</code>, which passes the rest of its
+  arguments to that component unchanged.</li>
+</ul>
+<p>Renaming or removing a flag, changing the syntax it accepts or what it
+means, and making an accepted value invalid are breaking changes and wait for a
+new major version; there is no deprecation period (see above). A minor
+release may add a flag or an environment variable.</p>
+<p>Not covered, and free to change in any release:</p>
+<ul>
+  <li>the defaults of limits, budgets and timeouts
+  (<code>--max-memory</code>, <code>--max-in-flight-bytes</code>,
+  <code>--max-connections</code>, <code>--max-connections-per-ip</code>,
+  <code>--drain-timeout</code>, <code>--liveness-timeout</code>,
+  <code>--replication-factor</code>). Set the ones your deployment depends
+  on explicitly; the changelog notes a changed default;</li>
+  <li>the wording of <code>--help</code>, log lines and error messages;</li>
+  <li><code>NANOCACHED_SECRET</code>, which only the proxy reads, as a legacy
+  name for <code>NANOCACHED_AUTH_SECRET</code>. It prints a warning and is
+  already slated to go; use <code>NANOCACHED_AUTH_SECRET</code> on all three
+  binaries;</li>
+  <li><code>NANOCACHED_TRACE_PREFIX</code>, which only a build with the
+  <code>trace</code> feature reads. The released images are built without
+  it.</li>
 </ul>
 
 <h3 id="tests-tools">Outside the promise: <code>tests/</code> and <code>tools/</code></h3>
