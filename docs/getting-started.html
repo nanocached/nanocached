@@ -108,14 +108,15 @@ bootstrapping client never sees a half-recovered node list.</p>
 name (or a stable IP)</strong> — an operational requirement the system
 does not verify. Every node and client must hold the <em>same list in the
 same order</em>; a single DNS name that round-robins across several
-replicas (or a multi-value discovery service, e.g. AWS Cloud Map's
-multi-value routing) breaks that, since which replica a resolution lands
+replicas (or a multi-value service-discovery entry) breaks that,
+since which replica a resolution lands
 on — and in what order — becomes nondeterministic per resolver, per
 lookup. A bare task/pod IP has the same problem in a different shape: it
 works until that replica restarts with a new one, silently dropping it
 from every <code>--discovery</code> list. Give each replica a stable
-identity instead — on ECS, one Cloud Map service (or ALB target group)
-per replica rather than one round-robin service in front of all of them;
+identity instead — on a container orchestrator, one service entry (or
+load-balancer target group) per replica rather than one round-robin
+service in front of all of them;
 on Kubernetes, a headless Service-per-replica or a StatefulSet's stable
 per-pod DNS names.</p>
 <p>Every replica must be started with the same
@@ -171,7 +172,7 @@ self-signed certs are marked as their own CA and get refused):</p>
 <p>Being self-signed, the same <code>cert.pem</code> doubles as the
 <code>--tls-ca</code> trust anchor for anything connecting to it. For
 what each flag encrypts in a cluster, certificate names, distribution
-and rotation on AWS, see <a href="deployment-tls.html">TLS</a> under
+and rotation, see <a href="deployment-tls.html">TLS</a> under
 Deployment.</p>
 
 <h2>Connect a client</h2>

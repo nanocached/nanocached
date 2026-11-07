@@ -124,8 +124,8 @@ replicas in the same order on every node and client with
 
 See [getting started](https://nanocached.org/getting-started.html) for
 replication and discovery replicas in detail, and the
-[deployment guides](https://nanocached.org/deployment.html) for verified
-setups on EC2, ECS Fargate and EKS.
+[deployment pages](https://nanocached.org/deployment.html) for what every
+deployment needs: operations, TLS, metrics and the proxy tier.
 
 ## Authentication
 
@@ -249,8 +249,8 @@ the proxy's own limits are in the [proxy guide](https://nanocached.org/deploymen
   replication, joins, and the [accepted behaviour](https://nanocached.org/architecture.html#accepted-behaviour)
   list. Read the list before relying on a cluster during a membership change.
 - [Protocol](https://nanocached.org/protocol.html): every command and status.
-- [Deployment](https://nanocached.org/deployment.html): EC2, ECS and EKS,
-  [operations](https://nanocached.org/deployment-operations.html) and
+- [Deployment](https://nanocached.org/deployment.html):
+  [operations](https://nanocached.org/deployment-operations.html), TLS, the proxy tier and
   [metrics](https://nanocached.org/deployment-metrics.html) (`--metrics-port`
   serves Prometheus `/metrics`, `/healthz` and `/readyz`).
 - [Capacity planner](https://nanocached.org/capacity-planner.html): an

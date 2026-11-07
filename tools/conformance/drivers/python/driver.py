@@ -3,7 +3,7 @@
 Reads the case file from make_cases.py and prints one JSON line per step.
 phase  main  runs every case, then writes this SDK's cross-SDK keys
        read  reads every SDK's cross-SDK keys back
-Connection comes from the same environment as tools/aws-harness:
+Connection comes from the environment:
 NANOTEST_ADDRESSES, NANOTEST_VIA_PROXY, NANOTEST_SECRET.
 """
 
