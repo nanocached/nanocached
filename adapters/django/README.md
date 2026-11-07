@@ -97,7 +97,9 @@ straight through to the matching `NanocachedClient.connect()` keyword
 `reconnect_cooldown` — see that method's docstring for what each one
 does) — each is optional and, when the OPTIONS entry omits it, the SDK's
 own default is what actually takes effect, not some second default
-chosen by this backend. `CA` is a filesystem path to a CA bundle and requires
+chosen by this backend. An `OPTIONS` key this backend does not know (a typo such as `"Tls"`) raises
+`ImproperlyConfigured` when the cache is created, instead of being ignored;
+Django's own `MAX_ENTRIES` and `CULL_FREQUENCY` are accepted. `CA` is a filesystem path to a CA bundle and requires
 `TLS` to be true: a `CA` without `TLS` raises `ValueError` at the first
 cache operation, not at startup. `READ_HEDGE_AFTER` and
 `RECONNECT_COOLDOWN` are seconds (`float`); everything else here is a
