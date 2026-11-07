@@ -524,10 +524,13 @@ Only a cluster with no reachable node at all fails `connect()`.
 
 An address whose redial just failed is treated as still down for
 `reconnect_cooldown` seconds (default `1.0`, a `connect()` keyword
-argument): requests routed to it during that window fail immediately with
-the original dial error instead of each paying another full 5-second
-connect timeout. Keep it short — a node that genuinely recovers is shut
-out for at most this long.
+argument; `0` also means the default): requests routed to it during that
+window fail immediately with the original dial error instead of each
+paying another full 5-second connect timeout. Keep it short — a node that
+genuinely recovers is shut out for at most this long. A negative or
+non-finite value is rejected with `ValueError`;
+`disable_reconnect_cooldown=True` switches the cooldown off (every request
+that finds a dead connection then pays its own full dial attempt).
 
 ## Errors and stats
 
