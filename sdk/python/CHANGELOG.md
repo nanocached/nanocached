@@ -11,6 +11,10 @@ whether or not a component changed (there is no `sdk/python/v0.4.3` tag:
 
 ### Changed
 
+- **Breaking:** the `nanocached.client` module is now `nanocached._client`. Only the names `nanocached` exports are public; `Connection`, `NodeTarget`, `ClusterTarget`, `compress_value` and the other module-level names that `nanocached.client` happened to expose are no longer reachable under a public path.
+- **Breaking:** `HashRing` and `DiscoveredNode` are no longer exported from `nanocached`. No public method took or returned either; `nanocached._hashring` still holds the ring for the repository's own tests.
+- The package ships a `py.typed` marker, so type checkers use the SDK's annotations.
+- An operation that finds no reachable owner, or whose target connection is gone, now raises `ConnectFailedError` (nothing was sent, a retry is always safe) instead of a bare `ConnectionError` that was not a `NanocachedError`. It is still a `ConnectionError`, so existing `except ConnectionError` blocks keep working.
 - **Breaking:** `reconnect_cooldown=0` no longer switches the reconnect cooldown off; like omitting it, it now means the default (1.0 s), which is how the Go, Rust, Java and .NET SDKs read `0`. A negative or non-finite value now raises `ValueError`. To switch the cooldown off, use the new `disable_reconnect_cooldown=True` (combining it with a non-zero `reconnect_cooldown` raises `ValueError`).
 
 ### Fixed

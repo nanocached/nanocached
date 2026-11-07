@@ -17,7 +17,6 @@ from nanocached import (
     ConnectionLostError,
     DecompressionError,
     DiscoveryBusyError,
-    HashRing,
     NanocachedClient,
     NanocachedError,
     NotNumericError,
@@ -31,6 +30,7 @@ from nanocached import (
     content_digest,
 )
 
+from nanocached._hashring import HashRing
 from mock_servers import MockDiscovery, MockNode, unused_port
 
 NAMES = [
@@ -265,7 +265,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
 
     async def test_oversized_key_and_value_are_rejected_before_touching_the_connection(self):
-        from nanocached.client import _MAX_REQUEST_BYTES
+        from nanocached._client import _MAX_REQUEST_BYTES
 
         client = await self.connect()
         try:
@@ -398,7 +398,7 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
         # can shrink well under _MAX_REQUEST_BYTES even though the
         # uncompressed value the caller asked to store never could have
         # fit the server's own request cap.
-        from nanocached.client import _MAX_REQUEST_BYTES
+        from nanocached._client import _MAX_REQUEST_BYTES
 
         client = await self.connect(compress=True, compression_threshold=16)
         try:
@@ -435,7 +435,7 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
 
 class ReconnectCooldownOptionTests(unittest.IsolatedAsyncioTestCase):
     async def test_zero_and_omitted_mean_the_default_and_only_the_switch_turns_it_off(self):
-        from nanocached.client import _DEFAULT_RECONNECT_COOLDOWN as default, _resolve_reconnect_cooldown as resolve
+        from nanocached._client import _DEFAULT_RECONNECT_COOLDOWN as default, _resolve_reconnect_cooldown as resolve
 
         self.assertEqual(resolve(None, False), default)
         self.assertEqual(resolve(0, False), default)
@@ -962,7 +962,7 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         # writer-less ClusterTarget used to throw, and (2) still close the
         # sockets it already opened to the genuine nodes this round.
         from nanocached import _identify
-        from nanocached.client import ClusterTarget, DiscoveredNode, NodeTarget
+        from nanocached._client import ClusterTarget, DiscoveredNode, NodeTarget
 
         class SpyWriter:
             def __init__(self):
@@ -991,7 +991,7 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with mock.patch.object(_identify, "connect_and_identify", fake_identify), mock.patch(
-            "nanocached.client.connect_and_identify", fake_identify
+            "nanocached._client.connect_and_identify", fake_identify
         ):
             with self.assertRaises(NanocachedError):
                 await client._open_cluster(identified)
@@ -1132,7 +1132,7 @@ class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
     # module-level constant exists only so these tests can shorten it.
 
     def setUp(self):
-        from nanocached import client as client_module
+        from nanocached import _client as client_module
 
         self._client_module = client_module
         self._default_interval = client_module._KEEPALIVE_INTERVAL
@@ -1582,18 +1582,18 @@ class CloseWarningTests(unittest.IsolatedAsyncioTestCase):
 
 class TlsOptionTests(unittest.TestCase):
     def test_tls_false_silently_ignores_ca(self):
-        from nanocached.client import _build_ssl_context
+        from nanocached._client import _build_ssl_context
 
         self.assertIsNone(_build_ssl_context(False, "/no/such/ca.pem"))
 
     def test_tls_true_without_ca_uses_the_default_trust_store(self):
-        from nanocached.client import _build_ssl_context
+        from nanocached._client import _build_ssl_context
 
         context = _build_ssl_context(True, None)
         self.assertIsInstance(context, ssl.SSLContext)
 
     def test_tls_true_with_an_unreadable_ca_file_is_a_connect_time_error(self):
-        from nanocached.client import _build_ssl_context
+        from nanocached._client import _build_ssl_context
 
         with self.assertRaises(OSError):
             _build_ssl_context(True, "/no/such/ca.pem")
@@ -2755,7 +2755,7 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
 
     async def test_a_large_batch_is_split_into_sub_frames_and_reassembled(self):
-        from nanocached.client import _MAX_BATCH_KEYS
+        from nanocached._client import _MAX_BATCH_KEYS
 
         client = await self.connect()
         try:
@@ -2844,7 +2844,7 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
         # Single-node/proxy mode never retries a chunk failure, so a get
         # attaches what the chunks that completed returned, as get_many
         # does; a plain touch has nothing partial worth attaching.
-        from nanocached.client import _MAX_BATCH_KEYS
+        from nanocached._client import _MAX_BATCH_KEYS
 
         client = await self.connect()
         try:
@@ -3419,7 +3419,7 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
             await self.stop(client, discovery, nodes)
 
     async def test_a_chunk_that_fails_in_the_cluster_moves_only_the_tail_to_the_retry(self):
-        from nanocached.client import _MAX_BATCH_KEYS
+        from nanocached._client import _MAX_BATCH_KEYS
 
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
@@ -4551,7 +4551,7 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
     TIMING_TOLERANCE_S = 0.02
 
     def setUp(self):
-        from nanocached import client as client_module
+        from nanocached import _client as client_module
 
         self._client_module = client_module
         self._default_cap = client_module._MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
@@ -4953,7 +4953,7 @@ class SharedBackgroundReplicaPoolTests(unittest.IsolatedAsyncioTestCase):
     # category.
 
     def setUp(self):
-        from nanocached import client as client_module
+        from nanocached import _client as client_module
 
         self._client_module = client_module
         self._default_cap = client_module._MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
@@ -5428,7 +5428,7 @@ class HedgedReadInflightCapTests(unittest.IsolatedAsyncioTestCase):
     TIMING_TOLERANCE_S = 0.03
 
     def setUp(self):
-        from nanocached import client as client_module
+        from nanocached import _client as client_module
 
         self._client_module = client_module
         self._default_cap = client_module._MAX_INFLIGHT_HEDGE_LOSER_LEGS
@@ -5546,7 +5546,7 @@ class HedgedReadSilentOwnerTests(unittest.IsolatedAsyncioTestCase):
     SILENT_FOR_S = 0.8
 
     def setUp(self):
-        from nanocached import client as client_module
+        from nanocached import _client as client_module
 
         self._client_module = client_module
         self._default_threshold = client_module._HEDGE_SUSPECT_LATE_LEGS
@@ -5910,7 +5910,7 @@ class RosterDialTests(unittest.IsolatedAsyncioTestCase):
                     await node.close()
 
     async def test_an_abandoned_bootstrap_round_closes_the_sockets_its_siblings_opened(self):
-        from nanocached import client as client_module
+        from nanocached import _client as client_module
 
         real = client_module.connect_and_identify
         opened = []
@@ -5939,7 +5939,7 @@ class RosterDialTests(unittest.IsolatedAsyncioTestCase):
             await node.close()
 
     async def test_an_abandoned_refresh_round_closes_the_sockets_its_siblings_opened(self):
-        from nanocached import client as client_module
+        from nanocached import _client as client_module
 
         real = client_module.connect_and_identify
         opened = []
@@ -5997,7 +5997,7 @@ class RosterDialTests(unittest.IsolatedAsyncioTestCase):
         return counting, state
 
     async def test_bootstrap_dials_a_big_roster_with_bounded_concurrency(self):
-        from nanocached import client as client_module
+        from nanocached import _client as client_module
 
         node = await MockNode().start()
         self.node_port = node.port
@@ -6021,7 +6021,7 @@ class RosterDialTests(unittest.IsolatedAsyncioTestCase):
             await node.close()
 
     async def test_refresh_dials_a_big_roster_with_bounded_concurrency(self):
-        from nanocached import client as client_module
+        from nanocached import _client as client_module
 
         existing = await MockNode().start()
         node = await MockNode().start()
@@ -6052,7 +6052,7 @@ class RosterDialTests(unittest.IsolatedAsyncioTestCase):
 
 class KeepAliveHungNodeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        from nanocached import client as client_module
+        from nanocached import _client as client_module
 
         self._client_module = client_module
         self._default_interval = client_module._KEEPALIVE_INTERVAL
@@ -7441,7 +7441,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         try:
             await client.set("a", "12")
             await client.set("c", "34")
-            with mock.patch("nanocached.client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
+            with mock.patch("nanocached._client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
                 with self.assertRaises(DecompressionError):
                     await client.get_many_bytes(["a", "c"])
         finally:
@@ -7457,7 +7457,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         client = await self.connect(compress=True)
         try:
             await client.set("a", "12")
-            with mock.patch("nanocached.client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
+            with mock.patch("nanocached._client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
                 with self.assertRaises(DecompressionError):
                     await client.get_many_bytes(["a"])
         finally:
@@ -7473,7 +7473,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         try:
             await client.set("a", "12")
             await client.set("c", "34")
-            with mock.patch("nanocached.client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
+            with mock.patch("nanocached._client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
                 result = await client.get_many_bytes(["a", "c"])
             self.assertEqual(result, {"a": b"12", "c": b"34"})
         finally:
@@ -7526,7 +7526,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
 
     async def test_a_batch_larger_than_max_batch_keys_is_transparently_chunked(self):
-        from nanocached.client import _MAX_BATCH_KEYS
+        from nanocached._client import _MAX_BATCH_KEYS
 
         client = await self.connect()
         try:
@@ -7545,7 +7545,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         # `o` sub-frames — otherwise the server's request_is_too_large
         # check would reject the whole frame with no reply at all,
         # closing the shared connection.
-        from nanocached.client import _MAX_REQUEST_BYTES
+        from nanocached._client import _MAX_REQUEST_BYTES
 
         client = await self.connect()
         try:
@@ -7572,7 +7572,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         # #222): large keys alone (no values on the wire for `m`) can
         # still sum past _MAX_REQUEST_BYTES well before _MAX_BATCH_KEYS
         # keys are reached.
-        from nanocached.client import _MAX_REQUEST_BYTES
+        from nanocached._client import _MAX_REQUEST_BYTES
 
         client = await self.connect()
         try:
@@ -7663,7 +7663,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         # this failure mode reaches the caller directly, and used to
         # arrive as a bare connection error with no trace of the earlier
         # chunk's hits.
-        from nanocached.client import _MAX_BATCH_KEYS
+        from nanocached._client import _MAX_BATCH_KEYS
 
         client = await self.connect()
         try:
@@ -7693,7 +7693,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         # get_many_bytes' own companion to the test above: partial_values
         # must carry raw bytes, not decoded str, exactly like a plain
         # successful get_many_bytes() result would.
-        from nanocached.client import _MAX_BATCH_KEYS
+        from nanocached._client import _MAX_BATCH_KEYS
 
         client = await self.connect()
         try:
@@ -7717,7 +7717,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         # chunk has no partial data yet to attach, so it must still
         # raise the original connection error unwrapped, exactly as
         # before this fix — not PartialConnectionLostError.
-        from nanocached.client import _MAX_BATCH_KEYS
+        from nanocached._client import _MAX_BATCH_KEYS
 
         client = await self.connect()
         try:
@@ -7737,7 +7737,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         # a connection failure mid-batch DOES have something meaningful
         # to attach — which keys an earlier, already-succeeded chunk
         # actually stored.
-        from nanocached.client import _MAX_BATCH_KEYS
+        from nanocached._client import _MAX_BATCH_KEYS
 
         client = await self.connect()
         try:
@@ -7762,7 +7762,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
 
     async def test_set_many_propagates_the_bare_error_when_the_first_chunk_fails(self):
-        from nanocached.client import _MAX_BATCH_KEYS
+        from nanocached._client import _MAX_BATCH_KEYS
 
         client = await self.connect()
         try:
@@ -7874,7 +7874,7 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
         # same walk a single get() does), the tail is read from the
         # replica, in one frame carrying only the tail's keys; the
         # primary is not asked again.
-        from nanocached.client import _MAX_BATCH_KEYS
+        from nanocached._client import _MAX_BATCH_KEYS
 
         nodes, discovery = await self.start_cluster()
         try:
@@ -8270,7 +8270,7 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
         # double-counting an already-resolved replica key into
         # replica_write_failures — the same class of overcounting bug
         # already fixed in the other SDKs' leg-runners.
-        from nanocached.client import _MAX_BATCH_KEYS
+        from nanocached._client import _MAX_BATCH_KEYS
 
         nodes, discovery = await self.start_cluster()
         try:
