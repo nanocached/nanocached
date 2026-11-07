@@ -26,3 +26,6 @@ Issues = "https://github.com/nanocached/nanocached/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+nanocached = ["py.typed"]

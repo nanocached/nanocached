@@ -658,6 +658,8 @@ produce a value the protocol can't safely round-trip — see "Counters
   only their own network latency, not everyone else's ahead of them.
 - This SDK speaks the current wire protocol (rendezvous hashing,
   replication-aware `L`/`W`); it requires an up-to-date server. Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.
+- `client.closed` is a read-only property, `True` once `close()` has run. The other SDKs spell it `isClosed`/`is_closed`; Python's own `io` and `asyncio` objects use `closed`, so this SDK does too.
+- Only what `nanocached` exports (`__all__`) is public. Every module is private, including `nanocached._client`, `_connection` and `_hashring`; in particular `HashRing` and `DiscoveredNode` are not part of the API. The package ships a `py.typed` marker, so type checkers use its annotations.
 - `close()` is a coroutine (like aiohttp's `ClientSession.close`): it
   returns only after any in-flight background replica writes finish and
   every connection is torn down. It also waits for an in-flight

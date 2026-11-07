@@ -50,6 +50,7 @@ from ._digest import content_digest
 from ._errors import (
     AlreadyClosedError,
     CompressionIncompatibleError,
+    ConnectFailedError,
     ConnectionLostError,
     NanocachedError,
     PartialConnectionLostError,
@@ -2612,7 +2613,7 @@ class NanocachedClient:
 
         names = self._owner_names(namespace, key)
         if not names:
-            raise ConnectionError("nanocached: no owner is reachable for this key")
+            raise ConnectFailedError("nanocached: no owner is reachable for this key")
         primary, replicas = names[0], names[1:]
 
         connection = await self._member_connection(primary)
@@ -2766,7 +2767,7 @@ class NanocachedClient:
 
         names = self._owner_names(namespace, key)
         if not names:
-            raise ConnectionError("nanocached: no owner is reachable for this key")
+            raise ConnectFailedError("nanocached: no owner is reachable for this key")
         primary, replicas = names[0], names[1:]
 
         connection = await self._member_connection(primary)
@@ -2813,7 +2814,7 @@ class NanocachedClient:
 
         names = self._owner_names(namespace, key)
         if not names:
-            raise ConnectionError("nanocached: no owner is reachable for this key")
+            raise ConnectFailedError("nanocached: no owner is reachable for this key")
         primary, replicas = names[0], names[1:]
 
         connection = await self._member_connection(primary)
@@ -3125,7 +3126,7 @@ class NanocachedClient:
                 # WrongNode answer (issue #8) — matching the TypeScript
                 # SDK's semantics.
                 last_error = error
-        raise last_error if last_error is not None else ConnectionError(
+        raise last_error if last_error is not None else ConnectFailedError(
             "nanocached: no owner is reachable for this key"
         )
 
@@ -3327,7 +3328,7 @@ class NanocachedClient:
 
         if replica_missed:
             return None
-        raise last_error if last_error is not None else ConnectionError(
+        raise last_error if last_error is not None else ConnectFailedError(
             "nanocached: no owner is reachable for this key"
         )
 
@@ -3438,7 +3439,7 @@ class NanocachedClient:
 
         names = self._owner_names(namespace, key)
         if not names:
-            raise ConnectionError("nanocached: no owner is reachable for this key")
+            raise ConnectFailedError("nanocached: no owner is reachable for this key")
         primary, replicas = names[0], names[1:]
 
         if primary_first:
@@ -3525,7 +3526,7 @@ class NanocachedClient:
         if member is None:
             # Connection-classified (issue #8): the usual cause is a
             # refresh racing this operation, which the retry layer heals.
-            raise ConnectionError(f"nanocached: {name} has no open connection")
+            raise ConnectFailedError(f"nanocached: {name} has no open connection")
         if member.connection is not None and not member.connection.closed:
             return member.connection
         return await self._redial(name, member.address)
@@ -3600,7 +3601,7 @@ class NanocachedClient:
         current = self._members.get(slot)
         if current is None:
             connection.close()
-            raise ConnectionError(f"nanocached: {slot} left the cluster while reconnecting")
+            raise ConnectFailedError(f"nanocached: {slot} left the cluster while reconnecting")
         if current.connection is None or current.connection.closed:
             current.connection = connection
             return connection

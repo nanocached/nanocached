@@ -22,9 +22,7 @@ from ._errors import (
     ServerTooOldError,
     WrongNodeError,
 )
-from ._hashring import HashRing
-from ._identify import DiscoveredNode
-from .client import ClientStats, Namespace, NanocachedClient
+from ._client import ClientStats, Namespace, NanocachedClient
 
 __all__ = [
     "AlreadyClosedError",
@@ -34,9 +32,7 @@ __all__ = [
     "ConnectFailedError",
     "ConnectionLostError",
     "DecompressionError",
-    "DiscoveredNode",
     "DiscoveryBusyError",
-    "HashRing",
     "Namespace",
     "NanocachedClient",
     "NanocachedError",
