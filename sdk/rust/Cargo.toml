@@ -49,6 +49,12 @@ tls = [
   "dep:rustls-native-certs",
 ]
 compression = ["dep:flate2"]
+# Not part of the API and not covered by any compatibility promise: exposes
+# the internals this crate's own integration tests drive (`HashRing`,
+# `DiscoveredNode`, tuning statics, per-client counters). The tests enable it
+# through the dev-dependency below; nothing else should.
+__test_hooks = []
 
 [dev-dependencies]
+nanocached = { path = ".", features = ["__test_hooks"] }
 tokio = { version = "1", features = ["full"] }

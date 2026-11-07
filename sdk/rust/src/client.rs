@@ -718,6 +718,8 @@ impl Options {
     /// else is rejected at [`NanocachedClient::connect`] time with
     /// [`Error::InvalidArgument`]. A zero interval would turn the
     /// keep-alive task into a busy loop that pings continuously.
+    #[cfg(feature = "__test_hooks")]
+    #[doc(hidden)]
     pub fn keep_alive_interval(mut self, interval: Duration) -> Self {
         self.keep_alive_interval = Some(interval);
         self
@@ -731,6 +733,8 @@ impl Options {
     /// Must be positive and at most 24 hours; anything
     /// else is rejected at [`NanocachedClient::connect`] time with
     /// [`Error::InvalidArgument`]. A zero timeout would fail every request.
+    #[cfg(feature = "__test_hooks")]
+    #[doc(hidden)]
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = Some(timeout);
         self
@@ -1966,6 +1970,7 @@ impl NanocachedClient {
     /// #180) as well as ones genuinely in flight. Public-but-hidden purely
     /// as a test hook to observe that the JoinSet stays bounded instead of
     /// growing for the client's lifetime.
+    #[cfg(feature = "__test_hooks")]
     #[doc(hidden)]
     pub async fn hedged_reads_len(&self) -> usize {
         self.inner.hedged_reads.lock().await.len()
@@ -1973,6 +1978,7 @@ impl NanocachedClient {
 
     /// Late hedge legs currently counted, summed over every node (see
     /// `HEDGE_SUSPECT_LATE_LEGS`). Public-but-hidden purely as a test hook.
+    #[cfg(feature = "__test_hooks")]
     #[doc(hidden)]
     pub fn late_hedge_legs_total(&self) -> usize {
         self.inner.late_hedge.total.load(Ordering::SeqCst)
@@ -1980,6 +1986,7 @@ impl NanocachedClient {
 
     /// Late hedge legs currently counted for `node`. Public-but-hidden
     /// purely as a test hook.
+    #[cfg(feature = "__test_hooks")]
     #[doc(hidden)]
     pub fn late_hedge_legs_of(&self, node: &str) -> usize {
         let legs = self
@@ -1994,6 +2001,7 @@ impl NanocachedClient {
     /// Sets the late-leg count for `node`, as if that many legs had gone
     /// unanswered. Public-but-hidden purely as a test hook; a count set
     /// here is not released by any leg, so a test sets it back to zero.
+    #[cfg(feature = "__test_hooks")]
     #[doc(hidden)]
     pub fn set_late_hedge_legs_for_test(&self, node: &str, count: usize) {
         let late = &self.inner.late_hedge;
@@ -2013,6 +2021,7 @@ impl NanocachedClient {
 
     /// The order a hedged read would try `owners` in right now. Public-but-
     /// hidden purely as a test hook.
+    #[cfg(feature = "__test_hooks")]
     #[doc(hidden)]
     pub fn hedge_order_for_test(&self, owners: Vec<String>) -> Vec<String> {
         self.inner.late_hedge.demote(owners)
@@ -2022,6 +2031,7 @@ impl NanocachedClient {
     /// (issue #296). Public-but-hidden purely as a test hook to observe
     /// that a departed proxy's entry does not linger forever after a
     /// proxy-mode failover swaps the pinned address.
+    #[cfg(feature = "__test_hooks")]
     #[doc(hidden)]
     pub async fn reconnect_cooldowns_len(&self) -> usize {
         self.inner.reconnect_cooldowns.lock().await.len()
@@ -2033,6 +2043,7 @@ impl NanocachedClient {
     /// collapses to exactly one membership entry (rather than the second
     /// occurrence's dial silently overwriting the first's live
     /// `Connection` via `HashMap::insert`, leaking it) after `connect()`.
+    #[cfg(feature = "__test_hooks")]
     #[doc(hidden)]
     pub async fn member_names(&self) -> Vec<String> {
         let state = self.inner.state.lock().await;
