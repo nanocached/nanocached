@@ -22,7 +22,13 @@ import {
   WrongNodeError,
 } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
-import { FIRE_AND_FORGET_TUNING, HEDGE_READ_TUNING, KEEPALIVE_TUNING, MAX_BATCH_KEYS } from "../src/client.js";
+import {
+  FIRE_AND_FORGET_TUNING,
+  HEDGE_READ_TUNING,
+  KEEPALIVE_TUNING,
+  MAX_BATCH_KEYS,
+  resolveReconnectCooldownMs,
+} from "../src/client.js";
 import { Connection, REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
 import { MAX_REQUEST_BYTES, MULTI_GET_TUNING } from "../src/protocol.js";
 import { maxMultiGetDecompressedBytes, setMaxMultiGetDecompressedBytesForTest } from "../src/compression.js";
@@ -8484,5 +8490,34 @@ describe("a big roster is dialed with bounded concurrency", () => {
     } finally {
       await Promise.all([discovery.close(), bootNode.close(), counting.close()]);
     }
+  });
+});
+
+describe("reconnect cooldown option", () => {
+  async function rejects(options: Record<string, unknown>, pattern: RegExp) {
+    await assert.rejects(
+      // The address is never dialed: option validation runs first.
+      NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: 1 }], ...options }),
+      pattern,
+    );
+  }
+
+  it("rejects a negative or non-finite reconnectCooldownMs", async () => {
+    await rejects({ reconnectCooldownMs: -1 }, /reconnectCooldownMs must be a non-negative number/);
+    await rejects({ reconnectCooldownMs: Number.NaN }, /reconnectCooldownMs must be a non-negative number/);
+    await rejects({ reconnectCooldownMs: Infinity }, /reconnectCooldownMs must be a non-negative number/);
+  });
+
+  it("reads 0 and omitting as the default, and switches it off only with disableReconnectCooldown", () => {
+    const base = { addresses: [{ host: "127.0.0.1", port: 1 }] };
+    assert.equal(resolveReconnectCooldownMs(base), 1000);
+    assert.equal(resolveReconnectCooldownMs({ ...base, reconnectCooldownMs: 0 }), 1000);
+    assert.equal(resolveReconnectCooldownMs({ ...base, reconnectCooldownMs: 50 }), 50);
+    assert.equal(resolveReconnectCooldownMs({ ...base, disableReconnectCooldown: true }), 0);
+    assert.equal(resolveReconnectCooldownMs({ ...base, disableReconnectCooldown: true, reconnectCooldownMs: 0 }), 0);
+  });
+
+  it("rejects disableReconnectCooldown combined with a non-zero reconnectCooldownMs", async () => {
+    await rejects({ disableReconnectCooldown: true, reconnectCooldownMs: 50 }, /contradicts a non-zero reconnectCooldownMs/);
   });
 });

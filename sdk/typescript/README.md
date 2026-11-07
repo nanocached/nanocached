@@ -352,10 +352,13 @@ idempotent request always; `incr`/`decr` and the compare-and-set calls only
 when the SDK can prove nothing was sent — see "What never sent means" below). Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.
 
 An address whose redial just failed is treated as still down for
-`reconnectCooldownMs` (default 1000): requests routed to it during that
-window fail immediately with the original dial error instead of each
+`reconnectCooldownMs` (default 1000; `0` also means the default): requests
+routed to it during that window fail immediately with the original dial error instead of each
 paying another full 5-second connect timeout. Keep it short — a node that
-genuinely recovers is shut out for at most this long.
+genuinely recovers is shut out for at most this long. A negative or
+non-finite value is rejected; `disableReconnectCooldown: true` switches the
+cooldown off (every request that finds a dead connection then pays its own
+full dial attempt).
 
 `connect()` itself tolerates a node that discovery still lists but that
 can't be reached — typically one that just died and hasn't been evicted
@@ -680,7 +683,7 @@ never replayed.
 ## API
 
 - `NanocachedClient.connect(options)` —
-  `options: { addresses, viaProxy?, authSecret?, tls?, ca?, compress?, compressionThreshold?, fireAndForgetReplicas?, readRepair?, readHedgeAfterMs?, reconnectCooldownMs? }`
+  `options: { addresses, viaProxy?, authSecret?, tls?, ca?, compress?, compressionThreshold?, fireAndForgetReplicas?, readRepair?, readHedgeAfterMs?, reconnectCooldownMs?, disableReconnectCooldown? }`
   (`addresses` is a required, non-empty `NanocachedAddress[]`, each
   `{ host, port }`; see [SDK proxy mode](#sdk-proxy-mode-viaproxy) for
   `viaProxy`)

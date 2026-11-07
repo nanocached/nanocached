@@ -322,12 +322,37 @@ export interface NanocachedClientOptions {
    * another full `CONNECT_DEADLINE_MS` (5s, socket.ts) redialing an
    * address that just proved unreachable. Default `DEFAULT_RECONNECT_COOLDOWN_MS`
    * (1s). Keep well under `NODE_LIST_STALE_AFTER_MS` so a node that
-   * genuinely recovers isn't shut out for long. */
+   * genuinely recovers isn't shut out for long. `0` (or omitting it) means
+   * the default, as in the other SDKs; a negative or non-finite value is
+   * rejected. To switch the cooldown off, set `disableReconnectCooldown`. */
   reconnectCooldownMs?: number;
+  /** Turn the reconnect cooldown off: every request that finds a dead
+   * connection pays its own full dial attempt. Combining it with a non-zero
+   * `reconnectCooldownMs` is rejected (the two contradict each other). */
+  disableReconnectCooldown?: boolean;
 }
 
 // See `NanocachedClientOptions.reconnectCooldownMs`.
 const DEFAULT_RECONNECT_COOLDOWN_MS = 1_000;
+
+/** The cooldown the client runs with: `0` ms when it is switched off,
+ * otherwise the configured value, where omitting it or passing `0` means the
+ * default (the same reading as Go, Rust, Java and .NET). */
+export function resolveReconnectCooldownMs(options: NanocachedClientOptions): number {
+  const configured = options.reconnectCooldownMs;
+  if (configured !== undefined && !(Number.isFinite(configured) && configured >= 0)) {
+    throw new NanocachedError("nanocached: reconnectCooldownMs must be a non-negative number of milliseconds");
+  }
+  if (options.disableReconnectCooldown === true) {
+    if (configured !== undefined && configured !== 0) {
+      throw new NanocachedError(
+        "nanocached: disableReconnectCooldown contradicts a non-zero reconnectCooldownMs; unset one of them",
+      );
+    }
+    return 0;
+  }
+  return configured === undefined || configured === 0 ? DEFAULT_RECONNECT_COOLDOWN_MS : configured;
+}
 
 const DEFAULT_COMPRESSION_THRESHOLD = 256;
 
@@ -981,7 +1006,7 @@ export class NanocachedClient {
     const ca = options.tls === true && options.ca !== undefined ? readFileSync(options.ca) : undefined;
     const compress = options.compress === true;
     const compressionThreshold = options.compressionThreshold ?? DEFAULT_COMPRESSION_THRESHOLD;
-    const reconnectCooldownMs = options.reconnectCooldownMs ?? DEFAULT_RECONNECT_COOLDOWN_MS;
+    const reconnectCooldownMs = resolveReconnectCooldownMs(options);
 
     if (options.viaProxy === true) {
       return NanocachedClient.connectViaProxy(options, addresses, ca, compress, compressionThreshold, reconnectCooldownMs);
