@@ -104,7 +104,8 @@ type Config struct {
 	// actually compresses a value; below it (or when compressing doesn't
 	// shrink the value) the value is stored as-is behind the marker
 	// byte, to avoid bloating small values with compression overhead.
-	// Zero means DefaultCompressionThreshold. Only meaningful when
+	// Zero means the default (256 bytes); use 1 to compress every
+	// non-empty value. Only meaningful when
 	// Compress is true. Negative is rejected by Connect.
 	CompressionThreshold int
 	// FireAndForgetReplicas lets Set/SetBytes/Delete return as soon as
@@ -141,7 +142,7 @@ type Config struct {
 	// it during this window fails immediately with the original dial
 	// error instead of paying another full 5-second connect deadline
 	// redialing an address that just proved unreachable. Zero means
-	// DefaultReconnectCooldown (1s) — the zero value of Config can't
+	// the default (1s) — the zero value of Config can't
 	// distinguish "not specified" from "explicitly zero", so zero has to
 	// mean "default". Keep it well under nodeListStaleAfter (30s) so a
 	// node that genuinely recovers isn't shut out for long. A negative
@@ -197,13 +198,13 @@ func (c Config) GoString() string {
 	return c.String()
 }
 
-// DefaultCompressionThreshold is the CompressionThreshold used when
+// defaultCompressionThreshold is the CompressionThreshold used when
 // Config.CompressionThreshold is left at zero.
-const DefaultCompressionThreshold = 256
+const defaultCompressionThreshold = 256
 
-// DefaultReconnectCooldown is the ReconnectCooldown used when
+// defaultReconnectCooldown is the ReconnectCooldown used when
 // Config.ReconnectCooldown is left at zero.
-const DefaultReconnectCooldown = time.Second
+const defaultReconnectCooldown = time.Second
 
 // maxRequestBytes bounds namespace+key+value size before any network
 // I/O. The server's own request cap (src/server.rs's MAX_REQUEST_SIZE)
@@ -529,7 +530,7 @@ type Client struct {
 	single        *connection // single-node mode
 	singleAddress string
 	members       map[string]*member // cluster mode
-	ring          *HashRing
+	ring          *hashRing
 	replication   int
 	lastFetch     time.Time
 	// When the fetch behind lastFetch began. A forced refresh may reuse a
@@ -587,14 +588,14 @@ func (c *Client) trackedConnection(netConn net.Conn, tagged bool) *connection {
 // Connect dials the first working address and returns a ready client.
 func Connect(config Config) (*Client, error) {
 	if len(config.Addresses) == 0 {
-		return nil, fmt.Errorf("nanocached: connect() needs a non-empty addresses list")
+		return nil, invalidArgumentf("nanocached: connect() needs a non-empty addresses list")
 	}
 	if config.CompressionThreshold < 0 {
-		return nil, fmt.Errorf(
+		return nil, invalidArgumentf(
 			"nanocached: CompressionThreshold must not be negative, got %d", config.CompressionThreshold)
 	}
 	if config.ReadHedgeAfter < 0 {
-		return nil, fmt.Errorf(
+		return nil, invalidArgumentf(
 			"nanocached: ReadHedgeAfter must not be negative, got %v", config.ReadHedgeAfter)
 	}
 	// Issue #488: an option that can have no effect in this configuration
@@ -603,11 +604,11 @@ func Connect(config Config) (*Client, error) {
 	// alongside it, and a CA without TLS is almost always a forgotten
 	// TLS: true.
 	if config.ViaProxy && config.ReadHedgeAfter > 0 {
-		return nil, fmt.Errorf(
+		return nil, invalidArgumentf(
 			"nanocached: ReadHedgeAfter has no effect with ViaProxy (a proxy connection has no replicas to hedge to); unset one of them")
 	}
 	if config.CA != "" && !config.TLS {
-		return nil, fmt.Errorf("nanocached: CA is only used when TLS is true; enable TLS or unset CA")
+		return nil, invalidArgumentf("nanocached: CA is only used when TLS is true; enable TLS or unset CA")
 	}
 
 	tlsConfig, err := buildTLSConfig(config)
@@ -617,12 +618,12 @@ func Connect(config Config) (*Client, error) {
 
 	compressionThreshold := config.CompressionThreshold
 	if compressionThreshold == 0 {
-		compressionThreshold = DefaultCompressionThreshold
+		compressionThreshold = defaultCompressionThreshold
 	}
 
 	reconnectCooldown := config.ReconnectCooldown
 	if reconnectCooldown == 0 {
-		reconnectCooldown = DefaultReconnectCooldown
+		reconnectCooldown = defaultReconnectCooldown
 	}
 
 	client := &Client{
@@ -735,11 +736,11 @@ func buildTLSConfig(config Config) (*tls.Config, error) {
 	}
 	pemBytes, err := os.ReadFile(config.CA)
 	if err != nil {
-		return nil, fmt.Errorf("nanocached: could not read CA file %s: %w", config.CA, err)
+		return nil, errors.Join(ErrInvalidArgument, fmt.Errorf("nanocached: could not read CA file %s: %w", config.CA, err))
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(pemBytes) {
-		return nil, fmt.Errorf("nanocached: no valid certificates found in CA file %s", config.CA)
+		return nil, invalidArgumentf("nanocached: no valid certificates found in CA file %s", config.CA)
 	}
 	return &tls.Config{RootCAs: pool}, nil
 }
@@ -753,7 +754,7 @@ type clusterDialOutcome struct {
 }
 
 // dedupeDiscoveredNodes drops repeated node names from discovery's raw
-// list, first occurrence winning — the same stance NewHashRing takes
+// list, first occurrence winning — the same stance newHashRing takes
 // (issues #328/#360), carried into the connection layer (issue #389).
 // Without it, refreshNodeList's move-then-install dance clobbers a live
 // member with a deadConnection() placeholder on a name's second
@@ -864,7 +865,7 @@ func (c *Client) openCluster(result *identified) error {
 		return lastError
 	}
 
-	c.ring = NewHashRing(names)
+	c.ring = newHashRing(names)
 	c.replication = replication
 	return nil
 }
@@ -2647,7 +2648,7 @@ func (c *Client) withClusterRetryNonIdempotent(operation func() error) error {
 
 // ownerNames returns (namespace, key)'s owners in rank order (issue
 // #105: HRW routing takes the namespace into account — see
-// HashRing.OwnersNS). A nil/empty namespace routes exactly as before
+// hashRing.OwnersNS). A nil/empty namespace routes exactly as before
 // namespaces existed.
 func (c *Client) ownerNames(namespace, key []byte) []string {
 	c.mu.Lock()
@@ -3568,7 +3569,7 @@ func (c *Client) refreshNodeList() {
 	}
 
 	c.members = fresh
-	c.ring = NewHashRing(names)
+	c.ring = newHashRing(names)
 	c.replication = replication
 
 	// Node names are per-process UUIDs; departed nodes' redial gates

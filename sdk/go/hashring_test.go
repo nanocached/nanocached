@@ -35,7 +35,7 @@ func TestMatchesCrossLanguageScoreVectors(t *testing.T) {
 		t.Errorf("fmix64(offset basis) = %#x", got)
 	}
 
-	ring := NewHashRing([]string{"node-a", "node-b", "node-c"})
+	ring := newHashRing([]string{"node-a", "node-b", "node-c"})
 	cases := map[string][]string{
 		"alpha": {"node-c", "node-b", "node-a"},
 		"beta":  {"node-a", "node-c", "node-b"},
@@ -74,7 +74,7 @@ func TestNamespacedKeyHashMatchesCrossLanguageVectors(t *testing.T) {
 // through the full HRW pipeline, over the ring/replicas the issue #105
 // spec pins them against.
 func TestNamespacedOwnersMatchCrossLanguageVectors(t *testing.T) {
-	ring := NewHashRing([]string{"node-a", "node-b", "node-c"})
+	ring := newHashRing([]string{"node-a", "node-b", "node-c"})
 	cases := []struct {
 		ns, key string
 		want    []string
@@ -106,7 +106,7 @@ func TestDefaultNamespaceHashesAndRoutesExactlyLikeTheLegacyForm(t *testing.T) {
 		t.Errorf("keyHash(\"\", \"alpha\") = %#x, want %#x", got, want)
 	}
 
-	ring := NewHashRing([]string{"node-a", "node-b", "node-c"})
+	ring := newHashRing([]string{"node-a", "node-b", "node-c"})
 	want := []string{"node-c", "node-b", "node-a"}
 	if got := ring.OwnersNS(nil, []byte("alpha"), 3); !reflect.DeepEqual(got, want) {
 		t.Errorf("OwnersNS(nil, \"alpha\") = %v, want %v", got, want)
@@ -133,7 +133,7 @@ func TestNamespaceAndKeyBoundariesAreUnambiguous(t *testing.T) {
 }
 
 func TestOwnersAreDistinctAndCapped(t *testing.T) {
-	ring := NewHashRing([]string{"node-a", "node-b", "node-c"})
+	ring := newHashRing([]string{"node-a", "node-b", "node-c"})
 	owners := ring.Owners([]byte("some-key"), 2)
 	if len(owners) != 2 || owners[0] == owners[1] {
 		t.Errorf("Owners = %v", owners)
@@ -154,7 +154,7 @@ func TestOwnersMatchesANaiveFullSortReference(t *testing.T) {
 		score uint64
 		node  string
 	}
-	naiveOwners := func(ring *HashRing, key []byte, replicas int) []string {
+	naiveOwners := func(ring *hashRing, key []byte, replicas int) []string {
 		keyHash := fnv1a(key)
 		ranked := make([]scored, len(ring.nodes))
 		for i, node := range ring.nodes {
@@ -183,7 +183,7 @@ func TestOwnersMatchesANaiveFullSortReference(t *testing.T) {
 	for i := range nodes {
 		nodes[i] = fmt.Sprintf("node-%d", i)
 	}
-	ring := NewHashRing(nodes)
+	ring := newHashRing(nodes)
 
 	// A tiny deterministic PRNG (splitmix64) stands in for a "math/rand"
 	// seeded sequence, keeping this test free of any flakiness tied to
@@ -210,8 +210,8 @@ func TestOwnersMatchesANaiveFullSortReference(t *testing.T) {
 }
 
 func TestAddingANodeNeverReordersExistingNodes(t *testing.T) {
-	before := NewHashRing([]string{"node-a", "node-b", "node-c"})
-	after := NewHashRing([]string{"node-a", "node-b", "node-c", "node-d"})
+	before := newHashRing([]string{"node-a", "node-b", "node-c"})
+	after := newHashRing([]string{"node-a", "node-b", "node-c", "node-d"})
 	for i := 0; i < 500; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
 		var newOrder []string
@@ -227,7 +227,7 @@ func TestAddingANodeNeverReordersExistingNodes(t *testing.T) {
 }
 
 func TestRouteErrorsOnAnEmptyRing(t *testing.T) {
-	node, err := NewHashRing(nil).Route([]byte("k"))
+	node, err := newHashRing(nil).Route([]byte("k"))
 	if !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("err = %v, want ErrInvalidArgument", err)
 	}
@@ -238,7 +238,7 @@ func TestRouteErrorsOnAnEmptyRing(t *testing.T) {
 
 func TestSpreadsKeysEvenly(t *testing.T) {
 	nodes := []string{"node-a", "node-b", "node-c"}
-	ring := NewHashRing(nodes)
+	ring := newHashRing(nodes)
 	counts := map[string]int{}
 	const total = 3000
 	for i := 0; i < total; i++ {
@@ -257,13 +257,13 @@ func TestSpreadsKeysEvenly(t *testing.T) {
 }
 
 // TestDuplicateNodeNamesAreDeduplicated is a regression test for issue
-// #360 (mirrors src/hash_ring.rs's HashRing::new dedupe from issue #328):
-// before this fix, a name repeated in NewHashRing's node list scored
+// #360 (mirrors src/hash_ring.rs's hashRing::new dedupe from issue #328):
+// before this fix, a name repeated in newHashRing's node list scored
 // independently for each of its slots in OwnersNS's bounded insertion, so
 // a duplicated node could occupy more than one place in the returned
 // top-`replicas` set — inflating its effective share of the ring.
 func TestDuplicateNodeNamesAreDeduplicated(t *testing.T) {
-	ring := NewHashRing([]string{"a", "b", "b", "b", "c", "d"})
+	ring := newHashRing([]string{"a", "b", "b", "b", "c", "d"})
 	key := []byte("some-key")
 
 	for replicas := 0; replicas <= 5; replicas++ {
@@ -279,7 +279,7 @@ func TestDuplicateNodeNamesAreDeduplicated(t *testing.T) {
 
 	// Construction order is otherwise unaffected: the first occurrence of
 	// a repeated name is kept in place.
-	deduped := NewHashRing([]string{"a", "b", "c", "d"})
+	deduped := newHashRing([]string{"a", "b", "c", "d"})
 	for i := 0; i < 200; i++ {
 		k := []byte(fmt.Sprintf("key-%d", i))
 		if got, want := ring.Owners(k, 4), deduped.Owners(k, 4); !reflect.DeepEqual(got, want) {

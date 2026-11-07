@@ -324,7 +324,7 @@ func identify(conn net.Conn, address string, authSecret []byte, probe authProbe,
 	}
 	shapedPrefix := (ack[0] == 'O' || ack[0] == 'E') && (ack[1] == 'n' || ack[1] == 'd')
 	if !shapedPrefix {
-		return nil, fmt.Errorf("nanocached: unexpected response to A")
+		return nil, protocolErrorf("nanocached: unexpected response to A")
 	}
 
 	// Echoed response tags stretches the reply to four bytes by a `T` before
@@ -341,11 +341,11 @@ func identify(conn net.Conn, address string, authSecret []byte, probe authProbe,
 			return nil, connectionLost("handshake read failed", err)
 		}
 		if fourth[0] != '\n' {
-			return nil, fmt.Errorf("nanocached: unexpected response to A")
+			return nil, protocolErrorf("nanocached: unexpected response to A")
 		}
 		tagged = true
 	default:
-		return nil, fmt.Errorf("nanocached: unexpected response to A")
+		return nil, protocolErrorf("nanocached: unexpected response to A")
 	}
 
 	if ack[0] == 'E' {
@@ -390,7 +390,7 @@ func identify(conn net.Conn, address string, authSecret []byte, probe authProbe,
 // (issue #486).
 func (r *identified) nodeReplication() (int, error) {
 	if r.list != listNodes {
-		return 0, fmt.Errorf("nanocached: replication factor requested from a %c roster", byte(r.list))
+		return 0, protocolErrorf("nanocached: replication factor requested from a %c roster", byte(r.list))
 	}
 	return r.replication, nil
 }
@@ -434,21 +434,21 @@ func readNodeList(reader *bufio.Reader) ([]discoveredNode, int, error) {
 	}
 	rest, ok := strings.CutPrefix(header, "N ")
 	if !ok {
-		return nil, 0, fmt.Errorf("nanocached: unexpected response from discovery server: %s", header)
+		return nil, 0, protocolErrorf("nanocached: unexpected response from discovery server: %s", header)
 	}
 
 	// `N <count> <r>\n` (client-side replication) — the replication factor rides along.
 	fields := strings.Split(rest, " ")
 	if len(fields) != 2 {
-		return nil, 0, fmt.Errorf("nanocached: invalid node-list header in discovery response")
+		return nil, 0, protocolErrorf("nanocached: invalid node-list header in discovery response")
 	}
 	count, err := parseStrictInt(fields[0])
 	if err != nil || count < 0 || count > maxNodeCount {
-		return nil, 0, fmt.Errorf("nanocached: invalid node count in discovery response")
+		return nil, 0, protocolErrorf("nanocached: invalid node count in discovery response")
 	}
 	replication, err := parseStrictInt(fields[1])
 	if err != nil || replication < 1 {
-		return nil, 0, fmt.Errorf("nanocached: invalid replication factor in discovery response")
+		return nil, 0, protocolErrorf("nanocached: invalid replication factor in discovery response")
 	}
 
 	nodes, err := readListEntries(reader, count)
@@ -476,12 +476,12 @@ func readProxyList(reader *bufio.Reader) ([]discoveredNode, error) {
 	}
 	rest, ok := strings.CutPrefix(header, "N ")
 	if !ok {
-		return nil, fmt.Errorf("nanocached: unexpected response from discovery server: %s", header)
+		return nil, protocolErrorf("nanocached: unexpected response from discovery server: %s", header)
 	}
 
 	count, err := parseStrictInt(rest)
 	if err != nil || count < 0 || count > maxNodeCount {
-		return nil, fmt.Errorf("nanocached: invalid proxy count in discovery response")
+		return nil, protocolErrorf("nanocached: invalid proxy count in discovery response")
 	}
 
 	return readListEntries(reader, count)
@@ -505,19 +505,19 @@ func readListEntries(reader *bufio.Reader, count int) ([]discoveredNode, error) 
 		total += len(entry)
 		lengths := strings.Split(strings.TrimSuffix(entry, "\n"), " ")
 		if len(lengths) != 2 {
-			return nil, fmt.Errorf("nanocached: invalid node entry header in discovery response")
+			return nil, protocolErrorf("nanocached: invalid node entry header in discovery response")
 		}
 		nameLength, err1 := parseStrictInt(lengths[0])
 		addrLength, err2 := parseStrictInt(lengths[1])
 		if err1 != nil || err2 != nil || nameLength < 0 || addrLength < 0 ||
 			nameLength > maxNodeFieldLength || addrLength > maxNodeFieldLength {
-			return nil, fmt.Errorf("nanocached: invalid node entry lengths in discovery response")
+			return nil, protocolErrorf("nanocached: invalid node entry lengths in discovery response")
 		}
 
 		bodyLength := nameLength + addrLength + 1 // +1: trailing '\n'
 		total += bodyLength
 		if total > maxNodeListResponseBytes {
-			return nil, fmt.Errorf(
+			return nil, protocolErrorf(
 				"nanocached: discovery node-list response exceeds %d bytes", maxNodeListResponseBytes)
 		}
 
@@ -526,7 +526,7 @@ func readListEntries(reader *bufio.Reader, count int) ([]discoveredNode, error) 
 			return nil, connectionLost("node-list read failed", err)
 		}
 		if body[len(body)-1] != '\n' {
-			return nil, fmt.Errorf("nanocached: malformed node entry in discovery response")
+			return nil, protocolErrorf("nanocached: malformed node entry in discovery response")
 		}
 		nodes = append(nodes, discoveredNode{
 			Name:    string(body[:nameLength]),

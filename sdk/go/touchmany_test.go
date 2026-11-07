@@ -894,7 +894,7 @@ func TestClusterBatchTouchWithAnUnreachablePrimaryIsAConnectionLossWithTheOtherH
 	var liveKeys []string
 	for i := range keys {
 		keys[i] = fmt.Sprintf("k%d", i)
-		if NewHashRing(testNames).Owners([]byte(keys[i]), 1)[0] == testNames[1] {
+		if newHashRing(testNames).Owners([]byte(keys[i]), 1)[0] == testNames[1] {
 			liveKeys = append(liveKeys, keys[i])
 		}
 	}

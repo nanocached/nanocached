@@ -2,7 +2,7 @@ package nanocached
 
 import "encoding/binary"
 
-// HashRing is rendezvous (highest-random-weight) hashing over a fixed
+// hashRing is rendezvous (highest-random-weight) hashing over a fixed
 // node list (the client-side replication design). This is
 // deliberately a byte-for-byte port of the same computation every other
 // nanocached participant uses (the Rust node, the TypeScript/Python/Java/
@@ -17,7 +17,7 @@ import "encoding/binary"
 // the lexicographically smaller name), and its primary is the top one.
 //
 // Built from node *names*, not addresses (node identity decoupled from address).
-type HashRing struct {
+type hashRing struct {
 	nodes      []string
 	nodeHashes []uint64
 }
@@ -90,16 +90,16 @@ func fmix64(value uint64) uint64 {
 	return value
 }
 
-// NewHashRing builds a ranking over the given node names, once, from a
+// newHashRing builds a ranking over the given node names, once, from a
 // discovery server's node list. Ranking never changes after construction.
 //
-// Issue #360 (mirrors src/hash_ring.rs's HashRing::new dedupe, issue
+// Issue #360 (mirrors src/hash_ring.rs's hashRing::new dedupe, issue
 // #328): deduplicates nodes, keeping the first occurrence so construction
 // order is otherwise unaffected. A repeated name would otherwise score
 // independently for each of its slots in OwnersNS's bounded insertion,
 // occupying more than one place in the returned top-`replicas` set and
 // inflating its effective share of the ring.
-func NewHashRing(nodes []string) *HashRing {
+func newHashRing(nodes []string) *hashRing {
 	deduped := make([]string, 0, len(nodes))
 	seen := make(map[string]struct{}, len(nodes))
 	for _, node := range nodes {
@@ -110,7 +110,7 @@ func NewHashRing(nodes []string) *HashRing {
 		deduped = append(deduped, node)
 	}
 
-	ring := &HashRing{
+	ring := &hashRing{
 		nodes:      deduped,
 		nodeHashes: make([]uint64, len(deduped)),
 	}
@@ -125,14 +125,14 @@ func NewHashRing(nodes []string) *HashRing {
 // the cluster is smaller. Equivalent to OwnersNS(nil, key, replicas) —
 // kept as its own method so existing callers (and this package's own
 // pre-#105 tests) don't have to pass a namespace they don't have.
-func (r *HashRing) Owners(key []byte, replicas int) []string {
+func (r *hashRing) Owners(key []byte, replicas int) []string {
 	return r.OwnersNS(nil, key, replicas)
 }
 
 // OwnersNS is Owners scoped to namespace (issue #105: first-class
 // namespaces) — an empty namespace is the same default keyspace Owners
 // itself addresses, byte-identical placement included (see keyHash).
-func (r *HashRing) OwnersNS(namespace, key []byte, replicas int) []string {
+func (r *hashRing) OwnersNS(namespace, key []byte, replicas int) []string {
 	keyHash := keyHash(namespace, key)
 
 	type scored struct {
@@ -196,14 +196,14 @@ func (r *HashRing) OwnersNS(namespace, key []byte, replicas int) []string {
 // of panicking — a public API shouldn't crash its caller's process over a
 // construction-time mistake it can hand back as an ordinary error
 // instead.
-func (r *HashRing) Route(key []byte) (string, error) {
+func (r *hashRing) Route(key []byte) (string, error) {
 	return r.RouteNS(nil, key)
 }
 
 // RouteNS is Route scoped to namespace (issue #105).
-func (r *HashRing) RouteNS(namespace, key []byte) (string, error) {
+func (r *hashRing) RouteNS(namespace, key []byte) (string, error) {
 	if len(r.nodes) == 0 {
-		return "", invalidArgument("nanocached: HashRing.Route called on an empty ring")
+		return "", invalidArgument("nanocached: hashRing.Route called on an empty ring")
 	}
 	return r.OwnersNS(namespace, key, 1)[0], nil
 }
