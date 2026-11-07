@@ -59,6 +59,8 @@ export interface NanocachedStoreConfig extends Config {
   readHedgeAfterMs?: number;
   /** See `NanocachedClientOptions.reconnectCooldownMs`. */
   reconnectCooldownMs?: number;
+  /** See `NanocachedClientOptions.disableReconnectCooldown`. */
+  disableReconnectCooldown?: boolean;
 }
 
 // The wire's TTL unit is whole seconds (every nanocached SDK/server
@@ -514,6 +516,7 @@ export async function nanocachedStore(config?: NanocachedStoreConfig): Promise<N
     readRepair: config.readRepair,
     readHedgeAfterMs: config.readHedgeAfterMs,
     reconnectCooldownMs: config.reconnectCooldownMs,
+    disableReconnectCooldown: config.disableReconnectCooldown,
   });
   return new NanocachedStore(client, config.namespace ?? DEFAULT_NAMESPACE, config.ttl, config.isCacheable);
 }
