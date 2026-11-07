@@ -12,6 +12,17 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Changed
+
+- `nanocached-proxy`: `NANOCACHED_SECRET`, the name the proxy read before
+  node, discovery and the docs agreed on `NANOCACHED_AUTH_SECRET`, is no
+  longer read. A proxy with only the old name set (and non-empty) now
+  exits at start-up with a message naming the new variable, instead of
+  accepting it with a deprecation warning; silently reading nothing would
+  have started it without authentication. With both set, the new name is
+  used and a warning says the old one is ignored. Rename the variable
+  before upgrading.
+
 ### Fixed
 
 - `nanocached-proxy`: a refused `A` that asked for response tags was

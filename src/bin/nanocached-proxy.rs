@@ -505,9 +505,11 @@ impl ProxyIdentity {
 const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 /// The name the proxy read before issue #165 — node and discovery always
 /// used `NANOCACHED_AUTH_SECRET`, so an operator following the docs got a
-/// proxy with auth silently off. Honoured for one release as a fallback,
-/// with a warning, so an existing deployment keeps working while it
-/// renames the variable.
+/// proxy with auth silently off. It was honoured for a while as a fallback,
+/// with a warning. It is no longer read: a proxy that has only this name
+/// set refuses to start (reading nothing would leave a deployment that
+/// relied on it with authentication silently off — the very problem the
+/// rename fixed).
 const LEGACY_AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_SECRET";
 
 fn read_auth_secret() -> io::Result<Option<Bytes>> {
@@ -518,20 +520,31 @@ fn read_auth_secret() -> io::Result<Option<Bytes>> {
         infra::read_env_secret(name)
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     }
-    Ok(read_auth_secret_from(|name| std::env::var(name).ok()))
+    read_auth_secret_from(|name| std::env::var(name).ok())
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))
 }
 
-fn read_auth_secret_from(var: impl Fn(&str) -> Option<String>) -> Option<Bytes> {
+fn read_auth_secret_from(var: impl Fn(&str) -> Option<String>) -> Result<Option<Bytes>, String> {
     let non_empty = |value: String| (!value.is_empty()).then_some(value);
+    let legacy_set = var(LEGACY_AUTH_SECRET_ENV_VAR)
+        .and_then(non_empty)
+        .is_some();
     if let Some(secret) = var(AUTH_SECRET_ENV_VAR).and_then(non_empty) {
-        return Some(Bytes::from(secret));
+        if legacy_set {
+            eprintln!(
+                "WARN {LEGACY_AUTH_SECRET_ENV_VAR} is set and ignored; {AUTH_SECRET_ENV_VAR} is used"
+            );
+        }
+        return Ok(Some(Bytes::from(secret)));
     }
-    let legacy = var(LEGACY_AUTH_SECRET_ENV_VAR).and_then(non_empty)?;
-    eprintln!(
-        "WARN {LEGACY_AUTH_SECRET_ENV_VAR} is deprecated and will stop being read in a future \
-         release; set {AUTH_SECRET_ENV_VAR} instead (the name node and discovery use)"
-    );
-    Some(Bytes::from(legacy))
+    if legacy_set {
+        return Err(format!(
+            "{LEGACY_AUTH_SECRET_ENV_VAR} is no longer read; set {AUTH_SECRET_ENV_VAR} to the same \
+             value (the name node and discovery use). Refusing to start rather than run without \
+             authentication"
+        ));
+    }
+    Ok(None)
 }
 
 // ─── HRW ring (independent re-implementation, see module docs) ───────
@@ -8157,24 +8170,34 @@ mod tests {
         };
         assert_eq!(
             read_auth_secret_from(env),
-            Some(Bytes::from_static(b"shared"))
+            Ok(Some(Bytes::from_static(b"shared")))
         );
     }
 
     #[test]
-    fn auth_secret_falls_back_to_the_legacy_name() {
+    fn the_legacy_name_alone_refuses_to_start() {
         let env = |name: &str| match name {
             "NANOCACHED_SECRET" => Some("legacy".to_string()),
             _ => None,
         };
-        assert_eq!(
-            read_auth_secret_from(env),
-            Some(Bytes::from_static(b"legacy"))
+        let error = read_auth_secret_from(env).unwrap_err();
+        assert!(
+            error.contains("NANOCACHED_SECRET is no longer read"),
+            "{error}"
         );
+        assert!(error.contains("NANOCACHED_AUTH_SECRET"), "{error}");
+        // An empty AUTH value does not count as set, so it does not
+        // rescue the legacy one.
+        let empty_new = |name: &str| match name {
+            "NANOCACHED_AUTH_SECRET" => Some(String::new()),
+            "NANOCACHED_SECRET" => Some("legacy".to_string()),
+            _ => None,
+        };
+        assert!(read_auth_secret_from(empty_new).is_err());
     }
 
     #[test]
-    fn auth_secret_prefers_the_new_name_and_ignores_empty_values() {
+    fn the_new_name_wins_and_empty_values_are_unset() {
         let both = |name: &str| match name {
             "NANOCACHED_AUTH_SECRET" => Some("new".to_string()),
             "NANOCACHED_SECRET" => Some("legacy".to_string()),
@@ -8182,19 +8205,10 @@ mod tests {
         };
         assert_eq!(
             read_auth_secret_from(both),
-            Some(Bytes::from_static(b"new"))
+            Ok(Some(Bytes::from_static(b"new")))
         );
-        let empty_new = |name: &str| match name {
-            "NANOCACHED_AUTH_SECRET" => Some(String::new()),
-            "NANOCACHED_SECRET" => Some("legacy".to_string()),
-            _ => None,
-        };
-        assert_eq!(
-            read_auth_secret_from(empty_new),
-            Some(Bytes::from_static(b"legacy"))
-        );
-        assert_eq!(read_auth_secret_from(|_| Some(String::new())), None);
-        assert_eq!(read_auth_secret_from(|_| None), None);
+        assert_eq!(read_auth_secret_from(|_| Some(String::new())), Ok(None));
+        assert_eq!(read_auth_secret_from(|_| None), Ok(None));
     }
 
     // ── request framing ──────────────────────────────────────────────
