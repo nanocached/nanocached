@@ -102,8 +102,6 @@ you read the changelog.</p>
 <p>These have no compatibility promise yet; a decision for each is still
 open:</p>
 <ul>
-  <li>metric names and the operations endpoints (<code>/healthz</code>,
-  <code>/readyz</code>, <code>/metrics</code>);</li>
   <li>the container image layout and tags other than the version tag;</li>
 </ul>
 
@@ -144,6 +142,37 @@ release may add a flag or an environment variable.</p>
   <code>trace</code> feature reads. The released images are built without
   it.</li>
 </ul>
+
+<h3 id="ops">Operations endpoints and metrics</h3>
+<p>From 1.0.0 the operations endpoint that <code>--metrics-port</code>
+turns on is covered, because probes, scrapers, dashboards and autoscaling
+rules are built on it:</p>
+<ul>
+  <li><code>GET /healthz</code>, <code>GET /readyz</code> and
+  <code>GET /metrics</code> on the node, the proxy and the discovery
+  server, and the status codes of the two probes: <code>200</code> when
+  the instance is healthy or ready, <code>503</code> when a ready check
+  fails. What makes <code>/readyz</code> fail is the one given in
+  <a href="deployment-operations.html#ops">What every
+  deployment needs</a>: a clustered node before it has adopted membership, a
+  proxy before it has a node roster or once it is draining, a discovery
+  server during its startup grace period;</li>
+  <li>the Prometheus text format (version 0.0.4) of <code>/metrics</code>;</li>
+  <li>every metric the three binaries export: its name, its type
+  (counter or gauge), its label keys and what it counts. That includes the
+  <code>namespace</code> label of the per-namespace metrics and a
+  counter&rsquo;s reset to zero when the process restarts.</li>
+</ul>
+<p>Removing or renaming a metric, changing its type, changing what it counts,
+and adding a label key to an existing metric (which splits a series that
+alert rules may select) are breaking changes and wait for a new major
+version. A minor release may add a metric. The set of label <em>values</em>
+(the namespaces present) follows the data and is not a compatibility
+matter.</p>
+<p>Not covered: the text of the response bodies, the <code>HELP</code> lines
+and the order of the lines in <code>/metrics</code>, and the unauthenticated
+nature of the endpoint (keep it on an internal interface, as the guide
+says).</p>
 
 <h3 id="tests-tools">Outside the promise: <code>tests/</code> and <code>tools/</code></h3>
 <p>Nothing under the repository&rsquo;s <code>tests/</code> and
