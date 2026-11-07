@@ -435,6 +435,29 @@ describe("nanocached-keyv, through Keyv's own API", () => {
     });
   });
 
+  it("forwards disableReconnectCooldown to the SDK, which rejects it next to a non-zero reconnectCooldownMs", async () => {
+    // The SDK refuses the two together before dialing, so the rejection
+    // proves the switch reaches NanocachedClient.connect(): were it
+    // dropped on the way, connect() would succeed against the mock node.
+    const node = await startMockNode();
+    try {
+      await assert.rejects(
+        connectStore(node, { disableReconnectCooldown: true, reconnectCooldownMs: 50 }),
+        /disableReconnectCooldown contradicts a non-zero reconnectCooldownMs/,
+      );
+      const store = await connectStore(node, { disableReconnectCooldown: true });
+      const keyv = new Keyv({ store, useKeyPrefix: false });
+      try {
+        await keyv.set("k", "v");
+        assert.equal(await keyv.get("k"), "v");
+      } finally {
+        await store.disconnect();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("exposes the underlying SDK client on the store", async () => {
     const node = await startMockNode();
     try {

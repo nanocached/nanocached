@@ -50,6 +50,8 @@ export interface NanocachedKeyvStoreConfig {
   readHedgeAfterMs?: number;
   /** See `NanocachedClientOptions.reconnectCooldownMs`. */
   reconnectCooldownMs?: number;
+  /** See `NanocachedClientOptions.disableReconnectCooldown`. */
+  disableReconnectCooldown?: boolean;
 }
 
 // Keyv's own unit is milliseconds throughout (`Keyv`'s `ttl` option and
@@ -217,6 +219,7 @@ export async function nanocachedKeyvStore(config: NanocachedKeyvStoreConfig): Pr
     readRepair: config.readRepair,
     readHedgeAfterMs: config.readHedgeAfterMs,
     reconnectCooldownMs: config.reconnectCooldownMs,
+    disableReconnectCooldown: config.disableReconnectCooldown,
   });
   return new NanocachedKeyvStore(client, config.namespace ?? DEFAULT_NAMESPACE);
 }
