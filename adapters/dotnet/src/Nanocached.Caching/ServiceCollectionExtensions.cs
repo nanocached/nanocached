@@ -47,7 +47,7 @@ public static class ServiceCollectionExtensions
             NanocachedCacheOptions options = provider.GetRequiredService<IOptions<NanocachedCacheOptions>>().Value;
             NanocachedClient client = NanocachedClient.ConnectAsync(BuildClientOptions(options))
                 .GetAwaiter().GetResult();
-            return new OwnedNanocachedDistributedCache(client, options.Namespace);
+            return new NanocachedDistributedCache(client, options.Namespace, ownsClient: true);
         });
         return services;
     }
@@ -126,23 +126,5 @@ public static class ServiceCollectionExtensions
             host = host[1..^1];
         }
         return (host, port);
-    }
-
-    /// <summary>The <see cref="IDistributedCache"/> instance actually
-    /// created for the "owns its own client" overload above — see that
-    /// overload's doc comment for why closing the client here, rather than
-    /// via a separately-resolved <see cref="IDisposable"/> registration, is
-    /// what makes disposal actually happen.</summary>
-    private sealed class OwnedNanocachedDistributedCache : NanocachedDistributedCache, IDisposable
-    {
-        private readonly NanocachedClient _client;
-
-        internal OwnedNanocachedDistributedCache(NanocachedClient client, string @namespace)
-            : base(client, @namespace)
-        {
-            _client = client;
-        }
-
-        public void Dispose() => _client.Close();
     }
 }

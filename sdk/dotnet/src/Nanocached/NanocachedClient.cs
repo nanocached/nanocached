@@ -12,7 +12,7 @@ namespace Nanocached;
 /// <summary>
 /// The public client. An address list names either a single
 /// nanocached-node or discovery server(s) fronting a cluster —
-/// <see cref="ConnectAsync(Options)"/> finds out from the server's own handshake
+/// <see cref="ConnectAsync(Options, CancellationToken)"/> finds out from the server's own handshake
 /// response (the server type in the auth response), so calling code is identical either way.
 ///
 /// Cluster mode implements client-side replication client-side replication: writes fan
@@ -28,9 +28,9 @@ namespace Nanocached;
 /// Thread-safe. Requests are pipelined per connection; concurrent
 /// callers share it.
 /// </summary>
-public sealed class NanocachedClient : IDisposable
+public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 {
-    /// <summary>Options for <see cref="ConnectAsync(Options)"/>.</summary>
+    /// <summary>Options for <see cref="ConnectAsync(Options, CancellationToken)"/>.</summary>
     public sealed class Options
     {
         /// <summary>Targets to try, in order — a one-element list is the
@@ -52,7 +52,7 @@ public sealed class NanocachedClient : IDisposable
         /// <summary>Connect over TLS. Defaults to the platform/system
         /// trust store; set <see cref="Ca"/> for a private CA. A set
         /// <see cref="Ca"/> with this false is rejected by
-        /// <see cref="ConnectAsync(Options)"/> (issue #488).</summary>
+        /// <see cref="ConnectAsync(Options, CancellationToken)"/> (issue #488).</summary>
         public bool Tls { get; set; }
 
         /// <summary>Path to a PEM file of trusted root certificate(s),
@@ -75,7 +75,7 @@ public sealed class NanocachedClient : IDisposable
         /// compressed — the per-value overhead of attempting it outweighs
         /// the savings. Only meaningful when <see cref="Compress"/> is
         /// true. Default 256. Negative is rejected by
-        /// <see cref="ConnectAsync(Options)"/>.</summary>
+        /// <see cref="ConnectAsync(Options, CancellationToken)"/>.</summary>
         public int CompressionThreshold { get; set; } = 256;
 
         /// <summary>Let SetAsync/DeleteAsync return as soon as the primary
@@ -162,14 +162,14 @@ public sealed class NanocachedClient : IDisposable
         /// there is nobody else to hedge to, so a configured
         /// <see cref="ReadHedgeAfter"/> together with
         /// <see cref="ViaProxy"/> is rejected by
-        /// <see cref="ConnectAsync(Options)"/> (issue #488). Namespaces, clear/clear-all, tags,
+        /// <see cref="ConnectAsync(Options, CancellationToken)"/> (issue #488). Namespaces, clear/clear-all, tags,
         /// keep-alive, and compression all work unchanged over the one
         /// connection.
         ///
         /// <para>Only meaningful when every configured
         /// <see cref="Addresses"/> entry is a discovery server: if the
         /// first reachable one instead identifies as a cache node — the
-        /// same identify handshake every other mode uses — <see cref="ConnectAsync(Options)"/>
+        /// same identify handshake every other mode uses — <see cref="ConnectAsync(Options, CancellationToken)"/>
         /// fails fast with a clear error rather than silently pinning to
         /// that node as non-proxy single mode would. An empty proxy
         /// roster, or every listed proxy being unreachable, is the SDK's
@@ -568,7 +568,49 @@ public sealed class NanocachedClient : IDisposable
         };
     }
 
-    public static async Task<NanocachedClient> ConnectAsync(Options options)
+    /// <summary>Connects. Cancelling <paramref name="cancellationToken"/> abandons
+    /// the wait with <see cref="OperationCanceledException"/>; a client that
+    /// finishes connecting after that is closed, never leaked. See
+    /// <see cref="Cancellation"/> for what cancellation means on a call.</summary>
+    public static Task<NanocachedClient> ConnectAsync(Options options, CancellationToken cancellationToken = default)
+    {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return Task.FromCanceled<NanocachedClient>(cancellationToken);
+        }
+        Task<NanocachedClient> work = ConnectCoreAsync(options);
+        if (!cancellationToken.CanBeCanceled || work.IsCompleted)
+        {
+            return work;
+        }
+        var result = new TaskCompletionSource<NanocachedClient>(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenRegistration registration =
+            cancellationToken.Register(() => result.TrySetCanceled(cancellationToken));
+        work.ContinueWith(
+            finished =>
+            {
+                registration.Dispose();
+                if (finished.IsCompletedSuccessfully)
+                {
+                    // Nobody is waiting any more: close the client rather than leak it.
+                    if (!result.TrySetResult(finished.Result)) finished.Result.Close();
+                }
+                else if (finished.IsFaulted)
+                {
+                    result.TrySetException(finished.Exception!.InnerExceptions);
+                }
+                else
+                {
+                    result.TrySetCanceled();
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+        return result.Task;
+    }
+
+    private static async Task<NanocachedClient> ConnectCoreAsync(Options options)
     {
         if (options.Addresses.Count == 0)
         {
@@ -1024,22 +1066,28 @@ public sealed class NanocachedClient : IDisposable
         }
     }
 
-    public Task<string?> GetAsync(string key) => GetAsync(EmptyNamespace, key);
+    public Task<string?> GetAsync(string key, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<string?>(cancellationToken)
+        : Cancellation.Abandonable(GetAsync(EmptyNamespace, key), cancellationToken);
 
     /// <summary>Returns the value decoded as UTF-8, or <c>null</c> when
     /// the key is missing. A value that is not valid UTF-8 raises
     /// <see cref="System.Text.DecoderFallbackException"/> — use
-    /// <see cref="GetBytesAsync(byte[])"/> for the raw bytes instead.</summary>
-    public Task<string?> GetAsync(byte[] key) => GetAsync(EmptyNamespace, key);
+    /// <see cref="GetBytesAsync(byte[], CancellationToken)"/> for the raw bytes instead.</summary>
+    public Task<string?> GetAsync(byte[] key, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<string?>(cancellationToken)
+        : Cancellation.Abandonable(GetAsync(EmptyNamespace, key), cancellationToken);
 
-    /// <summary>issue #105: as <see cref="GetAsync(string)"/>, scoped to
+    /// <summary>issue #105: as <see cref="GetAsync(string, CancellationToken)"/>, scoped to
     /// <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to, rather than
     /// duplicating this client's networking.</summary>
     internal Task<string?> GetAsync(byte[] namespaceBytes, string key) =>
         GetAsync(namespaceBytes, Utf8(key, "key"));
 
-    /// <summary>issue #105: as <see cref="GetAsync(byte[])"/>, scoped to
+    /// <summary>issue #105: as <see cref="GetAsync(byte[], CancellationToken)"/>, scoped to
     /// <paramref name="namespaceBytes"/>.</summary>
     internal async Task<string?> GetAsync(byte[] namespaceBytes, byte[] key)
     {
@@ -1047,21 +1095,27 @@ public sealed class NanocachedClient : IDisposable
         return value is null ? null : StrictUtf8.GetString(value);
     }
 
-    public Task<byte[]?> GetBytesAsync(string key) => GetBytesAsync(EmptyNamespace, key);
+    public Task<byte[]?> GetBytesAsync(string key, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<byte[]?>(cancellationToken)
+        : Cancellation.Abandonable(GetBytesAsync(EmptyNamespace, key), cancellationToken);
 
     /// <summary>Returns the raw value, or <c>null</c> when the key is
     /// missing. Transparently decompresses when <c>Compress</c> is
     /// enabled (value compression). With <c>ReadRepair</c>, a clean miss
     /// probes the remaining owners before being accepted as final
     /// (read repair).</summary>
-    public Task<byte[]?> GetBytesAsync(byte[] key) => GetBytesAsync(EmptyNamespace, key);
+    public Task<byte[]?> GetBytesAsync(byte[] key, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<byte[]?>(cancellationToken)
+        : Cancellation.Abandonable(GetBytesAsync(EmptyNamespace, key), cancellationToken);
 
-    /// <summary>issue #105: as <see cref="GetBytesAsync(string)"/>, scoped
+    /// <summary>issue #105: as <see cref="GetBytesAsync(string, CancellationToken)"/>, scoped
     /// to <paramref name="namespaceBytes"/>.</summary>
     internal Task<byte[]?> GetBytesAsync(byte[] namespaceBytes, string key) =>
         GetBytesAsync(namespaceBytes, Utf8(key, "key"));
 
-    /// <summary>issue #105: as <see cref="GetBytesAsync(byte[])"/>, scoped
+    /// <summary>issue #105: as <see cref="GetBytesAsync(byte[], CancellationToken)"/>, scoped
     /// to <paramref name="namespaceBytes"/> — this is the internal method
     /// <see cref="NanocachedNamespace"/> forwards to, rather than
     /// duplicating this client's networking.</summary>
@@ -1092,28 +1146,32 @@ public sealed class NanocachedClient : IDisposable
         return value;
     }
 
-    public Task<(string Value, string Token)?> GetWithTokenAsync(string key) =>
-        GetWithTokenAsync(EmptyNamespace, key);
+    public Task<(string Value, string Token)?> GetWithTokenAsync(string key, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<(string Value, string Token)?>(cancellationToken)
+        : Cancellation.Abandonable(GetWithTokenAsync(EmptyNamespace, key), cancellationToken);
 
-    /// <summary>issue #141 — compare-and-set: as <see cref="GetAsync(string)"/>,
+    /// <summary>issue #141 — compare-and-set: as <see cref="GetAsync(string, CancellationToken)"/>,
     /// but also returns a content digest ("CAS token") for the value, for
-    /// use with <see cref="ReplaceAsync(string, string, string, long)"/> or
-    /// <see cref="DeleteIfMatchesAsync(string, string)"/> — the same
+    /// use with <see cref="ReplaceAsync(string, string, string, long, CancellationToken)"/> or
+    /// <see cref="DeleteIfMatchesAsync(string, string, CancellationToken)"/> — the same
     /// not-found convention (<c>null</c>) as a plain <c>GetAsync</c> miss.
     /// The digest is computed from the exact wire bytes (see
     /// <see cref="ContentDigest"/>'s doc comment), so it is always the one
     /// the server itself would compute, even with <c>Compress</c>
     /// enabled.</summary>
-    public Task<(string Value, string Token)?> GetWithTokenAsync(byte[] key) =>
-        GetWithTokenAsync(EmptyNamespace, key);
+    public Task<(string Value, string Token)?> GetWithTokenAsync(byte[] key, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<(string Value, string Token)?>(cancellationToken)
+        : Cancellation.Abandonable(GetWithTokenAsync(EmptyNamespace, key), cancellationToken);
 
-    /// <summary>issue #141: as <see cref="GetWithTokenAsync(string)"/>,
+    /// <summary>issue #141: as <see cref="GetWithTokenAsync(string, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<(string Value, string Token)?> GetWithTokenAsync(byte[] namespaceBytes, string key) =>
         GetWithTokenAsync(namespaceBytes, Utf8(key, "key"));
 
-    /// <summary>issue #141: as <see cref="GetWithTokenAsync(byte[])"/>,
+    /// <summary>issue #141: as <see cref="GetWithTokenAsync(byte[], CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
     internal async Task<(string Value, string Token)?> GetWithTokenAsync(byte[] namespaceBytes, byte[] key)
     {
@@ -1124,23 +1182,27 @@ public sealed class NanocachedClient : IDisposable
         return (StrictUtf8.GetString(value), token);
     }
 
-    public Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(string key) =>
-        GetBytesWithTokenAsync(EmptyNamespace, key);
+    public Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(string key, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<(byte[] Value, string Token)?>(cancellationToken)
+        : Cancellation.Abandonable(GetBytesWithTokenAsync(EmptyNamespace, key), cancellationToken);
 
-    /// <summary>issue #141: as <see cref="GetWithTokenAsync(byte[])"/>, but
+    /// <summary>issue #141: as <see cref="GetWithTokenAsync(byte[], CancellationToken)"/>, but
     /// returns the raw (decompressed) value instead of decoding it as
-    /// UTF-8 — the <see cref="GetBytesAsync(byte[])"/> counterpart to
-    /// <see cref="GetWithTokenAsync(byte[])"/>.</summary>
-    public Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(byte[] key) =>
-        GetBytesWithTokenAsync(EmptyNamespace, key);
+    /// UTF-8 — the <see cref="GetBytesAsync(byte[], CancellationToken)"/> counterpart to
+    /// <see cref="GetWithTokenAsync(byte[], CancellationToken)"/>.</summary>
+    public Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(byte[] key, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<(byte[] Value, string Token)?>(cancellationToken)
+        : Cancellation.Abandonable(GetBytesWithTokenAsync(EmptyNamespace, key), cancellationToken);
 
-    /// <summary>issue #141: as <see cref="GetBytesWithTokenAsync(string)"/>,
+    /// <summary>issue #141: as <see cref="GetBytesWithTokenAsync(string, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(byte[] namespaceBytes, string key) =>
         GetBytesWithTokenAsync(namespaceBytes, Utf8(key, "key"));
 
-    /// <summary>issue #141: as <see cref="GetBytesWithTokenAsync(byte[])"/>,
+    /// <summary>issue #141: as <see cref="GetBytesWithTokenAsync(byte[], CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
     internal async Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(byte[] namespaceBytes, byte[] key)
     {
@@ -1278,12 +1340,14 @@ public sealed class NanocachedClient : IDisposable
     // to return on success, so it just throws a plain WrongNodeException
     // on the same condition.
 
-    /// <summary>As <see cref="GetManyBytesAsync(IReadOnlyList{string})"/>,
+    /// <summary>As <see cref="GetManyBytesAsync(IReadOnlyList{string}, CancellationToken)"/>,
     /// decoding every hit as UTF-8.</summary>
-    public Task<Dictionary<string, string>> GetManyAsync(IReadOnlyList<string> keys) =>
-        GetManyAsync(EmptyNamespace, keys);
+    public Task<Dictionary<string, string>> GetManyAsync(IReadOnlyList<string> keys, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<Dictionary<string, string>>(cancellationToken)
+        : Cancellation.Abandonable(GetManyAsync(EmptyNamespace, keys), cancellationToken);
 
-    /// <summary>issue #105: as <see cref="GetManyAsync(IReadOnlyList{string})"/>,
+    /// <summary>issue #105: as <see cref="GetManyAsync(IReadOnlyList{string}, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal async Task<Dictionary<string, string>> GetManyAsync(byte[] namespaceBytes, IReadOnlyList<string> keys)
@@ -1316,11 +1380,11 @@ public sealed class NanocachedClient : IDisposable
     /// <summary>Returns every requested key's raw value in one round trip
     /// per owner (batched get, docs/protocol.html#multi) — a missing key
     /// is simply absent from the returned dictionary, never an error, the
-    /// same "a miss is not an error" contract <see cref="GetBytesAsync(byte[])"/>
+    /// same "a miss is not an error" contract <see cref="GetBytesAsync(byte[], CancellationToken)"/>
     /// itself has. <paramref name="keys"/> must be non-empty.
     ///
     /// <para>A batch never fails as a whole, and it survives an
-    /// unreachable owner the way a single <see cref="GetBytesAsync(byte[])"/>
+    /// unreachable owner the way a single <see cref="GetBytesAsync(byte[], CancellationToken)"/>
     /// does: a key whose owner cannot be reached at the connection level
     /// (a dead node, a certificate this client cannot verify) is read
     /// from its next owner in rank order (see <see cref="MultiGetPassAsync"/>),
@@ -1336,7 +1400,7 @@ public sealed class NanocachedClient : IDisposable
     /// connection error when nothing resolved — a connection loss is
     /// never reported as a wrong-node answer. In single-node/proxy mode a
     /// <c>W</c> propagates immediately, exactly as
-    /// <see cref="GetBytesAsync(byte[])"/>'s own single-mode behavior does
+    /// <see cref="GetBytesAsync(byte[], CancellationToken)"/>'s own single-mode behavior does
     /// — there is no ring to refresh against.</para>
     ///
     /// <para>Larger batches are transparently split into more than one
@@ -1344,10 +1408,12 @@ public sealed class NanocachedClient : IDisposable
     /// <see cref="MaxBatchKeys"/> and, issue #222,
     /// <see cref="MaxRequestBytes"/>) — callers never need to think about
     /// this.</para></summary>
-    public Task<Dictionary<string, byte[]>> GetManyBytesAsync(IReadOnlyList<string> keys) =>
-        GetManyBytesAsync(EmptyNamespace, keys);
+    public Task<Dictionary<string, byte[]>> GetManyBytesAsync(IReadOnlyList<string> keys, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<Dictionary<string, byte[]>>(cancellationToken)
+        : Cancellation.Abandonable(GetManyBytesAsync(EmptyNamespace, keys), cancellationToken);
 
-    /// <summary>issue #105: as <see cref="GetManyBytesAsync(IReadOnlyList{string})"/>,
+    /// <summary>issue #105: as <see cref="GetManyBytesAsync(IReadOnlyList{string}, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
     internal async Task<Dictionary<string, byte[]>> GetManyBytesAsync(byte[] namespaceBytes, IReadOnlyList<string> keys)
     {
@@ -1797,23 +1863,27 @@ public sealed class NanocachedClient : IDisposable
     }
 
     /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>
-    public Task SetAsync(string key, string value, long ttlSeconds = 0) =>
-        SetAsync(EmptyNamespace, key, value, ttlSeconds);
+    public Task SetAsync(string key, string value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled(cancellationToken)
+        : Cancellation.Abandonable(SetAsync(EmptyNamespace, key, value, ttlSeconds), cancellationToken);
 
     /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no
     /// expiry. Transparently compresses values at or above
     /// <c>CompressionThreshold</c> when <c>Compress</c> is enabled
     /// (value compression).</summary>
-    public Task SetAsync(byte[] key, byte[] value, long ttlSeconds = 0) =>
-        SetAsync(EmptyNamespace, key, value, ttlSeconds);
+    public Task SetAsync(byte[] key, byte[] value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled(cancellationToken)
+        : Cancellation.Abandonable(SetAsync(EmptyNamespace, key, value, ttlSeconds), cancellationToken);
 
-    /// <summary>issue #105: as <see cref="SetAsync(string, string, long)"/>,
+    /// <summary>issue #105: as <see cref="SetAsync(string, string, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task SetAsync(byte[] namespaceBytes, string key, string value, long ttlSeconds = 0) =>
         SetAsync(namespaceBytes, Utf8(key, "key"), Utf8(value, "value"), ttlSeconds);
 
-    /// <summary>issue #105: as <see cref="SetAsync(byte[], byte[], long)"/>,
+    /// <summary>issue #105: as <see cref="SetAsync(byte[], byte[], long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
     internal async Task SetAsync(byte[] namespaceBytes, byte[] key, byte[] value, long ttlSeconds = 0)
     {
@@ -1841,18 +1911,24 @@ public sealed class NanocachedClient : IDisposable
         }).ConfigureAwait(false);
     }
 
-    public Task<bool> DeleteAsync(string key) => DeleteAsync(EmptyNamespace, key);
+    public Task<bool> DeleteAsync(string key, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(DeleteAsync(EmptyNamespace, key), cancellationToken);
 
     /// <summary>Returns whether the key existed before this call.</summary>
-    public Task<bool> DeleteAsync(byte[] key) => DeleteAsync(EmptyNamespace, key);
+    public Task<bool> DeleteAsync(byte[] key, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(DeleteAsync(EmptyNamespace, key), cancellationToken);
 
-    /// <summary>issue #105: as <see cref="DeleteAsync(string)"/>, scoped to
+    /// <summary>issue #105: as <see cref="DeleteAsync(string, CancellationToken)"/>, scoped to
     /// <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<bool> DeleteAsync(byte[] namespaceBytes, string key) =>
         DeleteAsync(namespaceBytes, Utf8(key, "key"));
 
-    /// <summary>issue #105: as <see cref="DeleteAsync(byte[])"/>, scoped to
+    /// <summary>issue #105: as <see cref="DeleteAsync(byte[], CancellationToken)"/>, scoped to
     /// <paramref name="namespaceBytes"/>. Returns whether the key existed
     /// before this call.</summary>
     internal async Task<bool> DeleteAsync(byte[] namespaceBytes, byte[] key)
@@ -1874,7 +1950,7 @@ public sealed class NanocachedClient : IDisposable
     /// never creates. <paramref name="ttlSeconds"/> is counted from the
     /// moment the node receives the request and has no default:
     /// <c>null</c> removes the TTL, 0 expires the entry at once (the
-    /// opposite of <see cref="SetAsync(string, string, long)"/>, where 0
+    /// opposite of <see cref="SetAsync(string, string, long, CancellationToken)"/>, where 0
     /// means no expiry), and a negative value throws
     /// <see cref="ArgumentOutOfRangeException"/> before any I/O.
     ///
@@ -1897,18 +1973,24 @@ public sealed class NanocachedClient : IDisposable
     /// outside the pipelined-order guarantee, as the retry paths do. Throws
     /// <see cref="ServerTooOldException"/> against a node that predates the
     /// command.</para></summary>
-    public Task<bool> TouchAsync(string key, long? ttlSeconds) => TouchAsync(EmptyNamespace, key, ttlSeconds);
+    public Task<bool> TouchAsync(string key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(TouchAsync(EmptyNamespace, key, ttlSeconds), cancellationToken);
 
-    /// <summary>As <see cref="TouchAsync(string, long?)"/>.</summary>
-    public Task<bool> TouchAsync(byte[] key, long? ttlSeconds) => TouchAsync(EmptyNamespace, key, ttlSeconds);
+    /// <summary>As <see cref="TouchAsync(string, long?, CancellationToken)"/>.</summary>
+    public Task<bool> TouchAsync(byte[] key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(TouchAsync(EmptyNamespace, key, ttlSeconds), cancellationToken);
 
-    /// <summary>issue #105: as <see cref="TouchAsync(string, long?)"/>, scoped to
+    /// <summary>issue #105: as <see cref="TouchAsync(string, long?, CancellationToken)"/>, scoped to
     /// <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<bool> TouchAsync(byte[] namespaceBytes, string key, long? ttlSeconds) =>
         TouchAsync(namespaceBytes, Utf8(key, "key"), ttlSeconds);
 
-    /// <summary>issue #105: as <see cref="TouchAsync(byte[], long?)"/>, scoped to
+    /// <summary>issue #105: as <see cref="TouchAsync(byte[], long?, CancellationToken)"/>, scoped to
     /// <paramref name="namespaceBytes"/>.</summary>
     internal async Task<bool> TouchAsync(byte[] namespaceBytes, byte[] key, long? ttlSeconds)
     {
@@ -1936,9 +2018,9 @@ public sealed class NanocachedClient : IDisposable
 
     /// <summary>Reads a value and replaces its TTL in one step (issue
     /// #825); <c>null</c> on a miss, which creates nothing. See
-    /// <see cref="TouchAsync(string, long?)"/> for
+    /// <see cref="TouchAsync(string, long?, CancellationToken)"/> for
     /// <paramref name="ttlSeconds"/>. Decoded as strict UTF-8, like
-    /// <see cref="GetAsync(string)"/>.
+    /// <see cref="GetAsync(string, CancellationToken)"/>.
     ///
     /// <para>A read that writes: it goes to the key's primary like a write
     /// (one refresh and retry on a wrong-node answer or a connection
@@ -1951,12 +2033,16 @@ public sealed class NanocachedClient : IDisposable
     /// the request was sent throws <see cref="ConnectionLostException"/>
     /// instead of being resent (issue #901): the node may have expired the
     /// entry and consumed its value, and a resend would report a miss.</para></summary>
-    public Task<string?> GetAndTouchAsync(string key, long? ttlSeconds) =>
-        GetAndTouchAsync(EmptyNamespace, key, ttlSeconds);
+    public Task<string?> GetAndTouchAsync(string key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<string?>(cancellationToken)
+        : Cancellation.Abandonable(GetAndTouchAsync(EmptyNamespace, key, ttlSeconds), cancellationToken);
 
-    /// <summary>As <see cref="GetAndTouchAsync(string, long?)"/>.</summary>
-    public Task<string?> GetAndTouchAsync(byte[] key, long? ttlSeconds) =>
-        GetAndTouchAsync(EmptyNamespace, key, ttlSeconds);
+    /// <summary>As <see cref="GetAndTouchAsync(string, long?, CancellationToken)"/>.</summary>
+    public Task<string?> GetAndTouchAsync(byte[] key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<string?>(cancellationToken)
+        : Cancellation.Abandonable(GetAndTouchAsync(EmptyNamespace, key, ttlSeconds), cancellationToken);
 
     internal Task<string?> GetAndTouchAsync(byte[] namespaceBytes, string key, long? ttlSeconds) =>
         GetAndTouchAsync(namespaceBytes, Utf8(key, "key"), ttlSeconds);
@@ -1968,14 +2054,18 @@ public sealed class NanocachedClient : IDisposable
     }
 
     /// <summary>The raw-bytes companion to
-    /// <see cref="GetAndTouchAsync(string, long?)"/>: no decoding.
+    /// <see cref="GetAndTouchAsync(string, long?, CancellationToken)"/>: no decoding.
     /// Transparently decompresses when <c>Compress</c> is enabled.</summary>
-    public Task<byte[]?> GetAndTouchBytesAsync(string key, long? ttlSeconds) =>
-        GetAndTouchBytesAsync(EmptyNamespace, key, ttlSeconds);
+    public Task<byte[]?> GetAndTouchBytesAsync(string key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<byte[]?>(cancellationToken)
+        : Cancellation.Abandonable(GetAndTouchBytesAsync(EmptyNamespace, key, ttlSeconds), cancellationToken);
 
-    /// <summary>As <see cref="GetAndTouchBytesAsync(string, long?)"/>.</summary>
-    public Task<byte[]?> GetAndTouchBytesAsync(byte[] key, long? ttlSeconds) =>
-        GetAndTouchBytesAsync(EmptyNamespace, key, ttlSeconds);
+    /// <summary>As <see cref="GetAndTouchBytesAsync(string, long?, CancellationToken)"/>.</summary>
+    public Task<byte[]?> GetAndTouchBytesAsync(byte[] key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<byte[]?>(cancellationToken)
+        : Cancellation.Abandonable(GetAndTouchBytesAsync(EmptyNamespace, key, ttlSeconds), cancellationToken);
 
     internal Task<byte[]?> GetAndTouchBytesAsync(byte[] namespaceBytes, string key, long? ttlSeconds) =>
         GetAndTouchBytesAsync(namespaceBytes, Utf8(key, "key"), ttlSeconds);
@@ -2021,14 +2111,14 @@ public sealed class NanocachedClient : IDisposable
 
     // ── Batched touch (issue #871) ───────────────────────────────────
 
-    /// <summary>Batched <see cref="TouchAsync(string, long?)"/> (issue
+    /// <summary>Batched <see cref="TouchAsync(string, long?, CancellationToken)"/> (issue
     /// #871): replaces the TTL of every key in <paramref name="keys"/> in
     /// place, one round trip per involved node, and returns each key's
     /// outcome — <c>true</c> if it existed, <c>false</c> for a missing or
     /// expired key, which a touch never creates. <paramref name="keys"/>
     /// must be non-empty; a key given more than once is touched once.
     /// <paramref name="ttlSeconds"/> is one TTL for the whole batch and
-    /// means what it means for <see cref="TouchAsync(string, long?)"/>:
+    /// means what it means for <see cref="TouchAsync(string, long?, CancellationToken)"/>:
     /// <c>null</c> removes it, 0 expires the keys at once, and a negative
     /// value throws <see cref="ArgumentOutOfRangeException"/> before any
     /// I/O.
@@ -2064,10 +2154,12 @@ public sealed class NanocachedClient : IDisposable
     /// expired them. Those keys must not be sent again (a second
     /// touch would find them gone and report them missing); treat each as
     /// "possibly expired".</para></summary>
-    public Task<Dictionary<string, bool>> TouchManyAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
-        TouchManyAsync(EmptyNamespace, keys, ttlSeconds);
+    public Task<Dictionary<string, bool>> TouchManyAsync(IReadOnlyList<string> keys, long? ttlSeconds, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<Dictionary<string, bool>>(cancellationToken)
+        : Cancellation.Abandonable(TouchManyAsync(EmptyNamespace, keys, ttlSeconds), cancellationToken);
 
-    /// <summary>issue #871: as <see cref="TouchManyAsync(IReadOnlyList{string}, long?)"/>,
+    /// <summary>issue #871: as <see cref="TouchManyAsync(IReadOnlyList{string}, long?, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal async Task<Dictionary<string, bool>> TouchManyAsync(
@@ -2091,13 +2183,13 @@ public sealed class NanocachedClient : IDisposable
         return touched;
     }
 
-    /// <summary>Batched <see cref="GetAndTouchAsync(string, long?)"/>
+    /// <summary>Batched <see cref="GetAndTouchAsync(string, long?, CancellationToken)"/>
     /// (issue #871): reads the values of <paramref name="keys"/> and
     /// replaces their TTL in one step, one round trip per involved node.
     /// A miss is absent from the result, creates nothing and is not an
-    /// error. See <see cref="TouchManyAsync(IReadOnlyList{string}, long?)"/>
+    /// error. See <see cref="TouchManyAsync(IReadOnlyList{string}, long?, CancellationToken)"/>
     /// for <paramref name="ttlSeconds"/>. Decoded as strict UTF-8, like
-    /// <see cref="GetManyAsync(IReadOnlyList{string})"/>.
+    /// <see cref="GetManyAsync(IReadOnlyList{string}, CancellationToken)"/>.
     ///
     /// <para>A read that writes, as <c>GetAndTouchAsync</c> is: each key
     /// goes to its primary in the <c>G</c> form, with no hedging and no
@@ -2108,7 +2200,7 @@ public sealed class NanocachedClient : IDisposable
     /// MiB per frame) is left out and left untouched, so it reads as a
     /// miss here.</para>
     ///
-    /// <para>Failures follow <see cref="GetManyAsync(IReadOnlyList{string})"/>:
+    /// <para>Failures follow <see cref="GetManyAsync(IReadOnlyList{string}, CancellationToken)"/>:
     /// keys still wrong-node after one bounded refresh-and-retry throw
     /// <see cref="PartialWrongNodeException{T}"/>, and keys whose primary
     /// was unreachable on both passes throw
@@ -2132,10 +2224,12 @@ public sealed class NanocachedClient : IDisposable
     /// <see cref="PartialServerTooOldException{T}"/> carrying their hits
     /// (with a TTL of 0 those values are consumed and would otherwise be
     /// lost).</para></summary>
-    public Task<Dictionary<string, string>> GetManyAndTouchAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
-        GetManyAndTouchAsync(EmptyNamespace, keys, ttlSeconds);
+    public Task<Dictionary<string, string>> GetManyAndTouchAsync(IReadOnlyList<string> keys, long? ttlSeconds, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<Dictionary<string, string>>(cancellationToken)
+        : Cancellation.Abandonable(GetManyAndTouchAsync(EmptyNamespace, keys, ttlSeconds), cancellationToken);
 
-    /// <summary>issue #871: as <see cref="GetManyAndTouchAsync(IReadOnlyList{string}, long?)"/>,
+    /// <summary>issue #871: as <see cref="GetManyAndTouchAsync(IReadOnlyList{string}, long?, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
     internal async Task<Dictionary<string, string>> GetManyAndTouchAsync(
         byte[] namespaceBytes, IReadOnlyList<string> keys, long? ttlSeconds)
@@ -2161,15 +2255,17 @@ public sealed class NanocachedClient : IDisposable
     }
 
     /// <summary>The raw-bytes companion to
-    /// <see cref="GetManyAndTouchAsync(IReadOnlyList{string}, long?)"/>: no
+    /// <see cref="GetManyAndTouchAsync(IReadOnlyList{string}, long?, CancellationToken)"/>: no
     /// decoding. Transparently decompresses when <c>Compress</c> is
     /// enabled. Failures are <see cref="PartialWrongNodeException{T}"/> and
     /// <see cref="PartialConnectionLostException{T}"/>, as for
-    /// <see cref="GetManyBytesAsync(IReadOnlyList{string})"/>.</summary>
-    public Task<Dictionary<string, byte[]>> GetManyAndTouchBytesAsync(IReadOnlyList<string> keys, long? ttlSeconds) =>
-        GetManyAndTouchBytesAsync(EmptyNamespace, keys, ttlSeconds);
+    /// <see cref="GetManyBytesAsync(IReadOnlyList{string}, CancellationToken)"/>.</summary>
+    public Task<Dictionary<string, byte[]>> GetManyAndTouchBytesAsync(IReadOnlyList<string> keys, long? ttlSeconds, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<Dictionary<string, byte[]>>(cancellationToken)
+        : Cancellation.Abandonable(GetManyAndTouchBytesAsync(EmptyNamespace, keys, ttlSeconds), cancellationToken);
 
-    /// <summary>issue #871: as <see cref="GetManyAndTouchBytesAsync(IReadOnlyList{string}, long?)"/>,
+    /// <summary>issue #871: as <see cref="GetManyAndTouchBytesAsync(IReadOnlyList{string}, long?, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
     internal async Task<Dictionary<string, byte[]>> GetManyAndTouchBytesAsync(
         byte[] namespaceBytes, IReadOnlyList<string> keys, long? ttlSeconds)
@@ -2640,10 +2736,12 @@ public sealed class NanocachedClient : IDisposable
         }
     }
 
-    public Task SetManyAsync(IReadOnlyDictionary<string, string> values, long ttlSeconds = 0) =>
-        SetManyAsync(EmptyNamespace, values, ttlSeconds);
+    public Task SetManyAsync(IReadOnlyDictionary<string, string> values, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled(cancellationToken)
+        : Cancellation.Abandonable(SetManyAsync(EmptyNamespace, values, ttlSeconds), cancellationToken);
 
-    /// <summary>issue #105: as <see cref="SetManyAsync(IReadOnlyDictionary{string, string}, long)"/>,
+    /// <summary>issue #105: as <see cref="SetManyAsync(IReadOnlyDictionary{string, string}, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task SetManyAsync(byte[] namespaceBytes, IReadOnlyDictionary<string, string> values, long ttlSeconds = 0)
@@ -2665,7 +2763,7 @@ public sealed class NanocachedClient : IDisposable
     /// TTL per call. <paramref name="values"/> must be non-empty.
     /// Transparently compresses values at or above
     /// <c>CompressionThreshold</c> when <c>Compress</c> is enabled,
-    /// exactly like <see cref="SetAsync(byte[], byte[], long)"/>.
+    /// exactly like <see cref="SetAsync(byte[], byte[], long, CancellationToken)"/>.
     ///
     /// <para>Within one batch, the same node can be a key's primary and
     /// another key's replica at once — it receives exactly one <c>o</c>
@@ -2673,23 +2771,25 @@ public sealed class NanocachedClient : IDisposable
     /// primary for decides that key's outcome; a replica-held key's
     /// failure or <c>W</c> is logged-and-swallowed into
     /// <c>Stats().ReplicaWriteFailures</c>, exactly like
-    /// <see cref="SetAsync(byte[], byte[], long)"/>'s own replica legs
+    /// <see cref="SetAsync(byte[], byte[], long, CancellationToken)"/>'s own replica legs
     /// (<see cref="WriteAsync{T}"/>). A batch never fails as a whole: if
     /// some keys' primaries are still wrong-node after one bounded
     /// refresh-and-retry, this throws <see cref="WrongNodeException"/> —
     /// every other key in the batch was still stored. In
     /// single-node/proxy mode a <c>W</c> propagates immediately, exactly
-    /// as <see cref="SetAsync(byte[], byte[], long)"/>'s own single-mode
+    /// as <see cref="SetAsync(byte[], byte[], long, CancellationToken)"/>'s own single-mode
     /// behavior does.</para>
     ///
     /// <para>Larger batches are transparently split into more than one
     /// <c>o</c> sub-frame per node (batch chunking, see
     /// <see cref="MaxBatchKeys"/> and, issue #222,
     /// <see cref="MaxRequestBytes"/>).</para></summary>
-    public Task SetManyBytesAsync(IReadOnlyDictionary<string, byte[]> values, long ttlSeconds = 0) =>
-        SetManyBytesAsync(EmptyNamespace, values, ttlSeconds);
+    public Task SetManyBytesAsync(IReadOnlyDictionary<string, byte[]> values, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled(cancellationToken)
+        : Cancellation.Abandonable(SetManyBytesAsync(EmptyNamespace, values, ttlSeconds), cancellationToken);
 
-    /// <summary>issue #105: as <see cref="SetManyBytesAsync(IReadOnlyDictionary{string, byte[]}, long)"/>,
+    /// <summary>issue #105: as <see cref="SetManyBytesAsync(IReadOnlyDictionary{string, byte[]}, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
     internal async Task SetManyBytesAsync(
         byte[] namespaceBytes, IReadOnlyDictionary<string, byte[]> values, long ttlSeconds = 0)
@@ -3110,25 +3210,28 @@ public sealed class NanocachedClient : IDisposable
 
     // ── incr / decr (issue #129) ─────────────────────────────────
 
-    public Task<long?> IncrAsync(string key, long delta) => IncrAsync(EmptyNamespace, key, delta);
+    public Task<long?> IncrAsync(string key, long delta, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<long?>(cancellationToken)
+        : Cancellation.Abandonable(IncrAsync(EmptyNamespace, key, delta), cancellationToken);
 
     /// <summary>issue #129: increments the counter stored at
     /// <paramref name="key"/> by <paramref name="delta"/> (a negative
     /// delta decrements — there is no separate decrement opcode; see
-    /// <see cref="DecrAsync(byte[], long)"/>) and returns its new value, or
+    /// <see cref="DecrAsync(byte[], long, CancellationToken)"/>) and returns its new value, or
     /// <c>null</c> when the key is missing or expired — the same
-    /// not-found convention <see cref="GetAsync(byte[])"/> uses. Throws
+    /// not-found convention <see cref="GetAsync(byte[], CancellationToken)"/> uses. Throws
     /// <see cref="NotNumericException"/> when the stored value isn't an
     /// integer INCR can operate on, or applying the delta would overflow a
     /// signed 64-bit integer.
     ///
-    /// <para><b>Exactly as volatile as <see cref="SetAsync(byte[], byte[], long)"/></b>:
+    /// <para><b>Exactly as volatile as <see cref="SetAsync(byte[], byte[], long, CancellationToken)"/></b>:
     /// LRU eviction and TTL expiry reclaim an incremented value like any
     /// other entry. Good for rate limiting or approximate counters, not
     /// for durable counts (billing, inventory).</para>
     ///
-    /// <para>Cluster replication: unlike <see cref="SetAsync(byte[], byte[], long)"/>/
-    /// <see cref="DeleteAsync(byte[])"/>, which send the identical write to
+    /// <para>Cluster replication: unlike <see cref="SetAsync(byte[], byte[], long, CancellationToken)"/>/
+    /// <see cref="DeleteAsync(byte[], CancellationToken)"/>, which send the identical write to
     /// every owner, only the primary owner ever runs the increment — a
     /// successful result is forwarded to the replicas as an ordinary
     /// <c>Set</c> of the literal new value instead of replaying the delta
@@ -3138,8 +3241,8 @@ public sealed class NanocachedClient : IDisposable
     /// full mechanics.</para>
     ///
     /// <para><b>At-least-once on a lost connection (issue #225)</b>: unlike
-    /// <see cref="GetAsync(byte[])"/>/<see cref="SetAsync(byte[], byte[], long)"/>/
-    /// <see cref="DeleteAsync(byte[])"/> — which are idempotent, so this
+    /// <see cref="GetAsync(byte[], CancellationToken)"/>/<see cref="SetAsync(byte[], byte[], long, CancellationToken)"/>/
+    /// <see cref="DeleteAsync(byte[], CancellationToken)"/> — which are idempotent, so this
     /// SDK's built-in redial-and-retry-once always resends them — Incr is
     /// NOT idempotent, so the redial-and-retry only ever resends this
     /// request when the connection is known to have died before the
@@ -3158,15 +3261,18 @@ public sealed class NanocachedClient : IDisposable
     /// enabled — an incremented value can't safely round-trip through
     /// compression. Disable <c>Compress</c> or use a separate client for
     /// counters.</para></summary>
-    public Task<long?> IncrAsync(byte[] key, long delta) => IncrAsync(EmptyNamespace, key, delta);
+    public Task<long?> IncrAsync(byte[] key, long delta, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<long?>(cancellationToken)
+        : Cancellation.Abandonable(IncrAsync(EmptyNamespace, key, delta), cancellationToken);
 
-    /// <summary>issue #129: as <see cref="IncrAsync(string, long)"/>,
+    /// <summary>issue #129: as <see cref="IncrAsync(string, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<long?> IncrAsync(byte[] namespaceBytes, string key, long delta) =>
         IncrAsync(namespaceBytes, Utf8(key, "key"), delta);
 
-    /// <summary>issue #129: as <see cref="IncrAsync(byte[], long)"/>,
+    /// <summary>issue #129: as <see cref="IncrAsync(byte[], long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — this is the internal
     /// method <see cref="NanocachedNamespace"/> forwards to, rather than
     /// duplicating this client's networking.</summary>
@@ -3194,27 +3300,33 @@ public sealed class NanocachedClient : IDisposable
         }
     }
 
-    /// <summary>issue #182: <see cref="IncrAsync(string, long)"/> with
+    /// <summary>issue #182: <see cref="IncrAsync(string, long, CancellationToken)"/> with
     /// <paramref name="delta"/> negated — never a different wire op. Same
     /// at-least-once-on-a-lost-connection caveat as
-    /// <see cref="IncrAsync(byte[], long)"/> (issue #225): not idempotent,
+    /// <see cref="IncrAsync(byte[], long, CancellationToken)"/> (issue #225): not idempotent,
     /// so a connection lost after the request frame was already fully
     /// written throws <see cref="ConnectionLostException"/> rather than
     /// risk decrementing twice. Also throws
     /// <see cref="CompressionIncompatibleException"/> when <c>Compress</c>
-    /// is enabled, for the same reason <see cref="IncrAsync(byte[], long)"/>
+    /// is enabled, for the same reason <see cref="IncrAsync(byte[], long, CancellationToken)"/>
     /// does (issue #321).</summary>
-    public Task<long?> DecrAsync(string key, long delta) => IncrAsync(key, NegateDecrDelta(delta));
+    public Task<long?> DecrAsync(string key, long delta, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<long?>(cancellationToken)
+        : Cancellation.Abandonable(IncrAsync(key, NegateDecrDelta(delta)), cancellationToken);
 
-    /// <summary>issue #129: <see cref="IncrAsync(byte[], long)"/> with
+    /// <summary>issue #129: <see cref="IncrAsync(byte[], long, CancellationToken)"/> with
     /// <paramref name="delta"/> negated — never a different wire op;
     /// <c>i</c>'s own signed delta already covers decrementing. issue
     /// #182: delegates the negation to <see cref="NegateDecrDelta"/>,
     /// which rejects <see cref="long.MinValue"/> rather than silently
-    /// wrapping it back to itself. See <see cref="IncrAsync(byte[], long)"/>'s
+    /// wrapping it back to itself. See <see cref="IncrAsync(byte[], long, CancellationToken)"/>'s
     /// doc comment for the at-least-once-on-a-lost-connection caveat
     /// (issue #225) this inherits.</summary>
-    public Task<long?> DecrAsync(byte[] key, long delta) => IncrAsync(key, NegateDecrDelta(delta));
+    public Task<long?> DecrAsync(byte[] key, long delta, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<long?>(cancellationToken)
+        : Cancellation.Abandonable(IncrAsync(key, NegateDecrDelta(delta)), cancellationToken);
 
     internal Task<long?> DecrAsync(byte[] namespaceBytes, string key, long delta) =>
         IncrAsync(namespaceBytes, key, NegateDecrDelta(delta));
@@ -3381,11 +3493,11 @@ public sealed class NanocachedClient : IDisposable
     /// the server computes over a key's exact stored bytes. Public and
     /// pure so a caller that already holds a value can compute its
     /// expected digest without a prior read — see
-    /// <see cref="ReplaceAsync(byte[], string, byte[], long)"/>'s doc
+    /// <see cref="ReplaceAsync(byte[], string, byte[], long, CancellationToken)"/>'s doc
     /// comment for why that shortcut is only safe when the caller's own
     /// serialization reproduces the stored bytes exactly, unlike the
     /// always-correct read-then-write-back path via
-    /// <see cref="GetWithTokenAsync(byte[])"/>. Computed identically by
+    /// <see cref="GetWithTokenAsync(byte[], CancellationToken)"/>. Computed identically by
     /// the server and every SDK; pinned by a fixed cross-language test
     /// vector (see NanocachedClientTests).</summary>
     public static string ContentDigest(byte[] value)
@@ -3397,18 +3509,20 @@ public sealed class NanocachedClient : IDisposable
     private const string CondAbsent = "A";
     private const string CondPresent = "P";
 
-    public Task<bool> PutIfAbsentAsync(string key, string value, long ttlSeconds = 0) =>
-        PutIfAbsentAsync(EmptyNamespace, key, value, ttlSeconds);
+    public Task<bool> PutIfAbsentAsync(string key, string value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(PutIfAbsentAsync(EmptyNamespace, key, value, ttlSeconds), cancellationToken);
 
     /// <summary>issue #141 — <c>add</c>/<c>putIfAbsent</c>: stores
     /// <paramref name="value"/> only if <paramref name="key"/> is
     /// currently absent (including lazily expired). Returns <c>true</c>
     /// when stored, <c>false</c> when the key already existed — a
     /// condition mismatch is a normal boolean outcome, never an
-    /// exception, the same idiom <see cref="DeleteAsync(byte[])"/> uses.
+    /// exception, the same idiom <see cref="DeleteAsync(byte[], CancellationToken)"/> uses.
     ///
     /// <para><b>Not a distributed lock</b>: LRU eviction can still reclaim
-    /// the key exactly as it would after a plain <see cref="SetAsync(byte[], byte[], long)"/>
+    /// the key exactly as it would after a plain <see cref="SetAsync(byte[], byte[], long, CancellationToken)"/>
     /// — if a key used as a lock is evicted under memory pressure, a
     /// second caller's <c>PutIfAbsentAsync</c> succeeds while the first
     /// caller still believes it holds the lock. See
@@ -3416,66 +3530,74 @@ public sealed class NanocachedClient : IDisposable
     ///
     /// <para>Cluster replication: only the key's primary owner evaluates
     /// the condition; on success the SDK forwards the literal value to the
-    /// remaining owners as an ordinary <see cref="SetAsync(byte[], byte[], long)"/>,
+    /// remaining owners as an ordinary <see cref="SetAsync(byte[], byte[], long, CancellationToken)"/>,
     /// never by replaying <c>k</c> on a replica — see
-    /// <see cref="IncrAsync(byte[], long)"/>'s doc comment for why that
+    /// <see cref="IncrAsync(byte[], long, CancellationToken)"/>'s doc comment for why that
     /// matters.</para>
     ///
     /// <para><b>At-least-once on a lost connection (issue #225)</b>: like
-    /// <see cref="IncrAsync(byte[], long)"/>, CAS is NOT idempotent — a
+    /// <see cref="IncrAsync(byte[], long, CancellationToken)"/>, CAS is NOT idempotent — a
     /// mismatch response and an already-succeeded response mean different
     /// things, so blindly replaying it after a redial could report an
     /// already-successful CAS as a mismatch. The redial-and-retry this SDK
-    /// builds in for <see cref="GetAsync(byte[])"/>/<see cref="SetAsync(byte[], byte[], long)"/>/
-    /// <see cref="DeleteAsync(byte[])"/> only ever resends this request
+    /// builds in for <see cref="GetAsync(byte[], CancellationToken)"/>/<see cref="SetAsync(byte[], byte[], long, CancellationToken)"/>/
+    /// <see cref="DeleteAsync(byte[], CancellationToken)"/> only ever resends this request
     /// when the connection is known to have died before the request frame
     /// could be written at all; if the frame was fully written and only
     /// the reply was lost, this method throws
     /// <see cref="ConnectionLostException"/> instead of guessing. The same
-    /// caveat applies to <see cref="ReplaceIfPresentAsync(byte[], byte[], long)"/>,
-    /// <see cref="ReplaceAsync(byte[], string, byte[], long)"/>, and
-    /// <see cref="DeleteIfMatchesAsync(byte[], string)"/>, which all share
+    /// caveat applies to <see cref="ReplaceIfPresentAsync(byte[], byte[], long, CancellationToken)"/>,
+    /// <see cref="ReplaceAsync(byte[], string, byte[], long, CancellationToken)"/>, and
+    /// <see cref="DeleteIfMatchesAsync(byte[], string, CancellationToken)"/>, which all share
     /// this same primary-then-replicate path.</para></summary>
-    public Task<bool> PutIfAbsentAsync(byte[] key, byte[] value, long ttlSeconds = 0) =>
-        PutIfAbsentAsync(EmptyNamespace, key, value, ttlSeconds);
+    public Task<bool> PutIfAbsentAsync(byte[] key, byte[] value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(PutIfAbsentAsync(EmptyNamespace, key, value, ttlSeconds), cancellationToken);
 
-    /// <summary>issue #141: as <see cref="PutIfAbsentAsync(string, string, long)"/>,
+    /// <summary>issue #141: as <see cref="PutIfAbsentAsync(string, string, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<bool> PutIfAbsentAsync(byte[] namespaceBytes, string key, string value, long ttlSeconds = 0) =>
         PutIfAbsentAsync(namespaceBytes, Utf8(key, "key"), Utf8(value, "value"), ttlSeconds);
 
-    /// <summary>issue #141: as <see cref="PutIfAbsentAsync(byte[], byte[], long)"/>,
+    /// <summary>issue #141: as <see cref="PutIfAbsentAsync(byte[], byte[], long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
     internal Task<bool> PutIfAbsentAsync(byte[] namespaceBytes, byte[] key, byte[] value, long ttlSeconds = 0) =>
         CasAsync(namespaceBytes, key, value, CondAbsent, ttlSeconds);
 
-    public Task<bool> ReplaceIfPresentAsync(string key, string value, long ttlSeconds = 0) =>
-        ReplaceIfPresentAsync(EmptyNamespace, key, value, ttlSeconds);
+    public Task<bool> ReplaceIfPresentAsync(string key, string value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(ReplaceIfPresentAsync(EmptyNamespace, key, value, ttlSeconds), cancellationToken);
 
     /// <summary>issue #141 — the two-argument <c>replace(key, value)</c>:
     /// stores <paramref name="value"/> only if <paramref name="key"/>
     /// currently holds any (unexpired) value, whatever it is. Returns
     /// <c>true</c> when replaced, <c>false</c> when the key was absent —
-    /// see <see cref="PutIfAbsentAsync(byte[], byte[], long)"/>'s doc
+    /// see <see cref="PutIfAbsentAsync(byte[], byte[], long, CancellationToken)"/>'s doc
     /// comment for the shared not-a-lock caveat and replication
     /// rule.</summary>
-    public Task<bool> ReplaceIfPresentAsync(byte[] key, byte[] value, long ttlSeconds = 0) =>
-        ReplaceIfPresentAsync(EmptyNamespace, key, value, ttlSeconds);
+    public Task<bool> ReplaceIfPresentAsync(byte[] key, byte[] value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(ReplaceIfPresentAsync(EmptyNamespace, key, value, ttlSeconds), cancellationToken);
 
-    /// <summary>issue #141: as <see cref="ReplaceIfPresentAsync(string, string, long)"/>,
+    /// <summary>issue #141: as <see cref="ReplaceIfPresentAsync(string, string, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<bool> ReplaceIfPresentAsync(byte[] namespaceBytes, string key, string value, long ttlSeconds = 0) =>
         ReplaceIfPresentAsync(namespaceBytes, Utf8(key, "key"), Utf8(value, "value"), ttlSeconds);
 
-    /// <summary>issue #141: as <see cref="ReplaceIfPresentAsync(byte[], byte[], long)"/>,
+    /// <summary>issue #141: as <see cref="ReplaceIfPresentAsync(byte[], byte[], long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
     internal Task<bool> ReplaceIfPresentAsync(byte[] namespaceBytes, byte[] key, byte[] value, long ttlSeconds = 0) =>
         CasAsync(namespaceBytes, key, value, CondPresent, ttlSeconds);
 
-    public Task<bool> ReplaceAsync(string key, string token, string newValue, long ttlSeconds = 0) =>
-        ReplaceAsync(EmptyNamespace, key, token, newValue, ttlSeconds);
+    public Task<bool> ReplaceAsync(string key, string token, string newValue, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(ReplaceAsync(EmptyNamespace, key, token, newValue, ttlSeconds), cancellationToken);
 
     /// <summary>issue #141 — the three-argument <c>replace(key, old, new)</c>:
     /// stores <paramref name="newValue"/> only if <paramref name="key"/>
@@ -3485,7 +3607,7 @@ public sealed class NanocachedClient : IDisposable
     /// <c>false</c> on a digest mismatch (including a since-deleted key).
     ///
     /// <para><paramref name="token"/> is ordinarily obtained from a real
-    /// prior <see cref="GetWithTokenAsync(byte[])"/> — that path is always
+    /// prior <see cref="GetWithTokenAsync(byte[], CancellationToken)"/> — that path is always
     /// correct. Reconstructing a digest via <see cref="ContentDigest"/>
     /// from a value the caller already holds (skipping the read) is only
     /// correct if that reconstruction produces byte-identical bytes to
@@ -3494,20 +3616,22 @@ public sealed class NanocachedClient : IDisposable
     /// mismatched <c>Compress</c> settings (the same caveat memcached's
     /// own value-based CAS has).</para>
     ///
-    /// <para>See <see cref="PutIfAbsentAsync(byte[], byte[], long)"/>'s
+    /// <para>See <see cref="PutIfAbsentAsync(byte[], byte[], long, CancellationToken)"/>'s
     /// doc comment for the shared not-a-lock caveat, replication rule, and
     /// — since ReplaceAsync is CAS, not idempotent — the
     /// at-least-once-on-a-lost-connection caveat (issue #225).</para></summary>
-    public Task<bool> ReplaceAsync(byte[] key, string token, byte[] newValue, long ttlSeconds = 0) =>
-        ReplaceAsync(EmptyNamespace, key, token, newValue, ttlSeconds);
+    public Task<bool> ReplaceAsync(byte[] key, string token, byte[] newValue, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(ReplaceAsync(EmptyNamespace, key, token, newValue, ttlSeconds), cancellationToken);
 
-    /// <summary>issue #141: as <see cref="ReplaceAsync(string, string, string, long)"/>,
+    /// <summary>issue #141: as <see cref="ReplaceAsync(string, string, string, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<bool> ReplaceAsync(byte[] namespaceBytes, string key, string token, string newValue, long ttlSeconds = 0) =>
         ReplaceAsync(namespaceBytes, Utf8(key, "key"), token, Utf8(newValue, "value"), ttlSeconds);
 
-    /// <summary>issue #141: as <see cref="ReplaceAsync(byte[], string, byte[], long)"/>,
+    /// <summary>issue #141: as <see cref="ReplaceAsync(byte[], string, byte[], long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>. issue #223: validates
     /// <paramref name="token"/> before it ever reaches the wire — see
     /// <see cref="ValidateToken"/>.</summary>
@@ -3517,22 +3641,25 @@ public sealed class NanocachedClient : IDisposable
         return CasAsync(namespaceBytes, key, newValue, token, ttlSeconds);
     }
 
-    public Task<bool> DeleteIfMatchesAsync(string key, string token) => DeleteIfMatchesAsync(EmptyNamespace, key, token);
+    public Task<bool> DeleteIfMatchesAsync(string key, string token, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(DeleteIfMatchesAsync(EmptyNamespace, key, token), cancellationToken);
 
     /// <summary>issue #141 — the two-argument <c>remove(key, old)</c>:
     /// removes <paramref name="key"/> only if its current stored value's
     /// content digest equals <paramref name="token"/> exactly. Returns
     /// <c>true</c> when removed, <c>false</c> on a digest mismatch or a
-    /// missing key — see <see cref="ReplaceAsync(byte[], string, byte[], long)"/>'s
+    /// missing key — see <see cref="ReplaceAsync(byte[], string, byte[], long, CancellationToken)"/>'s
     /// doc comment for how to obtain <paramref name="token"/>.
     ///
     /// <para>Cluster replication: only the primary owner evaluates the
     /// digest; on success the SDK forwards the removal to the remaining
-    /// owners as an ordinary <see cref="DeleteAsync(byte[])"/>, never by
+    /// owners as an ordinary <see cref="DeleteAsync(byte[], CancellationToken)"/>, never by
     /// replaying <c>x</c> on a replica.</para>
     ///
     /// <para><b>At-least-once on a lost connection (issue #225)</b>: unlike
-    /// <see cref="DeleteAsync(byte[])"/>, this is a conditional remove, not
+    /// <see cref="DeleteAsync(byte[], CancellationToken)"/>, this is a conditional remove, not
     /// idempotent — a mismatch and an already-succeeded removal mean
     /// different things. The built-in redial-and-retry only ever resends
     /// this request when the connection is known to have died before the
@@ -3540,17 +3667,20 @@ public sealed class NanocachedClient : IDisposable
     /// written and only the reply was lost, this method throws
     /// <see cref="ConnectionLostException"/> instead of reporting a
     /// possibly-already-successful removal as a mismatch. See
-    /// <see cref="PutIfAbsentAsync(byte[], byte[], long)"/>'s doc comment
+    /// <see cref="PutIfAbsentAsync(byte[], byte[], long, CancellationToken)"/>'s doc comment
     /// for the same caveat shared by every CAS method.</para></summary>
-    public Task<bool> DeleteIfMatchesAsync(byte[] key, string token) => DeleteIfMatchesAsync(EmptyNamespace, key, token);
+    public Task<bool> DeleteIfMatchesAsync(byte[] key, string token, CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+        ? Task.FromCanceled<bool>(cancellationToken)
+        : Cancellation.Abandonable(DeleteIfMatchesAsync(EmptyNamespace, key, token), cancellationToken);
 
-    /// <summary>issue #141: as <see cref="DeleteIfMatchesAsync(string, string)"/>,
+    /// <summary>issue #141: as <see cref="DeleteIfMatchesAsync(string, string, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
     /// <see cref="NanocachedNamespace"/> forwards to.</summary>
     internal Task<bool> DeleteIfMatchesAsync(byte[] namespaceBytes, string key, string token) =>
         DeleteIfMatchesAsync(namespaceBytes, Utf8(key, "key"), token);
 
-    /// <summary>issue #141: as <see cref="DeleteIfMatchesAsync(byte[], string)"/>,
+    /// <summary>issue #141: as <see cref="DeleteIfMatchesAsync(byte[], string, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>. issue #223: validates
     /// <paramref name="token"/> before it ever reaches the wire — see
     /// <see cref="ValidateToken"/>.</summary>
@@ -3579,7 +3709,7 @@ public sealed class NanocachedClient : IDisposable
     /// <summary>issue #141: as <see cref="IncrAsync(byte[], byte[], long)"/>
     /// but for <c>k</c> — validates, compresses (reusing
     /// <see cref="SetAsync(byte[], byte[], byte[], long)"/>'s exact
-    /// encode step, so a subsequent plain <see cref="GetAsync(byte[])"/>
+    /// encode step, so a subsequent plain <see cref="GetAsync(byte[], CancellationToken)"/>
     /// from any client can always decompress it), and runs the
     /// primary-evaluates-then-replicates driver.</summary>
     private async Task<bool> CasAsync(byte[] namespaceBytes, byte[] key, byte[] value, string cond, long ttlSeconds)
@@ -3681,7 +3811,7 @@ public sealed class NanocachedClient : IDisposable
     /// (empty clears the default namespace — not rejected, see
     /// <see cref="NanocachedNamespace"/>'s doc comment on
     /// <c>Namespace("")</c>). The internal method
-    /// <see cref="NanocachedNamespace.ClearAsync()"/> forwards to.</summary>
+    /// <see cref="NanocachedNamespace.ClearAsync(CancellationToken)"/> forwards to.</summary>
     internal async Task ClearAsync(byte[] namespaceBytes)
     {
         await BeforeOperationAsync().ConfigureAwait(false);
@@ -3693,7 +3823,12 @@ public sealed class NanocachedClient : IDisposable
     /// included — the client-side equivalent of the server's <c>F</c>.
     /// Per the issue, deliberately not named "flush" to keep the public
     /// API's vocabulary to get/set/delete/clear.</summary>
-    public async Task ClearAllAsync()
+    public Task ClearAllAsync(CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested
+            ? Task.FromCanceled(cancellationToken)
+            : Cancellation.Abandonable(ClearAllCoreAsync(), cancellationToken);
+
+    private async Task ClearAllCoreAsync()
     {
         await BeforeOperationAsync().ConfigureAwait(false);
         await ClearFanOutWithRetryAsync(connection => connection.ClearAllAsync())
@@ -3798,7 +3933,7 @@ public sealed class NanocachedClient : IDisposable
     /// plus the namespace and key alone would already risk tripping the
     /// server's MAX_REQUEST_SIZE (audit finding D2) — checked
     /// synchronously, before any connection is touched, mirroring
-    /// <see cref="SetAsync(byte[], byte[], long)"/>'s ttlSeconds check.
+    /// <see cref="SetAsync(byte[], byte[], long, CancellationToken)"/>'s ttlSeconds check.
     /// issue #105: the namespace counts toward the same budget as the key
     /// — the wire imposes no separate limit on it, so neither does this
     /// (the empty namespace contributes 0 bytes, so this is
@@ -3957,6 +4092,11 @@ public sealed class NanocachedClient : IDisposable
     }
 
     public void Dispose() => Close();
+
+    /// <summary>As <see cref="Close"/>, run on the thread pool so that waiting for
+    /// background replica writes and hedged reads to finish does not block the
+    /// caller&#39;s thread or synchronization context.</summary>
+    public ValueTask DisposeAsync() => new(Task.Run(Close));
 
     private void Teardown()
     {
@@ -4865,7 +5005,7 @@ public sealed class NanocachedClient : IDisposable
     /// mechanism). On success, <see cref="_singleAddress"/> is updated to
     /// the winner so the *next* redial retries the new proxy first, same
     /// as this one did. An empty roster is reported with a message naming
-    /// the situation, same wording as <see cref="ConnectAsync(Options)"/>'s
+    /// the situation, same wording as <see cref="ConnectAsync(Options, CancellationToken)"/>'s
     /// own empty-roster error; every proxy in a non-empty roster being
     /// unreachable surfaces as the last dial error, same as any other
     /// connect failure.</summary>
@@ -5138,13 +5278,13 @@ public sealed class NanocachedClient : IDisposable
     /// to answer <c>Q</c> instead of <c>L</c>. Used by
     /// <see cref="DialProxyWithFailoverAsync"/>'s reconnect fallback; the
     /// initial connect fetches <c>Q</c> directly in
-    /// <see cref="ConnectAsync(Options)"/>'s own loop instead, since that
+    /// <see cref="ConnectAsync(Options, CancellationToken)"/>'s own loop instead, since that
     /// first fetch also needs the loop's own per-address bookkeeping
     /// (<c>_targetKey</c>, the forgotten-close warning). Unlike
     /// <see cref="FetchNodeListAsync"/>, an address that identifies as a
     /// plain cache node is not skipped as merely uninteresting: it means
     /// ViaProxy is pointed at the wrong kind of address, the same
-    /// configuration error <see cref="ConnectAsync(Options)"/> fails fast
+    /// configuration error <see cref="ConnectAsync(Options, CancellationToken)"/> fails fast
     /// on, so it is thrown here too rather than silently trying the next
     /// address.</summary>
     private async Task<IReadOnlyList<DiscoveredNode>> FetchProxyListAsync()

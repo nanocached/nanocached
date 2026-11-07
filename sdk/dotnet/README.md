@@ -687,6 +687,27 @@ then holds is the caller's. Before this bound, N concurrent reads of a
 A client with `Compress = true` raises immediately rather than produce a
 counter value the protocol can't safely round-trip.
 
+## Cancellation
+
+Every async method of the client and of a namespace handle, and
+`ConnectAsync`, takes an optional trailing `CancellationToken`. Requests are
+pipelined on one connection and answered in order, so a request that is
+already written cannot be taken back, and no token ever reaches the stream (a
+half-written frame would desynchronize the pipeline). Cancelling therefore
+**abandons the wait**: the task ends with `OperationCanceledException`, the
+connection stays usable, and the operation may still run to completion on the
+cluster, its result discarded.
+
+- A token that is already cancelled when the call is made **sends nothing**.
+- After a cancellation the outcome of a write, and above all of `IncrAsync`,
+  `DecrAsync` and the compare-and-set calls, is unknown to the caller, exactly
+  as after `ConnectionLostException`; read the key to learn what happened.
+- A client that finishes connecting after `ConnectAsync` was cancelled is
+  closed, not leaked.
+- `DisposeAsync()` is `Close()` run on the thread pool, for `await using`:
+  waiting for background replica writes and hedged reads does not block your
+  thread.
+
 ## close()
 
 `client.Close()` (or `Dispose()`/`using`) is idempotent; calling it a

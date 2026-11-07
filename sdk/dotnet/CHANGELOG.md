@@ -10,6 +10,11 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 ## [Unreleased]
 
+### Added
+
+- Every public async method of `NanocachedClient` and `NanocachedNamespace`, and `ConnectAsync`, takes an optional trailing `CancellationToken cancellationToken = default`. Cancelling abandons the wait (`OperationCanceledException`) while the operation may still complete on the cluster; a token that is already cancelled sends nothing; a client that finishes connecting after a cancelled `ConnectAsync` is closed. Added now because a trailing parameter is a binary break once the API is frozen.
+- `NanocachedClient` implements `IAsyncDisposable`; `DisposeAsync()` runs `Close()` on the thread pool.
+
 ### Changed
 
 - **Breaking:** `HashRing` and `DiscoveredNode` are now `internal`. No public member took or returned either.

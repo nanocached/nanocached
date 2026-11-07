@@ -259,9 +259,14 @@ internal sealed class MockNode : IDisposable
         }
     }
 
+    /// <summary>Holds every future read reply for this many milliseconds —
+    /// for tests proving a cancelled token abandons the wait.</summary>
+    internal int GetDelayMillis;
+
     private async Task GetAsync(Stream stream, string ns, int keyLength, string tagSuffix)
     {
         byte[] key = await ReadExactlyAsync(stream, keyLength).ConfigureAwait(false);
+        if (Volatile.Read(ref GetDelayMillis) > 0) await Task.Delay(GetDelayMillis).ConfigureAwait(false);
         Entry? entry = EntryFor(ns, key);
         if (entry is null)
         {
