@@ -11,6 +11,9 @@ tag: 0.4.3 was a server-only release.
 
 ### Changed
 
+- **Breaking:** `MAX_BATCH_KEYS` is no longer exported (it was exported only so tests could assert on it; the cache-manager adapter now holds its own copy of the number). `client.url` is no longer reachable (it was an undocumented public field) and `client.nodeUrls` is read-only.
+- **Breaking:** the option mistakes `connect()` catches before dialing (an empty `addresses`, a bad `readHedgeAfterMs` or `reconnectCooldownMs`, `readHedgeAfterMs` with `viaProxy`, `ca` without `tls`) now throw a builtin `RangeError` instead of a `NanocachedError`, as the README already said caller mistakes do. Python raises `ValueError` for the same mistakes, Java `IllegalArgumentException`.
+- `readHedgeAfterMs` above 24 hours is now rejected. Above 2^31-1 the timer overflowed and fired after about a millisecond, so hedging sent a second request at once.
 - **Breaking:** `reconnectCooldownMs: 0` no longer switches the reconnect cooldown off; like omitting it, it now means the default (1000 ms), which is how the Go, Rust, Java and .NET SDKs read `0`. A negative or non-finite value is now rejected. To switch the cooldown off, use the new `disableReconnectCooldown: true` (combining it with a non-zero `reconnectCooldownMs` is rejected).
 
 ### Fixed
