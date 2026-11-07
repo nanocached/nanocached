@@ -2333,6 +2333,9 @@ func TestAMidStreamBusyIsNeverMisdeliveredToAPendingRequest(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "connection limit reached") {
 		t.Fatalf("get() error = %v, want the dedicated busy error", err)
 	}
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("get() error = %v, a connection-limit B must be an ErrConnectionLost", err)
+	}
 	if strings.Contains(err.Error(), "desynced") || strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("get() error = %v, the busy response must not surface as a generic mismatch", err)
 	}
@@ -3602,7 +3605,7 @@ func startCluster(t *testing.T, replication int) (map[string]*mockNode, *mockDis
 }
 
 func ownersOf(key string) []string {
-	return NewHashRing(testNames).Owners([]byte(key), 2)
+	return newHashRing(testNames).Owners([]byte(key), 2)
 }
 
 func TestRoutesAndReadsItsOwnWrites(t *testing.T) {
@@ -3649,7 +3652,7 @@ func TestWrongNodeTriggersRefreshAndOneRetry(t *testing.T) {
 	if err := client.Set("some-key", "v", 0); err != nil {
 		t.Fatal(err)
 	}
-	primary, err := NewHashRing(testNames).Route([]byte("some-key"))
+	primary, err := newHashRing(testNames).Route([]byte("some-key"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4712,7 +4715,7 @@ func TestClusterGetManyRecoversAPerKeyWrongNodeAfterARefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	primary, err := NewHashRing(testNames).Route([]byte(wrongKey))
+	primary, err := newHashRing(testNames).Route([]byte(wrongKey))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4745,7 +4748,7 @@ func TestClusterGetManyDegradesToAPartialMapWithErrWrongNodeWhenWrongNodePersist
 		t.Fatal(err)
 	}
 
-	primary, err := NewHashRing(testNames).Route([]byte(wrongKey))
+	primary, err := newHashRing(testNames).Route([]byte(wrongKey))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4835,7 +4838,7 @@ func TestClusterGetManyReportsAnUnreachableOwnerAsAConnectionLossNotWrongNode(t 
 	dead, live := testNames[0], testNames[1]
 	liveValues := map[string]string{}
 	for key, value := range all {
-		if NewHashRing(testNames).Owners([]byte(key), 1)[0] == live {
+		if newHashRing(testNames).Owners([]byte(key), 1)[0] == live {
 			liveValues[key] = value
 		}
 	}
@@ -4866,7 +4869,7 @@ func TestClusterSetManyRecoversAPerKeyWrongNodeAfterARefresh(t *testing.T) {
 	defer client.Close()
 
 	const wrongKey, okKey = "wrong-key", "ok-key"
-	primary, err := NewHashRing(testNames).Route([]byte(wrongKey))
+	primary, err := newHashRing(testNames).Route([]byte(wrongKey))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4906,7 +4909,7 @@ func TestClusterSetManyReportsAKeyStoredWhenItsAcknowledgingReplicaBecomesThePri
 	}
 	defer client.Close()
 
-	ring := NewHashRing(names)
+	ring := newHashRing(names)
 	var key string
 	for i := 0; key == ""; i++ {
 		candidate := fmt.Sprintf("key-%d", i)
@@ -5040,7 +5043,7 @@ func TestConnectFailsOnlyWhenEveryNodeIsUnreachable(t *testing.T) {
 }
 
 func TestRefreshKeepsTheLiveConnectionWhenDiscoveryRepeatsANodeName(t *testing.T) {
-	// #389: NewHashRing dedupes repeated node names (#328/#360), but the
+	// #389: newHashRing dedupes repeated node names (#328/#360), but the
 	// connection layer didn't — on refresh, a name's first occurrence
 	// moved the live member into the fresh map and deleted it from
 	// c.members, and the second occurrence (finding c.members empty for
@@ -6462,7 +6465,7 @@ func TestNamespacedWrongNodeTriggersRefreshAndOneRetry(t *testing.T) {
 	if err := ns.Set("some-key", "v", 0); err != nil {
 		t.Fatal(err)
 	}
-	primary, err := NewHashRing(testNames).RouteNS([]byte("users"), []byte("some-key"))
+	primary, err := newHashRing(testNames).RouteNS([]byte("users"), []byte("some-key"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6485,7 +6488,7 @@ func TestNamespacedWrongNodeTriggersRefreshAndOneRetry(t *testing.T) {
 // key, at least one of a handful of namespaces routes to a different
 // primary than the default namespace does.
 func TestNamespacedRoutingCanDifferFromTheDefaultNamespace(t *testing.T) {
-	ring := NewHashRing([]string{"node-a", "node-b", "node-c"})
+	ring := newHashRing([]string{"node-a", "node-b", "node-c"})
 	defaultPrimary, err := ring.Route([]byte("some-key"))
 	if err != nil {
 		t.Fatal(err)

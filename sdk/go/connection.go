@@ -1063,7 +1063,7 @@ func (c *connection) readLoop() {
 		// the oldest pending request below and poison the connection via
 		// the generic mismatch path instead of this dedicated one.
 		if marker == 'B' {
-			err := fmt.Errorf("nanocached: server rejected the connection (connection limit reached)")
+			err := connectionLost("nanocached: server rejected the connection (connection limit reached)", nil)
 			c.poison(err)
 			if haveReq {
 				// req has already been shifted out of c.pending above, so

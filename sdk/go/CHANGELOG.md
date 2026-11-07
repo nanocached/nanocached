@@ -10,6 +10,12 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `HashRing`, `NewHashRing`, `DefaultCompressionThreshold` and `DefaultReconnectCooldown` are no longer exported. No public function took or returned a `HashRing`, and the two defaults were exported by no other SDK; `Config` documents them (256 bytes and 1 s; `CompressionThreshold: 0` means the default, and `1` compresses every non-empty value).
+- A connection-limit `B` that arrives while requests are pending now matches `ErrConnectionLost`. It was an untyped error, so the cluster retry and the redial skipped it; the other SDKs treat it as a lost connection.
+- `Connect`'s option checks (no addresses, a negative `CompressionThreshold` or `ReadHedgeAfter`, `ReadHedgeAfter` with `ViaProxy`, `CA` without `TLS`, an unreadable or empty CA file) now match `ErrInvalidArgument`, and a malformed handshake or discovery response matches `ErrProtocol`. They were untyped `fmt.Errorf` errors that matched no sentinel; messages are unchanged.
+
 ### Fixed
 
 - Hedged reads (`ReadHedgeAfter`) stalled once an owner had stopped answering: after 32 hedge legs were left running against it, the next read waited for the request timeout (30 s) for one of them instead of returning the replica's answer, and against an owner that was only slow the limit made hedging ineffective at moderate read rates (about 400 reads per second and up against an owner answering in a few hundred milliseconds). An owner that has 32 hedge legs unanswered after the hedge interval is now tried last, so reads go to its replica first; a miss still waits for the primary. The limit on hedge legs in flight, which waits for a read's remaining legs, is raised from 32 to 256 and now only applies when every owner of a key is slow. (#1390)

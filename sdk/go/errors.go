@@ -2,6 +2,7 @@ package nanocached
 
 import (
 	"errors"
+	"fmt"
 	"net"
 )
 
@@ -205,6 +206,14 @@ func protocolError(context string) error {
 
 func invalidArgument(context string) error {
 	return errors.Join(ErrInvalidArgument, errors.New(context))
+}
+
+func protocolErrorf(format string, args ...any) error {
+	return protocolError(fmt.Sprintf(format, args...))
+}
+
+func invalidArgumentf(format string, args ...any) error {
+	return invalidArgument(fmt.Sprintf(format, args...))
 }
 
 func retryableFailed(context string) error {
