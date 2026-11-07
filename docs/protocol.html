@@ -138,6 +138,17 @@ SDKs additionally append
 a <code>T</code> field (<code>A &lt;secret-length&gt; T\n</code>) to
 request <a href="#tags">response tags</a>; a server that supports them
 echoes the capability as <code>OnT</code>/<code>OdT</code>.</div>
+<p id="a-capabilities">The capability fields after the length are <code>T</code>
+and <code>R</code>, in that order. Every other token is reserved: a node
+answers <code>En</code>, a discovery server <code>Ed</code> and
+<code>nanocached-proxy</code> a bare <code>E</code>, and the connection is
+closed. That refusal is also how an SDK learns that a server does not know a
+capability it asked for, and falls back to asking for less. A later release
+may define a new token, only as an opt-in capability a client asks for, never
+as a change to what a request without it does. <code>V</code> is set aside for
+versioned writes (a version carried on write requests and replies, so that the
+owners of a key can order the writes to it); no release defines it yet, and
+nothing should send it.</p>
 <p>A server with no secret, asked for tags with the placeholder secret:</p>
 <pre class="session"><code>&gt; A 1 T R\n\0
 &lt; OnT\n</code></pre>
