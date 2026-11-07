@@ -282,6 +282,10 @@ and nothing is written. The value is measured after pickling (or as the
 decimal digits of an `int`), and after compression when
 `OPTIONS.COMPRESS` is on.
 
+## Stored format
+
+Values are stored as pickles, except a plain `int`, which is stored as `INCR`'s decimal-ASCII counter (see "Counter storage"). That format is **not covered** by the compatibility promise: a release may change it, and says so in its changelog. Plan a rolling deploy accordingly: while old and new workers share a namespace, one side may fail to read what the other wrote (see the [compatibility page](https://nanocached.org/compatibility.html)).
+
 ## Requirements
 
 Python 3.11+, Django 5.2+ (version 0.6.0 is the last release that

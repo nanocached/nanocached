@@ -83,6 +83,10 @@ renamed `secret` here (`authSecret` in the SDK) to match the shorter name
 `nanocachedStore` connects a fresh `NanocachedClient` every call — it
 never reuses a client the caller already has (matching how `cache-manager`'s
 own store factories, e.g. its Redis store, always dial their own client).
+To share a client you already hold, build the store yourself:
+`new NanocachedStore(client, namespace, defaultTtlMs, isCacheable?)`. It does
+not own that client: `store.disconnect()` closes it for every user of it, so
+close the client yourself when you are done with all of them.
 Nothing about *using* this package changes behavior on its own — as with
 any `cache-manager` store, the `caching(...)` call above is the setup;
 merely adding the dependency does nothing.
@@ -180,6 +184,10 @@ that size rejects with a `RangeError` before anything is sent, and the
 entry is not written. Values
 are measured after JSON serialization, and after compression when
 `compress` is on.
+
+## Stored format
+
+Values are stored as JSON (`JSON.stringify`). That format is **not covered** by the compatibility promise: a release may change it, and says so in its changelog. Plan a rolling deploy accordingly: while old and new workers share a namespace, one side may fail to read what the other wrote (see the [compatibility page](https://nanocached.org/compatibility.html)).
 
 ## Requirements
 

@@ -433,6 +433,13 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
             await reader.close()
 
 
+class ReadHedgeAfterRangeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_zero_negative_non_numeric_and_above_24_hours(self):
+        for bad in (0, -1, float("nan"), 24 * 60 * 60 + 1, float("inf")):
+            with self.assertRaisesRegex(ValueError, "read_hedge_after must be a positive number of seconds"):
+                await NanocachedClient.connect([("127.0.0.1", 1)], read_hedge_after=bad)
+
+
 class ReconnectCooldownOptionTests(unittest.IsolatedAsyncioTestCase):
     async def test_zero_and_omitted_mean_the_default_and_only_the_switch_turns_it_off(self):
         from nanocached._client import _DEFAULT_RECONNECT_COOLDOWN as default, _resolve_reconnect_cooldown as resolve

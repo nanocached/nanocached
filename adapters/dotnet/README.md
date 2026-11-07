@@ -199,6 +199,10 @@ their own idiomatic adapters (Spring `CacheManager`, Django cache backend,
 cache-manager store, [JCache](../jcache), [Keyv](../keyv)) rather than
 mirrors of this one.
 
+## Stored format
+
+Values are stored inside a 13-byte envelope (see "Sliding expiration"). That format is **not covered** by the compatibility promise: a release may change it, and says so in its changelog. Plan a rolling deploy accordingly: while old and new workers share a namespace, one side may fail to read what the other wrote (see the [compatibility page](https://nanocached.org/compatibility.html)).
+
 ## Requirements
 
 .NET 10+ (version 0.6.0 is the last release that supports .NET 8 and
