@@ -45,6 +45,8 @@ Full documentation is at <https://nanocached.org>.
 Images of the latest release are published to GitHub Container Registry as
 `:latest` and `:<version>`. Every `main` commit that passes CI is also
 published as `:main` and `:sha-<commit>`, for trying unreleased changes.
+[Compatibility](https://nanocached.org/compatibility.html) says
+what each tag promises; pin `:<version>`, not `:latest`, in production.
 
 ```sh
 docker pull ghcr.io/nanocached/nanocached-node:latest

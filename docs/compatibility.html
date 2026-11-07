@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Compatibility — nanocached</title>
-<meta name="description" content="What nanocached promises to keep stable from 1.0.0: the client wire protocol, every SDK's public API, and how breaking changes are released.">
+<meta name="description" content="What nanocached promises to keep stable from 1.0.0: the client wire protocol, every SDK's public API, the server flags, metrics and container images, and how breaking changes are released.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="icon" href="favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -98,12 +98,12 @@ recorded in the changelog of every affected component. Pin the major
 version you depend on; upgrading to the next major is the point at which
 you read the changelog.</p>
 
-<h2 id="not-covered">Not covered by this page</h2>
-<p>These have no compatibility promise yet; a decision for each is still
-open:</p>
-<ul>
-  <li>the container image layout and tags other than the version tag;</li>
-</ul>
+<h2 id="server">Server binaries and images</h2>
+<p>Besides the wire protocol and the SDKs, three more things that
+deployments are written against are covered from 1.0.0: the command line of
+the server binaries, the operations endpoints and metrics, and the container
+images. The same rule applies to each: a breaking change waits for a new
+major version, and adding something is a minor change.</p>
 
 <h3 id="cli">Command-line flags and environment variables</h3>
 <p>From 1.0.0 the command line of <code>nanocached-node</code>,
@@ -174,7 +174,43 @@ and the order of the lines in <code>/metrics</code>, and the unauthenticated
 nature of the endpoint (keep it on an internal interface, as the guide
 says).</p>
 
-<h3 id="tests-tools">Outside the promise: <code>tests/</code> and <code>tools/</code></h3>
+<h3 id="images">Container images</h3>
+<p>The three images are
+<code>ghcr.io/nanocached/nanocached-node</code>,
+<code>nanocached-proxy</code> and <code>nanocached-discovery</code>. From
+1.0.0 these are covered:</p>
+<ul>
+  <li><strong><code>:X.Y.Z</code></strong> names that release and is never
+  moved to a different one. This is the tag to pin. Re-running a failed
+  release rebuilds the same version from the same source, so its digest can
+  change then; pin by digest if you need the exact bytes;</li>
+  <li><strong><code>:latest</code></strong> is the newest stable release,
+  moved for all three images together, and never a pre-release. It does
+  <em>not</em> stay inside a major version: the release that moves it past
+  1.x is the first 2.0.0. Do not run <code>:latest</code> where a major
+  upgrade must be a decision;</li>
+  <li>the platforms <code>linux/amd64</code> and <code>linux/arm64</code>;
+  dropping one is a breaking change, adding one is not;</li>
+  <li>how an image starts: the entrypoint is that image&rsquo;s own server
+  binary, so what follows the image name on a command line (or in
+  <code>args</code> and <code>command</code> fields) is the flags covered
+  <a href="#cli">above</a>; the process runs as uid and gid 10001; the
+  default arguments are <code>--host 0.0.0.0</code>; the ports are 8356
+  (node), 8357 (discovery) and 8358 (proxy).</li>
+</ul>
+<p>A new major version may change any of those, and says so in the
+changelog. Not covered, and free to change in any release: the base image
+(its distribution, libc and version) and anything the guides do not rely on
+in it, such as a shell or other tools; where the binary and other files sit
+in the image; the working directory; the image&rsquo;s labels and size.</p>
+<p>Two more kinds of tag exist and carry no promise at all:
+<code>:main</code> and <code>:sha-&lt;commit&gt;</code> are builds of
+unreleased commits, for trying a change. Floating tags such as
+<code>:X</code> or <code>:X.Y</code> do not exist; a minor release may add
+them, but nothing here depends on that.</p>
+
+<h2 id="not-covered">Not covered</h2>
+<h3 id="tests-tools"><code>tests/</code> and <code>tools/</code></h3>
 <p>Nothing under the repository&rsquo;s <code>tests/</code> and
 <code>tools/</code> directories is covered, at any version: the E2E,
 chaos and oracle scripts, the conformance harness, the AWS harness, the
