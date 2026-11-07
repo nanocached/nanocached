@@ -65,7 +65,8 @@ public final class JdkCacheValueSerializer implements CacheValueSerializer {
 
     /**
      * Uses {@code filter} instead of (or in addition to configuring) the JVM-wide filter.
-     * Pass {@code null} to explicitly deserialize without a filter — not recommended; see the
+     * Pass {@code (ObjectInputFilter) null} (the cast picks this constructor over the
+     * {@code ClassLoader} one) to explicitly deserialize without a filter — not recommended; see the
      * class javadoc and the README's trust boundary section. Unlike the no-arg constructor,
      * {@code filter} is fixed for this instance's lifetime, not re-read.
      */

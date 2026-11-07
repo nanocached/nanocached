@@ -50,7 +50,11 @@ Brings in the `org.nanocached:nanocached` SDK of the same version and
 
 Get a `CacheManager` through the standard JSR-107 API. Connection settings
 come from `Properties` passed to `getCacheManager` — the `nanocached.*`
-keys mirror the Spring Boot starter's:
+keys follow the Spring Boot starter's names, except that
+`Properties` hold plain numbers, so the two durations carry their unit in the
+name (`reconnect-cooldown-millis`, `read-hedge-after-millis`; the starter takes
+`reconnect-cooldown` and `read-hedge-after` as durations). A `nanocached.*`
+key the provider does not know is a `CacheException`, not ignored:
 
 ```java
 Properties properties = new Properties();

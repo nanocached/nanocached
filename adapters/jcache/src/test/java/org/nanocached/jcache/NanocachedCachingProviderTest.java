@@ -1,6 +1,7 @@
 package org.nanocached.jcache;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -58,6 +59,20 @@ class NanocachedCachingProviderTest {
                 provider instanceof NanocachedCachingProvider,
                 "expected the ServiceLoader to find NanocachedCachingProvider, got "
                         + provider.getClass());
+    }
+
+    @Test
+    void rejectsAnUnknownNanocachedProperty() {
+        CachingProvider provider = new NanocachedCachingProvider();
+        Properties properties = new Properties();
+        properties.setProperty("nanocached.addresses", "127.0.0.1:1");
+        properties.setProperty("nanocached.tsl", "true");
+        properties.setProperty("other.setting", "left alone");
+        CacheException error = assertThrows(
+                CacheException.class,
+                () -> provider.getCacheManager(URI.create("test:typo"), null, properties));
+        assertTrue(error.getMessage().contains("nanocached.tsl"), error.getMessage());
+        assertFalse(error.getMessage().contains("other.setting"), error.getMessage());
     }
 
     @Test
