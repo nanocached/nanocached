@@ -383,22 +383,26 @@ export const FIRE_AND_FORGET_TUNING = { maxInFlight: 32 };
  * still unanswered at that moment is a *late* leg of its node
  * (`suspectLateLegs` below). A node with that many late legs outstanding is
  * treated as not answering, and a read that has another owner tries that
- * owner first, so the silent node stops collecting a new leg per read. Legs
- * are counted only once they are late, not while merely in flight, so a
- * burst of concurrent reads to a healthy node never demotes it.
+ * owner first, so the silent node stops collecting a new leg per read. A
+ * leg is counted only once it is late — unanswered when the interval
+ * elapsed — not while merely in flight, so a burst of concurrent reads to a
+ * node that answers within the interval never demotes it; one whose round
+ * trip is longer than the interval is demoted by concurrency alone, which
+ * only changes the order its replicas are tried in.
  *
  * `maxLoserLegs` bounds how many hedged-read legs a single client may have
- * running in the background at once (issue #276), analogous to
- * FIRE_AND_FORGET_TUNING above but tracked against `hedgedReads` — a
- * separate pool, not shared with `backgroundReplicaWrites`. It is the
- * backstop for when trying a silent owner last is not enough because every
- * owner of the key is slow: past it, a further losing leg is awaited
- * synchronously right there (readHedged's resolveLosers) instead of being
- * left detached, the same "fall back to synchronous" shape
- * FIRE_AND_FORGET_TUNING's cap uses. It must sit well above `suspectLateLegs`
- * times the replication factor, or it would fire before a slow node has
- * been demoted. A mutable object only so tests can shrink them, mirroring
- * FIRE_AND_FORGET_TUNING. */
+ * left running in the background (issue #276), analogous to
+ * FIRE_AND_FORGET_TUNING above but tracked in `detachedHedgeLegs` — the
+ * legs of reads that have already returned (or whose caller gave up), not
+ * the legs of reads still in flight, whose number is the read concurrency
+ * and says nothing about accumulation. It is the backstop for when trying a
+ * silent owner last is not enough because every owner of the key is slow:
+ * past it, a further losing leg is awaited synchronously right there
+ * (readHedged's resolveLosers) instead of being left detached, the same
+ * "fall back to synchronous" shape FIRE_AND_FORGET_TUNING's cap uses. It
+ * must sit well above `suspectLateLegs` times the replication factor, or it
+ * would fire before a slow node has been demoted. A mutable object only so
+ * tests can shrink them, mirroring FIRE_AND_FORGET_TUNING. */
 export const HEDGE_READ_TUNING = { maxLoserLegs: 256, suspectLateLegs: 32 };
 
 /** Keep-alive is always on and internal (issue #27): every interval, a
@@ -985,6 +989,10 @@ export class NanocachedClient {
    * rejection, and drained by close() exactly like
    * `backgroundReplicaWrites`. See `readHedged`. */
   private readonly hedgedReads = new Set<Promise<unknown>>();
+  /** How many of those a read left running after it returned (or its
+   * caller gave up on it): the legs HEDGE_READ_TUNING.maxLoserLegs bounds.
+   * The rest of `hedgedReads` belong to reads still in flight. */
+  private detachedHedgeLegs = 0;
   /** Late hedge legs outstanding per node name (see HEDGE_READ_TUNING); an
    * entry exists only while it is positive. */
   private readonly lateHedgeLegs = new Map<string, number>();
@@ -3238,18 +3246,23 @@ export class NanocachedClient {
     // issue #276: `losers` are legs still pending once this read has
     // decided its answer. Normally they're simply left running — already
     // registered in `hedgedReads` by start() above — for close() to
-    // eventually drain, same as always. But past
-    // HEDGE_READ_TUNING.maxLoserLegs concurrently tracked legs (checked
-    // against `hedgedReads`, which still counts `losers` themselves at
-    // this point), the losers are removed from `hedgedReads` and awaited
-    // right here instead — the same "fall back to synchronous" shape
+    // eventually drain, same as always, and counted in `detachedHedgeLegs`
+    // until they settle. But past HEDGE_READ_TUNING.maxLoserLegs legs
+    // already left running that way (the legs of reads still in flight
+    // are not accumulation and do not count, so a burst of concurrent
+    // reads cannot by itself force every read to wait for its slow
+    // loser), the losers are removed from `hedgedReads` and awaited right
+    // here instead — the same "fall back to synchronous" shape
     // FIRE_AND_FORGET_TUNING's cap uses — so a client issuing many
     // concurrent hedged reads against a slow owner can't accumulate
     // unbounded background legs. Outcomes are ignored either way: a
     // loser's result was never going to be used.
     const resolveLosers = async (losers: Array<{ promise: Promise<Outcome>; index: number }>): Promise<void> => {
       if (losers.length === 0) return;
-      if (this.hedgedReads.size < HEDGE_READ_TUNING.maxLoserLegs) return;
+      if (this.detachedHedgeLegs < HEDGE_READ_TUNING.maxLoserLegs) {
+        for (const loser of losers) this.countDetachedLeg(loser.promise);
+        return;
+      }
       for (const loser of losers) {
         this.hedgedReads.delete(loser.promise as Promise<unknown>);
       }
@@ -3264,7 +3277,13 @@ export class NanocachedClient {
     while (pending.length > 0) {
       let timer: NodeJS.Timeout | null = null;
       const racers: Array<Promise<Outcome | "timeout">> = pending.map((leg) => leg.promise);
-      if (nextIndex < names.length) {
+      // The hedge interval is raced while there is another owner to
+      // start, and once more for a leg not yet counted as late — the last
+      // owner started has no owner after it, but its silence counts like
+      // any other's. With every owner started and every leg counted, only
+      // the legs are waited for.
+      const uncounted = pending.some((leg) => !lateCounted.has(leg.index));
+      if (nextIndex < names.length || uncounted) {
         racers.push(
           new Promise<"timeout">((resolve) => {
             timer = setTimeout(() => resolve("timeout"), hedgeAfterMs);
@@ -3281,16 +3300,18 @@ export class NanocachedClient {
 
       if (winner === "timeout") {
         // Hedge interval elapsed with no answer: every leg still pending
-        // is late; then one more owner, no change to `pending` for the
-        // legs already in flight.
+        // is late; then one more owner, if any, with no change to
+        // `pending` for the legs already in flight.
         for (const leg of pending) {
           if (!lateCounted.has(leg.index)) {
             lateCounted.add(leg.index);
             this.countLateLeg(names[leg.index], leg.promise);
           }
         }
-        pending.push({ promise: start(nextIndex), index: nextIndex });
-        nextIndex++;
+        if (nextIndex < names.length) {
+          pending.push({ promise: start(nextIndex), index: nextIndex });
+          nextIndex++;
+        }
         continue;
       }
 
@@ -3343,6 +3364,17 @@ export class NanocachedClient {
       const remaining = (this.lateHedgeLegs.get(name) ?? 0) - 1;
       if (remaining > 0) this.lateHedgeLegs.set(name, remaining);
       else this.lateHedgeLegs.delete(name);
+    });
+  }
+
+  /** Counts `leg`, a hedge leg left running by a read that has returned,
+   * in `detachedHedgeLegs` until it settles. `leg` never rejects (see
+   * readHedged), so the release runs exactly once; a leg that has already
+   * settled is released on the next microtask. */
+  private countDetachedLeg(leg: Promise<unknown>): void {
+    this.detachedHedgeLegs++;
+    void leg.then(() => {
+      this.detachedHedgeLegs--;
     });
   }
 

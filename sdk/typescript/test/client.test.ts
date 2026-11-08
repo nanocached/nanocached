@@ -6252,6 +6252,84 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
     }
   });
 
+  it("legs of reads still in flight do not count against the loser-leg cap", async () => {
+    // The cap bounds the legs left running by reads that have already
+    // returned, not the legs of reads still in flight: with the cap at
+    // the number of concurrent reads, none of them has a detached leg
+    // ahead of it, so every one returns with the replica's answer. The
+    // check used to be against every tracked leg, so the other reads'
+    // own in-flight primary legs alone met the cap and all three waited
+    // for the slow primary.
+    HEDGE_READ_TUNING.maxLoserLegs = 3;
+
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readHedgeAfterMs: 50,
+    });
+    try {
+      await client.set("k", "v");
+      const { primary, replica } = cluster.ownerOf("k");
+      primary.mock.delayGets(300);
+
+      const elapsed = await Promise.all(
+        Array.from({ length: 3 }, async () => {
+          const [value, ms] = await timed(client.get("k"));
+          assert.equal(value, "v");
+          return ms;
+        }),
+      );
+
+      for (const ms of elapsed) {
+        assert.ok(ms < 300 - TIMING_TOLERANCE_MS, `expected every call to return with the replica's answer, got ${elapsed}`);
+      }
+      assert.equal(replica.mock.getCount(), 3);
+      assert.equal((client as any).detachedHedgeLegs, 3, "the three primary legs were left running");
+
+      await client.close();
+      assert.equal((client as any).hedgedReads.size, 0);
+      assert.equal((client as any).detachedHedgeLegs, 0, "the detached legs release their counts");
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("the last owner started is counted late too", async () => {
+    // Once the final owner's leg has started there is no owner left to
+    // hedge to, but its silence counts like any other's: the hedge timer
+    // is still waited out once for it. It used not to be, so with
+    // replication 2 the replica could never be demoted through the keys
+    // it is second for.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readHedgeAfterMs: 50,
+    });
+    try {
+      await client.set("k", "v");
+      const { primary, replica } = cluster.ownerOf("k");
+      primary.mock.delayGets(400);
+      replica.mock.delayGets(400);
+
+      const read = client.get("k");
+      // 50 ms: the primary is late and the replica starts; 100 ms: the
+      // replica is late too.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.equal((client as any).lateHedgeLegs.get(primary.name), 1);
+      assert.equal((client as any).lateHedgeLegs.get(replica.name), 1);
+
+      assert.equal(await read, "v");
+      const deadline = Date.now() + 5000;
+      while ((client as any).lateHedgeLegs.size > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal((client as any).lateHedgeLegs.size, 0, "both legs release their counts");
+    } finally {
+      await client.close();
+      await cluster.close();
+    }
+  });
+
   it("tries a silent primary last once it has enough late legs", async () => {
     HEDGE_READ_TUNING.suspectLateLegs = 2;
     const cluster = await startReplicatedCluster();
