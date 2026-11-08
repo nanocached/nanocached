@@ -12,7 +12,10 @@ namespace Nanocached;
 /// <para>A token that is already cancelled when the call is made sends
 /// nothing. After a cancellation a write — and above all a counter or
 /// compare-and-set operation — has an outcome the caller does not know,
-/// exactly as after <see cref="ConnectionLostException"/>.</para>
+/// exactly as after <see cref="ConnectionLostException"/>. A cancelled
+/// call that had not reached the wire yet (parked on a ring refresh or a
+/// redial) keeps going and may land after calls the caller made later, so
+/// an abandoned write can overwrite a newer one for the same key.</para>
 /// </summary>
 internal static class Cancellation
 {
