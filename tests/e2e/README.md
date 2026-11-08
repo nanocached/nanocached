@@ -100,15 +100,28 @@ run; the logs are kept for 14 days.
 - By hand (`gh workflow run chaos-nightly.yaml -f cells=21`, or Run workflow
   in the Actions tab) it runs as many cells as asked, in parallel.
 
-The node image of these runs is built without the `trace` cargo feature. The
-feature (`src/trace.rs`, selected by `NANOCACHED_TRACE_PREFIX`) writes a
-`TRACE` line to stderr for each write to the keys whose names start with one of
-the prefixes, so a key can be followed through the cache and the forward
-paths. The nightly ran with it on (`tn,cp,cc`) for a day: eight of ten cells
-failed, on oracles whose keys were not traced (namespace keys, deletes, INCR),
-and three cells of the same commit without it passed. The cause, the trace
-code or the volume of stderr lines, is not known, so the nightly stays without
-it. To trace keys in a local run, build the node with
+The node image of these runs is built with the `trace` cargo feature
+(`src/trace.rs`, selected by `NANOCACHED_TRACE_PREFIX`): it writes a `TRACE`
+line to stderr for each request, apply and forward of the keys whose names
+start with one of the prefixes, with the values involved, so a key can be
+followed through the cache and the forward paths. The nightly traces the
+serial INCR keys only (`is`). Once every node's log is saved, `chaos.sh` runs
+`incrtrace.py` over them: per key, the increments the nodes applied against
+the ones the loader saw acknowledged or left in doubt, and whether any
+increment started from a value no increment had produced. Both are asserted,
+so a serial INCR answer the oracle cannot explain (one more than the
+increments asked for) comes with the node-side timeline of that key in the
+run's logs instead of a count alone; fewer applications than acknowledged is
+printed only. With the node built without the feature the check prints that
+it found no `TRACE` lines and asserts nothing.
+
+Why `is` alone: a day of the nightly tracing `tn,cp,cc` (about 300,000 lines
+a cell) had eight of ten cells fail on oracles whose keys were not traced,
+with the join and rejoin migrations about fifteen times slower than usual,
+and three cells of the same commit without tracing passed; `tn` alone (about
+110,000 lines) and `is` alone (about 350,000 lines, 30 cells) ran with the
+usual round times and no failure. The volume of stderr is the suspect, not
+confirmed. To trace other keys in a local run, build the node with
 `docker build --target node --build-arg FEATURES=trace .` and pass
 `NENV="-e NANOCACHED_TRACE_PREFIX=<prefix>[,<prefix>...]"` to `chaos.sh`.
 

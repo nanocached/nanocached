@@ -1154,6 +1154,23 @@ async fn forward_result(config: &ConnectionConfig, key: &Key, result: ForwardedR
     let Some(node_context) = &config.node_context else {
         return;
     };
+    trace!(
+        &key.name,
+        "forward key={} result={} migration_targets={:?} handoff_targets={:?}",
+        crate::trace::name(&key.name),
+        match &result {
+            ForwardedResult::Set { value, .. } => crate::trace::name(&value[..value.len().min(24)]),
+            ForwardedResult::Delete => "<delete>".to_string(),
+        },
+        migration_targets_for(node_context, key)
+            .iter()
+            .map(|t| t.addr.clone())
+            .collect::<Vec<_>>(),
+        handoff_targets_for(node_context, key)
+            .iter()
+            .map(|t| t.addr.clone())
+            .collect::<Vec<_>>()
+    );
 
     for target in migration_targets_for(node_context, key) {
         let write = match &result {
@@ -3723,10 +3740,23 @@ async fn handle_connection(
                 if let Some(node_context) = &config.node_context
                     && wrong_node_refreshed(node_context, &key).await
                 {
+                    trace!(
+                        &key.name,
+                        "set_request_w key={} from={}",
+                        crate::trace::name(&key.name),
+                        address
+                    );
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
                     continue;
                 }
+                trace!(
+                    &key.name,
+                    "set_request key={} from={} value={}",
+                    crate::trace::name(&key.name),
+                    address,
+                    crate::trace::name(&value[..value.len().min(24)])
+                );
 
                 let response = execute_command(
                     &request_tx,
@@ -3760,6 +3790,14 @@ async fn handle_connection(
                         "received U but this node isn't configured with a discovery server",
                     ));
                 };
+                trace!(
+                    &key.name,
+                    "u_request key={} from={} value={} if_absent={}",
+                    crate::trace::name(&key.name),
+                    address,
+                    crate::trace::name(&value[..value.len().min(24)]),
+                    if_absent
+                );
 
                 // Issue #295: `U` skips the wrong-node check below by
                 // design (see this arm's own doc comment), so without
@@ -4011,10 +4049,25 @@ async fn handle_connection(
                 if let Some(node_context) = &config.node_context
                     && not_the_primary_refreshed(node_context, &key).await
                 {
+                    trace!(
+                        &key.name,
+                        "incr_request_w key={} from={} tag={:?}",
+                        crate::trace::name(&key.name),
+                        address,
+                        tag
+                    );
                     write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
                         .await?;
                     continue;
                 }
+                trace!(
+                    &key.name,
+                    "incr_request key={} from={} delta={} tag={:?}",
+                    crate::trace::name(&key.name),
+                    address,
+                    delta,
+                    tag
+                );
 
                 let response = execute_command(
                     &request_tx,
@@ -4024,6 +4077,13 @@ async fn handle_connection(
                     },
                 )
                 .await?;
+                trace!(
+                    &key.name,
+                    "incr_reply key={} from={} reply={}",
+                    crate::trace::name(&key.name),
+                    address,
+                    String::from_utf8_lossy(&encode_response(&response, tag)).trim_end()
+                );
                 // Issue #129: only a `Response::Incremented` — i.e. INCR
                 // actually wrote a new value — needs forwarding;
                 // `NotFound`/`NotNumeric` changed nothing. The remaining
