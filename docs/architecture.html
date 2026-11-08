@@ -648,6 +648,15 @@ here.</p>
   once, an eviction while a third drains) leave keys transiently below R.
   Each healer acts on one membership snapshot and none coordinate; retire
   nodes one at a time and the case does not arise.</li>
+  <li>A drain that runs out of its budget leaves the keys it could not hand
+  off at R=1 (the leaver logs how many: <code>could not be handed off
+  within the drain budget</code>) until the survivors&rsquo; re-replication
+  pass for the leave has run, which takes seconds to tens of seconds for
+  tens of thousands of entries. A crash of the remaining owner inside that
+  window loses those keys for good: at R=2 that is two copy losses. The
+  budget is a soft limit by design (the leaver must exit), so the operator
+  side is to size <code>--drain-timeout</code> so the WARN does not appear,
+  and to let the cluster settle after a leave before the next change.</li>
   <li>A displaced copy loses its dead-copy mark on rewrite and is removed
   by the ownership reclaim pass after the 120&nbsp;s grace; an eviction
   that flips membership back inside the grace makes it live again, so a

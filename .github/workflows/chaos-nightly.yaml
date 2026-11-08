@@ -134,7 +134,7 @@ jobs:
           {
             echo "### chaos run ${{ matrix.run }}"
             echo '```'
-            grep -E "DONE|FAIL|^=== (check|discovery|incr trace|.* accepted)" chaos.log | cut -c1-700 || true
+            grep -E "DONE|FAIL|leaver .* drain:|re-replication after the leave|^=== (check|discovery|incr trace|.* accepted)" chaos.log | cut -c1-700 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

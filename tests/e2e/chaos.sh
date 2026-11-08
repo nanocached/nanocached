@@ -6,7 +6,17 @@
 # liveness eviction, start it again -> it rejoins as a fresh identity).
 # Membership never drops below 3 by construction (join before the next
 # decommission/kill), so with R=2 every key keeps at least one live copy
-# through a kill and gets re-homed by the following join/decommission.
+# through a kill and gets re-homed by the following join/decommission —
+# provided the cluster has healed from the previous fault. The drain
+# budget (--drain-timeout 20 here) is a soft limit: a leaver that runs out
+# of it leaves the undelivered keys at R=1 and says so (its drain is
+# printed per round: handoff time against the budget, entries left
+# behind), and the survivors' re-replication pass for the leave is what
+# brings them back to R=2. A kill before that pass finished took the only
+# copy of 28 such keys in one cell of 21, so after each decommission the
+# script waits (HEAL_BUDGET, 90 s) until every survivor has reported that
+# pass before the next round, as an operator retiring one node at a time
+# would.
 # PASS: every leaver exits 0, the load sees 0 corrupt and 0 miss (pre-seeded
 # keyspace, no deletes), and the untouched range k20000..k29999 verifies
 # with 0 miss / 0 corrupt / 0 err at the end. err_total is printed, not
@@ -205,12 +215,57 @@ for r in $(seq 1 $ROUNDS); do
       ;;
     decommission)
       n=${live[0]}; live=("${live[@]:1}"); T "round $r DECOMMISSION $n (docker stop -t 40, members -> ${#live[@]})"
+      # How many re-replication passes each survivor has run so far, so the
+      # heal wait below can tell the pass this leave triggers from earlier ones.
+      rrfile="$L/rrcount-round$r.txt"; : > "$rrfile"
+      for s in "${live[@]}"; do echo "$s $(docker logs $s 2>&1 | grep -c 're-replication after membership change')" >> "$rrfile"; done
       docker stop -t 40 $n >/dev/null
       rc=$(docker inspect -f '{{.State.ExitCode}}' $n)
       T "leaver $n exited rc=$rc after $(( $(date +%s)-t0 ))s"
       [ "$rc" = 0 ] || { T "FAIL: leaver $n exit code $rc"; fail=1; }
       wait_members ${#live[@]} $D 60 || { T "FAIL: membership after decommission of $n"; fail=1; }
       docker logs -t $n > "$L/$n.log" 2>&1; docker rm $n >/dev/null
+      # The leaver's own account of its drain: how long the handoff took
+      # against its budget and, when the budget ran out, how many entries it
+      # left behind at R=1. The WARN summary at the end covers live nodes
+      # only, so this is the one place the leaver's WARN is seen.
+      drain=$(python3 - "$L/$n.log" <<'PY'
+import re, sys, datetime
+def ts(line):
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.(\d+)", line)
+    return datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").timestamp() + int(m.group(2)[:6].ljust(6, "0")) / 1e6
+t0 = t1 = None; budget = handed = left = grace = "?"
+for line in open(sys.argv[1], errors="replace"):
+    if "shutdown signal received" in line:
+        t0 = ts(line); m = re.search(r"budget (\d+)s", line); budget = m.group(1) if m else "?"
+    elif "decommission: handed off" in line:
+        t1 = ts(line); handed = re.search(r"handed off (\d+)", line).group(1)
+    elif "could not be handed off" in line:
+        left = re.search(r"decommission: (\d+) entr", line).group(1)
+    elif "forwarding window open for" in line:
+        grace = re.search(r"open for (\d+)s", line).group(1)
+took = f"{t1 - t0:.1f}s" if t0 and t1 else "?"
+print(f"handed off {handed} entries in {took} (budget {budget}s), left behind {left if left != '?' else 0}, forwarding window {grace}s")
+PY
+)
+      T "leaver $n drain: $drain"
+      # Retire one node at a time and let the cluster heal: the leave
+      # re-ranked the leaver's keys and every survivor runs one
+      # re-replication pass for it. Wait for that pass to report on every
+      # survivor before the next fault, so the kill of the next round cannot
+      # take the only copy of a key the leaver left behind (the drain budget
+      # is a soft limit; one cell in 21 ran out of it). Bounded by
+      # HEAL_BUDGET; a timeout is printed, not failed.
+      hb=$(date +%s); pending=("${live[@]}")
+      while [ ${#pending[@]} -gt 0 ] && [ $(( $(date +%s)-hb )) -lt ${HEAL_BUDGET:-90} ]; do
+        still=()
+        for s in "${pending[@]}"; do
+          c=$(docker logs $s 2>&1 | grep -c 're-replication after membership change'); b=$(awk -v s="$s" '$1==s{print $2}' "$rrfile")
+          [ "$c" -gt "${b:-0}" ] || still+=("$s")
+        done
+        pending=("${still[@]}"); [ ${#pending[@]} -eq 0 ] || sleep 1
+      done
+      if [ ${#pending[@]} -eq 0 ]; then T "re-replication after the leave of $n reported by every survivor $(( $(date +%s)-hb ))s after the leave"; else T "WARN: re-replication after the leave of $n not reported by ${pending[*]} within ${HEAL_BUDGET:-90}s; continuing"; fi
       ;;
     kill)
       # Kill the newest node (a join just completed, so the oldest ones hold
