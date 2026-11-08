@@ -705,7 +705,7 @@ func Connect(config Config) (*Client, error) {
 		}
 
 		if len(result.nodes) == 0 {
-			lastError = fmt.Errorf(
+			lastError = protocolErrorf(
 				"nanocached: no live nodes registered with the discovery server at %s", key)
 			continue
 		}
@@ -719,7 +719,7 @@ func Connect(config Config) (*Client, error) {
 	}
 
 	if lastError == nil {
-		lastError = fmt.Errorf("nanocached: could not connect to any address")
+		lastError = connectionLost("nanocached: could not connect to any address", nil)
 	}
 	return nil, lastError
 }
@@ -826,7 +826,7 @@ func (c *Client) openCluster(result *identified) error {
 					_ = other.result.conn.Close()
 				}
 			}
-			return fmt.Errorf(
+			return protocolErrorf(
 				"nanocached: discovery server returned a non-node address: %s", nodes[i].Address)
 		}
 	}
@@ -860,7 +860,7 @@ func (c *Client) openCluster(result *identified) error {
 
 	if reachable == 0 {
 		if lastError == nil {
-			lastError = fmt.Errorf("nanocached: could not connect to any address")
+			lastError = connectionLost("nanocached: could not connect to any address", nil)
 		}
 		return lastError
 	}
@@ -900,13 +900,13 @@ func (c *Client) connectViaProxy() error {
 			// Config.ViaProxy's doc calls out, so fail fast instead of
 			// silently connecting to the wrong thing.
 			_ = result.conn.Close()
-			return fmt.Errorf(
+			return invalidArgumentf(
 				"nanocached: ViaProxy requires a discovery server address, but %s identifies as "+
 					"a cache node", key)
 		}
 
 		if len(result.nodes) == 0 {
-			lastError = fmt.Errorf(
+			lastError = protocolErrorf(
 				"nanocached: no proxies registered with the discovery server at %s", key)
 			continue
 		}
@@ -926,7 +926,7 @@ func (c *Client) connectViaProxy() error {
 	}
 
 	if lastError == nil {
-		lastError = fmt.Errorf("nanocached: could not connect to any address")
+		lastError = connectionLost("nanocached: could not connect to any address", nil)
 	}
 	return lastError
 }
@@ -954,13 +954,13 @@ func (c *Client) dialRandomProxy(proxies []discoveredNode) (conn *connection, ad
 			// proxy; if it no longer identifies as one, treat it like any
 			// other unreachable candidate rather than erroring out
 			// early — another registered proxy may still be reachable.
-			lastError = fmt.Errorf("nanocached: %s no longer identifies as a proxy", candidate)
+			lastError = protocolErrorf("nanocached: %s no longer identifies as a proxy", candidate)
 			continue
 		}
 		return c.trackedConnection(result.conn, result.tagged), candidate, nil
 	}
 	if lastError == nil {
-		lastError = fmt.Errorf("nanocached: no proxies registered with discovery")
+		lastError = protocolError("nanocached: no proxies registered with discovery")
 	}
 	return nil, "", lastError
 }
@@ -3472,7 +3472,7 @@ func (c *Client) openNodeConnection(address string) (*connection, error) {
 		return nil, err
 	}
 	if result.conn == nil {
-		return nil, fmt.Errorf("nanocached: %s no longer identifies as a cache node", address)
+		return nil, protocolErrorf("nanocached: %s no longer identifies as a cache node", address)
 	}
 	if c.IsClosed() {
 		_ = result.conn.Close()

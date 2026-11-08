@@ -1074,7 +1074,12 @@ func (c *connection) readLoop() {
 			return
 		}
 		if !haveReq {
-			c.poison(fmt.Errorf("nanocached: unsolicited response %q from server (connection desynced)", marker))
+			// The same failure as the tag mismatch below — the streams are
+			// misaligned and the connection is finished — so the pending
+			// requests get the same ErrConnectionLost (redialed, and
+			// retried when idempotent), not an untyped error.
+			c.poison(connectionLost(
+				fmt.Sprintf("nanocached: unsolicited response %q from server (connection desynced)", marker), nil))
 			return
 		}
 
