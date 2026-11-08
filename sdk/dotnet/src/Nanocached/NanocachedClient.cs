@@ -387,10 +387,15 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     // doc comment on why no CancellationToken ever reaches the stream) —
     // left to finish detached, and drained by Close() exactly like
     // _backgroundReplicaPermits' pool is. Bounded at
-    // MaxInFlightHedgeLoserLegs (issue #276): past that many concurrently
-    // detached legs, ReadHedgedAsync awaits its own remaining losers
-    // synchronously instead of leaving them detached here.
+    // MaxInFlightHedgeLoserLegs (issue #276): past that many legs left
+    // running by reads that returned (_detachedHedgeLegs), ReadHedgedAsync
+    // awaits its own remaining losers synchronously instead of leaving
+    // them detached here.
     private readonly ConcurrentDictionary<Task, byte> _hedgedReads = new();
+    // How many of _hedgedReads a read left running after it returned: the
+    // legs MaxInFlightHedgeLoserLegs bounds. The rest belong to reads still
+    // in flight, whose number is the read concurrency, not accumulation.
+    private int _detachedHedgeLegs;
     // Serializes a hedge leg's "check _closed, then register" (StartLeg)
     // against Close()'s "observe the set empty, then stop draining" (issue
     // #91). Without it a leg could be registered — and dialed against a
@@ -4437,7 +4442,17 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         while (pending.Count > 0)
         {
             Task<T> completed;
-            if (nextIndex < names.Count)
+            // The hedge interval is waited out while there is another owner
+            // to start, and once more for a leg not yet counted as late —
+            // the last owner started has no owner after it, but its silence
+            // counts like any other's. With every owner started and every
+            // leg counted, only the legs are waited for.
+            bool uncounted = false;
+            foreach (Task<T> leg in pending)
+            {
+                if (!lateCounted.Contains(leg)) { uncounted = true; break; }
+            }
+            if (nextIndex < names.Count || uncounted)
             {
                 using var cts = new CancellationTokenSource();
                 Task timer = Task.Delay(hedgeAfter, cts.Token);
@@ -4447,13 +4462,16 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 {
                     // Hedge interval elapsed with no answer: every leg still
                     // unanswered is late, which is what marks its owner as
-                    // silent; then one more owner.
+                    // silent; then one more owner, if any.
                     foreach (Task<T> leg in pending)
                     {
                         if (lateCounted.Add(leg)) CountLateLeg(names[legIndex[leg]], leg);
                     }
-                    pending.Add(StartLeg(nextIndex));
-                    nextIndex++;
+                    if (nextIndex < names.Count)
+                    {
+                        pending.Add(StartLeg(nextIndex));
+                        nextIndex++;
+                    }
                     continue;
                 }
                 cts.Cancel();
@@ -4582,6 +4600,11 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 
     internal int LateHedgeLegsTotal => Volatile.Read(ref _lateHedgeTotal);
 
+    /// <summary>Hedge legs left running by reads that have returned and
+    /// not yet finished — what <see cref="MaxInFlightHedgeLoserLegs"/>
+    /// bounds. For tests.</summary>
+    internal int DetachedHedgeLegs => Volatile.Read(ref _detachedHedgeLegs);
+
     internal void SetLateHedgeLegsForTest(string name, int count)
     {
         lock (_lateHedgeLock)
@@ -4597,10 +4620,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// different leg — normally left running detached in
     /// <see cref="_hedgedReads"/> for <see cref="Close"/> to eventually
     /// drain (they're already registered there, added by
-    /// <c>StartLeg</c>, and self-remove via their own continuation). But
-    /// past <see cref="MaxInFlightHedgeLoserLegs"/> concurrently detached
-    /// legs — checked against <see cref="_hedgedReads"/>, which still
-    /// counts <paramref name="tasks"/> themselves at this point — the
+    /// <c>StartLeg</c>, and self-remove via their own continuation), and
+    /// counted in <see cref="_detachedHedgeLegs"/> until they finish. But
+    /// past <see cref="MaxInFlightHedgeLoserLegs"/> legs already left
+    /// running that way — the legs of reads still in flight are not
+    /// accumulation and do not count, so a burst of concurrent reads
+    /// cannot by itself force every read to wait for its slow loser — the
     /// rest are pulled out of the registry and awaited right here
     /// instead, the same "fall back to synchronous" shape
     /// <see cref="MaxInFlightBackgroundReplicaWrites"/> uses past its own
@@ -4611,7 +4636,20 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     private async Task ResolveHedgeLosersAsync<T>(HashSet<Task<T>> tasks)
     {
         if (tasks.Count == 0) return;
-        if (_hedgedReads.Count < MaxInFlightHedgeLoserLegs) return;
+        if (Volatile.Read(ref _detachedHedgeLegs) < MaxInFlightHedgeLoserLegs)
+        {
+            foreach (Task<T> task in tasks)
+            {
+                if (task.IsCompleted) continue;
+                Interlocked.Increment(ref _detachedHedgeLegs);
+                // Runs exactly once, right away if the leg finished between
+                // the check and here.
+                _ = task.ContinueWith(
+                    _ => Interlocked.Decrement(ref _detachedHedgeLegs),
+                    TaskScheduler.Default);
+            }
+            return;
+        }
         foreach (Task<T> task in tasks)
         {
             _hedgedReads.TryRemove(task, out _);
@@ -5363,9 +5401,11 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     // An owner with this many hedge legs that were still unanswered when the
     // hedge interval elapsed is treated as having stopped answering and is
     // asked last (see DemoteSilentOwners). Counts legs that are late, not
-    // merely in flight: a burst of concurrent reads to a healthy owner has
-    // many in flight and none late. Internal and mutable only so tests can
-    // lower it.
+    // merely in flight: a burst of concurrent reads to an owner that answers
+    // within the interval has many in flight and none late, while one whose
+    // round trip is longer than the interval is demoted by concurrency
+    // alone, which only changes the order its replicas are tried in.
+    // Internal and mutable only so tests can lower it.
     internal static int HedgeSuspectLateLegs = 32;
 
 
