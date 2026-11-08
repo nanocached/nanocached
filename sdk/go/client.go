@@ -337,10 +337,13 @@ var maxInFlightBackgroundReplicaWrites = 32
 // elapses with no answer; every leg still unanswered at that moment is a
 // late leg of its node. A node with this many late legs is treated as not
 // answering, and a read that has another owner tries that owner first, so
-// the silent node stops collecting a new leg per read. Legs are counted
-// only once they are late, not while merely in flight, so a burst of
-// concurrent reads to a healthy node never demotes it. A variable only so
-// tests can shrink it.
+// the silent node stops collecting a new leg per read. A leg is counted
+// only once it is late — unanswered when the interval elapsed — not while
+// merely in flight, so a burst of concurrent reads to a node that answers
+// within the interval never demotes it; one whose round trip is longer
+// than the interval is demoted by concurrency alone, which only changes
+// the order its replicas are tried in. A variable only so tests can
+// shrink it.
 var hedgeSuspectLateLegs int32 = 32
 
 // maxInFlightHedgeReadLosers bounds how many hedged-read legs may be left
@@ -354,17 +357,16 @@ var hedgeSuspectLateLegs int32 = 32
 // can't be deferred before it starts running — it has to race the primary
 // concurrently to actually hedge anything — so this can't gate a leg's
 // start the way backgroundReplicaSem does. Instead it bounds
-// hedgedReadsInFlight, a live count of every hedge leg currently racing
-// from start to finish (mirroring the Python SDK's
-// _MAX_INFLIGHT_HEDGE_LOSER_LEGS check against len(self._hedged_reads),
-// which similarly counts every started-but-not-finished leg, winners
-// included transiently): once a read's outcome is decided, its remaining
-// pending legs are left running detached (hedgedReadsWG already tracks
-// them for Close() to drain) only while the count is under this cap: at
-// or past it, the read instead blocks right there draining their results
-// before returning — the same "fall back to synchronous" shape
-// fanReplicas uses past its own cap. A variable only so tests can shrink
-// it, mirroring maxInFlightBackgroundReplicaWrites.
+// hedgedReadsDetached, a live count of the legs that reads which have
+// already returned left running (the legs of reads still in flight are
+// the read concurrency, not accumulation, and are not counted): once a
+// read's outcome is decided, its remaining pending legs are left running
+// detached (hedgedReadsWG already tracks them for Close() to drain) only
+// while that count is under this cap: at or past it, the read instead
+// blocks right there draining their results before returning — the same
+// "fall back to synchronous" shape fanReplicas uses past its own cap. A
+// variable only so tests can shrink it, mirroring
+// maxInFlightBackgroundReplicaWrites.
 var maxInFlightHedgeReadLosers = 256
 
 // maxConcurrentDials bounds how many of a roster's nodes openCluster dials
@@ -475,17 +477,17 @@ type Client struct {
 	// readHedgeAfter is Config.ReadHedgeAfter (hedged reads); <= 0 disables
 	// hedging. hedgedReadsWG lets Close() drain hedging's losing legs
 	// before tearing down connections, exactly like backgroundReplicaWG
-	// does for fire-and-forget replica writes. hedgedReadsInFlight is a
-	// live count of every hedge leg currently racing (start to finish),
-	// checked against maxInFlightHedgeReadLosers (issue #276) so a client
-	// issuing many concurrent hedged reads against a slow owner can't
-	// accumulate an unbounded number of detached losing legs — see
-	// maxInFlightHedgeReadLosers's doc comment for why this is a live
-	// counter rather than an acquire/release semaphore like
+	// does for fire-and-forget replica writes. hedgedReadsDetached is a
+	// live count of the hedge legs that reads which have already returned
+	// left running, checked against maxInFlightHedgeReadLosers (issue
+	// #276) so a client issuing many concurrent hedged reads against a
+	// slow owner can't accumulate an unbounded number of detached losing
+	// legs — see maxInFlightHedgeReadLosers's doc comment for why this is
+	// a live counter rather than an acquire/release semaphore like
 	// backgroundReplicaSem.
 	readHedgeAfter      time.Duration
 	hedgedReadsWG       sync.WaitGroup
-	hedgedReadsInFlight atomic.Int32
+	hedgedReadsDetached atomic.Int32
 
 	// lateHedgeLegs counts, per node name, the hedge legs that were still
 	// unanswered when the hedge interval elapsed and have not finished
@@ -2887,6 +2889,10 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 	// 2 when it has finished; the swap on finish and the CAS on counting
 	// make exactly one of them responsible for the count.
 	legState := make([]atomic.Int32, len(names))
+	// detachState[i] is the same for the detached count
+	// (hedgedReadsDetached): 0 while leg i runs attached to this read, 1
+	// once the read returned and left it running, 2 when it has finished.
+	detachState := make([]atomic.Int32, len(names))
 	// start registers a leg on hedgedReadsWG and launches it, reporting
 	// whether it actually started. c.closed is rechecked under c.mu
 	// immediately before the Add — Close() flips closed under the same
@@ -2909,14 +2915,15 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 			return false
 		}
 		c.hedgedReadsWG.Add(1)
-		c.hedgedReadsInFlight.Add(1)
 		c.mu.Unlock()
 		go func() {
 			defer c.hedgedReadsWG.Done()
-			defer c.hedgedReadsInFlight.Add(-1)
 			v, o, e := c.readFromOwner(names[index], op)
 			if legState[index].Swap(2) == 1 {
 				c.releaseLateHedgeLeg(names[index])
+			}
+			if detachState[index].Swap(2) == 1 {
+				c.hedgedReadsDetached.Add(-1)
 			}
 			results <- legResult{index: index, value: v, ok: o, err: e}
 		}()
@@ -2925,22 +2932,28 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 
 	// finishHedge decides what happens to a hedged read's still-pending
 	// losing legs once its outcome is decided (issue #276), mirroring the
-	// Python SDK's resolve_losers: under maxInFlightHedgeReadLosers
-	// concurrently in-flight hedge legs — hedgedReadsInFlight, which
-	// still counts these pending legs themselves at this point, exactly
-	// as Python's check against len(self._hedged_reads) does — they're
-	// simply left running, exactly as before this issue's fix:
-	// hedgedReadsWG already tracks them for Close() to drain. At or past
-	// the cap, this call instead blocks here draining their results off
-	// the channel before returning, so a client issuing many concurrent
-	// hedged reads against a slow owner can't accumulate an unbounded
-	// number of detached legs. The results themselves are discarded
-	// either way — a loser's outcome was never going to be used.
-	finishHedge := func(pending int) {
+	// Python SDK's resolve_losers: under maxInFlightHedgeReadLosers legs
+	// already left running by reads that returned (hedgedReadsDetached —
+	// the legs of reads still in flight are not accumulation and do not
+	// count, so a burst of concurrent reads cannot by itself force every
+	// read to wait for its slow loser) they're simply left running, and
+	// counted there until they finish: hedgedReadsWG already tracks them
+	// for Close() to drain. At or past the cap, this call instead blocks
+	// here draining their results off the channel before returning, so a
+	// client issuing many concurrent hedged reads against a slow owner
+	// can't accumulate an unbounded number of detached legs. The results
+	// themselves are discarded either way — a loser's outcome was never
+	// going to be used.
+	finishHedge := func(pending, started int) {
 		if pending == 0 {
 			return
 		}
-		if int(c.hedgedReadsInFlight.Load()) < maxInFlightHedgeReadLosers {
+		if int(c.hedgedReadsDetached.Load()) < maxInFlightHedgeReadLosers {
+			for i := 0; i < started; i++ {
+				if detachState[i].CompareAndSwap(0, 1) {
+					c.hedgedReadsDetached.Add(1)
+				}
+			}
 			return
 		}
 		for i := 0; i < pending; i++ {
@@ -2972,9 +2985,18 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 	}
 
 	for pending > 0 {
+		// The hedge interval is waited out while there is another owner
+		// to start, and once more for a leg not yet counted as late — the
+		// last owner started has no owner after it, but its silence
+		// counts like any other's. With every owner started and every leg
+		// counted, only the legs are waited for.
+		needTimer := nextIndex < len(names)
+		for i := 0; !needTimer && i < nextIndex; i++ {
+			needTimer = legState[i].Load() == 0
+		}
 		var timer *time.Timer
 		var timeout <-chan time.Time
-		if nextIndex < len(names) {
+		if needTimer {
 			timer = time.NewTimer(c.readHedgeAfter)
 			timeout = timer.C
 		}
@@ -2991,12 +3013,12 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 					// Remaining legs, if any, are left running (or, past
 					// maxInFlightHedgeReadLosers, awaited synchronously
 					// right here) by finishHedge — see its doc comment.
-					finishHedge(pending)
+					finishHedge(pending, nextIndex)
 					return nil, false, res.err
 				}
 				lastError = res.err
 			case res.ok || names[res.index] == primaryName:
-				finishHedge(pending)
+				finishHedge(pending, nextIndex)
 				return res.value, res.ok, nil
 			default:
 				// A non-primary clean miss: provisional only.
@@ -3007,8 +3029,8 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 			}
 		case <-timeout:
 			// The hedge interval elapsed with no answer: every leg still
-			// running is late; then one more owner, without waiting for
-			// the legs already in flight.
+			// running is late; then one more owner, if any, without
+			// waiting for the legs already in flight.
 			for i := 0; i < nextIndex; i++ {
 				if legState[i].CompareAndSwap(0, 1) {
 					c.addLateHedgeLeg(names[i])
