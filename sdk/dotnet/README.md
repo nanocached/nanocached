@@ -702,6 +702,12 @@ cluster, its result discarded.
 - After a cancellation the outcome of a write, and above all of `IncrAsync`,
   `DecrAsync` and the compare-and-set calls, is unknown to the caller, exactly
   as after `ConnectionLostException`; read the key to learn what happened.
+- A cancelled call that had not reached the wire yet (it was waiting for a
+  ring refresh or a redial) keeps going and **may land after calls the
+  caller made later**: `SetAsync(k, v1, token)` cancelled while it waited,
+  then `SetAsync(k, v2)` completed, can still leave `v1` in the cache. A
+  caller that must not have that writes the later value only once it has
+  read the key, or uses `ReplaceAsync` with the token of the value it read.
 - A client that finishes connecting after `ConnectAsync` was cancelled is
   closed, not leaked.
 - `DisposeAsync()` is `Close()` run on the thread pool, for `await using`:
