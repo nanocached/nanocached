@@ -5748,6 +5748,71 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task LegsOfReadsStillInFlightDoNotCountAgainstTheHedgeCap()
+    {
+        // The cap bounds the legs left running by reads that have already
+        // returned, not the legs of reads still in flight: with the cap at
+        // the number of concurrent reads, none of them has a detached leg
+        // ahead of it, so every one returns with the replica's answer. The
+        // check used to be against every tracked leg, so the other reads'
+        // own in-flight primary legs alone met the cap and all three waited
+        // for the slow primary.
+        using var tuning = new HedgeTuning();
+        NanocachedClient.MaxInFlightHedgeLoserLegs = 3;
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        string primary = owners[0], replica = owners[1];
+        using NanocachedClient client = await ConnectHedging(cluster, 50);
+        await client.SetAsync("k", "v");
+        cluster.Nodes[primary].DelayGets(300);
+
+        long[] elapsed = await Task.WhenAll(Enumerable.Range(0, 3).Select(_ => Task.Run(async () =>
+        {
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            Assert.Equal("v", await client.GetAsync("k"));
+            return stopwatch.ElapsedMilliseconds;
+        })));
+
+        Assert.All(elapsed, ms => Assert.True(ms < 300 - HedgeTimingToleranceMillis,
+            $"expected every read to return with the replica's answer, got {string.Join(", ", elapsed)}ms"));
+        Assert.Equal(3, cluster.Nodes[replica].GetCount);
+        Assert.Equal(3, client.DetachedHedgeLegs);
+
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (client.DetachedHedgeLegs != 0 && DateTime.UtcNow < deadline) await Task.Delay(10);
+        Assert.Equal(0, client.DetachedHedgeLegs);
+    }
+
+    [Fact]
+    public async Task TheLastOwnerStartedIsCountedLateToo()
+    {
+        // Once the final owner's leg has started there is no owner left to
+        // hedge to, but its silence counts like any other's: the hedge timer
+        // is still waited out once for it. It used not to be, so with
+        // replication 2 the replica could never be demoted through the keys
+        // it is second for.
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        string primary = owners[0], replica = owners[1];
+        using NanocachedClient client = await ConnectHedging(cluster, 50);
+        await client.SetAsync("k", "v");
+        cluster.Nodes[primary].DelayGets(400);
+        cluster.Nodes[replica].DelayGets(400);
+
+        Task<string?> read = client.GetAsync("k");
+        // 50 ms: the primary is late and the replica starts; 100 ms: the
+        // replica is late too.
+        await Task.Delay(200);
+        Assert.Equal(1, client.LateHedgeLegsOf(primary));
+        Assert.Equal(1, client.LateHedgeLegsOf(replica));
+
+        Assert.Equal("v", await read);
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (client.LateHedgeLegsTotal != 0 && DateTime.UtcNow < deadline) await Task.Delay(10);
+        Assert.Equal(0, client.LateHedgeLegsTotal);
+    }
+
+    [Fact]
     public async Task ABurstOfReadsToAHealthyClusterDemotesNobody()
     {
         using var tuning = new HedgeTuning();
