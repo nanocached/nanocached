@@ -263,9 +263,12 @@ _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES = 32
 # still unanswered at that moment is a *late* leg for its node. A node
 # with this many late legs outstanding is treated as not answering, and
 # reads that have another owner try that owner first, so the silent node
-# stops collecting a new leg per read. Legs are counted only once they are
-# late, not while merely in flight, so a burst of concurrent reads to a
-# healthy node never demotes it. Mutable only so tests can shrink it,
+# stops collecting a new leg per read. A leg is counted only once it is
+# late — unanswered when the hedge interval elapsed — not while merely in
+# flight, so a burst of concurrent reads to a node that answers within the
+# interval never demotes it. One whose round trip is longer than the
+# interval is demoted by concurrency alone, which only changes the order
+# its replicas are tried in. Mutable only so tests can shrink it,
 # mirroring _KEEPALIVE_INTERVAL.
 _HEDGE_SUSPECT_LATE_LEGS = 32
 
@@ -275,13 +278,16 @@ _HEDGE_SUSPECT_LATE_LEGS = 32
 # close() — with no bound, a client issuing many concurrent hedged reads
 # against slow owners could accumulate an unbounded number of them.
 # This is the backstop for when trying a silent owner last is not enough
-# (every owner of the key is slow): past this many legs tracked in
-# self._hedged_reads, a read's remaining legs are awaited synchronously
-# right there instead of being detached — the same "fall back to
-# synchronous" shape as fire_and_forget_replicas past its own cap. It must
-# sit well above _HEDGE_SUSPECT_LATE_LEGS times the replication factor, or
-# it would fire before a slow node has been demoted. Mutable only so
-# tests can shrink it, mirroring _KEEPALIVE_INTERVAL.
+# (every owner of the key is slow): past this many legs left running
+# after their read returned (self._detached_hedge_legs — not the legs of
+# reads still in flight, whose number is the read concurrency and says
+# nothing about accumulation), a read's remaining legs are awaited
+# synchronously right there instead of being detached — the same "fall
+# back to synchronous" shape as fire_and_forget_replicas past its own
+# cap. It must sit well above _HEDGE_SUSPECT_LATE_LEGS times the
+# replication factor, or it would fire before a slow node has been
+# demoted. Mutable only so tests can shrink it, mirroring
+# _KEEPALIVE_INTERVAL.
 _MAX_INFLIGHT_HEDGE_LOSER_LEGS = 256
 
 # The longest a request header can ever legally be: marker + space + up to
@@ -693,6 +699,11 @@ class NanocachedClient:
         # (the losers); finished detached, drained by close() exactly like
         # _background_replica_writes.
         self._hedged_reads: set[asyncio.Task[object]] = set()
+        # How many of those were left running by a read that has already
+        # returned (or that its caller abandoned), i.e. the legs
+        # _MAX_INFLIGHT_HEDGE_LOSER_LEGS bounds; the rest of _hedged_reads
+        # belong to reads still in flight.
+        self._detached_hedge_legs = 0
         # Late hedge legs outstanding per node name (see
         # _HEDGE_SUSPECT_LATE_LEGS); an entry exists only while it is > 0.
         self._late_hedge_legs: dict[str, int] = {}
@@ -3197,17 +3208,24 @@ class NanocachedClient:
         def detach(tasks: set[asyncio.Task[object]]) -> None:
             # Left in _hedged_reads for close() to drain; removed from it
             # on completion so the set doesn't grow with finished legs.
+            # Each leg still running is counted in _detached_hedge_legs
+            # until it finishes: that count, not the size of
+            # _hedged_reads, is what _MAX_INFLIGHT_HEDGE_LOSER_LEGS bounds.
             for task in tasks:
                 task.add_done_callback(self._hedged_reads.discard)
+                if not task.done():
+                    self._count_detached_leg(task)
 
         async def resolve_losers(tasks: set[asyncio.Task[object]]) -> None:
             # issue #192: this read has already decided its answer, with
             # `tasks` left running. Normally they're detach()ed — left in
             # the background for close() to eventually drain, same as
-            # always. But past _MAX_INFLIGHT_HEDGE_LOSER_LEGS concurrently
-            # detached legs (checked against self._hedged_reads, which
-            # still counts `tasks` themselves at this point), further ones
-            # are awaited right here instead — the same "fall back to
+            # always. But past _MAX_INFLIGHT_HEDGE_LOSER_LEGS legs already
+            # left running that way (self._detached_hedge_legs — the legs
+            # of reads still in flight are not accumulation and do not
+            # count, so a burst of concurrent reads cannot by itself force
+            # every read to wait for its slow loser), further ones are
+            # awaited right here instead — the same "fall back to
             # synchronous" shape _dispatch_replica_writes uses past its
             # own cap — so a client issuing many concurrent hedged reads
             # against a slow owner can't accumulate unbounded background
@@ -3215,7 +3233,7 @@ class NanocachedClient:
             # never going to be used.
             if not tasks:
                 return
-            if len(self._hedged_reads) < _MAX_INFLIGHT_HEDGE_LOSER_LEGS:
+            if self._detached_hedge_legs < _MAX_INFLIGHT_HEDGE_LOSER_LEGS:
                 detach(tasks)
                 return
             for task in tasks:
@@ -3243,19 +3261,26 @@ class NanocachedClient:
 
         try:
             while pending:
-                timeout = hedge_after if next_index < len(names) else None
+                # The hedge interval is waited out while there is another
+                # owner to start, and once more for a leg not yet counted
+                # as late — the last owner started has no owner after it,
+                # but its silence counts like any other's. With every
+                # owner started and every leg counted, wait for an answer.
+                uncounted = any(task not in late_counted for task in pending)
+                timeout = hedge_after if next_index < len(names) or uncounted else None
                 done, pending = await asyncio.wait(
                     pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
                 )
                 if not done:
                     # Hedge interval elapsed with no answer: every leg
-                    # still pending is late; then one more owner.
+                    # still pending is late; then one more owner, if any.
                     for task in pending:
                         if task not in late_counted:
                             late_counted.add(task)
                             self._count_late_leg(names[legs[task]], task)
-                    pending.add(start(next_index))
-                    next_index += 1
+                    if next_index < len(names):
+                        pending.add(start(next_index))
+                        next_index += 1
                     continue
                 # issue #229: asyncio.wait(FIRST_COMPLETED) can return more
                 # than one finished task in `done` (e.g. the primary and a
@@ -3364,6 +3389,17 @@ class NanocachedClient:
                 late[name] = remaining
             else:
                 late.pop(name, None)
+
+        task.add_done_callback(release)
+
+    def _count_detached_leg(self, task: asyncio.Task[object]) -> None:
+        """Counts ``task``, a hedge leg left running by a read that has
+        returned, in ``_detached_hedge_legs`` until it finishes (a done
+        callback runs exactly once, however it finishes)."""
+        self._detached_hedge_legs += 1
+
+        def release(_task: asyncio.Task[object]) -> None:
+            self._detached_hedge_legs -= 1
 
         task.add_done_callback(release)
 

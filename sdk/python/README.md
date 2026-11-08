@@ -499,11 +499,17 @@ the silent one is asked only if the first does not answer, or to settle a
 miss (the primary's answer is still waited for, as above). So while an
 owner is slow, its replicas answer more of the reads, and a read no
 longer pays the hedge interval or adds one more leg to the slow owner.
-Legs that are merely in flight, as in a burst of concurrent reads to a
-healthy owner, do not count. When every owner of a key is in that state
-the order is unchanged, and past 256 hedge legs in flight a read waits
-for its own remaining legs instead of leaving them running, which bounds
-what a client can accumulate against a cluster that is slow throughout.
+A leg counts only once it is unanswered after the hedge interval, so a
+burst of concurrent reads to an owner that answers within the interval
+does not count; an owner whose round trip is longer than the interval
+under load is tried last by concurrency alone, which only changes the
+order its replicas are asked in. When every owner of a key is in that
+state the order is unchanged. Separately, a read whose answer came from
+one owner normally leaves its other legs running; past 256 legs left
+running that way a read waits for its own remaining legs instead, which
+bounds what a client can accumulate against a cluster that is slow
+throughout. Legs of reads still in flight do not count towards that
+limit.
 
 ## Reconnect and keep-alive
 

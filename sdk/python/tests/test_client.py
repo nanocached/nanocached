@@ -5542,6 +5542,50 @@ class HedgedReadInflightCapTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_legs_of_reads_still_in_flight_do_not_count_against_the_cap(self):
+        # The cap bounds the legs left running by reads that have already
+        # returned, not the legs of reads still in flight: with the cap at
+        # the number of concurrent reads, none of them has a detached leg
+        # ahead of it, so every one returns with the replica's answer. The
+        # check used to be against every tracked leg, so the other reads'
+        # own in-flight primary legs alone met the cap and all three waited
+        # for the slow primary.
+        self._client_module._MAX_INFLIGHT_HEDGE_LOSER_LEGS = 3
+
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.05
+            )
+            try:
+                await client.set("k", "v")
+                primary, replica = self.owners_of("k")
+                nodes[primary].delay_gets(0.3)
+
+                async def timed_get() -> float:
+                    start = asyncio.get_running_loop().time()
+                    self.assertEqual(await client.get("k"), "v")
+                    return asyncio.get_running_loop().time() - start
+
+                elapsed = await asyncio.gather(timed_get(), timed_get(), timed_get())
+
+                for seconds in elapsed:
+                    self.assertLess(seconds, 0.3 - self.TIMING_TOLERANCE_S, elapsed)
+                self.assertEqual(nodes[replica].get_count, 3)
+                self.assertEqual(
+                    client._detached_hedge_legs, 3, "the three primary legs were left running"
+                )
+                await wait_for(
+                    lambda: client._detached_hedge_legs == 0 and client._hedged_reads == set(),
+                    "the detached legs to finish and release their counts",
+                )
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
 
 class HedgedReadSilentOwnerTests(unittest.IsolatedAsyncioTestCase):
     """An owner that has stopped answering is tried last: once a node has
@@ -5689,6 +5733,39 @@ class HedgedReadSilentOwnerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(client._late_hedge_legs, {})
                 self.assertEqual(nodes[primary].get_count, 100)
                 self.assertEqual(nodes[replica].get_count, 0)
+            finally:
+                await client.close()
+        finally:
+            await self.stop_cluster(nodes, discovery)
+
+    async def test_the_last_owner_started_is_counted_late_too(self):
+        # Once the final owner's leg has started there is no owner left to
+        # hedge to, but its silence counts like any other's: the hedge
+        # timer is still waited out once for it. It used not to be, so with
+        # replication 2 the replica could never be demoted through the keys
+        # it is second for.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.05
+            )
+            try:
+                await client.set("k", "v")
+                primary, replica = self.owners_of("k")
+                nodes[primary].delay_gets(0.4)
+                nodes[replica].delay_gets(0.4)
+
+                read = asyncio.ensure_future(client.get("k"))
+                # 0.05 s: the primary is late and the replica starts;
+                # 0.10 s: the replica is late too.
+                await asyncio.sleep(0.2)
+                self.assertEqual(client._late_hedge_legs, {primary: 1, replica: 1})
+
+                self.assertEqual(await read, "v")
+                await wait_for(
+                    lambda: client._late_hedge_legs == {},
+                    "both legs to finish and release their counts",
+                )
             finally:
                 await client.close()
         finally:
