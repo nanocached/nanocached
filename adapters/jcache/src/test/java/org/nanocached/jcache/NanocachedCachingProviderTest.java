@@ -76,6 +76,28 @@ class NanocachedCachingProviderTest {
     }
 
     @Test
+    void rejectsAnUnknownPropertyEvenWhenAManagerForTheUriAlreadyExists() {
+        // The check used to live in connect(), which a repeat call for a URI
+        // whose manager exists never reaches: the typo was accepted quietly.
+        try (CachingProvider provider = new NanocachedCachingProvider()) {
+            URI uri = URI.create("test:typo-on-repeat");
+            ClassLoader classLoader = getClass().getClassLoader();
+            CacheManager first = provider.getCacheManager(uri, classLoader, propertiesFor(node));
+
+            Properties mistyped = propertiesFor(node);
+            mistyped.setProperty("nanocached.tsl", "true");
+            CacheException error = assertThrows(
+                    CacheException.class, () -> provider.getCacheManager(uri, classLoader, mistyped));
+            assertTrue(error.getMessage().contains("nanocached.tsl"), error.getMessage());
+
+            // The existing manager is untouched and still returned for
+            // well-formed properties.
+            assertFalse(first.isClosed());
+            assertSame(first, provider.getCacheManager(uri, classLoader, propertiesFor(node)));
+        }
+    }
+
+    @Test
     void requiresAddressesInProperties() {
         CachingProvider provider = new NanocachedCachingProvider();
         CacheException error = assertThrows(

@@ -45,6 +45,14 @@ public final class NanocachedCachingProvider implements CachingProvider {
         ClassLoader resolvedClassLoader = classLoader != null ? classLoader : getDefaultClassLoader();
         ManagerKey key = new ManagerKey(resolvedUri, resolvedClassLoader);
 
+        // Before the lookup, not inside connect(): a repeat call for a URI
+        // whose manager already exists returns that manager and, as JSR-107
+        // allows, ignores the properties — but a mistyped key in them is
+        // still the caller's mistake and must still be reported.
+        if (properties != null) {
+            rejectUnknownProperties(properties);
+        }
+
         NanocachedCacheManager existing = managers.get(key);
         if (existing != null && !existing.isClosed()) {
             return existing;
@@ -90,16 +98,20 @@ public final class NanocachedCachingProvider implements CachingProvider {
             "nanocached.fire-and-forget-replicas", "nanocached.read-repair",
             "nanocached.reconnect-cooldown-millis", "nanocached.read-hedge-after-millis");
 
-    private static NanocachedClient connect(Properties properties) {
-        // A mistyped key (say nanocached.tsl) must not be ignored quietly: it
-        // would leave TLS off and send the secret in the clear. Properties
-        // outside the nanocached. prefix belong to the caller and are left alone.
+    /** A mistyped key (say {@code nanocached.tsl}) must not be ignored
+     * quietly: it would leave TLS off and send the secret in the clear.
+     * Properties outside the {@code nanocached.} prefix belong to the caller
+     * and are left alone. */
+    private static void rejectUnknownProperties(Properties properties) {
         for (String name : properties.stringPropertyNames()) {
             if (name.startsWith("nanocached.") && !KNOWN_PROPERTIES.contains(name)) {
                 throw new CacheException("nanocached-jcache: unknown property \"" + name
                         + "\"; the keys this provider reads are " + new java.util.TreeSet<>(KNOWN_PROPERTIES));
             }
         }
+    }
+
+    private static NanocachedClient connect(Properties properties) {
         String addresses = properties.getProperty("nanocached.addresses");
         if (addresses == null || addresses.isBlank()) {
             throw new CacheException(

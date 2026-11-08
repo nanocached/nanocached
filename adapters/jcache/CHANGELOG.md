@@ -11,7 +11,7 @@ changed. What 1.0.0 will promise is described on the
 
 ### Changed
 
-- **Breaking:** a `nanocached.*` property the provider does not read (for example a mistyped `nanocached.tsl`) is now a `CacheException` naming it, where it used to be ignored: a mistyped TLS key left TLS off and sent the secret in the clear. Properties outside the `nanocached.` prefix are still left alone.
+- **Breaking:** a `nanocached.*` property the provider does not read (for example a mistyped `nanocached.tsl`) is now a `CacheException` naming it, where it used to be ignored: a mistyped TLS key left TLS off and sent the secret in the clear. Properties outside the `nanocached.` prefix are still left alone. The check runs on every `getCacheManager` call, including one that returns the existing manager for the same URI and class loader (whose properties are otherwise ignored, as JSR-107 allows). (#1457)
 
 ## [0.6.2] - 2026-11-03
 
