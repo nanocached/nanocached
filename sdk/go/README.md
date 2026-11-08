@@ -534,7 +534,7 @@ answer, so a second attempt would most likely wait out another deadline
 — a `Set` whose replica has stopped reading costs one deadline, not two.
 
 An address whose redial just failed is treated as still down for
-`Config.ReconnectCooldown` (default `DefaultReconnectCooldown`, 1 second):
+`Config.ReconnectCooldown` (default 1 second):
 requests routed to it during that window fail immediately with the
 original dial error instead of each paying another full 5-second connect
 timeout. Keep it short — a node that genuinely recovers is shut out for
