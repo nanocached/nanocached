@@ -302,7 +302,7 @@ public final class NanocachedClient implements AutoCloseable {
          * proxy is the only owner on this one connection, so there is
          * nobody to hedge to, and a configured {@link #readHedgeAfter} is
          * rejected here: {@code connect} throws
-         * {@code IllegalArgumentException} when both are set). Namespaces,
+         * {@code IllegalArgumentException} when both are set. Namespaces,
          * clear/clearAll, tags, keep-alive, and compression all work
          * unchanged; {@code close()} is unchanged too. From here on this
          * client behaves exactly like single-node mode, because a proxy
@@ -417,7 +417,7 @@ public final class NanocachedClient implements AutoCloseable {
     private static final int DEFAULT_COMPRESSION_THRESHOLD = 256;
 
     // See Options.reconnectCooldown. Mirrors sdk/typescript/src/client.ts's
-    // DEFAULT_RECONNECT_COOLDOWN_MS and sdk/python/src/nanocached/client.py's
+    // DEFAULT_RECONNECT_COOLDOWN_MS and sdk/python/src/nanocached/_client.py's
     // _DEFAULT_RECONNECT_COOLDOWN.
     private static final Duration DEFAULT_RECONNECT_COOLDOWN = Duration.ofMillis(1_000);
 
