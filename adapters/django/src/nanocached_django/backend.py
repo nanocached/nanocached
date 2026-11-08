@@ -68,7 +68,7 @@ _DEFAULT_NAMESPACE = "django"
 # compression, fire-and-forget replication, read repair, hedged reads or
 # a non-default reconnect cooldown. Maps each upper-case OPTIONS key onto
 # the NanocachedClient.connect() keyword it forwards to — see that
-# method's signature (sdk/python/src/nanocached/client.py) for what each
+# method's signature (sdk/python/src/nanocached/_client.py) for what each
 # one does and its type/default. Deliberately does *not* include
 # ``via_proxy``: that flag changes which roster connect() fetches
 # (proxies vs. nodes) rather than tuning an established connection, and
