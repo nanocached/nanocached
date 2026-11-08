@@ -41,6 +41,12 @@ framework adapters at one version, whether or not a component changed.
   `A 0`, a length that is not a number, a stray token) closed the
   connection without a byte. It is now answered `Ed\n` before the close,
   as the protocol page lists it and as a node answers `En\n` (#1408).
+  Before closing, the server half-closes and reads what the client is
+  still sending (at most a request's worth, for at most one second), as
+  the node and the proxy do after their `E`: a request is refused from its
+  header while its body may still be arriving, and closing a socket with
+  unread bytes sends a reset that could discard the `Ed\n` before the
+  client read it (#1458).
 
 ## [0.6.2] - 2026-11-03
 
