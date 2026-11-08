@@ -38,6 +38,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
@@ -543,7 +544,10 @@ public final class NanocachedClient implements AutoCloseable {
     // maxInFlightBackgroundReplicaWrites above: a losing leg is normally
     // left running detached in hedgedReads, drained by close() -- with no
     // bound, a client issuing many concurrent hedged reads against a
-    // slow owner could accumulate an unbounded number of them. Not
+    // slow owner could accumulate an unbounded number of them. Counted in
+    // detachedHedgeLegs (the legs reads that returned left running; the
+    // legs of reads still in flight are the read concurrency, not
+    // accumulation, and do not count). Not
     // permit-gated like backgroundReplicaWritePermits -- a leg must
     // always be started immediately to race for the read's own answer,
     // so admission can't be refused -- so this cap instead gates only
@@ -566,9 +570,20 @@ public final class NanocachedClient implements AutoCloseable {
     // An owner with this many hedge legs that were still unanswered when the
     // hedge interval elapsed is treated as having stopped answering and is
     // asked last (see demoteSilentOwners). Counts legs that are late, not
-    // merely in flight: a burst of concurrent reads to a healthy owner has
-    // many in flight and none late. Mutable only so tests can lower it.
+    // merely in flight: a burst of concurrent reads to an owner that
+    // answers within the interval has many in flight and none late, while
+    // one whose round trip is longer than the interval is demoted by
+    // concurrency alone, which only changes the order its replicas are
+    // tried in. Mutable only so tests can lower it.
     static volatile int hedgeSuspectLateLegs = 32;
+
+    // Threads (and queue depth) of the hedge-leg pool beyond the detached
+    // cap: the legs of reads still in flight, which the cap does not
+    // bound. Chosen like REPLICA_WRITER_POOL_HEADROOM, not derived.
+    private static final int HEDGE_LEG_POOL_HEADROOM = 16;
+    // Idle hedge-leg threads retire after this long: the pool is sized for
+    // a stopped owner, not for the steady state.
+    private static final long HEDGE_LEG_THREAD_KEEP_ALIVE_SECONDS = 60;
 
     // Cap on the throwaway dialer pool openCluster spins up to bootstrap-
     // dial every discovered node concurrently (issue #178). Node counts are
@@ -637,7 +652,7 @@ public final class NanocachedClient implements AutoCloseable {
     /** Every hedge leg currently in flight — including a read's own
      * winning leg while it's still racing — added by {@link
      * #startHedgeLeg} and removed on completion; a losing leg (issue
-     * #64) finishes detached on {@link #replicaWriters}, its result
+     * #64) finishes detached on {@link #hedgeLegs}, its result
      * discarded, drained by {@link #close()} exactly like {@link
      * #backgroundReplicaWritePermits}'s writes. Unlike that pool, a leg
      * is never refused admission here — it must always be started
@@ -645,6 +660,10 @@ public final class NanocachedClient implements AutoCloseable {
      * #maxInFlightHedgeLoserLegs} (issue #276) still bounds how many can
      * accumulate: see {@link #resolveLosers}. */
     private final Set<CompletableFuture<?>> hedgedReads = ConcurrentHashMap.newKeySet();
+    /** How many of {@link #hedgedReads} a read left running after it
+     * returned: the legs {@link #maxInFlightHedgeLoserLegs} bounds. The
+     * rest belong to reads still in flight. Package-private for tests. */
+    final AtomicInteger detachedHedgeLegs = new AtomicInteger();
     /** Serializes a hedge leg's "check closed, then register" against
      * {@link #close()}'s "observe the set empty, then stop draining"
      * (issue #91). Without it a leg could be registered — and dialed
@@ -750,6 +769,17 @@ public final class NanocachedClient implements AutoCloseable {
      * {@code set()} run its replica leg inline, blocking the caller the
      * option promises to return to as soon as the primary acks. */
     private ExecutorService backgroundLegs;
+    /** The pool for hedge legs (issue #1451), every leg of a hedged read
+     * included: a leg to an owner that has stopped answering holds a
+     * thread for the request timeout, and on {@link #replicaWriters} a
+     * burst of such legs within one hedge interval filled that pool's 48
+     * threads and 48-deep queue, so the replica writes and batched owner
+     * legs queued behind them and further hedge legs ran on the caller's
+     * own thread — the stall hedging exists to avoid. Sized from what can
+     * accumulate here, {@link #maxInFlightHedgeLoserLegs} plus headroom
+     * for the legs of reads in flight, with idle threads retiring, and
+     * with the same "caller runs the task" overflow policy. */
+    private ExecutorService hedgeLegs;
     private ScheduledExecutorService keepAlive;
 
     private static final class Member {
@@ -1271,6 +1301,33 @@ public final class NanocachedClient implements AutoCloseable {
         backgroundReplicaWritePermits = new java.util.concurrent.Semaphore(backgroundReplicaWritePermitCount);
         replicaWriters = newReplicaWriterPool(backgroundReplicaWritePermitCount + REPLICA_WRITER_POOL_HEADROOM);
         backgroundLegs = newReplicaWriterPool(backgroundReplicaWritePermitCount);
+        hedgeLegs = newHedgeLegPool(maxInFlightHedgeLoserLegs + HEDGE_LEG_POOL_HEADROOM);
+    }
+
+    /**
+     * {@link #newReplicaWriterPool} for hedge legs (issue #1451): the same
+     * bounds in both dimensions and the same overflow policy, but idle
+     * threads retire after {@link #HEDGE_LEG_THREAD_KEEP_ALIVE_SECONDS},
+     * since the pool is sized for the legs a stopped owner can hold, not
+     * for the steady state.
+     */
+    static ExecutorService newHedgeLegPool(int threads) {
+        java.util.concurrent.ThreadPoolExecutor pool = new java.util.concurrent.ThreadPoolExecutor(
+                threads, threads, HEDGE_LEG_THREAD_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(threads),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "nanocached-hedge-leg");
+                    thread.setDaemon(true);
+                    return thread;
+                },
+                (runnable, executor) -> {
+                    if (executor.isShutdown()) {
+                        throw new RejectedExecutionException("hedge leg pool is shut down");
+                    }
+                    runnable.run();
+                });
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
     }
 
     /**
@@ -1281,8 +1338,8 @@ public final class NanocachedClient implements AutoCloseable {
      * #replicaWriters} for the legs nothing bounds ahead of the pool —
      * synchronous-fallback replica legs and the batched get/set owner
      * legs, limited only by how many calls the application has in
-     * flight — plus the hedge legs ({@code maxInFlightHedgeLoserLegs});
-     * and {@link #backgroundLegs} for the permit-gated fire-and-forget
+     * flight; {@link #hedgeLegs} for the hedge legs (issue #1451); and
+     * {@link #backgroundLegs} for the permit-gated fire-and-forget
      * legs, which can never fill it. When the queue is full the
      * submitter runs the task itself — the same synchronous fallback
      * every call site already has for the permit-exhausted case — which
@@ -4570,16 +4627,21 @@ public final class NanocachedClient implements AutoCloseable {
         }
         // Hedged reads (issue #64): the losing leg of a hedge is never
         // cancelled (see Options.readHedgeAfter's doc for why), so it's
-        // still running on replicaWriters here — drain it exactly like the
+        // still running on hedgeLegs here — drain it exactly like the
         // background replica writes just above, before that pool is shut
         // down.
         drainHedgedReads();
         // Issue #500: every permit is held above, so no background leg is
         // running or queued here any more — this is teardown of idle
-        // threads, bounded by the plain termination margin.
+        // threads, bounded by the plain termination margin. The same for
+        // the hedge legs, all drained just above.
         if (backgroundLegs != null) {
             backgroundLegs.shutdown();
             awaitTerminationQuietly(backgroundLegs);
+        }
+        if (hedgeLegs != null) {
+            hedgeLegs.shutdown();
+            awaitTerminationQuietly(hedgeLegs);
         }
         if (replicaWriters != null) {
             replicaWriters.shutdown();
@@ -4702,6 +4764,9 @@ public final class NanocachedClient implements AutoCloseable {
         }
         if (backgroundLegs != null) {
             backgroundLegs.shutdown();
+        }
+        if (hedgeLegs != null) {
+            hedgeLegs.shutdown();
         }
         if (replicaWriters != null) {
             replicaWriters.shutdown();
@@ -5075,7 +5140,7 @@ public final class NanocachedClient implements AutoCloseable {
      * Connection.requestTimeoutMillis}); {@link #applyReconnecting} makes a
      * second attempt after a non-timeout connection failure; the thread
      * teardown margin covers scheduling slack; and the whole is doubled
-     * because a hedge leg may sit in {@link #replicaWriters}' queue (as
+     * because a hedge leg may sit in {@link #hedgeLegs}' queue (as
      * deep as the pool is wide) behind running legs that each take up to
      * the same time. Read live, so tests that shorten the timeouts shorten
      * this. */
@@ -5113,7 +5178,7 @@ public final class NanocachedClient implements AutoCloseable {
      *
      * A losing leg is never cancelled (interrupting a request mid-write
      * could desync that connection — see {@link Connection}) but left to
-     * run to completion, detached, on {@link #replicaWriters}; its result
+     * run to completion, detached, on {@link #hedgeLegs}; its result
      * is discarded and {@link #close()} drains it via {@link
      * #hedgedReads} exactly like a {@code fireAndForgetReplicas} write.
      */
@@ -5141,7 +5206,20 @@ public final class NanocachedClient implements AutoCloseable {
         while (pendingCount > 0) {
             int index;
             try {
-                if (nextIndex < names.size()) {
+                // The hedge interval is waited out while there is another
+                // owner to start, and once more for a leg not yet counted
+                // as late -- the last owner started has no owner after it,
+                // but its silence counts like any other's. With every
+                // owner started and every leg counted, the settle bound
+                // below applies.
+                boolean uncounted = false;
+                for (Integer started : legFutures.keySet()) {
+                    if (!lateCounted.contains(started)) {
+                        uncounted = true;
+                        break;
+                    }
+                }
+                if (nextIndex < names.size() || uncounted) {
                     index = settlement.await(readHedgeAfterNanos);
                 } else {
                     // Every owner is in flight: wait for one to report, but
@@ -5165,16 +5243,18 @@ public final class NanocachedClient implements AutoCloseable {
             if (index < 0) {
                 // Hedge interval elapsed with no answer: every leg still
                 // unanswered is late, which is what marks its owner as
-                // silent; then one more owner, without waiting for any leg
-                // already in flight.
+                // silent; then one more owner, if any, without waiting for
+                // any leg already in flight.
                 for (Map.Entry<Integer, CompletableFuture<Void>> leg : legFutures.entrySet()) {
                     if (lateCounted.add(leg.getKey())) {
                         countLateLeg(names.get(leg.getKey()), leg.getValue());
                     }
                 }
-                legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
-                pendingCount++;
-                nextIndex++;
+                if (nextIndex < names.size()) {
+                    legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
+                    pendingCount++;
+                    nextIndex++;
+                }
                 continue;
             }
 
@@ -5267,11 +5347,12 @@ public final class NanocachedClient implements AutoCloseable {
      * with {@code losers} — each already tracked in {@link #hedgedReads}
      * by {@link #startHedgeLeg} — left running. Normally they're left
      * exactly as they are: running detached in the background, drained
-     * eventually by {@link #close()}, same as always. But past {@link
-     * #maxInFlightHedgeLoserLegs} concurrently tracked hedge legs
-     * (checked against {@link #hedgedReads}, which still counts every
-     * leg in {@code losers} at this point, plus any other concurrent
-     * hedged read's own in-flight legs) — so a client issuing many
+     * eventually by {@link #close()}, same as always, and counted in
+     * {@link #detachedHedgeLegs} until they finish. But past {@link
+     * #maxInFlightHedgeLoserLegs} legs already left running that way
+     * (the legs of reads still in flight are not accumulation and do not
+     * count, so a burst of concurrent reads cannot by itself force every
+     * read to wait for its slow loser) — so a client issuing many
      * concurrent hedged reads against a slow owner can't accumulate an
      * unbounded number of background legs — this read instead joins them
      * right here before returning, the same "fall back to synchronous"
@@ -5279,7 +5360,18 @@ public final class NanocachedClient implements AutoCloseable {
      * cap. Outcomes are ignored either way: a loser's result was never
      * going to be used. */
     private void resolveLosers(Collection<CompletableFuture<Void>> losers) {
-        if (losers.isEmpty() || hedgedReads.size() < maxInFlightHedgeLoserLegs) {
+        if (losers.isEmpty()) {
+            return;
+        }
+        if (detachedHedgeLegs.get() < maxInFlightHedgeLoserLegs) {
+            for (CompletableFuture<Void> future : losers) {
+                if (!future.isDone()) {
+                    detachedHedgeLegs.incrementAndGet();
+                    // Runs exactly once, right away if the leg finished
+                    // between the check and here.
+                    future.whenComplete((ignoredResult, ignoredError) -> detachedHedgeLegs.decrementAndGet());
+                }
+            }
             return;
         }
         for (CompletableFuture<Void> future : losers) {
@@ -5294,7 +5386,7 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /** Starts one hedge leg against {@code names.get(index)} (via {@code
-     * name}), running it on {@link #replicaWriters} — falling back to
+     * name}), running it on {@link #hedgeLegs} — falling back to
      * running it inline if that pool was concurrently shut down by {@link
      * #close()}, mirroring {@link #submitReplicaWrite} — and reporting its
      * outcome through {@code settlement} (an allocation-free slot plus
@@ -5350,7 +5442,7 @@ public final class NanocachedClient implements AutoCloseable {
         // sees it.
         //
         // Only the check and the registration are under the lock; the leg is
-        // submitted after it is released. replicaWriters' overflow policy runs
+        // submitted after it is released. hedgeLegs' overflow policy runs
         // a task on the submitting thread when its queue is full, and a hedge
         // leg is a whole read round trip (up to requestTimeoutMillis): run
         // under the lock, that would block every other startHedgeLeg and
@@ -5375,9 +5467,9 @@ public final class NanocachedClient implements AutoCloseable {
             }
         };
         try {
-            replicaWriters.execute(tracked);
+            hedgeLegs.execute(tracked);
         } catch (RejectedExecutionException rejected) {
-            // close() shut replicaWriters down concurrently: run it inline
+            // close() shut hedgeLegs down concurrently: run it inline
             // rather than losing it (mirrors submitReplicaWrite).
             tracked.run();
         } catch (RuntimeException | Error error) {

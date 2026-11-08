@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -5714,6 +5715,113 @@ class NanocachedClientTest {
                 client.lateHedgeLegs.put("b", 2);
                 assertEquals(names, client.demoteSilentOwners(names), "every owner is silent");
                 client.lateHedgeLegs.clear();
+            }
+        }
+    }
+
+    @Test
+    void legsOfReadsStillInFlightDoNotCountAgainstTheHedgeCap() throws Exception {
+        // The cap bounds the legs left running by reads that have already
+        // returned, not the legs of reads still in flight: with the cap at
+        // the number of concurrent reads, none of them has a detached leg
+        // ahead of it, so every one returns with the replica's answer. The
+        // check used to be against every tracked leg, so the other reads'
+        // own in-flight primary legs alone met the cap and all three
+        // waited for the slow primary.
+        NanocachedClient.maxInFlightHedgeLoserLegs = 3;
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            String primary = owners.get(0);
+            String replica = owners.get(1);
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
+                client.set("k", "v");
+                cluster.nodes().get(primary).delayGets(300);
+
+                ExecutorService pool = Executors.newFixedThreadPool(3);
+                try {
+                    List<Future<Long>> reads = new ArrayList<>();
+                    for (int i = 0; i < 3; i++) {
+                        reads.add(pool.submit(() -> {
+                            long start = System.nanoTime();
+                            assertEquals(Optional.of("v"), client.get("k"));
+                            return (System.nanoTime() - start) / 1_000_000;
+                        }));
+                    }
+                    for (Future<Long> read : reads) {
+                        long elapsedMillis = read.get();
+                        assertTrue(elapsedMillis < 300 - HEDGE_TIMING_TOLERANCE_MILLIS,
+                                "expected every read to return with the replica's answer, one took "
+                                        + elapsedMillis + "ms");
+                    }
+                } finally {
+                    pool.shutdownNow();
+                }
+                assertEquals(3, cluster.nodes().get(replica).getCount.get());
+                assertEquals(3, client.detachedHedgeLegs.get(), "the three primary legs were left running");
+
+                long deadline = System.nanoTime() + 5_000_000_000L;
+                while (client.detachedHedgeLegs.get() > 0 && System.nanoTime() < deadline) {
+                    Thread.sleep(10);
+                }
+                assertEquals(0, client.detachedHedgeLegs.get(), "the detached legs release their counts");
+            }
+        }
+    }
+
+    @Test
+    void theLastOwnerStartedIsCountedLateToo() throws Exception {
+        // Once the final owner's leg has started there is no owner left to
+        // hedge to, but its silence counts like any other's: the hedge
+        // timer is still waited out once for it. It used not to be, so with
+        // replication 2 the replica could never be demoted through the
+        // keys it is second for.
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            String primary = owners.get(0);
+            String replica = owners.get(1);
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
+                client.set("k", "v");
+                cluster.nodes().get(primary).delayGets(400);
+                cluster.nodes().get(replica).delayGets(400);
+
+                ExecutorService pool = Executors.newSingleThreadExecutor();
+                try {
+                    Future<Optional<String>> read = pool.submit(() -> client.get("k"));
+                    // 50 ms: the primary is late and the replica starts;
+                    // 100 ms: the replica is late too.
+                    Thread.sleep(200);
+                    assertEquals(1, client.lateHedgeLegs.get(primary));
+                    assertEquals(1, client.lateHedgeLegs.get(replica));
+                    assertEquals(Optional.of("v"), read.get());
+                } finally {
+                    pool.shutdownNow();
+                }
+
+                long deadline = System.nanoTime() + 5_000_000_000L;
+                while (!client.lateHedgeLegs.isEmpty() && System.nanoTime() < deadline) {
+                    Thread.sleep(10);
+                }
+                assertTrue(client.lateHedgeLegs.isEmpty(), "both legs release their counts: " + client.lateHedgeLegs);
+            }
+        }
+    }
+
+    @Test
+    void hedgeLegsRunOnAPoolOfTheirOwn() throws Exception {
+        // Issue #1451: a leg to an owner that has stopped answering holds a
+        // thread for the request timeout; on the replica-writer pool a burst
+        // of them starved the replica writes and ran further legs on the
+        // caller's thread.
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
+                Field hedgeLegsField = NanocachedClient.class.getDeclaredField("hedgeLegs");
+                hedgeLegsField.setAccessible(true);
+                ExecutorService hedgeLegs = (ExecutorService) hedgeLegsField.get(client);
+                Field replicaWritersField = NanocachedClient.class.getDeclaredField("replicaWriters");
+                replicaWritersField.setAccessible(true);
+                assertNotSame(replicaWritersField.get(client), hedgeLegs);
+                assertEquals("nanocached-hedge-leg",
+                        hedgeLegs.submit(() -> Thread.currentThread().getName()).get());
             }
         }
     }
