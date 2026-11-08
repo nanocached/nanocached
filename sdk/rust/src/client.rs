@@ -341,10 +341,13 @@ const MAX_MULTIGET_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 /// still unanswered at that moment is a *late* leg of its node. A node with
 /// this many late legs outstanding is treated as not answering, and a read
 /// that has another owner tries that owner first, so the silent node stops
-/// collecting a new leg per read. Legs are counted only once they are late,
-/// not while merely in flight, so a burst of concurrent reads to a healthy
-/// node never demotes it. Read once per `connect`; public-but-hidden purely
-/// as a test hook, mirroring `MAX_INFLIGHT_HEDGE_LOSER_LEGS`.
+/// collecting a new leg per read. A leg is counted only once it is late —
+/// unanswered when the interval elapsed — not while merely in flight, so a
+/// burst of concurrent reads to a node that answers within the interval
+/// never demotes it; one whose round trip is longer than the interval is
+/// demoted by concurrency alone, which only changes the order its replicas
+/// are tried in. Read once per `connect`; public-but-hidden purely as a
+/// test hook, mirroring `MAX_INFLIGHT_HEDGE_LOSER_LEGS`.
 #[doc(hidden)]
 pub static HEDGE_SUSPECT_LATE_LEGS: AtomicUsize = AtomicUsize::new(32);
 
@@ -355,15 +358,17 @@ pub static HEDGE_SUSPECT_LATE_LEGS: AtomicUsize = AtomicUsize::new(32);
 /// reads against slow owners could accumulate an unbounded number of
 /// them. This is the backstop for when trying a silent owner last
 /// (`HEDGE_SUSPECT_LATE_LEGS`) is not enough because every owner of the
-/// key is slow: tracked against `hedged_reads`' own length, not a separate
-/// permit pool shared with `background_replica_permits`, a read's
-/// remaining legs are awaited synchronously right there past this cap
-/// instead of being left detached, the same "fall back to synchronous"
-/// shape `background_replica_permits` uses past its own cap. It must sit
-/// well above `HEDGE_SUSPECT_LATE_LEGS` times the replication factor, or it
-/// would fire before a slow node has been demoted. Read once per
-/// `connect`; public-but-hidden purely as a test hook, mirroring
-/// `MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES`.
+/// key is slow: tracked against the legs that reads which have already
+/// returned left running (`LateHedgeLegs::detached` — the legs of reads
+/// still in flight are the read concurrency, not accumulation, and are not
+/// counted), not a separate permit pool shared with
+/// `background_replica_permits`, a read's remaining legs are awaited
+/// synchronously right there past this cap instead of being left detached,
+/// the same "fall back to synchronous" shape `background_replica_permits`
+/// uses past its own cap. It must sit well above `HEDGE_SUSPECT_LATE_LEGS`
+/// times the replication factor, or it would fire before a slow node has
+/// been demoted. Read once per `connect`; public-but-hidden purely as a
+/// test hook, mirroring `MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES`.
 #[doc(hidden)]
 pub static MAX_INFLIGHT_HEDGE_LOSER_LEGS: AtomicUsize = AtomicUsize::new(256);
 
@@ -942,9 +947,12 @@ struct HedgeLegGuard {
 /// against `node`), 2 when it has finished: the timer's compare-exchange
 /// (under the counts' lock) and the finishing leg's swap make exactly one
 /// of them responsible for the count, so no exit path of the read can leak
-/// it.
+/// it. `detached` is the same for `LateHedgeLegs::detached`: 0 while the
+/// leg runs attached to its read, 1 once the read returned and left it
+/// running, 2 when it has finished.
 struct LateHedgeLeg {
     state: std::sync::atomic::AtomicU8,
+    detached: std::sync::atomic::AtomicU8,
     node: String,
     counts: Arc<LateHedgeLegs>,
 }
@@ -953,10 +961,13 @@ struct LateHedgeLeg {
 /// an entry exists only while it is positive. `total` is the sum, so a read
 /// can skip the lock while no node has any. Adding a leg and releasing it
 /// both take the lock, so a leg finishing at the very moment it is counted
-/// is always released after it was added.
+/// is always released after it was added. `detached` counts the legs that
+/// reads which have already returned left running, the number
+/// `MAX_INFLIGHT_HEDGE_LOSER_LEGS` bounds.
 struct LateHedgeLegs {
     legs: std::sync::Mutex<HashMap<String, usize>>,
     total: AtomicUsize,
+    detached: AtomicUsize,
     /// Owners with at least this many late legs are tried last.
     threshold: usize,
 }
@@ -966,6 +977,7 @@ impl LateHedgeLegs {
         Arc::new(Self {
             legs: std::sync::Mutex::new(HashMap::new()),
             total: AtomicUsize::new(0),
+            detached: AtomicUsize::new(0),
             threshold,
         })
     }
@@ -973,9 +985,22 @@ impl LateHedgeLegs {
     fn new_leg(self: &Arc<Self>, node: String) -> Arc<LateHedgeLeg> {
         Arc::new(LateHedgeLeg {
             state: std::sync::atomic::AtomicU8::new(0),
+            detached: std::sync::atomic::AtomicU8::new(0),
             node,
             counts: Arc::clone(self),
         })
+    }
+
+    /// Counts `leg` as left running by a read that returned, unless it has
+    /// finished meanwhile.
+    fn detach(&self, leg: &LateHedgeLeg) {
+        if leg
+            .detached
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.detached.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// `owners` with the ones that have stopped answering (at least
@@ -1052,6 +1077,9 @@ impl Drop for HedgeLegGuard {
     fn drop(&mut self) {
         if self.late.state.swap(2, Ordering::SeqCst) == 1 {
             self.late.counts.release(&self.late.node);
+        }
+        if self.late.detached.swap(2, Ordering::SeqCst) == 1 {
+            self.late.counts.detached.fetch_sub(1, Ordering::SeqCst);
         }
         if !self.sent {
             // Dropped without a result and not by `catch_unwind`'s path
@@ -1172,9 +1200,10 @@ struct Inner {
     /// write, so `close()` can drain it the same way before teardown
     /// instead of leaving it dangling past the client's own lifetime.
     hedged_reads: Mutex<tokio::task::JoinSet<()>>,
-    /// Cap for how many legs `hedged_reads` may hold before `read_hedged`
-    /// stops detaching its own still-outstanding losers and instead
-    /// awaits them synchronously (issue #276). Captured once from
+    /// Cap for how many legs reads that returned may have left running
+    /// (`LateHedgeLegs::detached`) before `read_hedged` stops detaching
+    /// its own still-outstanding losers and instead awaits them
+    /// synchronously (issue #276). Captured once from
     /// `MAX_INFLIGHT_HEDGE_LOSER_LEGS` at `connect`, mirroring
     /// `background_replica_cap`.
     hedge_loser_cap: usize,
@@ -1982,6 +2011,15 @@ impl NanocachedClient {
     #[doc(hidden)]
     pub fn late_hedge_legs_total(&self) -> usize {
         self.inner.late_hedge.total.load(Ordering::SeqCst)
+    }
+
+    /// Hedge legs left running by reads that have returned and not yet
+    /// finished — what `MAX_INFLIGHT_HEDGE_LOSER_LEGS` bounds.
+    /// Public-but-hidden purely as a test hook.
+    #[cfg(feature = "__test_hooks")]
+    #[doc(hidden)]
+    pub fn detached_hedge_legs(&self) -> usize {
+        self.inner.late_hedge.detached.load(Ordering::SeqCst)
     }
 
     /// Late hedge legs currently counted for `node`. Public-but-hidden
@@ -4636,8 +4674,8 @@ impl NanocachedClient {
     ///
     /// Every leg — including the ones still in flight once this method
     /// returns — is spawned via `spawn_hedge_leg` onto `hedged_reads`,
-    /// never cancelled, and drained by `close()`. Once `hedged_reads`
-    /// already holds `hedge_loser_cap` legs, though, this method's own
+    /// never cancelled, and drained by `close()`. Once reads that returned
+    /// have left `hedge_loser_cap` legs running, though, this method's own
     /// still-outstanding legs are awaited synchronously instead of left
     /// detached (`resolve_hedge_losers`, issue #276) — the read still
     /// completes correctly, it just stops accumulating background tasks.
@@ -4678,7 +4716,13 @@ impl NanocachedClient {
         let mut replica_missed = false;
 
         loop {
-            let outcome = if next_index < owners.len() {
+            // The hedge interval is waited out while there is another
+            // owner to start, and once more for a leg not yet counted as
+            // late — the last owner started has no owner after it, but its
+            // silence counts like any other's. With every owner started
+            // and every leg counted, only the legs are waited for.
+            let uncounted = legs.iter().any(|leg| leg.state.load(Ordering::SeqCst) == 0);
+            let outcome = if next_index < owners.len() || uncounted {
                 match tokio::time::timeout(hedge_after, rx.recv()).await {
                     Ok(Some(outcome)) => outcome,
                     // Every sender is a leg still counted in `in_flight`;
@@ -4688,22 +4732,24 @@ impl NanocachedClient {
                     Err(_elapsed) => {
                         // The hedge interval elapsed with no answer yet:
                         // every leg still running is late; then one more
-                        // owner, right away.
+                        // owner, if any, right away.
                         for leg in &legs {
                             self.inner.late_hedge.add(leg);
                         }
-                        legs.push(
-                            self.spawn_hedge_leg(
-                                Arc::clone(&owned_namespace),
-                                Arc::clone(&owned_key),
-                                owners[next_index].clone(),
-                                next_index,
-                                tx.clone(),
-                            )
-                            .await?,
-                        );
-                        next_index += 1;
-                        in_flight += 1;
+                        if next_index < owners.len() {
+                            legs.push(
+                                self.spawn_hedge_leg(
+                                    Arc::clone(&owned_namespace),
+                                    Arc::clone(&owned_key),
+                                    owners[next_index].clone(),
+                                    next_index,
+                                    tx.clone(),
+                                )
+                                .await?,
+                            );
+                            next_index += 1;
+                            in_flight += 1;
+                        }
                         continue;
                     }
                 }
@@ -4719,20 +4765,20 @@ impl NanocachedClient {
                 // Issue #1164: a leg that panicked is surfaced to the
                 // caller, not hedged around.
                 Err(error) if outcome.panicked => {
-                    self.resolve_hedge_losers(&mut rx, in_flight).await;
+                    self.resolve_hedge_losers(&mut rx, in_flight, &legs).await;
                     return Err(error);
                 }
                 Ok(Some(value)) => {
-                    self.resolve_hedge_losers(&mut rx, in_flight).await;
+                    self.resolve_hedge_losers(&mut rx, in_flight, &legs).await;
                     return Ok(Some(value));
                 }
                 Ok(None) if owners[outcome.index] == primary => {
-                    self.resolve_hedge_losers(&mut rx, in_flight).await;
+                    self.resolve_hedge_losers(&mut rx, in_flight, &legs).await;
                     return Ok(None);
                 }
                 Ok(None) => replica_missed = true,
                 Err(Error::WrongNode) => {
-                    self.resolve_hedge_losers(&mut rx, in_flight).await;
+                    self.resolve_hedge_losers(&mut rx, in_flight, &legs).await;
                     return Err(Error::WrongNode);
                 }
                 Err(error) => last_error = Some(error),
@@ -4771,29 +4817,35 @@ impl NanocachedClient {
     }
 
     /// Issue #276: `read_hedged` has already decided its answer, with
-    /// `in_flight` of its own legs still running (already spawned into
-    /// `hedged_reads` by `spawn_hedge_leg`, so counted in its length).
-    /// Normally they're simply left running — detached, in the
-    /// background, for `close()` to eventually drain, same as always.
-    /// But past `hedge_loser_cap` concurrently tracked legs (checked
-    /// against `hedged_reads`' own length, which still counts these
-    /// `in_flight` legs at this point), leaving more of them detached
-    /// would let one persistently slow owner accumulate one abandoned
-    /// task per hedged call forever. Instead, this read's own remaining
-    /// legs are drained right here — via `rx`, the same channel every
-    /// leg already reports its outcome to — before returning, so the
-    /// call still completes correctly, it just stops detaching. Outcomes
-    /// are discarded either way: a loser's result was never going to be
-    /// used.
+    /// `in_flight` of its own `legs` still running (already spawned into
+    /// `hedged_reads` by `spawn_hedge_leg`). Normally they're simply left
+    /// running — detached, in the background, for `close()` to eventually
+    /// drain, same as always — and counted in `LateHedgeLegs::detached`
+    /// until they finish. But past `hedge_loser_cap` legs already left
+    /// running that way (the legs of reads still in flight are not
+    /// accumulation and do not count, so a burst of concurrent reads
+    /// cannot by itself force every read to wait for its slow loser),
+    /// leaving more of them detached would let one persistently slow
+    /// owner accumulate one abandoned task per hedged call forever.
+    /// Instead, this read's own remaining legs are drained right here —
+    /// via `rx`, the same channel every leg already reports its outcome
+    /// to — before returning, so the call still completes correctly, it
+    /// just stops detaching. Outcomes are discarded either way: a loser's
+    /// result was never going to be used.
     async fn resolve_hedge_losers(
         &self,
         rx: &mut mpsc::UnboundedReceiver<HedgeOutcome>,
         in_flight: usize,
+        legs: &[Arc<LateHedgeLeg>],
     ) {
         if in_flight == 0 {
             return;
         }
-        if self.inner.hedged_reads.lock().await.len() < self.inner.hedge_loser_cap {
+        let late = &self.inner.late_hedge;
+        if late.detached.load(Ordering::SeqCst) < self.inner.hedge_loser_cap {
+            for leg in legs {
+                late.detach(leg);
+            }
             return;
         }
         for _ in 0..in_flight {
