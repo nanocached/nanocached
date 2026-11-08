@@ -19,9 +19,13 @@ name: Chaos nightly
 # behaviour the architecture page does not accept, and the accepted behaviour
 # is printed in the job summary so its size can be followed from run to run.
 #
-# The node image is built without the `trace` cargo feature (src/trace.rs):
-# with it on, cells failed on oracles whose keys were not traced, and the cause
-# is not known yet. See tests/e2e/README.md.
+# The node image is built with the `trace` cargo feature (src/trace.rs) and
+# traces the serial INCR keys only (`NANOCACHED_TRACE_PREFIX=is`): chaos.sh
+# counts the increments the nodes applied against the ones the loader saw
+# acknowledged (tests/e2e/incrtrace.py), so an INCR answer the oracle cannot
+# explain comes with the node-side evidence in the run's logs. Tracing more
+# prefixes made cells fail on untraced keys (the output volume slows the
+# membership changes); `is` alone ran clean. See tests/e2e/README.md.
 #
 # It reports; it does not gate release tagging.
 
@@ -77,10 +81,11 @@ jobs:
         with:
           context: .
           target: node
+          build-args: FEATURES=trace
           load: true
           tags: nanocached-node:chaos
-          cache-from: type=gha,scope=node
-          cache-to: type=gha,mode=max,scope=node
+          cache-from: type=gha,scope=node-trace
+          cache-to: type=gha,mode=max,scope=node-trace
 
       - name: Build the discovery image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -109,6 +114,8 @@ jobs:
           NODE: nanocached-node:chaos
           DISC: nanocached-discovery:chaos
           CLIENT: e2e-client:chaos
+          # Trace the serial INCR keys for incrtrace.py (see the header).
+          NENV: "-e NANOCACHED_TRACE_PREFIX=is"
           ROUNDS: "6"
           RUN: ci${{ matrix.run }}
           DELETE_ORACLE: "1"
@@ -127,7 +134,7 @@ jobs:
           {
             echo "### chaos run ${{ matrix.run }}"
             echo '```'
-            grep -E "DONE|FAIL|^=== (check|discovery|.* accepted)" chaos.log | cut -c1-700 || true
+            grep -E "DONE|FAIL|^=== (check|discovery|incr trace|.* accepted)" chaos.log | cut -c1-700 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

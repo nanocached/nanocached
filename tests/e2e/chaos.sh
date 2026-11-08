@@ -80,6 +80,12 @@
 # the primary (ia_short_on_replica); both are accepted behaviour in
 # docs/architecture.html. Output in $L/incr.log. Off
 # by default until it has run clean a few times in a row on main.
+# With a node built with the `trace` cargo feature and
+# NENV="-e NANOCACHED_TRACE_PREFIX=is", the serial counters are also checked
+# against the node traces once every log is saved (incrtrace.py): the
+# increments the nodes applied per key against the ones the loader saw
+# acknowledged or left in doubt, and no increment starting from a value no
+# increment produced. Asserted. Output in $L/incrtrace.txt.
 # CLEAR_ORACLE=1 adds clearload.py: cycles of 20 sets, a namespace clear and 20
 # sets of other keys, each cycle in a namespace of its own, one burst of
 # cycles per round. Asserted: no key written after a clear holds a value
@@ -414,6 +420,23 @@ if sdk.get('read_err'): print('sdk read_err', sdk['read_err'])
   echo "$msdk $mcheck" | grep -oE '"(md_stale|mn_stale|md_ok|mn_ok|md_stale_on_owner|mn_stale_on_owner|md_stale_on_primary|md_stale_on_replica|md_stale_keys|mn_stale_on_primary|mn_stale_on_replica|mn_stale_keys|md_owners_differ|mn_owners_differ|batches|keys_acked|partial|wrong_node|other_err)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== multi accepted (printed, not asserted): /'; echo
 fi
 for c in $(docker ps -aq --filter "name=^/$P-"); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); ip=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $c); echo "$n $ip" >> "$L/ipmap.txt"; [ -f "$L/$n.log" ] || docker logs -t $c > "$L/$n.log" 2>&1; done
+# With a trace-built node (NENV="-e NANOCACHED_TRACE_PREFIX=is"), every
+# applied increment of a serial key is a TRACE line in some node's log; now
+# that every log is saved, count them against what the loader saw
+# acknowledged (incrtrace.py). More applications than acknowledged + maybe,
+# or an increment starting from a value no increment produced, is the
+# evidence a phantom answer leaves on the node side.
+if [ "${INCR_ORACLE:-0}" = 1 ] && [ -f "$L/incrstate.json" ]; then
+  python3 "$E/incrtrace.py" --state "$L/incrstate.json" --logs "$L" --nodes "$P-n" > "$L/incrtrace.txt" 2>&1
+  itrace=$(tail -1 "$L/incrtrace.txt")
+  if [ "$(echo "$itrace" | grep -oE '"trace_lines": [0-9]+' | grep -oE '[0-9]+')" = 0 ]; then
+    echo "=== incr trace: no TRACE lines (node built without the trace feature or NANOCACHED_TRACE_PREFIX does not cover is); not checked"
+  else
+    tbad=$(echo "$itrace" | grep -oE '"(over_applied|value_from_nowhere)": [1-9][0-9]*' | tr '\n' ' ')
+    [ -z "$tbad" ] || { T "FAIL: incr trace: $tbad(details in $L/incrtrace.txt)"; fail=1; }
+    echo "$itrace" | grep -oE '"(trace_lines|applications|acked|maybe|over_applied|under_applied|within_bounds|value_from_nowhere)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr trace (asserted: over_applied, value_from_nowhere): /'; echo
+  fi
+fi
 echo "=== entries:"; cat "$L/entries.txt"
 echo "=== logs in $L"; cat "$L/ipmap.txt"
 cleanup

@@ -646,6 +646,14 @@ impl Cache {
         let remaining_ttl = expires_at.map(|expires_at| expires_at.saturating_duration_since(now));
 
         self.incrs += 1;
+        trace!(
+            &key.name,
+            "incr key={} old={} new={} delta={}",
+            crate::trace::name(&key.name),
+            current,
+            new_value,
+            delta
+        );
         self.insert(key.clone(), Bytes::from(new_value.to_string()), expires_at);
 
         IncrResult::Value(new_value, remaining_ttl)
@@ -911,8 +919,9 @@ impl Cache {
         self.note_handoff(now, ahead_of_ring);
         trace!(
             &key.name,
-            "handoff_set key={} marked={} had={:?} new_ttl={:?} ahead={}",
+            "handoff_set key={} value={} marked={} had={:?} new_ttl={:?} ahead={}",
             crate::trace::name(&key.name),
+            crate::trace::name(&value[..value.len().min(24)]),
             self.is_marked(&key),
             self.peek(&key).map(|e| (
                 e.is_expired_at(now),
@@ -1379,8 +1388,9 @@ impl Cache {
     fn insert(&mut self, key: Key, value: Bytes, expires_at: Option<Instant>) {
         trace!(
             &key.name,
-            "insert key={} ttl={:?} marked_before={}",
+            "insert key={} value={} ttl={:?} marked_before={}",
             crate::trace::name(&key.name),
+            crate::trace::name(&value[..value.len().min(24)]),
             expires_at.map(|x| x.saturating_duration_since(Instant::now()).as_secs()),
             self.is_marked(&key)
         );
