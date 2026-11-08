@@ -169,6 +169,15 @@ one that stops answering without closing it (a suspended process, a
 saturated host) can stretch the leave by up to 30&nbsp;s past the
 budget; the node still logs the entries it could not hand off and exits
 0.</p>
+<p>Treat that log line (<code>WARN decommission: N entr(ies) could not be
+handed off within the drain budget</code>) as a sizing signal, not as a
+loss: the surviving replicas hold those keys, and the survivors&rsquo;
+re-replication pass for the leave brings them back to R within seconds
+to tens of seconds. Until it has, they have one copy, and a node failure
+in that window loses them. If the line appears, raise
+<code>--drain-timeout</code> (and the stop grace with it) so the handoff
+completes with room to spare, and let the cluster settle after a leave
+before the next membership change.</p>
 <p><code>--drain-timeout 0</code> skips the handoff (the old
 crash-equivalent shutdown) — acceptable for fast restarts at
 R&nbsp;≥&nbsp;2, where replicas cover the gap.</p>

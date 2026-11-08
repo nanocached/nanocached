@@ -4079,10 +4079,13 @@ async fn handle_connection(
                 .await?;
                 trace!(
                     &key.name,
-                    "incr_reply key={} from={} reply={}",
+                    "incr_reply key={} from={} reply={:?}",
                     crate::trace::name(&key.name),
                     address,
-                    String::from_utf8_lossy(&encode_response(&response, tag)).trim_end()
+                    // Debug-quoted: the reply's value sits on its own line
+                    // after a CRLF, which printed raw made a bare value
+                    // line of its own in the log.
+                    String::from_utf8_lossy(&encode_response(&response, tag))
                 );
                 // Issue #129: only a `Response::Incremented` — i.e. INCR
                 // actually wrote a new value — needs forwarding;
