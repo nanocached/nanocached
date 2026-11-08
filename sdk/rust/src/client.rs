@@ -672,8 +672,8 @@ impl Options {
     /// so it runs to completion detached, and [`NanocachedClient::close`]
     /// drains it exactly like a fire-and-forget replica write.
     ///
-    /// `duration` must be positive and at most [`MAX_DURATION_OPTION`]
-    /// (24 hours); anything else is rejected at
+    /// `duration` must be positive and at most 24 hours; anything else is
+    /// rejected at
     /// [`NanocachedClient::connect`] time, the same as this crate's other
     /// invalid-argument checks.
     pub fn read_hedge_after(mut self, duration: Duration) -> Self {
@@ -2446,7 +2446,7 @@ impl NanocachedClient {
     /// key's operations. A replica's failure or `W` is
     /// counted in `stats().replica_write_failures` and never fails the
     /// batch. Larger batches are transparently split into more than one
-    /// `y` sub-frame per node (see [`MAX_BATCH_KEYS`]). If some keys'
+    /// `y` sub-frame per node (400 keys each at most). If some keys'
     /// primaries are still wrong-node after one bounded refresh-and-retry
     /// this returns a plain [`Error::WrongNode`], and a key whose primary
     /// could not be reached on both passes returns that connection error —
@@ -3167,8 +3167,8 @@ impl NanocachedClient {
     /// single-mode behavior does — there is no ring to refresh against.
     ///
     /// Larger batches are transparently split into more than one `m`
-    /// sub-frame per owner (batch chunking, bounded by both
-    /// [`MAX_BATCH_KEYS`] and cumulative wire bytes, issue #222) —
+    /// sub-frame per owner (batch chunking, bounded by both a key count
+    /// of 400 and cumulative wire bytes, issue #222) —
     /// callers never need to think about this.
     pub async fn get_many_bytes<K: AsRef<str>>(
         &self,
@@ -3606,7 +3606,7 @@ impl NanocachedClient {
     /// primary for decides that key's outcome; a replica-held key's
     /// failure or `W` is logged-and-swallowed into
     /// `stats().replica_write_failures`, exactly like [`Self::set`]'s
-    /// own replica legs ([`Self::write`]). A batch never fails as a
+    /// own replica legs. A batch never fails as a
     /// whole: if some keys' primaries are still wrong-node after one
     /// bounded refresh-and-retry, this returns `Err(Error::WrongNode)` —
     /// every other key in the batch was still stored. In
@@ -3614,8 +3614,8 @@ impl NanocachedClient {
     /// [`Self::set`]'s own single-mode behavior does.
     ///
     /// Larger batches are transparently split into more than one `o`
-    /// sub-frame per node (batch chunking, bounded by both
-    /// [`MAX_BATCH_KEYS`] and cumulative wire bytes, issue #222).
+    /// sub-frame per node (batch chunking, bounded by both a key count
+    /// of 400 and cumulative wire bytes, issue #222).
     pub async fn set_many_bytes(
         &self,
         values: &HashMap<String, Vec<u8>>,

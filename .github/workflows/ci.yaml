@@ -325,6 +325,14 @@ jobs:
           cargo fmt --check
           cargo clippy --all-targets --all-features -- -D clippy::all
 
+      # docs.rs builds these; a public doc comment that links to a private
+      # item renders as a broken link there and warns only here.
+      - name: Check the API docs build without warnings
+        working-directory: sdk/rust
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features
+
       - name: Run tests
         working-directory: sdk/rust
         run: cargo test --all-features
