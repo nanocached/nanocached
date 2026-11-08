@@ -5663,21 +5663,126 @@ func TestHedgedReadFallsBackToSynchronousPastTheCap(t *testing.T) {
 		return elapsed
 	}
 
-	// Well under the cap: the losing primary leg is left running detached
-	// (a generous cap of 3 tolerates hedgedReadsInFlight still counting
-	// the just-finished replica leg for a moment after it answers, since
-	// its own decrement races the decision below), so the read returns as
-	// soon as the replica answers, without waiting for the primary.
-	if elapsed := runOnce(3, 300*time.Millisecond); elapsed >= 300*time.Millisecond-hedgeTimingTolerance {
+	// Under the cap: nothing has been left running yet, so the losing
+	// primary leg is left running detached and the read returns as soon
+	// as the replica answers, without waiting for the primary.
+	if elapsed := runOnce(1, 300*time.Millisecond); elapsed >= 300*time.Millisecond-hedgeTimingTolerance {
 		t.Fatalf("under the cap: elapsed = %v, want well under the primary's 300ms delay (the loser leg should be left running detached)", elapsed)
 	}
 
-	// At the cap: the pending primary leg alone already meets it (issue
-	// #276's finishHedge counts pending legs against hedgedReadsInFlight
-	// before deciding whether to leave them running), so the read must
-	// instead block draining it before returning.
-	if elapsed := runOnce(1, 150*time.Millisecond); elapsed < 150*time.Millisecond-hedgeTimingTolerance {
+	// No room at all: the read must instead block draining the pending
+	// primary leg before returning.
+	if elapsed := runOnce(0, 150*time.Millisecond); elapsed < 150*time.Millisecond-hedgeTimingTolerance {
 		t.Fatalf("at the cap: elapsed = %v, want at least the primary's 150ms delay (should fall back to a synchronous wait)", elapsed)
+	}
+}
+
+func TestLegsOfReadsStillInFlightDoNotCountAgainstTheHedgeCap(t *testing.T) {
+	// The cap bounds the legs left running by reads that have already
+	// returned, not the legs of reads still in flight: with the cap at the
+	// number of concurrent reads, none of them has a detached leg ahead of
+	// it, so every one returns with the replica's answer. The check used
+	// to be against every leg in flight, so the other reads' own primary
+	// legs alone met the cap and all three waited for the slow primary.
+	original := maxInFlightHedgeReadLosers
+	defer func() { maxInFlightHedgeReadLosers = original }()
+	maxInFlightHedgeReadLosers = 3
+
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{
+		Addresses:      []Address{addr(discovery.address())},
+		ReadHedgeAfter: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownersOf("k")
+	primary, replica := owners[0], owners[1]
+	nodes[primary].delayGets(300 * time.Millisecond)
+
+	elapsed := make([]time.Duration, 3)
+	var wg sync.WaitGroup
+	for i := range elapsed {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			start := time.Now()
+			value, ok, err := client.Get("k")
+			elapsed[i] = time.Since(start)
+			if err != nil || !ok || value != "v" {
+				t.Errorf("Get = %q, %v, %v", value, ok, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	for _, d := range elapsed {
+		if d >= 300*time.Millisecond-hedgeTimingTolerance {
+			t.Fatalf("elapsed = %v, want every read well under the primary's 300ms delay", elapsed)
+		}
+	}
+	if got := nodes[replica].getCount.Load(); got != 3 {
+		t.Fatalf("replica getCount = %d, want 3", got)
+	}
+	if got := client.hedgedReadsDetached.Load(); got != 3 {
+		t.Fatalf("hedgedReadsDetached = %d, want 3 (the three primary legs were left running)", got)
+	}
+	if !waitUntil(t, 5*time.Second, func() bool { return client.hedgedReadsDetached.Load() == 0 }) {
+		t.Fatalf("the detached legs never released their counts: %d", client.hedgedReadsDetached.Load())
+	}
+}
+
+func TestTheLastOwnerStartedIsCountedLateToo(t *testing.T) {
+	// Once the final owner's leg has started there is no owner left to
+	// hedge to, but its silence counts like any other's: the hedge timer
+	// is still waited out once for it. It used not to be, so with
+	// replication 2 the replica could never be demoted through the keys
+	// it is second for.
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{
+		Addresses:      []Address{addr(discovery.address())},
+		ReadHedgeAfter: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownersOf("k")
+	primary, replica := owners[0], owners[1]
+	nodes[primary].delayGets(400 * time.Millisecond)
+	nodes[replica].delayGets(400 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() {
+		value, ok, err := client.Get("k")
+		if err == nil && (!ok || value != "v") {
+			err = fmt.Errorf("Get = %q, %v", value, ok)
+		}
+		done <- err
+	}()
+	// 50 ms: the primary is late and the replica starts; 100 ms: the
+	// replica is late too.
+	time.Sleep(200 * time.Millisecond)
+	if got := lateHedgeLegsOf(client, primary); got != 1 {
+		t.Fatalf("late legs on the primary = %d, want 1", got)
+	}
+	if got := lateHedgeLegsOf(client, replica); got != 1 {
+		t.Fatalf("late legs on the replica = %d, want 1", got)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !waitUntil(t, 5*time.Second, func() bool { return client.lateHedgeTotal.Load() == 0 }) {
+		t.Fatalf("the late legs never released their counts: %v", client.lateHedgeLegs)
 	}
 }
 
