@@ -33,8 +33,13 @@ Printed, not asserted:
    with every trace line of the key around it.
 4. Unmatched answers. When the loader saved its answers (`hist_s` in
    incrstate.json), each answer is matched to an application with that new
-   value within a few seconds; an answer no node applied points at the
-   client side (a reply attributed to the wrong request).
+   value within the match window; an answer no node applied points at the
+   client side (a reply attributed to the wrong request). The window is
+   wider than the loader's op timeout (15 s), the most a reply can trail
+   its application and still be an answer: a CI cell had three answers
+   (of 22,108) arrive 5.00 s after their application, during a kill,
+   which a 5 s window counted as unmatched; the cause of that lag is not
+   identified.
 
 The last line is a JSON summary; chaos.sh asserts over_applied and
 value_from_nowhere. Above it, the full timeline of each offending key.
@@ -52,7 +57,7 @@ ap.add_argument("--logs", required=True, help="directory with the saved node log
 ap.add_argument("--nodes", required=True, help="node log name prefix, e.g. nch-n (matches nch-n*.log)")
 ap.add_argument("--slack", type=float, default=1.0, help="seconds of timestamp slack for the value-from-nowhere check")
 ap.add_argument("--show", nargs="*", default=[], help="keys whose timeline is printed regardless")
-ap.add_argument("--match-window", type=float, default=5.0, help="seconds between a loader answer and the application it is matched to")
+ap.add_argument("--match-window", type=float, default=20.0, help="seconds between a loader answer and the application it is matched to (above the loader's 15 s op timeout)")
 a = ap.parse_args()
 
 TS = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z?$")
