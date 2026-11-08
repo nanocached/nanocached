@@ -7660,12 +7660,12 @@ async fn hedge_losers_fall_back_to_synchronous_past_the_cap() {
         }
     }
 
-    // Phase 2: cap forced to 1 — hedged_reads already holds this read's
-    // own two legs (primary + replica) by the time the primary decides,
-    // so the replica leg is drained synchronously instead of detached.
+    // Phase 2: cap forced to 0 — no leg may be left running by a read that
+    // returned, so the replica leg is drained synchronously instead of
+    // detached.
     {
         let default_cap = nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.load(Ordering::SeqCst);
-        nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(1, Ordering::SeqCst);
+        nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(0, Ordering::SeqCst);
 
         let (nodes, discovery) = start_cluster(2).await;
         let client = NanocachedClient::connect(
@@ -7702,6 +7702,118 @@ async fn hedge_losers_fall_back_to_synchronous_past_the_cap() {
         for (_, node) in nodes {
             node.stop();
         }
+    }
+}
+
+#[tokio::test]
+async fn legs_of_reads_still_in_flight_do_not_count_against_the_hedge_cap() {
+    // The cap bounds the legs left running by reads that have already
+    // returned, not the legs of reads still in flight: with the cap at the
+    // number of concurrent reads, none of them has a detached leg ahead of
+    // it, so every one returns with the replica's answer. The check used to
+    // be against every tracked leg, so the other reads' own in-flight
+    // primary legs alone met the cap and all three waited for the slow
+    // primary.
+    let (nodes, discovery) = start_cluster(2).await;
+    let default_cap = nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.load(Ordering::SeqCst);
+    nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(3, Ordering::SeqCst);
+    let client = NanocachedClient::connect(
+        options(discovery.port).read_hedge_after(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(default_cap, Ordering::SeqCst);
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    primary.state.gets_delay_ms.store(300, Ordering::SeqCst);
+
+    let timed_get = || async {
+        let start = tokio::time::Instant::now();
+        assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+        start.elapsed()
+    };
+    let elapsed = tokio::join!(timed_get(), timed_get(), timed_get());
+    for elapsed in [elapsed.0, elapsed.1, elapsed.2] {
+        assert!(
+            elapsed < Duration::from_millis(300) - HEDGE_TIMING_TOLERANCE,
+            "every read should return with the replica's answer: elapsed = {elapsed:?}"
+        );
+    }
+    assert_eq!(replica.state.gets.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        client.detached_hedge_legs(),
+        3,
+        "the three primary legs were left running"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while client.detached_hedge_legs() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        client.detached_hedge_legs(),
+        0,
+        "the detached legs release their counts"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn the_last_owner_started_is_counted_late_too() {
+    // Once the final owner's leg has started there is no owner left to
+    // hedge to, but its silence counts like any other's: the hedge timer is
+    // still waited out once for it. It used not to be, so with replication
+    // 2 the replica could never be demoted through the keys it is second
+    // for.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(
+        options(discovery.port).read_hedge_after(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    node_by_name(&nodes, &owners[0])
+        .state
+        .gets_delay_ms
+        .store(400, Ordering::SeqCst);
+    node_by_name(&nodes, &owners[1])
+        .state
+        .gets_delay_ms
+        .store(400, Ordering::SeqCst);
+
+    let (value, ()) = tokio::join!(client.get("k"), async {
+        // 50 ms: the primary is late and the replica starts; 100 ms: the
+        // replica is late too.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(client.late_hedge_legs_of(&owners[0]), 1);
+        assert_eq!(client.late_hedge_legs_of(&owners[1]), 1);
+    });
+    assert_eq!(value.unwrap(), Some("v".to_string()));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while client.late_hedge_legs_total() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        client.late_hedge_legs_total(),
+        0,
+        "both legs release their counts"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
     }
 }
 
