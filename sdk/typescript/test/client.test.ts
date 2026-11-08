@@ -32,7 +32,7 @@ import {
 import { Connection, REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
 import { MAX_REQUEST_BYTES, MULTI_GET_TUNING } from "../src/protocol.js";
 import { maxMultiGetDecompressedBytes, setMaxMultiGetDecompressedBytesForTest } from "../src/compression.js";
-import { startMockDiscovery, startMockNode, unreachablePort, unusedPort, type MockNode } from "./mockServers.js";
+import { revivablePort, startMockDiscovery, startMockNode, unreachablePort, type MockNode } from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -7141,16 +7141,16 @@ describe("NanocachedClient tolerant bootstrap (issue #67)", () => {
   }
 
   /** `revive`: the test later starts a mock node on a dead node's port,
-   * so that port has to be bindable (a released ephemeral port). Otherwise
-   * a dead node gets a port nothing listens on, ever: a released ephemeral
-   * port can be taken by a mock another test starts concurrently, and the
-   * dial then reaches a discovery or proxy mock instead of being refused. */
+   * so that port has to be bindable — `revivablePort()`, outside the range
+   * concurrent mocks bind in (a released ephemeral port was taken by one
+   * once, and the dial reached a live discovery mock). Otherwise a dead
+   * node gets a port nothing listens on, ever. */
   async function startCluster(dead: Set<string>, { revive = false } = {}) {
     const nodes = new Map<string, MockNode>();
     const entries: Array<{ name: string; address: string }> = [];
     for (const name of names) {
       if (dead.has(name)) {
-        const port = revive ? await unusedPort() : unreachablePort();
+        const port = revive ? await revivablePort() : unreachablePort();
         entries.push({ name, address: `127.0.0.1:${port}` });
       } else {
         const node = await startMockNode();

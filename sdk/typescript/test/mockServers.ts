@@ -249,23 +249,38 @@ export interface MockDiscovery extends MockServerBase {
   listProxiesCount(): number;
 }
 
-/** A port with nothing listening on it — bound once to reserve a real
- * ephemeral port, then released. */
-/** Binds and releases an ephemeral port — for a test that needs a port
- * it will itself listen on *later* (a node that comes back). Not for
- * "this address is unreachable" tests: the released port is in the same
- * ephemeral range every mock server picks from (`listen(0)`), so a
- * concurrent test can land a live mock on it — use `unreachablePort()` there. */
-export async function unusedPort(): Promise<number> {
-  const server = createServer();
-  const port = await listen(server);
-  await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-  return port;
+/** A loopback port nothing listens on now that the test will itself
+ * listen on *later* (a dead node that comes back). Not for "this address
+ * is unreachable" tests — use `unreachablePort()` there.
+ *
+ * Taken from 20000–20999, below the range `listen(0)` draws from (Linux
+ * 32768–60999, macOS 49152–65535), so a mock another test starts
+ * concurrently can never land on it between the probe here and the
+ * revival: that race, with a bound-and-released ephemeral port, once had
+ * the "redials an unreachable node" test dial a live mock discovery on
+ * its dead node's port and fail connect() with "non-node address". Each
+ * candidate is bind-probed (something else on the machine may hold it)
+ * and the cursor moves on, so two revivable ports in one run differ. */
+let nextRevivablePort = 20000;
+export async function revivablePort(): Promise<number> {
+  for (let tried = 0; tried < 1000; tried++) {
+    const candidate = nextRevivablePort;
+    nextRevivablePort = candidate === 20999 ? 20000 : candidate + 1;
+    const server = createServer();
+    try {
+      await listen(server, candidate);
+    } catch {
+      continue;
+    }
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    return candidate;
+  }
+  throw new Error("no free port in 20000-20999 for a revivable mock node");
 }
 
 /** A loopback port nothing will ever listen on, for "the node/proxy is
- * unreachable" tests. `unusedPort()` raced the mock servers other tests
- * start concurrently: CI once saw a "dead" proxy address answer as a live
+ * unreachable" tests. A bound-and-released ephemeral port raced the mock
+ * servers other tests start concurrently: CI once saw a "dead" proxy address answer as a live
  * mock node ("no longer identifies as a proxy", PR #459's
  * typescript-client job). Privileged ports 1-6 are never bound by
  * anything in this suite (every mock listens on 0) and are not bindable by
