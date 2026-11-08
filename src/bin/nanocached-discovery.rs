@@ -267,7 +267,11 @@
 //!                             sent on the connection. A request that does
 //!                             not parse (an unknown command, a bad length,
 //!                             a stray token) is answered `Ed\n` as well,
-//!                             and the connection closes. The `d` distinguishes
+//!                             and the connection closes — after reading
+//!                             what the client is still sending, for at
+//!                             most a second, so the reply is not lost to
+//!                             a reset (see `drain_rejected_request`). The
+//!                             `d` distinguishes
 //!                             this response from nanocached-node's own
 //!                             `On\n`/`En\n`, letting a client tell the two
 //!                             apart from the response to the same `A`
@@ -335,7 +339,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
@@ -4977,6 +4981,35 @@ async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()
     infra::write_all_within(stream, data, WRITE_TIMEOUT).await
 }
 
+/// How long `drain_rejected_request` keeps reading after the `Ed\n` for
+/// the client to close first. The node's and the proxy's
+/// `REJECTED_REQUEST_DRAIN_WINDOW`.
+const REJECTED_REQUEST_DRAIN_WINDOW: Duration = Duration::from_secs(1);
+
+/// After the `Ed\n` to a request that does not parse: half-close the write
+/// side (the client sees the reply and EOF at once), then read and discard
+/// what is still arriving — until the client closes, for at most
+/// `REJECTED_REQUEST_DRAIN_WINDOW` and a request's worth of bytes — before
+/// the socket is dropped. A request is rejected from its header (a `J`
+/// whose name length is over the limit, say) while its body may still be
+/// on the way, and closing a socket with unread bytes in its receive
+/// buffer sends a reset, which can discard the `Ed\n` on the client's side
+/// before it is read. The node and the proxy do the same for their `E`.
+async fn drain_rejected_request(stream: &mut ServerStream) {
+    let _ = stream.shutdown().await;
+    let drain = async {
+        let mut sink = [0_u8; 1024];
+        let mut discarded = 0;
+        while discarded < MAX_REQUEST_SIZE {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => discarded += n,
+            }
+        }
+    };
+    let _ = timeout(REJECTED_REQUEST_DRAIN_WINDOW, drain).await;
+}
+
 async fn handle_connection(
     mut stream: ServerStream,
     // The connection's source IP: combined with the port a `J`/`P`
@@ -5840,7 +5873,10 @@ async fn handle_connection(
                 // and a client that gets nothing but EOF cannot tell this
                 // from a dropped connection. Best effort — the peer may be
                 // gone already, and the parse error is what gets logged.
+                // Then what the client is still sending is read before
+                // the close, so a reset cannot discard the reply.
                 let _ = write_response(&mut stream, b"Ed\n").await;
+                drain_rejected_request(&mut stream).await;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("{error:?}"),
@@ -6020,7 +6056,6 @@ mod tests {
     use nanocached::infra::server_name_from_addr;
     use rustls::pki_types::{PrivateKeyDer, ServerName};
     use rustls::{ClientConfig, RootCertStore, ServerConfig};
-    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn parse_reports_incomplete_before_the_header_is_fully_buffered() {
@@ -11957,10 +11992,61 @@ mod tests {
                     String::from_utf8_lossy(frame),
                     secret.is_some()
                 );
+                // The server half-closed and is reading until the client
+                // closes (or a second passes): close first.
+                drop(client);
                 let error = connection_task.await.unwrap().unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             }
         }
+    }
+
+    /// A request rejected from its header while its body is still being
+    /// written: the client must still be able to read the `Ed\n`. Closing
+    /// a socket with unread bytes in its receive buffer sends a reset,
+    /// which can discard the reply on the client's side, so the server
+    /// reads what is still arriving (a bounded amount, for a bounded time)
+    /// before it drops the socket, as the node and the proxy do.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_client_still_writing_a_rejected_request_reads_the_ed() {
+        let (mut client, server) = tcp_pair().await;
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connection_task = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            registry,
+            current_join,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        // A name length over the limit is refused from the header alone;
+        // the body keeps coming after that. A write error here (the server
+        // gone) is what the old behaviour looked like; the reply is what
+        // is checked.
+        client.write_all(b"J 999 1 1\n").await.unwrap();
+        for _ in 0..4 {
+            if client.write_all(&[b'x'; 256]).await.is_err() {
+                break;
+            }
+        }
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"Ed\n");
+        drop(client);
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[tokio::test(flavor = "current_thread")]
