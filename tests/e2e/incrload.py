@@ -67,6 +67,7 @@ def now_s(): return time.strftime("%H:%M:%S") + f".{int((time.time() % 1) * 1000
 acked = {c: [0] * a.n for c in "as"}
 maybe = {c: [0] * a.n for c in "as"}
 rets = {c: [[] for _ in range(a.n)] for c in "as"}
+hist = [[] for _ in range(a.n)]   # serial keys: (time, answer or "err:<type>") in order, for lining up with node traces
 maybe_mark = [0] * a.n      # serial keys: failed increments already accounted for by the last answer
 counts = dict(ia_turns=0, is_turns=0, ops_err=0)
 anom = dict(counter_miss=0, not_numeric=0, is_phantom=0, is_rewind=0, is_skip=0)
@@ -116,10 +117,15 @@ async def incr_once(c, cls, i):
     except Exception as e:
         err(e, "incr-" + cls)
         if type(e).__name__ == "NotNumericError": note("not_numeric", key=k)
-        maybe[cls][i] += 1; return None
+        maybe[cls][i] += 1
+        if cls == "s": hist[i].append((now_s(), "err:" + type(e).__name__))
+        return None
     if r is None:
-        note("counter_miss", key=k); return None
+        note("counter_miss", key=k)
+        if cls == "s": hist[i].append((now_s(), "miss"))
+        return None
     acked[cls][i] += 1; rets[cls][i].append(r)
+    if cls == "s": hist[i].append((now_s(), r))
     return r
 
 async def ia_turn(clients, i):
@@ -138,8 +144,9 @@ async def is_turn(clients, i):
         if prev is None: continue
         gap = r - prev
         if gap <= 0: note("is_rewind", key=key("s", i), prev=prev, got=r)
-        elif gap - 1 > allowed: note("is_phantom", key=key("s", i), prev=prev, got=r, maybes=allowed)
-        elif gap > 1: note("is_skip", key=key("s", i), prev=prev, got=r)
+        # the key's recent answers and failures ride along, so the node traces can be lined up with them
+        elif gap - 1 > allowed: note("is_phantom", key=key("s", i), prev=prev, got=r, maybes=allowed, history=hist[i][-12:])
+        elif gap > 1: note("is_skip", key=key("s", i), prev=prev, got=r, history=hist[i][-12:])
 
 async def worker(w, clients):
     mine = list(range(w, a.n, a.workers))
@@ -229,7 +236,7 @@ async def main():
                           workers=agg, rewind_at=rewind_at, replica_write_failures=sum(s.replica_write_failures for s in st),
                           acked_a=sum(acked["a"]), maybe_a=sum(maybe["a"]), acked_s=sum(acked["s"]), maybe_s=sum(maybe["s"]), **out)), flush=True)
     if a.state:
-        json.dump(dict(n=a.n, acked=acked, maybe=maybe), open(a.state, "w"))
+        json.dump(dict(n=a.n, acked=acked, maybe=maybe, hist_s=hist), open(a.state, "w"))
     for c in clients: await c.close()
 
 asyncio.run(main())

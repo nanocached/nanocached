@@ -95,7 +95,9 @@
 # against the node traces once every log is saved (incrtrace.py): the
 # increments the nodes applied per key against the ones the loader saw
 # acknowledged or left in doubt, and no increment starting from a value no
-# increment produced. Asserted. Output in $L/incrtrace.txt.
+# increment produced. Asserted. Printed: two consecutive applications 2 or
+# more apart (a non-increment write moved the key between them) and loader
+# answers no node applied. Output in $L/incrtrace.txt.
 # CLEAR_ORACLE=1 adds clearload.py: cycles of 20 sets, a namespace clear and 20
 # sets of other keys, each cycle in a namespace of its own, one burst of
 # cycles per round. Asserted: no key written after a clear holds a value
@@ -489,7 +491,7 @@ if [ "${INCR_ORACLE:-0}" = 1 ] && [ -f "$L/incrstate.json" ]; then
   else
     tbad=$(echo "$itrace" | grep -oE '"(over_applied|value_from_nowhere)": [1-9][0-9]*' | tr '\n' ' ')
     [ -z "$tbad" ] || { T "FAIL: incr trace: $tbad(details in $L/incrtrace.txt)"; fail=1; }
-    echo "$itrace" | grep -oE '"(trace_lines|applications|acked|maybe|over_applied|under_applied|within_bounds|value_from_nowhere)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr trace (asserted: over_applied, value_from_nowhere): /'; echo
+    echo "$itrace" | grep -oE '"(trace_lines|applications|acked|maybe|over_applied|under_applied|within_bounds|value_from_nowhere|sequence_jumps|answers_unmatched)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr trace (asserted: over_applied, value_from_nowhere): /'; echo
   fi
 fi
 echo "=== entries:"; cat "$L/entries.txt"
