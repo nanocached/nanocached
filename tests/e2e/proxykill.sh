@@ -17,7 +17,7 @@ disc_up $P-disc --replication-factor 2; sleep 1
 i=0; for n in a b c; do i=$((i+1)); node_up $P-$n $D --drain-timeout 20; wait_members $i $D 120 || { cleanup; exit 1; }; done
 proxy_up $P-p1 $D --drain-timeout 20; proxy_up $P-p2 $D --drain-timeout 20
 t0=$(date +%s); while :; do c=$(proxies 2>/dev/null | head -1 | sed -n 's/count=\([0-9]*\).*/\1/p'); [ "$c" = 2 ] && break; [ $(( $(date +%s)-t0 )) -gt 60 ] && { T "TIMEOUT proxies"; cleanup; exit 1; }; sleep 1; done
-docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1
+tmo 300 docker run --rm --name $P-seed --network $NET -v $E:/w -w /w e2e-client python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { T "FAIL: verify.py seed failed or timed out (300s)"; cleanup; exit 1; }
 LOAD_SECS=${LOAD_SECS:-90}
 docker run -d --name $P-load --network $NET -v $E:/w -v $SDKP:/sdk -e PYTHONPATH=/sdk -w /w e2e-client python load.py --addr $D --via-proxy --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label pkill --reconnect-on-error --report-every 5 >/dev/null
 sleep 10; t0=$(date +%s); fail=0
@@ -27,8 +27,9 @@ T "evicted after $(( $(date +%s)-t0 ))s; restarting $P-c"; docker start $P-c >/d
 wait_members 3 $D 60 || { T "FAIL: rejoin"; fail=1; }; T "rejoined after $(( $(date +%s)-t0 ))s"
 tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
 docker logs $P-load > "$L/load.log" 2>&1; load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1); echo "=== load: $load"
-check=$(docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
+check=$(tmo 300 docker run --rm --name $P-check --network $NET -v $E:/w -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
 echo "=== check: $check"
+[ -n "$check" ] || { T "FAIL: verify.py check gave no result (failed or timed out after 300s)"; fail=1; }
 for c in $(docker ps -aq --filter "name=^/$P-"); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); echo "$n $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $c)" >> "$L/ipmap.txt"; docker logs -t $c > "$L/$n.log" 2>&1; done
 echo "=== WARN/ERROR categories (nodes, proxies, discovery)"; cat "$L"/$P-[abcpd]*.log | grep -v "^.*load" | grep -i "warn\|error\|panic" | sed -E 's/^[^ ]+Z //; s/[0-9a-f]{8}-[0-9a-f-]{27}/UUID/g; s/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+/ADDR/g; s/attempt [0-9]+\/[0-9]+/attempt X/g; s/after [0-9]+ attempt/after N attempt/g; s/[0-9]+ key/N key/g; s/[0-9]+ (entries|dead)/N \1/g' | sort | uniq -c | sort -rn | head -12
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { T "FAIL: untouched-range verify not clean"; fail=1; }

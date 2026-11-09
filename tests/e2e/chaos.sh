@@ -148,7 +148,7 @@ seq_no=0
 spawn(){ seq_no=$((seq_no+1)); spawned=$P-n$seq_no; node_up $spawned $D --drain-timeout 20 --metrics-port 9100; live+=("$spawned"); echo "$spawned $(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $spawned)" >> "$L/ipmap.txt"; }
 for _ in 1 2 3; do spawn; wait_members ${#live[@]} $D 120 || { T "FAIL: bootstrap member $spawned"; cleanup; exit 1; }; done
 T "seed 30000 keys (R=2): k0..k19999 is the load's keyspace, k20000..k29999 stays untouched"
-docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1
+tmo 300 docker run --rm --name $P-seed --network $NET -v "$E:/w" -w /w $CLIENT python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { T "FAIL: verify.py seed failed or timed out (300s)"; cleanup; exit 1; }
 # nanocached_node_entries, touches_total and touch_misses_total of every live node, one line per node: "<label> <node> <entries> <touches> <touch_misses>".
 entries_snapshot(){ for n in "${live[@]}"; do echo "$1 $n $(docker run --rm --network $NET $CLIENT python -c "import urllib.request,sys;b=urllib.request.urlopen('http://$n:9100/metrics',timeout=5).read().decode().splitlines();print(' '.join([l.split()[1] for l in b if l.startswith(m+' ')][0] for m in ('nanocached_node_entries','nanocached_node_touches_total','nanocached_node_touch_misses_total')))" 2>/dev/null || echo "?")"; done >> "$L/entries.txt"; }
 T "start the versioned writer (4 workers over s0..s19999; stopped when the last round ends)"
@@ -358,8 +358,9 @@ load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)
 echo "=== load: $load"
 docker logs $P-load > "$L/load.log" 2>&1
 T "verify the 10000 untouched keys (loss/corruption check)"
-check=$(tmo 300 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
+check=$(tmo 300 docker run --rm --name $P-check --network $NET -v "$E:/w" -w /w $CLIENT python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
 echo "=== check: $check"
+[ -n "$check" ] || { T "FAIL: verify.py check gave no result (failed or timed out after 300s)"; fail=1; }
 entries_snapshot end
 echo "=== discovery: abandoned=$(docker logs $P-disc 2>&1 | grep -c 'join abandoned') evicted=$(docker logs $P-disc 2>&1 | grep -ci 'evict')"
 warns $P-disc "${live[@]}"

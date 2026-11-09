@@ -28,7 +28,7 @@ cleanup; docker network create $NET >/dev/null
 disc_up $P-disc --replication-factor 2; sleep 1
 i=0; for n in a b c; do i=$((i+1)); node_up $P-$n $D --drain-timeout 20; wait_members $i $D 120 || { cleanup; exit 1; }; done
 T "seed 30000 keys (R=2): k0..k19999 is the load's keyspace, k20000..k29999 stays untouched for the loss check"
-docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1
+tmo 300 docker run --rm --name $P-seed --network $NET -v $E:/w -w /w e2e-client python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL: verify.py seed failed or timed out (300s)"; cleanup; exit 1; }
 T "start 60s mixed load (8 conns, get 70%)"
 LOAD_SECS=${LOAD_SECS:-60}
 fail=0
@@ -45,8 +45,9 @@ tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did 
 load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)
 echo "=== load: $load"
 T "verify the 10000 untouched keys post-drain (loss/corruption check)"
-check=$(docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
+check=$(tmo 300 docker run --rm --name $P-check --network $NET -v $E:/w -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
 echo "=== check: $check"
+[ -n "$check" ] || { echo "FAIL: verify.py check gave no result (failed or timed out after 300s)"; fail=1; }
 echo "=== leaver (a)"; docker logs $P-a 2>&1 | grep -i "decommission\|shutdown\|warn\|error" | head -8
 echo "=== discovery"; docker logs $P-disc 2>&1 | grep -i "left\|warn\|error" | head -5
 [ "$rc" = 0 ] || { echo "FAIL: leaver exit code $rc"; fail=1; }

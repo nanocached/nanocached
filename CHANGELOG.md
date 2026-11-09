@@ -25,6 +25,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
+  `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`
+  bounded only its final check), so a hung cluster hung the script instead of
+  failing it. Both now run under `tmo 300` in a named container, which the
+  cleanup removes; a seed that fails or times out ends the run, and a check
+  that gives no result fails it (#1622).
+
 - `nanocached-proxy`: a source IP's in-flight byte share was forgotten as
   soon as its last connection ended, even while requests that connection
   had dispatched were still charged (a client write error ends the

@@ -148,7 +148,10 @@ judged by their own test suites.
 
 - `cl.sh` — sourced by the scenarios: `disc_up`, `node_up`, `members`,
   `wait_members`, `load`, `summ`, `warns`.
-- `disc.py` (query `L`), `verify.py` (seed/check), `load.py` (mixed load,
+- `disc.py` (query `L`), `verify.py` (seed/check; `scalein.sh`, `proxydrain.sh`,
+  `proxykill.sh`, `freshjoin.sh` and `chaos.sh` run each under `tmo 300` in a named
+  container, and a seed that fails or times out ends the run, a check with no
+  result fails it, #1622), `load.py` (mixed load,
   `--hedge`), `stats.sh` + `memtrend.py` (RSS sampling + slope).
 - `CLIENT=<image>` overrides the `e2e-client` image name in `cl.sh` and
   `chaos.sh` (the other scenarios still use the literal name).
