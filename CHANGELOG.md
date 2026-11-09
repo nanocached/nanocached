@@ -47,6 +47,14 @@ framework adapters at one version, whether or not a component changed.
   header while its body may still be arriving, and closing a socket with
   unread bytes sends a reset that could discard the `Ed\n` before the
   client read it (#1458).
+- `nanocached-proxy`: the replica legs of an expiring (`ttl=0`) `y` batch,
+  sent once the primaries have answered, listed a key twice in an
+  address's frame when two of its remaining owner ranks shared that
+  address (replication 3 or more, two roster names on one IP:port, as
+  right after a same-address restart while the old entry is still
+  registered). The frame was up to twice the needed size and could cross
+  the node's frame limit for a large batch. Each key is now listed once
+  per address (#1515).
 
 ## [0.6.2] - 2026-11-03
 
