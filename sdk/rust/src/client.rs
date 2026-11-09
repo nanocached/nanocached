@@ -41,6 +41,13 @@ use crate::open_targets;
 /// the one check it means to affect.
 #[doc(hidden)]
 pub static NODE_LIST_STALE_AFTER_MS: AtomicU64 = AtomicU64::new(30_000);
+
+/// The shortest time between the end of one node-list refresh and the start
+/// of the next forced one. While discovery still lists a dead node every
+/// operation routed to it fails and forces a refresh that installs the same
+/// list; without a floor a sequential caller opens one discovery connection
+/// (`A` + `L`) per failed operation.
+const FORCED_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(200);
 // The keep-alive ping key is reserved by the SDKs precisely so a real
 // application key can never collide with it: a leading 0x00 already
 // keeps it out of any UTF-8 key space, and "nanocached-keepalive" makes
@@ -1233,6 +1240,13 @@ impl Inner {
 struct State {
     target: Target,
     last_fetch: Instant,
+    /// When the current or last node-list refresh began: a forced refresh
+    /// reuses only one that began after the failure it reacts to.
+    last_refresh_started: Option<Instant>,
+    /// When the last node-list refresh finished (success or failed fetch;
+    /// not one that was cancelled): the point `FORCED_REFRESH_MIN_INTERVAL`
+    /// is measured from.
+    last_refresh_end: Option<Instant>,
 }
 
 fn close_all_connections(target: &Target) {
@@ -1796,6 +1810,8 @@ impl NanocachedClient {
             state: Mutex::new(State {
                 target,
                 last_fetch: Instant::now(),
+                last_refresh_started: None,
+                last_refresh_end: None,
             }),
             redials: Mutex::new(HashMap::new()),
             refresh_gate: Mutex::new(()),
@@ -5540,17 +5556,31 @@ impl NanocachedClient {
 
         // Forced refreshes are single-flight too: a forced caller that
         // waited for the gate while another refresh ran reuses that
-        // refresh instead of running its own. Without this, N callers
-        // hitting the same dead node ran N full refreshes one after
-        // another (each a discovery round trip, up to the connect timeout
-        // when discovery is slow), and the last caller waited behind N - 1
-        // results it did not need. A refresh that completed — including
-        // one whose fetch failed, which also advances `last_fetch` — is
-        // what the waiter would have got from its own attempt moments
-        // later.
-        let observed = self.inner.state.lock().await.last_fetch;
-        let _gate = self.inner.refresh_gate.lock().await;
-        {
+        // refresh instead of running its own, provided the refresh BEGAN
+        // after the caller saw its failure. Without the single-flight, N
+        // callers hitting the same dead node ran N full refreshes one
+        // after another (each a discovery round trip, up to the connect
+        // timeout when discovery is slow). A refresh that began before the
+        // failure (say the 30 s staleness refresh, already past its
+        // discovery read when the node died) installs the list that still
+        // names the dead node, so it is waited out, not reused.
+        //
+        // Forced refreshes are also `FORCED_REFRESH_MIN_INTERVAL` apart,
+        // measured from the END of the last refresh: while discovery still
+        // lists a dead node every operation routed to it fails and forces
+        // one, and each refresh opens a discovery connection. A caller that
+        // finds the gate free and a refresh finished inside the interval
+        // reuses it (its retry still runs). One that waited out an older
+        // refresh may not (that refresh began before its failure), so it
+        // sits out the rest of the interval holding the gate and runs a
+        // refresh that the callers queued behind it share. Staleness
+        // refreshes are not throttled.
+        let observed = Instant::now();
+        let (_gate, waited_out_older_refresh) = match self.inner.refresh_gate.try_lock() {
+            Ok(gate) => (gate, false),
+            Err(_) => (self.inner.refresh_gate.lock().await, true),
+        };
+        let wait = {
             let state = self.inner.state.lock().await;
             if !force
                 && state.last_fetch.elapsed()
@@ -5559,11 +5589,30 @@ impl NanocachedClient {
                 // Someone else refreshed while we were waiting for the gate.
                 return;
             }
-            if force && state.last_fetch > observed {
+            if force
+                && state
+                    .last_refresh_started
+                    .is_some_and(|started| started >= observed)
+            {
+                return;
+            }
+            match state.last_refresh_end {
+                Some(end) if force => FORCED_REFRESH_MIN_INTERVAL.saturating_sub(end.elapsed()),
+                _ => Duration::ZERO,
+            }
+        };
+        if !wait.is_zero() {
+            if !waited_out_older_refresh {
+                return;
+            }
+            tokio::time::sleep(wait).await;
+            if self.inner.closed.load(Ordering::SeqCst) {
                 return;
             }
         }
+        self.inner.state.lock().await.last_refresh_started = Some(Instant::now());
         self.refresh_node_list().await;
+        self.inner.state.lock().await.last_refresh_end = Some(Instant::now());
     }
 
     async fn refresh_node_list(&self) {
