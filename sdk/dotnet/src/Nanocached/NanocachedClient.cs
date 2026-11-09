@@ -1375,12 +1375,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         }
         catch (PartialWrongNodeException<Dictionary<string, byte[]>> partial)
         {
-            throw new PartialWrongNodeException<Dictionary<string, string>>(DecodeMany(partial.PartialValues));
+            throw new PartialWrongNodeException<Dictionary<string, string>>(DecodePartial(partial.PartialValues));
         }
         catch (PartialConnectionLostException<Dictionary<string, byte[]>> partial)
         {
             throw new PartialConnectionLostException<Dictionary<string, string>>(
-                DecodeMany(partial.PartialValues), partial.InnerException!);
+                DecodePartial(partial.PartialValues), partial.InnerException!);
         }
     }
 
@@ -1390,6 +1390,33 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         foreach ((string key, byte[] value) in raw)
         {
             values[key] = StrictUtf8.GetString(value);
+        }
+        return values;
+    }
+
+    /// <summary>Decodes the values a partial-result exception carries.
+    /// Decoding is as strict as the success path's, but a stored value
+    /// need not be valid UTF-8 (nothing on the write side enforces it), and
+    /// a <see cref="DecoderFallbackException"/> thrown here would replace
+    /// the wrong-node or connection-loss exception the caller needs, along
+    /// with every other value already resolved. So a value the strict
+    /// decoder rejects is left out rather than handed back with
+    /// replacement characters (a cache must never return a value it did
+    /// not store); the <c>...BytesAsync</c> variants still have the exact
+    /// bytes.</summary>
+    private static Dictionary<string, string> DecodePartial(Dictionary<string, byte[]> raw)
+    {
+        var values = new Dictionary<string, string>(raw.Count);
+        foreach ((string key, byte[] value) in raw)
+        {
+            try
+            {
+                values[key] = StrictUtf8.GetString(value);
+            }
+            catch (DecoderFallbackException)
+            {
+                continue;
+            }
         }
         return values;
     }
@@ -2257,17 +2284,17 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         }
         catch (PartialWrongNodeException<Dictionary<string, byte[]>> partial)
         {
-            throw new PartialWrongNodeException<Dictionary<string, string>>(DecodeMany(partial.PartialValues));
+            throw new PartialWrongNodeException<Dictionary<string, string>>(DecodePartial(partial.PartialValues));
         }
         catch (PartialServerTooOldException<Dictionary<string, byte[]>> partial)
         {
             throw new PartialServerTooOldException<Dictionary<string, string>>(
-                DecodeMany(partial.PartialValues), partial.InnerException!);
+                DecodePartial(partial.PartialValues), partial.InnerException!);
         }
         catch (PartialConnectionLostException<Dictionary<string, byte[]>> partial)
         {
             throw new PartialConnectionLostException<Dictionary<string, string>>(
-                DecodeMany(partial.PartialValues), partial.InnerException!, partial.Message);
+                DecodePartial(partial.PartialValues), partial.InnerException!, partial.Message);
         }
     }
 
@@ -4973,8 +5000,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             else
             {
                 fresh.Close();
+                // Not sent: the request was never written, it only found
+                // its member gone (a refresh removed it while the redial
+                // ran). Marked so the non-idempotent paths refresh and
+                // reroute instead of reporting an outcome-unknown loss.
                 throw new ConnectionLostException(
-                    $"nanocached: {slot} left the cluster while reconnecting");
+                    $"nanocached: {slot} left the cluster while reconnecting", requestNotSent: true);
             }
         }
         return fresh;
@@ -5106,7 +5137,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             }
             if (!_members.TryGetValue(slot, out Member? member))
             {
-                throw new ConnectionLostException($"nanocached: {slot} has no open connection");
+                // Not sent: no connection was ever picked for this request.
+                // The ring still names a member a refresh in progress has
+                // already removed (RefreshNodeListAsync drops departed
+                // members first and swaps the ring only after dialing the
+                // new ones), and a non-idempotent op must read this as
+                // "refresh and reroute", not as a possibly-applied loss.
+                throw new ConnectionLostException(
+                    $"nanocached: {slot} has no open connection", requestNotSent: true);
             }
             return (slot, member.Address, member.Connection);
         }

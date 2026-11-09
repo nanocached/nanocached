@@ -251,7 +251,11 @@ If some keys' every owner was unreachable, `GetManyAsync`/
 `GetManyBytesAsync` throw `PartialConnectionLostException<T>`
 (`PartialValues` the keys that did resolve, `InnerException` the last
 connection error), or the bare connection error when nothing resolved —
-a connection loss is never reported as a wrong-node answer.
+a connection loss is never reported as a wrong-node answer. In the string
+variants a resolved value that is not valid UTF-8 is left out of
+`PartialValues` instead of replacing the exception with a
+`DecoderFallbackException`; the `...BytesAsync` variants still return its
+exact bytes.
 `SetManyAsync`/`SetManyBytesAsync` have nothing to return on success, so
 they just throw a plain `WrongNodeException` on the wrong-node condition
 — every other key in the batch was still stored; a key whose primary
@@ -578,7 +582,10 @@ desynced reply, a close by another request's failure or by the timeout
 watchdog while the write was in progress) is ambiguous and is never
 replayed. Every SDK applies this same rule; the Node and asyncio SDKs,
 whose runtimes buffer writes in user space and flush them in the
-background, can only ever prove the first case.
+background, can only ever prove the first case. A request that finds its
+node already gone from the member table (a node-list refresh dropped it
+and is still dialing the nodes that replaced it) was never sent either:
+it waits for that refresh and is routed again on the new list.
 
 `ConnectAsync` itself tolerates a node that discovery still lists but
 that can't be reached — typically one that just died and hasn't been

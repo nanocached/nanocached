@@ -197,14 +197,24 @@ internal sealed class HashRing
 
     /// <summary>Whether <paramref name="a"/> ranks strictly ahead of
     /// <paramref name="b"/> in owner order: higher score wins; ties break
-    /// toward the lexicographically smaller name (ordinal comparison,
-    /// matching byte-wise ordering elsewhere) — a total order every
-    /// nanocached implementation agrees on.</summary>
+    /// toward the smaller name by its UTF-8 bytes (the server's
+    /// <c>str::cmp</c>) — a total order every nanocached implementation
+    /// agrees on.</summary>
     private static bool Less((ulong Score, string Node) a, (ulong Score, string Node) b)
     {
         if (a.Score != b.Score) return a.Score > b.Score;
-        return string.CompareOrdinal(a.Node, b.Node) < 0;
+        return CompareNames(a.Node, b.Node) < 0;
     }
+
+    /// <summary>Orders node names by their UTF-8 bytes, unsigned.
+    /// <see cref="string.CompareOrdinal(string, string)"/> orders by UTF-16
+    /// code units instead, which differs for a supplementary-plane
+    /// character (a surrogate, 0xD800..0xDFFF) against one in
+    /// U+E000..U+FFFF: the surrogate sorts lower in UTF-16 but its
+    /// four-byte UTF-8 form sorts higher than their three-byte one. Reached
+    /// only on a score tie, so the allocation does not matter.</summary>
+    internal static int CompareNames(string a, string b) =>
+        Encoding.UTF8.GetBytes(a).AsSpan().SequenceCompareTo(Encoding.UTF8.GetBytes(b));
 
     /// <summary>The key's primary — <c>Owners(key, 1)[0]</c>.</summary>
     public string Route(ReadOnlySpan<byte> key) => Route(ReadOnlySpan<byte>.Empty, key);
