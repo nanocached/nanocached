@@ -5399,6 +5399,35 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
     });
   });
 
+  for (const get of [false, true]) {
+    it(`${get ? "getManyAndTouch" : "touchMany"} with ttl 0 loses only the chunk whose frame was written and sends the chunks after it`, async () => {
+      await withCluster(async (client, cluster) => {
+        const keys = keysWithPrimary(cluster, names[0], 3 * MAX_BATCH_KEYS, "lost");
+        await client.setMany(Object.fromEntries(keys.map((key) => [key, `v-${key}`])));
+        const primary = cluster.nodes[0].mock;
+        const before = primary.multiTouchFrames().length;
+        // Chunk 1 is answered; the connection dies on chunk 2, after its
+        // frame was written. Chunk 3 was never sent.
+        primary.failMultiTouchAfter(1);
+        const call = get ? client.getManyAndTouch(keys, 0) : client.touchMany(keys, 0);
+        await assert.rejects(call, (error: unknown) => {
+          assert.ok(error instanceof ConnectionLostError);
+          assert.equal(error.requestWasSent, true);
+          // Only chunk 2 is reported as lost, not the unsent chunk 3 as well
+          // (a plain touchMany rethrows the connection's own error).
+          if (get) assert.match(error.message, new RegExp(`could not reach the primary of ${MAX_BATCH_KEYS} of ${keys.length} keys`));
+          return true;
+        });
+        // Chunk 3 went to the retry pass instead of being given up on: its
+        // frame reaches the node and the keys are expired there.
+        const frames = primary.multiTouchFrames().slice(before);
+        assert.deepEqual(frames.map((frame) => frame.keys.length), [MAX_BATCH_KEYS, MAX_BATCH_KEYS, MAX_BATCH_KEYS]);
+        assert.deepEqual(frames[2].keys, keys.slice(2 * MAX_BATCH_KEYS));
+        for (const key of keys.slice(2 * MAX_BATCH_KEYS)) assert.equal(primary.store.has(key), false);
+      });
+    });
+  }
+
   it("is scoped to its namespace in a cluster", async () => {
     await withCluster(async (client, cluster) => {
       const users = client.namespace("users");
