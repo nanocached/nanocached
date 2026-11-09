@@ -103,7 +103,7 @@ public sealed class NanocachedNamespace
     public Task SetAsync(byte[] key, byte[] value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled(cancellationToken)
-        : Cancellation.Abandonable(_client.SetAsync(_namespace, key, value, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(_client.SetAsync(_namespace, Cancellation.Own(key, cancellationToken), Cancellation.Own(value, cancellationToken), ttlSeconds), cancellationToken);
 
     public Task<bool> DeleteAsync(string key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
@@ -114,7 +114,7 @@ public sealed class NanocachedNamespace
     public Task<bool> DeleteAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(_client.DeleteAsync(_namespace, key), cancellationToken);
+        : Cancellation.Abandonable(_client.DeleteAsync(_namespace, Cancellation.Own(key, cancellationToken)), cancellationToken);
 
     /// <summary>issue #825: as <see cref="NanocachedClient.TouchAsync(string, long?, CancellationToken)"/>,
     /// scoped to this handle's namespace.</summary>
@@ -127,7 +127,7 @@ public sealed class NanocachedNamespace
     public Task<bool> TouchAsync(byte[] key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(_client.TouchAsync(_namespace, key, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(_client.TouchAsync(_namespace, Cancellation.Own(key, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #825: as <see cref="NanocachedClient.GetAndTouchAsync(string, long?, CancellationToken)"/>,
     /// scoped to this handle's namespace.</summary>
@@ -140,7 +140,7 @@ public sealed class NanocachedNamespace
     public Task<string?> GetAndTouchAsync(byte[] key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<string?>(cancellationToken)
-        : Cancellation.Abandonable(_client.GetAndTouchAsync(_namespace, key, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(_client.GetAndTouchAsync(_namespace, Cancellation.Own(key, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #825: as <see cref="NanocachedClient.GetAndTouchBytesAsync(string, long?, CancellationToken)"/>,
     /// scoped to this handle's namespace.</summary>
@@ -153,7 +153,7 @@ public sealed class NanocachedNamespace
     public Task<byte[]?> GetAndTouchBytesAsync(byte[] key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<byte[]?>(cancellationToken)
-        : Cancellation.Abandonable(_client.GetAndTouchBytesAsync(_namespace, key, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(_client.GetAndTouchBytesAsync(_namespace, Cancellation.Own(key, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #871: as <see cref="NanocachedClient.TouchManyAsync(IReadOnlyList{string}, long?, CancellationToken)"/>,
     /// scoped to this namespace.</summary>
@@ -204,7 +204,7 @@ public sealed class NanocachedNamespace
     public Task SetManyBytesAsync(IReadOnlyDictionary<string, byte[]> values, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled(cancellationToken)
-        : Cancellation.Abandonable(_client.SetManyBytesAsync(_namespace, values, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(_client.SetManyBytesAsync(_namespace, Cancellation.OwnValues(values, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #129: as <see cref="NanocachedClient.IncrAsync(byte[], long, CancellationToken)"/>,
     /// scoped to this handle's namespace. As volatile as
@@ -222,7 +222,7 @@ public sealed class NanocachedNamespace
     public Task<long?> IncrAsync(byte[] key, long delta, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<long?>(cancellationToken)
-        : Cancellation.Abandonable(_client.IncrAsync(_namespace, key, delta), cancellationToken);
+        : Cancellation.Abandonable(_client.IncrAsync(_namespace, Cancellation.Own(key, cancellationToken), delta), cancellationToken);
 
     /// <summary>issue #129: <see cref="IncrAsync(byte[], long, CancellationToken)"/> with
     /// <paramref name="delta"/> negated — never a different wire op.</summary>
@@ -234,7 +234,7 @@ public sealed class NanocachedNamespace
     public Task<long?> DecrAsync(byte[] key, long delta, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<long?>(cancellationToken)
-        : Cancellation.Abandonable(_client.DecrAsync(_namespace, key, delta), cancellationToken);
+        : Cancellation.Abandonable(_client.DecrAsync(_namespace, Cancellation.Own(key, cancellationToken), delta), cancellationToken);
 
     /// <summary>issue #141 — compare-and-set: as
     /// <see cref="NanocachedClient.GetWithTokenAsync(string, CancellationToken)"/>, scoped to
@@ -274,7 +274,7 @@ public sealed class NanocachedNamespace
     public Task<bool> PutIfAbsentAsync(byte[] key, byte[] value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(_client.PutIfAbsentAsync(_namespace, key, value, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(_client.PutIfAbsentAsync(_namespace, Cancellation.Own(key, cancellationToken), Cancellation.Own(value, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #141 — the two-argument <c>replace(key, value)</c>:
     /// as <see cref="NanocachedClient.ReplaceIfPresentAsync(string, string, long, CancellationToken)"/>,
@@ -287,7 +287,7 @@ public sealed class NanocachedNamespace
     public Task<bool> ReplaceIfPresentAsync(byte[] key, byte[] value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(_client.ReplaceIfPresentAsync(_namespace, key, value, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(_client.ReplaceIfPresentAsync(_namespace, Cancellation.Own(key, cancellationToken), Cancellation.Own(value, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #141 — the three-argument <c>replace(key, old, new)</c>:
     /// as <see cref="NanocachedClient.ReplaceAsync(string, string, string, long, CancellationToken)"/>,
@@ -300,7 +300,7 @@ public sealed class NanocachedNamespace
     public Task<bool> ReplaceAsync(byte[] key, string token, byte[] newValue, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(_client.ReplaceAsync(_namespace, key, token, newValue, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(_client.ReplaceAsync(_namespace, Cancellation.Own(key, cancellationToken), token, Cancellation.Own(newValue, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #141 — the two-argument <c>remove(key, old)</c>: as
     /// <see cref="NanocachedClient.DeleteIfMatchesAsync(string, string, CancellationToken)"/>,
@@ -313,7 +313,7 @@ public sealed class NanocachedNamespace
     public Task<bool> DeleteIfMatchesAsync(byte[] key, string token, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(_client.DeleteIfMatchesAsync(_namespace, key, token), cancellationToken);
+        : Cancellation.Abandonable(_client.DeleteIfMatchesAsync(_namespace, Cancellation.Own(key, cancellationToken), token), cancellationToken);
 
     /// <summary>issue #106: drops every entry in this handle's namespace —
     /// on the empty namespace (<c>client.Namespace("")</c>), clears the

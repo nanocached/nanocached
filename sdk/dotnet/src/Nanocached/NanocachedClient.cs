@@ -1919,7 +1919,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task SetAsync(byte[] key, byte[] value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled(cancellationToken)
-        : Cancellation.Abandonable(SetAsync(EmptyNamespace, key, value, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(SetAsync(EmptyNamespace, Cancellation.Own(key, cancellationToken), Cancellation.Own(value, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #105: as <see cref="SetAsync(string, string, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
@@ -1964,7 +1964,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<bool> DeleteAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(DeleteAsync(EmptyNamespace, key), cancellationToken);
+        : Cancellation.Abandonable(DeleteAsync(EmptyNamespace, Cancellation.Own(key, cancellationToken)), cancellationToken);
 
     /// <summary>issue #105: as <see cref="DeleteAsync(string, CancellationToken)"/>, scoped to
     /// <paramref name="namespaceBytes"/> — the internal method
@@ -2026,7 +2026,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<bool> TouchAsync(byte[] key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(TouchAsync(EmptyNamespace, key, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(TouchAsync(EmptyNamespace, Cancellation.Own(key, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #105: as <see cref="TouchAsync(string, long?, CancellationToken)"/>, scoped to
     /// <paramref name="namespaceBytes"/> — the internal method
@@ -2086,7 +2086,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<string?> GetAndTouchAsync(byte[] key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<string?>(cancellationToken)
-        : Cancellation.Abandonable(GetAndTouchAsync(EmptyNamespace, key, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(GetAndTouchAsync(EmptyNamespace, Cancellation.Own(key, cancellationToken), ttlSeconds), cancellationToken);
 
     internal Task<string?> GetAndTouchAsync(byte[] namespaceBytes, string key, long? ttlSeconds) =>
         GetAndTouchAsync(namespaceBytes, Utf8(key, "key"), ttlSeconds);
@@ -2109,7 +2109,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<byte[]?> GetAndTouchBytesAsync(byte[] key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<byte[]?>(cancellationToken)
-        : Cancellation.Abandonable(GetAndTouchBytesAsync(EmptyNamespace, key, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(GetAndTouchBytesAsync(EmptyNamespace, Cancellation.Own(key, cancellationToken), ttlSeconds), cancellationToken);
 
     internal Task<byte[]?> GetAndTouchBytesAsync(byte[] namespaceBytes, string key, long? ttlSeconds) =>
         GetAndTouchBytesAsync(namespaceBytes, Utf8(key, "key"), ttlSeconds);
@@ -2831,7 +2831,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task SetManyBytesAsync(IReadOnlyDictionary<string, byte[]> values, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled(cancellationToken)
-        : Cancellation.Abandonable(SetManyBytesAsync(EmptyNamespace, values, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(SetManyBytesAsync(EmptyNamespace, Cancellation.OwnValues(values, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #105: as <see cref="SetManyBytesAsync(IReadOnlyDictionary{string, byte[]}, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/>.</summary>
@@ -3308,7 +3308,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<long?> IncrAsync(byte[] key, long delta, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<long?>(cancellationToken)
-        : Cancellation.Abandonable(IncrAsync(EmptyNamespace, key, delta), cancellationToken);
+        : Cancellation.Abandonable(IncrAsync(EmptyNamespace, Cancellation.Own(key, cancellationToken), delta), cancellationToken);
 
     /// <summary>issue #129: as <see cref="IncrAsync(string, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
@@ -3370,7 +3370,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<long?> DecrAsync(byte[] key, long delta, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<long?>(cancellationToken)
-        : Cancellation.Abandonable(IncrAsync(key, NegateDecrDelta(delta)), cancellationToken);
+        : Cancellation.Abandonable(IncrAsync(Cancellation.Own(key, cancellationToken), NegateDecrDelta(delta)), cancellationToken);
 
     internal Task<long?> DecrAsync(byte[] namespaceBytes, string key, long delta) =>
         IncrAsync(namespaceBytes, key, NegateDecrDelta(delta));
@@ -3597,7 +3597,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<bool> PutIfAbsentAsync(byte[] key, byte[] value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(PutIfAbsentAsync(EmptyNamespace, key, value, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(PutIfAbsentAsync(EmptyNamespace, Cancellation.Own(key, cancellationToken), Cancellation.Own(value, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #141: as <see cref="PutIfAbsentAsync(string, string, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
@@ -3625,7 +3625,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<bool> ReplaceIfPresentAsync(byte[] key, byte[] value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(ReplaceIfPresentAsync(EmptyNamespace, key, value, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(ReplaceIfPresentAsync(EmptyNamespace, Cancellation.Own(key, cancellationToken), Cancellation.Own(value, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #141: as <see cref="ReplaceIfPresentAsync(string, string, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
@@ -3667,7 +3667,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<bool> ReplaceAsync(byte[] key, string token, byte[] newValue, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(ReplaceAsync(EmptyNamespace, key, token, newValue, ttlSeconds), cancellationToken);
+        : Cancellation.Abandonable(ReplaceAsync(EmptyNamespace, Cancellation.Own(key, cancellationToken), token, Cancellation.Own(newValue, cancellationToken), ttlSeconds), cancellationToken);
 
     /// <summary>issue #141: as <see cref="ReplaceAsync(string, string, string, long, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
@@ -3716,7 +3716,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<bool> DeleteIfMatchesAsync(byte[] key, string token, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
-        : Cancellation.Abandonable(DeleteIfMatchesAsync(EmptyNamespace, key, token), cancellationToken);
+        : Cancellation.Abandonable(DeleteIfMatchesAsync(EmptyNamespace, Cancellation.Own(key, cancellationToken), token), cancellationToken);
 
     /// <summary>issue #141: as <see cref="DeleteIfMatchesAsync(string, string, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
