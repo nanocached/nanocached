@@ -8832,5 +8832,60 @@ class EstablishedConnectionResetRetiresTheSocketTests(unittest.IsolatedAsyncioTe
             await server.wait_closed()
 
 
+class RedialAfterCloseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_request_retried_after_close_fails_as_closed_instead_of_dialing(self):
+        # Issue #1612: close() poisons the connection a request is waiting
+        # on, and the retry layer redials it. _redial/_open_node_connection
+        # checked the closed flag only after the dial, so against a node
+        # that never completes the handshake the request spent the whole
+        # connect deadline (5 s) dialing and then failed with a
+        # ConnectFailedError instead of AlreadyClosedError. (Only a cluster
+        # client retries a failed request, after a forced refresh; single
+        # and proxy mode redial on the next call instead.)
+        accepted = 0
+        first_request = asyncio.Event()
+
+        async def serve(reader, writer):
+            nonlocal accepted
+            accepted += 1
+            first = accepted == 1
+            try:
+                header = await reader.readuntil(b"\n")
+                if first:
+                    await reader.readexactly(int(header.split()[1]))
+                    writer.write(b"On\n")
+                    await writer.drain()
+                    await reader.readuntil(b"\n")  # the request, never answered
+                    first_request.set()
+                await reader.read()  # silent until the peer closes
+            except (asyncio.IncompleteReadError, ConnectionError):
+                pass
+            finally:
+                writer.close()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        discovery = await MockDiscovery([(NAMES[0], f"127.0.0.1:{port}")]).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            request = asyncio.ensure_future(client.get("k"))
+            await asyncio.wait_for(first_request.wait(), 5)
+
+            await client.close()
+            try:
+                with self.assertRaises(AlreadyClosedError):
+                    await asyncio.wait_for(asyncio.shield(request), 3)
+            except asyncio.TimeoutError:
+                self.fail("get() still waiting 3 s after close(): it redialed the node instead of failing as closed")
+            finally:
+                request.cancel()
+                with contextlib.suppress(BaseException):
+                    await request
+        finally:
+            await discovery.close()
+            server.close()
+            await server.wait_closed()
+
+
 if __name__ == "__main__":
     unittest.main()
