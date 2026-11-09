@@ -34,6 +34,8 @@ for c in $(docker ps -aq --filter "name=^/$P-"); do n=$(docker inspect -f "{{.Na
 echo "=== WARN/ERROR categories (nodes, proxies, discovery)"; cat "$L"/$P-[abcpd]*.log | grep -v "^.*load" | grep -i "warn\|error\|panic" | sed -E 's/^[^ ]+Z //; s/[0-9a-f]{8}-[0-9a-f-]{27}/UUID/g; s/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+/ADDR/g; s/attempt [0-9]+\/[0-9]+/attempt X/g; s/after [0-9]+ attempt/after N attempt/g; s/[0-9]+ key/N key/g; s/[0-9]+ (entries|dead)/N \1/g' | sort | uniq -c | sort -rn | head -12
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { T "FAIL: untouched-range verify not clean"; fail=1; }
 echo "$load" | grep -q '"corrupt": 0' || { T "FAIL: corrupt"; fail=1; }
+ops=$(load_ops "$load"); [ "${ops:-0}" -ge $(( LOAD_SECS * ${MIN_OPS_S:-10} )) ] || { T "FAIL: load completed only ${ops:-0} ops in ${LOAD_SECS}s (want >= ${MIN_OPS_S:-10}/s: it did not run for the whole scenario)"; fail=1; }
 echo "$load" | grep -q '"miss": 0' || { T "FAIL: load saw misses"; fail=1; }
 cleanup
 echo "=== RESULT run=$RUN fail=$fail"
+[ "$fail" = 0 ] || exit 1

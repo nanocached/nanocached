@@ -37,8 +37,8 @@ code.</p>
 
 <p>Every SDK ships the full feature set: authentication, TLS, discovery
 replica lists, replication-aware routing (reads fail over, writes fan out
-to all R owners), transparent reconnect with a single retry, always-on
-keep-alive, opt-in transparent value compression, opt-in fire-and-forget
+to all R owners), transparent reconnect (see below for what is retried),
+always-on keep-alive, opt-in transparent value compression, opt-in fire-and-forget
 replica writes, opt-in read repair, and the same rendezvous-hashing
 pipeline verified against shared cross-language test vectors. Values are
 strings first: every <code>get</code> returns a string, with a
@@ -47,6 +47,21 @@ getter is strict UTF-8 in five SDKs (a stored value that is not valid
 UTF-8 raises); in Go, where a <code>string</code> can hold any bytes,
 <code>Get</code> returns the bytes unchanged and <code>GetBytes</code>
 is the <code>[]byte</code> form.</p>
+
+<p>A connection found closed is redialed on its next use in every SDK and
+mode. Whether a request that loses its connection while it is in flight is
+sent again depends on the mode. In cluster mode every SDK retries it once,
+after refreshing the node list from discovery, so a key whose primary died
+is rerouted. In single-node and proxy mode Go, Rust, Java and .NET also
+retry once: they redial and resend (a proxy client whose proxy is
+unreachable fails over to another proxy from discovery&rsquo;s roster).
+Python does not retry in either mode, and TypeScript does not in
+single-node mode: the call fails with the connection-lost error and the
+next call redials. TypeScript in proxy mode re-fetches the proxy roster
+and retries once, as in cluster mode. In every case a non-idempotent
+request (<code>incr</code>/<code>decr</code>, the compare-and-set calls,
+delete-if-matches) is resent only when the SDK can show that nothing was
+sent.</p>
 
 <p>A TTL is whole seconds; <code>0</code> (or omitting it) means no
 expiry. The wire field is an unsigned 64-bit decimal, and the largest

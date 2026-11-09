@@ -59,7 +59,11 @@ runs past the limit without its <code>\n</code> is refused the same way. Through
 <code>nanocached-proxy</code> the limit is 11 bytes lower, 1,048,565: the
 proxy puts a tag on the frame it passes to a node, and the node&rsquo;s
 limit still has to hold for the longer frame; the proxy answers a bare
-<code>E\n</code>. The frames only another node
+<code>E\n</code>. An <code>i</code> through the proxy is further limited
+to 1,048,512 bytes of namespace and key together, because the proxy sends
+its result to the replicas as a set, which carries the new value and the
+TTL that the <code>i</code> does not; a longer one closes the connection like
+any other request the proxy cannot accept. The frames only another node
 sends (<code>U</code>, <code>u</code>, <code>f</code>) may exceed it by
 4 KiB: the <code>U</code> that moves a value to another node carries the
 receiver&rsquo;s token on top of what the client&rsquo;s <code>S</code>

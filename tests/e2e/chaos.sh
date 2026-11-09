@@ -131,11 +131,17 @@ ROUNDS=${ROUNDS:-6}
 # Generous per-round budget: join migration of ~30k keys plus a drain or an
 # eviction wait. The load runs for the whole schedule plus a tail.
 ROUND_BUDGET=${ROUND_BUDGET:-150}
-LOAD_SECS=$(( ROUNDS * ROUND_BUDGET + 30 ))
+# Every decommission round (rounds 2, 5, ...) also waits up to HEAL_BUDGET for the
+# survivors' re-replication pass, on top of its ROUND_BUDGET; the load must still
+# be running when the last round ends, or the miss/corrupt assertions on it say
+# nothing about that round (checked after the loop).
+HEAL_BUDGET=${HEAL_BUDGET:-90}
+LOAD_SECS=$(( ROUNDS * ROUND_BUDGET + (ROUNDS + 1) / 3 * HEAL_BUDGET + 30 ))
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
 # Portable `timeout` (macOS has none): kill the command after N seconds.
 tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+trap cleanup EXIT  # Ctrl-C or a failed step must not leave the run's containers behind
 # A reused RUN name must not keep the previous run's node logs: the end-of-run
 # capture skips files that already exist (a leaver's log is saved when it leaves).
 RUN=${RUN:-$(date +%H%M%S)}; L="$E/logs/chaos-$RUN"; rm -rf "$L"; mkdir -p "$L"
@@ -197,6 +203,7 @@ if [ "${CLEAR_ORACLE:-0}" = 1 ]; then
 fi
 entries_snapshot seeded
 T "start ${LOAD_SECS}s mixed load (8 conns, get 70%, hedge 10ms, reconnect on error)"
+load_t0=$(date +%s)
 docker run -d --name $P-load --network $NET -v "$E:/w" -w /w $CLIENT python ${LOADER:-load.py} --addr $D --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label chaos --reconnect-on-error --hedge 0.01 --report-every 30 >/dev/null
 sleep 5
 actions=(join decommission kill)
@@ -285,6 +292,12 @@ PY
   T "round $r done in $(( $(date +%s)-t0 ))s; live=[${live[*]}]"
   entries_snapshot "round$r-$a"
 done
+# The load runs for a fixed LOAD_SECS: it must still be running now, or the last round(s) ran without it.
+if [ "$(docker inspect -f '{{.State.Running}}' $P-load 2>/dev/null)" = true ]; then
+  T "load still running after the last round ($(( $(date +%s)-load_t0 ))s of ${LOAD_SECS}s)"
+else
+  T "FAIL: the load had already ended when the last round finished ($(( $(date +%s)-load_t0 ))s into a ${LOAD_SECS}s load): the last round(s) ran without it"; fail=1
+fi
 T "stop the versioned writer and the touch workload (settle 15s / 50s, then read back every key)"
 tmo 300 docker stop -t 240 $P-swriter $P-touch $( [ "${DELETE_ORACLE:-0}" = 1 ] && echo $P-del ) $( [ "${TTL_ORACLE:-0}" = 1 ] && echo $P-ttl ) $( [ "${CAS_ORACLE:-0}" = 1 ] && echo $P-cas ) $( [ "${INCR_ORACLE:-0}" = 1 ] && echo $P-incr ) $( [ "${CLEAR_ORACLE:-0}" = 1 ] && echo $P-clear ) $( [ "${MULTI_ORACLE:-0}" = 1 ] && echo $P-multi ) >/dev/null
 versioned=$(docker logs $P-swriter 2>&1 | grep '"phase": "checked"' | tail -1)
@@ -367,6 +380,7 @@ warns $P-disc "${live[@]}"
 for f in "$L"/"$P"-n*.log; do [ -f "$f" ] && { echo "== $(basename "$f")"; grep -i "warn\|error\|panic" "$f" | sed 's/[0-9.]*:[0-9]*/X/g' | sort | uniq -c | sort -rn | head -5; }; done
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { T "FAIL: untouched-range verify not clean"; fail=1; }
 echo "$load" | grep -q '"corrupt": 0' || { T "FAIL: load saw corrupt reads"; fail=1; }
+ops=$(load_ops "$load"); [ "${ops:-0}" -ge $(( LOAD_SECS * ${MIN_OPS_S:-10} )) ] || { T "FAIL: load completed only ${ops:-0} ops in ${LOAD_SECS}s (want >= ${MIN_OPS_S:-10}/s: it did not run for the whole scenario)"; fail=1; }
 echo "$load" | grep -q '"miss": 0' || { T "FAIL: load saw misses"; fail=1; }
 # Touch oracle: lost copies, lingering copies of expired keys, a primary TTL other than the one touched.
 tbad=$(python3 -c "
@@ -485,14 +499,19 @@ for c in $(docker ps -aq --filter "name=^/$P-"); do n=$(docker inspect -f "{{.Na
 # or an increment starting from a value no increment produced, is the
 # evidence a phantom answer leaves on the node side.
 if [ "${INCR_ORACLE:-0}" = 1 ] && [ -f "$L/incrstate.json" ]; then
-  python3 "$E/incrtrace.py" --state "$L/incrstate.json" --logs "$L" --nodes "$P-n" > "$L/incrtrace.txt" 2>&1
+  itrc=0; python3 "$E/incrtrace.py" --state "$L/incrstate.json" --logs "$L" --nodes "$P-n" > "$L/incrtrace.txt" 2>&1 || itrc=$?
   itrace=$(tail -1 "$L/incrtrace.txt")
-  if [ "$(echo "$itrace" | grep -oE '"trace_lines": [0-9]+' | grep -oE '[0-9]+')" = 0 ]; then
+  # A traceback is not "no TRACE lines": the evidence channel going dark must fail the run, not pass it.
+  if [ "$itrc" != 0 ]; then
+    T "FAIL: incrtrace.py exited $itrc (see $L/incrtrace.txt): $(echo "$itrace" | cut -c1-200)"; fail=1
+  elif ! echo "$itrace" | grep -qE '^\{.*"trace_lines": [0-9]+.*"over_applied": [0-9]+.*"value_from_nowhere": [0-9]+'; then
+    T "FAIL: incrtrace.py's last line is not its summary (see $L/incrtrace.txt): $(echo "$itrace" | cut -c1-200)"; fail=1
+  elif [ "$(echo "$itrace" | grep -oE '"trace_lines": [0-9]+' | grep -oE '[0-9]+')" = 0 ]; then
     echo "=== incr trace: no TRACE lines (node built without the trace feature or NANOCACHED_TRACE_PREFIX does not cover is); not checked"
   else
     tbad=$(echo "$itrace" | grep -oE '"(over_applied|value_from_nowhere)": [1-9][0-9]*' | tr '\n' ' ')
     [ -z "$tbad" ] || { T "FAIL: incr trace: $tbad(details in $L/incrtrace.txt)"; fail=1; }
-    echo "$itrace" | grep -oE '"(trace_lines|applications|acked|maybe|over_applied|under_applied|within_bounds|value_from_nowhere|sequence_jumps|answers_unmatched)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr trace (asserted: over_applied, value_from_nowhere): /'; echo
+    echo "$itrace" | grep -oE '"(trace_lines|trace_lines_dropped|applications|acked|maybe|over_applied|under_applied|within_bounds|value_from_nowhere|sequence_jumps|answers_unmatched)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr trace (asserted: over_applied, value_from_nowhere): /'; echo
   fi
 fi
 echo "=== entries:"; cat "$L/entries.txt"

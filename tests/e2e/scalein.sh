@@ -39,7 +39,7 @@ t0=$(date +%s)
 docker stop -t 40 $P-a >/dev/null
 rc=$(docker inspect -f '{{.State.ExitCode}}' $P-a)
 T "leaver exited rc=$rc after $(( $(date +%s)-t0 ))s (want rc=0, well under 40s)"
-wait_members 2 $D 30
+wait_members 2 $D 30 || { echo "FAIL: membership did not drop 3 -> 2 within 30s of the leaver exiting"; fail=1; }
 T "waiting for the load to finish"
 tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
 load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)
@@ -53,6 +53,7 @@ echo "=== discovery"; docker logs $P-disc 2>&1 | grep -i "left\|warn\|error" | h
 [ "$rc" = 0 ] || { echo "FAIL: leaver exit code $rc"; fail=1; }
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { echo "FAIL: post-drain verify not clean"; fail=1; }
 echo "$load" | grep -q '"corrupt": 0' || { echo "FAIL: load saw corrupt reads"; fail=1; }
+ops=$(load_ops "$load"); [ "${ops:-0}" -ge $(( LOAD_SECS * ${MIN_OPS_S:-10} )) ] || { echo "FAIL: load completed only ${ops:-0} ops in ${LOAD_SECS}s (want >= ${MIN_OPS_S:-10}/s: it did not run for the whole scenario)"; fail=1; }
 # Pre-seeded keyspace + R=2 + graceful drain: reads must never miss.
 echo "$load" | grep -q '"miss": 0' || { echo "FAIL: load saw misses (hit-rate dip)"; fail=1; }
 cleanup
