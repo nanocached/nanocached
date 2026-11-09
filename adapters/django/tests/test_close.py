@@ -8,13 +8,52 @@ thread behind, with the next operation lazily reconnecting."""
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import threading
+import time
 import unittest
+import warnings
 from unittest import mock
 
 import support  # noqa: F401 - configures settings.CACHES / django.setup()
 from mock_node import MockNode
 from nanocached_django import NanocachedCache
+
+
+def _run_in_fork_child(test: unittest.TestCase, body, timeout: float = 5.0) -> None:
+    """Runs ``body()`` in a real ``os.fork()`` child and fails ``test`` if
+    the child raised or did not finish within ``timeout`` seconds (it is then
+    SIGKILLed, so a hang fails the test instead of blocking the suite). The
+    child leaves through ``os._exit`` so it never runs the test runner's
+    teardown or atexit hooks."""
+    with warnings.catch_warnings():
+        # 3.12+ warns that fork() in a multi-threaded process may deadlock;
+        # that is the very situation under test.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            body()
+            code = 0
+        finally:
+            os._exit(code)
+    deadline = time.monotonic() + timeout
+    status = 0
+    while time.monotonic() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        time.sleep(0.01)
+    else:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        test.fail(f"the forked child did not finish within {timeout} s")
+    test.assertTrue(
+        os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0,
+        f"the forked child failed (wait status {status})",
+    )
 
 
 class CloseLifecycleTests(unittest.TestCase):
@@ -105,6 +144,85 @@ class CloseLifecycleTests(unittest.TestCase):
         self.assertIsNot(backend._lifecycle_lock, old_lock)
         # The new lock is a fresh, unlocked Lock() — acquiring it must
         # not block.
+        self.assertTrue(backend._lifecycle_lock.acquire(timeout=1))
+        backend._lifecycle_lock.release()
+        backend.shutdown()
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork()")
+    def test_shutdown_in_a_forked_child_returns_and_leaves_the_parent_alone(self) -> None:
+        # issue #1482: shutdown() in a fork() child that inherited a started
+        # bridge used to wait on client.close() against a loop whose thread
+        # did not survive the fork, forever.
+        backend = self._new_backend()
+        self.addCleanup(backend.shutdown)
+        backend.set("k", "v")
+        parent_thread = backend._loop_thread
+
+        def child() -> None:
+            backend.shutdown()
+            assert backend._loop is None and backend._client is None
+            # The next operation in the child starts a loop of its own.
+            assert backend.get("k") == "v"
+            assert backend._loop_pid == os.getpid()
+            backend.shutdown()
+
+        _run_in_fork_child(self, child)
+
+        self.assertTrue(parent_thread.is_alive())
+        self.assertIs(backend._loop_thread, parent_thread)
+        self.assertEqual(backend.get("k"), "v")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork()")
+    def test_close_on_request_close_in_a_forked_child_returns(self) -> None:
+        # issue #1482: with CLOSE_ON_REQUEST (a private bridge) and a
+        # preloaded warm-up touch, the first request in a worker that does
+        # not touch the cache reaches close() -> shutdown().
+        backend = self._new_backend(CLOSE_ON_REQUEST=True)
+        self.addCleanup(backend.shutdown)
+        backend.set("k", "v")
+        parent_thread = backend._loop_thread
+
+        def child() -> None:
+            backend.close()
+            assert backend._loop is None and backend._client is None
+            assert backend.get("k") == "v"
+            backend.close()
+
+        _run_in_fork_child(self, child)
+
+        self.assertTrue(parent_thread.is_alive())
+        self.assertEqual(backend.get("k"), "v")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork()")
+    def test_fork_resets_the_lock_of_a_close_on_request_bridge(self) -> None:
+        # issue #1482: a CLOSE_ON_REQUEST instance's private bridge is not in
+        # the shared registry, but the at-fork lock reset must cover it too:
+        # a lock held by another thread at fork time stays locked in the
+        # child, which holds no thread that could release it.
+        backend = self._new_backend(CLOSE_ON_REQUEST=True)
+        self.addCleanup(backend.shutdown)
+        backend.set("k", "v")
+
+        def child() -> None:
+            backend.close()
+
+        self.assertTrue(backend._lifecycle_lock.acquire(timeout=1))
+        try:
+            _run_in_fork_child(self, child)
+        finally:
+            backend._lifecycle_lock.release()
+
+    def test_fork_hook_resets_the_lock_of_a_close_on_request_bridge(self) -> None:
+        from nanocached_django.backend import _reset_lifecycle_locks_in_child
+
+        backend = self._new_backend(CLOSE_ON_REQUEST=True)
+        backend.set("k", "v")
+        backend._lifecycle_lock.acquire()  # held by "another thread" at fork time
+        old_lock = backend._lifecycle_lock
+
+        _reset_lifecycle_locks_in_child()
+
+        self.assertIsNot(backend._lifecycle_lock, old_lock)
         self.assertTrue(backend._lifecycle_lock.acquire(timeout=1))
         backend._lifecycle_lock.release()
         backend.shutdown()

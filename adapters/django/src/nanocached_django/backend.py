@@ -45,6 +45,7 @@ import os
 import pickle
 import re
 import threading
+import weakref
 
 from django.core.cache.backends.base import DEFAULT_TIMEOUT, BaseCache
 from django.core.exceptions import ImproperlyConfigured
@@ -427,6 +428,22 @@ class _Bridge:
 
     def shutdown(self) -> None:
         with self.lock:
+            if self.loop is not None and self.pid != os.getpid():
+                # issue #1482: a fork() child that inherited a started
+                # bridge. The thread driving self.loop did not survive
+                # the fork, so awaiting client.close() on it would block
+                # forever (a worker that never touched the cache reaching
+                # close() under CLOSE_ON_REQUEST, or a worker-exit hook
+                # calling shutdown()). The loop, thread and client are
+                # the parent's to close — touching their shared sockets
+                # from here could corrupt the parent's live connections
+                # mid-frame — so only this process's references are
+                # dropped, exactly as ensure_started's fork branch does.
+                self.loop = None
+                self.thread = None
+                self.client = None
+                self.handles = {}
+                return
             loop, thread, client = self.loop, self.thread, self.client
             self.loop = None
             self.thread = None
@@ -449,11 +466,18 @@ class _Bridge:
 # of distinct CACHES configurations, not by thread or request count.
 _bridges: dict[tuple, _Bridge] = {}
 _bridges_lock = threading.Lock()
+# The private bridges of CLOSE_ON_REQUEST instances (issue #1482). Weak, so
+# a discarded instance's bridge is not kept alive by this registry; it only
+# exists so the at-fork hook below can reset those bridges' locks too.
+_private_bridges: "weakref.WeakSet[_Bridge]" = weakref.WeakSet()
 
 
 def _get_bridge(addresses, secret, connect_kwargs, *, shared: bool) -> _Bridge:
     if not shared:
-        return _Bridge(addresses, secret, connect_kwargs)
+        bridge = _Bridge(addresses, secret, connect_kwargs)
+        with _bridges_lock:
+            _private_bridges.add(bridge)
+        return bridge
     key = (tuple(addresses), secret, repr(sorted(connect_kwargs.items())))
     with _bridges_lock:
         bridge = _bridges.get(key)
@@ -488,6 +512,8 @@ def _reset_lifecycle_locks_in_child() -> None:
     global _bridges_lock
     _bridges_lock = threading.Lock()
     for bridge in list(_bridges.values()):
+        bridge.lock = threading.Lock()
+    for bridge in list(_private_bridges):
         bridge.lock = threading.Lock()
 
 
