@@ -11352,11 +11352,15 @@ fn wrong_node(node_context: &NodeContext, key: &Key) -> bool {
 /// the joiner, clients cannot route to it, so the displaced node keeps
 /// serving exactly what `wrong_node` lets it serve.
 ///
-/// Judged by the adopted ring when it grants the key at all, and by the
-/// newest published ring (`NodeContext::latest_published`) when only
-/// that one does — the entrant after a leave or an eviction, whose own
-/// ring still lags: it is the key's primary under what discovery
-/// publishes, and the client already routes by it.
+/// Judged by the adopted ring, and by the newest published ring
+/// (`NodeContext::latest_published`) where that one makes this node the
+/// key's primary: the entrant after a leave or an eviction, whose own
+/// ring still lags, and the rank-2 owner a removal promotes — it is the
+/// key's primary under what discovery publishes, and the client already
+/// routes by it. A join cannot make the published ring promote this node
+/// over a primary that is alive (it only adds members ahead of it), and a
+/// removed primary is dead or draining, so there is no second primary to
+/// run the same command.
 fn not_the_primary(node_context: &NodeContext, key: &Key) -> bool {
     let key_hash = KeyHash::of(key);
     if wrong_node_hashed(node_context, key_hash) {
@@ -11381,9 +11385,13 @@ fn not_the_primary(node_context: &NodeContext, key: &Key) -> bool {
     if adopted
         .ring
         .is_owner_hashed(key_hash, &node_context.name, adopted.replication)
+        && primary_under(&adopted)
     {
-        return !primary_under(&adopted);
+        return false;
     }
+    // Not the primary under the adopted ring: either it does not grant the
+    // key at all, or this node is a replica of it. Both can be the stale
+    // side of a removal, so the published ring decides.
     !node_context
         .latest_published
         .lock()
@@ -26395,6 +26403,52 @@ mod tests {
             1,
         );
         assert!(!not_the_primary(&node_context, &now_its_own));
+    }
+
+    #[test]
+    fn counters_and_cas_follow_the_published_ring_for_a_rank_two_owner_promoted_by_a_leave() {
+        // Adopted ring [a, b, c] at R = 2; "a" leaves and discovery
+        // publishes [b, c]. A key whose adopted owners are [a, c] and whose
+        // published owners are [c, b] is one c is a replica of under its
+        // own ring and the primary of under the published one. Until c
+        // adopts the new roster, an `i`/`k`/`x` from a client that follows
+        // the new list must be served, not refused with `W`.
+        let adopted = membership_of(&["a", "b", "c"], 2);
+        let published = membership_of(&["b", "c"], 2);
+        let node_context = test_node_context(
+            "c",
+            "tk-c",
+            Arc::new(Mutex::new(Some(Arc::clone(&adopted)))),
+            Arc::new(Mutex::new(None)),
+        );
+        let promoted = (0..10_000)
+            .map(|i| key(format!("key-{i}").as_bytes()))
+            .find(|k| {
+                adopted.ring.is_owner(k, "c", 2)
+                    && !adopted.ring.is_owner(k, "c", 1)
+                    && published.ring.is_owner(k, "c", 1)
+            })
+            .expect(
+                "some key c is rank 2 for under the adopted ring and primary for after the leave",
+            );
+        assert!(!wrong_node(&node_context, &promoted));
+        // Nothing published yet: c is a replica, so `W`.
+        assert!(not_the_primary(&node_context, &promoted));
+        note_published_roster(
+            &node_context.latest_published,
+            &["b".to_string(), "c".to_string()],
+            2,
+        );
+        assert!(!wrong_node(&node_context, &promoted));
+        assert!(!not_the_primary(&node_context, &promoted));
+
+        // A key c stays rank 2 for under the published ring too is still
+        // the primary's alone.
+        let replica = (0..10_000)
+            .map(|i| key(format!("key-{i}").as_bytes()))
+            .find(|k| adopted.ring.is_owner(k, "c", 2) && !published.ring.is_owner(k, "c", 1))
+            .expect("some key c stays a replica of");
+        assert!(not_the_primary(&node_context, &replica));
     }
 
     #[test]
