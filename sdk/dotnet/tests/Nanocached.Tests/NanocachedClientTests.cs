@@ -327,7 +327,7 @@ public class NanocachedClientTests
         // must not false-positive (issue #12).
         using var node = new MockNode();
         using var discovery = new MockDiscovery(new[] { (Names[0], node.Address) });
-        int dead = Wire.UnusedPort();
+        int dead = Wire.DeadNodePort();
 
         using NanocachedClient first = await NanocachedClient.ConnectAsync(
             ManyAddresses(("127.0.0.1", dead), ("127.0.0.1", discovery.Port)));
@@ -654,7 +654,7 @@ public class NanocachedClientTests
         // Cross-SDK contract (mirrors Rust/Go): a negative
         // ReconnectCooldown is invalid — DisableReconnectCooldown is the
         // only supported way to disable the cooldown.
-        var options = SingleAddress("127.0.0.1", Wire.UnusedPort());
+        var options = SingleAddress("127.0.0.1", Wire.DeadNodePort());
         options.ReconnectCooldown = TimeSpan.FromMilliseconds(-1);
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => NanocachedClient.ConnectAsync(options));
     }
@@ -662,7 +662,7 @@ public class NanocachedClientTests
     [Fact]
     public async Task ARefusedConnectIsAConnectionLostExceptionWithTheSocketErrorInside()
     {
-        int dead = Wire.UnusedPort();
+        int dead = Wire.DeadNodePort();
         var error = await Assert.ThrowsAsync<ConnectionLostException>(
             () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", dead)));
         Assert.IsType<System.Net.Sockets.SocketException>(error.InnerException);
@@ -1055,7 +1055,7 @@ public class NanocachedClientTests
     {
         using var node = new MockNode();
         using var discovery = new MockDiscovery(new[] { (Names[0], node.Address) });
-        int dead = Wire.UnusedPort();
+        int dead = Wire.DeadNodePort();
 
         using NanocachedClient client = await NanocachedClient.ConnectAsync(
             ManyAddresses(("127.0.0.1", dead), ("127.0.0.1", discovery.Port)));
@@ -3710,7 +3710,7 @@ public class NanocachedClientTests
     public async Task AnUnreachableAddressDuringRefreshIncrementsRefreshFailures()
     {
         using Cluster cluster = StartCluster(replication: 1);
-        int deadPort = Wire.UnusedPort();
+        int deadPort = Wire.DeadNodePort();
 
         // The dead address is tried first on every address walk, so both
         // the initial connect (which falls over to the real discovery
@@ -4970,7 +4970,7 @@ public class NanocachedClientTests
         // always compressing (Compression.CompressValue treats "shorter
         // than a negative threshold" as never true). Reject it up front,
         // like the other invalid-option checks in ConnectAsync.
-        var options = CompressingOptions(Wire.UnusedPort(), threshold: -1);
+        var options = CompressingOptions(Wire.DeadNodePort(), threshold: -1);
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => NanocachedClient.ConnectAsync(options));
     }
 
@@ -6098,7 +6098,7 @@ public class NanocachedClientTests
     public async Task ViaProxyFailsOverToTheLiveProxyWhenTheRandomlyChosenOneIsDown()
     {
         using var live = new MockNode();
-        int dead = Wire.UnusedPort();
+        int dead = Wire.DeadNodePort();
         using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
         discovery.SetProxies(new[] { ("proxy-dead", $"127.0.0.1:{dead}"), ("proxy-live", live.Address) });
 
@@ -6530,7 +6530,7 @@ public class TolerantBootstrapTests
         {
             if (dead.Contains(name))
             {
-                entries.Add((name, $"127.0.0.1:{Wire.UnusedPort()}"));
+                entries.Add((name, $"127.0.0.1:{Wire.DeadNodePort()}"));
             }
             else
             {
@@ -6782,7 +6782,7 @@ public class TolerantBootstrapTests
         using var good = new MockNode();
         // Nobody listens on this address: OpenNodeConnectionAsync throws
         // ConnectionLostException (a NanocachedException) for it.
-        string badAddress = $"127.0.0.1:{Wire.UnusedPort()}";
+        string badAddress = $"127.0.0.1:{Wire.DeadNodePort()}";
 
         discovery.SetNodes(new[]
         {
