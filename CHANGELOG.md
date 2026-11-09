@@ -61,6 +61,17 @@ framework adapters at one version, whether or not a component changed.
   header while its body may still be arriving, and closing a socket with
   unread bytes sends a reset that could discard the `Ed\n` before the
   client read it (#1458).
+- `nanocached-node` (built with `--features trace`, the nightly chaos
+  build): a peer token whose ninth byte fell inside a multi-byte
+  character panicked the handoff trace line, which cut the token at eight
+  bytes. A registrant holding the secret could register such a token, and
+  the panic landed in the forward drainer, the decommission, the
+  re-replication or the migration task; one in the decommission was
+  silent and left the node up. The trace now cuts at eight characters.
+  Separately, `NANOCACHED_TRACE_PREFIX` set but empty traced every key,
+  because every key starts with the empty string; an empty value (or an
+  empty entry in the list) now selects nothing, as an unset variable does
+  (#1489).
 - `nanocached-node`, `nanocached-proxy`, `nanocached-discovery`: after a
   refused request, the drain that half-closes and reads what the client is
   still sending was bounded by its one-second window only for the read;
