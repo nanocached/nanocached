@@ -40,6 +40,25 @@ class HashRingTest {
         assertEquals(List.of("node-a", "node-b", "node-c"), ring.owners(bytes(""), 3));
     }
 
+    @Test
+    void scoreTiesBreakByUnsignedUtf8BytesNotUtf16CodeUnits() {
+        // Two names that differ only in one character: U+FFFF (UTF-8 EF BF BF,
+        // one UTF-16 unit 0xFFFF) and U+10000 (UTF-8 F0 90 80 80, the UTF-16
+        // pair D800 DC00). The server orders by UTF-8 bytes (`str::cmp` in
+        // src/hash_ring.rs), so U+FFFF is the smaller name; String.compareTo
+        // orders by UTF-16 units and says the opposite.
+        String bmp = "node-\uFFFF";
+        String supplementary = "node-\uD800\uDC00";
+        assertTrue(supplementary.compareTo(bmp) < 0, "UTF-16 order is the one that differs");
+        assertTrue(HashRing.compareNames(bmp, supplementary) < 0);
+        assertTrue(HashRing.compareNames(supplementary, bmp) > 0);
+        assertEquals(0, HashRing.compareNames(bmp, "node-\uFFFF"));
+        // Unsigned: a byte >= 0x80 sorts above an ASCII one.
+        assertTrue(HashRing.compareNames("node-a", "node-\u00e9") < 0);
+        // A prefix sorts first.
+        assertTrue(HashRing.compareNames("node", "node-a") < 0);
+    }
+
     // Namespaces (issue #105): `key_hash = fnv1a(be32(len(ns)) || ns || key)`
     // for a non-empty namespace. Every SDK and the server pin these same
     // owner-order vectors (computed independently in Python from the
