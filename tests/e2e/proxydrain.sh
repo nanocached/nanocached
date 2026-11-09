@@ -65,5 +65,6 @@ echo "=== discovery"; docker logs $P-disc 2>&1 | grep -i "proxy\|warn\|error" | 
 [ "$rc" = 0 ] || { echo "FAIL: proxy exit code $rc"; fail=1; }
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { echo "FAIL: post-drain verify not clean"; fail=1; }
 echo "$load" | grep -q '"corrupt": 0' || { echo "FAIL: load saw corrupt reads"; fail=1; }
+ops=$(load_ops "$load"); [ "${ops:-0}" -ge $(( LOAD_SECS * ${MIN_OPS_S:-10} )) ] || { echo "FAIL: load completed only ${ops:-0} ops in ${LOAD_SECS}s (want >= ${MIN_OPS_S:-10}/s: it did not run for the whole scenario)"; fail=1; }
 cleanup
 if [ $fail = 0 ]; then T "DONE (PASS)"; else T "DONE (FAIL)"; exit 1; fi
