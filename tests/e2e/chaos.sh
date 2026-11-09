@@ -366,6 +366,7 @@ warns $P-disc "${live[@]}"
 for f in "$L"/"$P"-n*.log; do [ -f "$f" ] && { echo "== $(basename "$f")"; grep -i "warn\|error\|panic" "$f" | sed 's/[0-9.]*:[0-9]*/X/g' | sort | uniq -c | sort -rn | head -5; }; done
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { T "FAIL: untouched-range verify not clean"; fail=1; }
 echo "$load" | grep -q '"corrupt": 0' || { T "FAIL: load saw corrupt reads"; fail=1; }
+ops=$(load_ops "$load"); [ "${ops:-0}" -ge $(( LOAD_SECS * ${MIN_OPS_S:-10} )) ] || { T "FAIL: load completed only ${ops:-0} ops in ${LOAD_SECS}s (want >= ${MIN_OPS_S:-10}/s: it did not run for the whole scenario)"; fail=1; }
 echo "$load" | grep -q '"miss": 0' || { T "FAIL: load saw misses"; fail=1; }
 # Touch oracle: lost copies, lingering copies of expired keys, a primary TTL other than the one touched.
 tbad=$(python3 -c "
