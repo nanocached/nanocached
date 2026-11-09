@@ -731,6 +731,18 @@ cluster, its result discarded.
   then `SetAsync(k, v2)` completed, can still leave `v1` in the cache. A
   caller that must not have that writes the later value only once it has
   read the key, or uses `ReplaceAsync` with the token of the value it read.
+- **Your `byte[]` arguments stay yours.** The abandoned operation may read its
+  arguments after the call has thrown, so when the token can be cancelled the
+  `byte[]` overloads that write or change a key's expiry (`SetAsync`,
+  `DeleteAsync`, `IncrAsync`/`DecrAsync`, `TouchAsync`, `GetAndTouchAsync`,
+  `PutIfAbsentAsync`, `ReplaceIfPresentAsync`, `ReplaceAsync`,
+  `DeleteIfMatchesAsync`, and the values of `SetManyBytesAsync`) copy the key
+  and value at the call, and you may reuse or overwrite your buffers (an
+  `ArrayPool` rental, a request buffer) once the awaited call has completed,
+  failed or been cancelled. A token that can never be cancelled (`default`) copies nothing.
+  The `string` overloads encode the text at the call and never held your
+  memory. Reads (`GetAsync`, `GetBytesAsync` and the like) are not copied: an
+  abandoned read only fetches a value nobody awaits.
 - A client that finishes connecting after `ConnectAsync` was cancelled is
   closed, not leaked.
 - `DisposeAsync()` is `Close()` run on the thread pool, for `await using`:
