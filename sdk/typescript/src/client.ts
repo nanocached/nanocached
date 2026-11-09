@@ -4141,10 +4141,6 @@ export class NanocachedClient {
         // (issue #67) — nothing to close.
         member.connection?.close();
         members.delete(name);
-        // A departed node's address is never reused (names/addresses are
-        // per-process), so its per-address cooldown entry would otherwise
-        // linger forever in a churny deployment (issue #96).
-        this.reconnectCooldowns.delete(member.address);
       }
     }
 
@@ -4258,6 +4254,20 @@ export class NanocachedClient {
       replication: identified.replication,
     };
     this.nodeUrlList = nodes.filter((node) => members.has(node.name)).map((node) => node.address);
+
+    // A departed node's address is never reused (names/addresses are
+    // per-process), so its per-address cooldown entry would otherwise linger
+    // forever in a churny deployment (issue #96). Swept against the whole
+    // roster on every refresh rather than only for the members removed in
+    // this one: a redial still in flight when its member was removed (a
+    // black-holed address takes up to the connect timeout to fail) writes its
+    // cooldown after the removal's cleanup has run, and this sweep drops it
+    // at the next refresh.
+    const liveAddresses = new Set<string>();
+    for (const member of members.values()) liveAddresses.add(member.address);
+    for (const address of this.reconnectCooldowns.keys()) {
+      if (!liveAddresses.has(address)) this.reconnectCooldowns.delete(address);
+    }
     this.lastNodeListFetch = Date.now();
   }
 
