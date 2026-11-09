@@ -584,8 +584,11 @@ replayed. Every SDK applies this same rule; the Node and asyncio SDKs,
 whose runtimes buffer writes in user space and flush them in the
 background, can only ever prove the first case. A request that finds its
 node already gone from the member table (a node-list refresh dropped it
-and is still dialing the nodes that replaced it) was never sent either:
-it waits for that refresh and is routed again on the new list.
+and is still dialing the nodes that replaced it) was never sent either, so
+it is sent again after a refresh. A refresh that began before the failure may
+still list the old nodes, so the request waits it out, then waits for the rest
+of the 200 ms interval since it ended, runs one more refresh and is routed
+again on the list that one installs.
 
 `ConnectAsync` itself tolerates a node that discovery still lists but
 that can't be reached — typically one that just died and hasn't been

@@ -5244,8 +5244,16 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                     }
                 }
             }
-            await RefreshNodeListAsync().ConfigureAwait(false);
-            _lastRefreshEnd = MonotonicNow();
+            try
+            {
+                await RefreshNodeListAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                // A refresh that throws is still a refresh that ran: the
+                // next forced caller keeps the interval from its end.
+                _lastRefreshEnd = MonotonicNow();
+            }
         }
         finally
         {
