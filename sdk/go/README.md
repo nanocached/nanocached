@@ -391,8 +391,11 @@ As with `GetMany`, the returned map always holds the keys that resolved,
 whether or not `err` is nil. Keys whose primary still answers a wrong-node
 after one refresh and retry return `ErrWrongNode`; a primary that cannot be
 reached on both passes returns its connection error (`ErrConnectionLost`),
-never `ErrWrongNode`. A touch is idempotent, so a failed `TouchMany` can
-simply be sent again. Against a node that has `t` but not `y` both return
+never `ErrWrongNode`. With a TTL of `0` a frame whose connection was lost after
+it was written is not resent (the node may have expired the keys already), so
+only that frame's keys come back with `ErrConnectionLost`; the frames of the
+same batch that had not been sent yet still go out. A touch is idempotent, so
+a failed `TouchMany` can simply be sent again. Against a node that has `t` but not `y` both return
 `ErrServerTooOldBatch`, which also matches `ErrServerTooOld`.
 
 ## Batched get and set

@@ -33,7 +33,8 @@ import (
 // retried — except with ttlSeconds == 0, where a primary whose connection
 // fails after the frame was written is not resent (issue #901): the call
 // returns that ErrConnectionLost, with every key that did resolve in the
-// map. In a cluster it goes to every owner of a key, the primary's answer
+// map. Only the keys of the frame that was being written count as lost; the
+// frames of a chunked batch not yet sent still go out (issue #1602). In a cluster it goes to every owner of a key, the primary's answer
 // being the key's — with ttlSeconds == 0 the primaries are sent the batch
 // first, and the other owners only after they answered (issue #934, see
 // touchReplicasAfterPrimary). A replica's failure or `W` is counted in
@@ -216,7 +217,7 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 	if single {
 		// Single/proxy mode: no ring to refresh against, so a `W` or a
 		// failure propagates immediately, as in getManyNS.
-		entries, resolved, err := c.multiTouchChunked("", namespace, keyBytes, ttlSeconds, get, false)
+		entries, resolved, _, err := c.multiTouchChunked("", namespace, keyBytes, ttlSeconds, get, false)
 		results := make(map[int]multiEntry, len(keys))
 		wrongNode := false
 		for i := 0; i < resolved; i++ {
@@ -289,7 +290,14 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 // chunk started at, or len(keys) on success) are real answers — the rest
 // were never reached, which no entry value can say, since a miss is a real
 // answer too.
-func (c *Client) multiTouchChunked(slot string, namespace []byte, keys [][]byte, ttlSeconds int64, get bool, replicaOnly bool) (entries []multiEntry, resolved int, err error) {
+//
+// sentEnd is where the written frames end (equal to resolved on success):
+// when the failing chunk's frame may have reached the node (a connection
+// lost after the write, a reply deadline, an unparsable reply) it is the
+// end of that chunk, otherwise the chunk never left and sentEnd is resolved.
+// The positions from resolved to sentEnd are the failed chunk's; the ones
+// from sentEnd on were never sent, whatever the error says (issue #1602).
+func (c *Client) multiTouchChunked(slot string, namespace []byte, keys [][]byte, ttlSeconds int64, get bool, replicaOnly bool) (entries []multiEntry, resolved, sentEnd int, err error) {
 	entries = make([]multiEntry, len(keys))
 	// A touch that expires the keys is resent only if never sent (issue
 	// #901). A frame none of whose keys has this slot as primary (replicaOnly)
@@ -321,12 +329,26 @@ func (c *Client) multiTouchChunked(slot string, namespace []byte, keys [][]byte,
 			return opErr
 		})
 		if err != nil {
-			return entries, start, err
+			if touchFrameMayHaveBeenApplied(err) {
+				return entries, start, end, err
+			}
+			return entries, start, start, err
 		}
 		copy(entries[start:end], chunkEntries)
 		start = end
 	}
-	return entries, len(keys), nil
+	return entries, len(keys), len(keys), nil
+}
+
+// touchFrameMayHaveBeenApplied reports whether err, from a batched touch
+// chunk that went through applyExpiring, leaves open that the node received
+// and applied the frame: a connection lost or a reply that did not parse
+// after the write, as opposed to a failure marked errRequestNotSent (a dead
+// connection, a dial that failed) or an `En` rejection, which has its own
+// handling.
+func touchFrameMayHaveBeenApplied(err error) bool {
+	return (errors.Is(err, ErrConnectionLost) || errors.Is(err, ErrProtocol)) &&
+		!errors.Is(err, errRequestNotSent) && !errors.Is(err, errServerRejected)
 }
 
 // multiTouchState is what one TouchMany/GetManyAndTouch call learns across
@@ -431,7 +453,7 @@ func (c *Client) multiTouchPass(
 		for _, isPrimary := range leg.isPrimary {
 			anyPrimary = anyPrimary || isPrimary
 		}
-		entries, resolved, err := c.multiTouchChunked(leg.name, namespace, groupKeys, ttlSeconds, leg.get, !anyPrimary)
+		entries, resolved, sentEnd, err := c.multiTouchChunked(leg.name, namespace, groupKeys, ttlSeconds, leg.get, !anyPrimary)
 
 		state.mu.Lock()
 		defer state.mu.Unlock()
@@ -447,9 +469,7 @@ func (c *Client) multiTouchPass(
 			if errors.Is(err, errServerRejected) {
 				state.rejected = true
 			} else {
-				lostIsFinal = ttlSeconds == 0 &&
-					(errors.Is(err, ErrConnectionLost) || errors.Is(err, ErrProtocol)) &&
-					!errors.Is(err, errRequestNotSent)
+				lostIsFinal = ttlSeconds == 0 && touchFrameMayHaveBeenApplied(err)
 				if lostIsFinal {
 					state.lostErr = err
 				}
@@ -474,7 +494,10 @@ func (c *Client) multiTouchPass(
 					state.wrongNode[idx] = true
 				} else {
 					delete(state.wrongNode, idx)
-					if lostIsFinal {
+					// Only the chunk whose frame was written may have been
+					// applied (issue #1602): the chunks after it never left,
+					// so they are retried like any unresolved key.
+					if lostIsFinal && i < sentEnd {
 						state.lost[idx] = true
 						continue
 					}
@@ -567,7 +590,7 @@ func (c *Client) touchReplicasAfterPrimary(namespace []byte, keyBytes [][]byte, 
 	var wg sync.WaitGroup
 	for name, groupKeys := range groups {
 		run := func() {
-			entries, resolved, _ := c.multiTouchChunked(name, namespace, groupKeys, 0, false, true)
+			entries, resolved, _, _ := c.multiTouchChunked(name, namespace, groupKeys, 0, false, true)
 			for i := range groupKeys {
 				if i >= resolved || entries[i].wrongNode {
 					c.stats.replicaWriteFailures.Add(1)
