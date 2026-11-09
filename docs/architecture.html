@@ -90,7 +90,10 @@ unreachable.</p>
   interval, a node asked for a key its own view does not grant asks
   discovery for the current list before answering <code>W</code> (at
   most once a second, each ask bounded at a second), so a client that
-  already routes by the new list is served, not refused.</li>
+  already routes by the new list is served, not refused. That holds for
+  increments and compare-and-set too: a replica that the removal promoted
+  to a key's primary runs them as soon as the published list makes it the
+  primary, without waiting for its own ring to catch up.</li>
   <li>That same ring-view update triggers <strong>re-replication</strong>:
   rendezvous hashing's removal property means an eviction (or any leave)
   can only ever <em>promote</em> a node into a key's top-R, never leave a
