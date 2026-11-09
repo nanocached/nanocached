@@ -493,10 +493,15 @@ const NODE_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 /// an announce was out of contact: at least one heartbeat did not arrive.
 /// Below two intervals so that a single lost heartbeat (a gap of two
 /// intervals) counts, above one and a half so that one heartbeat that is
-/// late by a few seconds does not. `note_contact` restarts the node's
-/// unbroken membership (`NodeInfo::joined_at`) at such a heartbeat, which
-/// is what `announce_needs_rejoin` reads.
+/// late by a few seconds does not. `note_contact` records such a gap in the
+/// node's `NodeInfo::contact_breaks`, which is what `announce_needs_rejoin`
+/// reads.
 const CONTACT_BREAK: Duration = Duration::from_millis(NODE_HEARTBEAT_INTERVAL_SECS * 1800);
+/// Most contact breaks kept per node. They are also dropped once older than
+/// `DEPARTED_RETENTION`, the longest a departure can be asked about, so the
+/// cap only matters for a node whose heartbeat connection drops more than
+/// once every few seconds for an hour; its oldest breaks go first.
+const MAX_CONTACT_BREAKS: usize = 1024;
 /// Heartbeats that fit in the smallest accepted liveness window: one that
 /// is due, one that may be late or lost, and one so that the stall guard
 /// (`sweep_was_stalled` treats a sweep gap over half the window as a pause
@@ -759,17 +764,25 @@ struct NodeInfo {
     /// sentinel for an entry no live connection currently owns, e.g. one
     /// `P` (Announce) created directly, or a test constructs directly.
     owner_connection_id: u64,
-    /// When this entry's unbroken contact as a `Joined` member began (issue
-    /// #1311): set at creation, again by `promote_to_joined`, and again by
-    /// `note_contact` when a heartbeat or announce arrives after a gap of
-    /// `CONTACT_BREAK` or more — the node was cut off in between, and has
-    /// only been a member in contact since this moment. A `Joined` node
-    /// never leaves that state without leaving the registry.
-    /// `announce_needs_rejoin` compares this with the moment another node
-    /// was evicted, to tell a node the cluster went on without from one that
-    /// was evicted while every node still listed was cut off just the same
-    /// (issue #1479).
+    /// When this entry became a member: set at creation and again by
+    /// `promote_to_joined`. A `Joined` node never leaves that state without
+    /// leaving the registry. `announce_needs_rejoin` compares this with the
+    /// moment another node was evicted, to tell a node that was a member
+    /// then from one that registered after (issue #1311); whether the node
+    /// was in contact across that moment is `contact_breaks`.
     joined_at: Instant,
+    /// The gaps of `CONTACT_BREAK` or more between two consecutive contacts
+    /// of this `Joined` node, as `(previous_last_heartbeat, heard_again_at)`,
+    /// oldest first: at least one heartbeat did not arrive in between and the
+    /// node was out of contact. A node cut off across another node's
+    /// eviction saw no roster without it and took nothing over, so it does
+    /// not count, in `announce_needs_rejoin`, as one the cluster moved on
+    /// with (issue #1479); one whose gap began after the eviction was already
+    /// served that roster, and a later gap does not undo it (issue #1523).
+    /// Recorded by `note_contact` only (the stall guard moves
+    /// `last_heartbeat` without touching it), pruned to `DEPARTED_RETENTION`
+    /// and capped at `MAX_CONTACT_BREAKS`.
+    contact_breaks: Vec<(Instant, Instant)>,
 }
 
 impl NodeInfo {
@@ -799,6 +812,7 @@ impl NodeInfo {
             queue_position,
             owner_connection_id: 0,
             joined_at: Instant::now(),
+            contact_breaks: Vec::new(),
         }
     }
 }
@@ -1452,25 +1466,38 @@ fn apply_announce_to_existing(
 }
 
 /// A heartbeat or announce from `Joined` node `name` at `now`. Refreshes
-/// `last_heartbeat`; when the previous one is `CONTACT_BREAK` or more ago,
-/// at least one heartbeat did not arrive and the node was out of contact in
-/// between, so its unbroken membership (`joined_at`) starts over here
-/// (issue #1479). A node that was cut off across another node's eviction
-/// then no longer counts, in `announce_needs_rejoin`, as one the cluster
-/// moved on with: it saw no roster without the evicted node and took
-/// nothing over. The stall guard (`sweep_expired`) moves `last_heartbeat`
-/// without going through here, since a pause of discovery is not a break on
-/// the node's side.
+/// `last_heartbeat`. When the previous one is `CONTACT_BREAK` or more ago, at
+/// least one heartbeat did not arrive and the node was out of contact in
+/// between: the gap is recorded in `contact_breaks` (issues #1479, #1523).
+/// `announce_needs_rejoin` then does not count the node as one the cluster
+/// moved on with for a node evicted inside that gap. The stall guard
+/// (`sweep_expired`) moves `last_heartbeat` without going through here,
+/// since a pause of discovery is not a break on the node's side.
 fn note_contact(info: &mut NodeInfo, name: &str, now: Instant) {
-    let gap = now.duration_since(info.last_heartbeat);
+    let previous = info.last_heartbeat;
+    let gap = now.duration_since(previous);
     if info.state == NodeState::Joined && gap >= CONTACT_BREAK {
-        info.joined_at = now;
+        info.contact_breaks
+            .retain(|(_, end)| now.duration_since(*end) < DEPARTED_RETENTION);
+        if info.contact_breaks.len() >= MAX_CONTACT_BREAKS {
+            info.contact_breaks.remove(0);
+        }
+        info.contact_breaks.push((previous, now));
         println!(
             "INFO node heard from again after {}s without a heartbeat: {name}",
             gap.as_secs()
         );
     }
     info.last_heartbeat = now;
+}
+
+/// Whether `info` was out of contact across `at`: one of its contact breaks
+/// began before it and ended at or after it, so the node saw no roster
+/// without whatever departed then.
+fn contact_broken_across(info: &NodeInfo, at: Instant) -> bool {
+    info.contact_breaks
+        .iter()
+        .any(|(start, end)| *start < at && at <= *end)
 }
 
 struct Args {
@@ -2343,18 +2370,19 @@ fn pending_joiner_verdict(registry: &Registry, joiner: &str) -> &'static [u8] {
 /// Whether a node announcing itself (`P`) under `name` has to start over:
 /// `name` is on record as departed within `DEPARTED_RETENTION`, is not
 /// registered, and the cluster went on without it. The last needs a `Joined`
-/// node that was already `Joined` and in contact when `name` was evicted and
-/// has heartbeated without a break since (issue #1311, `joined_at`): only
-/// such a node was served a roster without `name`, took over its keys and
-/// was written to. When every node was evicted together, as when the path
-/// between discovery and all of them was cut, nobody was left to move on,
-/// and sending each back through a join would empty every cache for
-/// nothing; each registers as it announces. The same holds for the nodes
-/// evicted first when that path heals before the last of them is evicted:
-/// the ones still listed were cut off just the same (`note_contact` restarts
-/// their `joined_at` at the heartbeat that ends the gap), so they do not make
-/// the evicted ones start over (issue #1479). Takes the two locks one after
-/// the other, never nested.
+/// node that was already a member when `name` was evicted and was in contact
+/// across it (issue #1311, `joined_at`, `contact_breaks`): only such a node
+/// was served a roster without `name`, took over its keys and was written
+/// to. When every node was evicted together, as when the path between
+/// discovery and all of them was cut, nobody was left to move on, and
+/// sending each back through a join would empty every cache for nothing;
+/// each registers as it announces. The same holds for the nodes evicted
+/// first when that path heals before the last of them is evicted: the ones
+/// still listed were cut off just the same, a contact break spans the
+/// eviction, so they do not make the evicted ones start over (issue #1479).
+/// A break that began after the eviction does not count: that node had
+/// already been served the roster without `name` (issue #1523). Takes the two
+/// locks one after the other, never nested.
 fn announce_needs_rejoin(registry: &Registry, name: &str) -> bool {
     if lock(registry).contains_key(name) {
         return false;
@@ -2372,9 +2400,11 @@ fn announce_needs_rejoin(registry: &Registry, name: &str) -> bool {
     let Some(departed_at) = departed_at else {
         return false;
     };
-    lock(registry)
-        .values()
-        .any(|info| info.state == NodeState::Joined && info.joined_at < departed_at)
+    lock(registry).values().any(|info| {
+        info.state == NodeState::Joined
+            && info.joined_at < departed_at
+            && !contact_broken_across(info, departed_at)
+    })
 }
 
 fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, NodeInfo>> {
@@ -8129,8 +8159,32 @@ mod tests {
         assert!(!registered);
     }
 
+    /// A departure recorded at `at`, as `record_departed` would at that moment.
+    fn depart_at(registry: &Registry, name: &str, at: Instant) {
+        registry.departed.lock().unwrap().record(name, at);
+    }
+
+    /// A heartbeat of `name` at `at`.
+    fn heartbeat_at(registry: &Registry, name: &str, at: Instant) {
+        let mut guard = lock(registry);
+        note_contact(guard.get_mut(name).unwrap(), name, at);
+    }
+
+    /// Registers `name` as a member `Joined` for ten minutes whose last
+    /// heartbeat was at `last_heartbeat`.
+    fn insert_member(registry: &Registry, name: &str, now: Instant, last_heartbeat: Instant) {
+        let mut info = NodeInfo::new(
+            "127.0.0.1:3333".to_string(),
+            NodeState::Joined,
+            format!("tk-{name}"),
+        );
+        info.joined_at = now - Duration::from_secs(600);
+        info.last_heartbeat = last_heartbeat;
+        lock(registry).insert(name.to_string(), info);
+    }
+
     #[test]
-    fn note_contact_restarts_the_membership_only_after_a_gap_of_a_missed_heartbeat() {
+    fn note_contact_records_a_break_only_after_a_gap_of_a_missed_heartbeat() {
         let now = Instant::now();
         let mut info = NodeInfo::new(
             "127.0.0.1:3333".to_string(),
@@ -8140,40 +8194,191 @@ mod tests {
         let joined_at = now - Duration::from_secs(600);
         info.joined_at = joined_at;
 
-        // On time, and late by less than the break: membership unbroken.
+        // On time, and late by less than the break: no break.
         for gap in [
             Duration::from_secs(NODE_HEARTBEAT_INTERVAL_SECS),
             CONTACT_BREAK - Duration::from_millis(1),
         ] {
             info.last_heartbeat = now - gap;
             note_contact(&mut info, "node", now);
-            assert_eq!(info.joined_at, joined_at, "gap {gap:?}");
+            assert!(info.contact_breaks.is_empty(), "gap {gap:?}");
             assert_eq!(info.last_heartbeat, now);
         }
 
-        // One lost heartbeat (two intervals), or exactly the break: it starts over here.
+        // One lost heartbeat (two intervals), or exactly the break: recorded
+        // as (previous heartbeat, now). The membership start is not touched.
         for gap in [
             CONTACT_BREAK,
             Duration::from_secs(2 * NODE_HEARTBEAT_INTERVAL_SECS),
         ] {
-            info.joined_at = joined_at;
+            info.contact_breaks.clear();
             info.last_heartbeat = now - gap;
             note_contact(&mut info, "node", now);
-            assert_eq!(info.joined_at, now, "gap {gap:?}");
+            assert_eq!(info.contact_breaks, vec![(now - gap, now)], "gap {gap:?}");
             assert_eq!(info.last_heartbeat, now);
+            assert_eq!(info.joined_at, joined_at);
         }
 
-        // Not for a node that is not `Joined` (its `joined_at` is set at promotion).
+        // Not for a node that is not `Joined`.
         let mut waiting = NodeInfo::new(
             "127.0.0.1:3333".to_string(),
             NodeState::Waiting,
             "tk".to_string(),
         );
-        waiting.joined_at = joined_at;
         waiting.last_heartbeat = now - Duration::from_secs(60);
         note_contact(&mut waiting, "node", now);
-        assert_eq!(waiting.joined_at, joined_at);
+        assert!(waiting.contact_breaks.is_empty());
         assert_eq!(waiting.last_heartbeat, now);
+    }
+
+    #[test]
+    fn contact_breaks_are_pruned_to_the_departure_retention_and_capped() {
+        // Instants ahead of now: a plain `now - hour` would not exist on a
+        // host that has been up for less than that.
+        let start = Instant::now();
+        let mut info = NodeInfo::new(
+            "127.0.0.1:3333".to_string(),
+            NodeState::Joined,
+            "tk".to_string(),
+        );
+
+        // Breaks that ended more than the retention ago are dropped by the
+        // next one; younger ones stay.
+        let short = Duration::from_secs(1);
+        info.contact_breaks = vec![
+            (start, start + short),
+            (
+                start + DEPARTED_RETENTION,
+                start + DEPARTED_RETENTION + short,
+            ),
+        ];
+        let heard_again = start + short + DEPARTED_RETENTION + CONTACT_BREAK;
+        info.last_heartbeat = heard_again - CONTACT_BREAK;
+        note_contact(&mut info, "node", heard_again);
+        assert_eq!(
+            info.contact_breaks,
+            vec![
+                (
+                    start + DEPARTED_RETENTION,
+                    start + DEPARTED_RETENTION + short
+                ),
+                (heard_again - CONTACT_BREAK, heard_again),
+            ]
+        );
+
+        // The cap (unreachable through heartbeats alone: an hour holds at
+        // most 400 breaks of 9 s): the oldest goes first.
+        info.contact_breaks = (0..MAX_CONTACT_BREAKS as u32)
+            .map(|i| (start + short * (2 * i), start + short * (2 * i + 1)))
+            .collect();
+        let first = info.contact_breaks[1];
+        let last = start + Duration::from_secs(2100);
+        info.last_heartbeat = last;
+        note_contact(&mut info, "node", last + CONTACT_BREAK);
+        assert_eq!(info.contact_breaks.len(), MAX_CONTACT_BREAKS);
+        assert_eq!(info.contact_breaks[0], first);
+        assert_eq!(
+            *info.contact_breaks.last().unwrap(),
+            (last, last + CONTACT_BREAK)
+        );
+    }
+
+    #[test]
+    fn a_survivor_that_loses_a_heartbeat_after_the_eviction_still_makes_the_evicted_node_start_over()
+     {
+        // node-b was served the roster without node-a (its heartbeat after
+        // the eviction) and took node-a's keys over. One heartbeat
+        // connection then drops: its next heartbeat comes 10 s later. That
+        // gap starts after the eviction and must not make node-b look as if
+        // it never moved on.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let now = Instant::now();
+        let evicted_at = now - Duration::from_secs(30);
+        insert_member(
+            &registry,
+            "node-b",
+            now,
+            evicted_at - Duration::from_secs(1),
+        );
+        depart_at(&registry, "node-a", evicted_at);
+
+        heartbeat_at(&registry, "node-b", evicted_at + Duration::from_secs(1));
+        assert!(
+            announce_needs_rejoin(&registry, "node-a"),
+            "node-b moved on at its first heartbeat after the eviction"
+        );
+        heartbeat_at(&registry, "node-b", evicted_at + Duration::from_secs(11));
+        assert!(
+            announce_needs_rejoin(&registry, "node-a"),
+            "node-b took node-a's keys over before its gap; node-a must still start over"
+        );
+    }
+
+    #[test]
+    fn a_break_that_spans_another_departure_does_not_undo_having_moved_on() {
+        // node-b moved on past node-a's eviction at T+2. At T+20 node-x
+        // leaves; node-b's heartbeat connection drops and its next
+        // heartbeat, at T+28, ends a gap that spans node-x's departure but
+        // not node-a's. node-a announcing at T+30 still starts over.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let now = Instant::now();
+        let t = now - Duration::from_secs(40);
+        insert_member(&registry, "node-b", now, t - Duration::from_secs(1));
+        depart_at(&registry, "node-a", t);
+        heartbeat_at(&registry, "node-b", t + Duration::from_secs(2));
+        assert!(announce_needs_rejoin(&registry, "node-a"));
+        depart_at(&registry, "node-x", t + Duration::from_secs(20));
+        heartbeat_at(&registry, "node-b", t + Duration::from_secs(28));
+        assert!(
+            announce_needs_rejoin(&registry, "node-a"),
+            "a break spanning node-x's departure must not hide node-a's eviction"
+        );
+        // node-x, which did depart inside that break, is registered: the
+        // survivor was cut off across its departure.
+        assert!(!announce_needs_rejoin(&registry, "node-x"));
+    }
+
+    #[test]
+    fn a_survivor_cut_off_across_the_eviction_does_not_make_the_evicted_node_start_over() {
+        // node-c was out of contact from before node-d's eviction until
+        // after it.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let now = Instant::now();
+        let evicted_d = now - Duration::from_secs(5);
+        insert_member(&registry, "node-c", now, evicted_d - Duration::from_secs(5));
+        depart_at(&registry, "node-d", evicted_d);
+        heartbeat_at(&registry, "node-c", now);
+        assert!(!announce_needs_rejoin(&registry, "node-d"));
+
+        // A break that ended exactly at the eviction still spans it; one
+        // that began exactly there does not.
+        let registry: Registry = Arc::new(RegistryState::default());
+        insert_member(&registry, "node-c", now, evicted_d - CONTACT_BREAK);
+        depart_at(&registry, "node-d", evicted_d);
+        heartbeat_at(&registry, "node-c", evicted_d);
+        assert!(!announce_needs_rejoin(&registry, "node-d"));
+        let registry: Registry = Arc::new(RegistryState::default());
+        insert_member(&registry, "node-c", now, evicted_d);
+        depart_at(&registry, "node-d", evicted_d);
+        heartbeat_at(&registry, "node-c", evicted_d + CONTACT_BREAK);
+        assert!(announce_needs_rejoin(&registry, "node-d"));
+    }
+
+    #[test]
+    fn one_survivor_that_stayed_in_contact_is_enough_to_make_the_evicted_node_start_over() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        let now = Instant::now();
+        let evicted = now - Duration::from_secs(5);
+        insert_member(&registry, "node-b", now, evicted - Duration::from_secs(5));
+        depart_at(&registry, "node-a", evicted);
+        heartbeat_at(&registry, "node-b", now);
+        assert!(
+            !announce_needs_rejoin(&registry, "node-a"),
+            "node-b was cut off across the eviction"
+        );
+        insert_member(&registry, "node-c", now, evicted - Duration::from_secs(3));
+        heartbeat_at(&registry, "node-c", evicted + Duration::from_secs(1));
+        assert!(announce_needs_rejoin(&registry, "node-a"));
     }
 
     #[tokio::test(flavor = "current_thread")]

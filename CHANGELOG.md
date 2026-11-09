@@ -31,13 +31,25 @@ framework adapters at one version, whether or not a component changed.
   they cross the liveness window on different sweep ticks), the evicted
   nodes were sent back through a join and emptied their caches: a node
   still listed counted as one the cluster had moved on with, although it
-  had been cut off just the same and had taken nothing over. A member heard
-  from again after a gap of 9 s or more — at least one heartbeat did not
-  arrive — now counts as in unbroken contact only from that moment, so it
-  no longer makes the nodes evicted during the gap start over; they are
+  had been cut off just the same and had taken nothing over. A member
+  whose heartbeats stopped arriving for 9 s or more — at least one did not —
+  across a node's eviction no longer counts as one the cluster moved on
+  with, so it does not make that node start over; the evicted nodes are
   registered with their caches as when every node was evicted together. A
   survivor whose heartbeat was merely late, by less than 9 s, still counts
   as in contact throughout (#1479).
+- `nanocached-discovery`: a member that had been served the roster without
+  an evicted node, and then lost one heartbeat (a connection reset by a load
+  balancer or NAT, one read or write error; the node waits an interval and
+  reconnects), could make that node be registered with its pre-eviction
+  cache instead of being answered `G` when it came back later: it served
+  older values and deleted keys for as long as it stayed away (up to an
+  hour; in a two-node cluster one dropped heartbeat was enough), and the
+  survivors' reclaim pass dropped the newer copies. Discovery now keeps, per
+  member, the gaps of 9 s or more between its heartbeats and asks whether one
+  of them spans the eviction: only a member cut off across it stops
+  counting, and a gap that began after the eviction, or that spans some
+  other node's departure, no longer hides it (#1523).
 - `nanocached-node`: clearing one namespace left the handoff tombstones of
   that namespace's keys in place, while clearing the whole store dropped
   them. The tombstones stayed charged to the memory bound for their
