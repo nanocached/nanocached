@@ -204,7 +204,11 @@ its cache and joins again as a new node (its log says
 <code>evicted this node earlier</code>); it does not resume with what it
 held, because the cluster has moved on without it. At R=1 the keys it held
 and nobody rewrote in the meantime are therefore gone with it, as they were
-when it was evicted. Keep the heartbeat path short enough, and the liveness
+when it was evicted. When nobody could have moved on &mdash; every node was
+cut off from discovery at once, or discovery itself was not running &mdash;
+it is registered with its cache instead; the <a
+href="architecture.html#accepted-behaviour">accepted behaviour</a> list
+says exactly when. Keep the heartbeat path short enough, and the liveness
 timeout long enough, that a pause you expect does not evict it. A node
 heartbeats every 5&nbsp;s, so discovery refuses a
 <code>--liveness-timeout</code> below 15&nbsp;s (three heartbeats): with

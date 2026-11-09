@@ -7484,8 +7484,11 @@ where
     R: AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let _ = write_half.shutdown().await;
+    // The half-close is inside the window too: over TLS it first flushes
+    // the pending records, which blocks for as long as a peer that has
+    // stopped reading keeps the send buffer full.
     let drain = async {
+        let _ = write_half.shutdown().await;
         let mut sink = [0_u8; 8192];
         let mut discarded = 0;
         while discarded < MAX_REQUEST_SIZE {
@@ -9488,6 +9491,44 @@ mod tests {
         let error = super::read_line(&mut server, &mut buf).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(started.elapsed(), UPSTREAM_IO_TIMEOUT);
+    }
+
+    // A write half whose half-close never completes, as a TLS stream's does
+    // while the peer has stopped reading and the send buffer is full.
+    struct StuckShutdown;
+
+    impl tokio::io::AsyncWrite for StuckShutdown {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_rejected_request_drain_is_bounded_even_when_the_half_close_never_completes() {
+        // `_client` stays open and silent, so the read side never ends either.
+        let (_client, mut server) = tokio::io::duplex(64);
+        let mut write_half = StuckShutdown;
+        let started = Instant::now();
+        drain_rejected_request(&mut server, &mut write_half).await;
+        assert_eq!(started.elapsed(), REJECTED_REQUEST_DRAIN_WINDOW);
     }
 
     #[test]
