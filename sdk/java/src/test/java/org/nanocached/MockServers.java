@@ -204,6 +204,13 @@ final class MockServers {
         private final AtomicInteger closeAfterMultiGet = new AtomicInteger();
         private final AtomicInteger closeAfterMultiSet = new AtomicInteger();
         private volatile boolean silent = false;
+        /** While non-null, an `A` (auth) request is read in full and then
+         * left unanswered until the latch is released — a dial whose
+         * handshake takes as long as the test needs, for races between a
+         * redial and a concurrent refresh or close(). See {@link
+         * #holdAuthReplies}. */
+        private volatile java.util.concurrent.CountDownLatch authGate;
+        private final java.util.concurrent.Semaphore authHeld = new java.util.concurrent.Semaphore(0);
         /** The TTL (whole seconds; 0 if omitted on the wire) from the
          * most recent S request this server received. */
         volatile long lastSetTtl = 0;
@@ -372,6 +379,27 @@ final class MockServers {
                 if (pending == 0) return false;
                 if (retryableReplies.compareAndSet(pending, pending - 1)) return true;
             }
+        }
+
+        /** From now on, answers no `A` request until {@link
+         * #releaseAuthReplies}: the dial that sent it stays in its
+         * handshake. {@link #awaitAuthHeld} tells a test when one has
+         * arrived. */
+        void holdAuthReplies() {
+            authGate = new java.util.concurrent.CountDownLatch(1);
+        }
+
+        /** Answers every `A` request held since {@link #holdAuthReplies},
+         * and every later one, normally. */
+        void releaseAuthReplies() {
+            java.util.concurrent.CountDownLatch gate = authGate;
+            authGate = null;
+            if (gate != null) gate.countDown();
+        }
+
+        /** Waits until an `A` request is being held; consumes that arrival. */
+        boolean awaitAuthHeld(long millis) throws InterruptedException {
+            return authHeld.tryAcquire(millis, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
 
         /** Holds every future S reply for {@code millis} first — for tests
@@ -620,6 +648,16 @@ final class MockServers {
                             boolean accepted = requiredSecret == null
                                     ? secret.length > 0
                                     : java.util.Arrays.equals(secret, requiredSecret);
+                            java.util.concurrent.CountDownLatch gate = authGate;
+                            if (gate != null) {
+                                authHeld.release();
+                                try {
+                                    gate.await();
+                                } catch (InterruptedException interrupted) {
+                                    Thread.currentThread().interrupt();
+                                    return;
+                                }
+                            }
                             tagged = accepted && supportTags && parts.length > 2 && parts[2].equals("T");
                             out.write((accepted ? (tagged ? "OnT\n" : "On\n") : "En\n")
                                     .getBytes(StandardCharsets.US_ASCII));

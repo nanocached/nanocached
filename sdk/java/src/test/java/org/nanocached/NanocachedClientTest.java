@@ -8039,6 +8039,63 @@ class NanocachedClientTest {
         }
     }
 
+    // Issue #1543: memberConnection dials outside stateLock and used to hang
+    // the new connection off the Member it had captured before the dial. A
+    // refresh that dropped that member meanwhile left the connection on an
+    // orphan nothing closed: a socket and reader thread until the server's
+    // idle timeout, and the open-target counter stayed incremented.
+    @Test
+    void aRedialedConnectionIsClosedWhenARefreshDroppedTheMemberMeanwhile() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String victim = NAMES.get(1);
+                MockNode victimNode = cluster.nodes().get(victim);
+                Connection original = memberConnectionOf(client, victim);
+
+                Field targetKeyField = NanocachedClient.class.getDeclaredField("targetKey");
+                targetKeyField.setAccessible(true);
+                String targetKey = (String) targetKeyField.get(client);
+                Field openTargetsField = NanocachedClient.class.getDeclaredField("OPEN_TARGETS");
+                openTargetsField.setAccessible(true);
+                @SuppressWarnings("unchecked")
+                Map<String, Integer> openTargets = (Map<String, Integer>) openTargetsField.get(null);
+                waitFor(() -> openTargets.getOrDefault(targetKey, 0) == 2, "both members connected");
+
+                // The victim's connection dies; the next use redials it, and
+                // that dial is held in its handshake.
+                victimNode.dropConnections();
+                waitFor(original::isClosed, "the victim's connection to notice the drop");
+                waitFor(() -> openTargets.getOrDefault(targetKey, 0) == 1, "the dead connection to be untracked");
+                victimNode.holdAuthReplies();
+                Method memberConnection = NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
+                memberConnection.setAccessible(true);
+                ExecutorService redialer = Executors.newSingleThreadExecutor();
+                try {
+                    Future<Object> redial = redialer.submit(() -> memberConnection.invoke(client, victim));
+                    assertTrue(victimNode.awaitAuthHeld(5_000), "the redial must reach the node's handshake");
+
+                    // Discovery drops the victim while the dial is in flight.
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), cluster.nodes().get(NAMES.get(0)).address()));
+                    forceRefresh(client);
+                    Field membersField = NanocachedClient.class.getDeclaredField("members");
+                    membersField.setAccessible(true);
+                    assertFalse(((Map<?, ?>) membersField.get(client)).containsKey(victim));
+                    victimNode.releaseAuthReplies();
+
+                    ExecutionException failure = assertThrows(ExecutionException.class, () -> redial.get(10, java.util.concurrent.TimeUnit.SECONDS));
+                    Throwable cause = ((InvocationTargetException) failure.getCause()).getCause();
+                    assertTrue(cause instanceof NanocachedException.ConnectionLost lost && lost.notSent(),
+                            "a member that left while reconnecting is a not-sent connection failure: " + cause);
+                    waitFor(() -> openTargets.getOrDefault(targetKey, 0) == 1,
+                            "the redialed connection to be closed rather than leaked on the dropped member");
+                } finally {
+                    victimNode.releaseAuthReplies();
+                    redialer.shutdownNow();
+                }
+            }
+        }
+    }
+
     // Issue #1542: a request that close() poisoned retries through
     // singleConnection(). It used to dial and authenticate again before the
     // AlreadyClosed it ended in (in proxy mode: also re-fetch the roster from
