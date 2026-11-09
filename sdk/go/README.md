@@ -552,6 +552,12 @@ the Rust SDK, where `Options::reconnect_cooldown(Duration::ZERO)` also
 means "use the default" and `Options::disable_reconnect_cooldown()` is
 the equivalent of a negative value here.
 
+A listed address that now answers as something other than a cache node (a
+discovery server or a proxy that took over the address) is treated like a
+dead one: the redial fails with `ErrConnectionLost`, before anything was
+sent, so the operation refreshes the node list and is retried on the right
+owner instead of failing until the next scheduled refresh.
+
 `Connect` itself tolerates a node that discovery still lists but that
 can't be reached — typically one that just died and hasn't been evicted
 yet (a window of seconds): the node is kept in the ring without a
