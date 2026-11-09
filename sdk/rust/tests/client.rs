@@ -2674,6 +2674,59 @@ async fn rejects_a_key_and_value_that_would_exceed_the_servers_request_cap() {
     node.stop();
 }
 
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn set_and_cas_check_the_request_budget_against_the_raw_value_not_the_compressed_one() {
+    // The 1 MiB request budget is checked on the raw size, before
+    // compression, the way set_many and the other SDKs do: a value that
+    // compresses to a few bytes but is over the budget as written is
+    // rejected by set and every CAS write, not just by set_many.
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024 - 256;
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port).compress(true))
+        .await
+        .unwrap();
+
+    // One byte over: key "k" (1 byte) + value = MAX_REQUEST_BYTES + 1.
+    let over = vec![b'a'; MAX_REQUEST_BYTES];
+    let digest = nanocached::content_digest(b"x");
+    assert!(matches!(
+        client.set("k", over.clone(), 0).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        client.put_if_absent("k", over.clone(), 0).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        client.replace_if_present("k", over.clone(), 0).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        client.replace("k", digest, over.clone(), 0).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    let mut many = HashMap::new();
+    many.insert("k".to_string(), over.clone());
+    assert!(matches!(
+        client.set_many_bytes(&many, 0).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    // Nothing was stored, and no request reached the node.
+    assert!(node.state.store.lock().unwrap().is_empty());
+    assert_eq!(node.state.cas_sets.load(Ordering::SeqCst), 0);
+
+    // Exactly at the budget is accepted (and travels compressed).
+    let at = vec![b'a'; MAX_REQUEST_BYTES - 1];
+    client.set("k", at.clone(), 0).await.unwrap();
+    assert_eq!(client.get_bytes("k").await.unwrap(), Some(at.clone()));
+    assert!(client.replace_if_present("k", at.clone(), 0).await.unwrap());
+    assert!(client.put_if_absent("f", at.clone(), 0).await.unwrap());
+
+    client.close().await;
+    node.stop();
+}
+
 #[tokio::test]
 async fn rejects_an_oversized_key_on_get_and_delete_without_touching_the_network() {
     // Regression: get_bytes/delete used to call validate_key (which only
