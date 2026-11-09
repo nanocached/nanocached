@@ -148,14 +148,20 @@ unreachable.</p>
   saw no roster without the evicted node. So when the path to the whole
   fleet heals after the first evictions and before the last, the nodes
   still listed were cut off just the same, and the evicted ones are
-  registered with their caches rather than sent back. A gap that began
+  registered with their caches rather than sent back. A member that has
+  not been heard from since the eviction and has been silent for nine
+  seconds or more already counts as cut off when the evicted node
+  announces, before its own heartbeat arrives, so the outcome does not
+  depend on which of them reaches discovery first. A gap that began
   after the eviction, or that spans some other node&rsquo;s departure,
   changes nothing, since the member had already been served the roster
   without the evicted node: one dropped heartbeat connection later does not
   make a node that was evicted earlier come back with its old cache. A
   member whose single heartbeat was a few seconds late still counts as in
   contact throughout, so a node evicted while another was out of contact
-  for less than nine seconds across its eviction is still sent back. A node evicted longer ago than that
+  for less than nine seconds across its eviction, or announcing while another
+  that has not been heard from since the eviction has been silent for less
+  than nine seconds, is still sent back. A node evicted longer ago than that
   hour, or by a standby discovery replica (which only lists nodes), is
   registered as before.</li>
 </ul>

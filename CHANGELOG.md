@@ -50,6 +50,19 @@ framework adapters at one version, whether or not a component changed.
   of them spans the eviction: only a member cut off across it stops
   counting, and a gap that began after the eviction, or that spans some
   other node's departure, no longer hides it (#1523).
+- `nanocached-discovery`: in the same partial-eviction window, whether the
+  evicted nodes kept their caches depended on arrival order. A member that
+  was still listed but silent since before the eviction counted as one the
+  cluster had moved on with until its first heartbeat after the heal showed
+  its gap, so an evicted node whose announce reached discovery first was
+  sent back through a join and emptied its cache. A member not heard from
+  since the eviction and silent for 9 s or more is now treated as cut off
+  straight away, so the verdict is the same whichever reaches discovery
+  first. A member silent for less than 9 s still counts as in contact. The
+  pause guard's refresh of the liveness window after a stall of discovery
+  does not count as hearing from a member. Three nodes at R=2 and 40 keys, A
+  and B evicted and the path healed with their announces arriving before the
+  third node's heartbeat: 24 of 80 copies lost before, none after (#1532).
 - `nanocached-node`: clearing one namespace left the handoff tombstones of
   that namespace's keys in place, while clearing the whole store dropped
   them. The tombstones stayed charged to the memory bound for their
