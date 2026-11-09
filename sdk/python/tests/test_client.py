@@ -5902,6 +5902,84 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_refresh_keeps_a_newly_listed_node_whose_dial_fails(self):
+        # A node that joined and is listed, but cannot be dialed at the
+        # moment of the refresh, must still be in this client's ring (with
+        # no connection and its cooldown armed) like connect() installs it:
+        # otherwise this client routes the keys near it differently from
+        # every peer that did reach it, and R=1 keys go to a non-owner.
+        new = "new-node"
+        nodes, discovery = await self.start_cluster(set())
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], reconnect_cooldown=0.05
+            )
+            try:
+                dead_address = f"127.0.0.1:{await unused_port()}"
+                discovery.nodes = [(name, nodes[name].address) for name in NAMES] + [
+                    (new, dead_address)
+                ]
+                await client._refresh_node_list()
+
+                self.assertEqual(client.stats().refresh_failures, 1)
+                self.assertIn(new, client._members)
+                self.assertIsNone(client._members[new].connection)
+                self.assertIn(dead_address, client._redial_cooldowns)
+                self.assertEqual(sorted(client._ring._nodes), sorted([*NAMES, new]))
+
+                # A key owned by the new node is routed to it, not to a
+                # non-owner: the read fails over to the live replica.
+                key = next(
+                    f"key-{i}"
+                    for i in range(1000)
+                    if client._ring.owners(f"key-{i}".encode(), 2)[0] == new
+                )
+                for node in nodes.values():
+                    node.store[key.encode()] = b"v1"
+                self.assertEqual(await client.get(key), "v1")
+
+                # Bring the node up on the listed address: once the cooldown
+                # has passed, its next use dials it.
+                _, port = dead_address.rsplit(":", 1)
+                revived = await MockNode().start(port=int(port))
+                nodes[new] = revived
+                await asyncio.sleep(0.1)
+                await client.set(key, "v2")
+                self.assertIsNotNone(client._members[new].connection)
+                self.assertEqual(revived.store[key.encode()], b"v2")
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_refresh_keeps_a_newly_listed_node_whose_address_is_not_a_node(self):
+        new = "new-node"
+        nodes, discovery = await self.start_cluster(set())
+        other = await MockDiscovery([]).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], reconnect_cooldown=0.05
+            )
+            try:
+                discovery.nodes = [(name, nodes[name].address) for name in NAMES] + [
+                    (new, f"127.0.0.1:{other.port}")
+                ]
+                await client._refresh_node_list()
+
+                self.assertEqual(client.stats().refresh_failures, 1)
+                self.assertIsNone(client._members[new].connection)
+                self.assertIn(f"127.0.0.1:{other.port}", client._redial_cooldowns)
+                self.assertIn(new, client._ring._nodes)
+            finally:
+                await client.close()
+        finally:
+            await other.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
     async def test_refresh_purges_cooldowns_for_departed_addresses(self):
         # #96: a node that leaves the cluster must not leave its per-address
         # reconnect-cooldown entry behind — in a churny deployment (fresh
