@@ -25,6 +25,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a SIGTERM could be held for up to 10 s by a discovery
+  server that accepted the connection and never answered. The auth exchange
+  and the registration and heartbeat writes were not cut short by shutdown,
+  and `run` waited for the cache task, which cannot finish while the
+  heartbeat task is alive, before reaching the heartbeat join that is
+  bounded at 5 s. On top of the 10 s drain this approached a 30 s stop
+  grace. Shutdown now cuts those writes and the exchange short, and the
+  bounded heartbeat join comes first (#1533).
 - `nanocached-discovery`: when the path between discovery and the whole
   fleet was cut and healed after the first evictions but before the last
   (the nodes' heartbeats fall at different phases of the 5 s interval, so
