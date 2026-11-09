@@ -25,6 +25,20 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: clearing one namespace left the handoff tombstones of
+  that namespace's keys in place, while clearing the whole store dropped
+  them. The tombstones stayed charged to the memory bound for their
+  two minutes, and refused the put-if-absent copy of a key written again
+  after the clear within that time, so the key could be one copy short
+  after a membership change. Clearing a namespace now drops its tombstones
+  and gives their bytes back, as clearing everything does (#1491).
+- `nanocached-node`: a delete (`D`, `d`, or a relayed one) that found its
+  key present but already past its TTL removed the entry and answered
+  as if it had not been there without counting the removal, so
+  `nanocached_node_expirations_total` undercounted by the number of
+  deletes that hit an expired entry. Every other lazy removal (a get, an
+  `INCR`, a touch, a compare, the sweep) was counted. The delete now
+  counts it too (#1490).
 - `nanocached-proxy`: a refused `A` that asked for response tags was
   answered `En\n`, where a node answers `EnT\n` and a discovery server
   `EdT\n`. The proxy now echoes the `T` too, so a client reads the same
@@ -58,6 +72,15 @@ framework adapters at one version, whether or not a component changed.
   because every key starts with the empty string; an empty value (or an
   empty entry in the list) now selects nothing, as an unset variable does
   (#1489).
+- `nanocached-node`, `nanocached-proxy`, `nanocached-discovery`: after a
+  refused request, the drain that half-closes and reads what the client is
+  still sending was bounded by its one-second window only for the read;
+  the half-close itself was awaited outside it. Over TLS the half-close
+  first flushes the pending records, so a client that stopped reading
+  with the send buffer full parked the connection task there for good,
+  holding its connection permit and its per-IP permit. The half-close is
+  now inside the window, so the whole drain ends after one second at the
+  latest (#1483).
 
 ## [0.6.2] - 2026-11-03
 
