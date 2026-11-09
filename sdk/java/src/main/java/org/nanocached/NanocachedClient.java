@@ -1286,7 +1286,11 @@ public final class NanocachedClient implements AutoCloseable {
             for (DialOutcome outcome : outcomes) {
                 if (outcome.connection != null) outcome.connection.close();
             }
-            throw hardError;
+            // A first connect against such an address is a configuration
+            // error, not a node to route around: a plain exception with the
+            // same message, as in the Python and .NET SDKs. Only the
+            // refresh and lazy-redial paths use the ConnectionLost form.
+            throw new NanocachedException(hardError.getMessage());
         }
 
         List<String> names = new ArrayList<>(nodes.size());

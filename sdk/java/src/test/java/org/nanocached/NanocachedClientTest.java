@@ -3536,6 +3536,26 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aFirstConnectAgainstAHardDialFailureAddressStaysAPlainException() throws Exception {
+        // Only the refresh and redial paths classify a hard dial failure as
+        // ConnectionLost; a first connect() reports a configuration error.
+        try (MockDiscovery discovery = new MockDiscovery(
+                List.of(new DiscoveredNode(NAMES.get(0), "no-port-here")), 1)) {
+            NanocachedException error = assertThrows(NanocachedException.class,
+                    () -> connect("127.0.0.1", discovery.port()));
+            assertEquals(NanocachedException.class, error.getClass());
+            assertTrue(error.getMessage().contains("invalid node address"), error.getMessage());
+        }
+        try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.nodes = List.of(new DiscoveredNode(NAMES.get(0), "127.0.0.1:" + discovery.port()));
+            NanocachedException error = assertThrows(NanocachedException.class,
+                    () -> connect("127.0.0.1", discovery.port()));
+            assertEquals(NanocachedException.class, error.getClass());
+            assertTrue(error.getMessage().contains("non-node address"), error.getMessage());
+        }
+    }
+
+    @Test
     void rejectsADiscoveryHeaderLineThatNeverTerminates() throws Exception {
         // Regression (issue: audit finding): Identify.readLine had no cap
         // at all — unlike Connection.java's own readLine, bounded by
