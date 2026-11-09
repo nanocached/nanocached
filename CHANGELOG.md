@@ -25,6 +25,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a source IP's in-flight byte share was forgotten as
+  soon as its last connection ended, even while requests that connection
+  had dispatched were still charged (a client write error ends the
+  connection before a slow node has answered them). The IP's next
+  connection then got a fresh, full share on top of the bytes still held,
+  so a client that sent large requests and reset repeatedly could hold
+  more than one share, up to the proxy-wide budget, for as long as a node
+  stayed slow. The share is now kept until its last charge is released, so
+  the next connection finds those bytes still charged to its IP (#1538).
+
 - `nanocached-node`: a SIGTERM could be held for up to 10 s by a discovery
   server that accepted the connection and never answered. The auth exchange
   and the registration and heartbeat writes were not cut short by shutdown,
