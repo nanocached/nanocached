@@ -428,7 +428,14 @@ over to the next owner only when the holder is unreachable.
 `client.Replication` exposes the factor in use. A write whose primary
 just died recovers automatically once discovery drops the node (bounded
 by its liveness timeout): the failed attempt forces a node-list refresh
-and one retry.
+and one retry. A refresh forced this way starts at least 200 ms after the
+previous refresh finished: while discovery still lists a node that has
+died, every operation routed to it fails, and without that floor each
+failure would open its own discovery connection. A caller that fails
+inside the window reuses the refresh that just finished (its retry still
+runs), and callers that were waiting on a refresh that began before their
+failure share one follow-up refresh that starts when the window has
+passed. The 30-second staleness refresh is not delayed.
 
 ## Fire-and-forget replica writes
 

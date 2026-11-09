@@ -261,6 +261,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     private const int MultiSetHeaderAllowance = 24;
 
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
+    // The shortest time between the end of one node-list refresh and the
+    // start of the next forced one. While discovery still lists a dead node
+    // every operation routed to it fails and forces a refresh that installs
+    // the same list; without a floor a sequential caller opens one
+    // discovery connection per failed operation.
+    internal static readonly TimeSpan ForcedRefreshMinInterval = TimeSpan.FromMilliseconds(200);
     // Reserved by the SDKs so a real application key can never collide
     // with it: a GET refreshes the pinged key's server-side LRU recency,
     // which is exactly why collision would matter — an app using key
@@ -440,6 +446,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     // backward step of the wall clock cannot make the list look fresh for
     // the size of the step (Python's time.monotonic(), Java's nanoTime()).
     private long _lastFetch = MonotonicNow();
+    // When the current or last refresh began, and when the last one
+    // finished (null before the first): a forced refresh only reuses one
+    // that began after the failure it reacts to, and keeps
+    // ForcedRefreshMinInterval from the end of the last (issue #1583).
+    private long _lastRefreshStarted = long.MinValue;
+    private long? _lastRefreshEnd;
 
     /// <summary>The monotonic clock the reconnect cooldown and the
     /// node-list staleness are measured on: <see cref="System.Diagnostics.Stopwatch"/>
@@ -5151,20 +5163,51 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 
         // Forced refreshes are single-flight: a forced caller that waited
         // for the gate while another refresh ran reuses that refresh
-        // instead of running its own. Without this, N callers hitting the
-        // same dead node ran N full refreshes one after another (each a
-        // discovery round trip, up to the connect timeout when discovery
-        // is slow), and the last caller waited behind N - 1 results it
-        // did not need. A refresh that completed — including one whose
-        // fetch failed, which also advances _lastFetch — is what the
-        // waiter would have got from its own attempt moments later.
-        long observed = _lastFetch;
-        await _refreshGate.WaitAsync().ConfigureAwait(false);
+        // instead of running its own, provided that refresh STARTED after
+        // the caller saw its failure (issue #1583). Without the
+        // single-flight, N callers hitting the same dead node ran N full
+        // refreshes one after another (each a discovery round trip, up to
+        // the connect timeout when discovery is slow). A refresh that began
+        // before the failure (say the 30 s staleness refresh, already past
+        // its discovery read when the node died) installs the list that
+        // still names the dead node, so it is waited out, not reused.
+        //
+        // Forced refreshes are also ForcedRefreshMinInterval apart, measured
+        // from the END of the last refresh: while discovery still lists a
+        // dead node every operation routed to it fails and forces one, and
+        // each refresh opens a discovery connection. A caller that finds no
+        // refresh running and one finished within the interval reuses it
+        // (its retry still runs). One that waited out an older refresh may
+        // not (that refresh began before its failure), so it sits out the
+        // rest of the interval, still holding the gate, and runs a refresh
+        // that the callers queued behind it then share. Staleness refreshes
+        // are not throttled.
+        long observed = MonotonicNow();
+        bool waitedOutOlderRefresh = false;
+        if (!await _refreshGate.WaitAsync(0).ConfigureAwait(false))
+        {
+            waitedOutOlderRefresh = true;
+            await _refreshGate.WaitAsync().ConfigureAwait(false);
+        }
         try
         {
             if (!force && Elapsed(_lastFetch) < NodeListStaleAfter) return;
-            if (force && _lastFetch > observed) return;
+            if (force)
+            {
+                if (_lastRefreshStarted >= observed) return;
+                if (_lastRefreshEnd is long end)
+                {
+                    TimeSpan remaining = ForcedRefreshMinInterval - Elapsed(end);
+                    if (remaining > TimeSpan.Zero)
+                    {
+                        if (!waitedOutOlderRefresh) return;
+                        await Task.Delay(remaining).ConfigureAwait(false);
+                        if (_closed) return;
+                    }
+                }
+            }
             await RefreshNodeListAsync().ConfigureAwait(false);
+            _lastRefreshEnd = MonotonicNow();
         }
         finally
         {
@@ -5174,6 +5217,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 
     private async Task RefreshNodeListAsync()
     {
+        _lastRefreshStarted = MonotonicNow();
         Identify.ClusterTarget? cluster = await FetchNodeListAsync().ConfigureAwait(false);
         _lastFetch = MonotonicNow();
         if (cluster is null) return;
