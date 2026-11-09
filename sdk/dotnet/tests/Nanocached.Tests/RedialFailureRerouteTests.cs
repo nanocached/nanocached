@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text;
 using Xunit;
 
@@ -93,5 +94,82 @@ public class RedialFailureRerouteTests
         using var _d = discovery;
 
         Assert.Null(await client.IncrAsync(key, 1));
+    }
+
+    // issue #1525 — while a refresh dials a newly listed node, the member
+    // table has already lost the departed node but the ring still names
+    // it. A non-idempotent op on one of its keys found no member: that is
+    // a request that was never written, not a lost reply, so it waits for
+    // the refresh and reroutes like an idempotent op does.
+    private static Task StartRefresh(NanocachedClient client)
+    {
+        MethodInfo method = typeof(NanocachedClient)
+            .GetMethod("MaybeRefreshAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (Task)method.Invoke(client, new object[] { true })!;
+    }
+
+    private const string NewNodeName = "a3b6c9d2-4e5f-4a1b-8c7d-9e0f1a2b3c4d";
+
+    private static string KeyMovingFromTo(string from, string to)
+    {
+        string[] after = { to, NewNodeName };
+        for (int i = 0; ; i++)
+        {
+            string key = "window-" + i;
+            byte[] bytes = Encoding.UTF8.GetBytes(key);
+            if (new HashRing(Names).Owners(bytes, 1)[0] == from && new HashRing(after).Owners(bytes, 1)[0] == to)
+            {
+                return key;
+            }
+        }
+    }
+
+    [Fact]
+    public async Task NonIdempotentOpsWaitOutARefreshThatDropsTheirPrimary()
+    {
+        string key = KeyMovingFromTo(Names[0], Names[1]);
+        using var nodeA = new MockNode();
+        using var nodeB = new MockNode();
+        using var slow = new MockNode();
+        using var discovery = new MockDiscovery(
+            new List<(string, string)> { (Names[0], nodeA.Address), (Names[1], nodeB.Address) }, 1);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            new() { Addresses = { ("127.0.0.1", discovery.Port) } });
+
+        slow.DelayAuth(1500);
+        nodeB.Store[MockNode.KeyOf(Encoding.UTF8.GetBytes(key))] = Encoding.UTF8.GetBytes("5");
+        discovery.SetNodes(new List<(string, string)> { (Names[1], nodeB.Address), (NewNodeName, slow.Address) });
+
+        // The refresh drops A at once, then spends 1.5 s dialing the slow node.
+        Task refresh = StartRefresh(client);
+        await Task.Delay(300);
+        Assert.False(refresh.IsCompleted, "the refresh must still be dialing");
+
+        Assert.Equal(6L, await client.IncrAsync(key, 1));
+        Assert.True(refresh.IsCompleted);
+        Assert.False(await client.PutIfAbsentAsync(key, "other"));
+    }
+
+    [Fact]
+    public async Task ARedialThatFindsItsMemberGoneIsANotSentFailure()
+    {
+        using var nodeA = new MockNode();
+        using var nodeB = new MockNode();
+        using var discovery = new MockDiscovery(
+            new List<(string, string)> { (Names[0], nodeA.Address), (Names[1], nodeB.Address) }, 1);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            new() { Addresses = { ("127.0.0.1", discovery.Port) } });
+
+        MethodInfo dial = typeof(NanocachedClient)
+            .GetMethod("DialWithCooldownAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        Connection fresh = await (Task<Connection>)dial.Invoke(client, new object?[] { nodeA.Address })!;
+        MethodInfo install = typeof(NanocachedClient)
+            .GetMethod("InstallRedialedConnection", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        var thrown = Assert.Throws<TargetInvocationException>(
+            () => install.Invoke(client, new object?[] { "no-such-member", fresh }));
+        var lost = Assert.IsType<ConnectionLostException>(thrown.InnerException);
+        Assert.True(lost.RequestNotSent);
+        Assert.True(fresh.IsClosed);
     }
 }
