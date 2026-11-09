@@ -3536,6 +3536,26 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aFirstConnectAgainstAHardDialFailureAddressStaysAPlainException() throws Exception {
+        // Only the refresh and redial paths classify a hard dial failure as
+        // ConnectionLost; a first connect() reports a configuration error.
+        try (MockDiscovery discovery = new MockDiscovery(
+                List.of(new DiscoveredNode(NAMES.get(0), "no-port-here")), 1)) {
+            NanocachedException error = assertThrows(NanocachedException.class,
+                    () -> connect("127.0.0.1", discovery.port()));
+            assertEquals(NanocachedException.class, error.getClass());
+            assertTrue(error.getMessage().contains("invalid node address"), error.getMessage());
+        }
+        try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.nodes = List.of(new DiscoveredNode(NAMES.get(0), "127.0.0.1:" + discovery.port()));
+            NanocachedException error = assertThrows(NanocachedException.class,
+                    () -> connect("127.0.0.1", discovery.port()));
+            assertEquals(NanocachedException.class, error.getClass());
+            assertTrue(error.getMessage().contains("non-node address"), error.getMessage());
+        }
+    }
+
+    @Test
     void rejectsADiscoveryHeaderLineThatNeverTerminates() throws Exception {
         // Regression (issue: audit finding): Identify.readLine had no cap
         // at all — unlike Connection.java's own readLine, bounded by
@@ -8190,6 +8210,62 @@ class NanocachedClientTest {
                         () -> memberConnection.invoke(client, "bad-address"));
                 assertTrue(failure.getCause().getMessage().contains("invalid node address"),
                         failure.getCause().getMessage());
+            }
+        }
+    }
+
+    @Test
+    void operationsRerouteAroundAHardDialFailurePrimaryOnceDiscoveryDropsIt() throws Exception {
+        // A node kept in the ring after a hard dial failure (an unparseable
+        // address, or one that is not a cache node) holds its error in the
+        // cooldown. That error was a plain NanocachedException, which
+        // withWrongNodeRetry does not catch, so a write or INCR whose
+        // primary was that node surfaced it without the refresh that would
+        // have dropped the node. It is ConnectionLost, never sent, like a
+        // dead node's.
+        for (String badAddress : List.of("no-port-here", "NOT-A-NODE")) {
+            try (Cluster cluster = startCluster(2)) {
+                MockNode live = cluster.nodes().get(NAMES.get(0));
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    String address = badAddress.equals("NOT-A-NODE")
+                            ? "127.0.0.1:" + cluster.discovery().port()
+                            : badAddress;
+                    DiscoveredNode bad = new DiscoveredNode("bad-node", address);
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
+                    forceRefresh(client);
+                    assertNull(memberConnectionOf(client, "bad-node"));
+
+                    // Discovery drops the node; this client has not seen that yet.
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                    // Past the minimum interval between forced refreshes.
+                    Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
+                    List<String> ranked = List.of(NAMES.get(0), "bad-node");
+                    String key = keyWithPrimaryAmong(ranked, "bad-node");
+                    client.set(key, "v");
+                    assertEquals(Optional.of("v"), client.get(key));
+
+                    // Same again for INCR, which only retries a request that never left.
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
+                    forceRefresh(client);
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                    Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
+                    String counter = keyWithPrimaryAmong(ranked, "bad-node", key);
+                    live.store.put(MockNode.keyOf(counter.getBytes(StandardCharsets.UTF_8)),
+                            "10".getBytes(StandardCharsets.UTF_8));
+                    assertEquals(java.util.OptionalLong.of(15), client.incr(counter, 5));
+                }
+            }
+        }
+    }
+
+    private static String keyWithPrimaryAmong(List<String> names, String primary, String... except) {
+        HashRing ring = new HashRing(names);
+        for (int i = 0; ; i++) {
+            String candidate = "hard-" + i;
+            if (List.of(except).contains(candidate)) continue;
+            if (ring.owners(candidate.getBytes(StandardCharsets.UTF_8), 2).get(0).equals(primary)) {
+                return candidate;
             }
         }
     }

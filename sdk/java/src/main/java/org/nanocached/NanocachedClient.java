@@ -1142,8 +1142,8 @@ public final class NanocachedClient implements AutoCloseable {
         int separator = address.lastIndexOf(':');
         Integer port = separator == -1 ? null : parsePort(address.substring(separator + 1));
         if (separator == -1 || port == null) {
-            return DialOutcome.hard(new NanocachedException(
-                    "nanocached: invalid node address from discovery server: " + address));
+            return DialOutcome.hard(new NanocachedException.ConnectionLost(
+                    "nanocached: invalid node address from discovery server: " + address, null, true));
         }
         String host = address.substring(0, separator);
 
@@ -1158,8 +1158,8 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         if (!(identified instanceof Identify.NodeTarget nodeTarget)) {
-            return DialOutcome.hard(new NanocachedException(
-                    "nanocached: discovery server returned a non-node address: " + address));
+            return DialOutcome.hard(new NanocachedException.ConnectionLost(
+                    "nanocached: discovery server returned a non-node address: " + address, null, true));
         }
 
         try {
@@ -1286,7 +1286,11 @@ public final class NanocachedClient implements AutoCloseable {
             for (DialOutcome outcome : outcomes) {
                 if (outcome.connection != null) outcome.connection.close();
             }
-            throw hardError;
+            // A first connect against such an address is a configuration
+            // error, not a node to route around: a plain exception with the
+            // same message, as in the Python and .NET SDKs. Only the
+            // refresh and lazy-redial paths use the ConnectionLost form.
+            throw new NanocachedException(hardError.getMessage());
         }
 
         List<String> names = new ArrayList<>(nodes.size());
@@ -6477,7 +6481,8 @@ public final class NanocachedClient implements AutoCloseable {
         int separator = address.lastIndexOf(':');
         Integer port = separator == -1 ? null : parsePort(address.substring(separator + 1));
         if (separator == -1 || port == null) {
-            throw new NanocachedException("nanocached: invalid node address from discovery server: " + address);
+            throw new NanocachedException.ConnectionLost(
+                    "nanocached: invalid node address from discovery server: " + address, null, true);
         }
         String host = address.substring(0, separator);
 
