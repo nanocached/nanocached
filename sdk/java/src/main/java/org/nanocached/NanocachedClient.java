@@ -6367,7 +6367,24 @@ public final class NanocachedClient implements AutoCloseable {
             // deadline) before throwing the same AlreadyClosed.
             if (closed) throw new NanocachedException.AlreadyClosed();
             Connection connection = dialWithCooldown(member.address);
-            member.connection = connection;
+            // Issue #1543: the dial ran outside stateLock, so close() or a
+            // refresh that dropped this member may have run meanwhile. The
+            // connection would then hang off a Member nothing reaches any
+            // more (or that teardown() already passed), and its socket and
+            // reader thread would live until the server's idle timeout.
+            // Re-checked under the lock both of them close under.
+            synchronized (stateLock) {
+                if (closed) {
+                    connection.close();
+                    throw new NanocachedException.AlreadyClosed();
+                }
+                if (members.get(name) != member) {
+                    connection.close();
+                    throw new NanocachedException.ConnectionLost(
+                            "nanocached: " + name + " left the cluster while reconnecting", null, true);
+                }
+                member.connection = connection;
+            }
             return connection;
         }
     }
