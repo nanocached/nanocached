@@ -25,19 +25,62 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a source IP's in-flight byte share was forgotten as
+  soon as its last connection ended, even while requests that connection
+  had dispatched were still charged (a client write error ends the
+  connection before a slow node has answered them). The IP's next
+  connection then got a fresh, full share on top of the bytes still held,
+  so a client that sent large requests and reset repeatedly could hold
+  more than one share, up to the proxy-wide budget, for as long as a node
+  stayed slow. The share is now kept until its last charge is released, so
+  the next connection finds those bytes still charged to its IP (#1538).
+
+- `nanocached-node`: a SIGTERM could be held for up to 10 s by a discovery
+  server that accepted the connection and never answered. The auth exchange
+  and the registration and heartbeat writes were not cut short by shutdown,
+  and `run` waited for the cache task, which cannot finish while the
+  heartbeat task is alive, before reaching the heartbeat join that is
+  bounded at 5 s. On top of the 10 s drain this approached a 30 s stop
+  grace. Shutdown now cuts those writes and the exchange short, and the
+  bounded heartbeat join comes first (#1533).
 - `nanocached-discovery`: when the path between discovery and the whole
   fleet was cut and healed after the first evictions but before the last
   (the nodes' heartbeats fall at different phases of the 5 s interval, so
   they cross the liveness window on different sweep ticks), the evicted
   nodes were sent back through a join and emptied their caches: a node
   still listed counted as one the cluster had moved on with, although it
-  had been cut off just the same and had taken nothing over. A member heard
-  from again after a gap of 9 s or more — at least one heartbeat did not
-  arrive — now counts as in unbroken contact only from that moment, so it
-  no longer makes the nodes evicted during the gap start over; they are
+  had been cut off just the same and had taken nothing over. A member
+  whose heartbeats stopped arriving for 9 s or more — at least one did not —
+  across a node's eviction no longer counts as one the cluster moved on
+  with, so it does not make that node start over; the evicted nodes are
   registered with their caches as when every node was evicted together. A
   survivor whose heartbeat was merely late, by less than 9 s, still counts
   as in contact throughout (#1479).
+- `nanocached-discovery`: a member that had been served the roster without
+  an evicted node, and then lost one heartbeat (a connection reset by a load
+  balancer or NAT, one read or write error; the node waits an interval and
+  reconnects), could make that node be registered with its pre-eviction
+  cache instead of being answered `G` when it came back later: it served
+  older values and deleted keys for as long as it stayed away (up to an
+  hour; in a two-node cluster one dropped heartbeat was enough), and the
+  survivors' reclaim pass dropped the newer copies. Discovery now keeps, per
+  member, the gaps of 9 s or more between its heartbeats and asks whether one
+  of them spans the eviction: only a member cut off across it stops
+  counting, and a gap that began after the eviction, or that spans some
+  other node's departure, no longer hides it (#1523).
+- `nanocached-discovery`: in the same partial-eviction window, whether the
+  evicted nodes kept their caches depended on arrival order. A member that
+  was still listed but silent since before the eviction counted as one the
+  cluster had moved on with until its first heartbeat after the heal showed
+  its gap, so an evicted node whose announce reached discovery first was
+  sent back through a join and emptied its cache. A member not heard from
+  since the eviction and silent for 9 s or more is now treated as cut off
+  straight away, so the verdict is the same whichever reaches discovery
+  first. A member silent for less than 9 s still counts as in contact. The
+  pause guard's refresh of the liveness window after a stall of discovery
+  does not count as hearing from a member. Three nodes at R=2 and 40 keys, A
+  and B evicted and the path healed with their announces arriving before the
+  third node's heartbeat: 24 of 80 copies lost before, none after (#1532).
 - `nanocached-node`: clearing one namespace left the handoff tombstones of
   that namespace's keys in place, while clearing the whole store dropped
   them. The tombstones stayed charged to the memory bound for their
