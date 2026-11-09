@@ -5034,8 +5034,11 @@ const REJECTED_REQUEST_DRAIN_WINDOW: Duration = Duration::from_secs(1);
 /// buffer sends a reset, which can discard the `Ed\n` on the client's side
 /// before it is read. The node and the proxy do the same for their `E`.
 async fn drain_rejected_request(stream: &mut ServerStream) {
-    let _ = stream.shutdown().await;
+    // The half-close is inside the window too: over TLS it first flushes
+    // the pending records, which blocks for as long as a peer that has
+    // stopped reading keeps the send buffer full.
     let drain = async {
+        let _ = stream.shutdown().await;
         let mut sink = [0_u8; 1024];
         let mut discarded = 0;
         while discarded < MAX_REQUEST_SIZE {

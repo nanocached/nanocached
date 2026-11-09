@@ -2489,8 +2489,11 @@ async fn reject_request(stream: &mut ServerStream, reason: String) -> io::Error 
 /// hold a connection permit for that long.
 async fn reject_oversized_request(stream: &mut ServerStream, reason: String) -> io::Error {
     let error = reject_request(stream, reason).await;
-    let _ = stream.shutdown().await;
+    // The half-close is inside the window too: over TLS it first flushes
+    // the pending records, which blocks for as long as a peer that has
+    // stopped reading keeps the send buffer full.
     let drain = async {
+        let _ = stream.shutdown().await;
         let mut sink = [0_u8; 8192];
         let mut discarded = 0;
         while discarded < MAX_REQUEST_SIZE {
@@ -8201,7 +8204,7 @@ fn handoff_message(
         crate::trace::name(&key.name),
         ttl.map(|t| t.as_secs()),
         if_absent,
-        &token[..token.len().min(8)]
+        crate::trace::short_token(token)
     );
     let mut header = format!(
         "U {} {} {} {}",
@@ -8233,7 +8236,7 @@ fn handoff_delete_message(key: &Key, token: &str) -> Vec<u8> {
         &key.name,
         "send_u key={} token={}",
         crate::trace::name(&key.name),
-        &token[..token.len().min(8)]
+        crate::trace::short_token(token)
     );
     let mut message = format!(
         "u {} {} {}\n",
