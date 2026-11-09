@@ -5380,6 +5380,119 @@ async fn batch_touch_still_wrong_node_after_the_retry_returns_what_did_resolve()
     stop_cluster(client, nodes, discovery).await;
 }
 
+// ── a non-UTF-8 value among a partial result (issue #1526) ──────────
+//
+// A stored value need not be valid UTF-8. Decoding the partial map
+// strictly turned every `Partial*` error of the text methods into
+// `InvalidUtf8`, so the caller lost the error class and every other value
+// that had resolved; the undecodable value is now left out of the map.
+
+/// A two-node cluster, three keys per primary, one of node B's keys
+/// holding `FF FE 80`. Returns the node B keys that decode and the one
+/// that does not.
+async fn partial_cluster_with_a_binary_value(
+    replication: usize,
+) -> (
+    Vec<(String, MockNode)>,
+    MockDiscovery,
+    NanocachedClient,
+    Vec<String>,
+    HashMap<String, String>,
+    String,
+) {
+    let (nodes, discovery) = start_cluster(replication).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let primary_a = keys_whose_primary_is(NAMES[0], 3);
+    let primary_b = keys_whose_primary_is(NAMES[1], 3);
+    let all = concat(&primary_a, &primary_b);
+    client.set_many(&values_for(&all), 0).await.unwrap();
+    let binary = primary_b[0].clone();
+    client
+        .set(&binary, vec![0xff, 0xfe, 0x80], 0)
+        .await
+        .unwrap();
+    let readable = values_for(&primary_b[1..]);
+    (nodes, discovery, client, all, readable, binary)
+}
+
+#[tokio::test]
+async fn get_many_keeps_partial_wrong_node_when_a_resolved_value_is_not_utf8() {
+    let (nodes, discovery, client, all, readable, binary) =
+        partial_cluster_with_a_binary_value(1).await;
+    node_named(&nodes, NAMES[0])
+        .state
+        .wrong_node_replies
+        .store(8, Ordering::SeqCst);
+
+    match client.get_many(&all).await {
+        Err(Error::PartialWrongNodeText(partial)) => {
+            assert_eq!(partial, readable);
+            assert!(!partial.contains_key(&binary));
+        }
+        other => panic!("expected PartialWrongNodeText, got {other:?}"),
+    }
+
+    node_named(&nodes, NAMES[0])
+        .state
+        .wrong_node_replies
+        .store(8, Ordering::SeqCst);
+    match client.get_many_and_touch(&all, Some(31)).await {
+        Err(Error::PartialWrongNodeText(partial)) => assert_eq!(partial, readable),
+        other => panic!("expected PartialWrongNodeText, got {other:?}"),
+    }
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn get_many_keeps_partial_connection_lost_when_a_resolved_value_is_not_utf8() {
+    let (nodes, discovery, client, all, readable, binary) =
+        partial_cluster_with_a_binary_value(1).await;
+    node_named(&nodes, NAMES[0]).stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    match client.get_many(&all).await {
+        Err(Error::PartialConnectionLostText(partial, cause)) => {
+            assert_eq!(partial, readable);
+            assert!(!partial.contains_key(&binary));
+            assert!(
+                matches!(*cause, Error::ConnectionLost(_)),
+                "cause = {cause:?}"
+            );
+        }
+        other => panic!("expected PartialConnectionLostText, got {other:?}"),
+    }
+
+    match client.get_many_and_touch(&all, Some(31)).await {
+        Err(Error::PartialConnectionLostText(partial, _cause)) => assert_eq!(partial, readable),
+        other => panic!("expected PartialConnectionLostText, got {other:?}"),
+    }
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn get_many_and_touch_keeps_partial_server_too_old_when_a_resolved_value_is_not_utf8() {
+    let (nodes, discovery, client, all, readable, binary) =
+        partial_cluster_with_a_binary_value(1).await;
+    node_named(&nodes, NAMES[0])
+        .state
+        .reject_multi_touch
+        .store(true, Ordering::SeqCst);
+
+    match client.get_many_and_touch(&all, Some(31)).await {
+        Err(Error::PartialServerTooOldText(partial)) => {
+            assert_eq!(partial, readable);
+            assert!(!partial.contains_key(&binary));
+        }
+        other => panic!("expected PartialServerTooOldText, got {other:?}"),
+    }
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
 // ── an expiring touch asks the primary first (issue #934) ───────────
 //
 // With `Some(0)` the plain touch to the other owners goes out only after

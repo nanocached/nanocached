@@ -279,6 +279,20 @@ fn decode_many(raw: HashMap<String, Vec<u8>>) -> Result<HashMap<String, String>>
     Ok(values)
 }
 
+/// Decodes the values a `Partial*` error carries. Decoding is as strict as
+/// [`decode_many`]'s per value, but a stored value need not be valid UTF-8
+/// (`set_bytes` stores anything), and a failure here would replace the
+/// wrong-node, server-too-old or connection-loss error the caller needs
+/// with [`Error::InvalidUtf8`], along with every other value already
+/// resolved. So a value that is not valid UTF-8 is left out rather than
+/// handed back with replacement characters — a cache must never return a
+/// value it did not store; `get_many_bytes` still has the exact bytes.
+fn decode_partial(raw: HashMap<String, Vec<u8>>) -> HashMap<String, String> {
+    raw.into_iter()
+        .filter_map(|(key, value)| String::from_utf8(value).ok().map(|text| (key, text)))
+        .collect()
+}
+
 /// `decr`'s delta negation (issue #129) — shared by
 /// [`NanocachedClient::decr`] and [`Namespace::decr`]. `i64::MIN` has no
 /// valid `i64` negation (`i64::MAX` is one short of `|i64::MIN|`), so
@@ -2583,13 +2597,13 @@ impl NanocachedClient {
         {
             Ok(raw) => decode_many(raw),
             Err(Error::PartialWrongNode(partial)) => {
-                Err(Error::PartialWrongNodeText(decode_many(partial)?))
+                Err(Error::PartialWrongNodeText(decode_partial(partial)))
             }
             Err(Error::PartialServerTooOld(partial)) => {
-                Err(Error::PartialServerTooOldText(decode_many(partial)?))
+                Err(Error::PartialServerTooOldText(decode_partial(partial)))
             }
             Err(Error::PartialConnectionLost(partial, cause)) => Err(
-                Error::PartialConnectionLostText(decode_many(partial)?, cause),
+                Error::PartialConnectionLostText(decode_partial(partial), cause),
             ),
             Err(other) => Err(other),
         }
@@ -3172,10 +3186,10 @@ impl NanocachedClient {
         match self.get_many_bytes_in(namespace, keys).await {
             Ok(raw) => decode_many(raw),
             Err(Error::PartialWrongNode(partial)) => {
-                Err(Error::PartialWrongNodeText(decode_many(partial)?))
+                Err(Error::PartialWrongNodeText(decode_partial(partial)))
             }
             Err(Error::PartialConnectionLost(partial, cause)) => Err(
-                Error::PartialConnectionLostText(decode_many(partial)?, cause),
+                Error::PartialConnectionLostText(decode_partial(partial), cause),
             ),
             Err(other) => Err(other),
         }
