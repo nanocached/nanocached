@@ -306,6 +306,18 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
         ));
     }
 
+    // The node registers `args.port` with discovery as the address clients
+    // dial, and discovery refuses port 0. `--port 0` makes the kernel pick
+    // a port the registration would not carry, so the node would serve but
+    // never join, with nothing but a retrying log line to say why.
+    if args.port == 0 && args.discovery.is_some() {
+        return Err(ArgsError::Invalid(
+            "--port 0 cannot be used with --discovery: the node must register the port it \
+             listens on"
+                .to_string(),
+        ));
+    }
+
     // Issue #126: an explicit per-IP cap above the total is a
     // misconfiguration (it could never bind); the implicit default
     // instead shrinks to fit a lowered total. Checked here, after the
@@ -336,6 +348,8 @@ Usage: nanocached-node [options]
                                orchestrate a join — every node
                                in a cluster must list the same addresses
                                in the same order. Omit to run standalone
+                               Cannot be combined with --port 0: the
+                               node registers the port it listens on
   --tls-cert <path>           PEM certificate chain; requires TLS on every
                                accepted connection (no plaintext fallback)
   --tls-key <path>            PEM private key matching --tls-cert
@@ -558,6 +572,36 @@ mod tests {
             .map(|flag| flag.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    #[test]
+    fn port_0_is_refused_with_discovery_in_either_flag_order() {
+        for flags in [
+            &["--port", "0", "--discovery", "127.0.0.1:8357"],
+            &["--discovery", "127.0.0.1:8357", "--port", "0"],
+        ] {
+            let Err(ArgsError::Invalid(message)) = parse_args_from(args(flags)) else {
+                panic!("{flags:?} must be rejected");
+            };
+            assert_eq!(
+                message,
+                "--port 0 cannot be used with --discovery: the node must register the port \
+                 it listens on"
+            );
+        }
+    }
+
+    #[test]
+    fn port_0_is_still_accepted_standalone_and_discovery_with_a_real_port() {
+        // Standalone, an ephemeral port is fine: nothing registers it.
+        let parsed = parse_args_from(args(&["--port", "0"])).unwrap();
+        assert_eq!(parsed.port, 0);
+        assert!(parsed.discovery.is_none());
+
+        let parsed =
+            parse_args_from(args(&["--port", "8356", "--discovery", "127.0.0.1:8357"])).unwrap();
+        assert_eq!(parsed.port, 8356);
+        assert!(parsed.discovery.is_some());
     }
 
     #[test]
