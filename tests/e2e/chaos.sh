@@ -136,7 +136,8 @@ ROUND_BUDGET=${ROUND_BUDGET:-150}
 # be running when the last round ends, or the miss/corrupt assertions on it say
 # nothing about that round (checked after the loop).
 HEAL_BUDGET=${HEAL_BUDGET:-90}
-LOAD_SECS=$(( ROUNDS * ROUND_BUDGET + (ROUNDS + 1) / 3 * HEAL_BUDGET + 30 ))
+HEAL_ROUNDS=$(( (ROUNDS + 1) / 3 ))
+LOAD_SECS=$(( ROUNDS * ROUND_BUDGET + HEAL_ROUNDS * HEAL_BUDGET + 30 ))
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
 # Portable `timeout` (macOS has none): kill the command after N seconds.
 tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }
