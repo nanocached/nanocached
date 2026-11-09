@@ -186,6 +186,15 @@ framework adapters at one version, whether or not a component changed.
   holding its connection permit and its per-IP permit. The half-close is
   now inside the window, so the whole drain ends after one second at the
   latest (#1483).
+- `nanocached-node`: a re-replication pass superseded by a second eviction
+  no longer forgets the first eviction's keys. The new pass healed only the
+  owners the second change promoted, so the keys the first change promoted
+  new owners for, and the aborted pass had not reached, stayed at one copy
+  at R=2 until they were rewritten or the ring moved them again (a
+  held-pass reproduction left 28 of 168 pairs unsent). The new pass now
+  also heals from the rings the aborted pass had not finished from; the
+  sends are put-if-absent, so repeating a delivered key is harmless
+  (#1522).
 - `nanocached-node`: the decommission drain no longer spends its budget on
   a survivor that is dead but still listed by discovery. Each key bound for
   such a node cost three refused dials and their backoffs (about 0.3 s), so

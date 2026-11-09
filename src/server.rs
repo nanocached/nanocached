@@ -6575,6 +6575,13 @@ struct ActiveRereplication {
     /// `ActiveMigration::completed_at`: nothing here needs to measure a
     /// forwarding grace, only to know the run is over.
     done: AtomicBool,
+    /// The rings this run still owes a pass from: the one its own change
+    /// started from, plus those of earlier runs it took over from that were
+    /// aborted before they had considered every key. Emptied once the run
+    /// has considered every key, so a successor starts from its own ring
+    /// only; left as is when the run is aborted, for the successor to pick
+    /// up (issue #1522).
+    unfinished_baselines: Mutex<Vec<Arc<HashRing>>>,
 }
 
 /// Occupies `slot` with an `ActiveMigration` for this guard's lifetime
@@ -8742,6 +8749,32 @@ fn rereplication_targets(
         .collect()
 }
 
+/// `rereplication_targets` for a pass that also owes the changes of the
+/// runs it superseded (issue #1522): the owners promoted by any of the
+/// `earlier` rings' changes to `after`, together with those of `before`'s.
+/// Each ring is diffed against `after` separately because the sender
+/// condition is per ring — a node promoted by the first change into a
+/// key's top-R was not an owner under the first ring but is the one that
+/// holds the key for the second.
+fn rereplication_targets_since(
+    before: &HashRing,
+    earlier: &[Arc<HashRing>],
+    after: &HashRing,
+    key_hash: KeyHash,
+    replication: usize,
+    self_name: &str,
+) -> Vec<String> {
+    let mut targets = rereplication_targets(before, after, key_hash, replication, self_name);
+    for ring in earlier {
+        for target in rereplication_targets(ring, after, key_hash, replication, self_name) {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
 /// Issue #275: installs `state` into `slot` and hands back whatever
 /// occupied it a moment ago, both under one lock acquisition — the fix
 /// for the check-then-act race `run_superseding_rereplication` used to
@@ -8787,6 +8820,14 @@ fn take_over_rereplication_slot(
 /// just handled, plus the joiner's own, and runs only after its own
 /// transfer has completed — so neither of those two steps applies there).
 ///
+/// Issue #1522: a run it aborted before that run had considered every key
+/// leaves its starting ring in `ActiveRereplication::unfinished_baselines`.
+/// This run takes them over and heals from each of them to `after_ring`
+/// (`rereplication_targets_since`), so the owners the aborted run's change
+/// promoted, and it had not reached, are not forgotten; a key the aborted
+/// run did send is sent again, harmlessly (put-if-absent). The forwarding
+/// window below stays on this run's own, newest, snapshot.
+///
 /// Issue #275: the install (`take_over_rereplication_slot`) happens
 /// *before* the wait on the previous occupant's `done`, not after — see
 /// that function's doc comment for why this ordering is what keeps
@@ -8812,8 +8853,14 @@ async fn run_superseding_rereplication(
     let state = Arc::new(ActiveRereplication {
         abort_requested: AtomicBool::new(false),
         done: AtomicBool::new(false),
+        unfinished_baselines: Mutex::new(vec![Arc::clone(&before_ring)]),
     });
     let previous = take_over_rereplication_slot(&node_context.active_rereplication, &state);
+    // Issue #1522: the rings the aborted run had not finished from, so
+    // the keys its change promoted new owners for, and it had not reached,
+    // are still covered. The sends are put-if-absent: a key the aborted
+    // run did deliver is harmless to send again.
+    let mut earlier_rings: Vec<Arc<HashRing>> = Vec::new();
     if let Some(previous) = previous {
         previous.abort_requested.store(true, Ordering::SeqCst);
         // Issue #498: bounded by the deadline *and* by shutdown — see
@@ -8837,6 +8884,16 @@ async fn run_superseding_rereplication(
                 }
             }
         }
+        earlier_rings = previous
+            .unfinished_baselines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut own = state
+            .unfinished_baselines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        own.splice(0..0, earlier_rings.iter().cloned());
     }
 
     // The forwarding window opens with the pass — a later ring change's
@@ -8855,9 +8912,10 @@ async fn run_superseding_rereplication(
         grace: FORWARDING_GRACE_BASE,
     });
 
-    run_rereplication(
+    let completed = run_rereplication(
         &node_context,
         &before_ring,
+        &earlier_rings,
         &after_ring,
         replication,
         &addresses,
@@ -8867,6 +8925,13 @@ async fn run_superseding_rereplication(
     )
     .await;
 
+    if completed {
+        state
+            .unfinished_baselines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
     state.done.store(true, Ordering::SeqCst);
     {
         // Stamp this pass's own window only: a later pass may already
@@ -8965,7 +9030,10 @@ async fn spawn_or_supersede_rereplication(
 /// still present in both rings is mid-decommission. A key left below R
 /// by an earlier, unrelated window (see `run_decommission`'s doc
 /// comment) is only picked up here if a later change happens to re-rank
-/// it.
+/// it. (`earlier_rings` widens that to the changes of runs this one
+/// superseded before they finished, issue #1522; the return value says
+/// whether this run considered every key, i.e. was neither aborted nor
+/// cut short by shutdown.)
 ///
 /// Issue #295: a target this node has no membership token for (missing
 /// from `tokens`) is skipped exactly like a target with no address —
@@ -8979,16 +9047,17 @@ async fn spawn_or_supersede_rereplication(
 async fn run_rereplication(
     node_context: &NodeContext,
     before_ring: &HashRing,
+    earlier_rings: &[Arc<HashRing>],
     after_ring: &HashRing,
     replication: usize,
     addresses: &HashMap<String, String>,
     tokens: &HashMap<String, String>,
     abort_requested: &AtomicBool,
     shutdown_rx: &mut watch::Receiver<bool>,
-) {
+) -> bool {
     let Some(keys) = list_keys(&node_context.request_tx).await else {
         eprintln!("WARN re-replication: cache task is unavailable");
-        return;
+        return false;
     };
     // Issue #970: dead copies stay out of this handoff unless their marks are still held.
     let skip_dead = marks_released(&node_context.active_migration);
@@ -9040,8 +9109,9 @@ async fn run_rereplication(
             break;
         }
 
-        let targets = rereplication_targets(
+        let targets = rereplication_targets_since(
             before_ring,
+            earlier_rings,
             after_ring,
             hasher.hash(&key),
             replication,
@@ -9194,6 +9264,9 @@ async fn run_rereplication(
         owners_reached.len(),
         skipped
     );
+    // False when an abort or a shutdown cut the pass short, so a successor
+    // knows this run's ring change is not fully covered yet.
+    !abort_requested.load(Ordering::SeqCst) && !*shutdown_rx.borrow()
 }
 
 async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Key>> {
@@ -29226,6 +29299,7 @@ mod tests {
             run_rereplication(
                 &node_context,
                 &before_ring,
+                &[],
                 &after_ring,
                 replication,
                 &addresses,
@@ -29338,6 +29412,7 @@ mod tests {
                     run_rereplication(
                         &node_context,
                         &before_ring,
+                        &[],
                         &after_ring,
                         replication,
                         &addresses,
@@ -29448,6 +29523,7 @@ mod tests {
         run_rereplication(
             &node_context,
             &before_ring,
+            &[],
             &after_ring,
             replication,
             &addresses,
@@ -29664,6 +29740,7 @@ mod tests {
         *node_context.active_rereplication.lock().unwrap() = Some(Arc::new(ActiveRereplication {
             abort_requested: AtomicBool::new(false),
             done: AtomicBool::new(false),
+            unfinished_baselines: Mutex::default(),
         }));
         let abort_requested = AtomicBool::new(true);
 
@@ -29745,6 +29822,7 @@ mod tests {
         let previous = Arc::new(ActiveRereplication {
             abort_requested: AtomicBool::new(false),
             done: AtomicBool::new(false),
+            unfinished_baselines: Mutex::default(),
         });
         *node_context.active_rereplication.lock().unwrap() = Some(Arc::clone(&previous));
 
@@ -30791,6 +30869,168 @@ mod tests {
         drop(node_context);
         cache_task.await.unwrap();
     }
+    /// Issue #1522: a re-replication pass superseded by a second eviction
+    /// must not drop the keys the first eviction promoted new owners for
+    /// and the pass had not reached. Node `a` holds 400 keys at R=2; the
+    /// rings go [a,b,c,d] -> [a,b,c] -> [a,c]; the first pass is held at
+    /// its first send while the second starts, then released. Every
+    /// (target, key) pair either change promoted must have been sent by
+    /// the two passes together.
+    #[tokio::test(flavor = "current_thread")]
+    async fn superseded_rereplication_pass_still_covers_the_aborted_passes_ring_change() {
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap().to_string();
+        let addr_c = listener_c.local_addr().unwrap().to_string();
+        let (frames_b, peer_b) = spawn_recording_peer(listener_b);
+        let (frames_c, peer_c) = spawn_recording_peer(listener_c);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut node_context = test_node_context(
+            "a",
+            "tk-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        node_context.shutdown_rx = shutdown_rx.clone();
+
+        let replication = 2;
+        let ring_of = |names: &[&str]| {
+            Arc::new(HashRing::new(
+                names.iter().map(|name| name.to_string()).collect(),
+            ))
+        };
+        let first = ring_of(&["a", "b", "c", "d"]);
+        let second = ring_of(&["a", "b", "c"]);
+        let third = ring_of(&["a", "c"]);
+        let mut first_change: HashSet<(String, String)> = HashSet::new();
+        let mut both_changes: HashSet<(String, String)> = HashSet::new();
+        for index in 0..400u32 {
+            let name = format!("key-{index}");
+            let key = key(name.as_bytes());
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key.clone(),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+            let hash = KeyHash::of(&key);
+            // A target the second eviction removed has nothing left to
+            // receive its copy; only the final ring's members count.
+            for target in rereplication_targets(&first, &second, hash, replication, "a") {
+                if third.nodes().contains(&target) {
+                    first_change.insert((target.clone(), name.clone()));
+                    both_changes.insert((target, name.clone()));
+                }
+            }
+            for target in rereplication_targets(&second, &third, hash, replication, "a") {
+                both_changes.insert((target, name.clone()));
+            }
+        }
+        assert!(
+            both_changes.len() > first_change.len() && !first_change.is_empty(),
+            "both changes must promote owners"
+        );
+
+        let addresses: HashMap<String, String> = [
+            ("a", "127.0.0.1:2".to_string()),
+            ("b", addr_b),
+            ("c", addr_c),
+        ]
+        .into_iter()
+        .map(|(name, addr)| (name.to_string(), addr))
+        .collect();
+        let tokens: HashMap<String, String> = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| (name.to_string(), format!("tok-{name}")))
+            .collect();
+
+        // Held, the first pass connects and stops before its first send.
+        node_context.gates.pass.hold();
+        let first_pass = tokio::spawn(run_superseding_rereplication(
+            node_context.clone(),
+            Arc::clone(&first),
+            Arc::clone(&second),
+            replication,
+            addresses.clone(),
+            tokens.clone(),
+            shutdown_rx.clone(),
+        ));
+        let first_state = timeout(Duration::from_secs(30), async {
+            loop {
+                let installed = node_context.active_rereplication.lock().unwrap().clone();
+                if let Some(state) = installed {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first pass installs itself");
+        let second_pass = tokio::spawn(run_superseding_rereplication(
+            node_context.clone(),
+            Arc::clone(&second),
+            Arc::clone(&third),
+            replication,
+            addresses,
+            tokens,
+            shutdown_rx,
+        ));
+        // The second pass has asked the first to stop.
+        timeout(Duration::from_secs(30), async {
+            while !first_state.abort_requested.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second pass asks the first to stop");
+        node_context.gates.pass.release();
+        timeout(Duration::from_secs(30), async {
+            first_pass.await.unwrap();
+            second_pass.await.unwrap();
+        })
+        .await
+        .expect("both passes finish");
+
+        let mut sent: HashSet<(String, String)> = HashSet::new();
+        for (peer, frames) in [("b", &frames_b), ("c", &frames_c)] {
+            for frame in frames.lock().unwrap().iter() {
+                let header_end = frame.iter().position(|byte| *byte == b'\n').unwrap();
+                let header = String::from_utf8_lossy(&frame[..header_end]).into_owned();
+                // `U <ns-len> <key-len> <value-len> <token-len> ..`, body
+                // token, namespace, key, value.
+                let lengths: Vec<usize> = header
+                    .split(' ')
+                    .skip(1)
+                    .filter_map(|field| field.parse().ok())
+                    .collect();
+                let body = &frame[header_end + 1..];
+                let name_start = lengths[3] + lengths[0];
+                let name = &body[name_start..name_start + lengths[1]];
+                sent.insert((peer.to_string(), String::from_utf8_lossy(name).into_owned()));
+            }
+        }
+        let mut missing: Vec<_> = both_changes.difference(&sent).collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "{} of {} (target, key) pairs were never sent, e.g. {:?}",
+            missing.len(),
+            both_changes.len(),
+            &missing[..missing.len().min(5)]
+        );
+
+        peer_b.abort();
+        peer_c.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
 
     #[test]
     fn take_over_rereplication_slot_never_hands_the_same_previous_to_two_callers() {
@@ -30812,6 +31052,7 @@ mod tests {
                 Arc::new(ActiveRereplication {
                     abort_requested: AtomicBool::new(false),
                     done: AtomicBool::new(false),
+                    unfinished_baselines: Mutex::default(),
                 })
             })
             .collect();
