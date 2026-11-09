@@ -4988,8 +4988,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             else
             {
                 fresh.Close();
+                // Not sent: the request was never written, it only found
+                // its member gone (a refresh removed it while the redial
+                // ran). Marked so the non-idempotent paths refresh and
+                // reroute instead of reporting an outcome-unknown loss.
                 throw new ConnectionLostException(
-                    $"nanocached: {slot} left the cluster while reconnecting");
+                    $"nanocached: {slot} left the cluster while reconnecting", requestNotSent: true);
             }
         }
         return fresh;
@@ -5121,7 +5125,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             }
             if (!_members.TryGetValue(slot, out Member? member))
             {
-                throw new ConnectionLostException($"nanocached: {slot} has no open connection");
+                // Not sent: no connection was ever picked for this request.
+                // The ring still names a member a refresh in progress has
+                // already removed (RefreshNodeListAsync drops departed
+                // members first and swaps the ring only after dialing the
+                // new ones), and a non-idempotent op must read this as
+                // "refresh and reroute", not as a possibly-applied loss.
+                throw new ConnectionLostException(
+                    $"nanocached: {slot} has no open connection", requestNotSent: true);
             }
             return (slot, member.Address, member.Connection);
         }
