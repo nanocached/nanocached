@@ -5550,7 +5550,10 @@ async fn an_expiring_touch_reroutes_a_dead_primary_with_no_replica_touched() {
         assert!(stored(replica, key), "get={get}: the copy is still there");
 
         // Once the roster drops the primary the reroute reaches the replica
-        // as the new primary, and finds the value.
+        // as the new primary, and finds the value. The call above refreshed
+        // just now, so the next forced refresh waits out the minimum
+        // interval (issue #1580) before it can see the change.
+        tokio::time::sleep(Duration::from_millis(250)).await;
         shrink_roster_to(&discovery, &nodes, &owners[1]);
         if get {
             assert_eq!(
@@ -5702,6 +5705,9 @@ async fn an_expiring_batch_touch_reroutes_a_dead_primary_with_no_replica_touched
         assert!(multi_touch_frames(replica).is_empty(), "get={get}");
         assert!(keys.iter().all(|key| stored(replica, key)), "get={get}");
 
+        // The call above refreshed just now: wait out the minimum interval
+        // between forced refreshes (issue #1580).
+        tokio::time::sleep(Duration::from_millis(250)).await;
         shrink_roster_to(&discovery, &nodes, NAMES[1]);
         if get {
             assert_eq!(
@@ -9627,7 +9633,7 @@ async fn batched_set_retries_only_the_legs_that_failed_and_reports_an_unreachabl
 // ── forced refreshes are single-flight ────────────────────────────
 
 #[tokio::test]
-async fn concurrent_callers_on_a_dead_node_share_one_forced_refresh() {
+async fn concurrent_callers_on_a_dead_node_share_their_forced_refreshes() {
     // Four callers that find their node dead at the same time used to run
     // four full refreshes one after another behind the refresh gate, the
     // last caller waiting through all of them. (The existing coalescing
@@ -9657,16 +9663,21 @@ async fn concurrent_callers_on_a_dead_node_share_one_forced_refresh() {
     }
     for caller in callers {
         let elapsed = caller.await.unwrap();
+        // Two refreshes of 400 ms and the minimum interval between them;
+        // four serialized ones would be 1.6 s of refreshing alone.
         assert!(
-            elapsed < Duration::from_millis(1_000),
+            elapsed < Duration::from_millis(1_500),
             "a caller waited {elapsed:?} (serialized refreshes?)"
         );
     }
     discovery.l_delay_ms.store(0, Ordering::SeqCst);
+    // The first caller's refresh, then one follow-up shared by the three
+    // that queued behind it (that refresh began before their failure, so it
+    // is not theirs to reuse; issue #1580).
     assert_eq!(
         discovery.l_requests.load(Ordering::SeqCst) - before,
-        1,
-        "one shared refresh"
+        2,
+        "two shared refreshes"
     );
 
     client.close().await;
@@ -9674,6 +9685,100 @@ async fn concurrent_callers_on_a_dead_node_share_one_forced_refresh() {
     for (_, node) in nodes {
         node.stop();
     }
+}
+
+// ── forced refreshes: start time and minimum interval (issue #1580) ─
+
+/// A two-node cluster at R=1 whose first node is stopped but still listed
+/// by discovery (its liveness window), and a key it owns: every operation
+/// on that key fails and forces a refresh that installs the same roster.
+async fn dead_listed_primary() -> (
+    Vec<(String, MockNode)>,
+    MockDiscovery,
+    NanocachedClient,
+    String,
+) {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let key = (0..)
+        .map(|i| format!("dead-{i}"))
+        .find(|key| owners_of(key)[0] == NAMES[0])
+        .unwrap();
+    nodes[0].1.stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    (nodes, discovery, client, key)
+}
+
+#[tokio::test]
+async fn sequential_failures_against_a_dead_listed_primary_do_not_each_open_a_discovery_connection()
+{
+    let (nodes, discovery, client, key) = dead_listed_primary().await;
+    let before = discovery.l_requests.load(Ordering::SeqCst);
+
+    for _ in 0..40 {
+        assert!(client.set(&key, "v", 0).await.is_err());
+    }
+
+    // One refresh for the first failure; the rest fall inside the interval.
+    let fetches = discovery.l_requests.load(Ordering::SeqCst) - before;
+    assert!((1..=2).contains(&fetches), "{fetches} node-list fetches");
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn a_forced_refresh_runs_again_once_the_interval_has_passed() {
+    let (nodes, discovery, client, key) = dead_listed_primary().await;
+
+    assert!(client.set(&key, "v", 0).await.is_err());
+    let after_first = discovery.l_requests.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(client.set(&key, "v", 0).await.is_err());
+
+    assert_eq!(discovery.l_requests.load(Ordering::SeqCst), after_first + 1);
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn a_forced_refresh_does_not_reuse_one_that_began_before_its_failure() {
+    let (nodes, discovery, client, key) = dead_listed_primary().await;
+    // A healthy key, to start a staleness refresh that is still waiting on
+    // discovery's list when the write below fails.
+    let healthy = (0..)
+        .map(|i| format!("healthy-{i}"))
+        .find(|key| owners_of(key)[0] == NAMES[1])
+        .unwrap();
+    let before = discovery.l_requests.load(Ordering::SeqCst);
+
+    let default_stale_after = nanocached::NODE_LIST_STALE_AFTER_MS.load(Ordering::SeqCst);
+    nanocached::NODE_LIST_STALE_AFTER_MS.store(50, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await; // let the list go stale
+    discovery.l_delay_ms.store(600, Ordering::SeqCst);
+    let in_flight = {
+        let client = client.clone();
+        tokio::spawn(async move { client.get(&healthy).await })
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    nanocached::NODE_LIST_STALE_AFTER_MS.store(default_stale_after, Ordering::SeqCst);
+
+    let started = Instant::now();
+    assert!(client.set(&key, "v", 0).await.is_err());
+    let elapsed = started.elapsed();
+    in_flight.await.unwrap().unwrap();
+    discovery.l_delay_ms.store(0, Ordering::SeqCst);
+
+    // The staleness refresh, then a second one that began after the failure
+    // and after the interval that followed the first.
+    assert_eq!(discovery.l_requests.load(Ordering::SeqCst) - before, 2);
+    assert!(
+        elapsed >= Duration::from_millis(600 - 150 + 200),
+        "the follow-up refresh started too early: {elapsed:?}"
+    );
+
+    stop_cluster(client, nodes, discovery).await;
 }
 
 // ── a stalled replica costs one request timeout, not two ──────────
