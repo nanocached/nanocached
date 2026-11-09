@@ -1823,8 +1823,9 @@ export class NanocachedClient {
     // rejected outright, not silently forwarded just because DEFLATE
     // happens to shrink it under the cap. Re-checked after compression
     // too, purely as a defense-in-depth backstop should compressValue
-    // ever grow a value instead of shrinking it (encodeSet, reached
-    // through connection.set below, does that second check).
+    // ever grow a value by more than its marker byte (encodeSet, reached
+    // through connection.set below, does that second check, allowing the
+    // marker).
     checkKeyAndValue(keyBytes, valueBytes, namespace);
     const outgoing = this.compress ? compressValue(valueBytes, this.compressionThreshold) : valueBytes;
     return this.withWrongNodeRetry(() =>

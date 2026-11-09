@@ -86,11 +86,19 @@ describe("encodeSet", () => {
     assert.throws(() => encodeSet(Buffer.alloc(0), Buffer.from("v")), RangeError);
   });
 
-  it("rejects a key+value combination beyond MAX_REQUEST_BYTES synchronously", () => {
+  it("rejects a key+value combination beyond MAX_REQUEST_BYTES plus the compression marker byte synchronously", () => {
     assert.throws(
-      () => encodeSet(Buffer.alloc(MAX_REQUEST_BYTES), Buffer.from("x")),
+      () => encodeSet(Buffer.alloc(MAX_REQUEST_BYTES), Buffer.from("xx")),
       RangeError,
     );
+  });
+
+  it("accepts one byte over MAX_REQUEST_BYTES: the compression marker added to a value at the cap", () => {
+    // The size cap applies to the value before compression (the client checks
+    // it there), so a value exactly at the cap must still encode once
+    // `compress` has prefixed its marker byte.
+    assert.doesNotThrow(() => encodeSet(Buffer.alloc(MAX_REQUEST_BYTES - 1, "k"), Buffer.from("vv")));
+    assert.doesNotThrow(() => encodeSet(Buffer.alloc(MAX_REQUEST_BYTES), Buffer.from("x")));
   });
 
   it("accepts a key+value combination of exactly MAX_REQUEST_BYTES", () => {
@@ -339,8 +347,8 @@ describe("encodeCas (issue #141)", () => {
     assert.throws(() => encodeCas(Buffer.alloc(0), Buffer.from("v"), { kind: "absent" }), RangeError);
   });
 
-  it("rejects a key+value combination beyond MAX_REQUEST_BYTES synchronously", () => {
-    assert.throws(() => encodeCas(Buffer.alloc(MAX_REQUEST_BYTES), Buffer.from("x"), { kind: "absent" }), RangeError);
+  it("rejects a key+value combination beyond MAX_REQUEST_BYTES plus the compression marker byte synchronously", () => {
+    assert.throws(() => encodeCas(Buffer.alloc(MAX_REQUEST_BYTES), Buffer.from("xx"), { kind: "absent" }), RangeError);
   });
 
   it("rejects non-integer and negative TTLs synchronously", () => {
@@ -1129,13 +1137,14 @@ describe("namespaced encoders (first-class namespaces, issue #105)", () => {
     // ns-spec.md: "no limit on ns beyond the request size rules the SDK
     // already applies to key+value" — so namespace+key (encodeGet/
     // encodeDelete) and namespace+key+value (encodeSet) share the same
-    // budget the unnamespaced forms already enforce.
+    // budget the unnamespaced forms already enforce (encodeSet allows one
+    // more byte on top of it, for the compression marker).
     const namespace = Buffer.alloc(MAX_REQUEST_BYTES - 2, "n");
     assert.doesNotThrow(() => encodeGet(Buffer.from("ab"), undefined, namespace));
     assert.throws(() => encodeGet(Buffer.from("abc"), undefined, namespace), RangeError);
 
     const smallNamespace = Buffer.alloc(MAX_REQUEST_BYTES - 2, "n");
     assert.doesNotThrow(() => encodeSet(Buffer.from("a"), Buffer.from("b"), 0, undefined, smallNamespace));
-    assert.throws(() => encodeSet(Buffer.from("a"), Buffer.from("bc"), 0, undefined, smallNamespace), RangeError);
+    assert.throws(() => encodeSet(Buffer.from("a"), Buffer.from("bcd"), 0, undefined, smallNamespace), RangeError);
   });
 });
