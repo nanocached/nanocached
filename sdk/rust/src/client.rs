@@ -33,14 +33,11 @@ use crate::open_targets;
 
 /// How long, in milliseconds, the node list may go without a re-fetch from
 /// discovery before get/set/delete refreshes it first (checked lazily on
-/// use). Read fresh on every `maybe_refresh` call rather than once at
-/// connect, mirroring `connection::REQUEST_TIMEOUT_MS` —
-/// `#[doc(hidden)]` purely as a test hook so a single-flight-coalescing
-/// test can shrink the staleness window instead of waiting out the real
-/// 30s default; a test that lowers it should restore it immediately after
-/// the one check it means to affect.
-#[doc(hidden)]
-pub static NODE_LIST_STALE_AFTER_MS: AtomicU64 = AtomicU64::new(30_000);
+/// use). Each client starts with this and reads its own copy on every
+/// `maybe_refresh` call (`Inner::node_list_stale_after_ms`), so a test that
+/// shortens the window for one client (a `#[doc(hidden)]` test hook) does
+/// not change what the others, running concurrently, see.
+const NODE_LIST_STALE_AFTER_MS: u64 = 30_000;
 
 /// The shortest time between the end of one node-list refresh and the start
 /// of the next forced one. While discovery still lists a dead node every
@@ -1249,6 +1246,9 @@ struct Inner {
     /// dropped before it finishes puts back what was here before it began
     /// (`RefreshStarted`). Never held across an await.
     last_refresh_started: std::sync::Mutex<Option<Instant>>,
+    /// How long the node list may go without a re-fetch before an
+    /// operation refreshes it first; starts at `NODE_LIST_STALE_AFTER_MS`.
+    node_list_stale_after_ms: AtomicU64,
 }
 
 /// Records the start of a node-list refresh in `Inner::last_refresh_started`
@@ -1897,6 +1897,7 @@ impl NanocachedClient {
             via_proxy: options.via_proxy,
             request_timeout,
             last_refresh_started: std::sync::Mutex::new(None),
+            node_list_stale_after_ms: AtomicU64::new(NODE_LIST_STALE_AFTER_MS),
         });
 
         // Keep-alive is always on, with an internal interval (issue #27):
@@ -2132,6 +2133,17 @@ impl NanocachedClient {
     #[doc(hidden)]
     pub fn hedge_order_for_test(&self, owners: Vec<String>) -> Vec<String> {
         self.inner.late_hedge.demote(owners)
+    }
+
+    /// Sets how long the node list may go without a re-fetch before an
+    /// operation on this client refreshes it first (30 s by default).
+    /// Public-but-hidden purely as a test hook; it affects this client only.
+    #[cfg(feature = "__test_hooks")]
+    #[doc(hidden)]
+    pub fn set_node_list_stale_after_ms_for_test(&self, ms: u64) {
+        self.inner
+            .node_list_stale_after_ms
+            .store(ms, Ordering::SeqCst);
     }
 
     /// Number of per-address reconnect-cooldown entries currently held
@@ -2903,9 +2915,8 @@ impl NanocachedClient {
             start += len;
             // Set when `op` itself failed with `Error::Protocol`: a reply
             // that could not be parsed, which only a written frame gets. A
-            // `Protocol` that did not come from `op` is the dial's (an
-            // address that no longer identifies as a node): nothing was
-            // sent.
+            // `Protocol` that did not come from `op` is the dial's (a
+            // handshake that could not be parsed): nothing was sent.
             let bad_reply = AtomicBool::new(false);
             let op = |connection: Arc<Connection>| {
                 let bad_reply = &bad_reply;
@@ -5574,8 +5585,12 @@ impl NanocachedClient {
             // single-node target, a cluster member, or — proxy mode,
             // issue #122 — the one proxy this client is pinned to): any
             // other answer means it stopped being a cache node underneath
-            // this client, same treatment either way.
-            Identified::Cluster { .. } | Identified::Proxies { .. } => Err(Error::Protocol(
+            // this client, same treatment either way. It is the dial's
+            // failure, nothing was written: `ConnectionLost` (not
+            // `Protocol`), so `with_cluster_retry` refreshes the node list
+            // and reroutes, and a reconnect-cooldown entry made from it
+            // fails the next operation the same way.
+            Identified::Cluster { .. } | Identified::Proxies { .. } => Err(Error::ConnectionLost(
                 format!("nanocached: {address} no longer identifies as a cache node"),
             )),
         }
@@ -5601,7 +5616,9 @@ impl NanocachedClient {
             }
             if !force
                 && state.last_fetch.elapsed()
-                    < Duration::from_millis(NODE_LIST_STALE_AFTER_MS.load(Ordering::SeqCst))
+                    < Duration::from_millis(
+                        self.inner.node_list_stale_after_ms.load(Ordering::SeqCst),
+                    )
             {
                 return;
             }
@@ -5637,7 +5654,9 @@ impl NanocachedClient {
             let state = self.inner.state.lock().await;
             if !force
                 && state.last_fetch.elapsed()
-                    < Duration::from_millis(NODE_LIST_STALE_AFTER_MS.load(Ordering::SeqCst))
+                    < Duration::from_millis(
+                        self.inner.node_list_stale_after_ms.load(Ordering::SeqCst),
+                    )
             {
                 // Someone else refreshed while we were waiting for the gate.
                 return;
