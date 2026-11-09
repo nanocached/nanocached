@@ -1727,12 +1727,48 @@ internal static class Wire
     internal static Task WriteAsync(Stream stream, string text) =>
         stream.WriteAsync(Encoding.ASCII.GetBytes(text)).AsTask();
 
-    internal static int UnusedPort()
+    private static readonly object DeadPortLock = new();
+    private static readonly HashSet<int> HandedOutPorts = new();
+    private static int nextDeadPort = 20000;
+
+    /// <summary>
+    /// A loopback port nothing in this process will listen on: the address
+    /// of a dead node, or of one the test itself revives later.
+    ///
+    /// Taken from 20000-20999, below the range listen(0) draws from (Linux
+    /// 32768-60999, macOS 49152-65535). A bound-and-released port 0 is not
+    /// enough: xUnit runs test classes in parallel and every mock listens on
+    /// port 0, so a mock another test starts can land on the released port
+    /// before this test dials it, and the "dead" address then answers as a
+    /// live discovery server or node (CI once failed
+    /// RefreshPurgesCooldownsForDepartedAddresses with "no longer
+    /// identifies as a cache node"). Each candidate is bind-probed
+    /// (something else on the machine may hold it) and recorded, so two
+    /// calls in one run never return the same port.
+    /// </summary>
+    internal static int DeadNodePort()
     {
-        var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
-        return port;
+        lock (DeadPortLock)
+        {
+            for (int tried = 0; tried < 1000; tried++)
+            {
+                int candidate = nextDeadPort;
+                nextDeadPort = candidate == 20999 ? 20000 : candidate + 1;
+                if (HandedOutPorts.Contains(candidate)) continue;
+                var listener = new TcpListener(IPAddress.Loopback, candidate);
+                try
+                {
+                    listener.Start();
+                }
+                catch (SocketException)
+                {
+                    continue;
+                }
+                listener.Stop();
+                HandedOutPorts.Add(candidate);
+                return candidate;
+            }
+        }
+        throw new InvalidOperationException("no free port in 20000-20999 for a dead mock node");
     }
 }
