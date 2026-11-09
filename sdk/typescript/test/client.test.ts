@@ -1817,6 +1817,64 @@ describe("unsolicited response with nothing pending (issue #1177)", () => {
   });
 });
 
+describe("Connection.close() marks the connection closed synchronously (issue #1614)", () => {
+  async function withServer(run: (port: number, received: () => number) => Promise<void>): Promise<void> {
+    const serverSockets: Socket[] = [];
+    let bytes = 0;
+    const server = createServer((socket) => {
+      serverSockets.push(socket);
+      socket.on("data", (chunk) => {
+        bytes += chunk.length;
+      });
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      await run((server.address() as import("node:net").AddressInfo).port, () => bytes);
+    } finally {
+      for (const socket of serverSockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
+
+  async function open(port: number): Promise<Connection> {
+    const { connect } = await import("node:net");
+    const socket = connect(port, "127.0.0.1");
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    return new Connection(socket);
+  }
+
+  it("a request issued in the same tick is rejected as never sent", async () => {
+    await withServer(async (port, received) => {
+      const connection = await open(port);
+      connection.close();
+      assert.equal(connection.isClosed(), true);
+      await assert.rejects(connection.get("k"), (error: unknown) => {
+        assert.ok(error instanceof ConnectionLostError);
+        assert.equal(error.requestWasSent, false);
+        return true;
+      });
+      await delay(20);
+      assert.equal(received(), 0, "nothing may reach the server");
+    });
+  });
+
+  it("a request already written when close() runs is still reported as sent", async () => {
+    await withServer(async (port, received) => {
+      const connection = await open(port);
+      const pending = connection.get("k");
+      pending.catch(() => {});
+      await waitFor(() => received() > 0, "the request to reach the server");
+      connection.close();
+      await assert.rejects(pending, (error: unknown) => {
+        assert.ok(error instanceof ConnectionLostError);
+        assert.equal(error.requestWasSent, true);
+        return true;
+      });
+    });
+  });
+});
+
 describe("onData's fatal paths route through poison() (issue #187)", () => {
   it("a malformed response marks the connection closed synchronously, before the 'close' event", async () => {
     // Regression: onData's response-parse-failure branch called
