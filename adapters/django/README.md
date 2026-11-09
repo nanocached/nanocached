@@ -301,8 +301,9 @@ A namespace, key and value together must fit in one request: 1 MiB
 minus a 256-byte header, 1,048,320 bytes. A `set`/`add`/`set_many` entry
 over that size raises the SDK's `ValueError` before anything is sent,
 and nothing is written. The value is measured after pickling (or as the
-decimal digits of an `int`), and after compression when
-`OPTIONS.COMPRESS` is on.
+decimal digits of an `int`) and before compression, so with
+`OPTIONS.COMPRESS` on a value over the limit is still rejected, even if it
+would compress to less.
 
 ## Stored format
 
