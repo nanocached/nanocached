@@ -48,7 +48,7 @@ docker stop -t 30 $P-p1 >/dev/null &
 STOP=$!
 # how fast does Q drop the leaver?
 while :; do c=$(proxies 2>/dev/null | head -1 | sed -n 's/count=\([0-9]*\).*/\1/p'); [ "$c" = 1 ] && break
-  [ $(( ($(date +%s%N)-t0)/1000000000 )) -gt 30 ] && { T "TIMEOUT: Q still lists $c proxies"; break; }; sleep 0.3; done
+  [ $(( ($(date +%s%N)-t0)/1000000000 )) -gt 30 ] && { T "FAIL: Q still lists ${c:-?} proxies 30s after the SIGTERM (want 1: the immediate Z deregistration)"; fail=1; break; }; sleep 0.3; done
 T "Q roster at 1 after $(( ($(date +%s%N)-t0)/1000000 ))ms"
 wait $STOP
 rc=$(docker inspect -f '{{.State.ExitCode}}' $P-p1)
@@ -65,5 +65,6 @@ echo "=== discovery"; docker logs $P-disc 2>&1 | grep -i "proxy\|warn\|error" | 
 [ "$rc" = 0 ] || { echo "FAIL: proxy exit code $rc"; fail=1; }
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { echo "FAIL: post-drain verify not clean"; fail=1; }
 echo "$load" | grep -q '"corrupt": 0' || { echo "FAIL: load saw corrupt reads"; fail=1; }
+ops=$(load_ops "$load"); [ "${ops:-0}" -ge $(( LOAD_SECS * ${MIN_OPS_S:-10} )) ] || { echo "FAIL: load completed only ${ops:-0} ops in ${LOAD_SECS}s (want >= ${MIN_OPS_S:-10}/s: it did not run for the whole scenario)"; fail=1; }
 cleanup
 if [ $fail = 0 ]; then T "DONE (PASS)"; else T "DONE (FAIL)"; exit 1; fi

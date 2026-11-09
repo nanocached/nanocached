@@ -7,7 +7,12 @@ ap.add_argument("--keyspace",type=int,default=10000); ap.add_argument("--value-s
 ap.add_argument("--think",type=float,default=0.0); ap.add_argument("--reconnect-on-error",action="store_true"); ap.add_argument("--report-every",type=float,default=30)
 ap.add_argument("--label",default="load"); ap.add_argument("--hedge",type=float,default=0.0); ap.add_argument("--via-proxy",action="store_true")
 a=ap.parse_args(); addrs=[(x.rsplit(":",1)[0], int(x.rsplit(":",1)[1])) for x in a.addr.split(",")]
-val=("x"*a.value_size).encode()
+def val(k):
+    # Same bytes as verify.py's val(): the value encodes its key, so a read that
+    # returns another key's value (or a truncated/garbled one) differs from the
+    # expected bytes, and keys seeded by `verify.py seed --size <value-size>`
+    # already hold exactly this value.
+    return (f"{k}|1|"+"x"*a.value_size).encode()[:max(a.value_size,10)]
 res=dict(ops=0,get=0,set=0,miss=0,corrupt=0,err_total=0,errors=collections.Counter(),lat=[],samples=[],sdk_stats=[])
 async def worker(idx):
     kw={}
@@ -22,8 +27,9 @@ async def worker(idx):
                 if random.random()<a.get_ratio:
                     v=await c.get_bytes(k); res["get"]+=1
                     if v is None: res["miss"]+=1
+                    elif v!=val(k): res["corrupt"]+=1
                 else:
-                    await c.set(k,val); res["set"]+=1
+                    await c.set(k,val(k)); res["set"]+=1
                 res["ops"]+=1
             except Exception as e:
                 res["err_total"]+=1; res["errors"][type(e).__name__]+=1
