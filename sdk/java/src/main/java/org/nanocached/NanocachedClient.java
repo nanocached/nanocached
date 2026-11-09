@@ -6589,22 +6589,19 @@ public final class NanocachedClient implements AutoCloseable {
                 // isn't worth a warning on every refresh. Counted via
                 // stats().refreshFailures instead.
                 refreshFailures.incrementAndGet();
-                if (outcome.hard) {
-                    // An unparseable address, or one that is not a cache
-                    // node: nothing a later redial could fix, so it stays
-                    // out of the ring (as before) rather than becoming a
-                    // member whose redial throws a non-failover error.
-                    continue;
-                }
                 // Install the just-discovered node without a connection and
                 // arm its cooldown instead of leaving it out of the ring
                 // (issue #67, matching openCluster and the Go/Rust/.NET/
                 // Python/TS SDKs): the ring ranks by the full candidate set,
-                // so dropping a new node on a transient dial failure would
-                // make this client's primary/replica choice for keys near it
-                // disagree with every peer that did reach it until the next
-                // refresh (extra W answers and refreshes); kept, its keys
-                // fail over per request and its next use redials it.
+                // so dropping a new node on a failed dial would make this
+                // client's primary/replica choice for keys near it disagree
+                // with every peer that did reach it until the next refresh
+                // (extra W answers and refreshes); kept, its keys fail over
+                // per request and its next use redials it. A hard failure
+                // (an unparseable address, or one that is not a cache node)
+                // is kept the same way, holding its own error in the
+                // cooldown: every peer ranks the node whatever its address
+                // turns out to be, and discovery dropping it ends it.
                 members.put(node.name(), new Member(node.address(), null));
                 // A dial skipped by dialRefreshNode comes back carrying the
                 // error that armed the cooldown; re-arming it would only

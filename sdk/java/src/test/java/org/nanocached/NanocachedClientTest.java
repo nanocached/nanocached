@@ -8039,6 +8039,59 @@ class NanocachedClientTest {
         }
     }
 
+    @Test
+    void refreshKeepsANewNodeWithAHardDialFailureInTheRingHoldingItsError() throws Exception {
+        // A newly listed node whose address cannot be dialed at all (an
+        // unparseable one, or one that is not a cache node) was skipped, so
+        // the ring was rebuilt without it and this client ranked the keys
+        // near it differently from every other client. It is now a member
+        // without a connection whose cooldown holds the hard error, like a
+        // node whose dial failed softly.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String notACacheNode = "127.0.0.1:" + cluster.discovery().port();
+                List<DiscoveredNode> roster = new ArrayList<>(cluster.discovery().nodes);
+                roster.add(new DiscoveredNode("bad-address", "no-port-here"));
+                roster.add(new DiscoveredNode("not-a-node", notACacheNode));
+                cluster.discovery().nodes = roster;
+
+                forceRefresh(client);
+
+                Field membersField = NanocachedClient.class.getDeclaredField("members");
+                membersField.setAccessible(true);
+                Map<?, ?> members = (Map<?, ?>) membersField.get(client);
+                for (String name : List.of("bad-address", "not-a-node")) {
+                    assertTrue(members.containsKey(name), name + " must stay a member");
+                    assertNull(memberConnectionOf(client, name));
+                }
+
+                Field ringField = NanocachedClient.class.getDeclaredField("ring");
+                ringField.setAccessible(true);
+                HashRing ring = (HashRing) ringField.get(client);
+                List<String> owners = ring.owners("some-key".getBytes(StandardCharsets.UTF_8), 5);
+                assertTrue(owners.contains("bad-address") && owners.contains("not-a-node"),
+                        "the ring must be built with both nodes, like every peer's: " + owners);
+
+                Field cooldownsField = NanocachedClient.class.getDeclaredField("reconnectCooldowns");
+                cooldownsField.setAccessible(true);
+                Map<?, ?> cooldowns = (Map<?, ?>) cooldownsField.get(client);
+                assertTrue(cooldowns.containsKey("no-port-here"), "the unparseable address has its cooldown armed");
+                assertTrue(cooldowns.containsKey(notACacheNode), "the non-node address has its cooldown armed");
+                assertEquals(2, client.stats().refreshFailures());
+
+                // The next use of such a node surfaces the error the dial
+                // produced, without dialing again inside the cooldown.
+                Method memberConnection = NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
+                memberConnection.setAccessible(true);
+                java.lang.reflect.InvocationTargetException failure = assertThrows(
+                        java.lang.reflect.InvocationTargetException.class,
+                        () -> memberConnection.invoke(client, "bad-address"));
+                assertTrue(failure.getCause().getMessage().contains("invalid node address"),
+                        failure.getCause().getMessage());
+            }
+        }
+    }
+
     private static void forceRefresh(NanocachedClient client) throws Exception {
         Method refreshNodeList = NanocachedClient.class.getDeclaredMethod("refreshNodeList");
         refreshNodeList.setAccessible(true);
