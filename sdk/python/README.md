@@ -274,8 +274,11 @@ raise `WrongNodeError` from `touch_many` and `PartialWrongNodeError`, with
 the keys that did resolve in `partial_values`, from `get_many_and_touch`. A
 primary that cannot be reached on both passes raises its connection error
 (`PartialConnectionLostError` with `partial_values` for
-`get_many_and_touch`, when some keys did resolve). A touch is idempotent, so
-a failed `touch_many` can simply be sent again. Both raise `ServerTooOldError`
+`get_many_and_touch`, when some keys did resolve). With `ttl_seconds=0` a frame
+whose connection was lost after it was written is not resent (the node may
+have expired the keys already), so only that frame's keys count as lost; the
+frames of the same batch that had not been sent yet still go out. A touch is
+idempotent, so a failed `touch_many` can simply be sent again. Both raise `ServerTooOldError`
 against a node that has `t` but not `y`; in a cluster, when other primaries
 had already answered, `get_many_and_touch` raises its subclass
 `PartialServerTooOldError` with their hits in `partial_values` (with

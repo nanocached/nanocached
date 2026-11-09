@@ -3510,6 +3510,50 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
+    async def test_an_expiring_batch_retries_the_chunks_after_the_one_lost_mid_batch(self):
+        # Issue #1600: with ttl 0 a connection lost after a chunk's frame
+        # was written makes only that chunk's keys lost. 1,200 keys on one
+        # primary are three `y` frames and the node drops the connection on
+        # the second; the third was never sent, so it goes out in the retry
+        # pass and only the second chunk's 400 keys are reported.
+        from nanocached._client import _MAX_BATCH_KEYS
+
+        for get in (False, True):
+            with self.subTest(get=get):
+                nodes, discovery = await self.start_cluster(replication=1)
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    primary = nodes[NAMES[0]]
+                    keys = self.keys_by_primary(NAMES[0], 3 * _MAX_BATCH_KEYS, "lostmid")
+                    values = {key: f"v-{key}" for key in keys}
+                    await client.set_many(values)
+                    primary.multi_touch_frames.clear()
+                    primary.fail_multi_touch_after(1)  # chunk 1 answered, chunk 2 dropped
+                    if get:
+                        # The hits of the chunks that did resolve ride along.
+                        lost = set(keys[_MAX_BATCH_KEYS : 2 * _MAX_BATCH_KEYS])
+                        with self.assertRaises(PartialConnectionLostError) as raised:
+                            await client.get_many_and_touch(keys, 0)
+                        self.assertIn("400 of 1200 keys", str(raised.exception))
+                        self.assertEqual(
+                            raised.exception.partial_values,
+                            {key: values[key] for key in keys if key not in lost},
+                        )
+                    else:
+                        with self.assertRaises(ConnectionLostError):
+                            await client.touch_many(keys, 0)
+                    frames = primary.multi_touch_frames
+                    self.assertEqual(
+                        [len(f[1]) for f in frames],
+                        [_MAX_BATCH_KEYS] * 3,
+                        "chunk 1, the lost chunk 2, then the never-sent chunk 3 in the retry pass",
+                    )
+                    self.assertEqual(
+                        frames[2][1], [k.encode() for k in keys[2 * _MAX_BATCH_KEYS :]]
+                    )
+                finally:
+                    await self.stop(client, discovery, nodes)
+
     async def test_a_batch_touch_is_scoped_to_its_namespace_in_a_cluster(self):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
