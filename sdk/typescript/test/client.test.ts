@@ -1591,6 +1591,34 @@ describe("a forced node-list refresh and one already in flight (issue #1227)", (
   });
 });
 
+describe("the reconnect cooldown map follows the roster (issue #1547)", () => {
+  it("a refresh drops a cooldown for an address that is no longer listed, whenever the entry was written", async () => {
+    const node = await startMockNode();
+    const discovery = await startMockDiscovery([{ name: "n1", address: node.address }]);
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        const cooldowns = (client as any).reconnectCooldowns as Map<string, { until: number; error: Error }>;
+        // What a redial that loses the race with a refresh leaves behind: its
+        // member was removed (and its cleanup run) before it failed, so it
+        // writes the cooldown for an address no roster lists any more.
+        const departed = "127.0.0.1:9";
+        cooldowns.set(departed, { until: Date.now() + 60_000, error: new Error("connect timed out") });
+        cooldowns.set(node.address, { until: Date.now() + 60_000, error: new Error("still listed") });
+
+        await (client as any).maybeRefreshNodeList({ force: true });
+
+        assert.equal(cooldowns.has(departed), false, "the departed address's cooldown must be pruned");
+        assert.equal(cooldowns.has(node.address), true, "a listed address keeps its cooldown");
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), node.close()]);
+    }
+  });
+});
+
 describe("a redial finishing after close() (issue #1216)", () => {
   // close() only closes the connections installed when it runs, so a redial
   // that resolves after close() must not install its result. The race is a
