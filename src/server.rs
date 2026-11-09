@@ -6639,8 +6639,9 @@ struct ActiveRereplication {
     /// aborted before they had considered every key. Emptied once the run
     /// has considered every key, so a successor starts from its own ring
     /// only; left as is when the run is aborted, for the successor to pick
-    /// up (issue #1522).
-    unfinished_baselines: Mutex<Vec<Arc<HashRing>>>,
+    /// up (issue #1522). Bounded and free of repeats: see
+    /// `fold_unfinished_baselines` (issue #1606).
+    unfinished_baselines: Mutex<Vec<RereplicationBaseline>>,
 }
 
 /// Occupies `slot` with an `ActiveMigration` for this guard's lifetime
@@ -8890,24 +8891,140 @@ fn rereplication_targets(
         .collect()
 }
 
-/// `rereplication_targets` for a pass that also owes the changes of the
-/// runs it superseded (issue #1522): the owners promoted by any of the
-/// `earlier` rings' changes to `after`, together with those of `before`'s.
-/// Each ring is diffed against `after` separately because the sender
-/// condition is per ring — a node promoted by the first change into a
+/// A ring a re-replication pass still owes a heal from (issue #1522): the
+/// ring an aborted run's change started from, or the fold of several such
+/// rings (issue #1606).
+#[derive(Clone)]
+struct RereplicationBaseline {
+    ring: Arc<HashRing>,
+    /// Set on a fold of several baselines. The sender condition is still
+    /// `ring`'s, but the targets are every other owner of the key under the
+    /// final ring rather than the ones `ring` lacks: the targets of the
+    /// folded baselines cannot be told from one ring, and the owners that
+    /// already hold the key take the repeat as a no-op (put-if-absent).
+    every_other_owner: bool,
+}
+
+impl RereplicationBaseline {
+    fn plain(ring: Arc<HashRing>) -> Self {
+        Self {
+            ring,
+            every_other_owner: false,
+        }
+    }
+
+    /// The member names, sorted: two baselines with the same ones rank
+    /// every key alike.
+    fn sorted_members(&self) -> Vec<&str> {
+        let mut members: Vec<&str> = self.ring.nodes().iter().map(String::as_str).collect();
+        members.sort_unstable();
+        members
+    }
+}
+
+/// The most baselines a pass heals from at once. Each costs a
+/// `is_owner_hashed` and an `owners_hashed` per key, and holds its ring.
+const MAX_UNFINISHED_BASELINES: usize = 8;
+
+/// Issue #1606: bounds the baselines a pass takes over from the runs it
+/// superseded, oldest first, `own` (this pass's starting ring) last. A run of
+/// ring changes faster than the passes complete otherwise left every pass
+/// one baseline longer, so each was slower than the one it replaced and less
+/// likely to finish.
+///
+/// Baselines with the same member set rank every key alike and are kept
+/// once (the folded one when only one of them is). Beyond
+/// `MAX_UNFINISHED_BASELINES` the two oldest are folded into one:
+/// `every_other_owner`, over the rings' common members plus this node. The
+/// sender condition of the fold holds wherever it held for either ring (a
+/// ring with fewer members only ever ranks a surviving member higher), and
+/// its targets are all the other owners, a superset of both rings'. What it
+/// costs is traffic: a key may go to an owner that already has it, and a key
+/// this node holds but owned under none of the folded rings may go out as
+/// well.
+fn fold_unfinished_baselines(
+    baselines: Vec<RereplicationBaseline>,
+    self_name: &str,
+) -> Vec<RereplicationBaseline> {
+    fn dedup(baselines: Vec<RereplicationBaseline>) -> Vec<RereplicationBaseline> {
+        let mut at: HashMap<Vec<String>, usize> = HashMap::with_capacity(baselines.len());
+        let mut kept: Vec<RereplicationBaseline> = Vec::with_capacity(baselines.len());
+        for baseline in baselines {
+            let members: Vec<String> = baseline
+                .sorted_members()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            match at.get(&members) {
+                Some(&index) => kept[index].every_other_owner |= baseline.every_other_owner,
+                None => {
+                    at.insert(members, kept.len());
+                    kept.push(baseline);
+                }
+            }
+        }
+        kept
+    }
+
+    let mut baselines = dedup(baselines);
+    while baselines.len() > MAX_UNFINISHED_BASELINES {
+        let newer = baselines.remove(1);
+        let older = baselines.remove(0);
+        let newer_members = newer.sorted_members();
+        let mut members: Vec<String> = older
+            .sorted_members()
+            .into_iter()
+            .filter(|member| newer_members.binary_search(member).is_ok() || *member == self_name)
+            .map(str::to_string)
+            .collect();
+        if !members.iter().any(|member| member == self_name) {
+            members.push(self_name.to_string());
+        }
+        baselines.insert(
+            0,
+            RereplicationBaseline {
+                ring: Arc::new(HashRing::new(members)),
+                every_other_owner: true,
+            },
+        );
+        baselines = dedup(baselines);
+    }
+    baselines
+}
+
+/// `rereplication_targets` for a pass that owes the changes of several
+/// baselines (issue #1522): the owners promoted to `after` by any of their
+/// changes. Each ring is diffed against `after` separately because the
+/// sender condition is per ring — a node promoted by the first change into a
 /// key's top-R was not an owner under the first ring but is the one that
 /// holds the key for the second.
 fn rereplication_targets_since(
-    before: &HashRing,
-    earlier: &[Arc<HashRing>],
+    baselines: &[RereplicationBaseline],
     after: &HashRing,
     key_hash: KeyHash,
     replication: usize,
     self_name: &str,
 ) -> Vec<String> {
-    let mut targets = rereplication_targets(before, after, key_hash, replication, self_name);
-    for ring in earlier {
-        for target in rereplication_targets(ring, after, key_hash, replication, self_name) {
+    let mut targets: Vec<String> = Vec::new();
+    for baseline in baselines {
+        let more = if baseline.every_other_owner {
+            if !baseline
+                .ring
+                .is_owner_hashed(key_hash, self_name, replication)
+                || !after.nodes().iter().any(|node| node.as_str() == self_name)
+            {
+                continue;
+            }
+            after
+                .owners_hashed(key_hash, replication)
+                .into_iter()
+                .filter(|owner| *owner != self_name)
+                .map(str::to_string)
+                .collect()
+        } else {
+            rereplication_targets(&baseline.ring, after, key_hash, replication, self_name)
+        };
+        for target in more {
             if !targets.contains(&target) {
                 targets.push(target);
             }
@@ -8994,14 +9111,15 @@ async fn run_superseding_rereplication(
     let state = Arc::new(ActiveRereplication {
         abort_requested: AtomicBool::new(false),
         done: AtomicBool::new(false),
-        unfinished_baselines: Mutex::new(vec![Arc::clone(&before_ring)]),
+        unfinished_baselines: Mutex::new(vec![RereplicationBaseline::plain(Arc::clone(
+            &before_ring,
+        ))]),
     });
     let previous = take_over_rereplication_slot(&node_context.active_rereplication, &state);
     // Issue #1522: the rings the aborted run had not finished from, so
     // the keys its change promoted new owners for, and it had not reached,
     // are still covered. The sends are put-if-absent: a key the aborted
     // run did deliver is harmless to send again.
-    let mut earlier_rings: Vec<Arc<HashRing>> = Vec::new();
     if let Some(previous) = previous {
         previous.abort_requested.store(true, Ordering::SeqCst);
         // Issue #498: bounded by the deadline *and* by shutdown — see
@@ -9025,7 +9143,7 @@ async fn run_superseding_rereplication(
                 }
             }
         }
-        earlier_rings = previous
+        let mut baselines = previous
             .unfinished_baselines
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -9034,8 +9152,14 @@ async fn run_superseding_rereplication(
             .unfinished_baselines
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        own.splice(0..0, earlier_rings.iter().cloned());
+        baselines.extend(own.iter().cloned());
+        *own = fold_unfinished_baselines(baselines, &node_context.name);
     }
+    let baselines = state
+        .unfinished_baselines
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
 
     // The forwarding window opens with the pass — a later ring change's
     // pass replaces it with its own, newer, snapshot.
@@ -9055,8 +9179,7 @@ async fn run_superseding_rereplication(
 
     let completed = run_rereplication(
         &node_context,
-        &before_ring,
-        &earlier_rings,
+        &baselines,
         &after_ring,
         replication,
         &addresses,
@@ -9171,10 +9294,11 @@ async fn spawn_or_supersede_rereplication(
 /// still present in both rings is mid-decommission. A key left below R
 /// by an earlier, unrelated window (see `run_decommission`'s doc
 /// comment) is only picked up here if a later change happens to re-rank
-/// it. (`earlier_rings` widens that to the changes of runs this one
-/// superseded before they finished, issue #1522; the return value says
-/// whether this run considered every key, i.e. was neither aborted nor
-/// cut short by shutdown.)
+/// it. (`baselines` are this run's own starting ring and, widening that
+/// to the changes of runs this one superseded before they finished (issue
+/// #1522), theirs, bounded by `fold_unfinished_baselines` (issue #1606);
+/// the return value says whether this run considered every key, i.e. was
+/// neither aborted nor cut short by shutdown.)
 ///
 /// Issue #295: a target this node has no membership token for (missing
 /// from `tokens`) is skipped exactly like a target with no address —
@@ -9187,8 +9311,7 @@ async fn spawn_or_supersede_rereplication(
 #[allow(clippy::too_many_arguments)]
 async fn run_rereplication(
     node_context: &NodeContext,
-    before_ring: &HashRing,
-    earlier_rings: &[Arc<HashRing>],
+    baselines: &[RereplicationBaseline],
     after_ring: &HashRing,
     replication: usize,
     addresses: &HashMap<String, String>,
@@ -9251,8 +9374,7 @@ async fn run_rereplication(
         }
 
         let targets = rereplication_targets_since(
-            before_ring,
-            earlier_rings,
+            baselines,
             after_ring,
             hasher.hash(&key),
             replication,
@@ -29694,8 +29816,7 @@ mod tests {
             let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
             run_rereplication(
                 &node_context,
-                &before_ring,
-                &[],
+                &plain_baselines(&before_ring),
                 &after_ring,
                 replication,
                 &addresses,
@@ -29807,8 +29928,7 @@ mod tests {
                 async move {
                     run_rereplication(
                         &node_context,
-                        &before_ring,
-                        &[],
+                        &plain_baselines(&before_ring),
                         &after_ring,
                         replication,
                         &addresses,
@@ -29918,8 +30038,7 @@ mod tests {
 
         run_rereplication(
             &node_context,
-            &before_ring,
-            &[],
+            &plain_baselines(&before_ring),
             &after_ring,
             replication,
             &addresses,
@@ -30013,8 +30132,7 @@ mod tests {
 
         run_rereplication(
             &node_context,
-            &before_ring,
-            &[],
+            &plain_baselines(&before_ring),
             &after_ring,
             replication,
             &addresses,
@@ -30353,6 +30471,13 @@ mod tests {
             node_context.active_rereplication.lock().unwrap().is_none(),
             "the run still owns the slot and must clear it on the way out"
         );
+    }
+
+    /// `ring` as the one plain baseline of a pass.
+    fn plain_baselines(ring: &HashRing) -> Vec<RereplicationBaseline> {
+        vec![RereplicationBaseline::plain(Arc::new(HashRing::new(
+            ring.nodes().to_vec(),
+        )))]
     }
 
     fn member_names(known_ring: &KnownRing) -> Option<(Vec<String>, usize)> {
@@ -31521,6 +31646,221 @@ mod tests {
 
         peer_b.abort();
         peer_c.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    fn ring_of_members(names: &[&str]) -> Arc<HashRing> {
+        Arc::new(HashRing::new(
+            names.iter().map(|name| name.to_string()).collect(),
+        ))
+    }
+
+    /// Issue #1606: a long run of aborted passes keeps a bounded list, with
+    /// baselines of the same member set kept once.
+    #[test]
+    fn unfinished_baselines_are_deduplicated_and_bounded() {
+        // The same member set, in another order, is the same ring.
+        let folded = fold_unfinished_baselines(
+            vec![
+                RereplicationBaseline::plain(ring_of_members(&["a", "b", "c"])),
+                RereplicationBaseline::plain(ring_of_members(&["c", "a"])),
+                RereplicationBaseline::plain(ring_of_members(&["c", "b", "a"])),
+                RereplicationBaseline::plain(ring_of_members(&["a", "c"])),
+            ],
+            "a",
+        );
+        assert_eq!(folded.len(), 2);
+        assert!(folded.iter().all(|baseline| !baseline.every_other_owner));
+
+        // Flapping between two memberships never grows the list.
+        let flapping: Vec<RereplicationBaseline> = (0..500)
+            .map(|index| {
+                RereplicationBaseline::plain(if index % 2 == 0 {
+                    ring_of_members(&["a", "b", "c"])
+                } else {
+                    ring_of_members(&["a", "b"])
+                })
+            })
+            .collect();
+        assert_eq!(fold_unfinished_baselines(flapping, "a").len(), 2);
+
+        // Every distinct subset of eight other members, 255 passes in a row.
+        let others: Vec<String> = (0..8).map(|index| format!("n{index}")).collect();
+        let chain: Vec<RereplicationBaseline> = (1u32..256)
+            .map(|mask| {
+                let mut members = vec!["a".to_string()];
+                members.extend(
+                    others
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| mask & (1 << index) != 0)
+                        .map(|(_, name)| name.clone()),
+                );
+                RereplicationBaseline::plain(Arc::new(HashRing::new(members)))
+            })
+            .collect();
+        let folded = fold_unfinished_baselines(chain, "a");
+        assert!(
+            folded.len() <= MAX_UNFINISHED_BASELINES,
+            "{} baselines kept",
+            folded.len()
+        );
+        assert!(
+            folded
+                .iter()
+                .all(|baseline| baseline.ring.nodes().iter().any(|node| node == "a"))
+        );
+    }
+
+    /// Issue #1606: folding must not lose a target. For every key, the
+    /// folded list targets at least what the full list did.
+    #[test]
+    fn folding_unfinished_baselines_keeps_every_target() {
+        let replication = 2;
+        let after = ring_of_members(&["a", "b", "c", "d", "e"]);
+        let rings: Vec<Arc<HashRing>> = [
+            vec!["a", "b", "x"],
+            vec!["a", "x", "y"],
+            vec!["a", "c", "x", "y"],
+            vec!["a", "d", "y"],
+            vec!["a", "b", "c", "x", "y", "z"],
+            vec!["a", "e", "z"],
+            vec!["a", "c", "d", "z"],
+            vec!["a", "b", "d", "e"],
+            vec!["a", "b", "e", "w"],
+            vec!["a", "c", "w"],
+            vec!["a", "d", "e", "w", "x"],
+            vec!["a", "w", "v"],
+        ]
+        .iter()
+        .map(|names| ring_of_members(names))
+        .collect();
+        let full: Vec<RereplicationBaseline> = rings
+            .iter()
+            .map(|ring| RereplicationBaseline::plain(Arc::clone(ring)))
+            .collect();
+        let folded = fold_unfinished_baselines(full.clone(), "a");
+        assert!(folded.len() <= MAX_UNFINISHED_BASELINES);
+        assert!(
+            folded.iter().any(|baseline| baseline.every_other_owner),
+            "twelve distinct rings must have been folded"
+        );
+        let mut checked = 0;
+        for index in 0..2000u32 {
+            let hash = KeyHash::of(&key(format!("key-{index}").as_bytes()));
+            let wanted = rereplication_targets_since(&full, &after, hash, replication, "a");
+            let got = rereplication_targets_since(&folded, &after, hash, replication, "a");
+            for target in &wanted {
+                assert!(
+                    got.contains(target),
+                    "key-{index}: target {target} lost by folding ({wanted:?} -> {got:?})"
+                );
+            }
+            checked += wanted.len();
+        }
+        assert!(checked > 100, "only {checked} targets to compare");
+    }
+
+    /// Issue #1606: a pass superseded again and again before any of them
+    /// finishes (each is parked mid-send while the next arrives) hands its
+    /// successor a bounded list, not one baseline per ring change.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_chain_of_superseded_passes_keeps_a_bounded_baseline_list() {
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap().to_string();
+        let (_frames_b, peer_b) = spawn_recording_peer(listener_b);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut node_context = test_node_context(
+            "a",
+            "tk-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        node_context.shutdown_rx = shutdown_rx.clone();
+        for index in 0..4 {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key(format!("key-{index}").as_bytes()),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        // [a, x] -> [a, b] promotes b for every key; the rest are distinct
+        // memberships, each pass starting from the previous one's.
+        let mut rings = vec![ring_of_members(&["a", "x"]), ring_of_members(&["a", "b"])];
+        let passes = MAX_UNFINISHED_BASELINES * 3;
+        for mask in 1u32..=passes as u32 {
+            let mut members = vec!["a".to_string(), "b".to_string()];
+            members.extend(
+                (0..8)
+                    .filter(|bit| mask & (1 << bit) != 0)
+                    .map(|bit| format!("n{bit}")),
+            );
+            rings.push(Arc::new(HashRing::new(members)));
+        }
+        let addresses = HashMap::from([("b".to_string(), addr_b)]);
+        let tokens = HashMap::from([("b".to_string(), "tok-b".to_string())]);
+
+        // Held, the first pass connects and stops before its first send, so
+        // no pass ever finishes while the others arrive.
+        node_context.gates.pass.hold();
+        let mut handles = Vec::new();
+        let mut states: Vec<Arc<ActiveRereplication>> = Vec::new();
+        for pair in rings.windows(2).take(passes) {
+            handles.push(tokio::spawn(run_superseding_rereplication(
+                node_context.clone(),
+                Arc::clone(&pair[0]),
+                Arc::clone(&pair[1]),
+                2,
+                addresses.clone(),
+                tokens.clone(),
+                shutdown_rx.clone(),
+            )));
+            let state = timeout(Duration::from_secs(30), async {
+                loop {
+                    let installed = node_context.active_rereplication.lock().unwrap().clone();
+                    if let Some(state) = installed
+                        && !states.iter().any(|seen| Arc::ptr_eq(seen, &state))
+                    {
+                        break state;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("each pass installs itself");
+            states.push(state);
+        }
+        // The last pass is told to stop too, so it keeps what it holds
+        // instead of clearing it as a finished pass does.
+        let last = states.last().unwrap();
+        last.abort_requested.store(true, Ordering::SeqCst);
+        node_context.gates.pass.release();
+        timeout(Duration::from_secs(60), async {
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        })
+        .await
+        .expect("every pass returns");
+
+        let held = last.unfinished_baselines.lock().unwrap().len();
+        assert!(
+            held <= MAX_UNFINISHED_BASELINES,
+            "the last of {passes} aborted passes holds {held} baselines"
+        );
+        assert!(held > 1, "an aborted chain must still owe its rings");
+
+        peer_b.abort();
         drop(node_context);
         drop(request_tx);
         cache_task.await.unwrap();
