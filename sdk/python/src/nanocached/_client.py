@@ -3764,15 +3764,29 @@ class NanocachedClient:
             return
 
         for node, outcome in outcomes:
-            if isinstance(outcome, Exception):
-                self._refresh_failures += 1
-                continue
+            # Refresh is opportunistic/best-effort and must never fail the
+            # caller's operation (client-side replication's
+            # eventual-consistency model), so a node that can't be dialed
+            # here is counted in stats().refresh_failures but still
+            # installed — without a connection and with its reconnect
+            # cooldown armed, exactly like _open_cluster (issue #67): the
+            # ring must hold every listed node, or this client routes the
+            # keys near it differently from every peer that did reach it
+            # (R=1 keys sent to a non-owner, R>=2 writes skipping the
+            # listed owner). Its next use redials it once the cooldown has
+            # passed.
             if not isinstance(outcome, NodeTarget):
-                # Refresh is opportunistic/best-effort and must never fail
-                # the caller's operation (client-side replication's
-                # eventual-consistency model) — this node is just
-                # skipped, counted in stats().refresh_failures.
                 self._refresh_failures += 1
+                error = (
+                    outcome
+                    if isinstance(outcome, Exception)
+                    else NanocachedError(f"nanocached: {node.address} does not identify as a cache node")
+                )
+                self._members[node.name] = _Member(node.address, None)
+                self._redial_cooldowns[node.address] = (
+                    time.monotonic() + self._reconnect_cooldown,
+                    error,
+                )
                 continue
             self._members[node.name] = _Member(
                 node.address, self._new_connection(outcome.reader, outcome.writer, outcome.tagged)
