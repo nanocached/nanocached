@@ -21,6 +21,11 @@ changed. What 1.0.0 will promise is described on the
 - **Breaking:** an `OPTIONS` key the backend does not know now raises `ImproperlyConfigured` when the cache is created. Before, it was ignored, so a misspelled `"Tls": True` left TLS off and sent the secret in the clear. Django's own `MAX_ENTRIES` and `CULL_FREQUENCY` (either case) are still accepted.
 - **Breaking:** `nanocached_django.__version__` is gone. It read `"0.1.0"` while the package was 0.6.2 and nothing kept it current; use `importlib.metadata.version("nanocached-django")`.
 
+### Fixed
+
+- `shutdown()` blocked forever in a `fork()` child that had inherited a started bridge (Gunicorn `preload_app = True`, or uWSGI without `lazy-apps`, with a cache touch in the master before the fork), because it waited on a loop whose thread did not survive the fork. With `OPTIONS["CLOSE_ON_REQUEST"]` the first request in a worker that had not used the cache (a health check, a static file) reached `close()` and hung the worker; a worker-exit hook calling `shutdown()` hung the same way. In a child, `shutdown()` and `close()` now drop the inherited loop and client without waiting on them and return, leaving the parent's connection alone; the next cache operation starts a fresh loop. (#1482)
+- The reset of the backend's locks in a forked child did not cover the private bridge of a `CLOSE_ON_REQUEST` instance, so a lock another thread held at the moment of the fork stayed locked in the worker. Those bridges are now reset too. The README's "Preforking servers" section now says what is covered. (#1482)
+
 ## [0.6.2] - 2026-11-03
 
 No changes. Version aligned with the rest of the project: every release

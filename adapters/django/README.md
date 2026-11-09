@@ -158,8 +158,24 @@ every worker holding a loop whose driving thread died in the fork —
 and each operation would block forever on
 `run_coroutine_threadsafe(...).result()`. The parent's inherited sockets
 are deliberately left untouched in the child; the parent remains their
-owner. No configuration is needed — `preload_app = True` and uWSGI
-without `lazy-apps` both just work.
+owner.
+
+What a worker can rely on after the fork:
+
+- The first cache operation rebuilds the bridge, as above.
+- `shutdown()` — and so `close()` under `CLOSE_ON_REQUEST` — in a worker that
+  has not yet touched the cache returns at once: it forgets the inherited
+  loop and client without waiting on them, since the parent owns both. A
+  worker that serves a health check or a static file first, or a worker-exit
+  hook that calls `shutdown()`, therefore does not hang. The next cache
+  operation in that worker starts a fresh loop.
+- The locks that guard the bridge are reset in the child, for the shared
+  bridge and for the private bridge of a `CLOSE_ON_REQUEST` instance alike,
+  so a lock another thread held at the moment of the fork cannot block the
+  worker.
+
+No configuration is needed — `preload_app = True` and uWSGI without
+`lazy-apps` both just work.
 
 ## Timeouts
 
