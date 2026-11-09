@@ -4527,6 +4527,12 @@ export class NanocachedClient {
   }
 
   private async ensureConnected(slot: string, address: string): Promise<Connection> {
+    // Checked before any dial (issue #1613): a request that was already
+    // running when close() destroyed its connection arrives here with the
+    // client closed, and openNodeConnection would only notice after the
+    // dial finished, up to a connect deadline later.
+    if (this.closed) throw new AlreadyClosedError();
+
     const inFlight = this.reconnects.get(slot);
     if (inFlight) return inFlight;
 

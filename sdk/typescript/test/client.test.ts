@@ -1781,6 +1781,44 @@ describe("a redial finishing after close() (issue #1216)", () => {
   it("a proxy-mode client closes the redialed connection", () => closeRightAfterRedial("proxy"));
 });
 
+describe("a request that needs a redial after close() does not dial (issue #1613)", () => {
+  // An operation that was already running when close() destroyed its
+  // connection reaches the redial path with the client closed. It must fail
+  // as closed before opening a socket, not spend a connect deadline dialing
+  // (and then close what it dialed).
+  async function redialAfterClose(mode: "single" | "cluster" | "proxy"): Promise<void> {
+    const node = await startMockNode();
+    const discovery =
+      mode === "single"
+        ? null
+        : await startMockDiscovery(mode === "cluster" ? [{ name: "n1", address: node.address }] : []);
+    if (discovery !== null && mode === "proxy") discovery.setProxies([{ name: "p1", address: node.address }]);
+    try {
+      const client = await NanocachedClient.connect(
+        mode === "single"
+          ? { addresses: [{ host: "127.0.0.1", port: node.port }] }
+          : { addresses: [{ host: "127.0.0.1", port: discovery!.port }], viaProxy: mode === "proxy" },
+      );
+      await client.close();
+      const connectionsBefore = node.connectionCount();
+      const redial =
+        mode === "single"
+          ? () => (client as any).singleConnection()
+          : mode === "proxy"
+            ? () => (client as any).proxyConnection()
+            : () => (client as any).memberConnection("n1");
+      await assert.rejects(redial(), AlreadyClosedError);
+      assert.equal(node.connectionCount(), connectionsBefore, "no connection may be opened for a closed client");
+    } finally {
+      await Promise.all([discovery?.close(), node.close()]);
+    }
+  }
+
+  it("a single-node client fails as closed without dialing", () => redialAfterClose("single"));
+  it("a cluster client fails as closed without dialing", () => redialAfterClose("cluster"));
+  it("a proxy-mode client fails as closed without dialing", () => redialAfterClose("proxy"));
+});
+
 describe("unsolicited response with nothing pending (issue #1177)", () => {
   it("poisons the connection instead of silently dropping the reply", async () => {
     // Regression: a parsed response with no pending request was discarded
