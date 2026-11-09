@@ -5980,6 +5980,49 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_failed_operations_against_a_dead_listed_primary_do_not_each_open_a_discovery_connection(self):
+        # While discovery still lists a dead node (its liveness window),
+        # every operation routed to it failed and forced a refresh, and
+        # each refresh asked discovery for the same list over a new
+        # connection. Forced refreshes are now at least
+        # _FORCED_REFRESH_MIN_INTERVAL apart; callers in between reuse
+        # the one that just finished (the retry itself still runs).
+        from nanocached import _client as client_module
+
+        dead, live = NAMES[0], NAMES[1]
+        nodes, discovery = await self.start_cluster({dead})
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], reconnect_cooldown=100
+            )
+            try:
+                key = self.key_with_primary(dead)
+                nodes[live].store[key.encode()] = b"5"
+                before = discovery.list_count
+                started = asyncio.get_running_loop().time()
+                for _ in range(40):
+                    with self.assertRaises(ConnectionError):
+                        await client.incr(key)
+                elapsed = asyncio.get_running_loop().time() - started
+                refreshes = discovery.list_count - before
+                allowed = int(elapsed / client_module._FORCED_REFRESH_MIN_INTERVAL) + 1
+                self.assertGreaterEqual(refreshes, 1)
+                self.assertLessEqual(refreshes, allowed, (refreshes, elapsed))
+
+                # Once the interval has passed the next failure refreshes
+                # again: a node that did come back must still be found.
+                await asyncio.sleep(client_module._FORCED_REFRESH_MIN_INTERVAL + 0.05)
+                before = discovery.list_count
+                with self.assertRaises(ConnectionError):
+                    await client.incr(key)
+                self.assertEqual(discovery.list_count - before, 1)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
     async def test_refresh_purges_cooldowns_for_departed_addresses(self):
         # #96: a node that leaves the cluster must not leave its per-address
         # reconnect-cooldown entry behind — in a churny deployment (fresh
