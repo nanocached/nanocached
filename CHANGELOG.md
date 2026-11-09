@@ -25,6 +25,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e`: `scalein.sh`, `proxydrain.sh` and `proxykill.sh` did not enforce
+  the PASS conditions in their headers. `scalein.sh` ignored the result of the
+  wait for membership 3 -> 2 (at R=2 a decommission that never handed off
+  still passed on the replica's copies), `proxydrain.sh` only printed a
+  timeout when the `Q` roster did not drop to 1 proxy, and `proxykill.sh`
+  printed `fail=1` but exited 0. Each is now a failure with a message, and
+  `proxykill.sh` exits non-zero (#1620).
+
 - `nanocached-proxy`: a source IP's in-flight byte share was forgotten as
   soon as its last connection ended, even while requests that connection
   had dispatched were still charged (a client write error ends the
