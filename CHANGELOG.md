@@ -25,6 +25,18 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-discovery`: a node restarted on the same address while its
+  old name was still a member (within the liveness timeout of a `kill -9`)
+  stalled its own join and ran the handoff twice. The old name stayed in
+  the roster, so the join's `M` for it went to the new process, which
+  refused it (`membership token mismatch`); the live members completed
+  their handoff, and the join waited until the old name was evicted,
+  was abandoned (`ready member evicted mid-join`) and started again from
+  scratch. A `J` under a new name from the address a `Joined` member holds
+  now drops the old name at once, as an eviction would: it leaves the
+  roster, is recorded as departed, and is no longer waited for by a join
+  in flight (#1616).
+
 - `nanocached-proxy`: the replica write of an `i` (INCR) result could be
   over the node's 1 MiB request limit and poison the connection every client
   of the proxy shares. The proxy turns the node's `I <value> <ttl>` into an
