@@ -138,9 +138,18 @@ unreachable.</p>
   silent and nobody moved on without them. Nor are nodes sent back when every one
   of them was evicted together, as when the path between discovery and the
   whole fleet was cut: discovery answers <code>G</code> only while some
-  node has been a member without a break since before that node was
-  evicted, since only such a node can have taken its keys over, and
-  otherwise registers the node as it announces. A node evicted longer ago than that
+  node has been a member in unbroken contact since before that node was
+  evicted, since only such a node was served a roster without it and can
+  have taken its keys over, and otherwise registers the node as it
+  announces. A member heard from again after a gap of nine seconds or
+  more (at least one of its five-second heartbeats did not arrive) counts
+  as in contact only from that moment: when the path to the whole fleet
+  heals after the first evictions and before the last, the nodes still
+  listed were cut off just the same, and the evicted ones are registered
+  with their caches rather than sent back. A member whose single heartbeat
+  was a few seconds late still counts as in contact throughout, so a node
+  evicted while another was out of contact for less than nine seconds
+  across its eviction is still sent back. A node evicted longer ago than that
   hour, or by a standby discovery replica (which only lists nodes), is
   registered as before.</li>
 </ul>
