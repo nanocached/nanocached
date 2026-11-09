@@ -1243,6 +1243,48 @@ struct Inner {
     /// client opens — including the ones a later refresh/reconnect dials —
     /// so the per-request deadline is per-client, not a shared global.
     request_timeout: Duration,
+    /// When the current or last node-list refresh that ran to completion
+    /// (or is still running) began: a forced refresh reuses only one that
+    /// began after the failure it reacts to. A refresh whose future is
+    /// dropped before it finishes puts back what was here before it began
+    /// (`RefreshStarted`). Never held across an await.
+    last_refresh_started: std::sync::Mutex<Option<Instant>>,
+}
+
+/// Records the start of a node-list refresh in `Inner::last_refresh_started`
+/// and, unless `finish` is called, puts the previous value back when
+/// dropped: the future of a forced refresh is dropped when the caller's own
+/// future is (say a `tokio::time::timeout` around the client call), and a
+/// start left behind would make a forced caller that saw its failure before
+/// that point conclude a refresh ran after it.
+struct RefreshStarted<'a> {
+    slot: &'a std::sync::Mutex<Option<Instant>>,
+    previous: Option<Instant>,
+    finished: bool,
+}
+
+impl<'a> RefreshStarted<'a> {
+    fn begin(slot: &'a std::sync::Mutex<Option<Instant>>) -> Self {
+        let mut started = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = started.replace(Instant::now());
+        Self {
+            slot,
+            previous,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for RefreshStarted<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = self.previous;
+        }
+    }
 }
 
 impl Inner {
@@ -1254,9 +1296,6 @@ impl Inner {
 struct State {
     target: Target,
     last_fetch: Instant,
-    /// When the current or last node-list refresh began: a forced refresh
-    /// reuses only one that began after the failure it reacts to.
-    last_refresh_started: Option<Instant>,
     /// When the last node-list refresh finished (success or failed fetch;
     /// not one that was cancelled): the point `FORCED_REFRESH_MIN_INTERVAL`
     /// is measured from.
@@ -1824,7 +1863,6 @@ impl NanocachedClient {
             state: Mutex::new(State {
                 target,
                 last_fetch: Instant::now(),
-                last_refresh_started: None,
                 last_refresh_end: None,
             }),
             redials: Mutex::new(HashMap::new()),
@@ -1858,6 +1896,7 @@ impl NanocachedClient {
             },
             via_proxy: options.via_proxy,
             request_timeout,
+            last_refresh_started: std::sync::Mutex::new(None),
         });
 
         // Keep-alive is always on, with an internal interval (issue #27):
@@ -5604,8 +5643,11 @@ impl NanocachedClient {
                 return;
             }
             if force
-                && state
+                && self
+                    .inner
                     .last_refresh_started
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
                     .is_some_and(|started| started >= observed)
             {
                 return;
@@ -5624,8 +5666,9 @@ impl NanocachedClient {
                 return;
             }
         }
-        self.inner.state.lock().await.last_refresh_started = Some(Instant::now());
+        let started = RefreshStarted::begin(&self.inner.last_refresh_started);
         self.refresh_node_list().await;
+        started.finish();
         self.inner.state.lock().await.last_refresh_end = Some(Instant::now());
     }
 
