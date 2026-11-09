@@ -734,6 +734,13 @@ const DECOMMISSION_OVERRIDE_GRACE: Duration = Duration::from_secs(2);
 /// under `DECOMMISSION_OVERRIDE_GRACE` so an operator override still
 /// reaches the `V`.
 const HEARTBEAT_QUIESCE_WAIT: Duration = Duration::from_secs(1);
+/// Issue #1535: the least a decommission's `V` to discovery is given, even
+/// when the handoff has already used up the drain budget. The leave is
+/// otherwise bounded by what is left of the budget; a responsive discovery
+/// answers it in milliseconds, and skipping it would leave the node listed
+/// (and served from) until the liveness timeout, so it keeps a short
+/// window of its own.
+const LEAVE_MIN_WAIT: Duration = Duration::from_secs(2);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Issue #1028: the per-connection log lines (`INFO accepted connection
@@ -7760,11 +7767,17 @@ async fn leave_membership(
     node_context: &NodeContext,
     discovery_addrs: &[String],
     heartbeat: &mut Option<HeartbeatStop>,
+    deadline: Instant,
 ) {
     if let Some(heartbeat) = heartbeat.as_mut() {
         heartbeat.stop_and_wait().await;
     }
-    send_leave(node_context, discovery_addrs).await;
+    // What is left of the drain budget (the bound the stop grace is sized
+    // against), but never less than `LEAVE_MIN_WAIT`.
+    let bound = deadline
+        .saturating_duration_since(Instant::now())
+        .max(LEAVE_MIN_WAIT);
+    send_leave(node_context, discovery_addrs, bound).await;
 }
 
 async fn run_decommission(
@@ -7856,7 +7869,7 @@ async fn run_decommission(
             "INFO decommission: second shutdown signal received during the join-migration \
              wait — leaving without a handoff"
         );
-        leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
+        leave_membership(&node_context, &discovery_addrs, &mut heartbeat, deadline).await;
         return;
     }
 
@@ -7881,7 +7894,7 @@ async fn run_decommission(
                 "WARN decommission: shutdown override while fetching the roster; leaving \
                  without a handoff"
             );
-            leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
+            leave_membership(&node_context, &discovery_addrs, &mut heartbeat, deadline).await;
             return;
         }
         Some(Ok(roster)) => roster,
@@ -7890,7 +7903,7 @@ async fn run_decommission(
                 "WARN decommission: fetching the roster failed ({error}); leaving without a \
                  handoff"
             );
-            leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
+            leave_membership(&node_context, &discovery_addrs, &mut heartbeat, deadline).await;
             return;
         }
     };
@@ -7899,7 +7912,7 @@ async fn run_decommission(
     if !members.iter().any(|(name, _, _)| *name == self_name) {
         // Not a member (already expired, or never joined): nothing to
         // hand off.
-        leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
+        leave_membership(&node_context, &discovery_addrs, &mut heartbeat, deadline).await;
         return;
     }
     let survivors: Vec<(String, String, String)> = members
@@ -7909,7 +7922,7 @@ async fn run_decommission(
         .collect();
     if survivors.is_empty() {
         println!("INFO decommission: last member — nothing to hand off");
-        leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
+        leave_membership(&node_context, &discovery_addrs, &mut heartbeat, deadline).await;
         return;
     }
 
@@ -7945,7 +7958,7 @@ async fn run_decommission(
     // 3. Transfer.
     let Some(keys) = list_keys(&node_context.request_tx).await else {
         eprintln!("WARN decommission: cache task unavailable; leaving without a handoff");
-        leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
+        leave_membership(&node_context, &discovery_addrs, &mut heartbeat, deadline).await;
         return;
     };
     // Issue #970: dead copies stay out of this handoff unless their marks are still held.
@@ -8115,7 +8128,7 @@ async fn run_decommission(
     println!("INFO decommission: handed off {sent} entr(ies)");
 
     // 4. Leave.
-    leave_membership(&node_context, &discovery_addrs, &mut heartbeat).await;
+    leave_membership(&node_context, &discovery_addrs, &mut heartbeat, deadline).await;
 
     // 5. Grace: keep forwarding concurrent writes while clients refresh
     // onto the post-leave roster.
@@ -8147,37 +8160,71 @@ async fn run_decommission(
 /// removal is immediate on each replica that hears it (they don't
 /// gossip); one refusing/unreachable replica only means that replica
 /// serves this node until its liveness timeout.
-async fn send_leave(node_context: &NodeContext, discovery_addrs: &[String]) {
+///
+/// The replicas are told at the same time and the whole call is bounded by
+/// `bound` (issue #1535): tried one after another, each with its own
+/// `OUTBOUND_IO_TIMEOUT`, replicas that accept and never answer added 10 s
+/// apiece past the drain budget, and the first of them kept the others from
+/// being told at all until its turn was over. What was not delivered in
+/// time is logged and left to the liveness timeout.
+async fn send_leave(node_context: &NodeContext, discovery_addrs: &[String], bound: Duration) {
+    let mut leaves = JoinSet::new();
     for addr in discovery_addrs {
-        let result = timeout(OUTBOUND_IO_TIMEOUT, async {
-            let mut stream =
-                connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
-            let mut frame = format!(
-                "V {} {}\n",
-                node_context.name.len(),
-                node_context.token.len()
-            )
-            .into_bytes();
-            frame.extend_from_slice(node_context.name.as_bytes());
-            frame.extend_from_slice(node_context.token.as_bytes());
-            stream.write_all(&frame).await?;
-            stream.flush().await?;
-            let mut ack = [0u8; 2];
-            stream.read_exact(&mut ack).await?;
-            if &ack != b"R\n" {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "discovery did not acknowledge the leave",
-                ));
-            }
-            io::Result::Ok(())
-        })
-        .await
-        .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "leave timed out")));
+        let node_context = node_context.clone();
+        let addr = addr.clone();
+        leaves.spawn(async move {
+            let result = timeout(OUTBOUND_IO_TIMEOUT, async {
+                let mut stream =
+                    connect_and_authenticate(&node_context, &addr, AuthPeer::Discovery).await?;
+                let mut frame = format!(
+                    "V {} {}\n",
+                    node_context.name.len(),
+                    node_context.token.len()
+                )
+                .into_bytes();
+                frame.extend_from_slice(node_context.name.as_bytes());
+                frame.extend_from_slice(node_context.token.as_bytes());
+                stream.write_all(&frame).await?;
+                stream.flush().await?;
+                let mut ack = [0u8; 2];
+                stream.read_exact(&mut ack).await?;
+                if &ack != b"R\n" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "discovery did not acknowledge the leave",
+                    ));
+                }
+                io::Result::Ok(())
+            })
+            .await
+            .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "leave timed out")));
+            (addr, result)
+        });
+    }
 
-        if let Err(error) = result {
-            eprintln!("WARN decommission: leave notification to {addr} failed: {error}");
+    let mut unanswered: Vec<String> = discovery_addrs.to_vec();
+    let all_answered = timeout(bound, async {
+        while let Some(joined) = leaves.join_next().await {
+            let Ok((addr, result)) = joined else {
+                continue;
+            };
+            if let Some(position) = unanswered.iter().position(|pending| *pending == addr) {
+                unanswered.swap_remove(position);
+            }
+            if let Err(error) = result {
+                eprintln!("WARN decommission: leave notification to {addr} failed: {error}");
+            }
         }
+    })
+    .await;
+    // Dropping `leaves` aborts whatever is still waiting.
+    if all_answered.is_err() {
+        eprintln!(
+            "WARN decommission: the leave notification was not delivered to {} within {}s — \
+             those discovery replicas serve this node until their liveness timeout",
+            unanswered.join(", "),
+            bound.as_secs_f32()
+        );
     }
 }
 
@@ -32485,5 +32532,57 @@ mod tests {
         fake_discovery.abort();
 
         assert_join_then_heartbeats(&received.lock().unwrap(), 8356);
+    }
+
+    /// Issue #1535: the leave is bounded as a whole, and a replica that
+    /// accepts and never answers neither adds its own 10 s nor keeps the
+    /// replicas after it from being told. Real time on purpose: a connect
+    /// resolves its address on a blocking thread, which a paused clock
+    /// would race past (auto-advancing the timers while it runs).
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_leave_is_bounded_as_a_whole_and_still_reaches_the_replicas_that_answer() {
+        // Two replicas that take the connection and never answer, the
+        // first listed so that a sequential walk would sit on it.
+        let mut silent_tasks = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..2 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(listener.local_addr().unwrap().to_string());
+            silent_tasks.push(tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((connection, _)) = listener.accept().await {
+                    held.push(connection);
+                }
+            }));
+        }
+        let answering = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(answering.local_addr().unwrap().to_string());
+        let (left, answering_task) =
+            spawn_mock_discovery(answering, "127.0.0.1:1".to_string(), None);
+
+        let node_context = test_node_context(
+            "leaver",
+            "tk-leaver",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            send_leave(&node_context, &addrs, Duration::from_millis(300)),
+        )
+        .await
+        .expect("send_leave must stop at its bound, not wait out each silent replica's 10 s");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(*left.lock().unwrap(), vec!["leaver".to_string()]);
+
+        answering_task.abort();
+        for task in silent_tasks {
+            task.abort();
+        }
     }
 }

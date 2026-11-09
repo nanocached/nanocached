@@ -38,6 +38,14 @@ framework adapters at one version, whether or not a component changed.
   registered with their caches as when every node was evicted together. A
   survivor whose heartbeat was merely late, by less than 9 s, still counts
   as in contact throughout (#1479).
+- `nanocached-node`: the decommission's leave notification was not bounded
+  by the drain budget. It went to the discovery replicas one after another,
+  each allowed 10 s, so replicas that accepted the connection and never
+  answered added 10 s apiece past the budget the stop grace is sized
+  against, and the first of them kept the others from being told until its
+  turn was over. The replicas are now told at the same time and the whole
+  notification gets what is left of the budget, at least 2 s; what was not
+  delivered in time is logged and left to the liveness timeout (#1535).
 - `nanocached-node`: clearing one namespace left the handoff tombstones of
   that namespace's keys in place, while clearing the whole store dropped
   them. The tombstones stayed charged to the memory bound for their
