@@ -1172,12 +1172,19 @@ async fn forward_result(config: &ConnectionConfig, key: &Key, result: ForwardedR
             .collect::<Vec<_>>()
     );
 
+    // Stamped once, before the first (possibly waiting) enqueue, so every
+    // target's copy counts its TTL from when the write was made.
+    let stamped_ttl = match &result {
+        ForwardedResult::Set { ttl, .. } => ForwardTtl::stamp(*ttl),
+        ForwardedResult::Delete => None,
+    };
+
     for target in migration_targets_for(node_context, key) {
         let write = match &result {
-            ForwardedResult::Set { value, ttl } => OwnedForwardedWrite::Set {
+            ForwardedResult::Set { value, .. } => OwnedForwardedWrite::Set {
                 key: key.clone(),
                 value: value.clone(),
-                ttl: *ttl,
+                ttl: stamped_ttl,
             },
             ForwardedResult::Delete => OwnedForwardedWrite::Delete { key: key.clone() },
         };
@@ -1186,10 +1193,10 @@ async fn forward_result(config: &ConnectionConfig, key: &Key, result: ForwardedR
 
     for target in handoff_targets_for(node_context, key) {
         let write = match &result {
-            ForwardedResult::Set { value, ttl } => OwnedForwardedWrite::HandoffSet {
+            ForwardedResult::Set { value, .. } => OwnedForwardedWrite::HandoffSet {
                 key: key.clone(),
                 value: value.clone(),
-                ttl: *ttl,
+                ttl: stamped_ttl,
                 if_absent: false,
             },
             ForwardedResult::Delete => OwnedForwardedWrite::HandoffDelete { key: key.clone() },
@@ -2246,6 +2253,15 @@ pub(crate) async fn run_with_hooks(
     // copy), so the original binding still holds a `request_tx` here.
     drop(node_context);
 
+    // The heartbeat task holds the last `request_tx` clones (its
+    // `NodeContext`), so `cache_task` cannot finish before it ends. Join it
+    // first, bounded, so an unresponsive discovery server costs at most
+    // `HEARTBEAT_SHUTDOWN_WAIT` instead of an unbounded `cache_task.await`
+    // in front of the bounded join (issue #1533).
+    if let Some(heartbeat_task) = heartbeat_task {
+        join_heartbeat_task(heartbeat_task, HEARTBEAT_SHUTDOWN_WAIT).await?;
+    }
+
     cache_task
         .await
         .map_err(|error| io::Error::other(format!("cache task failed: {error}")))?;
@@ -2258,10 +2274,6 @@ pub(crate) async fn run_with_hooks(
         reclaim_task
             .await
             .map_err(|error| io::Error::other(format!("reclaim task failed: {error}")))?;
-    }
-
-    if let Some(heartbeat_task) = heartbeat_task {
-        join_heartbeat_task(heartbeat_task, HEARTBEAT_SHUTDOWN_WAIT).await?;
     }
 
     if let Some(metrics_task) = metrics_task {
@@ -3695,6 +3707,9 @@ async fn handle_connection(
                             &[&join_batches, &leave_batches],
                         );
 
+                        // Counted from here, not from when each batch is
+                        // sent after its wait for room (issue #1534).
+                        let ttl = ForwardTtl::stamp(ttl);
                         for (batches, handoff) in [(join_batches, false), (leave_batches, true)] {
                             for batch in batches {
                                 let writes = batch.items.into_iter().map(|(name, value)| {
@@ -3852,6 +3867,9 @@ async fn handle_connection(
                     },
                 )
                 .await?;
+                // The relays below count the TTL from the moment it was
+                // applied here (issue #1534).
+                let relay_ttl = ForwardTtl::stamp(ttl);
                 // Issue #975: a put-if-absent copy — a re-replication pass
                 // promoting this node under the ring it saw — that lands
                 // after this node's own join handoff took its key snapshot
@@ -3903,14 +3921,14 @@ async fn handle_connection(
                         OwnedForwardedWrite::HandoffSet {
                             key: key.clone(),
                             value: value.clone(),
-                            ttl,
+                            ttl: relay_ttl,
                             if_absent: true,
                         }
                     } else {
                         OwnedForwardedWrite::Set {
                             key: key.clone(),
                             value: value.clone(),
-                            ttl,
+                            ttl: relay_ttl,
                         }
                     };
                     spawn_forward(&config, node_context.clone(), target, forward).await;
@@ -3947,7 +3965,7 @@ async fn handle_connection(
                             OwnedForwardedWrite::HandoffSet {
                                 key: key.clone(),
                                 value: value.clone(),
-                                ttl,
+                                ttl: relay_ttl,
                                 if_absent,
                             },
                         )
@@ -4284,6 +4302,9 @@ async fn handle_connection(
                             &[&join_batches, &leave_batches],
                         );
 
+                        // Counted from here, not from when each batch is
+                        // sent after its wait for room (issue #1534).
+                        let ttl = ForwardTtl::stamp(ttl);
                         for (batches, handoff) in [(join_batches, false), (leave_batches, true)] {
                             for batch in batches {
                                 let writes = batch.items.into_iter().map(|(name, value)| {
@@ -5239,14 +5260,19 @@ async fn register_with_discovery(
                         // Bounded so a discovery server that accepts TCP but
                         // never drains can't wedge this task forever (and,
                         // via `heartbeat_task.await`, hang shutdown).
-                        let exchange = timeout(OUTBOUND_IO_TIMEOUT, async {
-                            stream.write_all(&auth).await?;
-                            stream.flush().await?;
-                            let mut ack = [0u8; 3];
-                            stream.read_exact(&mut ack).await?;
-                            io::Result::Ok(ack)
-                        })
-                        .await;
+                        // Also cut short by shutdown (issue #1533): the
+                        // bound alone is `OUTBOUND_IO_TIMEOUT`, which a
+                        // SIGTERM would otherwise wait out in full.
+                        let exchange = tokio::select! {
+                            _ = shutdown_rx.changed() => return,
+                            result = timeout(OUTBOUND_IO_TIMEOUT, async {
+                                stream.write_all(&auth).await?;
+                                stream.flush().await?;
+                                let mut ack = [0u8; 3];
+                                stream.read_exact(&mut ack).await?;
+                                io::Result::Ok(ack)
+                            }) => result,
+                        };
                         // Only an explicit `Ed` is a rejected secret. A
                         // dropped connection or garbage instead (issue #68)
                         // is most often a node speaking plaintext to a
@@ -5297,9 +5323,14 @@ async fn register_with_discovery(
                 let registration = if sending_join { &join } else { &announce };
 
                 let registration_sent = authenticated
-                    && infra::write_all_within(&mut stream, registration, OUTBOUND_IO_TIMEOUT)
-                        .await
-                        .is_ok();
+                    && {
+                        // Raced with shutdown like the reads below (issue #1533).
+                        let written = tokio::select! {
+                            _ = shutdown_rx.changed() => return,
+                            result = infra::write_all_within(&mut stream, registration, OUTBOUND_IO_TIMEOUT) => result,
+                        };
+                        written.is_ok()
+                    };
                 if registration_sent {
                     // For `J`, staged node join: this connection is held open by
                     // discovery (no idle timeout applies) until this node
@@ -5387,10 +5418,11 @@ async fn register_with_discovery(
                                 pending_joiner.as_ref().map(|(name, _)| name.as_str()),
                             );
 
-                            if infra::write_all_within(&mut stream, &heartbeat, OUTBOUND_IO_TIMEOUT)
-                                .await
-                                .is_err()
-                            {
+                            let heartbeat_written = tokio::select! {
+                                _ = shutdown_rx.changed() => return,
+                                result = infra::write_all_within(&mut stream, &heartbeat, OUTBOUND_IO_TIMEOUT) => result,
+                            };
+                            if heartbeat_written.is_err() {
                                 break;
                             }
 
@@ -6559,6 +6591,13 @@ struct ActiveRereplication {
     /// `ActiveMigration::completed_at`: nothing here needs to measure a
     /// forwarding grace, only to know the run is over.
     done: AtomicBool,
+    /// The rings this run still owes a pass from: the one its own change
+    /// started from, plus those of earlier runs it took over from that were
+    /// aborted before they had considered every key. Emptied once the run
+    /// has considered every key, so a successor starts from its own ring
+    /// only; left as is when the run is aborted, for the successor to pick
+    /// up (issue #1522).
+    unfinished_baselines: Mutex<Vec<Arc<HashRing>>>,
 }
 
 /// Occupies `slot` with an `ActiveMigration` for this guard's lifetime
@@ -7658,7 +7697,12 @@ async fn drain_pending_clears(
 /// out mid-transfer this logs what was left behind and still sends `V`
 /// (the process is exiting either way; clean membership beats a
 /// liveness-timeout ghost), degrading to today's crash semantics for
-/// the untransferred remainder.
+/// the untransferred remainder. The deadline is checked between keys
+/// and between the attempts on one key. An entrant that fails every
+/// attempt on a key (a node that is dead but still listed by discovery)
+/// is written off for `FORWARD_FAIL_FAST_WINDOW`, as `run_rereplication`
+/// does: its keys are counted as left behind without a dial, so they
+/// cannot spend the budget the live entrants' keys need.
 ///
 /// Issue #357 — a documented tradeoff, not a defect: the ring pair from
 /// step 2 is one roster snapshot, never recomputed, and nothing tells a
@@ -7953,6 +7997,9 @@ async fn run_decommission(
     let mut streams: HashMap<String, ClientStream> = HashMap::new();
     let mut sent = 0usize;
     let mut left_behind = 0usize;
+    // When each entrant address last used up every attempt on one key —
+    // the drain's counterpart of `run_rereplication`'s `failed_targets`.
+    let mut failed_targets: HashMap<String, Instant> = HashMap::new();
 
     // Tenth-pass audit (2026-09-02): consumed by hand (not a `for` over
     // `keys` directly) so that on a shutdown override mid-transfer the
@@ -8008,6 +8055,18 @@ async fn run_decommission(
             continue;
         };
 
+        // An entrant that has just used up every attempt on a key is
+        // written off for `FORWARD_FAIL_FAST_WINDOW`: its keys are counted
+        // as left behind without a dial, so a dead but still-listed
+        // survivor cannot spend the budget the live entrants' keys need.
+        if failed_targets
+            .get(addr)
+            .is_some_and(|failed_at| failed_at.elapsed() < FORWARD_FAIL_FAST_WINDOW)
+        {
+            left_behind += 1;
+            continue;
+        }
+
         // Live re-peek, same reasoning as the join transfer: a client
         // write racing this key's turn must win.
         let Some((_, value, ttl)) =
@@ -8018,7 +8077,15 @@ async fn run_decommission(
 
         let mut delivered = false;
         let mut overridden = false;
+        let mut failed_attempts = 0u32;
         for attempt in 0..KEY_TRANSFER_ATTEMPTS {
+            // The budget is checked between attempts too: a key whose
+            // entrant is unreachable costs up to
+            // `KEY_TRANSFER_ATTEMPTS` x `OUTBOUND_IO_TIMEOUT`, which must
+            // not run on past the deadline.
+            if Instant::now() >= deadline {
+                break;
+            }
             let mut connected = streams.contains_key(addr);
             if !connected {
                 // See the roster fetch above for why this (and the
@@ -8040,6 +8107,7 @@ async fn run_decommission(
                         connected = true;
                     }
                     Some(Err(error)) => {
+                        failed_attempts += 1;
                         eprintln!("WARN decommission: connecting to {addr} failed: {error}");
                     }
                 }
@@ -8061,6 +8129,7 @@ async fn run_decommission(
                         delivered = true;
                     }
                     Some(Err(error)) => {
+                        failed_attempts += 1;
                         eprintln!("WARN decommission: transfer to {addr} failed: {error}");
                         streams.remove(addr);
                     }
@@ -8103,6 +8172,16 @@ async fn run_decommission(
             sent += 1;
         } else {
             left_behind += 1;
+            // Only an entrant that failed every attempt (not one the loop
+            // left because the budget ran out) is written off.
+            if failed_attempts == KEY_TRANSFER_ATTEMPTS {
+                failed_targets.insert(addr.clone(), Instant::now());
+                eprintln!(
+                    "WARN decommission: giving up on {addr} for {}s; its remaining keys are \
+                     left behind without further attempts",
+                    FORWARD_FAIL_FAST_WINDOW.as_secs()
+                );
+            }
         }
     }
 
@@ -8686,6 +8765,32 @@ fn rereplication_targets(
         .collect()
 }
 
+/// `rereplication_targets` for a pass that also owes the changes of the
+/// runs it superseded (issue #1522): the owners promoted by any of the
+/// `earlier` rings' changes to `after`, together with those of `before`'s.
+/// Each ring is diffed against `after` separately because the sender
+/// condition is per ring — a node promoted by the first change into a
+/// key's top-R was not an owner under the first ring but is the one that
+/// holds the key for the second.
+fn rereplication_targets_since(
+    before: &HashRing,
+    earlier: &[Arc<HashRing>],
+    after: &HashRing,
+    key_hash: KeyHash,
+    replication: usize,
+    self_name: &str,
+) -> Vec<String> {
+    let mut targets = rereplication_targets(before, after, key_hash, replication, self_name);
+    for ring in earlier {
+        for target in rereplication_targets(ring, after, key_hash, replication, self_name) {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
 /// Issue #275: installs `state` into `slot` and hands back whatever
 /// occupied it a moment ago, both under one lock acquisition — the fix
 /// for the check-then-act race `run_superseding_rereplication` used to
@@ -8731,6 +8836,14 @@ fn take_over_rereplication_slot(
 /// just handled, plus the joiner's own, and runs only after its own
 /// transfer has completed — so neither of those two steps applies there).
 ///
+/// Issue #1522: a run it aborted before that run had considered every key
+/// leaves its starting ring in `ActiveRereplication::unfinished_baselines`.
+/// This run takes them over and heals from each of them to `after_ring`
+/// (`rereplication_targets_since`), so the owners the aborted run's change
+/// promoted, and it had not reached, are not forgotten; a key the aborted
+/// run did send is sent again, harmlessly (put-if-absent). The forwarding
+/// window below stays on this run's own, newest, snapshot.
+///
 /// Issue #275: the install (`take_over_rereplication_slot`) happens
 /// *before* the wait on the previous occupant's `done`, not after — see
 /// that function's doc comment for why this ordering is what keeps
@@ -8756,8 +8869,14 @@ async fn run_superseding_rereplication(
     let state = Arc::new(ActiveRereplication {
         abort_requested: AtomicBool::new(false),
         done: AtomicBool::new(false),
+        unfinished_baselines: Mutex::new(vec![Arc::clone(&before_ring)]),
     });
     let previous = take_over_rereplication_slot(&node_context.active_rereplication, &state);
+    // Issue #1522: the rings the aborted run had not finished from, so
+    // the keys its change promoted new owners for, and it had not reached,
+    // are still covered. The sends are put-if-absent: a key the aborted
+    // run did deliver is harmless to send again.
+    let mut earlier_rings: Vec<Arc<HashRing>> = Vec::new();
     if let Some(previous) = previous {
         previous.abort_requested.store(true, Ordering::SeqCst);
         // Issue #498: bounded by the deadline *and* by shutdown — see
@@ -8781,6 +8900,16 @@ async fn run_superseding_rereplication(
                 }
             }
         }
+        earlier_rings = previous
+            .unfinished_baselines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut own = state
+            .unfinished_baselines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        own.splice(0..0, earlier_rings.iter().cloned());
     }
 
     // The forwarding window opens with the pass — a later ring change's
@@ -8799,9 +8928,10 @@ async fn run_superseding_rereplication(
         grace: FORWARDING_GRACE_BASE,
     });
 
-    run_rereplication(
+    let completed = run_rereplication(
         &node_context,
         &before_ring,
+        &earlier_rings,
         &after_ring,
         replication,
         &addresses,
@@ -8811,6 +8941,13 @@ async fn run_superseding_rereplication(
     )
     .await;
 
+    if completed {
+        state
+            .unfinished_baselines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
     state.done.store(true, Ordering::SeqCst);
     {
         // Stamp this pass's own window only: a later pass may already
@@ -8909,7 +9046,10 @@ async fn spawn_or_supersede_rereplication(
 /// still present in both rings is mid-decommission. A key left below R
 /// by an earlier, unrelated window (see `run_decommission`'s doc
 /// comment) is only picked up here if a later change happens to re-rank
-/// it.
+/// it. (`earlier_rings` widens that to the changes of runs this one
+/// superseded before they finished, issue #1522; the return value says
+/// whether this run considered every key, i.e. was neither aborted nor
+/// cut short by shutdown.)
 ///
 /// Issue #295: a target this node has no membership token for (missing
 /// from `tokens`) is skipped exactly like a target with no address —
@@ -8923,16 +9063,17 @@ async fn spawn_or_supersede_rereplication(
 async fn run_rereplication(
     node_context: &NodeContext,
     before_ring: &HashRing,
+    earlier_rings: &[Arc<HashRing>],
     after_ring: &HashRing,
     replication: usize,
     addresses: &HashMap<String, String>,
     tokens: &HashMap<String, String>,
     abort_requested: &AtomicBool,
     shutdown_rx: &mut watch::Receiver<bool>,
-) {
+) -> bool {
     let Some(keys) = list_keys(&node_context.request_tx).await else {
         eprintln!("WARN re-replication: cache task is unavailable");
-        return;
+        return false;
     };
     // Issue #970: dead copies stay out of this handoff unless their marks are still held.
     let skip_dead = marks_released(&node_context.active_migration);
@@ -8984,8 +9125,9 @@ async fn run_rereplication(
             break;
         }
 
-        let targets = rereplication_targets(
+        let targets = rereplication_targets_since(
             before_ring,
+            earlier_rings,
             after_ring,
             hasher.hash(&key),
             replication,
@@ -9138,6 +9280,9 @@ async fn run_rereplication(
         owners_reached.len(),
         skipped
     );
+    // False when an abort or a shutdown cut the pass short, so a successor
+    // knows this run's ring change is not fully covered yet.
+    !abort_requested.load(Ordering::SeqCst) && !*shutdown_rx.borrow()
 }
 
 async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Key>> {
@@ -10069,7 +10214,7 @@ enum OwnedForwardedWrite {
     Set {
         key: Key,
         value: Bytes,
-        ttl: Option<Duration>,
+        ttl: Option<ForwardTtl>,
     },
     Delete {
         key: Key,
@@ -10083,13 +10228,47 @@ enum OwnedForwardedWrite {
     HandoffSet {
         key: Key,
         value: Bytes,
-        ttl: Option<Duration>,
+        ttl: Option<ForwardTtl>,
         if_absent: bool,
     },
     HandoffDelete {
         key: Key,
     },
     Clear(ClearScope),
+}
+
+/// The relative TTL of a forwarded `Set`/`HandoffSet` together with when
+/// the write was made, so what goes on the wire is what is *left* of it
+/// when the write is sent, not what it was when it was made. A forward can
+/// wait behind a slow-but-live target for up to `FORWARD_TIMEOUT` per
+/// attempt (and a queue of others before it); sending the original number
+/// of seconds made the target hold the value that much longer than the
+/// node that took the write, or hold a short-lived value (an `INCR`
+/// counter) that had already expired there (issue #1534).
+///
+/// A TTL that ran out while the write waited is sent as `0`: the frame
+/// that already means "expire now" — a `U` deletes, an `S` stores the key
+/// already expired — which still replaces whatever older value the target
+/// holds for the key (dropping the write would leave that value alive).
+#[derive(Clone, Copy, Debug)]
+struct ForwardTtl {
+    ttl: Duration,
+    made_at: Instant,
+}
+
+impl ForwardTtl {
+    /// `ttl` as of now; `None` (no expiry) stays `None`.
+    fn stamp(ttl: Option<Duration>) -> Option<Self> {
+        ttl.map(|ttl| Self {
+            ttl,
+            made_at: Instant::now(),
+        })
+    }
+
+    /// What is left of the TTL now: zero once it has run out.
+    fn remaining(self) -> Duration {
+        self.ttl.saturating_sub(self.made_at.elapsed())
+    }
 }
 
 impl OwnedForwardedWrite {
@@ -10179,86 +10358,55 @@ impl OwnedForwardedWrite {
         // reconnect-plus-send.
         let deadline = tokio::time::Instant::now() + FORWARD_TIMEOUT;
 
+        forward_on_locked_connection(
+            node_context,
+            &target.addr,
+            connection,
+            self.frame(target),
+            deadline,
+        )
+        .await
+    }
+
+    /// The frame to send for this write to `target` now. A `Set`'s TTL is
+    /// what is left of it at this moment (`ForwardTtl`), so a later attempt
+    /// or a longer wait in the queue sends less.
+    fn frame<'a>(&'a self, target: &'a ForwardTarget) -> ForwardedWrite<'a> {
         match self {
-            OwnedForwardedWrite::Set { key, value, ttl } => {
-                forward_on_locked_connection(
-                    node_context,
-                    &target.addr,
-                    connection,
-                    ForwardedWrite::Set {
-                        key,
-                        value,
-                        ttl: *ttl,
-                    },
-                    deadline,
-                )
-                .await
-            }
-            OwnedForwardedWrite::Delete { key } => {
-                forward_on_locked_connection(
-                    node_context,
-                    &target.addr,
-                    connection,
-                    ForwardedWrite::Delete { key },
-                    deadline,
-                )
-                .await
-            }
+            OwnedForwardedWrite::Set { key, value, ttl } => ForwardedWrite::Set {
+                key,
+                value,
+                ttl: ttl.map(ForwardTtl::remaining),
+            },
+            OwnedForwardedWrite::Delete { key } => ForwardedWrite::Delete { key },
             OwnedForwardedWrite::HandoffSet {
                 key,
                 value,
                 ttl,
                 if_absent,
-            } => {
-                forward_on_locked_connection(
-                    node_context,
-                    &target.addr,
-                    connection,
-                    ForwardedWrite::HandoffSet {
-                        key,
-                        value,
-                        ttl: *ttl,
-                        // `false` for a decommission leave-forward (a
-                        // concurrent client write must win unconditionally —
-                        // see `ForwardedWrite::HandoffSet`'s own doc
-                        // comment); `true` for the join relay of a
-                        // re-replication put-if-absent, so the joining owner
-                        // keeps any value it already holds.
-                        if_absent: *if_absent,
-                        // Issue #295: `target`'s own token, not this
-                        // node's — see `Command::HandoffSet::token`.
-                        token: &target.token,
-                    },
-                    deadline,
-                )
-                .await
-            }
-            OwnedForwardedWrite::HandoffDelete { key } => {
-                forward_on_locked_connection(
-                    node_context,
-                    &target.addr,
-                    connection,
-                    ForwardedWrite::HandoffDelete {
-                        key,
-                        token: &target.token,
-                    },
-                    deadline,
-                )
-                .await
-            }
-            OwnedForwardedWrite::Clear(scope) => {
-                forward_on_locked_connection(
-                    node_context,
-                    &target.addr,
-                    connection,
-                    ForwardedWrite::Clear {
-                        scope,
-                        token: &target.token,
-                    },
-                    deadline,
-                )
-                .await
-            }
+            } => ForwardedWrite::HandoffSet {
+                key,
+                value,
+                ttl: ttl.map(ForwardTtl::remaining),
+                // `false` for a decommission leave-forward (a
+                // concurrent client write must win unconditionally —
+                // see `ForwardedWrite::HandoffSet`'s own doc
+                // comment); `true` for the join relay of a
+                // re-replication put-if-absent, so the joining owner
+                // keeps any value it already holds.
+                if_absent: *if_absent,
+                // Issue #295: `target`'s own token, not this
+                // node's — see `Command::HandoffSet::token`.
+                token: &target.token,
+            },
+            OwnedForwardedWrite::HandoffDelete { key } => ForwardedWrite::HandoffDelete {
+                key,
+                token: &target.token,
+            },
+            OwnedForwardedWrite::Clear(scope) => ForwardedWrite::Clear {
+                scope,
+                token: &target.token,
+            },
         }
     }
 
@@ -24122,6 +24270,179 @@ mod tests {
         cache_task.await.unwrap();
     }
 
+    /// Issue #1521 helper: a fake discovery server that serves `L` and
+    /// `T` with three members — the leaver, a "dead" survivor listed at
+    /// `127.0.0.1:1` (nothing listens there, so every dial is refused) and
+    /// a live survivor at `peer_addr` (R=1) — and acks `V`.
+    fn spawn_dead_survivor_discovery(
+        listener: TcpListener,
+        peer_addr: String,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let peer_addr = peer_addr.clone();
+                tokio::spawn(async move {
+                    let entries = [
+                        ("leaver", "127.0.0.1:2", "tok-leaver"),
+                        ("dead", "127.0.0.1:1", "tok-dead"),
+                        ("peer", peer_addr.as_str(), "tok-peer"),
+                    ];
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let Some(position) = buf.iter().position(|byte| *byte == b'\n') else {
+                            let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                            continue;
+                        };
+                        let line: Vec<u8> = buf.drain(..=position).collect();
+                        let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+                        // `T` and `V` carry a body of the two lengths in the line.
+                        let body_len: usize = if line.starts_with("T ") || line.starts_with("V ") {
+                            line.split(' ')
+                                .skip(1)
+                                .take(2)
+                                .map(|field| field.parse::<usize>().unwrap())
+                                .sum()
+                        } else {
+                            0
+                        };
+                        while buf.len() < body_len {
+                            let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                        }
+                        buf.drain(..body_len);
+                        if line == "L" || line.starts_with("T ") {
+                            let with_tokens = line != "L";
+                            let mut response = format!("N {} 1\n", entries.len()).into_bytes();
+                            for (name, addr, token) in entries {
+                                if with_tokens {
+                                    response.extend_from_slice(
+                                        format!(
+                                            "{} {} {}\n{name}{addr}{token}\n",
+                                            name.len(),
+                                            addr.len(),
+                                            token.len()
+                                        )
+                                        .as_bytes(),
+                                    );
+                                } else {
+                                    response.extend_from_slice(
+                                        format!("{} {}\n{name}{addr}\n", name.len(), addr.len())
+                                            .as_bytes(),
+                                    );
+                                }
+                            }
+                            let _ = stream.write_all(&response).await;
+                        } else if line.starts_with("V ") {
+                            let _ = stream.write_all(b"R\n").await;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// Issue #1521: a survivor that is dead but still listed by discovery
+    /// must not use up the drain budget the live entrants' keys need.
+    /// Every key bound for it used to cost three refused dials and the
+    /// 100 ms and 200 ms backoffs (about 0.3 s), so with a budget of a few
+    /// seconds the keys after the first dozen or so — including those
+    /// bound for the live survivor — were counted as left behind and never
+    /// sent. The dead address now fails fast after its first key.
+    #[tokio::test(flavor = "current_thread")]
+    async fn decommission_drain_does_not_spend_its_budget_on_a_dead_listed_survivor() {
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_task = spawn_dead_survivor_discovery(discovery_listener, peer_addr);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let node_context = NodeContext {
+            gates: Default::default(),
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: discovery_addr.clone(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx,
+            drain: DrainState::default(),
+        };
+        let before = HashRing::new(vec!["leaver".into(), "dead".into(), "peer".into()]);
+        let after = HashRing::new(vec!["dead".into(), "peer".into()]);
+        let mut to_peer = 0usize;
+        let mut to_dead = 0usize;
+        for index in 0..300u32 {
+            let k = key(format!("key-{index}").as_bytes());
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: k.clone(),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+            if before.is_owner(&k, "leaver", 1) {
+                if after.is_owner(&k, "peer", 1) {
+                    to_peer += 1;
+                } else {
+                    to_dead += 1;
+                }
+            }
+        }
+        // Enough dead-bound keys that the old per-key cost overruns the
+        // budget below many times over.
+        assert!(to_peer > 20 && to_dead > 40, "{to_peer} {to_dead}");
+
+        run_decommission(
+            node_context.clone(),
+            vec![discovery_addr],
+            Duration::from_secs(5),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            to_peer,
+            "every key bound for the live survivor must be handed off"
+        );
+
+        discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
     /// Issue #124 helper: a fake discovery server that serves `L` (the
     /// leaver plus `peer_addr`, R=1), records the name in every `V`, and —
     /// when `secret` is set — insists on the `A` handshake first, acking
@@ -28997,6 +29318,7 @@ mod tests {
             run_rereplication(
                 &node_context,
                 &before_ring,
+                &[],
                 &after_ring,
                 replication,
                 &addresses,
@@ -29109,6 +29431,7 @@ mod tests {
                     run_rereplication(
                         &node_context,
                         &before_ring,
+                        &[],
                         &after_ring,
                         replication,
                         &addresses,
@@ -29219,6 +29542,7 @@ mod tests {
         run_rereplication(
             &node_context,
             &before_ring,
+            &[],
             &after_ring,
             replication,
             &addresses,
@@ -29435,6 +29759,7 @@ mod tests {
         *node_context.active_rereplication.lock().unwrap() = Some(Arc::new(ActiveRereplication {
             abort_requested: AtomicBool::new(false),
             done: AtomicBool::new(false),
+            unfinished_baselines: Mutex::default(),
         }));
         let abort_requested = AtomicBool::new(true);
 
@@ -29516,6 +29841,7 @@ mod tests {
         let previous = Arc::new(ActiveRereplication {
             abort_requested: AtomicBool::new(false),
             done: AtomicBool::new(false),
+            unfinished_baselines: Mutex::default(),
         });
         *node_context.active_rereplication.lock().unwrap() = Some(Arc::clone(&previous));
 
@@ -30562,6 +30888,168 @@ mod tests {
         drop(node_context);
         cache_task.await.unwrap();
     }
+    /// Issue #1522: a re-replication pass superseded by a second eviction
+    /// must not drop the keys the first eviction promoted new owners for
+    /// and the pass had not reached. Node `a` holds 400 keys at R=2; the
+    /// rings go [a,b,c,d] -> [a,b,c] -> [a,c]; the first pass is held at
+    /// its first send while the second starts, then released. Every
+    /// (target, key) pair either change promoted must have been sent by
+    /// the two passes together.
+    #[tokio::test(flavor = "current_thread")]
+    async fn superseded_rereplication_pass_still_covers_the_aborted_passes_ring_change() {
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap().to_string();
+        let addr_c = listener_c.local_addr().unwrap().to_string();
+        let (frames_b, peer_b) = spawn_recording_peer(listener_b);
+        let (frames_c, peer_c) = spawn_recording_peer(listener_c);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut node_context = test_node_context(
+            "a",
+            "tk-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        node_context.shutdown_rx = shutdown_rx.clone();
+
+        let replication = 2;
+        let ring_of = |names: &[&str]| {
+            Arc::new(HashRing::new(
+                names.iter().map(|name| name.to_string()).collect(),
+            ))
+        };
+        let first = ring_of(&["a", "b", "c", "d"]);
+        let second = ring_of(&["a", "b", "c"]);
+        let third = ring_of(&["a", "c"]);
+        let mut first_change: HashSet<(String, String)> = HashSet::new();
+        let mut both_changes: HashSet<(String, String)> = HashSet::new();
+        for index in 0..400u32 {
+            let name = format!("key-{index}");
+            let key = key(name.as_bytes());
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key.clone(),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+            let hash = KeyHash::of(&key);
+            // A target the second eviction removed has nothing left to
+            // receive its copy; only the final ring's members count.
+            for target in rereplication_targets(&first, &second, hash, replication, "a") {
+                if third.nodes().contains(&target) {
+                    first_change.insert((target.clone(), name.clone()));
+                    both_changes.insert((target, name.clone()));
+                }
+            }
+            for target in rereplication_targets(&second, &third, hash, replication, "a") {
+                both_changes.insert((target, name.clone()));
+            }
+        }
+        assert!(
+            both_changes.len() > first_change.len() && !first_change.is_empty(),
+            "both changes must promote owners"
+        );
+
+        let addresses: HashMap<String, String> = [
+            ("a", "127.0.0.1:2".to_string()),
+            ("b", addr_b),
+            ("c", addr_c),
+        ]
+        .into_iter()
+        .map(|(name, addr)| (name.to_string(), addr))
+        .collect();
+        let tokens: HashMap<String, String> = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| (name.to_string(), format!("tok-{name}")))
+            .collect();
+
+        // Held, the first pass connects and stops before its first send.
+        node_context.gates.pass.hold();
+        let first_pass = tokio::spawn(run_superseding_rereplication(
+            node_context.clone(),
+            Arc::clone(&first),
+            Arc::clone(&second),
+            replication,
+            addresses.clone(),
+            tokens.clone(),
+            shutdown_rx.clone(),
+        ));
+        let first_state = timeout(Duration::from_secs(30), async {
+            loop {
+                let installed = node_context.active_rereplication.lock().unwrap().clone();
+                if let Some(state) = installed {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first pass installs itself");
+        let second_pass = tokio::spawn(run_superseding_rereplication(
+            node_context.clone(),
+            Arc::clone(&second),
+            Arc::clone(&third),
+            replication,
+            addresses,
+            tokens,
+            shutdown_rx,
+        ));
+        // The second pass has asked the first to stop.
+        timeout(Duration::from_secs(30), async {
+            while !first_state.abort_requested.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second pass asks the first to stop");
+        node_context.gates.pass.release();
+        timeout(Duration::from_secs(30), async {
+            first_pass.await.unwrap();
+            second_pass.await.unwrap();
+        })
+        .await
+        .expect("both passes finish");
+
+        let mut sent: HashSet<(String, String)> = HashSet::new();
+        for (peer, frames) in [("b", &frames_b), ("c", &frames_c)] {
+            for frame in frames.lock().unwrap().iter() {
+                let header_end = frame.iter().position(|byte| *byte == b'\n').unwrap();
+                let header = String::from_utf8_lossy(&frame[..header_end]).into_owned();
+                // `U <ns-len> <key-len> <value-len> <token-len> ..`, body
+                // token, namespace, key, value.
+                let lengths: Vec<usize> = header
+                    .split(' ')
+                    .skip(1)
+                    .filter_map(|field| field.parse().ok())
+                    .collect();
+                let body = &frame[header_end + 1..];
+                let name_start = lengths[3] + lengths[0];
+                let name = &body[name_start..name_start + lengths[1]];
+                sent.insert((peer.to_string(), String::from_utf8_lossy(name).into_owned()));
+            }
+        }
+        let mut missing: Vec<_> = both_changes.difference(&sent).collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "{} of {} (target, key) pairs were never sent, e.g. {:?}",
+            missing.len(),
+            both_changes.len(),
+            &missing[..missing.len().min(5)]
+        );
+
+        peer_b.abort();
+        peer_c.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
 
     #[test]
     fn take_over_rereplication_slot_never_hands_the_same_previous_to_two_callers() {
@@ -30583,6 +31071,7 @@ mod tests {
                 Arc::new(ActiveRereplication {
                     abort_requested: AtomicBool::new(false),
                     done: AtomicBool::new(false),
+                    unfinished_baselines: Mutex::default(),
                 })
             })
             .collect();
@@ -32485,5 +32974,154 @@ mod tests {
         fake_discovery.abort();
 
         assert_join_then_heartbeats(&received.lock().unwrap(), 8356);
+    }
+
+    /// The header line of the frame `write` goes out as to a forward target
+    /// right now; `attempt` sends exactly what `frame` returns.
+    fn frame_header(write: &OwnedForwardedWrite) -> String {
+        let target = ForwardTarget {
+            addr: "127.0.0.1:0".to_string(),
+            connection: Arc::new(AsyncMutex::new(None)),
+            token: "tok-target".to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
+        };
+        let message = match write.frame(&target) {
+            ForwardedWrite::Set { key, value, ttl } => set_message(key, value, ttl),
+            ForwardedWrite::HandoffSet {
+                key,
+                value,
+                ttl,
+                if_absent,
+                token,
+            } => handoff_message(key, value, ttl, if_absent, token),
+            _ => unreachable!("only sets are built here"),
+        };
+        String::from_utf8_lossy(&message)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    fn queued_sets(ttl: Option<Duration>) -> (OwnedForwardedWrite, OwnedForwardedWrite) {
+        let ttl = ForwardTtl::stamp(ttl);
+        (
+            OwnedForwardedWrite::Set {
+                key: key(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl,
+            },
+            OwnedForwardedWrite::HandoffSet {
+                key: key(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl,
+                if_absent: false,
+            },
+        )
+    }
+
+    /// Issue #1534: the TTL goes out as what is left of it when the write
+    /// is sent, not as the number of seconds fixed when it was made.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_forwarded_set_sends_the_ttl_left_after_its_wait_in_the_queue() {
+        let (set, handoff) = queued_sets(Some(Duration::from_secs(30)));
+        assert_eq!(frame_header(&set), "S 4 5 30");
+        assert_eq!(frame_header(&handoff), "U 0 4 5 10 30");
+
+        // Waited behind a slow target for 12 s.
+        tokio::time::advance(Duration::from_secs(12)).await;
+        assert_eq!(frame_header(&set), "S 4 5 18");
+        assert_eq!(frame_header(&handoff), "U 0 4 5 10 18");
+
+        // A retry after a failed attempt counts the time that took too.
+        tokio::time::advance(Duration::from_millis(10_500)).await;
+        assert_eq!(frame_header(&set), "S 4 5 8");
+        assert_eq!(frame_header(&handoff), "U 0 4 5 10 8");
+    }
+
+    /// Issue #1534: a TTL that ran out while the write waited goes out as
+    /// `0` (a `U` deletes, an `S` stores the key already expired) instead
+    /// of as the full TTL, and a write without a TTL is untouched.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_forwarded_set_whose_ttl_ran_out_in_the_queue_goes_out_as_zero() {
+        let (set, handoff) = queued_sets(Some(Duration::from_secs(5)));
+        let (no_ttl_set, no_ttl_handoff) = queued_sets(None);
+
+        tokio::time::advance(Duration::from_secs(12)).await;
+
+        assert_eq!(frame_header(&set), "S 4 5 0");
+        assert_eq!(frame_header(&handoff), "U 0 4 5 10 0");
+        assert_eq!(frame_header(&no_ttl_set), "S 4 5");
+        assert_eq!(frame_header(&no_ttl_handoff), "U 0 4 5 10");
+    }
+
+    /// Issue #1533: a discovery server that accepts TCP and never answers the
+    /// auth exchange must not hold SIGTERM shutdown up to the auth timeout
+    /// (`OUTBOUND_IO_TIMEOUT`). Before the fix the exchange was not raced
+    /// against `shutdown_rx` and `run` awaited `cache_task` (which needs the
+    /// heartbeat task's `request_tx` clone dropped) before the bounded
+    /// heartbeat join, so `run` returned only when the 10 s timeout fired.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_is_not_held_up_by_a_discovery_that_never_answers_auth() {
+        let discovery = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery.local_addr().unwrap().to_string();
+        // Read the auth bytes so the node is known to be parked in the ack
+        // read, then hold the connection open without answering.
+        let (auth_seen_tx, auth_seen_rx) = oneshot::channel();
+        let held = tokio::spawn(async move {
+            let (mut connection, _) = discovery.accept().await.unwrap();
+            let mut buffer = [0u8; 64];
+            let _ = connection.read(&mut buffer).await;
+            let _ = auth_seen_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let node_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_port = node_listener.local_addr().unwrap().port();
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let signal_for_hook = Arc::clone(&signal);
+        let hooks = RunHooks {
+            shutdown: Box::new(move || {
+                let signal = Arc::clone(&signal_for_hook);
+                Box::pin(async move {
+                    signal.notified().await;
+                    Ok(())
+                })
+            }),
+            node_name: Some("n".to_string()),
+            listener: Some(node_listener),
+            gates: Default::default(),
+        };
+        let node = tokio::spawn(run_with_hooks(
+            "127.0.0.1:0",
+            Some(HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: node_port,
+                interval: Duration::from_millis(20),
+                auth_secret: Some(Bytes::from_static(b"s")),
+                tls_connector: None,
+            }),
+            None,
+            None,
+            MAX_CACHE_MEMORY_BYTES,
+            None,
+            Duration::ZERO,
+            ConnectionLimits::default(),
+            Vec::new(),
+            hooks,
+        ));
+        timeout(Duration::from_secs(5), auth_seen_rx)
+            .await
+            .expect("the node never sent its auth handshake")
+            .unwrap();
+
+        signal.notify_one();
+        // Well under `OUTBOUND_IO_TIMEOUT` (10 s), which is what the
+        // unraced exchange would otherwise run to.
+        let result = timeout(Duration::from_secs(3), node)
+            .await
+            .expect("shutdown was held up by the unanswered auth exchange");
+        result.unwrap().unwrap();
+        held.abort();
     }
 }
