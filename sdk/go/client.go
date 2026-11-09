@@ -3341,6 +3341,13 @@ func (c *Client) slotConnection(slot string) (*connection, error) {
 		return current, nil
 	}
 
+	// A request whose connection Close() poisoned lands here to redial: it
+	// must fail as closed at once, not spend a connect deadline dialing a
+	// node only to have the post-dial check below discard the result.
+	if c.IsClosed() {
+		return nil, ErrClosed
+	}
+
 	// Per-address reconnect cooldown (see Client.redialCooldowns' own doc
 	// comment): an address whose dial just failed stays "down" for
 	// reconnectCooldown, so a burst of requests routed to it — or one
