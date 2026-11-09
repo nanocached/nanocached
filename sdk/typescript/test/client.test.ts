@@ -5370,6 +5370,41 @@ describe("NanocachedClient non-idempotent retry on connection loss (issue #225)"
     }
   });
 
+  it("incr: reroutes when a refresh removes the primary while the redial to it is in flight", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "incr-redial-loses-race-with-refresh";
+      const { primary, replica } = cluster.ownerOf(key);
+      await client.set(key, "10"); // on both owners
+
+      primary.mock.dropConnections();
+      await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+
+      // The redial to the primary completes, but a refresh that no longer
+      // lists the primary lands before the caller sees the connection.
+      cluster.discovery.setNodes([{ name: replica.name, address: replica.mock.address }]);
+      const original = (client as any).ensureConnected.bind(client);
+      let raced = false;
+      (client as any).ensureConnected = async (...args: unknown[]) => {
+        const connection = await original(...args);
+        if (!raced) {
+          raced = true;
+          await (client as any).maybeRefreshNodeList({ force: true });
+        }
+        return connection;
+      };
+
+      assert.equal(await client.incr(key, 5), 15, "incr must refresh and reroute to the new primary");
+      assert.ok(raced, "the redial must have raced the refresh");
+      assert.equal(replica.mock.incrCount(), 1);
+      assert.equal(primary.mock.incrCount(), 0, "the removed primary never saw the request");
+    } finally {
+      await client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
   it("incr: does not replay through the outer withWrongNodeRetry when the primary applied it and only the reply was lost", async () => {
     const cluster = await startReplicatedCluster();
     const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
