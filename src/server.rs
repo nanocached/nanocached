@@ -2491,8 +2491,11 @@ async fn reject_request(stream: &mut ServerStream, reason: String) -> io::Error 
 /// hold a connection permit for that long.
 async fn reject_oversized_request(stream: &mut ServerStream, reason: String) -> io::Error {
     let error = reject_request(stream, reason).await;
-    let _ = stream.shutdown().await;
+    // The half-close is inside the window too: over TLS it first flushes
+    // the pending records, which blocks for as long as a peer that has
+    // stopped reading keeps the send buffer full.
     let drain = async {
+        let _ = stream.shutdown().await;
         let mut sink = [0_u8; 8192];
         let mut discarded = 0;
         while discarded < MAX_REQUEST_SIZE {
