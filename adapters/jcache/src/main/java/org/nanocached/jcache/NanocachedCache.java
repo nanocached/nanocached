@@ -80,7 +80,11 @@ import org.nanocached.NanocachedException;
  *       fires no per-entry events at all — enumerating what a bulk
  *       {@code CLEAR} actually removed would need a client-side key
  *       registry this adapter does not keep, so it behaves exactly like
- *       {@link #clear()}.
+ *       {@link #clear()}. {@link #put}, {@link #putAll} and the
+ *       single-argument {@link #remove(Object)} and {@link
+ *       #replace(Object, Object)} decode the previous value only when a
+ *       listener is registered, and fire without an old value if it can no
+ *       longer be deserialized rather than fail a write that has landed.
  * </ul>
  *
  * <p><b>{@code getAndPut}/{@code getAndReplace}/{@code getAndRemove}/
@@ -478,14 +482,14 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             if (existing.isPresent()) {
                 namespace.delete(keyBytes);
                 statistics.recordRemove();
-                fireRemoved(key, decode(existing.get().value()));
+                fireRemovedFromBytes(key, existing.get().value());
             }
             return;
         }
         namespace.set(keyBytes, valueBytes, ttl.getAsLong());
         statistics.recordPut();
         if (existing.isPresent()) {
-            fireUpdated(key, value, decode(existing.get().value()));
+            fireUpdatedFromBytes(key, value, existing.get().value());
         } else {
             fireCreated(key, value);
         }
@@ -620,7 +624,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             boolean removed = namespace.delete(keyBytes);
             if (removed) {
                 statistics.recordRemove();
-                existing.ifPresent(bytes -> fireRemoved(key, decode(bytes)));
+                existing.ifPresent(bytes -> fireRemovedFromBytes(key, bytes));
             }
             return removed;
         }
@@ -708,7 +712,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 if (present) {
                     namespace.delete(wireKeys[i]);
                     statistics.recordRemove();
-                    fireRemoved(keys.get(i), decode(existing[i]));
+                    fireRemovedFromBytes(keys.get(i), existing[i]);
                 }
                 continue;
             }
@@ -727,7 +731,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             for (int i : positions) {
                 statistics.recordPut();
                 if (existing[i] != null) {
-                    fireUpdated(keys.get(i), values.get(i), decode(existing[i]));
+                    fireUpdatedFromBytes(keys.get(i), values.get(i), existing[i]);
                 } else {
                     fireCreated(keys.get(i), values.get(i));
                 }
@@ -834,7 +838,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         boolean deleted = namespace.delete(keyBytes);
         if (deleted) {
             statistics.recordRemove();
-            raw.ifPresent(bytes -> fireRemoved(key, decode(bytes)));
+            raw.ifPresent(bytes -> fireRemovedFromBytes(key, bytes));
         }
         return deleted;
     }
@@ -1067,6 +1071,53 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
     private void fireRemoved(K key, V oldValue) {
         fire(EventType.REMOVED, key, null, oldValue, true);
+    }
+
+    private void fireRemovedWithoutOldValue(K key) {
+        fire(EventType.REMOVED, key, null, null, false);
+    }
+
+    /** {@link #fireUpdated} for a write that did not read the old value
+     * for its own sake ({@code put}, {@code putAll}): the previous bytes
+     * are decoded only when a listener is registered, and bytes that can
+     * no longer be deserialized (a changed {@code serialVersionUID}, a
+     * class removed by a redeploy, a serial-filter rejection) fire the
+     * event without an old value instead of failing a write that has
+     * already landed. */
+    private void fireUpdatedFromBytes(K key, V value, byte[] oldBytes) {
+        if (listeners.isEmpty()) {
+            return;
+        }
+        V oldValue;
+        try {
+            oldValue = decode(oldBytes);
+        } catch (RuntimeException e) {
+            logUndecodableOldValue(key, e);
+            fireUpdatedWithoutOldValue(key, value);
+            return;
+        }
+        fireUpdated(key, value, oldValue);
+    }
+
+    /** As {@link #fireUpdatedFromBytes}, for {@code Removed}. */
+    private void fireRemovedFromBytes(K key, byte[] oldBytes) {
+        if (listeners.isEmpty()) {
+            return;
+        }
+        V oldValue;
+        try {
+            oldValue = decode(oldBytes);
+        } catch (RuntimeException e) {
+            logUndecodableOldValue(key, e);
+            fireRemovedWithoutOldValue(key);
+            return;
+        }
+        fireRemoved(key, oldValue);
+    }
+
+    private void logUndecodableOldValue(K key, RuntimeException e) {
+        System.err.println("nanocached-jcache: previous value of " + key + " in " + name
+                + " cannot be deserialized; firing the event without an old value: " + e);
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
