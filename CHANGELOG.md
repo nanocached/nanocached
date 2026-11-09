@@ -25,6 +25,17 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node` (built with the `trace` feature, which the released
+  images are not): TRACE lines were written to stderr with a blocking
+  `eprintln!` on the request path, so a log pipe nobody was reading (a
+  collector under pressure) stopped the whole node once it was full: with
+  stderr unread, a standalone node answered 571 traced sets and then no
+  request at all, traced or not. The lines now go through a bounded queue
+  to a writer thread; those that do not fit are dropped and counted, a
+  `TRACE dropped lines=<n>` line reports them in the stream and at
+  shutdown, and `incrtrace.py` leaves its value-from-nowhere assertion at 0
+  for logs that contain one (#1623).
+
 - `nanocached-node`: the decommission drain wrote a live entrant off for
   30 s after one key was refused three times, and the re-replication pass
   did the same to a target. The write-off was meant for a node that is down but
