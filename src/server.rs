@@ -2246,6 +2246,15 @@ pub(crate) async fn run_with_hooks(
     // copy), so the original binding still holds a `request_tx` here.
     drop(node_context);
 
+    // The heartbeat task holds the last `request_tx` clones (its
+    // `NodeContext`), so `cache_task` cannot finish before it ends. Join it
+    // first, bounded, so an unresponsive discovery server costs at most
+    // `HEARTBEAT_SHUTDOWN_WAIT` instead of an unbounded `cache_task.await`
+    // in front of the bounded join (issue #1533).
+    if let Some(heartbeat_task) = heartbeat_task {
+        join_heartbeat_task(heartbeat_task, HEARTBEAT_SHUTDOWN_WAIT).await?;
+    }
+
     cache_task
         .await
         .map_err(|error| io::Error::other(format!("cache task failed: {error}")))?;
@@ -2258,10 +2267,6 @@ pub(crate) async fn run_with_hooks(
         reclaim_task
             .await
             .map_err(|error| io::Error::other(format!("reclaim task failed: {error}")))?;
-    }
-
-    if let Some(heartbeat_task) = heartbeat_task {
-        join_heartbeat_task(heartbeat_task, HEARTBEAT_SHUTDOWN_WAIT).await?;
     }
 
     if let Some(metrics_task) = metrics_task {
@@ -5239,14 +5244,19 @@ async fn register_with_discovery(
                         // Bounded so a discovery server that accepts TCP but
                         // never drains can't wedge this task forever (and,
                         // via `heartbeat_task.await`, hang shutdown).
-                        let exchange = timeout(OUTBOUND_IO_TIMEOUT, async {
-                            stream.write_all(&auth).await?;
-                            stream.flush().await?;
-                            let mut ack = [0u8; 3];
-                            stream.read_exact(&mut ack).await?;
-                            io::Result::Ok(ack)
-                        })
-                        .await;
+                        // Also cut short by shutdown (issue #1533): the
+                        // bound alone is `OUTBOUND_IO_TIMEOUT`, which a
+                        // SIGTERM would otherwise wait out in full.
+                        let exchange = tokio::select! {
+                            _ = shutdown_rx.changed() => return,
+                            result = timeout(OUTBOUND_IO_TIMEOUT, async {
+                                stream.write_all(&auth).await?;
+                                stream.flush().await?;
+                                let mut ack = [0u8; 3];
+                                stream.read_exact(&mut ack).await?;
+                                io::Result::Ok(ack)
+                            }) => result,
+                        };
                         // Only an explicit `Ed` is a rejected secret. A
                         // dropped connection or garbage instead (issue #68)
                         // is most often a node speaking plaintext to a
@@ -5297,9 +5307,14 @@ async fn register_with_discovery(
                 let registration = if sending_join { &join } else { &announce };
 
                 let registration_sent = authenticated
-                    && infra::write_all_within(&mut stream, registration, OUTBOUND_IO_TIMEOUT)
-                        .await
-                        .is_ok();
+                    && {
+                        // Raced with shutdown like the reads below (issue #1533).
+                        let written = tokio::select! {
+                            _ = shutdown_rx.changed() => return,
+                            result = infra::write_all_within(&mut stream, registration, OUTBOUND_IO_TIMEOUT) => result,
+                        };
+                        written.is_ok()
+                    };
                 if registration_sent {
                     // For `J`, staged node join: this connection is held open by
                     // discovery (no idle timeout applies) until this node
@@ -5387,10 +5402,11 @@ async fn register_with_discovery(
                                 pending_joiner.as_ref().map(|(name, _)| name.as_str()),
                             );
 
-                            if infra::write_all_within(&mut stream, &heartbeat, OUTBOUND_IO_TIMEOUT)
-                                .await
-                                .is_err()
-                            {
+                            let heartbeat_written = tokio::select! {
+                                _ = shutdown_rx.changed() => return,
+                                result = infra::write_all_within(&mut stream, &heartbeat, OUTBOUND_IO_TIMEOUT) => result,
+                            };
+                            if heartbeat_written.is_err() {
                                 break;
                             }
 
@@ -32698,5 +32714,74 @@ mod tests {
         fake_discovery.abort();
 
         assert_join_then_heartbeats(&received.lock().unwrap(), 8356);
+    }
+
+    /// Issue #1533: a discovery server that accepts TCP and never answers the
+    /// auth exchange must not hold SIGTERM shutdown up to the auth timeout
+    /// (`OUTBOUND_IO_TIMEOUT`). Before the fix the exchange was not raced
+    /// against `shutdown_rx` and `run` awaited `cache_task` (which needs the
+    /// heartbeat task's `request_tx` clone dropped) before the bounded
+    /// heartbeat join, so `run` returned only when the 10 s timeout fired.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_is_not_held_up_by_a_discovery_that_never_answers_auth() {
+        let discovery = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery.local_addr().unwrap().to_string();
+        // Read the auth bytes so the node is known to be parked in the ack
+        // read, then hold the connection open without answering.
+        let (auth_seen_tx, auth_seen_rx) = oneshot::channel();
+        let held = tokio::spawn(async move {
+            let (mut connection, _) = discovery.accept().await.unwrap();
+            let mut buffer = [0u8; 64];
+            let _ = connection.read(&mut buffer).await;
+            let _ = auth_seen_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let node_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_port = node_listener.local_addr().unwrap().port();
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let signal_for_hook = Arc::clone(&signal);
+        let hooks = RunHooks {
+            shutdown: Box::new(move || {
+                let signal = Arc::clone(&signal_for_hook);
+                Box::pin(async move {
+                    signal.notified().await;
+                    Ok(())
+                })
+            }),
+            node_name: Some("n".to_string()),
+            listener: Some(node_listener),
+            gates: Default::default(),
+        };
+        let node = tokio::spawn(run_with_hooks(
+            "127.0.0.1:0",
+            Some(HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: node_port,
+                interval: Duration::from_millis(20),
+                auth_secret: Some(Bytes::from_static(b"s")),
+                tls_connector: None,
+            }),
+            None,
+            None,
+            MAX_CACHE_MEMORY_BYTES,
+            None,
+            Duration::ZERO,
+            ConnectionLimits::default(),
+            Vec::new(),
+            hooks,
+        ));
+        timeout(Duration::from_secs(5), auth_seen_rx)
+            .await
+            .expect("the node never sent its auth handshake")
+            .unwrap();
+
+        signal.notify_one();
+        // Well under `OUTBOUND_IO_TIMEOUT` (10 s), which is what the
+        // unraced exchange would otherwise run to.
+        let result = timeout(Duration::from_secs(3), node)
+            .await
+            .expect("shutdown was held up by the unanswered auth exchange");
+        result.unwrap().unwrap();
+        held.abort();
     }
 }
