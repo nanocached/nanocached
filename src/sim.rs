@@ -896,6 +896,8 @@ struct WindowOutcome {
     /// mirrors writes to B), D's join displaces B, D's eviction gives
     /// them back to B.
     keys: usize,
+    /// Of those, the keys D took, how many B held once the eviction's
+    /// copies had landed (before D joined).
     b_held_after_the_eviction: usize,
     /// Keys B does not hold once it owns them again and the TTL a touch
     /// gave them in A's window has passed: the mirrored touch revived B's
@@ -983,15 +985,15 @@ async fn scenario_973() -> WindowOutcome {
     // A adopts the two-member ring at its next heartbeat and runs the
     // pass; wait for every promoted copy to land on B.
     let mut waited = Duration::ZERO;
+    let mut held_on_b = std::collections::HashSet::new();
     loop {
-        let mut held = 0;
+        held_on_b.clear();
         for key in &chosen {
             if client.holds(b, key).await {
-                held += 1;
+                held_on_b.insert(key.clone());
             }
         }
-        out.b_held_after_the_eviction = held;
-        if held == chosen.len() || waited >= Duration::from_secs(15) {
+        if held_on_b.len() == chosen.len() || waited >= Duration::from_secs(15) {
             break;
         }
         run_for(Duration::from_millis(250)).await;
@@ -1013,6 +1015,9 @@ async fn scenario_973() -> WindowOutcome {
         })
         .collect();
     out.keys = chosen.len();
+    // Counted over the narrowed list: the keys the rest of the scenario is
+    // about, and so the ones B must have held for it to prove anything.
+    out.b_held_after_the_eviction = chosen.iter().filter(|key| held_on_b.contains(*key)).count();
     run_for(Duration::from_secs(5)).await;
     // A client with the published ring gives every key a TTL ...
     for key in &chosen {
@@ -1441,6 +1446,11 @@ async fn a_relayed_copy_landing_after_a_forwarded_expiry_does_not_revive_the_key
 struct LateCopyOutcome {
     /// Keys A and C owned, that D takes from B once C is gone.
     keys: usize,
+    /// Of those, the keys whose pass copy reached B after B took its
+    /// handoff snapshot: B held none of them before the pass was released
+    /// and held them before its handoff finished. Zero means the scenario
+    /// did not reach the state it is about.
+    late_copies: usize,
     /// Keys B serves once D is gone and B owns them again: the pass copy
     /// that landed on B after its handoff snapshot was never marked, so
     /// it outlived the join, and the client's expiry on the owners never
@@ -1506,13 +1516,27 @@ async fn scenario_975_late_copy() -> LateCopyOutcome {
         .collect();
     let mut out = LateCopyOutcome {
         keys: chosen.len(),
+        late_copies: 0,
         b_revived: 0,
         a_kept: 0,
     };
+    // B owns none of these yet.
+    let mut held_before = 0;
+    for key in &chosen {
+        if client.holds(b, key).await {
+            held_before += 1;
+        }
+    }
+    assert_eq!(held_before, 0, "B held keys before the pass: {out:?}");
     // The pass copies land on B after its snapshot, while its handoff is
     // in flight.
     na.gates.pass.release();
     run_for(Duration::from_secs(1)).await;
+    for key in &chosen {
+        if client.holds(b, key).await {
+            out.late_copies += 1;
+        }
+    }
     nb.gates.transfer.release();
     run_until_members(dport, 3).await;
     // Past the join's confirmation on B and the sweep that follows it.
@@ -1552,6 +1576,10 @@ async fn a_pass_copy_landing_after_the_handoff_snapshot_is_marked_like_the_keys_
     let out = scenario_975_late_copy().await;
     eprintln!("{out:?}");
     assert!(out.keys > 0, "nothing to check: {out:?}");
+    assert!(
+        out.late_copies > 0,
+        "nothing to check, no pass copy reached B after its snapshot: {out:?}"
+    );
     assert_eq!(out.a_kept, 0, "the expiry did not take on A: {out:?}");
     assert_eq!(
         out.b_revived, 0,
