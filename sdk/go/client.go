@@ -60,6 +60,16 @@ import (
 // on use).
 const nodeListStaleAfter = 30 * time.Second
 
+// forcedRefreshMinInterval is the minimum time between two forced node-list
+// refreshes. While discovery still lists a dead node (its liveness window),
+// every operation whose primary is that node fails and forces a refresh
+// that installs the same list; without a floor, a sequential caller opens
+// one discovery connection per failed operation. A forced caller that finds
+// a refresh completed within this window reuses its result, and callers that
+// waited behind an older refresh share one follow-up that starts once the
+// window has passed.
+const forcedRefreshMinInterval = 200 * time.Millisecond
+
 // keepaliveKey is reserved by the SDKs precisely so a real application
 // key can never collide with it: a leading 0x00 already keeps it out of
 // any UTF-8 key space, and "nanocached-keepalive" makes an accidental
@@ -541,6 +551,9 @@ type Client struct {
 	// already in flight fetched the roster from before the failure (issue
 	// #1247).
 	lastFetchStarted time.Time
+	// When the last refresh (forced or not) finished, successfully or not:
+	// the point forcedRefreshMinInterval is measured from.
+	lastRefreshEnd time.Time
 }
 
 // ── open-connection tracking (forgotten-close detection) ────────────
@@ -3519,7 +3532,13 @@ func (c *Client) maybeRefresh(force bool) {
 		return
 	}
 
-	c.refreshMu.Lock()
+	// A caller that has to queue behind another refresh waited out a
+	// refresh that was in flight when it arrived.
+	waited := false
+	if !c.refreshMu.TryLock() {
+		waited = true
+		c.refreshMu.Lock()
+	}
 	defer c.refreshMu.Unlock()
 	c.mu.Lock()
 	// Single-flight: N callers that hit a dead node at the same time
@@ -3528,11 +3547,34 @@ func (c *Client) maybeRefresh(force bool) {
 	// the last caller waited for all of them. A forced caller now reuses
 	// a refresh that started after it observed its failure.
 	skip = (!force && time.Since(c.lastFetch) < nodeListStaleAfter) || (force && !c.lastFetchStarted.Before(observed))
+	// Minimum interval between forced refreshes (issue #1531). A caller that
+	// found the gate free and a refresh finished within the window reuses
+	// it: the roster it installed is the freshest discovery will hand out at
+	// this rate. A caller that waited behind an older refresh cannot (that
+	// refresh began before its failure), so its follow-up starts once the
+	// window has passed; the callers queued behind it then find a refresh
+	// that started after their failure and share it.
+	var wait time.Duration
+	if force && !skip {
+		wait = forcedRefreshMinInterval - time.Since(c.lastRefreshEnd)
+	}
 	c.mu.Unlock()
 	if skip {
 		return
 	}
+	if wait > 0 {
+		if !waited {
+			return
+		}
+		time.Sleep(wait)
+		if c.IsClosed() {
+			return
+		}
+	}
 	c.refreshNodeList()
+	c.mu.Lock()
+	c.lastRefreshEnd = time.Now()
+	c.mu.Unlock()
 }
 
 func (c *Client) refreshNodeList() {
