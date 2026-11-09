@@ -4553,6 +4553,46 @@ public class NanocachedClientTests
         Assert.False(bare.GetType().IsGenericType);
     }
 
+    // Issue #1528: a stored value need not be valid UTF-8. Decoding the
+    // partial values strictly threw DecoderFallbackException out of the
+    // catch that was re-throwing the Partial* exception, so the caller lost
+    // the exception and every other resolved value.
+    [Fact]
+    public async Task GetManyKeepsThePartialExceptionWhenAResolvedValueIsNotValidUtf8()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        List<string> keys = Enumerable.Range(0, 401).Select(i => "k" + i).ToList();
+        await client.SetAsync(Bytes("k0"), new byte[] { 0xff, 0xfe, 0x80 });
+        await client.SetAsync("k1", "text");
+
+        node.FailMultiGetFromRequestOnward(2);
+        PartialConnectionLostException<Dictionary<string, string>> failure =
+            await Assert.ThrowsAsync<PartialConnectionLostException<Dictionary<string, string>>>(
+                () => client.GetManyAsync(keys));
+
+        Assert.Equal(new Dictionary<string, string> { ["k1"] = "text" }, failure.PartialValues);
+        Assert.NotNull(failure.InnerException);
+    }
+
+    [Fact]
+    public async Task GetManyAndTouchKeepsThePartialExceptionWhenAResolvedValueIsNotValidUtf8()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        List<string> keys = Enumerable.Range(0, 401).Select(i => "k" + i).ToList();
+        await client.SetAsync(Bytes("k0"), new byte[] { 0xff, 0xfe, 0x80 });
+        await client.SetAsync("k1", "text");
+
+        node.FailMultiTouchFromRequestOnward(2);
+        PartialConnectionLostException<Dictionary<string, string>> failure =
+            await Assert.ThrowsAsync<PartialConnectionLostException<Dictionary<string, string>>>(
+                () => client.GetManyAndTouchAsync(keys, 30));
+
+        Assert.Equal(new Dictionary<string, string> { ["k1"] = "text" }, failure.PartialValues);
+        Assert.NotNull(failure.InnerException);
+    }
+
     [Fact]
     public async Task BatchTouchEndsOnAWholeFrameWrongNodeOnASingleNode()
     {

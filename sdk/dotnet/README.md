@@ -251,7 +251,11 @@ If some keys' every owner was unreachable, `GetManyAsync`/
 `GetManyBytesAsync` throw `PartialConnectionLostException<T>`
 (`PartialValues` the keys that did resolve, `InnerException` the last
 connection error), or the bare connection error when nothing resolved —
-a connection loss is never reported as a wrong-node answer.
+a connection loss is never reported as a wrong-node answer. In the string
+variants a resolved value that is not valid UTF-8 is left out of
+`PartialValues` instead of replacing the exception with a
+`DecoderFallbackException`; the `...BytesAsync` variants still return its
+exact bytes.
 `SetManyAsync`/`SetManyBytesAsync` have nothing to return on success, so
 they just throw a plain `WrongNodeException` on the wrong-node condition
 — every other key in the batch was still stored; a key whose primary

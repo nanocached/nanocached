@@ -1363,12 +1363,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         }
         catch (PartialWrongNodeException<Dictionary<string, byte[]>> partial)
         {
-            throw new PartialWrongNodeException<Dictionary<string, string>>(DecodeMany(partial.PartialValues));
+            throw new PartialWrongNodeException<Dictionary<string, string>>(DecodePartial(partial.PartialValues));
         }
         catch (PartialConnectionLostException<Dictionary<string, byte[]>> partial)
         {
             throw new PartialConnectionLostException<Dictionary<string, string>>(
-                DecodeMany(partial.PartialValues), partial.InnerException!);
+                DecodePartial(partial.PartialValues), partial.InnerException!);
         }
     }
 
@@ -1378,6 +1378,33 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         foreach ((string key, byte[] value) in raw)
         {
             values[key] = StrictUtf8.GetString(value);
+        }
+        return values;
+    }
+
+    /// <summary>Decodes the values a partial-result exception carries.
+    /// Decoding is as strict as the success path's, but a stored value
+    /// need not be valid UTF-8 (nothing on the write side enforces it), and
+    /// a <see cref="DecoderFallbackException"/> thrown here would replace
+    /// the wrong-node or connection-loss exception the caller needs, along
+    /// with every other value already resolved. So a value the strict
+    /// decoder rejects is left out rather than handed back with
+    /// replacement characters (a cache must never return a value it did
+    /// not store); the <c>...BytesAsync</c> variants still have the exact
+    /// bytes.</summary>
+    private static Dictionary<string, string> DecodePartial(Dictionary<string, byte[]> raw)
+    {
+        var values = new Dictionary<string, string>(raw.Count);
+        foreach ((string key, byte[] value) in raw)
+        {
+            try
+            {
+                values[key] = StrictUtf8.GetString(value);
+            }
+            catch (DecoderFallbackException)
+            {
+                continue;
+            }
         }
         return values;
     }
@@ -2245,17 +2272,17 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         }
         catch (PartialWrongNodeException<Dictionary<string, byte[]>> partial)
         {
-            throw new PartialWrongNodeException<Dictionary<string, string>>(DecodeMany(partial.PartialValues));
+            throw new PartialWrongNodeException<Dictionary<string, string>>(DecodePartial(partial.PartialValues));
         }
         catch (PartialServerTooOldException<Dictionary<string, byte[]>> partial)
         {
             throw new PartialServerTooOldException<Dictionary<string, string>>(
-                DecodeMany(partial.PartialValues), partial.InnerException!);
+                DecodePartial(partial.PartialValues), partial.InnerException!);
         }
         catch (PartialConnectionLostException<Dictionary<string, byte[]>> partial)
         {
             throw new PartialConnectionLostException<Dictionary<string, string>>(
-                DecodeMany(partial.PartialValues), partial.InnerException!, partial.Message);
+                DecodePartial(partial.PartialValues), partial.InnerException!, partial.Message);
         }
     }
 
