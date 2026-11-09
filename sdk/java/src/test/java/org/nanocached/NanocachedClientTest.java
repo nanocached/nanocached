@@ -582,6 +582,29 @@ class NanocachedClientTest {
         }
     }
 
+    // A value that is not valid UTF-8 among the keys a partial getMany has
+    // already resolved must not turn the partial exception into an
+    // UncheckedIOException: the caller would lose the error class and every
+    // other resolved value. The undecodable value is left out of the map.
+    @Test
+    void getManyChunkedConnectionFailureSurvivesANonUtf8ResolvedValue() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                List<String> keys = new ArrayList<>();
+                for (int i = 0; i < 401; i++) keys.add("k" + i);
+                client.set("k0", "first-chunk-value");
+                client.set("k1".getBytes(StandardCharsets.UTF_8), new byte[] {(byte) 0xFF, (byte) 0xFE, (byte) 0x80});
+
+                node.closeAfterNextMultiGet();
+                NanocachedException.PartialConnectionLostStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class, () -> client.getMany(keys));
+
+                assertEquals(Map.of("k0", "first-chunk-value"), failure.partialValues,
+                        "the binary value is left out, the rest of the resolved values survive");
+            }
+        }
+    }
+
     @Test
     void setManyBytesChunkedConnectionFailureCarriesFirstChunksSucceededIndices() throws Exception {
         try (MockNode node = new MockNode()) {
@@ -2026,6 +2049,34 @@ class NanocachedClientTest {
                 Map<String, String> resolved = new java.util.LinkedHashMap<>();
                 for (String key : primaryB) resolved.put(key, values.get(key));
                 assertEquals(resolved, partial.partialValues);
+            }
+        }
+    }
+
+    @Test
+    void getManyAndGetManyAndTouchKeepWrongNodeWhenAResolvedValueIsNotUtf8() throws Exception {
+        for (boolean touch : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                    List<String> primaryA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                    List<String> primaryB = keysWhosePrimaryIs(NAMES.get(1), 3);
+                    List<String> all = concat(primaryA, primaryB);
+                    Map<String, String> values = new java.util.LinkedHashMap<>();
+                    for (String key : all) values.put(key, "value of " + key);
+                    client.setMany(values);
+                    String binary = primaryB.get(0);
+                    client.set(binary.getBytes(StandardCharsets.UTF_8), new byte[] {(byte) 0xFF, (byte) 0xFE});
+
+                    for (int i = 0; i < 8; i++) nodeA.answerWrongNodeOnce();
+                    NanocachedException.PartialWrongNodeStrings partial = assertThrows(
+                            NanocachedException.PartialWrongNodeStrings.class,
+                            () -> { if (touch) client.getManyAndTouch(all, 31); else client.getMany(all); });
+                    Map<String, String> resolved = new java.util.LinkedHashMap<>();
+                    for (String key : primaryB) if (!key.equals(binary)) resolved.put(key, values.get(key));
+                    assertEquals(resolved, partial.partialValues,
+                            "the non-UTF-8 value is left out, every other resolved value survives");
+                }
             }
         }
     }
@@ -8041,6 +8092,104 @@ class NanocachedClientTest {
                     victimNode.releaseAuthReplies();
                     redialer.shutdownNow();
                 }
+            }
+        }
+    }
+
+    // Issue #1542: a request that close() poisoned retries through
+    // singleConnection(). It used to dial and authenticate again before the
+    // AlreadyClosed it ended in (in proxy mode: also re-fetch the roster from
+    // discovery and dial other proxies); it must fail fast, dialing nothing.
+    private static void singleConnectionAfterClose(NanocachedClient client) throws Exception {
+        Method singleConnection = NanocachedClient.class.getDeclaredMethod("singleConnection");
+        singleConnection.setAccessible(true);
+        java.lang.reflect.InvocationTargetException failure = assertThrows(
+                java.lang.reflect.InvocationTargetException.class, () -> singleConnection.invoke(client));
+        assertTrue(failure.getCause() instanceof NanocachedException.AlreadyClosed,
+                String.valueOf(failure.getCause()));
+    }
+
+    @Test
+    void singleConnectionAfterCloseFailsWithoutDialing() throws Exception {
+        try (MockNode node = new MockNode()) {
+            NanocachedClient client = connect("127.0.0.1", node.port());
+            client.close();
+            int dialsBefore = node.connectionCount.get();
+
+            singleConnectionAfterClose(client);
+
+            assertEquals(dialsBefore, node.connectionCount.get(), "a closed client must not dial the node again");
+        }
+    }
+
+    @Test
+    void proxyModeSingleConnectionAfterCloseFailsWithoutDialingOrAskingDiscovery() throws Exception {
+        try (MockNode proxy = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
+            NanocachedClient client = NanocachedClient.connect(viaProxyOptions(discovery.port()));
+            proxy.close();
+            client.close();
+            int discoveryBefore = discovery.connectionCount.get();
+            int proxyBefore = proxy.connectionCount.get();
+
+            singleConnectionAfterClose(client);
+
+            assertEquals(discoveryBefore, discovery.connectionCount.get(),
+                    "a closed client must not re-fetch the proxy roster");
+            assertEquals(proxyBefore, proxy.connectionCount.get());
+        }
+    }
+
+    @Test
+    void refreshKeepsANewNodeWithAHardDialFailureInTheRingHoldingItsError() throws Exception {
+        // A newly listed node whose address cannot be dialed at all (an
+        // unparseable one, or one that is not a cache node) was skipped, so
+        // the ring was rebuilt without it and this client ranked the keys
+        // near it differently from every other client. It is now a member
+        // without a connection whose cooldown holds the hard error, like a
+        // node whose dial failed softly.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String notACacheNode = "127.0.0.1:" + cluster.discovery().port();
+                List<DiscoveredNode> roster = new ArrayList<>(cluster.discovery().nodes);
+                roster.add(new DiscoveredNode("bad-address", "no-port-here"));
+                roster.add(new DiscoveredNode("not-a-node", notACacheNode));
+                cluster.discovery().nodes = roster;
+
+                forceRefresh(client);
+
+                Field membersField = NanocachedClient.class.getDeclaredField("members");
+                membersField.setAccessible(true);
+                Map<?, ?> members = (Map<?, ?>) membersField.get(client);
+                for (String name : List.of("bad-address", "not-a-node")) {
+                    assertTrue(members.containsKey(name), name + " must stay a member");
+                    assertNull(memberConnectionOf(client, name));
+                }
+
+                Field ringField = NanocachedClient.class.getDeclaredField("ring");
+                ringField.setAccessible(true);
+                HashRing ring = (HashRing) ringField.get(client);
+                List<String> owners = ring.owners("some-key".getBytes(StandardCharsets.UTF_8), 5);
+                assertTrue(owners.contains("bad-address") && owners.contains("not-a-node"),
+                        "the ring must be built with both nodes, like every peer's: " + owners);
+
+                Field cooldownsField = NanocachedClient.class.getDeclaredField("reconnectCooldowns");
+                cooldownsField.setAccessible(true);
+                Map<?, ?> cooldowns = (Map<?, ?>) cooldownsField.get(client);
+                assertTrue(cooldowns.containsKey("no-port-here"), "the unparseable address has its cooldown armed");
+                assertTrue(cooldowns.containsKey(notACacheNode), "the non-node address has its cooldown armed");
+                assertEquals(2, client.stats().refreshFailures());
+
+                // The next use of such a node surfaces the error the dial
+                // produced, without dialing again inside the cooldown.
+                Method memberConnection = NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
+                memberConnection.setAccessible(true);
+                java.lang.reflect.InvocationTargetException failure = assertThrows(
+                        java.lang.reflect.InvocationTargetException.class,
+                        () -> memberConnection.invoke(client, "bad-address"));
+                assertTrue(failure.getCause().getMessage().contains("invalid node address"),
+                        failure.getCause().getMessage());
             }
         }
     }
