@@ -143,6 +143,14 @@ framework adapters at one version, whether or not a component changed.
   holding its connection permit and its per-IP permit. The half-close is
   now inside the window, so the whole drain ends after one second at the
   latest (#1483).
+- `nanocached-proxy`: after a successful `INCR`, `DECR` or compare-and-set
+  the proxy sent the result to the key's other owners as a plain write,
+  including, when two roster names shared one address (a node restarted at
+  the same address while its old name had not timed out), the primary's own
+  address. The node that had just evaluated the command was then written
+  its result again as a later, unordered `Set`, which could overwrite the
+  value a concurrent writer had left there in between. The result now goes
+  only to the distinct addresses other than the primary's (#1524).
 
 ## [0.6.2] - 2026-11-03
 

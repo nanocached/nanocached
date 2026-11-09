@@ -6259,17 +6259,42 @@ impl PrimaryCommand {
 
 /// Hands a successful result to the replicas, then returns the client's
 /// answer — the replica legs are awaited so a client that reads its own
-/// write through a replica isn't racing them.
+/// write through a replica isn't racing them. `owners` is the key's owner
+/// list, primary first.
+///
+/// The result goes to each distinct address other than the primary's. Two
+/// roster names can share one address (a node restarted at the same
+/// address while its old name has not yet timed out), so the ring can rank
+/// that address as both primary and replica: the result sent to it again
+/// would arrive as a later, unordered `Set`/`Delete` at the node that just
+/// evaluated the command, and overwrite what a concurrent writer left
+/// there since.
 async fn answer_after_fan_out(
     context: &ProxyContext,
-    replicas: &[String],
+    owners: &[String],
     response: Vec<u8>,
     replicate: Option<ReplicaResult>,
 ) -> Vec<u8> {
     if let Some(result) = replicate {
-        fan_out_to_replicas(context, replicas, result.frame, result.expect, result.what).await;
+        let replicas = replica_addresses(owners);
+        fan_out_to_replicas(context, &replicas, result.frame, result.expect, result.what).await;
     }
     response
+}
+
+/// The addresses of `owners` (primary first) that are neither the
+/// primary's nor listed twice, in ring order.
+fn replica_addresses(owners: &[String]) -> Vec<String> {
+    let Some((primary, replicas)) = owners.split_first() else {
+        return Vec::new();
+    };
+    let mut distinct: Vec<String> = Vec::with_capacity(replicas.len());
+    for addr in replicas {
+        if addr != primary && !distinct.contains(addr) {
+            distinct.push(addr.clone());
+        }
+    }
+    distinct
 }
 
 /// A primary-evaluated command's completion: the primary's ordered reply
@@ -6297,7 +6322,7 @@ async fn finish_primary_evaluated(
             PrimaryVerdict::Answer {
                 response,
                 replicate,
-            } => Ok(answer_after_fan_out(context, &owners[1..], response, replicate).await),
+            } => Ok(answer_after_fan_out(context, &owners, response, replicate).await),
             PrimaryVerdict::WrongNode => {
                 force_refresh(context).await;
                 refan_primary_evaluated(context, command, address, tag, retry_capable).await
@@ -6330,7 +6355,7 @@ async fn refan_primary_evaluated(
         return Err(Fatal::Transient);
     };
     let owners = ring.owners(namespace, key);
-    let Some((primary, replicas)) = owners.split_first() else {
+    let Some(primary) = owners.first() else {
         return Ok(transient_reply(retry_capable, tag));
     };
     match context
@@ -6347,7 +6372,7 @@ async fn refan_primary_evaluated(
             PrimaryVerdict::Answer {
                 response,
                 replicate,
-            } => Ok(answer_after_fan_out(context, replicas, response, replicate).await),
+            } => Ok(answer_after_fan_out(context, &owners, response, replicate).await),
             PrimaryVerdict::WrongNode | PrimaryVerdict::Unexpected => Err(Fatal::Transient),
         },
         // `call_non_idempotent` already re-sent a frame that provably never
@@ -14390,6 +14415,55 @@ mod tests {
         assert_eq!(replica.incrs(), 0);
         assert_eq!(primary.entry(b"", b"counter"), Some(b"15".to_vec()));
         assert_eq!(replica.entry(b"", b"counter"), Some(b"15".to_vec()));
+    }
+
+    // Two roster names can share one address (a node restarted at the same
+    // address while its old name has not yet timed out). The ring then
+    // ranks that address as both primary and replica; the result of an
+    // `i` must not be sent back to the primary's own address as a later,
+    // unordered `Set`, where it would overwrite a concurrent writer's value.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_incr_result_is_not_fanned_out_to_the_primarys_own_address() {
+        let node = MockNode::start().await;
+        let roster = vec![
+            ("node-a".to_string(), node.addr.clone()),
+            ("node-b".to_string(), node.addr.clone()),
+        ];
+        let discovery = start_mock_discovery(roster, 2).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 1 1\nk5").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        let sets_before = node.set_ttls().len();
+
+        stream.write_all(b"i 0 1 1\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+
+        assert_eq!(node.incrs(), 1);
+        assert_eq!(
+            node.set_ttls().len() - sets_before,
+            0,
+            "the result must not be sent back to the node that computed it"
+        );
+    }
+
+    #[test]
+    fn replica_addresses_skip_the_primarys_address_and_repeats() {
+        let owners = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            replica_addresses(&owners(&["a", "b", "c"])),
+            owners(&["b", "c"])
+        );
+        assert_eq!(replica_addresses(&owners(&["a", "a", "b"])), owners(&["b"]));
+        assert_eq!(
+            replica_addresses(&owners(&["a", "b", "a", "b", "c"])),
+            owners(&["b", "c"])
+        );
+        assert!(replica_addresses(&owners(&["a", "a"])).is_empty());
+        assert!(replica_addresses(&owners(&["a"])).is_empty());
+        assert!(replica_addresses(&[]).is_empty());
     }
 
     // ── issue #824: `t` ───────────────────────────────────────────────
