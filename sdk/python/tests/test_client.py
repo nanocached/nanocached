@@ -415,6 +415,31 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_a_value_exactly_at_the_cap_is_sent_with_compress_enabled(self):
+        # key+value exactly at _MAX_REQUEST_BYTES passes the pre-compression
+        # check; the marker byte compress_value then adds must not make
+        # the write fail (Go sends it — the header allowance covers it).
+        from nanocached._client import _MAX_REQUEST_BYTES
+
+        value = os.urandom(_MAX_REQUEST_BYTES - 1)  # incompressible, so marker 0x00
+        client = await self.connect(compress=True)
+        try:
+            await client.set("k", value)
+            self.assertEqual(self.node.store[b"k"], b"\x00" + value)
+            self.assertEqual(await client.get_bytes("k"), value)
+
+            self.assertTrue(await client.put_if_absent("a", value))
+            self.assertEqual(self.node.store[b"a"], b"\x00" + value)
+            self.assertTrue(await client.replace_if_present("a", value))
+
+            await client.set_many({"m": value})
+            self.assertEqual(self.node.store[b"m"], b"\x00" + value)
+
+            with self.assertRaises(ValueError):
+                await client.set("k", value + b"x")
+        finally:
+            await client.close()
+
     async def test_reading_a_legacy_value_with_compress_enabled_raises_clearly(self):
         writer = await self.connect()
         try:
