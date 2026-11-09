@@ -2052,7 +2052,10 @@ public final class NanocachedClient implements AutoCloseable {
     // the same condition.
 
     /** As {@link #getManyBytes(List)}, decoding every hit as strict
-     * UTF-8.
+     * UTF-8. A partial failure ({@link NanocachedException.PartialWrongNodeStrings},
+     * {@link NanocachedException.PartialConnectionLostStrings}) carries the
+     * values already resolved, leaving out any that is not valid UTF-8
+     * ({@link #getManyBytes(List)} has its exact bytes).
      * @throws UncheckedIOException if a stored value is not valid UTF-8 */
     public Map<String, String> getMany(List<String> keys) {
         return getManyDecoded(EMPTY_NAMESPACE, keys);
@@ -2068,11 +2071,32 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             return decodeMany(getManyBytes(namespace, keys));
         } catch (NanocachedException.PartialWrongNode partial) {
-            throw new NanocachedException.PartialWrongNodeStrings(decodeMany(partial.partialValues));
+            throw new NanocachedException.PartialWrongNodeStrings(decodePartial(partial.partialValues));
         } catch (NanocachedException.PartialConnectionLost partial) {
             throw new NanocachedException.PartialConnectionLostStrings(
-                    partial.getMessage(), partial.getCause(), decodeMany(partial.partialValues));
+                    partial.getMessage(), partial.getCause(), decodePartial(partial.partialValues));
         }
+    }
+
+    /** Decodes the values a partial-result exception carries. As strict as
+     * {@link #decodeMany}, but a stored value need not be valid UTF-8
+     * (nothing on the write side enforces it), and the {@link
+     * UncheckedIOException} the strict decode throws would replace the
+     * wrong-node or connection-loss exception the caller needs, with every
+     * other resolved value. So a value that is not valid UTF-8 is left out
+     * of the map rather than decoded lossily (a cache must not return a
+     * value it did not store); {@link #getManyBytes(List)} still has its
+     * exact bytes. */
+    private static Map<String, String> decodePartial(Map<String, byte[]> raw) {
+        Map<String, String> values = new LinkedHashMap<>(raw.size());
+        for (Map.Entry<String, byte[]> entry : raw.entrySet()) {
+            try {
+                values.put(entry.getKey(), decodeUtf8Strict(entry.getValue()));
+            } catch (UncheckedIOException notUtf8) {
+                continue;
+            }
+        }
+        return values;
     }
 
     private static Map<String, String> decodeMany(Map<String, byte[]> raw) {
@@ -3094,13 +3118,13 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             return decodeMany(getManyAndTouchBytes(namespace, keys, ttlSeconds));
         } catch (NanocachedException.PartialWrongNode partial) {
-            throw new NanocachedException.PartialWrongNodeStrings(decodeMany(partial.partialValues));
+            throw new NanocachedException.PartialWrongNodeStrings(decodePartial(partial.partialValues));
         } catch (NanocachedException.PartialServerTooOld partial) {
             throw new NanocachedException.PartialServerTooOldStrings(
-                    partial.getCause(), decodeMany(partial.partialValues));
+                    partial.getCause(), decodePartial(partial.partialValues));
         } catch (NanocachedException.PartialConnectionLost partial) {
             throw new NanocachedException.PartialConnectionLostStrings(
-                    partial.getMessage(), partial.getCause(), decodeMany(partial.partialValues));
+                    partial.getMessage(), partial.getCause(), decodePartial(partial.partialValues));
         }
     }
 
@@ -6175,11 +6199,29 @@ public final class NanocachedClient implements AutoCloseable {
 
         synchronized (redialLocks.computeIfAbsent("", slot -> new Object())) {
             if (single.isClosed()) {
+                // Issue #1542: a request that close() poisoned retries
+                // through here. Without this check it would dial and
+                // authenticate once more (up to the connect deadline) — and
+                // in proxy mode re-fetch the roster from discovery and dial
+                // other proxies — before the AlreadyClosed it ends in.
+                if (closed) throw new NanocachedException.AlreadyClosed();
                 // SDK proxy mode (issue #122): a dead proxy connection gets
                 // its own reconnect strategy (retry the same proxy, then
                 // re-fetch the roster) instead of the plain single-address
                 // redial every other single-mode target uses.
-                single = viaProxy ? reconnectProxy() : dialWithCooldown(singleAddress);
+                Connection fresh = viaProxy ? reconnectProxy() : dialWithCooldown(singleAddress);
+                // close() may have run during the dial, after teardown() had
+                // already closed the old connection: a connection installed
+                // now would never be closed. Installed under stateLock, the
+                // same lock teardown() closes under, so either close() sees
+                // it or this sees close().
+                synchronized (stateLock) {
+                    if (closed) {
+                        fresh.close();
+                        throw new NanocachedException.AlreadyClosed();
+                    }
+                    single = fresh;
+                }
             }
             return single;
         }
@@ -6384,7 +6426,24 @@ public final class NanocachedClient implements AutoCloseable {
             // deadline) before throwing the same AlreadyClosed.
             if (closed) throw new NanocachedException.AlreadyClosed();
             Connection connection = dialWithCooldown(member.address);
-            member.connection = connection;
+            // Issue #1543: the dial ran outside stateLock, so close() or a
+            // refresh that dropped this member may have run meanwhile. The
+            // connection would then hang off a Member nothing reaches any
+            // more (or that teardown() already passed), and its socket and
+            // reader thread would live until the server's idle timeout.
+            // Re-checked under the lock both of them close under.
+            synchronized (stateLock) {
+                if (closed) {
+                    connection.close();
+                    throw new NanocachedException.AlreadyClosed();
+                }
+                if (members.get(name) != member) {
+                    connection.close();
+                    throw new NanocachedException.ConnectionLost(
+                            "nanocached: " + name + " left the cluster while reconnecting", null, true);
+                }
+                member.connection = connection;
+            }
             return connection;
         }
     }
@@ -6619,22 +6678,19 @@ public final class NanocachedClient implements AutoCloseable {
                 // isn't worth a warning on every refresh. Counted via
                 // stats().refreshFailures instead.
                 refreshFailures.incrementAndGet();
-                if (outcome.hard) {
-                    // An unparseable address, or one that is not a cache
-                    // node: nothing a later redial could fix, so it stays
-                    // out of the ring (as before) rather than becoming a
-                    // member whose redial throws a non-failover error.
-                    continue;
-                }
                 // Install the just-discovered node without a connection and
                 // arm its cooldown instead of leaving it out of the ring
                 // (issue #67, matching openCluster and the Go/Rust/.NET/
                 // Python/TS SDKs): the ring ranks by the full candidate set,
-                // so dropping a new node on a transient dial failure would
-                // make this client's primary/replica choice for keys near it
-                // disagree with every peer that did reach it until the next
-                // refresh (extra W answers and refreshes); kept, its keys
-                // fail over per request and its next use redials it.
+                // so dropping a new node on a failed dial would make this
+                // client's primary/replica choice for keys near it disagree
+                // with every peer that did reach it until the next refresh
+                // (extra W answers and refreshes); kept, its keys fail over
+                // per request and its next use redials it. A hard failure
+                // (an unparseable address, or one that is not a cache node)
+                // is kept the same way, holding its own error in the
+                // cooldown: every peer ranks the node whatever its address
+                // turns out to be, and discovery dropping it ends it.
                 members.put(node.name(), new Member(node.address(), null));
                 // A dial skipped by dialRefreshNode comes back carrying the
                 // error that armed the cooldown; re-arming it would only
