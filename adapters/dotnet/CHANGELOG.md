@@ -14,6 +14,10 @@ changed. What 1.0.0 will promise is described on the
 - **Breaking:** `NanocachedDistributedCache` is `sealed`, and its `(NanocachedClient, NanocachedCacheOptions)` constructor is gone: it read only `Namespace` and ignored every other option. Use `(client, namespace)`, or `AddNanocachedDistributedCache`. A container still disposes the cache it created through the registration that owns its client.
 - The `CancellationToken` of `GetAsync`, `SetAsync`, `RefreshAsync` and `RemoveAsync` is now passed to the SDK, so cancelling abandons the wait; it used to be checked on entry only.
 
+### Fixed
+
+- The README said the value size limit is measured after compression when `Compress` is on. The SDK checks the value before compressing it, so a value over the limit throws `ArgumentOutOfRangeException` even if it would compress to less; the README now says so. (#1603)
+
 ## [0.6.2] - 2026-11-03
 
 No changes. Version aligned with the rest of the project: every release

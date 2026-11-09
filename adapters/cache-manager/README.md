@@ -182,8 +182,9 @@ A namespace, key and value together must fit in one request: 1 MiB
 minus a 256-byte header, 1,048,320 bytes. A `set` or `mset` entry over
 that size rejects with a `RangeError` before anything is sent, and the
 entry is not written. Values
-are measured after JSON serialization, and after compression when
-`compress` is on.
+are measured after JSON serialization and before compression, so with
+`compress` on a value over the limit is still rejected, even if it would
+compress to less.
 
 ## Stored format
 

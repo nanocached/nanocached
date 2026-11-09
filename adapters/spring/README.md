@@ -242,7 +242,8 @@ here) and throws `UnsupportedOperationException`.
 ## Value size limit
 
 A serialized value must fit the server's request limit of 1 MiB (key
-and value together, after serialization and optional compression); a
+and value together, measured after serialization and before optional
+compression, so compression cannot bring a larger value under it); a
 larger one is rejected by the SDK with `IllegalArgumentException` before
 anything is sent, which the error handler sees as a put error.
 

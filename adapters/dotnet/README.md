@@ -188,7 +188,8 @@ A namespace, key and value together must fit in one request: 1 MiB
 minus a 256-byte header, 1,048,320 bytes, with the envelope's 13 bytes
 counted as part of the value. A `Set` over that size throws the SDK's
 `ArgumentOutOfRangeException` before anything is sent, and nothing is
-written. The value is measured after compression when `Compress` is on.
+written. The value is measured before compression: with `Compress` on, a value over
+the limit is still rejected, even if it would compress to less.
 
 ## Policy note
 

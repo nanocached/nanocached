@@ -284,8 +284,9 @@ in the same way.
 A namespace, key and value together must fit in one request: 1 MiB
 minus a 256-byte header, 1,048,320 bytes. A `set` over that size rejects
 with a `RangeError` before anything is sent, and nothing is written. The value is measured as Keyv hands it
-over — its JSON envelope (`{value, expires}`) included — and after
-compression when `compress` is on. Under Keyv's default error policy
+over — its JSON envelope (`{value, expires}`) included — and before
+compression, so with `compress` on a value over the limit is still
+rejected, even if it would compress to less. Under Keyv's default error policy
 that `RangeError` is the same `error` event plus `set` resolving `false`
 described above, so an oversize value is silently not cached unless
 `throwOnErrors` is on or an `error` listener is attached.

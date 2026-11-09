@@ -23,6 +23,7 @@ changed. What 1.0.0 will promise is described on the
 
 ### Fixed
 
+- The README said the value size limit is measured after compression when `OPTIONS.COMPRESS` is on. The SDK checks the value before compressing it, so a value over the limit is rejected with `ValueError` even if it would compress to less; the README now says so. (#1603)
 - `shutdown()` blocked forever in a `fork()` child that had inherited a started bridge (Gunicorn `preload_app = True`, or uWSGI without `lazy-apps`, with a cache touch in the master before the fork), because it waited on a loop whose thread did not survive the fork. With `OPTIONS["CLOSE_ON_REQUEST"]` the first request in a worker that had not used the cache (a health check, a static file) reached `close()` and hung the worker; a worker-exit hook calling `shutdown()` hung the same way. In a child, `shutdown()` and `close()` now drop the inherited loop and client without waiting on them and return, leaving the parent's connection alone; the next cache operation starts a fresh loop. (#1482)
 - The reset of the backend's locks in a forked child did not cover the private bridge of a `CLOSE_ON_REQUEST` instance, so a lock another thread held at the moment of the fork stayed locked in the worker. Those bridges are now reset too. The README's "Preforking servers" section now says what is covered. (#1482)
 

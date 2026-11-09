@@ -9,6 +9,10 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Fixed
+
+- The README said the value size limit is measured after serialization and optional compression. The SDK checks the serialized value before compressing it, so a value over the limit is rejected even if it would compress to less; the README now says so. (#1603)
+
 ## [0.6.2] - 2026-11-03
 
 No changes. Version aligned with the rest of the project: every release
