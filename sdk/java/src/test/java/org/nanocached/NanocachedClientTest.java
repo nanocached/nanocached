@@ -7988,6 +7988,51 @@ class NanocachedClientTest {
         }
     }
 
+    // Issue #1542: a request that close() poisoned retries through
+    // singleConnection(). It used to dial and authenticate again before the
+    // AlreadyClosed it ended in (in proxy mode: also re-fetch the roster from
+    // discovery and dial other proxies); it must fail fast, dialing nothing.
+    private static void singleConnectionAfterClose(NanocachedClient client) throws Exception {
+        Method singleConnection = NanocachedClient.class.getDeclaredMethod("singleConnection");
+        singleConnection.setAccessible(true);
+        java.lang.reflect.InvocationTargetException failure = assertThrows(
+                java.lang.reflect.InvocationTargetException.class, () -> singleConnection.invoke(client));
+        assertTrue(failure.getCause() instanceof NanocachedException.AlreadyClosed,
+                String.valueOf(failure.getCause()));
+    }
+
+    @Test
+    void singleConnectionAfterCloseFailsWithoutDialing() throws Exception {
+        try (MockNode node = new MockNode()) {
+            NanocachedClient client = connect("127.0.0.1", node.port());
+            client.close();
+            int dialsBefore = node.connectionCount.get();
+
+            singleConnectionAfterClose(client);
+
+            assertEquals(dialsBefore, node.connectionCount.get(), "a closed client must not dial the node again");
+        }
+    }
+
+    @Test
+    void proxyModeSingleConnectionAfterCloseFailsWithoutDialingOrAskingDiscovery() throws Exception {
+        try (MockNode proxy = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
+            NanocachedClient client = NanocachedClient.connect(viaProxyOptions(discovery.port()));
+            proxy.close();
+            client.close();
+            int discoveryBefore = discovery.connectionCount.get();
+            int proxyBefore = proxy.connectionCount.get();
+
+            singleConnectionAfterClose(client);
+
+            assertEquals(discoveryBefore, discovery.connectionCount.get(),
+                    "a closed client must not re-fetch the proxy roster");
+            assertEquals(proxyBefore, proxy.connectionCount.get());
+        }
+    }
+
     private static void forceRefresh(NanocachedClient client) throws Exception {
         Method refreshNodeList = NanocachedClient.class.getDeclaredMethod("refreshNodeList");
         refreshNodeList.setAccessible(true);

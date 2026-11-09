@@ -6158,11 +6158,29 @@ public final class NanocachedClient implements AutoCloseable {
 
         synchronized (redialLocks.computeIfAbsent("", slot -> new Object())) {
             if (single.isClosed()) {
+                // Issue #1542: a request that close() poisoned retries
+                // through here. Without this check it would dial and
+                // authenticate once more (up to the connect deadline) — and
+                // in proxy mode re-fetch the roster from discovery and dial
+                // other proxies — before the AlreadyClosed it ends in.
+                if (closed) throw new NanocachedException.AlreadyClosed();
                 // SDK proxy mode (issue #122): a dead proxy connection gets
                 // its own reconnect strategy (retry the same proxy, then
                 // re-fetch the roster) instead of the plain single-address
                 // redial every other single-mode target uses.
-                single = viaProxy ? reconnectProxy() : dialWithCooldown(singleAddress);
+                Connection fresh = viaProxy ? reconnectProxy() : dialWithCooldown(singleAddress);
+                // close() may have run during the dial, after teardown() had
+                // already closed the old connection: a connection installed
+                // now would never be closed. Installed under stateLock, the
+                // same lock teardown() closes under, so either close() sees
+                // it or this sees close().
+                synchronized (stateLock) {
+                    if (closed) {
+                        fresh.close();
+                        throw new NanocachedException.AlreadyClosed();
+                    }
+                    single = fresh;
+                }
             }
             return single;
         }
