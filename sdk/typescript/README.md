@@ -188,7 +188,13 @@ the node list, so the SDK needs no configuration:
 
 The node list is re-fetched lazily when it is more than 30 seconds old. If a
 node answers that it no longer owns a key (its view of the cluster changed),
-the SDK refreshes the node list and retries that operation once. A discovery
+the SDK refreshes the node list and retries that operation once. A refresh
+forced this way waits at least 200 ms after the previous refresh finished:
+while discovery still lists a node that has died, every operation routed to it
+fails, and without that floor each failure would open its own discovery
+connection. A caller that fails inside the window reuses the refresh that just
+finished, and callers waiting on a refresh that started before their failure
+share one follow-up refresh that starts when the window has passed. A discovery
 outage degrades only topology updates: existing connections keep serving
 traffic on the last-known node list.
 

@@ -529,6 +529,16 @@ function shuffled<T>(items: readonly T[]): T[] {
 // on use rather than on a timer — see NanocachedClient.maybeRefreshNodeList.
 const NODE_LIST_STALE_AFTER_MS = 30_000;
 
+/** Minimum time between two forced node-list refreshes. While discovery
+ * still lists a dead node (its liveness window), every operation whose
+ * primary is that node fails and forces a refresh that installs the same
+ * list; without a floor, a sequential caller opens one discovery
+ * connection per failed operation. A forced caller that finds a refresh
+ * completed within this window reuses its result, and callers that were
+ * waiting out an older refresh share one follow-up that starts once the
+ * window has passed. */
+const FORCED_REFRESH_MIN_INTERVAL_MS = 200;
+
 // Batch chunking (issues #128/#150/#151): NanocachedClient never sends
 // more than this many keys in one `m`/`o` sub-frame — larger batches
 // transparently become more than one sub-frame per owner, invisible to
@@ -912,6 +922,14 @@ export class NanocachedClient {
    * refresh tell one that began after its failure from one already in
    * flight (issue #1227). */
   private refreshStarts = 0;
+  /** `performance.now()` when the last refresh (forced or not) finished,
+   * successfully or not — the floor `FORCED_REFRESH_MIN_INTERVAL_MS` is
+   * measured from. */
+  private lastRefreshEnd = Number.NEGATIVE_INFINITY;
+  /** True while `nodeListRefresh` is a follow-up still waiting out the
+   * minimum interval: it has not fetched anything yet, so a forced caller
+   * arriving now can share it — it will start after that caller's failure. */
+  private refreshWaitingForInterval = false;
   /** One in-flight lazy reconnect per connection slot (the node name in
    * cluster mode, "" in single mode) — concurrent requests that all find
    * the same dead connection share one reconnect instead of dialing N
@@ -4007,7 +4025,12 @@ export class NanocachedClient {
    * that refresh out but is only satisfied by one that *started* after it
    * decided to refresh — one a concurrent forced caller started in the
    * meantime, or its own. All forced callers that arrived during the old
-   * refresh therefore share a single follow-up refresh. */
+   * refresh therefore share a single follow-up refresh.
+   *
+   * Forced refreshes are also rate-limited (FORCED_REFRESH_MIN_INTERVAL_MS):
+   * a forced caller that finds a refresh completed within that window
+   * reuses its result instead of opening another discovery connection, and
+   * the shared follow-up above starts only once the window has passed. */
   private async maybeRefreshNodeList(options?: { force?: boolean }): Promise<void> {
     if (this.target.kind === "single") return;
     if (this.target.kind === "proxy") {
@@ -4018,16 +4041,18 @@ export class NanocachedClient {
 
     // Every refresh started so far began before this point (issue #1227).
     const observed = this.refreshStarts;
+    let waitedOutOlderRefresh = false;
     for (;;) {
       const inFlight = this.nodeListRefresh;
       if (inFlight !== null) {
-        if (!options?.force || this.refreshStarts > observed) {
+        if (!options?.force || this.refreshStarts > observed || this.refreshWaitingForInterval) {
           await inFlight;
           return;
         }
         // Forced, and this refresh began before the failure was seen: let
         // it finish (its starter reports its own errors) and look again.
         await inFlight.catch(() => {});
+        waitedOutOlderRefresh = true;
         continue;
       }
       // A refresh that started after `observed` has already completed.
@@ -4035,8 +4060,37 @@ export class NanocachedClient {
       break;
     }
 
-    this.refreshStarts++;
-    this.nodeListRefresh = this.target.kind === "proxy" ? this.refreshProxyTarget() : this.refreshNodeList();
+    // Minimum interval between forced refreshes. A caller that arrived with
+    // no refresh running and finds one completed within the window reuses
+    // it: the node list it installed is the freshest discovery will hand out
+    // at this rate. A caller that waited out an older refresh cannot (that
+    // refresh began before its failure), so its follow-up starts once the
+    // window has passed, and later callers share it.
+    let delayMs = 0;
+    if (options?.force) {
+      delayMs = FORCED_REFRESH_MIN_INTERVAL_MS - (performance.now() - this.lastRefreshEnd);
+      if (delayMs > 0 && !waitedOutOlderRefresh) return;
+    }
+
+    const refresh = async (): Promise<void> => {
+      if (delayMs > 0) {
+        this.refreshWaitingForInterval = true;
+        try {
+          await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+        } finally {
+          this.refreshWaitingForInterval = false;
+        }
+        // Closed while waiting: nothing was fetched, so nothing finished.
+        if (this.closed) return;
+      }
+      this.refreshStarts++;
+      try {
+        await (this.target.kind === "proxy" ? this.refreshProxyTarget() : this.refreshNodeList());
+      } finally {
+        this.lastRefreshEnd = performance.now();
+      }
+    };
+    this.nodeListRefresh = refresh();
     try {
       await this.nodeListRefresh;
     } finally {

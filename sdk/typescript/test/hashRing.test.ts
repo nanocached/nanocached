@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { fmix64, fnv1a, HashRing, keyHash } from "../src/hashRing.js";
+import { compareNodeNames, fmix64, fnv1a, HashRing, keyHash } from "../src/hashRing.js";
 
 describe("fnv1a", () => {
   // Published FNV-1a 64-bit test vectors — these pin the hash to the exact
@@ -332,6 +332,34 @@ describe("HashRing.owners bounded top-R selection (audit finding)", () => {
       const key = Buffer.from(`key-${i}`);
       for (let replicas = 1; replicas <= 6; replicas++) {
         assert.deepEqual(ring.owners(key, replicas), referenceOwners(names, mixed, key, replicas));
+      }
+    }
+  });
+
+  it("breaks score ties by UTF-8 bytes, not UTF-16 code units", () => {
+    // U+FFFF is EF BF BF in UTF-8 and one UTF-16 unit (0xFFFF); U+10000 is
+    // F0 90 80 80 and the pair D800 DC00. The server orders by UTF-8 bytes
+    // (`str::cmp`), so U+FFFF is the smaller name; JavaScript's `<` orders by
+    // UTF-16 units and says the opposite.
+    const bmp = "node-￿";
+    const supplementary = "node-\u{10000}";
+    assert.ok(supplementary < bmp, "UTF-16 order is the one that differs");
+    assert.ok(compareNodeNames(bmp, supplementary) < 0);
+    assert.ok(compareNodeNames(supplementary, bmp) > 0);
+    assert.equal(compareNodeNames(bmp, "node-￿"), 0);
+    // Unsigned: a byte >= 0x80 sorts above an ASCII one.
+    assert.ok(compareNodeNames("node-a", "node-é") < 0);
+    // A prefix sorts first.
+    assert.ok(compareNodeNames("node", "node-a") < 0);
+
+    // Through the ring: force every score to tie, in both construction orders.
+    for (const names of [[bmp, supplementary], [supplementary, bmp]]) {
+      const ring = new HashRing(names);
+      const internals = ring as unknown as { nodeHashHi: Uint32Array; nodeHashLo: Uint32Array };
+      internals.nodeHashHi.fill(0x01234567);
+      internals.nodeHashLo.fill(0x89abcdef);
+      for (const replicas of [1, 2]) {
+        assert.deepEqual(ring.owners(Buffer.from("tie"), replicas), [bmp, supplementary].slice(0, replicas));
       }
     }
   });
