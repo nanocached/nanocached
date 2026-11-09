@@ -217,6 +217,16 @@ framework adapters at one version, whether or not a component changed.
   left at the moment of each send; one that ran out while the write waited
   goes out as `0`, which expires the copy at once and still replaces an
   older value the target held (#1534).
+- `nanocached-node`: the starting rings a re-replication pass takes over
+  from the passes it superseded had no bound and no de-duplication. Every
+  pass aborted before it finished added one ring, and a pass checks each
+  key against each of them (an ownership test and a ranking per ring), so a
+  run of ring changes faster than the passes complete made every pass
+  slower than the last, and less likely to finish, while all the rings were
+  held. Rings with the same members are now kept once, and beyond eight the
+  two oldest are folded into one that keeps the sender condition and
+  targets every other owner of the key; the cost is a repeated put-if-absent
+  to an owner that already has the key (#1606).
 - `nanocached-node`: a re-replication pass superseded by a second eviction
   no longer forgets the first eviction's keys. The new pass healed only the
   owners the second change promoted, so the keys the first change promoted
