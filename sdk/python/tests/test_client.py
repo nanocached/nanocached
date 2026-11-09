@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import gc
 import io
 import os
 import random
@@ -411,6 +412,31 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
             # Still usable afterward — none of the above touched the wire.
             await client.set("k", "v")
             self.assertEqual(await client.get("k"), "v")
+        finally:
+            await client.close()
+
+    async def test_a_value_exactly_at_the_cap_is_sent_with_compress_enabled(self):
+        # key+value exactly at _MAX_REQUEST_BYTES passes the pre-compression
+        # check; the marker byte compress_value then adds must not make
+        # the write fail (Go sends it — the header allowance covers it).
+        from nanocached._client import _MAX_REQUEST_BYTES
+
+        value = os.urandom(_MAX_REQUEST_BYTES - 1)  # incompressible, so marker 0x00
+        client = await self.connect(compress=True)
+        try:
+            await client.set("k", value)
+            self.assertEqual(self.node.store[b"k"], b"\x00" + value)
+            self.assertEqual(await client.get_bytes("k"), value)
+
+            self.assertTrue(await client.put_if_absent("a", value))
+            self.assertEqual(self.node.store[b"a"], b"\x00" + value)
+            self.assertTrue(await client.replace_if_present("a", value))
+
+            await client.set_many({"m": value})
+            self.assertEqual(self.node.store[b"m"], b"\x00" + value)
+
+            with self.assertRaises(ValueError):
+                await client.set("k", value + b"x")
         finally:
             await client.close()
 
@@ -1365,6 +1391,42 @@ class StalledPeerTests(unittest.IsolatedAsyncioTestCase):
                 all(isinstance(outcome, ConnectionError) for outcome in outcomes), outcomes
             )
         finally:
+            await node.close()
+
+    async def test_cancelling_a_set_blocked_in_a_write_leaves_no_unretrieved_future(self):
+        # asyncio.wait_for(client.set(k, big), t) cancelling while drain()
+        # is suspended poisons the connection, which rejects every pending
+        # slot — including the cancelled caller's own, whose future
+        # nobody awaits any more. The event loop logged it as "Future
+        # exception was never retrieved" at ERROR when it was
+        # garbage-collected. (Eight sets: the first ones fit the kernel's
+        # socket buffers, the later ones block in drain().)
+        node = await self.stalled_node()
+        loop = asyncio.get_running_loop()
+        logged: list[str] = []
+        loop.set_exception_handler(lambda _loop, context: logged.append(context.get("message", "")))
+
+        async def timed_out_set(client, i):
+            try:
+                await asyncio.wait_for(client.set(f"k{i}", b"x" * 900_000), 0.3)
+            except (asyncio.TimeoutError, ConnectionError):
+                # Timed out, or failed because an earlier cancellation
+                # poisoned the connection under it.
+                pass
+
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await asyncio.gather(*(timed_out_set(client, i) for i in range(8)))
+                for _ in range(5):
+                    gc.collect()
+                    await asyncio.sleep(0)
+            finally:
+                await client.close()
+            gc.collect()
+            self.assertEqual([m for m in logged if "never retrieved" in m], [])
+        finally:
+            loop.set_exception_handler(None)
             await node.close()
 
     async def test_close_returns_while_a_fire_and_forget_replica_is_stalled(self):
@@ -6019,6 +6081,65 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await client.close()
         finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_an_incr_routed_to_a_listed_non_node_is_retried_after_a_refresh(self):
+        # The stored cooldown error for an address that answers as
+        # something other than a node has to be a ConnectionError, or
+        # _with_wrong_node_retry raises it without refreshing: the incr
+        # kept failing until the 30 s staleness refresh, even after
+        # discovery had dropped the node.
+        new = "new-node"
+        nodes, discovery = await self.start_cluster(set())
+        other = await MockDiscovery([]).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], reconnect_cooldown=100
+            )
+            try:
+                original = list(discovery.nodes)
+                discovery.nodes = original + [(new, f"127.0.0.1:{other.port}")]
+                await client._refresh_node_list()
+                stored = client._redial_cooldowns[f"127.0.0.1:{other.port}"][1]
+                self.assertIsInstance(stored, ConnectFailedError)
+
+                key = next(
+                    f"counter-{i}"
+                    for i in range(1000)
+                    if client._ring.owners(f"counter-{i}".encode(), 2)[0] == new
+                )
+                for node in nodes.values():
+                    node.store[key.encode()] = b"5"
+
+                # Discovery has dropped the bad address by the time the
+                # operation fails and forces its refresh.
+                discovery.nodes = original
+                self.assertEqual(await client.incr(key), 6)
+                self.assertNotIn(new, client._members)
+            finally:
+                await client.close()
+        finally:
+            await other.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_redialing_a_member_that_now_answers_as_a_non_node_is_a_connection_error(self):
+        # Same reason as above, for a member already in the ring whose
+        # address has since been taken over by a discovery server.
+        nodes, discovery = await self.start_cluster(set())
+        other = await MockDiscovery([]).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                with self.assertRaises(ConnectFailedError):
+                    await client._open_node_connection(f"127.0.0.1:{other.port}")
+            finally:
+                await client.close()
+        finally:
+            await other.close()
             await discovery.close()
             for node in nodes.values():
                 await node.close()
