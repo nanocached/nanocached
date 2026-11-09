@@ -1227,6 +1227,17 @@ async fn fetch_roster_from(
             "L header out of bounds",
         ));
     }
+    // A replica with no node registered (a fresh process, or one the
+    // nodes stopped heartbeating to) answers `N 0 R`. Like `B` it has no
+    // roster to give yet, so it is a failed fetch: `race_ok` then moves on
+    // to the replicas that do, instead of the first-listed empty one
+    // winning every refresh and emptying the ring.
+    if count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("discovery at {addr} has no node registered"),
+        ));
+    }
 
     let mut nodes = Vec::with_capacity(count);
     for _ in 0..count {
@@ -11981,6 +11992,26 @@ mod tests {
         InFlightBudget,
         IpInFlightShares,
     ) {
+        start_proxy_observed_waiting(discovery_addr, secret, limits, announce, backends, true).await
+    }
+
+    /// `start_proxy_observed`; `wait_for_ring` false returns without
+    /// waiting for the first roster (a discovery that has none to give
+    /// never publishes one).
+    async fn start_proxy_observed_waiting(
+        discovery_addr: &str,
+        secret: Option<&str>,
+        limits: ConnectionLimits,
+        announce: Option<ProxyIdentity>,
+        backends: Arc<SharedBackends>,
+        wait_for_ring: bool,
+    ) -> (
+        String,
+        watch::Sender<bool>,
+        Arc<ProxyContext>,
+        InFlightBudget,
+        IpInFlightShares,
+    ) {
         let (ring_tx, ring_rx) = watch::channel(None);
         let (refresh_tx, refresh_rx) = mpsc::channel(16);
         let (drain_tx, drain_rx) = watch::channel(false);
@@ -12030,7 +12061,7 @@ mod tests {
         // Wait until the first roster fetch landed, so tests don't race
         // the refresher and see `B`.
         let mut ring = ring_rx;
-        while ring.borrow().is_none() {
+        while wait_for_ring && ring.borrow().is_none() {
             ring.changed().await.unwrap();
         }
         (addr, drain_tx, context, proxy_budget, ip_shares)
@@ -12568,8 +12599,17 @@ mod tests {
         // Issue #125: the per-request no-roster reply must not desync a
         // tagged connection — `R <tag>` for capable clients; legacy
         // clients keep the pre-#125 bare `B`.
+        // Discovery has no node to list, so the proxy never gets a ring.
         let discovery = start_mock_discovery(Vec::new(), 1).await;
-        let proxy = start_proxy(&discovery, None, 64).await;
+        let (proxy, _drain, _context, _, _) = start_proxy_observed_waiting(
+            &discovery,
+            None,
+            test_limits(64),
+            None,
+            Arc::new(SharedBackends::new()),
+            false,
+        )
+        .await;
 
         let mut stream = TcpStream::connect(&proxy).await.unwrap();
         stream.write_all(b"A 1 T R\nx").await.unwrap();
@@ -17572,7 +17612,8 @@ mod tests {
         // `max_connections` set to 1, one such peer should permanently
         // block every later connection without the fix.
         let (acceptor, connector) = self_signed_tls();
-        let discovery = start_mock_discovery(Vec::new(), 1).await;
+        let discovery =
+            start_mock_discovery(vec![("node".to_string(), "127.0.0.1:1".to_string())], 1).await;
         let proxy = start_tls_proxy(&discovery, 1, acceptor).await;
 
         // Occupies the sole connection permit with a raw TCP connection
@@ -17620,7 +17661,8 @@ mod tests {
         // must mirror that: over budget, with TLS on, the connection is
         // just dropped rather than answered in plaintext.
         let (acceptor, _connector) = self_signed_tls();
-        let discovery = start_mock_discovery(Vec::new(), 1).await;
+        let discovery =
+            start_mock_discovery(vec![("node".to_string(), "127.0.0.1:1".to_string())], 1).await;
         // A permit is held for the whole test, so every dial below is
         // over budget.
         let proxy = start_tls_proxy(&discovery, 1, acceptor).await;
@@ -17687,6 +17729,62 @@ mod tests {
             .await
             .expect("the live replica's roster should still answer");
         assert_eq!(ring.all_addresses(), vec!["127.0.0.1:2".to_string()]);
+    }
+
+    /// Issue #1591: a replica with no node registered answers `N 0 R`. It
+    /// used to count as a success, and listed first it won the race on every
+    /// refresh, so the proxy adopted an empty ring and answered every
+    /// request `B` while the next replica held the full roster.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_roster_from_the_first_replica_loses_the_race() {
+        let empty = start_mock_discovery(Vec::new(), 2).await;
+        let live =
+            start_mock_discovery(vec![("node".to_string(), "127.0.0.1:2".to_string())], 2).await;
+
+        let ring = fetch_roster(&[empty, live], &None, &None)
+            .await
+            .expect("the replica that has the roster answers");
+        assert_eq!(ring.all_addresses(), vec!["127.0.0.1:2".to_string()]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_roster_is_a_failed_fetch() {
+        let empty = start_mock_discovery(Vec::new(), 2).await;
+        let error = match fetch_roster(std::slice::from_ref(&empty), &None, &None).await {
+            Ok(ring) => panic!("an empty roster was adopted: {} node(s)", ring.nodes.len()),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+    }
+
+    /// Issue #1591: when every replica answers with no node, the refresher
+    /// keeps the ring it has instead of publishing an empty one (which
+    /// would also have pruned every backend slot).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_all_empty_answer_keeps_the_current_ring() {
+        let node = MockNode::start().await;
+        let discovery =
+            start_mock_discovery_handle(vec![("node-a".to_string(), node.addr.clone())], 1).await;
+        let (_proxy, _drain, context) =
+            start_proxy_with_drain(&discovery.addr, None, 64, None).await;
+        assert_eq!(current_ring(&context).unwrap().nodes.len(), 1);
+
+        discovery.roster.lock().unwrap().clear();
+        let before = discovery.roster_fetches.load(Ordering::SeqCst);
+        let (waiter, _done) = oneshot::channel();
+        context.refresh_now.send(waiter).await.unwrap();
+        timeout(UPSTREAM_IO_TIMEOUT, async {
+            while discovery.roster_fetches.load(Ordering::SeqCst) == before {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the refresher fetches the roster again");
+        // The fetch has been answered; give the refresher its turn.
+        sleep(Duration::from_millis(200)).await;
+
+        let ring = current_ring(&context).expect("the ring is still there");
+        assert_eq!(ring.nodes.len(), 1, "an empty roster replaced the ring");
     }
 
     /// Issue #1246: the `L` parser's entry bound is the fleet's 65,536,
