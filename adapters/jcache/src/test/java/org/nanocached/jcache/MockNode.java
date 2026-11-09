@@ -126,10 +126,21 @@ final class MockNode implements AutoCloseable {
             while (true) {
                 try {
                     Socket socket = server.accept();
-                    accepted.add(socket);
-                    Thread serve = new Thread(() -> serve(socket));
-                    serve.setDaemon(true);
-                    serve.start();
+                    synchronized (lifecycle) {
+                        if (closed) {
+                            // accept() won against close(): the connection
+                            // arrived while the listener was going away. It
+                            // must not be served by a node that has already
+                            // been closed.
+                            socket.close();
+                            return;
+                        }
+                        accepted.add(socket);
+                        Thread serve = new Thread(() -> serve(socket));
+                        serve.setDaemon(true);
+                        serveThreads.add(serve);
+                        serve.start();
+                    }
                 } catch (IOException stop) {
                     return;
                 }
@@ -157,16 +168,64 @@ final class MockNode implements AutoCloseable {
         return store(namespace).get(ByteBuffer.wrap(key));
     }
 
+    /** Guards {@link #closed}'s transition, {@link #accepted} and {@link
+     * #serveThreads}: a connection is either registered here before {@link
+     * #close()} takes its snapshot (and closed by it) or sees {@code closed}
+     * and is dropped by the accept loop — never accepted but unregistered. */
+    private final Object lifecycle = new Object();
+    private volatile boolean closed;
     /** Every accepted socket, so {@link #close()} can sever live
      * connections too — a stopped node, not just one that accepts
      * nothing new. */
-    private final java.util.List<Socket> accepted = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final java.util.List<Socket> accepted = new java.util.ArrayList<>();
+    private final java.util.List<Thread> serveThreads = new java.util.ArrayList<>();
 
+    /**
+     * Stops the node and returns only once it is completely stopped: the
+     * listener is released, every connection is closed and no thread is
+     * still serving one. Idempotent.
+     *
+     * <p>{@code ServerSocket.close()} alone is not enough. On Linux it
+     * returns while the accept thread is still inside {@code accept(2)}, and
+     * the kernel keeps the listening socket alive until that thread leaves
+     * the call; a client that connects in that window completes its
+     * handshake, and the accept loop hands it a fresh serve thread that
+     * answers from {@link #stores} as if the node were still up (issue
+     * #1519: a {@code get} right after {@code close()} returned a value
+     * instead of failing). So this also waits for the accept loop to end,
+     * and the accept loop drops anything it accepts once {@link #closed}
+     * is set.
+     */
     @Override
     public void close() throws IOException {
+        java.util.List<Socket> sockets;
+        java.util.List<Thread> threads;
+        synchronized (lifecycle) {
+            if (closed) return;
+            closed = true;
+            sockets = new java.util.ArrayList<>(accepted);
+            threads = new java.util.ArrayList<>(serveThreads);
+        }
         server.close();
-        for (Socket socket : accepted) {
+        join(acceptLoop);
+        for (Socket socket : sockets) {
             socket.close();
+        }
+        for (Thread thread : threads) {
+            join(thread);
+        }
+    }
+
+    private static void join(Thread thread) throws IOException {
+        if (thread == Thread.currentThread()) return;
+        try {
+            thread.join(5_000);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new java.io.InterruptedIOException("interrupted while stopping a mock node thread");
+        }
+        if (thread.isAlive()) {
+            throw new IOException("a mock node thread did not stop within 5 s of close()");
         }
     }
 
@@ -189,6 +248,8 @@ final class MockNode implements AutoCloseable {
             boolean tagged = false;
             while (true) {
                 String[] parts = readLine(in).split(" ");
+                // A request read after close() began is never answered.
+                if (closed) return;
                 String tagSuffix = tagged ? " " + parts[parts.length - 1] : "";
                 switch (parts[0]) {
                     case "A" -> {
