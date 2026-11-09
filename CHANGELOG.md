@@ -25,6 +25,19 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: the replica write of an `i` (INCR) result could be
+  over the node's 1 MiB request limit and poison the connection every client
+  of the proxy shares. The proxy turns the node's `I <value> <ttl>` into an
+  `S` for the replicas, which carries the value (up to 20 digits) and the
+  TTL where the client's `i` carried only a delta, so an `i` at the client
+  frame limit gave a replica `S` the node refused (`request is too large`, a
+  bare `En` and a close); the requests of other clients already written on
+  the connection then failed with an unknown outcome. An `i` whose namespace
+  and key exceed 1,048,512 bytes is now refused at its header, before the
+  primary applies it, and a backend frame that would be over the node's
+  limit once tagged is never written: it fails as not sent and the
+  connection is left alone (#1590).
+
 - `nanocached-proxy`: a source IP's in-flight byte share was forgotten as
   soon as its last connection ended, even while requests that connection
   had dispatched were still charged (a client write error ends the

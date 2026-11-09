@@ -188,6 +188,22 @@ const BACKEND_TAG_MAX_BYTES: usize = 1 + 10;
 /// backend frame within what a node accepts.
 const MAX_CLIENT_FRAME_SIZE: usize = MAX_REQUEST_SIZE - BACKEND_TAG_MAX_BYTES;
 
+/// The most a backend frame's header grows when its `{tag}` placeholder is
+/// replaced with a connection tag: a `u32` is at most ten digits.
+const TAG_MAX_DIGITS: usize = 10;
+
+/// What a replica `S`/`s` frame built from an INCR result adds to the
+/// namespace and key it carries: its header (`s <ns> <key> <len> <ttl>
+/// <tag>`, the two lengths up to seven digits each, the value's length two,
+/// the TTL and the tag ten) is 43 bytes, and the value, an `i64` in
+/// decimal, 20. The client's `i` frame carries only a delta, so this is
+/// growth `MAX_CLIENT_FRAME_SIZE` does not cover.
+const INCR_RESULT_FRAME_OVERHEAD: usize = 64;
+
+/// The most namespace and key bytes an `i` request may carry: the replica
+/// write of its result must fit the node's request limit as well.
+const MAX_INCR_NAMESPACE_KEY_BYTES: usize = MAX_REQUEST_SIZE - INCR_RESULT_FRAME_OVERHEAD;
+
 /// Mirrors the node's `MAX_MULTI_REPLY_VALUE_BYTES`: the most value bytes
 /// one `M` reply carries. A node's reply can legitimately exceed the 1 MiB
 /// request bound (a few large hits in one batch), so `read_reply` must
@@ -2313,11 +2329,15 @@ fn parse_request_body(
                 return Err(invalid("empty key"));
             }
             let delta = parse_delta_field(delta)?;
-            let body = body!(
-                namespace_length
-                    .checked_add(key_length)
-                    .ok_or_else(|| invalid("frame length overflow"))?
-            );
+            let namespace_key_length = namespace_length
+                .checked_add(key_length)
+                .ok_or_else(|| invalid("frame length overflow"))?;
+            // The replica write of the result carries the value and the TTL
+            // as well; see `INCR_RESULT_FRAME_OVERHEAD`.
+            if namespace_key_length > MAX_INCR_NAMESPACE_KEY_BYTES {
+                return Err(invalid("incr namespace and key exceed the request limit"));
+            }
+            let body = body!(namespace_key_length);
             let namespace = body.slice(..namespace_length);
             let key = body.slice(namespace_length..);
             Ok(ParseOutcome::Ready(
@@ -3130,6 +3150,15 @@ fn backend_exit_log_line(addr: &str, poisoned_exit: bool, clients_affected: bool
 /// send order, and with it their tag, is known).
 const TAG_PLACEHOLDER: &str = "{tag}";
 
+/// The most bytes `frame` takes on the wire once `substitute_tag` has put a
+/// connection tag in its header.
+fn backend_frame_wire_bound(frame: &Bytes) -> usize {
+    frame
+        .len()
+        .saturating_sub(TAG_PLACEHOLDER.len())
+        .saturating_add(TAG_MAX_DIGITS)
+}
+
 /// Splits `frame` into its header — with `{tag}` substituted for `tag` —
 /// and its body, for the caller to write as two separate pieces instead
 /// of one concatenated buffer.
@@ -3891,6 +3920,22 @@ impl SharedBackends {
         frame: Bytes,
         expect: Expect,
     ) -> PendingReply {
+        // A node answers a request over `MAX_REQUEST_SIZE` with a bare `En`
+        // and closes the connection, which this one shares with every other
+        // client of the proxy: their requests already written on it would
+        // fail with an unknown outcome. Whatever built the frame, one that
+        // would not fit is never written.
+        let wire_bound = backend_frame_wire_bound(&frame);
+        if wire_bound > MAX_REQUEST_SIZE {
+            return PendingReply::failed(not_sent(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "request for {addr} would be {wire_bound} bytes, over the node's \
+                     {MAX_REQUEST_SIZE}-byte limit"
+                ),
+            )));
+        }
+
         // Issue #177: a fast-fail check before even touching the
         // per-address slot lock — a black-holed address that just
         // failed shouldn't make every concurrent caller queue up behind
@@ -9849,6 +9894,125 @@ mod tests {
         let mut input = BytesMut::from(&format!("S 1 {value_len}\n").into_bytes()[..]);
         let error = parse_request(&mut input, false, &mut RequestScanState::default()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Issue #1590: the replica `S` built from an INCR result carries the
+    /// value and the TTL, which the client's `i` (a delta) does not, so a
+    /// key that fits `MAX_CLIENT_FRAME_SIZE` as an `i` could make a replica
+    /// write the node refuses. Such an `i` is refused at its header, before
+    /// the primary applies anything.
+    #[test]
+    fn an_incr_whose_replica_write_could_not_fit_is_refused_at_the_header() {
+        // The reproduction: a 1,048,533-byte key, a frame at the client bound.
+        let header = "i 0 1048533 1000000000000000000\n";
+        assert_eq!(header.len() + 1_048_533, MAX_CLIENT_FRAME_SIZE);
+        let mut input = BytesMut::from(header.as_bytes());
+        let error = parse_request(&mut input, false, &mut RequestScanState::default()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        // The bound is the key and namespace, not the frame: a namespace
+        // counts too, and a key that leaves room for the replica write parses.
+        let fits = MAX_REQUEST_SIZE - 64;
+        let mut input = BytesMut::from(format!("i 5 {} 1\n", fits - 5).as_bytes());
+        let error = parse_request(&mut input, false, &mut RequestScanState::default());
+        assert!(matches!(error, Ok(ParseOutcome::Incomplete)), "{error:?}");
+        let mut input = BytesMut::from(format!("i 5 {} 1\n", fits - 4).as_bytes());
+        let error = parse_request(&mut input, false, &mut RequestScanState::default()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Whatever the largest INCR result is, the replica frame fits when the
+    /// key is at the INCR bound.
+    #[test]
+    fn the_replica_write_of_an_incr_result_fits_the_nodes_limit_at_the_incr_bound() {
+        let key = vec![b'k'; MAX_REQUEST_SIZE - 64];
+        let value = b"-9223372036854775808";
+        let frame = frame_set(b"", &key, value, Some(u64::from(u32::MAX)));
+        assert!(
+            backend_frame_wire_bound(&frame) <= MAX_REQUEST_SIZE,
+            "{}",
+            backend_frame_wire_bound(&frame)
+        );
+        let namespaced = frame_set(
+            &[b'n'; 4],
+            &key[..key.len() - 4],
+            value,
+            Some(u64::from(u32::MAX)),
+        );
+        assert!(backend_frame_wire_bound(&namespaced) <= MAX_REQUEST_SIZE);
+    }
+
+    /// Issue #1590: a frame over what a node accepts is never written to the
+    /// shared connection, whoever built it. The node here would see a
+    /// connection, so the test also proves it is never dialed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_over_the_nodes_limit_is_refused_before_it_reaches_the_node() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let context = bare_context();
+
+        // The shape from the issue: an INCR result for a 1,048,533-byte key.
+        let reply = NodeReply::Incremented(
+            b"1000000000000000000".to_vec().into(),
+            Some(u32::MAX.into()),
+        );
+        let key = vec![b'k'; 1_048_533];
+        let PrimaryVerdict::Answer {
+            replicate: Some(result),
+            ..
+        } = PrimaryCommand::Incr { delta: 1 }.verdict(b"", &key, reply, None)
+        else {
+            panic!("an incremented reply is answered and replicated");
+        };
+        assert!(backend_frame_wire_bound(&result.frame) > MAX_REQUEST_SIZE);
+
+        let outcome = context
+            .backends
+            .enqueue(&context, &addr, result.frame.clone(), result.expect)
+            .await
+            .await;
+        let error = outcome.expect_err("the oversized frame must not be sent");
+        assert!(request_not_sent(&error), "{error}");
+
+        // Through the fan-out the replica legs use: a warning, no write.
+        fan_out_to_replicas(
+            &context,
+            std::slice::from_ref(&addr),
+            result.frame,
+            result.expect,
+            result.what,
+        )
+        .await;
+        assert!(
+            timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "the proxy connected to the node for a frame it could not send"
+        );
+    }
+
+    /// The other side of the guard: a frame whose widest form is exactly the
+    /// node's limit is sent and answered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_at_the_nodes_limit_is_still_sent() {
+        let node = MockNode::start().await;
+        let context = bare_context();
+        let key = b"k".to_vec();
+        let mut value_len = MAX_REQUEST_SIZE;
+        while backend_frame_wire_bound(&frame_set(b"", &key, &vec![b'v'; value_len], None))
+            > MAX_REQUEST_SIZE
+        {
+            value_len -= 1;
+        }
+        let frame = frame_set(b"", &key, &vec![b'v'; value_len], None);
+        assert_eq!(backend_frame_wire_bound(&frame), MAX_REQUEST_SIZE);
+
+        let reply = context
+            .backends
+            .call(&context, &node.addr, frame, Expect::Stored)
+            .await
+            .expect("a frame the node accepts is sent");
+        assert!(matches!(reply, NodeReply::Stored));
     }
 
     #[tokio::test]
@@ -17149,24 +17313,31 @@ mod tests {
         // dead handle.
         let silent = start_silent_after_handshake_node().await;
         let context = bare_context();
-        // Comfortably larger than any plausible default OS socket buffer
-        // pair on an unread loopback connection, so the write reliably
-        // blocks instead of racing a platform-specific buffer size.
-        let big_value = vec![b'x'; 5_000_000];
+        // Together comfortably larger than any plausible default OS socket
+        // buffer pair on an unread loopback connection, so the write
+        // reliably blocks instead of racing a platform-specific buffer
+        // size. Several frames, each within what a node accepts, since
+        // `enqueue` sends no larger one.
+        let big_value = vec![b'x'; 1_000_000];
 
         // Deliberately not awaited: `run_backend`'s writer stalls trying
-        // to deliver this to `silent`, and the point of this test is what
+        // to deliver these to `silent`, and the point of this test is what
         // happens to the connection's own bookkeeping while that reply
         // never arrives — not the reply itself.
-        let _pending = context
-            .backends
-            .enqueue(
-                &context,
-                &silent,
-                frame_set(b"", b"key", &big_value, None),
-                Expect::Stored,
-            )
-            .await;
+        let mut _pending = Vec::new();
+        for _ in 0..8 {
+            _pending.push(
+                context
+                    .backends
+                    .enqueue(
+                        &context,
+                        &silent,
+                        frame_set(b"", b"key", &big_value, None),
+                        Expect::Stored,
+                    )
+                    .await,
+            );
+        }
 
         assert_eq!(
             context.backends.dialed.load(Ordering::SeqCst),
@@ -17204,17 +17375,23 @@ mod tests {
             .backends
             .enqueue(&context, &node, frame_get(b"", b"a"), Expect::Value)
             .await;
-        // Larger than any socket buffer pair, so the write blocks.
-        let big_value = vec![b'x'; 5_000_000];
-        let _stalled = context
-            .backends
-            .enqueue(
-                &context,
-                &node,
-                frame_set(b"", b"key", &big_value, None),
-                Expect::Stored,
-            )
-            .await;
+        // Together larger than any socket buffer pair, so the write blocks
+        // (several frames, each within what a node accepts).
+        let big_value = vec![b'x'; 1_000_000];
+        let mut _stalled = Vec::new();
+        for _ in 0..32 {
+            _stalled.push(
+                context
+                    .backends
+                    .enqueue(
+                        &context,
+                        &node,
+                        frame_set(b"", b"key", &big_value, None),
+                        Expect::Stored,
+                    )
+                    .await,
+            );
+        }
         let queued = context
             .backends
             .enqueue(&context, &node, frame_get(b"", b"b"), Expect::Value)
