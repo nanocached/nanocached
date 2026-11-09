@@ -3863,6 +3863,74 @@ func TestAForcedRefreshDoesNotReuseARefreshThatStartedBeforeItsFailure(t *testin
 	}
 }
 
+// deadPrimaryCluster starts two nodes at R=1, kills the first and returns a
+// key it owns: discovery still lists the dead node (its liveness window), so
+// every operation on that key fails and forces a refresh that installs the
+// same roster again.
+func deadPrimaryCluster(t *testing.T) (*Client, *mockDiscovery, string) {
+	t.Helper()
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	var key string
+	for i := 0; key == ""; i++ {
+		candidate := fmt.Sprintf("dead-%d", i)
+		if newHashRing(testNames).Owners([]byte(candidate), 1)[0] == testNames[0] {
+			key = candidate
+		}
+	}
+	nodes[testNames[0]].close()
+	time.Sleep(50 * time.Millisecond)
+	return client, discovery, key
+}
+
+func TestForcedRefreshesAreRateLimited(t *testing.T) {
+	// A caller failing against a dead primary over and over used to open one
+	// discovery connection per failed operation (issue #1531).
+	client, discovery, key := deadPrimaryCluster(t)
+	before := discovery.lCount.Load()
+	for i := 0; i < 40; i++ {
+		if err := client.Set(key, "v", 0); err == nil {
+			t.Fatal("a write to a dead primary succeeded")
+		}
+	}
+	// One refresh for the first failure; the rest fall inside the window.
+	if got := discovery.lCount.Load() - before; got > 2 {
+		t.Fatalf("discovery saw %d node-list fetches for 40 failed operations, want at most 2", got)
+	}
+}
+
+func TestAForcedRefreshRunsAgainOnceTheWindowHasPassed(t *testing.T) {
+	client, discovery, key := deadPrimaryCluster(t)
+	_ = client.Set(key, "v", 0)
+	afterFirst := discovery.lCount.Load()
+	time.Sleep(forcedRefreshMinInterval + 100*time.Millisecond)
+	_ = client.Set(key, "v", 0)
+	if got := discovery.lCount.Load(); got != afterFirst+1 {
+		t.Fatalf("discovery saw %d fetches after the window, want %d", got, afterFirst+1)
+	}
+}
+
+func TestConcurrentFailuresShareTheirRefreshes(t *testing.T) {
+	client, discovery, key := deadPrimaryCluster(t)
+	before := discovery.lCount.Load()
+	var wg sync.WaitGroup
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = client.Set(key, "v", 0)
+		}()
+	}
+	wg.Wait()
+	if got := discovery.lCount.Load() - before; got > 2 {
+		t.Fatalf("discovery saw %d node-list fetches for 40 concurrent failures, want at most 2", got)
+	}
+}
+
 func TestGetManyReadsARepeatedKeyOnce(t *testing.T) {
 	// A repeated key is read once: sending every copy would cost one
 	// `m` frame per 400 copies and retain one reply per frame.

@@ -61,7 +61,14 @@ fails a write), and `Get`/`GetBytes` ask the primary, falling over to
 the next owner only when the holder is unreachable. `client.Replication()`
 exposes the factor in use. A write whose primary just died recovers
 automatically once discovery drops the node (bounded by its liveness
-timeout): the failed attempt forces a node-list refresh and one retry.
+timeout): the failed attempt forces a node-list refresh and one retry. A
+refresh forced this way waits at least 200 ms after the previous refresh
+finished: while discovery still lists a node that has died, every operation
+routed to it fails, and without that floor each failure would open its own
+discovery connection. A caller that fails inside the window reuses the refresh
+that just finished, and callers queued behind a refresh that started before
+their failure share one follow-up refresh that starts when the window has
+passed.
 
 ## Fire-and-forget replica writes
 
