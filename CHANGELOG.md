@@ -25,6 +25,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a replica that a leave or an eviction promoted to a
+  key's primary refused `INCR`, `CAS` and `CAS-delete` on that key with `W`
+  until it adopted the new ring, up to a heartbeat and longer while a join
+  was pending on it. A key the node's own ring granted at rank 2 was judged
+  by that ring alone, so the newer list discovery had already published,
+  which the client followed, was never consulted, and the refresh before
+  the `W` re-evaluated the same predicate. The published ring now makes
+  this node the primary there too; a node that is only a replica under it
+  still answers `W` (#1589).
+
 - `nanocached-proxy`: a source IP's in-flight byte share was forgotten as
   soon as its last connection ended, even while requests that connection
   had dispatched were still charged (a client write error ends the
