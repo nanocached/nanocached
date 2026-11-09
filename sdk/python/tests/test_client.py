@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import gc
 import io
 import os
 import random
@@ -1390,6 +1391,42 @@ class StalledPeerTests(unittest.IsolatedAsyncioTestCase):
                 all(isinstance(outcome, ConnectionError) for outcome in outcomes), outcomes
             )
         finally:
+            await node.close()
+
+    async def test_cancelling_a_set_blocked_in_a_write_leaves_no_unretrieved_future(self):
+        # asyncio.wait_for(client.set(k, big), t) cancelling while drain()
+        # is suspended poisons the connection, which rejects every pending
+        # slot — including the cancelled caller's own, whose future
+        # nobody awaits any more. The event loop logged it as "Future
+        # exception was never retrieved" at ERROR when it was
+        # garbage-collected. (Eight sets: the first ones fit the kernel's
+        # socket buffers, the later ones block in drain().)
+        node = await self.stalled_node()
+        loop = asyncio.get_running_loop()
+        logged: list[str] = []
+        loop.set_exception_handler(lambda _loop, context: logged.append(context.get("message", "")))
+
+        async def timed_out_set(client, i):
+            try:
+                await asyncio.wait_for(client.set(f"k{i}", b"x" * 900_000), 0.3)
+            except (asyncio.TimeoutError, ConnectionError):
+                # Timed out, or failed because an earlier cancellation
+                # poisoned the connection under it.
+                pass
+
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await asyncio.gather(*(timed_out_set(client, i) for i in range(8)))
+                for _ in range(5):
+                    gc.collect()
+                    await asyncio.sleep(0)
+            finally:
+                await client.close()
+            gc.collect()
+            self.assertEqual([m for m in logged if "never retrieved" in m], [])
+        finally:
+            loop.set_exception_handler(None)
             await node.close()
 
     async def test_close_returns_while_a_fire_and_forget_replica_is_stalled(self):
