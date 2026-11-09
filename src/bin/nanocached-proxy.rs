@@ -5589,6 +5589,59 @@ async fn finish_multi_touch(
     }
 }
 
+/// The keys `expire_batch_on_other_owners` sends, per owner address. A key
+/// is listed once per address: two of its owner ranks can share one (two
+/// roster names on one IP:port, as right after a same-address restart), and
+/// the node needs the key once, not once per rank.
+fn plan_expire_on_other_owners(
+    ring: &RingView,
+    batch: &MultiTouchBatch<'_>,
+    entries: &[Option<ProxyMultiEntry>],
+    answered_by: &[Option<String>],
+) -> Vec<(String, Vec<Bytes>)> {
+    let mut others: AddrGroups<Vec<usize>> = AddrGroups::new(ring);
+    let namespace_hash = NamespaceHash::of(batch.namespace);
+    let mut top = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        if !matches!(
+            entry,
+            Some(ProxyMultiEntry::Value(_) | ProxyMultiEntry::Miss)
+        ) {
+            continue;
+        }
+        let Some(answered) = answered_by[position].as_deref() else {
+            continue;
+        };
+        ring.rank_owners(
+            namespace_hash,
+            &batch.keys[position],
+            ring.replication,
+            &mut top,
+        );
+        for &(_, owner) in &top {
+            if ring.nodes[owner].1 != answered {
+                // A key's owners are filed together, so a repeat is the
+                // group's last position.
+                let positions = others.group_for(owner);
+                if positions.last() != Some(&position) {
+                    positions.push(position);
+                }
+            }
+        }
+    }
+    others
+        .into_named()
+        .into_iter()
+        .map(|(addr, positions)| {
+            let keys = positions
+                .into_iter()
+                .map(|position| batch.keys[position].clone())
+                .collect();
+            (addr, keys)
+        })
+        .collect()
+}
+
 /// Issue #934: the deferred replica legs of an expiring batch — one plain
 /// `y ... 0` per other owner on the current ring, covering every key whose
 /// primary answered (a value or a miss: a miss on the primary can still
@@ -5613,36 +5666,11 @@ async fn expire_batch_on_other_owners(
     let Some(ring) = current_ring(context) else {
         return;
     };
-    let mut others: AddrGroups<Vec<Bytes>> = AddrGroups::new(&ring);
-    let namespace_hash = NamespaceHash::of(batch.namespace);
-    let mut top = Vec::new();
-    for (position, entry) in entries.iter().enumerate() {
-        if !matches!(
-            entry,
-            Some(ProxyMultiEntry::Value(_) | ProxyMultiEntry::Miss)
-        ) {
-            continue;
-        }
-        let Some(answered) = answered_by[position].as_deref() else {
-            continue;
-        };
-        ring.rank_owners(
-            namespace_hash,
-            &batch.keys[position],
-            ring.replication,
-            &mut top,
-        );
-        for &(_, owner) in &top {
-            if ring.nodes[owner].1 != answered {
-                others.group_for(owner).push(batch.keys[position].clone());
-            }
-        }
-    }
+    let others = plan_expire_on_other_owners(&ring, batch, entries, answered_by);
     if others.is_empty() {
         return;
     }
     let frames: Vec<(String, Bytes)> = others
-        .into_named()
         .into_iter()
         .map(|(addr, keys)| {
             (
@@ -12755,6 +12783,39 @@ mod tests {
 
         stream.write_all(b"o 0 2 1 1 1 1\nabcd").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "O 2 S S");
+    }
+
+    // Issue #1515: the deferred replica legs of an expiring batch list a key
+    // once per address even when two of its owner ranks share one.
+    #[test]
+    fn an_expiring_batchs_other_owner_frames_list_a_key_once_per_address() {
+        // node-b and node-c share addr-2; replication 3 makes every key's
+        // owners the whole roster. addr-1 answered every key.
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), "addr-1".to_string()),
+                ("node-b".to_string(), "addr-2".to_string()),
+                ("node-c".to_string(), "addr-2".to_string()),
+            ],
+            3,
+        );
+        let keys: Vec<Bytes> = (0..6).map(|i| Bytes::from(format!("key-{i}"))).collect();
+        let batch = MultiTouchBatch {
+            namespace: b"",
+            keys: &keys,
+            ttl: Some(0),
+            get: false,
+        };
+        let entries = vec![Some(ProxyMultiEntry::Miss); keys.len()];
+        let answered_by = vec![Some("addr-1".to_string()); keys.len()];
+
+        let plan = plan_expire_on_other_owners(&ring, &batch, &entries, &answered_by);
+        assert_eq!(plan.len(), 1, "only the address that did not answer");
+        let (addr, listed) = &plan[0];
+        assert_eq!(addr, "addr-2");
+        assert_eq!(listed, &keys, "each key once, in batch order");
+        let frame = frame_multi_touch(b"", listed, Some(0), false);
+        assert!(frame.starts_with(format!("y 0 {} ", keys.len()).as_bytes()));
     }
 
     // Issue #1486: two roster names on one address (a node restarted on the
