@@ -45,6 +45,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e`: `load.py` initialised its `corrupt` counter but never
+  incremented it, and wrote the same constant value to every key, so the
+  `"corrupt": 0` assertions in `scalein.sh`, `proxydrain.sh`, `proxykill.sh`,
+  `freshjoin.sh` and `chaos.sh` could only hold. The loader now writes the
+  value `verify.py` seeds for the key (it encodes the key) and counts any
+  other bytes read back as `corrupt`, and those scripts also fail when the
+  load completed fewer than `MIN_OPS_S` (10) ops per second of its run (#1619).
+
 - `nanocached-discovery`: a pause of the discovery process longer than a
   join's migration timeout (a stop-the-world of a minute or more, `SIGSTOP`,
   a paused VM) abandoned the join on the first sweep after it resumed, as
