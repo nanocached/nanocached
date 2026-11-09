@@ -5975,15 +5975,19 @@ async fn wait_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver<
 /// only a namespaced key needs the `s` form (issue #105), which every
 /// node must understand before namespaces are put to use.
 fn set_message(key: &Key, value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
+    let mut message = set_header(key, value.len(), ttl).into_bytes();
+    message.extend_from_slice(&key.namespace);
+    message.extend_from_slice(&key.name);
+    message.extend_from_slice(value);
+    message
+}
+
+/// `set_message`'s header line, newline included.
+fn set_header(key: &Key, value_len: usize, ttl: Option<Duration>) -> String {
     let mut header = if key.is_namespaced() {
-        format!(
-            "s {} {} {}",
-            key.namespace.len(),
-            key.name.len(),
-            value.len()
-        )
+        format!("s {} {} {}", key.namespace.len(), key.name.len(), value_len)
     } else {
-        format!("S {} {}", key.name.len(), value.len())
+        format!("S {} {}", key.name.len(), value_len)
     };
 
     if let Some(ttl) = ttl {
@@ -5991,12 +5995,41 @@ fn set_message(key: &Key, value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
     }
 
     header.push('\n');
+    header
+}
 
-    let mut message = header.into_bytes();
-    message.extend_from_slice(&key.namespace);
-    message.extend_from_slice(&key.name);
-    message.extend_from_slice(value);
-    message
+/// The frame a queued `Set` goes out as to `token`'s node. The `S`/`s` it
+/// has always been, unless that frame would be over `MAX_REQUEST_SIZE`,
+/// which the receiver refuses (`En`, then a close) because it cannot tell
+/// a forward from a client's write (issue #1536). A touch forwarded as the
+/// value it left, with the new TTL, can do that: a value stored by an `S`
+/// within a few bytes of the limit grows by the TTL field. Such a write
+/// goes as the unconditional `U` instead, the frame that carries
+/// `INTERNAL_FRAME_ALLOWANCE` for exactly this kind of overhead and that a
+/// joiner already receives for a lingering slot (`into_handoff_frame`).
+/// Every other forward keeps the frame it had, and so does the receiver's
+/// handling of it.
+fn queued_set_frame<'a>(
+    key: &'a Key,
+    value: &'a Bytes,
+    ttl: Option<Duration>,
+    token: &'a str,
+) -> ForwardedWrite<'a> {
+    let frame_len = set_header(key, value.len(), ttl).len()
+        + key.namespace.len()
+        + key.name.len()
+        + value.len();
+    if request_is_too_large(frame_len, Some(b'S')) {
+        ForwardedWrite::HandoffSet {
+            key,
+            value,
+            ttl,
+            if_absent: false,
+            token,
+        }
+    } else {
+        ForwardedWrite::Set { key, value, ttl }
+    }
 }
 
 /// Staged node join: propagates a client's `D` for a key an in-progress handoff
@@ -10185,11 +10218,7 @@ impl OwnedForwardedWrite {
                     node_context,
                     &target.addr,
                     connection,
-                    ForwardedWrite::Set {
-                        key,
-                        value,
-                        ttl: *ttl,
-                    },
+                    queued_set_frame(key, value, *ttl, &target.token),
                     deadline,
                 )
                 .await
@@ -32485,5 +32514,78 @@ mod tests {
         fake_discovery.abort();
 
         assert_join_then_heartbeats(&received.lock().unwrap(), 8356);
+    }
+
+    /// The wire bytes of the frame `queued_set_frame` chose.
+    fn queued_set_bytes(
+        key: &Key,
+        value: &Bytes,
+        ttl: Option<Duration>,
+        token: &str,
+    ) -> (bool, Vec<u8>) {
+        match queued_set_frame(key, value, ttl, token) {
+            ForwardedWrite::Set { key, value, ttl } => (false, set_message(key, value, ttl)),
+            ForwardedWrite::HandoffSet {
+                key,
+                value,
+                ttl,
+                if_absent,
+                token,
+            } => {
+                assert!(
+                    !if_absent,
+                    "a forwarded write overwrites, it is not a relay"
+                );
+                (true, handoff_message(key, value, ttl, if_absent, token))
+            }
+            _ => unreachable!("a queued set is an S or a U"),
+        }
+    }
+
+    /// Issue #1536: a touch forwards the value with its new TTL, so the
+    /// `S` of a value stored within a few bytes of the limit can be over
+    /// the limit with the TTL field added, and the receiver refuses it. At
+    /// the boundary the forward goes out as a `U`, which the receiver
+    /// accepts with the internal allowance; below it, as the `S` it was.
+    #[test]
+    fn a_queued_set_over_the_request_limit_goes_out_as_a_handoff_frame() {
+        let token = Uuid::nil().to_string();
+        let ttl = Some(Duration::from_secs(86_400));
+        for key in [
+            key(b"name"),
+            Key::new(Bytes::from_static(b"ns"), Bytes::from_static(b"name")),
+        ] {
+            let frame_len = |value_len: usize| {
+                set_header(&key, value_len, ttl).len()
+                    + key.namespace.len()
+                    + key.name.len()
+                    + value_len
+            };
+            // The largest value whose `S`/`s` still fits.
+            let fits = (0..=MAX_REQUEST_SIZE)
+                .rev()
+                .find(|value_len| frame_len(*value_len) <= MAX_REQUEST_SIZE)
+                .unwrap();
+            assert_eq!(frame_len(fits), MAX_REQUEST_SIZE);
+
+            let value = Bytes::from(vec![b'v'; fits]);
+            let (handoff, bytes) = queued_set_bytes(&key, &value, ttl, &token);
+            assert!(!handoff);
+            assert_eq!(bytes.len(), MAX_REQUEST_SIZE);
+            assert!(!request_is_too_large(bytes.len(), bytes.first().copied()));
+
+            // One byte more, as a touch adding a TTL to a value that was
+            // stored without one: over the limit as an `S`.
+            let value = Bytes::from(vec![b'v'; fits + 1]);
+            assert!(request_is_too_large(frame_len(fits + 1), Some(b'S')));
+            let (handoff, bytes) = queued_set_bytes(&key, &value, ttl, &token);
+            assert!(handoff);
+            assert!(bytes.len() > MAX_REQUEST_SIZE);
+            assert!(
+                !request_is_too_large(bytes.len(), bytes.first().copied()),
+                "the U must fit what the receiver allows it ({} bytes)",
+                bytes.len()
+            );
+        }
     }
 }
