@@ -25,6 +25,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a discovery server with no node registered (a fresh
+  process, or one the nodes had stopped heartbeating to) answers `L` with
+  `N 0 R`, and the proxy counted that as a successful fetch. Listed first in
+  `--discovery`, it won the race on every refresh, so the proxy published an
+  empty ring, dropped every backend connection slot and answered every
+  request `B` while the next server held the full roster. An empty roster is
+  now a failed fetch, like `B`: the race moves on to the other servers, and if
+  every server is empty the proxy keeps the ring it has (#1591).
+
 - `nanocached-node` (built with the `trace` feature, which the released
   images are not): TRACE lines were written to stderr with a blocking
   `eprintln!` on the request path, so a log pipe nobody was reading (a
