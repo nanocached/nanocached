@@ -96,7 +96,10 @@ public class ExpiringTouchOrderTests
         Assert.Empty(replica.TouchFrames);
 
         // Once discovery drops the primary the reroute finds the value on
-        // the surviving replica, which is the primary now.
+        // the surviving replica, which is the primary now. The calls above
+        // refreshed just now, so the next forced refresh waits out the
+        // minimum interval (issue #1583) before it can see the change.
+        await Task.Delay(NanocachedClient.ForcedRefreshMinInterval + TimeSpan.FromMilliseconds(100));
         cluster.Discovery.SetNodes(
             cluster.Nodes.Where(p => p.Key != primaryName).Select(p => (p.Key, p.Value.Address)).ToList());
         Assert.Equal("v", await cluster.Client.GetAndTouchAsync(key, 0));
@@ -207,8 +210,11 @@ public class ExpiringTouchOrderTests
         await Assert.ThrowsAnyAsync<ConnectionLostException>(() => cluster.Client.TouchManyAsync(keys, 0));
         Assert.Empty(replica.MultiTouchFrames);
 
+        // The calls above refreshed just now: wait out the minimum
+        // interval between forced refreshes (issue #1583).
+        await Task.Delay(NanocachedClient.ForcedRefreshMinInterval + TimeSpan.FromMilliseconds(100));
         cluster.Discovery.SetNodes(new List<(string, string)> { (Names[1], replica.Address) });
-        var hits = await cluster.Client.GetManyAndTouchAsync(keys, 0);
+        var hits =await cluster.Client.GetManyAndTouchAsync(keys, 0);
         Assert.Equal(keys.OrderBy(k => k), hits.Keys.OrderBy(k => k));
         // One frame per pass: the rerouted batch, the survivor being the primary.
         Assert.Single(replica.MultiTouchFrames);

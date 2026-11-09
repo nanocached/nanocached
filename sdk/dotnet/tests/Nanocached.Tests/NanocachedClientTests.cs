@@ -6393,11 +6393,15 @@ public class NanocachedClientTests
     // ── forced refreshes are single-flight ──────────────────────────
 
     [Fact]
-    public async Task ConcurrentCallersOnADeadNodeShareOneForcedRefresh()
+    public async Task ConcurrentCallersOnADeadNodeShareTheirForcedRefreshes()
     {
         // Four callers that find their node dead at the same time used to
         // run four full refreshes one after another behind the refresh
-        // gate, the last caller waiting through all of them.
+        // gate, the last caller waiting through all of them. Now the
+        // first caller's refresh is one, and the three that queued behind
+        // it (it began before their failure, so it is not theirs) share a
+        // single follow-up once the minimum interval has passed (issue
+        // #1583): two refreshes, not four.
         using Cluster cluster = StartCluster(replication: 1);
         using NanocachedClient client =
             await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
@@ -6415,9 +6419,11 @@ public class NanocachedClientTests
         })).ToArray();
         foreach (long millis in await Task.WhenAll(callers))
         {
-            Assert.True(millis < 1_000, $"a caller waited {millis}ms (serialized refreshes?)");
+            // Two refreshes of 400 ms and the interval between them; four
+            // serialized ones would be 1.6 s of refreshing alone.
+            Assert.True(millis < 1_500, $"a caller waited {millis}ms (serialized refreshes?)");
         }
-        Assert.Equal(2, cluster.Discovery.ConnectionCount);
+        Assert.Equal(3, cluster.Discovery.ConnectionCount);
     }
 
     /// <summary>A key whose primary under <see cref="Names"/> (R=1) is
