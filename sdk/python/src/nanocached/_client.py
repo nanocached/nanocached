@@ -3739,10 +3739,9 @@ class NanocachedClient:
                             return
                         await asyncio.sleep(remaining)
                         continue
-                task = asyncio.ensure_future(self._refresh_node_list())
+                task = asyncio.ensure_future(self._run_refresh())
                 self._refresh_task = task
                 self._refresh_started = time.monotonic()
-                task.add_done_callback(self._note_refresh_finished)
             elif force and self._refresh_started < observed:
                 # wait() neither raises the old refresh's error (its own
                 # callers get it) nor cancels it if we are cancelled.
@@ -3752,9 +3751,23 @@ class NanocachedClient:
             await asyncio.shield(task)
             return
 
-    def _note_refresh_finished(self, task: "asyncio.Task[None]") -> None:
-        if not task.cancelled():
-            self._refresh_finished = time.monotonic()
+    async def _run_refresh(self) -> None:
+        """_refresh_node_list(), recording when it ended. The end time is
+        set here, in the refresh task's last step, not from a done callback:
+        a callback runs one loop iteration after the task completed, and a
+        forced caller scheduled in between would see ``task.done()`` with
+        the previous end time, find the interval already passed and start
+        another refresh right behind this one (issue #1607). A cancelled
+        refresh records nothing."""
+        cancelled = False
+        try:
+            await self._refresh_node_list()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            if not cancelled:
+                self._refresh_finished = time.monotonic()
 
     async def _refresh_node_list(self) -> None:
         cluster = await self._fetch_node_list()
