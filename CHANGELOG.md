@@ -25,6 +25,33 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-discovery`: when the path between discovery and the whole
+  fleet was cut and healed after the first evictions but before the last
+  (the nodes' heartbeats fall at different phases of the 5 s interval, so
+  they cross the liveness window on different sweep ticks), the evicted
+  nodes were sent back through a join and emptied their caches: a node
+  still listed counted as one the cluster had moved on with, although it
+  had been cut off just the same and had taken nothing over. A member heard
+  from again after a gap of 9 s or more — at least one heartbeat did not
+  arrive — now counts as in unbroken contact only from that moment, so it
+  no longer makes the nodes evicted during the gap start over; they are
+  registered with their caches as when every node was evicted together. A
+  survivor whose heartbeat was merely late, by less than 9 s, still counts
+  as in contact throughout (#1479).
+- `nanocached-node`: clearing one namespace left the handoff tombstones of
+  that namespace's keys in place, while clearing the whole store dropped
+  them. The tombstones stayed charged to the memory bound for their
+  two minutes, and refused the put-if-absent copy of a key written again
+  after the clear within that time, so the key could be one copy short
+  after a membership change. Clearing a namespace now drops its tombstones
+  and gives their bytes back, as clearing everything does (#1491).
+- `nanocached-node`: a delete (`D`, `d`, or a relayed one) that found its
+  key present but already past its TTL removed the entry and answered
+  as if it had not been there without counting the removal, so
+  `nanocached_node_expirations_total` undercounted by the number of
+  deletes that hit an expired entry. Every other lazy removal (a get, an
+  `INCR`, a touch, a compare, the sweep) was counted. The delete now
+  counts it too (#1490).
 - `nanocached-proxy`: a refused `A` that asked for response tags was
   answered `En\n`, where a node answers `EnT\n` and a discovery server
   `EdT\n`. The proxy now echoes the `T` too, so a client reads the same
@@ -58,6 +85,56 @@ framework adapters at one version, whether or not a component changed.
   now holds a share of the charge too, and the bytes are free once both
   the reply has been written (or dropped) and the driver has finished
   (#1488).
+- `nanocached-proxy`: a node refuses a request it will not run (an old
+  node that does not know a command the proxy sent, or a frame over its
+  size limit) with the untagged `En\n` and then closes the connection, but
+  the proxy only recognised a tagged `E <tag>` as a refusal. Against a real
+  node the `En` was read as a malformed reply: the request ended as an
+  unknown outcome (the fatal `E` and a close for a client that asked for
+  `R`) and the backend connection was poisoned. The `R` that a refused
+  expiring touch, `i`, `k` or `x` is meant to get therefore came only from
+  the test mock. An untagged `En` on a backend connection is now the
+  refusal of the oldest request waiting for a reply, answered as such
+  (`R` for those four), and the close that follows is an ordinary close of
+  the shared connection: requests reserved behind it fail as lost replies
+  do and the next request redials (#1487).
+- `nanocached-proxy`: when two roster names shared one address (a node
+  restarted on the same IP:port under a new name while its old entry was
+  still registered), an `o` batch put each key into that address's
+  sub-frame once per owner rank, so the frame carried every key and value
+  twice and could grow to twice the client's frame. Past about 512 KiB the
+  node answered `En` and closed, which poisoned the shared backend
+  connection for every other client and left the batch's keys answered
+  `W`, because the retry built the same frame. Each key is now filed once
+  per address, in the first pass and in the retry, keeping the primary
+  flag of its best-ranked owner; a `y` batch without `G` or an expiry
+  had the same duplicate and gets the same fix (#1486).
+- `nanocached-node`: `--port 0` together with `--discovery` was accepted.
+  The node registered port 0, which discovery refuses, so it served on the
+  port the kernel gave it but never joined, and the only sign was a
+  rejected registration logged on every retry. The combination now exits
+  at start-up with a message saying that the node must register the port
+  it listens on. `--port 0` without `--discovery` is unchanged (#1492).
+- `nanocached-node` (built with `--features trace`, the nightly chaos
+  build): a peer token whose ninth byte fell inside a multi-byte
+  character panicked the handoff trace line, which cut the token at eight
+  bytes. A registrant holding the secret could register such a token, and
+  the panic landed in the forward drainer, the decommission, the
+  re-replication or the migration task; one in the decommission was
+  silent and left the node up. The trace now cuts at eight characters.
+  Separately, `NANOCACHED_TRACE_PREFIX` set but empty traced every key,
+  because every key starts with the empty string; an empty value (or an
+  empty entry in the list) now selects nothing, as an unset variable does
+  (#1489).
+- `nanocached-node`, `nanocached-proxy`, `nanocached-discovery`: after a
+  refused request, the drain that half-closes and reads what the client is
+  still sending was bounded by its one-second window only for the read;
+  the half-close itself was awaited outside it. Over TLS the half-close
+  first flushes the pending records, so a client that stopped reading
+  with the send buffer full parked the connection task there for good,
+  holding its connection permit and its per-IP permit. The half-close is
+  now inside the window, so the whole drain ends after one second at the
+  latest (#1483).
 
 ## [0.6.2] - 2026-11-03
 
