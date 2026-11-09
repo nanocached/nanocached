@@ -993,9 +993,15 @@ async fn scenario_973() -> WindowOutcome {
                 held_on_b.insert(key.clone());
             }
         }
-        if held_on_b.len() == chosen.len() || waited >= Duration::from_secs(15) {
+        if held_on_b.len() == chosen.len() {
             break;
         }
+        assert!(
+            waited < Duration::from_secs(15),
+            "B holds {} of the {} promoted keys after {waited:?}, the rest never landed",
+            held_on_b.len(),
+            chosen.len()
+        );
         run_for(Duration::from_millis(250)).await;
         waited += Duration::from_millis(250);
     }
@@ -1056,9 +1062,9 @@ async fn a_write_in_a_re_replication_window_is_not_mirrored_to_a_node_a_later_jo
     let out = scenario_973().await;
     eprintln!("{out:?}");
     assert!(out.keys > 0, "nothing to check: {out:?}");
-    assert!(
-        out.b_held_after_the_eviction > 0,
-        "nothing to check, B was not promoted for the keys: {out:?}"
+    assert_eq!(
+        out.b_held_after_the_eviction, out.keys,
+        "B was not promoted for every key the scenario checks: {out:?}"
     );
     assert_eq!(out.a_missing, 0, "A lost keys it owned throughout: {out:?}");
     assert_eq!(
