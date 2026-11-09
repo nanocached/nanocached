@@ -32,7 +32,7 @@ import {
 import { Connection, REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
 import { MAX_REQUEST_BYTES, MULTI_GET_TUNING } from "../src/protocol.js";
 import { maxMultiGetDecompressedBytes, setMaxMultiGetDecompressedBytesForTest } from "../src/compression.js";
-import { revivablePort, startMockDiscovery, startMockNode, unreachablePort, type MockNode } from "./mockServers.js";
+import { revivablePort, startMockDiscovery, startMockNode, unreachablePort, type MockDiscovery, type MockNode } from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -525,6 +525,60 @@ describe("NanocachedClient value compression (value compression)", () => {
         // Still usable afterward — none of the above touched the wire.
         await client.set("k", "v");
         assert.equal(await client.get("k"), "v");
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("sends a key+value exactly at the cap: the cap is on the value before the marker byte is added (issue #1546)", async () => {
+    const { MAX_REQUEST_BYTES } = await import("../src/protocol.js");
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+      });
+      try {
+        const atCap = randomBytes(MAX_REQUEST_BYTES - 1); // key "z" + value = MAX_REQUEST_BYTES; incompressible
+        await client.set("z", atCap);
+        assert.deepEqual(Buffer.from(await client.getBytes("z") as Uint8Array), atCap);
+
+        // One byte more is still refused, before any I/O.
+        await assert.rejects(client.set("y", Buffer.concat([atCap, Buffer.from([0])])), RangeError);
+        assert.equal(node.store.has("y"), false);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("setManyBytes with an at-cap value stores the whole batch rather than throwing after a sub-frame was stored (issue #1546)", async () => {
+    const { MAX_REQUEST_BYTES } = await import("../src/protocol.js");
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+      });
+      try {
+        const atCap = randomBytes(MAX_REQUEST_BYTES - 1);
+        await client.setManyBytes({ a: Buffer.from("1"), b: Buffer.from("2"), z: atCap });
+        assert.deepEqual(Buffer.from(await client.getBytes("a") as Uint8Array), Buffer.from("1"));
+        assert.deepEqual(Buffer.from(await client.getBytes("b") as Uint8Array), Buffer.from("2"));
+        assert.deepEqual(Buffer.from(await client.getBytes("z") as Uint8Array), atCap);
+
+        // A pair over the cap fails the eager check, with nothing of the batch stored.
+        node.store.clear();
+        await assert.rejects(
+          client.setManyBytes({ a: Buffer.from("1"), b: Buffer.from("2"), z: Buffer.concat([atCap, Buffer.from([0])]) }),
+          RangeError,
+        );
+        assert.equal(node.store.size, 0);
       } finally {
         await client.close();
       }
@@ -1616,6 +1670,61 @@ describe("the reconnect cooldown map follows the roster (issue #1547)", () => {
     } finally {
       await Promise.all([discovery.close(), node.close()]);
     }
+  });
+});
+
+describe("forced node-list refreshes are rate-limited (issue #1530)", () => {
+  // Two nodes at R=1 with node A dead and still listed by discovery (its
+  // liveness window): every operation whose primary is A fails and forces a
+  // refresh that installs the same list.
+  async function withDeadPrimary(
+    run: (ctx: { client: NanocachedClient; discovery: MockDiscovery; deadKey: string }) => Promise<void>,
+  ): Promise<void> {
+    const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+    const [dead, live] = await Promise.all([startMockNode(), startMockNode()]);
+    const discovery = await startMockDiscovery([
+      { name: names[0], address: dead.address },
+      { name: names[1], address: live.address },
+    ]);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+    try {
+      const ring = new HashRing(names);
+      let deadKey = "";
+      for (let i = 0; deadKey === ""; i++) if (ring.owners(Buffer.from(`k${i}`), 1)[0] === names[0]) deadKey = `k${i}`;
+      await dead.close();
+      await waitFor(() => memberConnectionClosed(client, names[0]), "the client to see the FIN");
+      await run({ client, discovery, deadKey });
+    } finally {
+      await client.close();
+      await Promise.all([discovery.close(), live.close(), dead.close().catch(() => {})]);
+    }
+  }
+
+  it("a caller failing against a dead primary over and over does not open a discovery connection per failure", async () => {
+    await withDeadPrimary(async ({ client, discovery, deadKey }) => {
+      const before = discovery.listCount();
+      for (let i = 0; i < 40; i++) await assert.rejects(client.set(deadKey, "v"));
+      // One refresh for the first failure; the rest fall inside the window.
+      assert.ok(discovery.listCount() - before <= 2, `discovery saw ${discovery.listCount() - before} node-list fetches`);
+    });
+  });
+
+  it("refreshes again once the window has passed", async () => {
+    await withDeadPrimary(async ({ client, discovery, deadKey }) => {
+      await assert.rejects(client.set(deadKey, "v"));
+      const afterFirst = discovery.listCount();
+      await delay(300);
+      await assert.rejects(client.set(deadKey, "v"));
+      assert.equal(discovery.listCount(), afterFirst + 1);
+    });
+  });
+
+  it("concurrent failures share the refreshes instead of each starting one", async () => {
+    await withDeadPrimary(async ({ client, discovery, deadKey }) => {
+      const before = discovery.listCount();
+      await Promise.all(Array.from({ length: 40 }, () => assert.rejects(client.set(deadKey, "v"))));
+      assert.ok(discovery.listCount() - before <= 2, `discovery saw ${discovery.listCount() - before} node-list fetches`);
+    });
   });
 });
 

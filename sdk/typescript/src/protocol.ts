@@ -102,15 +102,27 @@ export function checkKey(key: Uint8Array, namespace: Uint8Array = EMPTY_NAMESPAC
   }
 }
 
+// The one byte `compress` adds in front of a stored value (compression.ts's
+// marker). The size cap is on the value the caller handed over, checked
+// before compression (NanocachedClient.set and friends call
+// checkKeyAndValue on it), so the encoders accept that byte on top of it:
+// without the allowance, a key+value exactly at the cap would pass the
+// caller-side check and then be refused for the marker byte alone, and a
+// `setMany` batch could throw on a later sub-frame after an earlier one had
+// been stored. The frame stays inside the server's limit, which
+// MAX_REQUEST_BYTES leaves MAX_REQUEST_HEADER_LENGTH bytes of headroom for.
+export const COMPRESSION_MARKER_BYTES = 1;
+
 // Exported so callers that need to size-check a value *before* it reaches
 // encodeSet can share this exact rule — see NanocachedClient.set, which
 // checks the pre-compression value this way (issue #47 audit item 3:
 // checking only the post-compression frame here let an oversized value
 // that compresses well slip past the cap; Python's client.py has the
-// same two-layer check for the same reason).
-export function checkKeyAndValue(key: Uint8Array, value: Uint8Array, namespace: Uint8Array = EMPTY_NAMESPACE): void {
+// same two-layer check for the same reason). `allowance` is extra bytes
+// permitted on top of the cap: the encoders pass COMPRESSION_MARKER_BYTES.
+export function checkKeyAndValue(key: Uint8Array, value: Uint8Array, namespace: Uint8Array = EMPTY_NAMESPACE, allowance = 0): void {
   checkKey(key, namespace);
-  if (namespace.length + key.length + value.length > MAX_REQUEST_BYTES) {
+  if (namespace.length + key.length + value.length > MAX_REQUEST_BYTES + allowance) {
     // See MAX_REQUEST_BYTES/checkKey above: same server-side rejection, same
     // poisoned-connection consequence, just measured across namespace+key+
     // value together instead of namespace+key alone.
@@ -143,7 +155,7 @@ export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds = 0, ta
     // anything is written, same bound as encodeIncr's delta.
     throw new RangeError(`nanocached: ttlSeconds must be a non-negative safe integer, got ${ttlSeconds}`);
   }
-  checkKeyAndValue(key, value, namespace);
+  checkKeyAndValue(key, value, namespace, COMPRESSION_MARKER_BYTES);
 
   if (namespace.length === 0) {
     const header =
@@ -306,7 +318,7 @@ export function encodeCas(key: Uint8Array, value: Uint8Array, cond: CasCondition
     // request on it down too.
     throw new RangeError(`nanocached: ttlSeconds must be a non-negative safe integer, got ${ttlSeconds}`);
   }
-  checkKeyAndValue(key, value, namespace);
+  checkKeyAndValue(key, value, namespace, COMPRESSION_MARKER_BYTES);
   const token = condToken(cond);
 
   const header =
@@ -472,7 +484,7 @@ export function encodeMultiSet(
   let total = namespace.length + MULTI_FRAME_HEADER_SLACK;
   const lengthFields: string[] = new Array(keys.length);
   for (let i = 0; i < keys.length; i++) {
-    checkKeyAndValue(keys[i], values[i], namespace);
+    checkKeyAndValue(keys[i], values[i], namespace, COMPRESSION_MARKER_BYTES);
     total += multiSetEntryCost(keys[i], values[i]);
     if (i > 0 && total > MAX_REQUEST_BYTES) {
       throw new RangeError(

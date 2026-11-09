@@ -157,7 +157,9 @@ the "uncompressed" marker by chance — a silently wrong read). There is no
 dual-mode migration path: only turn this on for a fresh keyspace, or only
 after every client touching an existing one has upgraded and enabled it
 together. Incompressible data (already-compressed media, random bytes) is
-passed through unchanged rather than bloated.
+passed through unchanged rather than bloated. The request size limit applies
+to the key and value as passed in, before compression: a pair exactly at the
+limit is accepted, and the marker byte does not count against it.
 
 **Incompatible with `incr`/`decr`**: a `compress`-enabled
 client rejects `incr`/`decr` outright with `CompressionIncompatibleError`
@@ -186,7 +188,13 @@ the node list, so the SDK needs no configuration:
 
 The node list is re-fetched lazily when it is more than 30 seconds old. If a
 node answers that it no longer owns a key (its view of the cluster changed),
-the SDK refreshes the node list and retries that operation once. A discovery
+the SDK refreshes the node list and retries that operation once. A refresh
+forced this way waits at least 200 ms after the previous refresh finished:
+while discovery still lists a node that has died, every operation routed to it
+fails, and without that floor each failure would open its own discovery
+connection. A caller that fails inside the window reuses the refresh that just
+finished, and callers waiting on a refresh that started before their failure
+share one follow-up refresh that starts when the window has passed. A discovery
 outage degrades only topology updates: existing connections keep serving
 traffic on the last-known node list.
 
