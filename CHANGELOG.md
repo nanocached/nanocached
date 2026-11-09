@@ -45,6 +45,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e/chaos.sh`: with `INCR_ORACLE=1` the run ignored `incrtrace.py`'s
+  exit status and read its last line, so a script that died with a traceback
+  left no `trace_lines`, skipped the "no TRACE lines" branch and passed with
+  `over_applied` and `value_from_nowhere` never checked. A non-zero exit, or a
+  last line that is not the summary, now fails the run (#1618).
+
 - `tests/e2e`: `load.py` initialised its `corrupt` counter but never
   incremented it, and wrote the same constant value to every key, so the
   `"corrupt": 0` assertions in `scalein.sh`, `proxydrain.sh`, `proxykill.sh`,

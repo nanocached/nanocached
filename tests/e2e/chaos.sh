@@ -485,9 +485,14 @@ for c in $(docker ps -aq --filter "name=^/$P-"); do n=$(docker inspect -f "{{.Na
 # or an increment starting from a value no increment produced, is the
 # evidence a phantom answer leaves on the node side.
 if [ "${INCR_ORACLE:-0}" = 1 ] && [ -f "$L/incrstate.json" ]; then
-  python3 "$E/incrtrace.py" --state "$L/incrstate.json" --logs "$L" --nodes "$P-n" > "$L/incrtrace.txt" 2>&1
+  itrc=0; python3 "$E/incrtrace.py" --state "$L/incrstate.json" --logs "$L" --nodes "$P-n" > "$L/incrtrace.txt" 2>&1 || itrc=$?
   itrace=$(tail -1 "$L/incrtrace.txt")
-  if [ "$(echo "$itrace" | grep -oE '"trace_lines": [0-9]+' | grep -oE '[0-9]+')" = 0 ]; then
+  # A traceback is not "no TRACE lines": the evidence channel going dark must fail the run, not pass it.
+  if [ "$itrc" != 0 ]; then
+    T "FAIL: incrtrace.py exited $itrc (see $L/incrtrace.txt): $(echo "$itrace" | cut -c1-200)"; fail=1
+  elif ! echo "$itrace" | grep -qE '^\{.*"trace_lines": [0-9]+.*"over_applied": [0-9]+.*"value_from_nowhere": [0-9]+'; then
+    T "FAIL: incrtrace.py's last line is not its summary (see $L/incrtrace.txt): $(echo "$itrace" | cut -c1-200)"; fail=1
+  elif [ "$(echo "$itrace" | grep -oE '"trace_lines": [0-9]+' | grep -oE '[0-9]+')" = 0 ]; then
     echo "=== incr trace: no TRACE lines (node built without the trace feature or NANOCACHED_TRACE_PREFIX does not cover is); not checked"
   else
     tbad=$(echo "$itrace" | grep -oE '"(over_applied|value_from_nowhere)": [1-9][0-9]*' | tr '\n' ' ')

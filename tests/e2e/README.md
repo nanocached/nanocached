@@ -118,7 +118,8 @@ stuck log pipe cannot stall the node; it writes `TRACE dropped lines=<n>`
 into the stream. With such a line in the logs the check cannot tell a
 missing line from a phantom, so it reports `trace_lines_dropped` and leaves
 `value_from_nowhere` at 0. With the node built without the feature the check
-prints that it found no `TRACE` lines and asserts nothing.
+prints that it found no `TRACE` lines and asserts nothing. `incrtrace.py` itself failing (a non-zero exit, or a last line that is not its
+summary) fails the run instead of reading as "no `TRACE` lines" (#1618).
 
 Why `is` alone: a day of the nightly tracing `tn,cp,cc` (about 300,000 lines
 a cell) had eight of ten cells fail on oracles whose keys were not traced,
