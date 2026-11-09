@@ -3767,6 +3767,50 @@ class NanocachedClientTest {
         }
     }
 
+    // Issue #1481: a dial failure proves nothing was sent, so INCR and CAS
+    // refresh and reroute around a dead primary the way set/get/delete do.
+
+    @Test
+    void incrRoutesAroundADeadPrimaryOnceDiscoveryDropsIt() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "counter-after-primary-death";
+                List<String> owners =
+                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                client.set(key, "10"); // replicated to the survivor too
+
+                cluster.nodes().get(owners.get(0)).close();
+                cluster.discovery().nodes = List.of(new DiscoveredNode(
+                        owners.get(1), cluster.nodes().get(owners.get(1)).address()));
+                Thread.sleep(50);
+
+                assertEquals(java.util.OptionalLong.of(15), client.incr(key, 5));
+                assertEquals(java.util.OptionalLong.of(12), client.decr(key, 3));
+            }
+        }
+    }
+
+    @Test
+    void casRoutesAroundADeadPrimaryOnceDiscoveryDropsIt() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "cas-after-primary-death";
+                List<String> owners =
+                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                client.set(key, "old"); // replicated to the survivor too
+
+                cluster.nodes().get(owners.get(0)).close();
+                cluster.discovery().nodes = List.of(new DiscoveredNode(
+                        owners.get(1), cluster.nodes().get(owners.get(1)).address()));
+                Thread.sleep(50);
+
+                assertTrue(client.replaceIfPresent(key, "new"));
+                assertEquals(Optional.of("new"), client.get(key));
+                assertFalse(client.putIfAbsent(key, "other"));
+            }
+        }
+    }
+
     @Test
     void fansDeletesOutToEveryOwner() throws Exception {
         try (Cluster cluster = startCluster(2)) {
