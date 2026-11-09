@@ -25,6 +25,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a delete (`D`, `d`, or a relayed one) that found its
+  key present but already past its TTL removed the entry and answered
+  as if it had not been there without counting the removal, so
+  `nanocached_node_expirations_total` undercounted by the number of
+  deletes that hit an expired entry. Every other lazy removal (a get, an
+  `INCR`, a touch, a compare, the sweep) was counted. The delete now
+  counts it too (#1490).
 - `nanocached-proxy`: a refused `A` that asked for response tags was
   answered `En\n`, where a node answers `EnT\n` and a discovery server
   `EdT\n`. The proxy now echoes the `T` too, so a client reads the same
