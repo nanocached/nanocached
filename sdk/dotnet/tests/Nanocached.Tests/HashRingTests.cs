@@ -33,6 +33,26 @@ public class HashRingTests
     }
 
     [Fact]
+    public void ScoreTiesBreakByUnsignedUtf8BytesNotUtf16CodeUnits()
+    {
+        // Two names that differ only in one character: U+FFFF (UTF-8 EF BF BF,
+        // one UTF-16 unit 0xFFFF) and U+10000 (UTF-8 F0 90 80 80, the UTF-16
+        // pair D800 DC00). The server orders by UTF-8 bytes (`str::cmp` in
+        // src/hash_ring.rs), so U+FFFF is the smaller name; CompareOrdinal
+        // orders by UTF-16 units and says the opposite.
+        string bmp = "node-￿";
+        string supplementary = "node-𐀀";
+        Assert.True(string.CompareOrdinal(supplementary, bmp) < 0, "UTF-16 order is the one that differs");
+        Assert.True(HashRing.CompareNames(bmp, supplementary) < 0);
+        Assert.True(HashRing.CompareNames(supplementary, bmp) > 0);
+        Assert.Equal(0, HashRing.CompareNames(bmp, "node-￿"));
+        // Unsigned: a byte >= 0x80 sorts above an ASCII one.
+        Assert.True(HashRing.CompareNames("node-a", "node-é") < 0);
+        // A prefix sorts first.
+        Assert.True(HashRing.CompareNames("node", "node-a") < 0);
+    }
+
+    [Fact]
     public void NamespacedKeysMatchCrossLanguageVectors()
     {
         // issue #105 — first-class namespaces: key_hash for (ns, key),
