@@ -41,6 +41,13 @@ Printed, not asserted:
    which a 5 s window counted as unmatched; the cause of that lag is not
    identified.
 
+A node writes its TRACE lines through a bounded queue and drops what does not
+fit when stderr falls behind, putting `TRACE dropped lines=<n>` into the
+stream. With any such line in the logs an increment can be missing, so an
+increment starting from a value no traced increment produced proves nothing:
+the NOWHERE rows are still printed, but value_from_nowhere is reported as 0
+and trace_lines_dropped says how many lines were lost.
+
 The last line is a JSON summary; chaos.sh asserts over_applied and
 value_from_nowhere. Above it, the full timeline of each offending key.
 """
@@ -76,10 +83,16 @@ state = json.load(open(a.state))
 n_keys = state["n"]
 pat = re.compile(r"^(\S+) TRACE (\w+) key=(is\d+) (.*)$")
 events = collections.defaultdict(list)
+dropped_pat = re.compile(r"TRACE dropped lines=(\d+)")
 trace_lines = 0
+trace_lines_dropped = 0
 for f in sorted(glob.glob(f"{a.logs}/{a.nodes}*.log")):
     node = f.rsplit("/", 1)[1][:-4]
     for line in open(f, errors="replace"):
+        d = dropped_pat.search(line)
+        if d:
+            trace_lines_dropped += int(d.group(1))
+            continue
         m = pat.search(line)
         if not m:
             continue
@@ -192,7 +205,8 @@ print(json.dumps({
     "over_applied": len(over),
     "under_applied": len(under),
     "within_bounds": within,
-    "value_from_nowhere": len(nowhere),
+    "value_from_nowhere": 0 if trace_lines_dropped else len(nowhere),
+    "trace_lines_dropped": trace_lines_dropped,
     "sequence_jumps": len(jumps),
     "answers_unmatched": len(unmatched) if hist else None,
     "over_keys": [r["key"] for r in over[:20]],

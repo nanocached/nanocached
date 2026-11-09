@@ -360,10 +360,15 @@ for the node list.
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps
 its connections warm automatically, pinging any connection that real
 traffic has left idle for 30 seconds — so an idle timeout never severs a
-healthy client, and a request that does find its connection dead (a node
-restart, a network blip) redials and retries once transparently (an
-idempotent request always; `incr`/`decr` and the compare-and-set calls only
-when the SDK can prove nothing was sent — see "What never sent means" below). Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.
+healthy client. A request that finds its connection already closed (a node
+restart, a network blip) redials it before sending. In cluster mode and in
+proxy mode a request whose connection is lost is also retried once, after a
+node-list (cluster) or proxy-roster (proxy) refresh (an idempotent request
+always; `incr`/`decr` and the compare-and-set calls only when the SDK can
+prove nothing was sent — see "What never sent means" below). In single-node
+mode there is nothing to refresh from, so a request that loses its connection
+while it is in flight is not retried: it rejects with `ConnectionLostError`,
+and the next call redials. Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.
 
 An address whose redial just failed is treated as still down for
 `reconnectCooldownMs` (default 1000; `0` also means the default): requests

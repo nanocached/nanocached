@@ -112,8 +112,13 @@ increment started from a value no increment had produced. Both are asserted,
 so a serial INCR answer the oracle cannot explain (one more than the
 increments asked for) comes with the node-side timeline of that key in the
 run's logs instead of a count alone; fewer applications than acknowledged is
-printed only. With the node built without the feature the check prints that
-it found no `TRACE` lines and asserts nothing.
+printed only. A node hands its `TRACE` lines to a writer thread through a
+bounded queue and drops what does not fit when stderr falls behind, so a
+stuck log pipe cannot stall the node; it writes `TRACE dropped lines=<n>`
+into the stream. With such a line in the logs the check cannot tell a
+missing line from a phantom, so it reports `trace_lines_dropped` and leaves
+`value_from_nowhere` at 0. With the node built without the feature the check
+prints that it found no `TRACE` lines and asserts nothing.
 
 Why `is` alone: a day of the nightly tracing `tn,cp,cc` (about 300,000 lines
 a cell) had eight of ten cells fail on oracles whose keys were not traced,

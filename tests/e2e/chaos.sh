@@ -492,7 +492,7 @@ if [ "${INCR_ORACLE:-0}" = 1 ] && [ -f "$L/incrstate.json" ]; then
   else
     tbad=$(echo "$itrace" | grep -oE '"(over_applied|value_from_nowhere)": [1-9][0-9]*' | tr '\n' ' ')
     [ -z "$tbad" ] || { T "FAIL: incr trace: $tbad(details in $L/incrtrace.txt)"; fail=1; }
-    echo "$itrace" | grep -oE '"(trace_lines|applications|acked|maybe|over_applied|under_applied|within_bounds|value_from_nowhere|sequence_jumps|answers_unmatched)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr trace (asserted: over_applied, value_from_nowhere): /'; echo
+    echo "$itrace" | grep -oE '"(trace_lines|trace_lines_dropped|applications|acked|maybe|over_applied|under_applied|within_bounds|value_from_nowhere|sequence_jumps|answers_unmatched)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr trace (asserted: over_applied, value_from_nowhere): /'; echo
   fi
 fi
 echo "=== entries:"; cat "$L/entries.txt"
