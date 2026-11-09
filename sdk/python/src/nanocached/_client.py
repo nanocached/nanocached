@@ -3671,7 +3671,7 @@ class NanocachedClient:
                 return await self._reconnect_via_new_proxy()
             raise
         if not isinstance(identified, NodeTarget):
-            raise NanocachedError(f"nanocached: {address} no longer identifies as a cache node")
+            raise ConnectFailedError(f"nanocached: {address} no longer identifies as a cache node")
         if self._closed:
             identified.writer.close()
             raise AlreadyClosedError()
@@ -3780,7 +3780,10 @@ class NanocachedClient:
                 error = (
                     outcome
                     if isinstance(outcome, Exception)
-                    else NanocachedError(f"nanocached: {node.address} does not identify as a cache node")
+                    # A ConnectionError, like a dead address's: only those
+                    # make an operation routed here refresh and reroute
+                    # (_with_wrong_node_retry).
+                    else ConnectFailedError(f"nanocached: {node.address} does not identify as a cache node")
                 )
                 self._members[node.name] = _Member(node.address, None)
                 self._redial_cooldowns[node.address] = (
