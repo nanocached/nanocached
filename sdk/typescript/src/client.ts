@@ -4238,7 +4238,10 @@ export class NanocachedClient {
         members.set(node.name, { address: node.address, connection: null });
         this.reconnectCooldowns.set(node.address, {
           until: Date.now() + this.reconnectCooldownMs,
-          error: new NanocachedError(`nanocached: discovery returned a non-node address: ${node.address}`),
+          // Connection-classified and never sent (like the dial failure
+          // above), so the refresh-and-retry layer reroutes an operation
+          // that meets the cached error, even a non-idempotent one.
+          error: new ConnectionLostError(`nanocached: discovery returned a non-node address: ${node.address}`, { requestWasSent: false }),
         });
         continue;
       }
@@ -4563,7 +4566,11 @@ export class NanocachedClient {
     const identified = await connectAndIdentify({ ...splitHostPort(address), authSecret: this.authSecret, tls: this.tls, ca: this.ca });
 
     if (identified.kind !== "node") {
-      throw new NanocachedError(`nanocached: ${address} no longer identifies as a cache node`);
+      // Connection-classified and never sent: the usual cause is an address
+      // another kind of server now answers on, which a node-list refresh
+      // fixes, so the refresh-and-retry layer must recognise it (a plain
+      // NanocachedError would fail even a never-sent incr/cas outright).
+      throw new ConnectionLostError(`nanocached: ${address} no longer identifies as a cache node`, { requestWasSent: false });
     }
     if (this.closed) {
       identified.socket.destroy();
