@@ -25,6 +25,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-discovery`: a pause of the discovery process longer than a
+  join's migration timeout (a stop-the-world of a minute or more, `SIGSTOP`,
+  a paused VM) abandoned the join on the first sweep after it resumed, as
+  `migration timeout`, though the nodes had not been given any time to
+  answer. The sweep already gave every node and proxy a fresh liveness
+  window after such a pause; the join's migration timeout now does not count
+  the time discovery was not running either, so the join carries on and the
+  joining node is not sent back to start over (#1617).
+
 - `nanocached-discovery`: a node restarted on the same address while its
   old name was still a member (within the liveness timeout of a `kill -9`)
   stalled its own join and ran the handoff twice. The old name stayed in
