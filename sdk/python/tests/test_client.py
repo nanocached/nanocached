@@ -5,6 +5,7 @@ import io
 import os
 import random
 import ssl
+import time
 import traceback
 import unittest
 from unittest import mock
@@ -3509,6 +3510,50 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
+    async def test_an_expiring_batch_retries_the_chunks_after_the_one_lost_mid_batch(self):
+        # Issue #1600: with ttl 0 a connection lost after a chunk's frame
+        # was written makes only that chunk's keys lost. 1,200 keys on one
+        # primary are three `y` frames and the node drops the connection on
+        # the second; the third was never sent, so it goes out in the retry
+        # pass and only the second chunk's 400 keys are reported.
+        from nanocached._client import _MAX_BATCH_KEYS
+
+        for get in (False, True):
+            with self.subTest(get=get):
+                nodes, discovery = await self.start_cluster(replication=1)
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    primary = nodes[NAMES[0]]
+                    keys = self.keys_by_primary(NAMES[0], 3 * _MAX_BATCH_KEYS, "lostmid")
+                    values = {key: f"v-{key}" for key in keys}
+                    await client.set_many(values)
+                    primary.multi_touch_frames.clear()
+                    primary.fail_multi_touch_after(1)  # chunk 1 answered, chunk 2 dropped
+                    if get:
+                        # The hits of the chunks that did resolve ride along.
+                        lost = set(keys[_MAX_BATCH_KEYS : 2 * _MAX_BATCH_KEYS])
+                        with self.assertRaises(PartialConnectionLostError) as raised:
+                            await client.get_many_and_touch(keys, 0)
+                        self.assertIn("400 of 1200 keys", str(raised.exception))
+                        self.assertEqual(
+                            raised.exception.partial_values,
+                            {key: values[key] for key in keys if key not in lost},
+                        )
+                    else:
+                        with self.assertRaises(ConnectionLostError):
+                            await client.touch_many(keys, 0)
+                    frames = primary.multi_touch_frames
+                    self.assertEqual(
+                        [len(f[1]) for f in frames],
+                        [_MAX_BATCH_KEYS] * 3,
+                        "chunk 1, the lost chunk 2, then the never-sent chunk 3 in the retry pass",
+                    )
+                    self.assertEqual(
+                        frames[2][1], [k.encode() for k in keys[2 * _MAX_BATCH_KEYS :]]
+                    )
+                finally:
+                    await self.stop(client, discovery, nodes)
+
     async def test_a_batch_touch_is_scoped_to_its_namespace_in_a_cluster(self):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
@@ -6707,6 +6752,62 @@ class ForcedRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.release.set()
         await asyncio.wait_for(asyncio.gather(earlier, *forced), 5)
         self.assertEqual(self.fetches, 2)
+
+    def script_fetch(self):
+        """Replaces the fixture's gated fetch with a stub that holds the first
+        call until the returned future is set, records (began, ended) of each
+        call, and answers "unusable" (None) so a refresh changes nothing."""
+        gate = asyncio.get_running_loop().create_future()
+        calls: list[tuple[float, float | None]] = []
+
+        async def fetch():
+            index = len(calls)
+            calls.append((time.monotonic(), None))
+            if index == 0:
+                await gate
+            calls[index] = (calls[index][0], time.monotonic())
+            return None
+
+        self.client._fetch_node_list = fetch
+        return gate, calls
+
+    async def test_a_forced_caller_scheduled_right_after_a_refresh_ends_does_not_start_another(self):
+        # Issue #1607: the refresh's end time was recorded by a done
+        # callback, one loop iteration after the task completed. A forced
+        # caller whose step ran in that gap saw the task done and the old
+        # end time, found the 200 ms interval long passed and started a
+        # second refresh immediately. Here the second caller is queued
+        # behind the refresh task's final step, which is exactly that gap.
+        gate, calls = self.script_fetch()
+        first = asyncio.ensure_future(self.client._maybe_refresh(force=True))
+        await wait_for(lambda: calls, "the first refresh to reach the fetch")
+        gate.set_result(None)  # schedules the refresh task's last step...
+        second = asyncio.ensure_future(self.client._maybe_refresh(force=True))  # ...then this
+        await asyncio.wait_for(asyncio.gather(first, second), 5)
+        self.assertEqual(len(calls), 1, "the second forced caller started another refresh")
+
+    async def test_a_forced_caller_that_waited_out_an_older_refresh_sleeps_the_interval_before_its_own(self):
+        # The waited_out_older_refresh branch of _maybe_refresh (issues
+        # #1200, #1529): a forced caller that arrives while a refresh is in
+        # flight cannot take its result (it began before the failure), and
+        # cannot start the next one before the minimum interval has passed
+        # since that one ended.
+        from nanocached import _client as client_module
+
+        gate, calls = self.script_fetch()
+        older = asyncio.ensure_future(self.client._maybe_refresh(force=True))
+        await wait_for(lambda: calls, "the older refresh to reach the fetch")
+        await asyncio.sleep(0.01)  # the failure this caller reacts to is later than the refresh's start
+        waiter = asyncio.ensure_future(self.client._maybe_refresh(force=True))
+        await asyncio.sleep(0.01)  # let it queue behind the older refresh
+        self.assertFalse(waiter.done())
+        gate.set_result(None)
+        await asyncio.wait_for(asyncio.gather(older, waiter), 5)
+
+        self.assertEqual(len(calls), 2, "the waiter must run a refresh of its own")
+        gap = calls[1][0] - calls[0][1]
+        # A lower bound only; the clock may wake the sleep a tick early.
+        self.assertGreaterEqual(gap, client_module._FORCED_REFRESH_MIN_INTERVAL - 0.02)
 
     async def test_stale_check_still_joins_a_refresh_in_flight(self):
         earlier = asyncio.ensure_future(self.client._maybe_refresh(force=True))
