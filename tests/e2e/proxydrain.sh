@@ -36,7 +36,7 @@ while :; do c=$(proxies 2>/dev/null | head -1 | sed -n 's/count=\([0-9]*\).*/\1/
   [ $(( $(date +%s)-t0 )) -gt 60 ] && { T "TIMEOUT waiting for 2 proxies in Q (got $c)"; cleanup; exit 1; }; sleep 1; done
 T "2 proxies registered in Q"
 T "seed 15000 keys (R=2): k0..k9999 is the load's keyspace, k10000..k14999 stays untouched for the loss check"
-docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py seed --addr $D,$D --n 15000 --size 256 | tail -1
+tmo 300 docker run --rm --name $P-seed --network $NET -v $E:/w -w /w e2e-client python verify.py seed --addr $D,$D --n 15000 --size 256 | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL: verify.py seed failed or timed out (300s)"; cleanup; exit 1; }
 T "start 45s via_proxy load (8 conns — random proxy per conn)"
 LOAD_SECS=${LOAD_SECS:-45}
 fail=0
@@ -58,8 +58,9 @@ tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did 
 load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)
 echo "=== load: $load"
 T "verify the 5000 untouched keys post-drain (loss/corruption check)"
-check=$(docker run --rm --network $NET -v $E:/w -w /w e2e-client python verify.py check --addr $D,$D --start 10000 --n 5000 --size 256 | tail -1)
+check=$(tmo 300 docker run --rm --name $P-check --network $NET -v $E:/w -w /w e2e-client python verify.py check --addr $D,$D --start 10000 --n 5000 --size 256 | tail -1)
 echo "=== check: $check"
+[ -n "$check" ] || { echo "FAIL: verify.py check gave no result (failed or timed out after 300s)"; fail=1; }
 echo "=== proxy p1"; docker logs $P-p1 2>&1 | grep -i "drain\|deregister\|shutdown\|warn\|error" | head -8
 echo "=== discovery"; docker logs $P-disc 2>&1 | grep -i "proxy\|warn\|error" | head -6
 [ "$rc" = 0 ] || { echo "FAIL: proxy exit code $rc"; fail=1; }

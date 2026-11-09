@@ -45,6 +45,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
+  `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`
+  bounded only its final check), so a hung cluster hung the script instead of
+  failing it. Both now run under `tmo 300` in a named container, which the
+  cleanup removes; a seed that fails or times out ends the run, and a check
+  that gives no result fails it (#1622).
+
 - `tests/e2e/chaos.sh`: the load ran `ROUNDS * ROUND_BUDGET + 30` s, which left
   out the up to 90 s `HEAL_BUDGET` wait of each decommission round, so in the
   worst case the last rounds ran with no load and the miss and corrupt

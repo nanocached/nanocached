@@ -21,7 +21,7 @@ disc_up $P-disc --replication-factor 2; sleep 1
 live=(); seq_no=0
 spawn(){ seq_no=$((seq_no+1)); spawned=$P-n$seq_no; node_up $spawned $D --drain-timeout 20 --metrics-port 9100; live+=("$spawned"); }
 for _ in 1 2 3; do spawn; wait_members ${#live[@]} $D 120 || { T "FAIL: bootstrap"; cleanup; exit 1; }; done
-docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1
+tmo 300 docker run --rm --name $P-seed --network $NET -v "$E:/w" -w /w e2e-client python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { T "FAIL: verify.py seed failed or timed out (300s)"; cleanup; exit 1; }
 LOAD_SECS=${LOAD_SECS:-90}
 docker run -d --name $P-load --network $NET -v "$E:/w" -w /w e2e-client python load.py --addr $D --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label fresh --reconnect-on-error --hedge 0.01 --report-every 5 >/dev/null
 sleep 3; t0=$(date +%s); fail=0
@@ -54,8 +54,9 @@ esac
 tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
 fi
 docker logs $P-load > "$L/load.log" 2>&1; load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1); echo "=== load: $load"
-check=$(docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
+check=$(tmo 300 docker run --rm --name $P-check --network $NET -v "$E:/w" -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
 echo "=== check: $check"
+[ -n "$check" ] || { T "FAIL: verify.py check gave no result (failed or timed out after 300s)"; fail=1; }
 echo "=== entries per node (metrics)"; for c in $(docker ps --filter "name=^/$P-n" --format '{{.Names}}' | sort); do printf "%s " $c; docker run --rm --network $NET e2e-client python -c "import urllib.request,re,sys;t=urllib.request.urlopen('http://$c:9100/metrics',timeout=3).read().decode();print(' '.join(l for l in t.splitlines() if re.search('entries|marked',l) and not l.startswith('#')))"; done
 docker logs -t $P-disc > "$L/disc.log" 2>&1
 for c in $(docker ps -aq --filter "name=^/$P-"); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); echo "$n $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $c)" >> "$L/ipmap.txt"; [ -f "$L/$n.log" ] || docker logs -t $c > "$L/$n.log" 2>&1; done

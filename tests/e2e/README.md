@@ -154,7 +154,10 @@ judged by their own test suites.
 
 - `cl.sh` — sourced by the scenarios: `disc_up`, `node_up`, `members`,
   `wait_members`, `load`, `load_ops`, `summ`, `warns`.
-- `disc.py` (query `L`), `verify.py` (seed/check), `load.py` (mixed load,
+- `disc.py` (query `L`), `verify.py` (seed/check; `scalein.sh`, `proxydrain.sh`,
+  `proxykill.sh`, `freshjoin.sh` and `chaos.sh` run each under `tmo 300` in a named
+  container, and a seed that fails or times out ends the run, a check with no
+  result fails it, #1622), `load.py` (mixed load,
   `--hedge`; every key it writes holds `verify.py`'s value for that key, and a
   read that returns any other bytes is counted as `corrupt`, #1619; the scripts
   that assert on the load also require `ops` >= `MIN_OPS_S` (10) per second),
