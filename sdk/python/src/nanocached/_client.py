@@ -1315,13 +1315,14 @@ class NanocachedClient:
         # Rust's and Go's Set — an oversized value must be rejected outright,
         # not silently forwarded just because DEFLATE happens to shrink it
         # under the cap (issue #47 audit; Rust/Go's own bound is on the
-        # pre-compression value for the same reason). Re-checked after
-        # compression too, purely as a defense-in-depth backstop should
-        # compress_value ever grow a value instead of shrinking it.
+        # pre-compression value for the same reason). Not re-checked after
+        # compression: compress_value adds the one marker byte and never
+        # grows a value by more than that, which the
+        # _MAX_REQUEST_HEADER_BYTES allowance already covers — a re-check
+        # would refuse a value exactly at the cap that Go sends.
         _check_key_and_value(key_bytes, value_bytes, namespace)
         if self._compress:
             value_bytes = compress_value(value_bytes, self._compression_threshold)
-            _check_key_and_value(key_bytes, value_bytes, namespace)
         await self._before_operation()
         await self._with_wrong_node_retry(
             lambda: self._write(
@@ -1873,12 +1874,10 @@ class NanocachedClient:
         seen: dict[bytes, str | bytes] = {}
         for original, value in values.items():
             key_bytes, value_bytes = _to_bytes(original), _to_bytes(value, "value")
-            # See _set()'s own comment: validated before compressing, and
-            # re-checked after, purely as a defense-in-depth backstop.
+            # See _set()'s own comment: validated before compressing only.
             _check_key_and_value(key_bytes, value_bytes, namespace)
             if self._compress:
                 value_bytes = compress_value(value_bytes, self._compression_threshold)
-                _check_key_and_value(key_bytes, value_bytes, namespace)
             if key_bytes in seen:
                 raise ValueError(
                     f"nanocached: duplicate key after encoding: {original!r} and "
@@ -2761,7 +2760,6 @@ class NanocachedClient:
         _check_key_and_value(key_bytes, value_bytes, namespace)
         if self._compress:
             value_bytes = compress_value(value_bytes, self._compression_threshold)
-            _check_key_and_value(key_bytes, value_bytes, namespace)
         await self._before_operation()
         return await self._with_wrong_node_retry(
             lambda: self._cas_set_write(namespace, key_bytes, value_bytes, cond, ttl_seconds),

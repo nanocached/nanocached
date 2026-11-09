@@ -933,6 +933,11 @@ class Connection:
                     # way a mid-write cancellation always was, so this
                     # still poisons the whole connection rather than
                     # scoping the failure to just this one request.
+                    # This caller's own future never reaches _request, so
+                    # nobody would retrieve the exception _poison() sets
+                    # on it ("Future exception was never retrieved"):
+                    # cancel it first, which _poison() skips.
+                    future.cancel()
                     self._poison(ConnectionError("nanocached: connection failed: cancelled mid-write"))
                     raise
 
