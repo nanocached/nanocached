@@ -45,6 +45,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e`: `scalein.sh`, `proxydrain.sh` and `proxykill.sh` did not enforce
+  the PASS conditions in their headers. `scalein.sh` ignored the result of the
+  wait for membership 3 -> 2 (at R=2 a decommission that never handed off
+  still passed on the replica's copies), `proxydrain.sh` only printed a
+  timeout when the `Q` roster did not drop to 1 proxy, and `proxykill.sh`
+  printed `fail=1` but exited 0. Each is now a failure with a message, and
+  `proxykill.sh` exits non-zero (#1620).
+
 - `tests/e2e/chaos.sh`: with `INCR_ORACLE=1` the run ignored `incrtrace.py`'s
   exit status and read its last line, so a script that died with a traceback
   left no `trace_lines`, skipped the "no TRACE lines" branch and passed with
