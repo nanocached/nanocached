@@ -8858,3 +8858,91 @@ describe("reconnect cooldown option", () => {
     await rejects({ disableReconnectCooldown: true, reconnectCooldownMs: 50 }, /contradicts a non-zero reconnectCooldownMs/);
   });
 });
+
+describe("a listed address that answers as a discovery server instead of a node", () => {
+  // The address is real and listening, but it identifies as a discovery
+  // (what an address reused by another server kind looks like). Nothing is
+  // written to it, so every operation that meets it is safe to refresh and
+  // reroute, even a non-idempotent one.
+  const goodName = "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6";
+  const otherName = "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47";
+
+  function keyOwnedBy(name: string, names: string[]): string {
+    for (let i = 0; ; i++) {
+      const key = `non-node-${i}`;
+      if (new HashRing(names).owners(Buffer.from(key), 1)[0] === name) return key;
+    }
+  }
+
+  const operations: Array<[string, (client: NanocachedClient, key: string) => Promise<unknown>]> = [
+    ["set", (client, key) => client.set(key, "v")],
+    ["incr", (client, key) => client.incr(key)],
+  ];
+
+  for (const [label, operation] of operations) {
+    it(`${label} refreshes and reroutes when a freshly listed node answers as a non-node`, async () => {
+      const good = await startMockNode();
+      // Its address answers as a discovery server: a non-node.
+      const impostor = await startMockDiscovery([]);
+      const discovery = await startMockDiscovery([{ name: goodName, address: good.address }]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          // The refresh lists the impostor as a node: its dial identifies as a
+          // non-node and the cooldown caches that error.
+          discovery.setNodes([
+            { name: goodName, address: good.address },
+            { name: otherName, address: impostor.address },
+          ]);
+          // (refreshNodeList itself, not maybeRefreshNodeList: a forced refresh
+          // right before the operation's own would be spaced out or shared.)
+          await (client as any).refreshNodeList();
+          assert.equal((client as any).target.members.get(otherName).connection, null);
+          // Discovery has since dropped it; the client's ring has not yet.
+          discovery.setNodes([{ name: goodName, address: good.address }]);
+
+          const key = keyOwnedBy(otherName, [goodName, otherName]);
+          const listsBefore = discovery.listCount();
+          await operation(client, key);
+          assert.ok(discovery.listCount() > listsBefore, "the failure must trigger a node-list refresh");
+          assert.ok(good.store.has(key) || good.incrCount() === 1, "the write must have been rerouted to the remaining node");
+        } finally {
+          await client.close();
+        }
+      } finally {
+        await Promise.all([good.close(), impostor.close(), discovery.close()]);
+      }
+    });
+
+    it(`${label} refreshes and reroutes when a redialed address no longer identifies as a node`, async () => {
+      const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+      const impostor = await startMockDiscovery([]);
+      const discovery = await startMockDiscovery([
+        { name: goodName, address: nodeA.address },
+        { name: otherName, address: nodeB.address },
+      ]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          const member = (client as any).target.members.get(otherName);
+          const dead = member.connection as Connection;
+          nodeB.dropConnections();
+          await waitFor(() => dead.isClosed(), "the connection to be dropped");
+          // The member's last-known address now answers as a discovery server;
+          // discovery still lists the node at its real address.
+          member.address = impostor.address;
+
+          const key = keyOwnedBy(otherName, [goodName, otherName]);
+          const listsBefore = discovery.listCount();
+          await operation(client, key);
+          assert.ok(discovery.listCount() > listsBefore, "the failure must trigger a node-list refresh");
+          assert.ok(nodeB.store.has(key) || nodeB.incrCount() === 1, "the write must have reached the node after the refresh");
+        } finally {
+          await client.close();
+        }
+      } finally {
+        await Promise.all([nodeA.close(), nodeB.close(), impostor.close(), discovery.close()]);
+      }
+    });
+  }
+});
