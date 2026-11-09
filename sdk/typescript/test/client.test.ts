@@ -1860,6 +1860,44 @@ describe("a node-list refresh that is still dialing new nodes (issue #1615)", ()
   }
 });
 
+describe("a request that needs a redial after close() does not dial (issue #1613)", () => {
+  // An operation that was already running when close() destroyed its
+  // connection reaches the redial path with the client closed. It must fail
+  // as closed before opening a socket, not spend a connect deadline dialing
+  // (and then close what it dialed).
+  async function redialAfterClose(mode: "single" | "cluster" | "proxy"): Promise<void> {
+    const node = await startMockNode();
+    const discovery =
+      mode === "single"
+        ? null
+        : await startMockDiscovery(mode === "cluster" ? [{ name: "n1", address: node.address }] : []);
+    if (discovery !== null && mode === "proxy") discovery.setProxies([{ name: "p1", address: node.address }]);
+    try {
+      const client = await NanocachedClient.connect(
+        mode === "single"
+          ? { addresses: [{ host: "127.0.0.1", port: node.port }] }
+          : { addresses: [{ host: "127.0.0.1", port: discovery!.port }], viaProxy: mode === "proxy" },
+      );
+      await client.close();
+      const connectionsBefore = node.connectionCount();
+      const redial =
+        mode === "single"
+          ? () => (client as any).singleConnection()
+          : mode === "proxy"
+            ? () => (client as any).proxyConnection()
+            : () => (client as any).memberConnection("n1");
+      await assert.rejects(redial(), AlreadyClosedError);
+      assert.equal(node.connectionCount(), connectionsBefore, "no connection may be opened for a closed client");
+    } finally {
+      await Promise.all([discovery?.close(), node.close()]);
+    }
+  }
+
+  it("a single-node client fails as closed without dialing", () => redialAfterClose("single"));
+  it("a cluster client fails as closed without dialing", () => redialAfterClose("cluster"));
+  it("a proxy-mode client fails as closed without dialing", () => redialAfterClose("proxy"));
+});
+
 describe("unsolicited response with nothing pending (issue #1177)", () => {
   it("poisons the connection instead of silently dropping the reply", async () => {
     // Regression: a parsed response with no pending request was discarded
@@ -1893,6 +1931,64 @@ describe("unsolicited response with nothing pending (issue #1177)", () => {
       for (const socket of serverSockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+});
+
+describe("Connection.close() marks the connection closed synchronously (issue #1614)", () => {
+  async function withServer(run: (port: number, received: () => number) => Promise<void>): Promise<void> {
+    const serverSockets: Socket[] = [];
+    let bytes = 0;
+    const server = createServer((socket) => {
+      serverSockets.push(socket);
+      socket.on("data", (chunk) => {
+        bytes += chunk.length;
+      });
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      await run((server.address() as import("node:net").AddressInfo).port, () => bytes);
+    } finally {
+      for (const socket of serverSockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
+
+  async function open(port: number): Promise<Connection> {
+    const { connect } = await import("node:net");
+    const socket = connect(port, "127.0.0.1");
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    return new Connection(socket);
+  }
+
+  it("a request issued in the same tick is rejected as never sent", async () => {
+    await withServer(async (port, received) => {
+      const connection = await open(port);
+      connection.close();
+      assert.equal(connection.isClosed(), true);
+      await assert.rejects(connection.get("k"), (error: unknown) => {
+        assert.ok(error instanceof ConnectionLostError);
+        assert.equal(error.requestWasSent, false);
+        return true;
+      });
+      await delay(20);
+      assert.equal(received(), 0, "nothing may reach the server");
+    });
+  });
+
+  it("a request already written when close() runs is still reported as sent", async () => {
+    await withServer(async (port, received) => {
+      const connection = await open(port);
+      const pending = connection.get("k");
+      pending.catch(() => {});
+      await waitFor(() => received() > 0, "the request to reach the server");
+      connection.close();
+      await assert.rejects(pending, (error: unknown) => {
+        assert.ok(error instanceof ConnectionLostError);
+        assert.equal(error.requestWasSent, true);
+        return true;
+      });
+    });
   });
 });
 
@@ -5478,6 +5574,35 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
     });
   });
 
+  for (const get of [false, true]) {
+    it(`${get ? "getManyAndTouch" : "touchMany"} with ttl 0 loses only the chunk whose frame was written and sends the chunks after it`, async () => {
+      await withCluster(async (client, cluster) => {
+        const keys = keysWithPrimary(cluster, names[0], 3 * MAX_BATCH_KEYS, "lost");
+        await client.setMany(Object.fromEntries(keys.map((key) => [key, `v-${key}`])));
+        const primary = cluster.nodes[0].mock;
+        const before = primary.multiTouchFrames().length;
+        // Chunk 1 is answered; the connection dies on chunk 2, after its
+        // frame was written. Chunk 3 was never sent.
+        primary.failMultiTouchAfter(1);
+        const call = get ? client.getManyAndTouch(keys, 0) : client.touchMany(keys, 0);
+        await assert.rejects(call, (error: unknown) => {
+          assert.ok(error instanceof ConnectionLostError);
+          assert.equal(error.requestWasSent, true);
+          // Only chunk 2 is reported as lost, not the unsent chunk 3 as well
+          // (a plain touchMany rethrows the connection's own error).
+          if (get) assert.match(error.message, new RegExp(`could not reach the primary of ${MAX_BATCH_KEYS} of ${keys.length} keys`));
+          return true;
+        });
+        // Chunk 3 went to the retry pass instead of being given up on: its
+        // frame reaches the node and the keys are expired there.
+        const frames = primary.multiTouchFrames().slice(before);
+        assert.deepEqual(frames.map((frame) => frame.keys.length), [MAX_BATCH_KEYS, MAX_BATCH_KEYS, MAX_BATCH_KEYS]);
+        assert.deepEqual(frames[2].keys, keys.slice(2 * MAX_BATCH_KEYS));
+        for (const key of keys.slice(2 * MAX_BATCH_KEYS)) assert.equal(primary.store.has(key), false);
+      });
+    });
+  }
+
   it("is scoped to its namespace in a cluster", async () => {
     await withCluster(async (client, cluster) => {
       const users = client.namespace("users");
@@ -8936,4 +9061,92 @@ describe("reconnect cooldown option", () => {
   it("rejects disableReconnectCooldown combined with a non-zero reconnectCooldownMs", async () => {
     await rejects({ disableReconnectCooldown: true, reconnectCooldownMs: 50 }, /contradicts a non-zero reconnectCooldownMs/);
   });
+});
+
+describe("a listed address that answers as a discovery server instead of a node", () => {
+  // The address is real and listening, but it identifies as a discovery
+  // (what an address reused by another server kind looks like). Nothing is
+  // written to it, so every operation that meets it is safe to refresh and
+  // reroute, even a non-idempotent one.
+  const goodName = "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6";
+  const otherName = "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47";
+
+  function keyOwnedBy(name: string, names: string[]): string {
+    for (let i = 0; ; i++) {
+      const key = `non-node-${i}`;
+      if (new HashRing(names).owners(Buffer.from(key), 1)[0] === name) return key;
+    }
+  }
+
+  const operations: Array<[string, (client: NanocachedClient, key: string) => Promise<unknown>]> = [
+    ["set", (client, key) => client.set(key, "v")],
+    ["incr", (client, key) => client.incr(key)],
+  ];
+
+  for (const [label, operation] of operations) {
+    it(`${label} refreshes and reroutes when a freshly listed node answers as a non-node`, async () => {
+      const good = await startMockNode();
+      // Its address answers as a discovery server: a non-node.
+      const impostor = await startMockDiscovery([]);
+      const discovery = await startMockDiscovery([{ name: goodName, address: good.address }]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          // The refresh lists the impostor as a node: its dial identifies as a
+          // non-node and the cooldown caches that error.
+          discovery.setNodes([
+            { name: goodName, address: good.address },
+            { name: otherName, address: impostor.address },
+          ]);
+          // (refreshNodeList itself, not maybeRefreshNodeList: a forced refresh
+          // right before the operation's own would be spaced out or shared.)
+          await (client as any).refreshNodeList();
+          assert.equal((client as any).target.members.get(otherName).connection, null);
+          // Discovery has since dropped it; the client's ring has not yet.
+          discovery.setNodes([{ name: goodName, address: good.address }]);
+
+          const key = keyOwnedBy(otherName, [goodName, otherName]);
+          const listsBefore = discovery.listCount();
+          await operation(client, key);
+          assert.ok(discovery.listCount() > listsBefore, "the failure must trigger a node-list refresh");
+          assert.ok(good.store.has(key) || good.incrCount() === 1, "the write must have been rerouted to the remaining node");
+        } finally {
+          await client.close();
+        }
+      } finally {
+        await Promise.all([good.close(), impostor.close(), discovery.close()]);
+      }
+    });
+
+    it(`${label} refreshes and reroutes when a redialed address no longer identifies as a node`, async () => {
+      const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+      const impostor = await startMockDiscovery([]);
+      const discovery = await startMockDiscovery([
+        { name: goodName, address: nodeA.address },
+        { name: otherName, address: nodeB.address },
+      ]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          const member = (client as any).target.members.get(otherName);
+          const dead = member.connection as Connection;
+          nodeB.dropConnections();
+          await waitFor(() => dead.isClosed(), "the connection to be dropped");
+          // The member's last-known address now answers as a discovery server;
+          // discovery still lists the node at its real address.
+          member.address = impostor.address;
+
+          const key = keyOwnedBy(otherName, [goodName, otherName]);
+          const listsBefore = discovery.listCount();
+          await operation(client, key);
+          assert.ok(discovery.listCount() > listsBefore, "the failure must trigger a node-list refresh");
+          assert.ok(nodeB.store.has(key) || nodeB.incrCount() === 1, "the write must have reached the node after the refresh");
+        } finally {
+          await client.close();
+        }
+      } finally {
+        await Promise.all([nodeA.close(), nodeB.close(), impostor.close(), discovery.close()]);
+      }
+    });
+  }
 });
