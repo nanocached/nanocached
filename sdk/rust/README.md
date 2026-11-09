@@ -210,7 +210,9 @@ return `Err(Error::PartialConnectionLost(map, cause))`/
 `Err(Error::PartialConnectionLostText(map, cause))` — the `map` the
 keys that did resolve, `cause` the last connection error — or the bare
 connection error when nothing resolved; a connection loss is never
-reported as a wrong-node answer. `set_many`/`set_many_bytes` have
+reported as a wrong-node answer. In the `...Text` forms a resolved value
+that is not valid UTF-8 is left out of the `map` instead of replacing the
+error with `Error::InvalidUtf8` (`get_many_bytes` returns its bytes). `set_many`/`set_many_bytes` have
 nothing to attach on a persisting wrong-node, so they just return a
 plain `Err(Error::WrongNode)` — every other key in the batch was still
 stored; a key whose primary could not be reached at all (no `W` was

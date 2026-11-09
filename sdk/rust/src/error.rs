@@ -136,7 +136,10 @@ pub enum Error {
     /// As [`Self::PartialWrongNode`], but returned by `get_many` — the
     /// UTF-8-decoded counterpart, produced once
     /// [`Self::PartialWrongNode`]'s own map has been decoded the same
-    /// way a successful `get_many` decodes `get_many_bytes`' own result.
+    /// way a successful `get_many` decodes `get_many_bytes`' own result,
+    /// except that a value that is not valid UTF-8 is left out of the map
+    /// instead of replacing this error with [`Self::InvalidUtf8`]
+    /// (`get_many_bytes` still returns its bytes).
     PartialWrongNodeText(HashMap<String, String>),
     /// `get_many_and_touch_bytes` (issue #924) in a cluster when one
     /// primary answered `En` to `y` while other primaries had already
