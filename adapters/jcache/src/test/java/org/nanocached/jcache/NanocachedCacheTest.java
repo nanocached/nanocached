@@ -1378,6 +1378,52 @@ class NanocachedCacheTest {
         assertTrue(events.isEmpty());
     }
 
+    // JSR-107: registering the same CacheEntryListenerConfiguration again is an
+    // IllegalArgumentException. It used to be accepted, delivering every event
+    // twice, and one deregister then removed both.
+    @Test
+    void registeringAnEqualListenerConfigurationTwiceIsRejected() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingListener<String, String> listener = new RecordingListener<>(events);
+        CacheEntryListenerConfiguration<String, String> config = new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(listener), null, true, true);
+        cache.registerCacheEntryListener(config);
+
+        assertThrows(IllegalArgumentException.class, () -> cache.registerCacheEntryListener(config));
+        // An equal but distinct configuration is the same registration.
+        assertThrows(IllegalArgumentException.class, () -> cache.registerCacheEntryListener(
+                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true)));
+
+        cache.put("a", "1");
+        assertEquals(List.of("CREATED:a:1"), events, "the rejected registrations must not deliver anything");
+
+        // After a deregister the configuration can be registered again.
+        cache.deregisterCacheEntryListener(config);
+        cache.registerCacheEntryListener(config);
+        events.clear();
+        cache.put("b", "1");
+        assertEquals(List.of("CREATED:b:1"), events);
+    }
+
+    @Test
+    void aCacheConfiguredWithTheSameListenerConfigurationTwiceIsRejected() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        CacheEntryListenerConfiguration<String, String> config = new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(new RecordingListener<String, String>(events)), null, true, true);
+        // MutableConfiguration itself refuses a duplicate, so hand the manager
+        // a configuration that reports one twice.
+        MutableConfiguration<String, String> duplicated = new MutableConfiguration<String, String>() {
+            @Override
+            public Iterable<CacheEntryListenerConfiguration<String, String>> getCacheEntryListenerConfigurations() {
+                return List.of(config, config);
+            }
+        };
+        duplicated.setTypes(String.class, String.class);
+
+        assertThrows(IllegalArgumentException.class, () -> manager.createCache("duplicated", duplicated));
+        assertNull(manager.getCache("duplicated"), "a rejected cache must not be registered");
+    }
+
     // ── configuration / lifecycle ────────────────────────────────────
 
     @Test

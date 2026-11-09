@@ -1043,12 +1043,33 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         addListener(Objects.requireNonNull(config, "cacheEntryListenerConfiguration"));
     }
 
+    /** Registers {@code config}, from {@link #registerCacheEntryListener}
+     * and from the cache's own configuration alike.
+     *
+     * @throws IllegalArgumentException if an equal configuration is already
+     *     registered, as JSR-107 requires: the second registration would
+     *     deliver every event twice, and {@link
+     *     #deregisterCacheEntryListener} (which matches by {@code equals})
+     *     would remove both */
     private void addListener(CacheEntryListenerConfiguration<K, V> config) {
-        CacheEntryListener<? super K, ? super V> listenerInstance = config.getCacheEntryListenerFactory().create();
-        CacheEntryEventFilter<? super K, ? super V> filterInstance = config.getCacheEntryEventFilterFactory() != null
-                ? config.getCacheEntryEventFilterFactory().create()
-                : null;
-        listeners.add(new RegisteredListener<>(config, listenerInstance, filterInstance));
+        // One registration at a time, so two threads registering equal
+        // configurations cannot both pass the check.
+        synchronized (listeners) {
+            for (RegisteredListener<K, V> registered : listeners) {
+                if (registered.config().equals(config)) {
+                    throw new IllegalArgumentException(
+                            "nanocached-jcache: this CacheEntryListenerConfiguration is already registered on cache "
+                                    + name);
+                }
+            }
+            CacheEntryListener<? super K, ? super V> listenerInstance =
+                    config.getCacheEntryListenerFactory().create();
+            CacheEntryEventFilter<? super K, ? super V> filterInstance =
+                    config.getCacheEntryEventFilterFactory() != null
+                            ? config.getCacheEntryEventFilterFactory().create()
+                            : null;
+            listeners.add(new RegisteredListener<>(config, listenerInstance, filterInstance));
+        }
     }
 
     @Override
