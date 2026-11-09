@@ -849,7 +849,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 continue;
             }
 
-            if (error is ConnectionLostException)
+            if (error is ConnectionLostException and not NotACacheNodeException)
             {
                 _members[node.Name] = new Member(node.Address, null);
                 ArmReconnectCooldown(node.Address, error);
@@ -861,6 +861,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             }
         }
 
+        if (fatal is NotACacheNodeException)
+        {
+            // A listed address that answers as a non-node stays the plain
+            // configuration error it was at connect time.
+            throw new NanocachedException(fatal.Message);
+        }
         if (fatal is not null)
         {
             ExceptionDispatchInfo.Capture(fatal).Throw();
@@ -5181,8 +5187,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 
         if (identified is not Identify.NodeTarget node)
         {
-            throw new NanocachedException(
-                $"nanocached: {address} no longer identifies as a cache node");
+            // Not sent, and a topology change the refresh-and-retry layer
+            // heals (a reclaimed address now answering as discovery or a
+            // proxy), so a ConnectionLostException like a refused dial; a
+            // plain NanocachedException would be stored in the cooldown and
+            // fail every operation on this member until the staleness refresh.
+            throw new NotACacheNodeException(address);
         }
         if (_closed)
         {

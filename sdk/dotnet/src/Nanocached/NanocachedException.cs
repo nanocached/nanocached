@@ -137,6 +137,19 @@ public class ConnectionLostException : NanocachedException
     }
 }
 
+/// <summary>An address that was dialed as a cache node answered as
+/// discovery or a proxy. Never sent (the handshake is all that ran), so the
+/// retry layers refresh the roster and reroute, as for a refused dial. A
+/// distinct type only so the initial cluster connect can keep treating a
+/// listed non-node as a configuration error instead of an unreachable
+/// node (<c>OpenClusterAsync</c>); it never reaches a caller as this
+/// type.</summary>
+internal sealed class NotACacheNodeException : ConnectionLostException
+{
+    internal NotACacheNodeException(string address)
+        : base($"nanocached: {address} no longer identifies as a cache node", requestNotSent: true) { }
+}
+
 /// <summary>
 /// issue #411 — raised by <c>NanocachedClient.GetManyBytesAsync</c>/
 /// <c>NanocachedClient.SetManyBytesAsync</c> (and their decoded-string
