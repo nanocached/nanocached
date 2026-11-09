@@ -2864,9 +2864,8 @@ impl NanocachedClient {
             start += len;
             // Set when `op` itself failed with `Error::Protocol`: a reply
             // that could not be parsed, which only a written frame gets. A
-            // `Protocol` that did not come from `op` is the dial's (an
-            // address that no longer identifies as a node): nothing was
-            // sent.
+            // `Protocol` that did not come from `op` is the dial's (a
+            // handshake that could not be parsed): nothing was sent.
             let bad_reply = AtomicBool::new(false);
             let op = |connection: Arc<Connection>| {
                 let bad_reply = &bad_reply;
@@ -5535,8 +5534,12 @@ impl NanocachedClient {
             // single-node target, a cluster member, or — proxy mode,
             // issue #122 — the one proxy this client is pinned to): any
             // other answer means it stopped being a cache node underneath
-            // this client, same treatment either way.
-            Identified::Cluster { .. } | Identified::Proxies { .. } => Err(Error::Protocol(
+            // this client, same treatment either way. It is the dial's
+            // failure, nothing was written: `ConnectionLost` (not
+            // `Protocol`), so `with_cluster_retry` refreshes the node list
+            // and reroutes, and a reconnect-cooldown entry made from it
+            // fails the next operation the same way.
+            Identified::Cluster { .. } | Identified::Proxies { .. } => Err(Error::ConnectionLost(
                 format!("nanocached: {address} no longer identifies as a cache node"),
             )),
         }
