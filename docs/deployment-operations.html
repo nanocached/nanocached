@@ -161,14 +161,18 @@ reclaim all get the graceful path with no extra hooks.</p>
   <li>It keeps serving and forwards writes it no longer owns for the
   rest of the budget while clients catch up, then exits 0.</li>
 </ol>
-<p>The budget is checked <em>between</em> keys, so it is a soft limit.
-A key that is being sent when the budget runs out is given up only
-after up to three attempts of 10&nbsp;s each, and every key after it is
-left behind. A receiver that refuses the connection fails at once, but
-one that stops answering without closing it (a suspended process, a
-saturated host) can stretch the leave by up to 30&nbsp;s past the
-budget; the node still logs the entries it could not hand off and exits
-0.</p>
+<p>The budget is checked between keys and between the attempts on one
+key, so it is a soft limit. An attempt that is under way when the budget
+runs out is allowed to finish (its connect and its send are each bounded
+by 10&nbsp;s), no further attempt starts, and every key after it is left
+behind. A receiver that refuses the connection fails at once, but one that
+stops answering without closing it (a suspended process, a saturated
+host) can stretch the leave past the budget by that one attempt. A
+receiver that fails all three attempts on a key (a node that is down but
+still listed by discovery) is written off for 30&nbsp;s: its remaining
+keys are left behind without further attempts, so the keys bound for the
+live nodes still get the budget. The node logs the entries it could not
+hand off and exits 0.</p>
 <p>Treat that log line (<code>WARN decommission: N entr(ies) could not be
 handed off within the drain budget</code>) as a sizing signal, not as a
 loss: the surviving replicas hold those keys, and the survivors&rsquo;

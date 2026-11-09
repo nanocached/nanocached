@@ -143,6 +143,14 @@ framework adapters at one version, whether or not a component changed.
   holding its connection permit and its per-IP permit. The half-close is
   now inside the window, so the whole drain ends after one second at the
   latest (#1483).
+- `nanocached-node`: the decommission drain no longer spends its budget on
+  a survivor that is dead but still listed by discovery. Each key bound for
+  such a node cost three refused dials and their backoffs (about 0.3 s), so
+  after a few dozen keys the budget was gone and every later key, including
+  those whose entrant was alive, was counted as left behind and never
+  sent. An entrant that fails all attempts on a key is now skipped for 30 s
+  (as the re-replication pass already did) and the deadline is also checked
+  between the attempts on one key (#1521).
 
 ## [0.6.2] - 2026-11-03
 

@@ -7658,7 +7658,12 @@ async fn drain_pending_clears(
 /// out mid-transfer this logs what was left behind and still sends `V`
 /// (the process is exiting either way; clean membership beats a
 /// liveness-timeout ghost), degrading to today's crash semantics for
-/// the untransferred remainder.
+/// the untransferred remainder. The deadline is checked between keys
+/// and between the attempts on one key. An entrant that fails every
+/// attempt on a key (a node that is dead but still listed by discovery)
+/// is written off for `FORWARD_FAIL_FAST_WINDOW`, as `run_rereplication`
+/// does: its keys are counted as left behind without a dial, so they
+/// cannot spend the budget the live entrants' keys need.
 ///
 /// Issue #357 — a documented tradeoff, not a defect: the ring pair from
 /// step 2 is one roster snapshot, never recomputed, and nothing tells a
@@ -7953,6 +7958,9 @@ async fn run_decommission(
     let mut streams: HashMap<String, ClientStream> = HashMap::new();
     let mut sent = 0usize;
     let mut left_behind = 0usize;
+    // When each entrant address last used up every attempt on one key —
+    // the drain's counterpart of `run_rereplication`'s `failed_targets`.
+    let mut failed_targets: HashMap<String, Instant> = HashMap::new();
 
     // Tenth-pass audit (2026-09-02): consumed by hand (not a `for` over
     // `keys` directly) so that on a shutdown override mid-transfer the
@@ -8008,6 +8016,18 @@ async fn run_decommission(
             continue;
         };
 
+        // An entrant that has just used up every attempt on a key is
+        // written off for `FORWARD_FAIL_FAST_WINDOW`: its keys are counted
+        // as left behind without a dial, so a dead but still-listed
+        // survivor cannot spend the budget the live entrants' keys need.
+        if failed_targets
+            .get(addr)
+            .is_some_and(|failed_at| failed_at.elapsed() < FORWARD_FAIL_FAST_WINDOW)
+        {
+            left_behind += 1;
+            continue;
+        }
+
         // Live re-peek, same reasoning as the join transfer: a client
         // write racing this key's turn must win.
         let Some((_, value, ttl)) =
@@ -8018,7 +8038,15 @@ async fn run_decommission(
 
         let mut delivered = false;
         let mut overridden = false;
+        let mut failed_attempts = 0u32;
         for attempt in 0..KEY_TRANSFER_ATTEMPTS {
+            // The budget is checked between attempts too: a key whose
+            // entrant is unreachable costs up to
+            // `KEY_TRANSFER_ATTEMPTS` x `OUTBOUND_IO_TIMEOUT`, which must
+            // not run on past the deadline.
+            if Instant::now() >= deadline {
+                break;
+            }
             let mut connected = streams.contains_key(addr);
             if !connected {
                 // See the roster fetch above for why this (and the
@@ -8040,6 +8068,7 @@ async fn run_decommission(
                         connected = true;
                     }
                     Some(Err(error)) => {
+                        failed_attempts += 1;
                         eprintln!("WARN decommission: connecting to {addr} failed: {error}");
                     }
                 }
@@ -8061,6 +8090,7 @@ async fn run_decommission(
                         delivered = true;
                     }
                     Some(Err(error)) => {
+                        failed_attempts += 1;
                         eprintln!("WARN decommission: transfer to {addr} failed: {error}");
                         streams.remove(addr);
                     }
@@ -8103,6 +8133,16 @@ async fn run_decommission(
             sent += 1;
         } else {
             left_behind += 1;
+            // Only an entrant that failed every attempt (not one the loop
+            // left because the budget ran out) is written off.
+            if failed_attempts == KEY_TRANSFER_ATTEMPTS {
+                failed_targets.insert(addr.clone(), Instant::now());
+                eprintln!(
+                    "WARN decommission: giving up on {addr} for {}s; its remaining keys are \
+                     left behind without further attempts",
+                    FORWARD_FAIL_FAST_WINDOW.as_secs()
+                );
+            }
         }
     }
 
@@ -24113,6 +24153,179 @@ mod tests {
             second_gap > first_gap,
             "expected the backoff to increase between attempts, got {first_gap:?} then \
              {second_gap:?}"
+        );
+
+        discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Issue #1521 helper: a fake discovery server that serves `L` and
+    /// `T` with three members — the leaver, a "dead" survivor listed at
+    /// `127.0.0.1:1` (nothing listens there, so every dial is refused) and
+    /// a live survivor at `peer_addr` (R=1) — and acks `V`.
+    fn spawn_dead_survivor_discovery(
+        listener: TcpListener,
+        peer_addr: String,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let peer_addr = peer_addr.clone();
+                tokio::spawn(async move {
+                    let entries = [
+                        ("leaver", "127.0.0.1:2", "tok-leaver"),
+                        ("dead", "127.0.0.1:1", "tok-dead"),
+                        ("peer", peer_addr.as_str(), "tok-peer"),
+                    ];
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let Some(position) = buf.iter().position(|byte| *byte == b'\n') else {
+                            let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                            continue;
+                        };
+                        let line: Vec<u8> = buf.drain(..=position).collect();
+                        let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+                        // `T` and `V` carry a body of the two lengths in the line.
+                        let body_len: usize = if line.starts_with("T ") || line.starts_with("V ") {
+                            line.split(' ')
+                                .skip(1)
+                                .take(2)
+                                .map(|field| field.parse::<usize>().unwrap())
+                                .sum()
+                        } else {
+                            0
+                        };
+                        while buf.len() < body_len {
+                            let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                        }
+                        buf.drain(..body_len);
+                        if line == "L" || line.starts_with("T ") {
+                            let with_tokens = line != "L";
+                            let mut response = format!("N {} 1\n", entries.len()).into_bytes();
+                            for (name, addr, token) in entries {
+                                if with_tokens {
+                                    response.extend_from_slice(
+                                        format!(
+                                            "{} {} {}\n{name}{addr}{token}\n",
+                                            name.len(),
+                                            addr.len(),
+                                            token.len()
+                                        )
+                                        .as_bytes(),
+                                    );
+                                } else {
+                                    response.extend_from_slice(
+                                        format!("{} {}\n{name}{addr}\n", name.len(), addr.len())
+                                            .as_bytes(),
+                                    );
+                                }
+                            }
+                            let _ = stream.write_all(&response).await;
+                        } else if line.starts_with("V ") {
+                            let _ = stream.write_all(b"R\n").await;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// Issue #1521: a survivor that is dead but still listed by discovery
+    /// must not use up the drain budget the live entrants' keys need.
+    /// Every key bound for it used to cost three refused dials and the
+    /// 100 ms and 200 ms backoffs (about 0.3 s), so with a budget of a few
+    /// seconds the keys after the first dozen or so — including those
+    /// bound for the live survivor — were counted as left behind and never
+    /// sent. The dead address now fails fast after its first key.
+    #[tokio::test(flavor = "current_thread")]
+    async fn decommission_drain_does_not_spend_its_budget_on_a_dead_listed_survivor() {
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_task = spawn_dead_survivor_discovery(discovery_listener, peer_addr);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let node_context = NodeContext {
+            gates: Default::default(),
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: discovery_addr.clone(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx,
+            drain: DrainState::default(),
+        };
+        let before = HashRing::new(vec!["leaver".into(), "dead".into(), "peer".into()]);
+        let after = HashRing::new(vec!["dead".into(), "peer".into()]);
+        let mut to_peer = 0usize;
+        let mut to_dead = 0usize;
+        for index in 0..300u32 {
+            let k = key(format!("key-{index}").as_bytes());
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: k.clone(),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+            if before.is_owner(&k, "leaver", 1) {
+                if after.is_owner(&k, "peer", 1) {
+                    to_peer += 1;
+                } else {
+                    to_dead += 1;
+                }
+            }
+        }
+        // Enough dead-bound keys that the old per-key cost overruns the
+        // budget below many times over.
+        assert!(to_peer > 20 && to_dead > 40, "{to_peer} {to_dead}");
+
+        run_decommission(
+            node_context.clone(),
+            vec![discovery_addr],
+            Duration::from_secs(5),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            to_peer,
+            "every key bound for the live survivor must be handed off"
         );
 
         discovery_task.abort();
