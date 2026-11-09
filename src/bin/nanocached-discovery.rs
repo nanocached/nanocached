@@ -5016,6 +5016,15 @@ async fn sweep_expired(
                     promoted.notify_one();
                 }
 
+                // Issue #1617: the pause that gave every node a fresh
+                // liveness window above gave the join the same: the nodes
+                // could not report `C` to a discovery that was not
+                // running, so its migration timeout does not count the
+                // time. Only the time discovery was running is spent.
+                if stalled && let Some(pending) = lock_current_join(&current_join).as_mut() {
+                    pending.started_at = (pending.started_at + since_last_tick).min(now);
+                }
+
                 // Staged node join pattern 3: a ready node alive but never
                 // reporting `C` (see `migration_timeout_for`).
                 let timed_out: Option<JoinIdentity> = lock_current_join(&current_join)
@@ -14359,9 +14368,94 @@ mod tests {
         ));
 
         tokio::task::yield_now().await;
-        tokio::time::advance(MIGRATION_TIMEOUT_BASE + Duration::from_secs(1)).await;
+        // In steps: one jump across the timeout looks like a pause of
+        // discovery itself, which the timeout does not count (issue #1617).
+        advance_in_steps(
+            MIGRATION_TIMEOUT_BASE + Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(lock_current_join(&current_join).is_none());
+        assert!(!lock(&registry).contains_key("node-b"));
+
+        shutdown_tx.send_replace(true);
+        sweep_task.await.unwrap();
+    }
+
+    /// Issue #1617: the stall guard gives every node a fresh liveness window
+    /// after discovery itself did not run, but the migration timeout runs on
+    /// `started_at`, which the pause counts against too. A join that had
+    /// made progress was abandoned on the first tick after a pause longer
+    /// than the timeout, though no node had been given the time to answer.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_pause_of_discovery_does_not_count_against_the_migration_timeout() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+            generation: 1,
+        })));
+        let liveness = Duration::from_secs(60);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            None,
+            None,
+            2,
+            Instant::now(),
+            liveness,
+            shutdown_rx,
+        ));
         tokio::task::yield_now().await;
 
+        // The join runs for 10 s with the sweep ticking.
+        advance_in_steps(Duration::from_secs(10), Duration::from_secs(1)).await;
+        assert!(lock_current_join(&current_join).is_some());
+
+        // Discovery stops for longer than the migration timeout and the
+        // liveness window; the node's heartbeat gets a fresh window.
+        tokio::time::advance(MIGRATION_TIMEOUT_BASE + Duration::from_secs(10)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            lock_current_join(&current_join).is_some(),
+            "the pause was counted against the migration timeout"
+        );
+        assert!(lock(&registry).contains_key("node-b"));
+
+        // The timeout still runs: it is reached on the time discovery was
+        // running for.
+        advance_in_steps(
+            MIGRATION_TIMEOUT_BASE - Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(lock_current_join(&current_join).is_none());
         assert!(!lock(&registry).contains_key("node-b"));
 

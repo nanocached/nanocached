@@ -135,7 +135,8 @@ unreachable.</p>
   than half the liveness timeout (a stopped or suspended discovery process,
   which finds every heartbeat old when it resumes): that sweep gives every
   node and proxy a fresh liveness window instead, since they were not
-  silent and nobody moved on without them. Nor are nodes sent back when every one
+  silent and nobody moved on without them. A join in progress gets the
+  same: the pause is not counted against its migration timeout. Nor are nodes sent back when every one
   of them was evicted together, as when the path between discovery and the
   whole fleet was cut: discovery answers <code>G</code> only while some
   node has been a member in unbroken contact since before that node was
