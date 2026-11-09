@@ -3595,7 +3595,15 @@ class NanocachedClient:
         awaiter happens to unwind first: if the originating awaiter is
         cancelled while asyncio.shield keeps the dial running, the entry
         must stay put until that dial actually finishes, or a later
-        caller would start a redundant second dial to the same address."""
+        caller would start a redundant second dial to the same address.
+
+        A closed client never dials (issue #1612): a request whose
+        connection close() poisoned lands here when the retry layer
+        reruns it, and must fail as closed at once rather than spend a
+        connect deadline dialing a node whose connection would then be
+        discarded."""
+        if self._closed:
+            raise AlreadyClosedError()
         in_flight = self._redials.get(slot)
         if in_flight is not None:
             return await asyncio.shield(in_flight)
@@ -3662,6 +3670,8 @@ class NanocachedClient:
         return current.connection
 
     async def _open_node_connection(self, address: str) -> Connection:
+        if self._closed:
+            raise AlreadyClosedError()
         node_host, node_port = split_host_port(address)
         try:
             identified = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
