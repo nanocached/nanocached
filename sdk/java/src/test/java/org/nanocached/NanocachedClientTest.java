@@ -582,6 +582,29 @@ class NanocachedClientTest {
         }
     }
 
+    // A value that is not valid UTF-8 among the keys a partial getMany has
+    // already resolved must not turn the partial exception into an
+    // UncheckedIOException: the caller would lose the error class and every
+    // other resolved value. The undecodable value is left out of the map.
+    @Test
+    void getManyChunkedConnectionFailureSurvivesANonUtf8ResolvedValue() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                List<String> keys = new ArrayList<>();
+                for (int i = 0; i < 401; i++) keys.add("k" + i);
+                client.set("k0", "first-chunk-value");
+                client.set("k1".getBytes(StandardCharsets.UTF_8), new byte[] {(byte) 0xFF, (byte) 0xFE, (byte) 0x80});
+
+                node.closeAfterNextMultiGet();
+                NanocachedException.PartialConnectionLostStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class, () -> client.getMany(keys));
+
+                assertEquals(Map.of("k0", "first-chunk-value"), failure.partialValues,
+                        "the binary value is left out, the rest of the resolved values survive");
+            }
+        }
+    }
+
     @Test
     void setManyBytesChunkedConnectionFailureCarriesFirstChunksSucceededIndices() throws Exception {
         try (MockNode node = new MockNode()) {
@@ -2026,6 +2049,34 @@ class NanocachedClientTest {
                 Map<String, String> resolved = new java.util.LinkedHashMap<>();
                 for (String key : primaryB) resolved.put(key, values.get(key));
                 assertEquals(resolved, partial.partialValues);
+            }
+        }
+    }
+
+    @Test
+    void getManyAndGetManyAndTouchKeepWrongNodeWhenAResolvedValueIsNotUtf8() throws Exception {
+        for (boolean touch : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                    List<String> primaryA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                    List<String> primaryB = keysWhosePrimaryIs(NAMES.get(1), 3);
+                    List<String> all = concat(primaryA, primaryB);
+                    Map<String, String> values = new java.util.LinkedHashMap<>();
+                    for (String key : all) values.put(key, "value of " + key);
+                    client.setMany(values);
+                    String binary = primaryB.get(0);
+                    client.set(binary.getBytes(StandardCharsets.UTF_8), new byte[] {(byte) 0xFF, (byte) 0xFE});
+
+                    for (int i = 0; i < 8; i++) nodeA.answerWrongNodeOnce();
+                    NanocachedException.PartialWrongNodeStrings partial = assertThrows(
+                            NanocachedException.PartialWrongNodeStrings.class,
+                            () -> { if (touch) client.getManyAndTouch(all, 31); else client.getMany(all); });
+                    Map<String, String> resolved = new java.util.LinkedHashMap<>();
+                    for (String key : primaryB) if (!key.equals(binary)) resolved.put(key, values.get(key));
+                    assertEquals(resolved, partial.partialValues,
+                            "the non-UTF-8 value is left out, every other resolved value survives");
+                }
             }
         }
     }

@@ -2035,7 +2035,10 @@ public final class NanocachedClient implements AutoCloseable {
     // the same condition.
 
     /** As {@link #getManyBytes(List)}, decoding every hit as strict
-     * UTF-8.
+     * UTF-8. A partial failure ({@link NanocachedException.PartialWrongNodeStrings},
+     * {@link NanocachedException.PartialConnectionLostStrings}) carries the
+     * values already resolved, leaving out any that is not valid UTF-8
+     * ({@link #getManyBytes(List)} has its exact bytes).
      * @throws UncheckedIOException if a stored value is not valid UTF-8 */
     public Map<String, String> getMany(List<String> keys) {
         return getManyDecoded(EMPTY_NAMESPACE, keys);
@@ -2051,11 +2054,32 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             return decodeMany(getManyBytes(namespace, keys));
         } catch (NanocachedException.PartialWrongNode partial) {
-            throw new NanocachedException.PartialWrongNodeStrings(decodeMany(partial.partialValues));
+            throw new NanocachedException.PartialWrongNodeStrings(decodePartial(partial.partialValues));
         } catch (NanocachedException.PartialConnectionLost partial) {
             throw new NanocachedException.PartialConnectionLostStrings(
-                    partial.getMessage(), partial.getCause(), decodeMany(partial.partialValues));
+                    partial.getMessage(), partial.getCause(), decodePartial(partial.partialValues));
         }
+    }
+
+    /** Decodes the values a partial-result exception carries. As strict as
+     * {@link #decodeMany}, but a stored value need not be valid UTF-8
+     * (nothing on the write side enforces it), and the {@link
+     * UncheckedIOException} the strict decode throws would replace the
+     * wrong-node or connection-loss exception the caller needs, with every
+     * other resolved value. So a value that is not valid UTF-8 is left out
+     * of the map rather than decoded lossily (a cache must not return a
+     * value it did not store); {@link #getManyBytes(List)} still has its
+     * exact bytes. */
+    private static Map<String, String> decodePartial(Map<String, byte[]> raw) {
+        Map<String, String> values = new LinkedHashMap<>(raw.size());
+        for (Map.Entry<String, byte[]> entry : raw.entrySet()) {
+            try {
+                values.put(entry.getKey(), decodeUtf8Strict(entry.getValue()));
+            } catch (UncheckedIOException notUtf8) {
+                continue;
+            }
+        }
+        return values;
     }
 
     private static Map<String, String> decodeMany(Map<String, byte[]> raw) {
@@ -3077,13 +3101,13 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             return decodeMany(getManyAndTouchBytes(namespace, keys, ttlSeconds));
         } catch (NanocachedException.PartialWrongNode partial) {
-            throw new NanocachedException.PartialWrongNodeStrings(decodeMany(partial.partialValues));
+            throw new NanocachedException.PartialWrongNodeStrings(decodePartial(partial.partialValues));
         } catch (NanocachedException.PartialServerTooOld partial) {
             throw new NanocachedException.PartialServerTooOldStrings(
-                    partial.getCause(), decodeMany(partial.partialValues));
+                    partial.getCause(), decodePartial(partial.partialValues));
         } catch (NanocachedException.PartialConnectionLost partial) {
             throw new NanocachedException.PartialConnectionLostStrings(
-                    partial.getMessage(), partial.getCause(), decodeMany(partial.partialValues));
+                    partial.getMessage(), partial.getCause(), decodePartial(partial.partialValues));
         }
     }
 
