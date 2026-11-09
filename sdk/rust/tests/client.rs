@@ -5150,7 +5150,7 @@ async fn expiring_touch_many_counts_a_dial_that_found_no_node_as_not_sent() {
     let port = node.port;
 
     // Node A goes away and a discovery server answers on its address: the
-    // redial no longer identifies a cache node (an `Error::Protocol`
+    // redial no longer identifies a cache node (an `Error::ConnectionLost`
     // from the dial, before anything is written).
     node.stop();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -5158,7 +5158,7 @@ async fn expiring_touch_many_counts_a_dial_that_found_no_node_as_not_sent() {
 
     let result = client.touch_many(&keys, Some(0)).await;
     assert!(
-        matches!(result, Err(Error::Protocol(_))),
+        matches!(result, Err(Error::ConnectionLost(_))),
         "result = {result:?}"
     );
     // Nothing was sent, so the keys went through the refresh-and-retry
@@ -5167,6 +5167,45 @@ async fn expiring_touch_many_counts_a_dial_that_found_no_node_as_not_sent() {
     assert_eq!(impostor.l_requests.load(Ordering::SeqCst), 2);
 
     impostor.stop();
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn an_address_that_answers_as_discovery_on_redial_makes_the_operation_refresh_and_reroute() {
+    let (mut nodes, discovery) = start_cluster(1).await;
+    // The default reconnect cooldown stays on: the failed dial arms a
+    // cooldown entry for A's address, which must carry the same error.
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let key = key_with_primary(NAMES[0]);
+    let port = node_named(&nodes, NAMES[0]).port;
+
+    // A goes away and a discovery server answers on its address, which
+    // discovery still lists; A's name is re-registered at a new address.
+    node_named(&nodes, NAMES[0]).stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let impostor = MockDiscovery::start_on_port(port, Vec::new(), 1, Vec::new()).await;
+    let replacement = MockNode::start().await;
+    *discovery.nodes.lock().unwrap() = vec![
+        (NAMES[0].to_string(), replacement.address()),
+        (NAMES[1].to_string(), node_named(&nodes, NAMES[1]).address()),
+    ];
+
+    // The redial finds no node: not a protocol violation but a connection
+    // that could not be made, so the operation refreshes and goes to A's
+    // new address instead of failing until the 30 s staleness refresh.
+    client.set(&key, "v", 0).await.unwrap();
+    assert!(replacement
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(key.as_bytes()));
+
+    impostor.stop();
+    replacement.stop();
+    nodes.remove(0);
     stop_cluster(client, nodes, discovery).await;
 }
 
