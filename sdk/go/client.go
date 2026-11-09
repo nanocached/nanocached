@@ -3514,7 +3514,14 @@ func (c *Client) openNodeConnection(address string) (*connection, error) {
 		return nil, err
 	}
 	if result.conn == nil {
-		return nil, protocolErrorf("nanocached: %s no longer identifies as a cache node", address)
+		// Not a protocol error: the address was reachable but is not (or no
+		// longer) the node it was listed as, which a node-list refresh
+		// cures — so it must read as a lost connection that was never
+		// used, the way a dead address does. withClusterRetry and
+		// withClusterRetryNonIdempotent refresh and reroute only on that.
+		// The cooldown entry armed from this error carries the same type.
+		return nil, notSent(connectionLost(
+			"nanocached: "+address+" no longer identifies as a cache node", nil))
 	}
 	if c.IsClosed() {
 		_ = result.conn.Close()

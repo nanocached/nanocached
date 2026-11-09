@@ -391,8 +391,11 @@ As with `GetMany`, the returned map always holds the keys that resolved,
 whether or not `err` is nil. Keys whose primary still answers a wrong-node
 after one refresh and retry return `ErrWrongNode`; a primary that cannot be
 reached on both passes returns its connection error (`ErrConnectionLost`),
-never `ErrWrongNode`. A touch is idempotent, so a failed `TouchMany` can
-simply be sent again. Against a node that has `t` but not `y` both return
+never `ErrWrongNode`. With a TTL of `0` a frame whose connection was lost after
+it was written is not resent (the node may have expired the keys already), so
+only that frame's keys come back with `ErrConnectionLost`; the frames of the
+same batch that had not been sent yet still go out. A touch is idempotent, so
+a failed `TouchMany` can simply be sent again. Against a node that has `t` but not `y` both return
 `ErrServerTooOldBatch`, which also matches `ErrServerTooOld`.
 
 ## Batched get and set
@@ -551,6 +554,12 @@ finds a dead connection pays its own full dial attempt). This mirrors
 the Rust SDK, where `Options::reconnect_cooldown(Duration::ZERO)` also
 means "use the default" and `Options::disable_reconnect_cooldown()` is
 the equivalent of a negative value here.
+
+A listed address that now answers as something other than a cache node (a
+discovery server or a proxy that took over the address) is treated like a
+dead one: the redial fails with `ErrConnectionLost`, before anything was
+sent, so the operation refreshes the node list and is retried on the right
+owner instead of failing until the next scheduled refresh.
 
 `Connect` itself tolerates a node that discovery still lists but that
 can't be reached — typically one that just died and hasn't been evicted

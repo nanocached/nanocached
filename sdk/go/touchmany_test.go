@@ -1029,3 +1029,51 @@ func TestClusterBatchTouchPureReplicaLegsMayRunInTheBackground(t *testing.T) {
 		return true
 	}, "the background replica touch")
 }
+
+// Issue #1602: with ttlSeconds == 0 a connection lost after a chunk's frame
+// was written makes only that chunk's keys lost. 1,200 keys on one primary
+// are three `y` frames; the node drops the connection on the second. The
+// third was never sent, so it must go out in the retry pass (as it does with
+// a non-zero TTL) and the call must name only the second chunk's 400 keys.
+func TestClusterExpiringBatchRetriesChunksAfterTheOneLostMidBatch(t *testing.T) {
+	for _, get := range []bool{false, true} {
+		t.Run(fmt.Sprintf("get=%v", get), func(t *testing.T) {
+			nodes, discovery := startBatchTouchCluster(t, 1, [2]mockNodeOpts{})
+			client := connectCluster(t, discovery, Config{})
+			keys := keysWithPrimary(testNames[0], 3*maxBatchKeys, "chunk")
+			primary := nodes[testNames[0]]
+			if _, err := client.SetMany(valuesFor(keys), 0); err != nil {
+				t.Fatal(err)
+			}
+
+			primary.failMultiTouchAfter(1) // chunk 1 answered, chunk 2 dropped
+			var resolved int
+			var err error
+			if get {
+				var values map[string]string
+				values, err = client.GetManyAndTouch(keys, 0)
+				resolved = len(values)
+			} else {
+				var touched map[string]bool
+				touched, err = client.TouchMany(keys, 0)
+				resolved = len(touched)
+			}
+			if !errors.Is(err, ErrConnectionLost) || errors.Is(err, errRequestNotSent) {
+				t.Fatalf("err = %v, want the lost chunk's ErrConnectionLost", err)
+			}
+			if !strings.Contains(err.Error(), "could not reach the primary of 400 of 1200 keys") {
+				t.Fatalf("err = %q, want only the 400 keys of the lost chunk named", err)
+			}
+			if resolved != 2*maxBatchKeys {
+				t.Fatalf("resolved %d keys, want 800 (chunks 1 and 3)", resolved)
+			}
+			frames := primary.yFramesSeen()
+			if len(frames) != 3 {
+				t.Fatalf("primary saw %d y frames, want 3 (chunk 1, the lost chunk 2, chunk 3 in the retry pass)", len(frames))
+			}
+			if frames[2].keys[0] != keys[2*maxBatchKeys] {
+				t.Fatalf("third frame starts at %q, want the never-sent chunk starting at %q", frames[2].keys[0], keys[2*maxBatchKeys])
+			}
+		})
+	}
+}
