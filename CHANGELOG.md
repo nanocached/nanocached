@@ -25,6 +25,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: clearing one namespace left the handoff tombstones of
+  that namespace's keys in place, while clearing the whole store dropped
+  them. The tombstones stayed charged to the memory bound for their
+  two minutes, and refused the put-if-absent copy of a key written again
+  after the clear within that time, so the key could be one copy short
+  after a membership change. Clearing a namespace now drops its tombstones
+  and gives their bytes back, as clearing everything does (#1491).
 - `nanocached-proxy`: a refused `A` that asked for response tags was
   answered `En\n`, where a node answers `EnT\n` and a discovery server
   `EdT\n`. The proxy now echoes the `T` too, so a client reads the same
