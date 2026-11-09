@@ -45,6 +45,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e/chaos.sh`: the load ran `ROUNDS * ROUND_BUDGET + 30` s, which left
+  out the up to 90 s `HEAL_BUDGET` wait of each decommission round, so in the
+  worst case the last rounds ran with no load and the miss and corrupt
+  assertions on it said nothing about them, with nothing checking that the
+  load outlived the rounds. The load now covers the heal waits, and the run
+  fails when the load had already ended as the last round finished. The
+  script also removes its containers on exit (an `EXIT` trap, as the other
+  scenarios have), so a Ctrl-C no longer leaves them running (#1621).
+
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh` and `proxykill.sh` did not enforce
   the PASS conditions in their headers. `scalein.sh` ignored the result of the
   wait for membership 3 -> 2 (at R=2 a decommission that never handed off
