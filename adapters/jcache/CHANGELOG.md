@@ -16,6 +16,7 @@ changed. What 1.0.0 will promise is described on the
 ### Fixed
 
 - `put`, `putAll`, `replace(K, V)` and `remove(K)` threw `CacheException` ("failed to deserialize cache value") after the write had already landed when the key's previous value could not be deserialized any more (a changed `serialVersionUID`, a class removed by a redeploy, a serial-filter rejection): the old value was decoded as an argument to the listener event, before the event machinery checked for listeners, and `putAll` stopped between its expiry groups, leaving the later groups unwritten. The previous value is now decoded only when a listener is registered, and if it cannot be decoded the event fires without an old value; the write succeeds. `getAndPut`, `getAndReplace`, `getAndRemove`, `replace(K, V, V)` and `remove(K, V)` still throw, since their result depends on the old value. (#1485)
+- `put`, `putAll`, `remove(K)` and `replace(K, V)` still threw after the write had landed when decoding the previous value raised a `LinkageError` (`ExceptionInInitializerError` from a stored class whose static initializer fails, `NoClassDefFoundError` after a redeploy), which the fix above did not cover because it caught only `RuntimeException`. A `LinkageError` is now treated like any other undecodable previous value: the event fires without an old value. (#1550)
 
 ## [0.6.2] - 2026-11-03
 
