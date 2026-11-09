@@ -14,6 +14,17 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the decommission section said an attempt's connect and its send are
+  each bounded by 10 s, and that the leave notification adds nothing to the
+  budget while also giving it 2 s when the handoff used the budget up. An
+  attempt is bounded by the sum of its legs, each limited to 10 s (TCP
+  connect, TLS handshake, auth exchange, send): 20 s on a plain connection
+  and 40 s with TLS and an auth secret. The leave notification gets what is
+  left of the budget, or 2 s past it, on top of the attempt that overran.
+  The stop-grace sizing rule is adjusted to match (the budget plus 45 s,
+  from the budget plus 30 s, to cover a receiver that stops answering)
+  (#1605).
+
 - Docs: the SDKs page listed "transparent reconnect with a single retry" as
   behaviour common to all six SDKs. It now says what each SDK does when a
   request loses its connection: in cluster mode every SDK retries once after
