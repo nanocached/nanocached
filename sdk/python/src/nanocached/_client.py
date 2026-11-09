@@ -184,6 +184,15 @@ _DEFAULT_COMPRESSION_THRESHOLD = 256
 # get/set/delete refreshes it first (checked lazily on use).
 _NODE_LIST_STALE_AFTER = 30.0
 
+# The shortest time between two forced node-list refreshes (a refresh an
+# operation forces by failing against the current list). While a dead node
+# is still listed by discovery every operation routed to it fails and
+# forces one, and each refresh opens a discovery connection: a sequential
+# caller opened one per failed operation (thousands per second). A forced
+# caller that finds a refresh completed less than this long ago reuses its
+# result. Mutable only so tests can shrink or grow it.
+_FORCED_REFRESH_MIN_INTERVAL = 0.2
+
 # How many of a roster's nodes a dial round (_open_cluster's bootstrap,
 # _refresh_node_list) has in flight at once. Discovery may list up to
 # 65536 nodes; dialing them all at once opens that many sockets in one go,
@@ -722,6 +731,9 @@ class NanocachedClient:
         # When _refresh_task began (monotonic): a forced refresh only joins
         # one that started after the failure it reacts to (_maybe_refresh).
         self._refresh_started: float = 0.0
+        # When the last refresh finished (monotonic), for
+        # _FORCED_REFRESH_MIN_INTERVAL.
+        self._refresh_finished: float = float("-inf")
         self._redials: dict[str, asyncio.Task[Connection]] = {}
         self._reconnect_cooldown: float = _DEFAULT_RECONNECT_COOLDOWN
         # Per-address reconnect cooldown (see _redial) — keyed by address
@@ -3692,20 +3704,43 @@ class NanocachedClient:
         # fresh one runs after it — never concurrently, since both write
         # the member table. Forced callers that arrive while the fresh one
         # runs share it. (issue #1200)
+        #
+        # Forced refreshes are also at least _FORCED_REFRESH_MIN_INTERVAL
+        # apart (issue #1529). A forced caller that finds the last refresh
+        # finished within that interval reuses its result: the retry that
+        # follows still runs, it just does not open another discovery
+        # connection to learn the same list. One that had to wait out an
+        # older in-flight refresh may not reuse it (that one began before
+        # its failure), so it waits for the interval to pass and then runs
+        # a fresh refresh, which the callers arriving meanwhile share.
         observed = time.monotonic()
+        waited_out_older_refresh = False
         while True:
             task = self._refresh_task
             if task is None or task.done():
+                if force:
+                    remaining = self._refresh_finished + _FORCED_REFRESH_MIN_INTERVAL - time.monotonic()
+                    if remaining > 0:
+                        if not waited_out_older_refresh:
+                            return
+                        await asyncio.sleep(remaining)
+                        continue
                 task = asyncio.ensure_future(self._refresh_node_list())
                 self._refresh_task = task
                 self._refresh_started = time.monotonic()
+                task.add_done_callback(self._note_refresh_finished)
             elif force and self._refresh_started < observed:
                 # wait() neither raises the old refresh's error (its own
                 # callers get it) nor cancels it if we are cancelled.
                 await asyncio.wait({task})
+                waited_out_older_refresh = True
                 continue
             await asyncio.shield(task)
             return
+
+    def _note_refresh_finished(self, task: "asyncio.Task[None]") -> None:
+        if not task.cancelled():
+            self._refresh_finished = time.monotonic()
 
     async def _refresh_node_list(self) -> None:
         cluster = await self._fetch_node_list()

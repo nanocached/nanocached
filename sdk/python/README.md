@@ -61,6 +61,16 @@ raises `DiscoveryBusyError` — retry shortly.
 client = await NanocachedClient.connect([("10.0.0.1", 8357), ("10.0.0.2", 8357)])
 ```
 
+The node list is refreshed when it is more than 30 seconds old, and when an
+operation fails against it (a wrong-node answer, or a node that cannot be
+reached) before that operation is retried once. Forced refreshes are at
+least 200 ms apart per client: while discovery still lists a node that has
+died, operations routed to it keep failing, and one that fails within
+200 ms of the last refresh reuses that refresh's list rather than opening
+another discovery connection. The retry still runs, and a refresh that was
+already under way when the operation failed is not taken as an answer to
+it: the caller waits for the interval to pass and a fresh refresh runs.
+
 ## Proxy mode
 
 `addresses` must still point at discovery server(s); `via_proxy=True` fetches
