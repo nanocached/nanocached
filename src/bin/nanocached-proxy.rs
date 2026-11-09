@@ -3198,6 +3198,20 @@ async fn read_reply<S: AsyncRead + Unpin>(
         return Err(io::Error::other("backend answered busy"));
     }
 
+    // A node refuses a request it will not run (one it cannot parse, such
+    // as a frame an older node does not know, or one over its size limit)
+    // with the bare `En\n`, never a tagged form, and then closes the
+    // connection. It reads, runs and answers a connection's requests one at
+    // a time, in order, so by the time it refuses one every earlier reply
+    // has been written: the `En` answers the oldest request still waiting,
+    // which is the one this read is for. The close that follows reaches the
+    // reader as an end of stream, handled like any other close of the
+    // connection: what is still reserved behind this request fails as
+    // written-but-unanswered, and the next request redials.
+    if line == "En" {
+        return Ok(NodeReply::Error);
+    }
+
     let fields: Vec<&str> = parts.collect();
 
     // Issue #128 measurement prototype: `M`'s roster is variable-length
@@ -10307,6 +10321,11 @@ mod tests {
         /// request — simulates a node-side close (idle timeout, crash)
         /// on the shared connection.
         close_once: Arc<AtomicBool>,
+        /// Issue #1487: refuses the next request as a node refuses one it will
+        /// not run: the untagged `En\n`, then the close (`reject_request`).
+        /// Unlike `close_once` the node did answer, so the proxy must read
+        /// the refusal as that request's answer, not as a lost reply.
+        refuse_once: Arc<AtomicBool>,
         /// Issue #272: applies the next `i` (INCR) request to the store,
         /// then drops the connection instead of sending the `I` reply —
         /// simulates the delta having landed at the primary while the
@@ -10339,8 +10358,10 @@ mod tests {
         close_after_touch_apply_once: Arc<AtomicBool>,
         /// The markers (`"W"`, `"E"`) the next `t` frames are refused with,
         /// one per frame in order, before any is applied — a stale ring
-        /// that is still stale after a refresh, or a node that fails the
-        /// request. Nothing is logged in `touches` or expired.
+        /// that is still stale after a refresh, or a node that refuses the
+        /// frame. `"W"` is answered `W <tag>`; `"E"` as a node does, the
+        /// untagged `En` and then the close. Nothing is logged in
+        /// `touches` or expired.
         refuse_touches: Arc<StdMutex<std::collections::VecDeque<&'static str>>>,
         get_delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
@@ -10389,6 +10410,7 @@ mod tests {
                 flushed: Arc::new(AtomicUsize::new(0)),
                 wrong_node_once: Arc::new(AtomicBool::new(false)),
                 close_once: Arc::new(AtomicBool::new(false)),
+                refuse_once: Arc::new(AtomicBool::new(false)),
                 close_after_incr_apply_once: Arc::new(AtomicBool::new(false)),
                 close_after_incr_applies: Arc::new(AtomicUsize::new(0)),
                 close_after_cas_set_apply_once: Arc::new(AtomicBool::new(false)),
@@ -10413,6 +10435,7 @@ mod tests {
             let flushed = Arc::clone(&node.flushed);
             let wrong_once = Arc::clone(&node.wrong_node_once);
             let close_once = Arc::clone(&node.close_once);
+            let refuse_once = Arc::clone(&node.refuse_once);
             let close_after_incr_apply_once = Arc::clone(&node.close_after_incr_apply_once);
             let close_after_incr_applies = Arc::clone(&node.close_after_incr_applies);
             let close_after_cas_set_apply_once = Arc::clone(&node.close_after_cas_set_apply_once);
@@ -10445,6 +10468,7 @@ mod tests {
                             flushed: Arc::clone(&flushed),
                             wrong_once: Arc::clone(&wrong_once),
                             close_once: Arc::clone(&close_once),
+                            refuse_once: Arc::clone(&refuse_once),
                             close_after_incr_apply_once: Arc::clone(&close_after_incr_apply_once),
                             close_after_incr_applies: Arc::clone(&close_after_incr_applies),
                             close_after_cas_set_apply_once: Arc::clone(
@@ -10513,6 +10537,7 @@ mod tests {
         flushed: Arc<AtomicUsize>,
         wrong_once: Arc<AtomicBool>,
         close_once: Arc<AtomicBool>,
+        refuse_once: Arc<AtomicBool>,
         close_after_incr_apply_once: Arc<AtomicBool>,
         close_after_incr_applies: Arc<AtomicUsize>,
         close_after_cas_set_apply_once: Arc<AtomicBool>,
@@ -10559,6 +10584,7 @@ mod tests {
             flushed,
             wrong_once,
             close_once,
+            refuse_once,
             close_after_incr_apply_once,
             close_after_incr_applies,
             close_after_cas_set_apply_once,
@@ -10604,6 +10630,18 @@ mod tests {
                 let command = parts.next().unwrap_or_default().to_string();
                 if command != "A" && close_once.swap(false, Ordering::SeqCst) {
                     // Simulated node-side drop: no reply, connection gone.
+                    return Ok(());
+                }
+                if command != "A" && refuse_once.swap(false, Ordering::SeqCst) {
+                    // As `reject_oversized_request` does: reply, half-close,
+                    // read what is still arriving, then drop the socket.
+                    stream.write_all(b"En\n").await?;
+                    stream.shutdown().await?;
+                    let drain = async {
+                        let mut sink = [0_u8; 1024];
+                        while !matches!(stream.read(&mut sink).await, Ok(0) | Err(_)) {}
+                    };
+                    let _ = timeout(Duration::from_secs(1), drain).await;
                     return Ok(());
                 }
                 let fields: Vec<String> = parts.map(str::to_string).collect();
@@ -11019,6 +11057,13 @@ mod tests {
                         }
                         let refusal = refuse_touches.lock().unwrap().pop_front();
                         if let Some(marker) = refusal {
+                            // A real node's `E` is the untagged `En\n` and
+                            // then the close (`reject_request`); only `W`
+                            // is tagged.
+                            if marker == "E" {
+                                stream.write_all(b"En\n").await?;
+                                return Ok(());
+                            }
                             stream
                                 .write_all(format!("{marker} {}\n", tag(&fields)).as_bytes())
                                 .await?;
@@ -15049,7 +15094,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_zero_ttl_touch_the_node_refuses_is_r_not_an_unknown_outcome() {
         // A `W` or `E` means the frame was refused and nothing expired, so it
-        // is no unknown outcome. The ring still being stale after the
+        // is no unknown outcome. The node's `E` is its real wire form, the
+        // untagged `En` and then the close. The ring still being stale after the
         // refresh, or the node failing the retry, must reach a retry-capable
         // client as `R` (and the connection must stay usable), not as the
         // fatal `E` + close of an `i`, `k` or `x` whose outcome is unknown.
@@ -15098,6 +15144,99 @@ mod tests {
                     "{name}, get={get}: the retry"
                 );
             }
+        }
+    }
+
+    // Issue #1487: a node's refusal is the untagged `En\n` and a close, and
+    // answers the request at the head of the reservation queue. For `i`, `k`
+    // and `x`, whose outcome is unknown after any other failure, it is the
+    // retryable `R`, and the node is not asked again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_incr_or_cas_the_node_refuses_is_r_not_an_unknown_outcome() {
+        let requests: [(&str, &[u8]); 3] = [
+            ("i", b"i 0 1 5\nk"),
+            ("k", b"k 0 1 3 P\nkBob"),
+            ("x", b"x 0 1 0123456789abcdef0123456789abcdef\nk"),
+        ];
+        for (name, request) in requests {
+            let (nodes, proxy) = cluster(1).await;
+            let mut stream = TcpStream::connect(&proxy).await.unwrap();
+            stream.write_all(b"A 1 R\nx").await.unwrap();
+            let mut buf = BytesMut::new();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+            stream.write_all(b"S 1 2\nk10").await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+            nodes[0].refuse_once.store(true, Ordering::SeqCst);
+            stream.write_all(request).await.unwrap();
+            assert_eq!(
+                read_line(&mut stream, &mut buf).await.unwrap(),
+                "R",
+                "{name}"
+            );
+            assert_eq!(nodes[0].incrs(), 0, "{name}");
+            assert_eq!(nodes[0].cas_sets() + nodes[0].cas_deletes(), 0, "{name}");
+            assert_eq!(nodes[0].entry(b"", b"k"), Some(b"10".to_vec()), "{name}");
+
+            // The connection to the proxy is intact, and the next request
+            // goes to the node on a fresh connection.
+            stream.write_all(b"i 0 1 5\nk").await.unwrap();
+            assert_eq!(
+                read_line(&mut stream, &mut buf).await.unwrap(),
+                "I 2",
+                "{name}"
+            );
+            assert_eq!(nodes[0].auth_count.load(Ordering::SeqCst), 2, "{name}");
+        }
+    }
+
+    // Issue #1487: the refusal is read as the answer to the request it
+    // belongs to, and the close that follows is an ordinary close of the
+    // shared connection: the next request redials and is served.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_next_request_after_a_refusal_redials_and_is_served() {
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        stream.write_all(b"A 1 R\nx").await.unwrap();
+        let mut buf = BytesMut::new();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+        stream.write_all(b"S 1 2\nk10").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        node.refuse_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"i 0 1 5\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R");
+
+        stream.write_all(b"G 1\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 2");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"10");
+    }
+
+    #[tokio::test]
+    async fn read_reply_takes_an_untagged_en_as_the_refusal_of_any_request_kind() {
+        for expect in [
+            Expect::Value,
+            Expect::Stored,
+            Expect::Deleted,
+            Expect::Cleared,
+            Expect::Incremented,
+            Expect::CasSet,
+            Expect::Touch,
+            Expect::Touched,
+            Expect::Multi,
+            Expect::MultiAck,
+            Expect::MultiTouch,
+        ] {
+            let mut stream = std::io::Cursor::new(b"En\n".to_vec());
+            let mut buf = BytesMut::new();
+            let reply = read_reply(&mut stream, &mut buf, 7, expect)
+                .await
+                .expect("a node's refusal is an answer");
+            assert!(matches!(reply, NodeReply::Error));
         }
     }
 

@@ -47,6 +47,19 @@ framework adapters at one version, whether or not a component changed.
   header while its body may still be arriving, and closing a socket with
   unread bytes sends a reset that could discard the `Ed\n` before the
   client read it (#1458).
+- `nanocached-proxy`: a node refuses a request it will not run (an old
+  node that does not know a command the proxy sent, or a frame over its
+  size limit) with the untagged `En\n` and then closes the connection, but
+  the proxy only recognised a tagged `E <tag>` as a refusal. Against a real
+  node the `En` was read as a malformed reply: the request ended as an
+  unknown outcome (the fatal `E` and a close for a client that asked for
+  `R`) and the backend connection was poisoned. The `R` that a refused
+  expiring touch, `i`, `k` or `x` is meant to get therefore came only from
+  the test mock. An untagged `En` on a backend connection is now the
+  refusal of the oldest request waiting for a reply, answered as such
+  (`R` for those four), and the close that follows is an ordinary close of
+  the shared connection: requests reserved behind it fail as lost replies
+  do and the next request redials (#1487).
 
 ## [0.6.2] - 2026-11-03
 
