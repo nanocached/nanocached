@@ -736,6 +736,20 @@ header's own last field. Tagged mode is per connection and
 entirely opt-in — a plain <code>A</code> keeps every frame exactly as
 documented above.</p>
 
+<p>A node&rsquo;s refusal is the exception: a request it will not run (one it
+cannot parse, or one over the size limit) is answered with the bare
+<code>En\n</code>, untagged, even on a tagged connection, and the node then
+closes the connection. A node answers a connection&rsquo;s requests one at a
+time, in order, so by the time it refuses a request every earlier reply has
+been written: the <code>En</code> is the answer to the oldest request still
+waiting, and whatever was sent behind it is never answered.
+<code>nanocached-proxy</code> reads it that way on its connections to the
+nodes, which is what lets it answer a refused expiring touch, <code>i</code>,
+<code>k</code> or <code>x</code> with <code>R</code> (to a client that asked
+for it) instead of the fatal <code>E</code> of an unknown outcome. To its own
+clients the proxy tags its errors, <code>E &lt;tag&gt;\n</code>, as the table
+below shows.</p>
+
 <p>Every request ends its header with a tag and every reply echoes it:</p>
 <pre class="session"><code>&gt; A 1 T\n\0
 &lt; OnT\n

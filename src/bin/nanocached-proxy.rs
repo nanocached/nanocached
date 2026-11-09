@@ -3198,6 +3198,20 @@ async fn read_reply<S: AsyncRead + Unpin>(
         return Err(io::Error::other("backend answered busy"));
     }
 
+    // A node refuses a request it will not run (one it cannot parse, such
+    // as a frame an older node does not know, or one over its size limit)
+    // with the bare `En\n`, never a tagged form, and then closes the
+    // connection. It reads, runs and answers a connection's requests one at
+    // a time, in order, so by the time it refuses one every earlier reply
+    // has been written: the `En` answers the oldest request still waiting,
+    // which is the one this read is for. The close that follows reaches the
+    // reader as an end of stream, handled like any other close of the
+    // connection: what is still reserved behind this request fails as
+    // written-but-unanswered, and the next request redials.
+    if line == "En" {
+        return Ok(NodeReply::Error);
+    }
+
     let fields: Vec<&str> = parts.collect();
 
     // Issue #128 measurement prototype: `M`'s roster is variable-length
@@ -3510,6 +3524,50 @@ fn frame_multi_set(namespace: &[u8], keys: &[Bytes], values: &[Bytes], ttl: Opti
         frame.extend_from_slice(value);
     }
     frame.into()
+}
+
+/// Files one key's leg under an address group. A key's owners can share an
+/// address (two roster names on one IP:port, as when a node restarts under
+/// a new name while its old entry is still registered), so ranks 0 and 1
+/// of the same key land in one group; the node must be sent that key once,
+/// not once per rank. The caller files a key's ranks consecutively, best
+/// first, so a repeat is always the group's last leg — and the leg already
+/// there keeps its primary flag.
+fn push_leg(legs: &mut Vec<(usize, bool)>, position: usize, is_primary: bool) {
+    if legs.last().is_some_and(|&(last, _)| last == position) {
+        return;
+    }
+    legs.push((position, is_primary));
+}
+
+/// One address's share of an `o` batch: the address and its legs.
+type SetGroup = (String, Vec<(usize, bool)>);
+
+/// Files `positions` of an `o` batch under every owner address of each key:
+/// the positions that have no owner at all (an empty ring) and, per
+/// address, the `(position, is that address the key's primary)` legs to
+/// put in its sub-frame. Shared by the first dispatch and `retry_multi_set`.
+fn plan_multi_set(
+    ring: &RingView,
+    namespace: &[u8],
+    keys: &[Bytes],
+    positions: impl IntoIterator<Item = usize>,
+) -> (Vec<usize>, Vec<SetGroup>) {
+    let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(ring);
+    let mut missing = Vec::new();
+    let mut top = Vec::new();
+    let namespace_hash = NamespaceHash::of(namespace);
+    for position in positions {
+        ring.rank_owners(namespace_hash, &keys[position], ring.replication, &mut top);
+        if top.is_empty() {
+            missing.push(position);
+            continue;
+        }
+        for (rank, &(_, owner)) in top.iter().enumerate() {
+            push_leg(groups.group_for(owner), position, rank == 0);
+        }
+    }
+    (missing, groups.into_named())
 }
 
 /// Issue #871: one `y` sub-frame per involved owner address and role — see
@@ -4337,6 +4395,26 @@ enum Fatal {
 
 type DriverResult = Result<Vec<u8>, Fatal>;
 
+/// The sending half of a dispatched request's result, held by the driver
+/// that completes it. It also holds a share of the request's in-flight
+/// charge (issue #1488): the driver's frames, keys and values stay alive
+/// until it has settled the request, and the connection's writer may be
+/// gone before that (a failed or timed-out write drops the queue behind
+/// it), so the charge cannot be owned by the queued reply alone. The share
+/// goes when the result is sent (or the driver is dropped without sending);
+/// the queued reply's share goes when its response has been written or
+/// dropped, and the bytes are free once both are.
+struct DriverTx {
+    result: oneshot::Sender<DriverResult>,
+    _charge: Arc<InFlightCharge>,
+}
+
+impl DriverTx {
+    fn send(self, result: DriverResult) -> Result<(), DriverResult> {
+        self.result.send(result)
+    }
+}
+
 /// Issue #125: on a connection whose client declared the retryable-error
 /// capability (`A ... R`), an upstream failure that would otherwise be
 /// the fatal `E`-and-close becomes a per-request `R` (+tag) and the
@@ -4395,12 +4473,17 @@ async fn dispatch_request(
     request: Request,
     tag: Option<u32>,
     retry_capable: bool,
+    charge: Arc<InFlightCharge>,
 ) -> oneshot::Receiver<DriverResult> {
     context
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let (result_tx, result_rx) = oneshot::channel();
+    let (result, result_rx) = oneshot::channel();
+    let result_tx = DriverTx {
+        result,
+        _charge: charge,
+    };
 
     let Some(ring) = current_ring(&context) else {
         // No roster yet: `R` for a retry-capable client (tagged — this
@@ -4605,28 +4688,13 @@ async fn dispatch_request(
             values,
             ttl,
         } => {
-            let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(&ring);
-            let mut missing = Vec::new();
-            let mut top = Vec::new();
-            let namespace_hash = NamespaceHash::of(&namespace);
-
-            for (position, key) in keys.iter().enumerate() {
-                ring.rank_owners(namespace_hash, key, ring.replication, &mut top);
-                if top.is_empty() {
-                    missing.push(position);
-                    continue;
-                }
-                for (rank, &(_, owner)) in top.iter().enumerate() {
-                    groups.group_for(owner).push((position, rank == 0));
-                }
-            }
+            let (missing, groups) = plan_multi_set(&ring, &namespace, &keys, 0..keys.len());
 
             if groups.is_empty() {
                 let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
                 return result_rx;
             }
 
-            let groups = groups.into_named();
             let requests = groups.iter().map(|(owner, legs)| {
                 let group_keys: Vec<Bytes> = legs
                     .iter()
@@ -5248,21 +5316,10 @@ async fn retry_multi_set(
         return;
     };
 
-    let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(&ring);
-    let mut top = Vec::new();
-    let namespace_hash = NamespaceHash::of(namespace);
-    for &position in retry_positions {
-        let key = &keys[position];
-        ring.rank_owners(namespace_hash, key, ring.replication, &mut top);
-        if top.is_empty() {
-            entries[position] = Some(ProxyAckEntry::WrongNode);
-            continue;
-        }
-        for (rank, &(_, owner)) in top.iter().enumerate() {
-            groups.group_for(owner).push((position, rank == 0));
-        }
+    let (missing, groups) = plan_multi_set(&ring, namespace, keys, retry_positions.iter().copied());
+    for position in missing {
+        entries[position] = Some(ProxyAckEntry::WrongNode);
     }
-    let groups = groups.into_named();
 
     // Issue #177: same concurrent fan-out as `retry_multi_get` above.
     let requests = groups.iter().map(|(owner, legs)| {
@@ -5358,7 +5415,7 @@ fn plan_multi_touch(
             if get && rank == 0 {
                 primaries.group_for(owner).push((position, true));
             } else {
-                plain.group_for(owner).push((position, rank == 0));
+                push_leg(plain.group_for(owner), position, rank == 0);
             }
         }
     }
@@ -6316,7 +6373,7 @@ async fn dispatch_primary_evaluated(
     request: PrimaryRequest,
     tag: Option<u32>,
     retry_capable: bool,
-    result_tx: oneshot::Sender<DriverResult>,
+    result_tx: DriverTx,
 ) {
     let PrimaryRequest {
         namespace,
@@ -6773,7 +6830,9 @@ fn shrink_to_contents(buf: &mut BytesMut) {
 /// that reply has been written.
 struct ClientReply {
     result: oneshot::Receiver<DriverResult>,
-    charge: Option<InFlightCharge>,
+    /// Shared with the request's driver (`DriverTx`), so the bytes stay
+    /// charged while either still needs them.
+    charge: Option<Arc<InFlightCharge>>,
 }
 
 impl ClientReply {
@@ -6979,10 +7038,15 @@ async fn handle_client(
                         .await
                         .is_err()
                     {
+                        // The queue behind this reply is dropped with its
+                        // charges' shares; a request that is still being
+                        // served keeps the share its driver holds
+                        // (`DriverTx`) until the driver finishes.
                         return write_half;
                     }
                     // Written and about to be dropped: the bytes this
-                    // request was charged are free again.
+                    // request was charged are free again, unless its
+                    // driver is still working on it.
                     drop(response);
                     drop(charge);
                 }
@@ -7192,8 +7256,15 @@ async fn handle_client(
                     // Dispatch inline (awaiting the ordered backend
                     // enqueues) before parsing the next request — see
                     // `dispatch_request` on why order matters here.
-                    let result =
-                        dispatch_request(Arc::clone(&context), request, tag, retry_capable).await;
+                    let charge = Arc::new(charge);
+                    let result = dispatch_request(
+                        Arc::clone(&context),
+                        request,
+                        tag,
+                        retry_capable,
+                        Arc::clone(&charge),
+                    )
+                    .await;
                     if fifo_tx
                         .send(ClientReply {
                             result,
@@ -7494,8 +7565,11 @@ where
     R: AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let _ = write_half.shutdown().await;
+    // The half-close is inside the window too: over TLS it first flushes
+    // the pending records, which blocks for as long as a peer that has
+    // stopped reading keeps the send buffer full.
     let drain = async {
+        let _ = write_half.shutdown().await;
         let mut sink = [0_u8; 8192];
         let mut discarded = 0;
         while discarded < MAX_REQUEST_SIZE {
@@ -9040,6 +9114,68 @@ mod tests {
         (node, proxy, context)
     }
 
+    // Issue #1488: a request's in-flight bytes are held by what is still
+    // working on it, not only by the reply queued for its client. A write
+    // error to a client that went away ends its writer and drops the queue
+    // behind it; the requests already dispatched are still at the node, and
+    // their keys and values still pinned, so their bytes stay charged until
+    // the drivers finish.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dispatched_requests_bytes_stay_charged_after_its_client_writer_ends() {
+        let node = MockNode::start().await;
+        node.store
+            .lock()
+            .unwrap()
+            .insert((Vec::new(), b"k".to_vec()), b"v".to_vec());
+        *node.get_delay.lock().unwrap() = Duration::from_millis(300);
+        let roster = vec![("node".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let (proxy, _drain, _context, budget) = start_proxy_observed(
+            &discovery,
+            None,
+            test_limits(8),
+            None,
+            Arc::new(SharedBackends::new()),
+        )
+        .await;
+        let total = budget.bytes;
+        assert_eq!(budget.permits.available_permits(), total);
+
+        // Two pipelined reads on one connection. The node answers them in
+        // order: the first after 300 ms, the second 1.5 s after that.
+        let (mut client, _buf) = connect_and_auth(&proxy).await;
+        client.write_all(b"G 1\nkG 1\nk").await.unwrap();
+        sleep(Duration::from_millis(50)).await;
+        *node.get_delay.lock().unwrap() = Duration::from_millis(1500);
+        assert!(
+            budget.permits.available_permits() <= total - 2 * MAX_REQUEST_SIZE,
+            "both reads should be charged"
+        );
+
+        // The client resets the connection, so the writer's write of the
+        // first reply fails and the writer ends with the second still at
+        // the node.
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(client);
+        sleep(Duration::from_millis(700)).await;
+        let held = total - budget.permits.available_permits();
+        assert!(
+            held >= MAX_REQUEST_SIZE,
+            "the read still at the node must stay charged, but only {held} bytes are held"
+        );
+
+        // Once the node has answered it, everything is free again.
+        let freed = timeout(Duration::from_secs(5), async {
+            while budget.permits.available_permits() != total {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(freed.is_ok(), "the charge was never released");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_connection_stops_being_read_once_its_in_flight_bytes_are_spent() {
         // Six pipelined `G`s against a node that answers each after
@@ -9498,6 +9634,44 @@ mod tests {
         let error = super::read_line(&mut server, &mut buf).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(started.elapsed(), UPSTREAM_IO_TIMEOUT);
+    }
+
+    // A write half whose half-close never completes, as a TLS stream's does
+    // while the peer has stopped reading and the send buffer is full.
+    struct StuckShutdown;
+
+    impl tokio::io::AsyncWrite for StuckShutdown {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_rejected_request_drain_is_bounded_even_when_the_half_close_never_completes() {
+        // `_client` stays open and silent, so the read side never ends either.
+        let (_client, mut server) = tokio::io::duplex(64);
+        let mut write_half = StuckShutdown;
+        let started = Instant::now();
+        drain_rejected_request(&mut server, &mut write_half).await;
+        assert_eq!(started.elapsed(), REJECTED_REQUEST_DRAIN_WINDOW);
     }
 
     #[test]
@@ -10335,6 +10509,11 @@ mod tests {
         /// request — simulates a node-side close (idle timeout, crash)
         /// on the shared connection.
         close_once: Arc<AtomicBool>,
+        /// Issue #1487: refuses the next request as a node refuses one it will
+        /// not run: the untagged `En\n`, then the close (`reject_request`).
+        /// Unlike `close_once` the node did answer, so the proxy must read
+        /// the refusal as that request's answer, not as a lost reply.
+        refuse_once: Arc<AtomicBool>,
         /// Issue #272: applies the next `i` (INCR) request to the store,
         /// then drops the connection instead of sending the `I` reply —
         /// simulates the delta having landed at the primary while the
@@ -10360,6 +10539,9 @@ mod tests {
         /// Issue #824: the `(ttl, get)` of every `t` this node received, in
         /// arrival order — shows which legs were sent `G` and which TTL.
         touches: TouchLog,
+        /// Issue #1486: how many pairs each `o` frame this node received
+        /// carried, in arrival order — a key sent twice in one frame shows.
+        multi_set_sizes: Arc<StdMutex<Vec<usize>>>,
         /// Issue #824: applies the next `t` that finds its key (a touch
         /// changes nothing the mock stores), then drops the connection
         /// instead of replying — the reply lost after the node executed
@@ -10367,8 +10549,10 @@ mod tests {
         close_after_touch_apply_once: Arc<AtomicBool>,
         /// The markers (`"W"`, `"E"`) the next `t` frames are refused with,
         /// one per frame in order, before any is applied — a stale ring
-        /// that is still stale after a refresh, or a node that fails the
-        /// request. Nothing is logged in `touches` or expired.
+        /// that is still stale after a refresh, or a node that refuses the
+        /// frame. `"W"` is answered `W <tag>`; `"E"` as a node does, the
+        /// untagged `En` and then the close. Nothing is logged in
+        /// `touches` or expired.
         refuse_touches: Arc<StdMutex<std::collections::VecDeque<&'static str>>>,
         get_delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
@@ -10417,11 +10601,13 @@ mod tests {
                 flushed: Arc::new(AtomicUsize::new(0)),
                 wrong_node_once: Arc::new(AtomicBool::new(false)),
                 close_once: Arc::new(AtomicBool::new(false)),
+                refuse_once: Arc::new(AtomicBool::new(false)),
                 close_after_incr_apply_once: Arc::new(AtomicBool::new(false)),
                 close_after_incr_applies: Arc::new(AtomicUsize::new(0)),
                 close_after_cas_set_apply_once: Arc::new(AtomicBool::new(false)),
                 close_after_cas_delete_apply_once: Arc::new(AtomicBool::new(false)),
                 touches: Arc::new(StdMutex::new(Vec::new())),
+                multi_set_sizes: Arc::new(StdMutex::new(Vec::new())),
                 close_after_touch_apply_once: Arc::new(AtomicBool::new(false)),
                 refuse_touches: Arc::new(StdMutex::new(std::collections::VecDeque::new())),
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
@@ -10441,12 +10627,14 @@ mod tests {
             let flushed = Arc::clone(&node.flushed);
             let wrong_once = Arc::clone(&node.wrong_node_once);
             let close_once = Arc::clone(&node.close_once);
+            let refuse_once = Arc::clone(&node.refuse_once);
             let close_after_incr_apply_once = Arc::clone(&node.close_after_incr_apply_once);
             let close_after_incr_applies = Arc::clone(&node.close_after_incr_applies);
             let close_after_cas_set_apply_once = Arc::clone(&node.close_after_cas_set_apply_once);
             let close_after_cas_delete_apply_once =
                 Arc::clone(&node.close_after_cas_delete_apply_once);
             let touches = Arc::clone(&node.touches);
+            let multi_set_sizes = Arc::clone(&node.multi_set_sizes);
             let close_after_touch_apply_once = Arc::clone(&node.close_after_touch_apply_once);
             let refuse_touches = Arc::clone(&node.refuse_touches);
             let delay = Arc::clone(&node.get_delay);
@@ -10473,6 +10661,7 @@ mod tests {
                             flushed: Arc::clone(&flushed),
                             wrong_once: Arc::clone(&wrong_once),
                             close_once: Arc::clone(&close_once),
+                            refuse_once: Arc::clone(&refuse_once),
                             close_after_incr_apply_once: Arc::clone(&close_after_incr_apply_once),
                             close_after_incr_applies: Arc::clone(&close_after_incr_applies),
                             close_after_cas_set_apply_once: Arc::clone(
@@ -10482,6 +10671,7 @@ mod tests {
                                 &close_after_cas_delete_apply_once,
                             ),
                             touches: Arc::clone(&touches),
+                            multi_set_sizes: Arc::clone(&multi_set_sizes),
                             close_after_touch_apply_once: Arc::clone(&close_after_touch_apply_once),
                             refuse_touches: Arc::clone(&refuse_touches),
                             delay: Arc::clone(&delay),
@@ -10522,6 +10712,10 @@ mod tests {
             self.touches.lock().unwrap().clone()
         }
 
+        fn multi_set_sizes(&self) -> Vec<usize> {
+            self.multi_set_sizes.lock().unwrap().clone()
+        }
+
         fn entry(&self, namespace: &[u8], key: &[u8]) -> Option<Vec<u8>> {
             self.store
                 .lock()
@@ -10541,6 +10735,7 @@ mod tests {
         flushed: Arc<AtomicUsize>,
         wrong_once: Arc<AtomicBool>,
         close_once: Arc<AtomicBool>,
+        refuse_once: Arc<AtomicBool>,
         close_after_incr_apply_once: Arc<AtomicBool>,
         close_after_incr_applies: Arc<AtomicUsize>,
         close_after_cas_set_apply_once: Arc<AtomicBool>,
@@ -10548,6 +10743,7 @@ mod tests {
         /// Issue #824: the `(ttl, get)` of every `t` this node received, in
         /// arrival order — shows which legs were sent `G` and which TTL.
         touches: TouchLog,
+        multi_set_sizes: Arc<StdMutex<Vec<usize>>>,
         /// Issue #824: applies the next `t` that finds its key (a touch
         /// changes nothing the mock stores), then drops the connection
         /// instead of replying — the reply lost after the node executed
@@ -10587,11 +10783,13 @@ mod tests {
             flushed,
             wrong_once,
             close_once,
+            refuse_once,
             close_after_incr_apply_once,
             close_after_incr_applies,
             close_after_cas_set_apply_once,
             close_after_cas_delete_apply_once,
             touches,
+            multi_set_sizes,
             close_after_touch_apply_once,
             refuse_touches,
             delay,
@@ -10632,6 +10830,18 @@ mod tests {
                 let command = parts.next().unwrap_or_default().to_string();
                 if command != "A" && close_once.swap(false, Ordering::SeqCst) {
                     // Simulated node-side drop: no reply, connection gone.
+                    return Ok(());
+                }
+                if command != "A" && refuse_once.swap(false, Ordering::SeqCst) {
+                    // As `reject_oversized_request` does: reply, half-close,
+                    // read what is still arriving, then drop the socket.
+                    stream.write_all(b"En\n").await?;
+                    stream.shutdown().await?;
+                    let drain = async {
+                        let mut sink = [0_u8; 1024];
+                        while !matches!(stream.read(&mut sink).await, Ok(0) | Err(_)) {}
+                    };
+                    let _ = timeout(Duration::from_secs(1), drain).await;
                     return Ok(());
                 }
                 let fields: Vec<String> = parts.map(str::to_string).collect();
@@ -10766,6 +10976,7 @@ mod tests {
                     "o" => {
                         let ns_length: usize = fields[0].parse().unwrap();
                         let count: usize = fields[1].parse().unwrap();
+                        multi_set_sizes.lock().unwrap().push(count);
                         let mut pairs = Vec::with_capacity(count);
                         for pair in 0..count {
                             let key_length: usize = fields[2 + pair * 2].parse().unwrap();
@@ -11047,6 +11258,13 @@ mod tests {
                         }
                         let refusal = refuse_touches.lock().unwrap().pop_front();
                         if let Some(marker) = refusal {
+                            // A real node's `E` is the untagged `En\n` and
+                            // then the close (`reject_request`); only `W`
+                            // is tagged.
+                            if marker == "E" {
+                                stream.write_all(b"En\n").await?;
+                                return Ok(());
+                            }
                             stream
                                 .write_all(format!("{marker} {}\n", tag(&fields)).as_bytes())
                                 .await?;
@@ -11420,6 +11638,25 @@ mod tests {
         announce: Option<ProxyIdentity>,
         backends: Arc<SharedBackends>,
     ) -> (String, watch::Sender<bool>, Arc<ProxyContext>) {
+        let (addr, drain, context, _) =
+            start_proxy_observed(discovery_addr, secret, limits, announce, backends).await;
+        (addr, drain, context)
+    }
+
+    /// `start_proxy_full`, also handing back the proxy-wide in-flight
+    /// budget so a test can read how many bytes are held.
+    async fn start_proxy_observed(
+        discovery_addr: &str,
+        secret: Option<&str>,
+        limits: ConnectionLimits,
+        announce: Option<ProxyIdentity>,
+        backends: Arc<SharedBackends>,
+    ) -> (
+        String,
+        watch::Sender<bool>,
+        Arc<ProxyContext>,
+        InFlightBudget,
+    ) {
         let (ring_tx, ring_rx) = watch::channel(None);
         let (refresh_tx, refresh_rx) = mpsc::channel(16);
         let (drain_tx, drain_rx) = watch::channel(false);
@@ -11450,6 +11687,8 @@ mod tests {
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let in_flight = InFlightAdmission::new(&limits);
+        let proxy_budget = in_flight.proxy.clone();
         tokio::spawn(serve(
             listener,
             Arc::clone(&context),
@@ -11458,7 +11697,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(limits.max_connections)),
                 per_ip_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 max_connections_per_ip: limits.max_connections_per_ip,
-                in_flight: InFlightAdmission::new(&limits),
+                in_flight,
             },
             Duration::from_secs(5),
         ));
@@ -11469,7 +11708,7 @@ mod tests {
         while ring.borrow().is_none() {
             ring.changed().await.unwrap();
         }
-        (addr, drain_tx, context)
+        (addr, drain_tx, context, proxy_budget)
     }
 
     async fn start_proxy(
@@ -12577,6 +12816,103 @@ mod tests {
         assert_eq!(listed, &keys, "each key once, in batch order");
         let frame = frame_multi_touch(b"", listed, Some(0), false);
         assert!(frame.starts_with(format!("y 0 {} ", keys.len()).as_bytes()));
+    }
+
+    // Issue #1486: two roster names on one address (a node restarted on the
+    // same IP:port under a new name while its old entry is still registered)
+    // are both owners of a key at R=2. The key goes to that address once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_set_sends_a_key_once_when_two_roster_names_share_an_address() {
+        let node = MockNode::start().await;
+        let roster = vec![
+            ("node-a".to_string(), node.addr.clone()),
+            ("node-b".to_string(), node.addr.clone()),
+        ];
+        let discovery = start_mock_discovery(roster, 2).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"o 0 2 1 1 1 1\nabcd").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "O 2 S S");
+        assert_eq!(node.multi_set_sizes(), vec![2], "each key once, not twice");
+        assert_eq!(node.entry(b"", b"a"), Some(b"b".to_vec()));
+        assert_eq!(node.entry(b"", b"c"), Some(b"d".to_vec()));
+
+        // The retry after a per-key `W` rebuilds the frame the same way.
+        node.multi_set_sizes.lock().unwrap().clear();
+        node.wrong_node_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"o 0 2 1 1 1 1\nefgh").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "O 2 S S");
+        assert_eq!(
+            node.multi_set_sizes(),
+            vec![2, 1],
+            "retry: only the refused key"
+        );
+    }
+
+    #[test]
+    fn batch_plans_file_a_key_once_per_address_even_when_names_share_one() {
+        // node-a and node-b share addr-1; replication 3 makes every key's
+        // top-3 the whole roster, so ranks hit addr-1 twice.
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), "addr-1".to_string()),
+                ("node-b".to_string(), "addr-1".to_string()),
+                ("node-c".to_string(), "addr-2".to_string()),
+            ],
+            3,
+        );
+        let keys: Vec<Bytes> = (0..8).map(|i| Bytes::from(format!("key-{i}"))).collect();
+
+        let (missing, groups) = plan_multi_set(&ring, b"", &keys, 0..keys.len());
+        assert!(missing.is_empty());
+        assert_eq!(groups.len(), 2);
+        for (addr, legs) in &groups {
+            let positions: Vec<usize> = legs.iter().map(|&(position, _)| position).collect();
+            assert_eq!(positions, (0..keys.len()).collect::<Vec<_>>(), "{addr}");
+        }
+        // The primary flag is the one the best-ranked name gave it.
+        let mut top = Vec::new();
+        for (position, key) in keys.iter().enumerate() {
+            ring.rank_owners(NamespaceHash::of(b""), key, 3, &mut top);
+            let primary_addr = ring.nodes[top[0].1].1.as_str();
+            for (addr, legs) in &groups {
+                let leg = legs.iter().find(|&&(p, _)| p == position).unwrap();
+                assert_eq!(leg.1, addr == primary_addr, "key {position} at {addr}");
+            }
+        }
+
+        // The same for a touch batch with no `G` and no expiry, where every
+        // owner's share is one plain group.
+        let (missing, touch_groups) =
+            plan_multi_touch(&ring, b"", &keys, 0..keys.len(), Some(30), false);
+        assert!(missing.is_empty());
+        for group in &touch_groups {
+            assert_eq!(group.legs.len(), keys.len(), "{}", group.addr);
+        }
+    }
+
+    #[test]
+    fn a_two_name_ring_on_one_address_sends_a_key_once_in_its_sub_frame() {
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), "addr-1".to_string()),
+                ("node-b".to_string(), "addr-1".to_string()),
+            ],
+            2,
+        );
+        let keys = [Bytes::from_static(b"k")];
+        let values = [Bytes::from_static(b"vv")];
+        let (_, groups) = plan_multi_set(&ring, b"ns", &keys, 0..1);
+        assert_eq!(groups.len(), 1);
+        let (addr, legs) = &groups[0];
+        assert_eq!(addr, "addr-1");
+        assert_eq!(legs, &vec![(0, true)]);
+        let group_keys: Vec<Bytes> = legs.iter().map(|&(p, _)| keys[p].clone()).collect();
+        let group_values: Vec<Bytes> = legs.iter().map(|&(p, _)| values[p].clone()).collect();
+        let frame = frame_multi_set(b"ns", &group_keys, &group_values, Some(5));
+        let expected = format!("o 2 1 1 2 5 {TAG_PLACEHOLDER}\nnskvv");
+        assert_eq!(&frame[..], expected.as_bytes());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -15110,7 +15446,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_zero_ttl_touch_the_node_refuses_is_r_not_an_unknown_outcome() {
         // A `W` or `E` means the frame was refused and nothing expired, so it
-        // is no unknown outcome. The ring still being stale after the
+        // is no unknown outcome. The node's `E` is its real wire form, the
+        // untagged `En` and then the close. The ring still being stale after the
         // refresh, or the node failing the retry, must reach a retry-capable
         // client as `R` (and the connection must stay usable), not as the
         // fatal `E` + close of an `i`, `k` or `x` whose outcome is unknown.
@@ -15159,6 +15496,99 @@ mod tests {
                     "{name}, get={get}: the retry"
                 );
             }
+        }
+    }
+
+    // Issue #1487: a node's refusal is the untagged `En\n` and a close, and
+    // answers the request at the head of the reservation queue. For `i`, `k`
+    // and `x`, whose outcome is unknown after any other failure, it is the
+    // retryable `R`, and the node is not asked again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_incr_or_cas_the_node_refuses_is_r_not_an_unknown_outcome() {
+        let requests: [(&str, &[u8]); 3] = [
+            ("i", b"i 0 1 5\nk"),
+            ("k", b"k 0 1 3 P\nkBob"),
+            ("x", b"x 0 1 0123456789abcdef0123456789abcdef\nk"),
+        ];
+        for (name, request) in requests {
+            let (nodes, proxy) = cluster(1).await;
+            let mut stream = TcpStream::connect(&proxy).await.unwrap();
+            stream.write_all(b"A 1 R\nx").await.unwrap();
+            let mut buf = BytesMut::new();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+            stream.write_all(b"S 1 2\nk10").await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+            nodes[0].refuse_once.store(true, Ordering::SeqCst);
+            stream.write_all(request).await.unwrap();
+            assert_eq!(
+                read_line(&mut stream, &mut buf).await.unwrap(),
+                "R",
+                "{name}"
+            );
+            assert_eq!(nodes[0].incrs(), 0, "{name}");
+            assert_eq!(nodes[0].cas_sets() + nodes[0].cas_deletes(), 0, "{name}");
+            assert_eq!(nodes[0].entry(b"", b"k"), Some(b"10".to_vec()), "{name}");
+
+            // The connection to the proxy is intact, and the next request
+            // goes to the node on a fresh connection.
+            stream.write_all(b"i 0 1 5\nk").await.unwrap();
+            assert_eq!(
+                read_line(&mut stream, &mut buf).await.unwrap(),
+                "I 2",
+                "{name}"
+            );
+            assert_eq!(nodes[0].auth_count.load(Ordering::SeqCst), 2, "{name}");
+        }
+    }
+
+    // Issue #1487: the refusal is read as the answer to the request it
+    // belongs to, and the close that follows is an ordinary close of the
+    // shared connection: the next request redials and is served.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_next_request_after_a_refusal_redials_and_is_served() {
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        stream.write_all(b"A 1 R\nx").await.unwrap();
+        let mut buf = BytesMut::new();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+        stream.write_all(b"S 1 2\nk10").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        node.refuse_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"i 0 1 5\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R");
+
+        stream.write_all(b"G 1\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 2");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"10");
+    }
+
+    #[tokio::test]
+    async fn read_reply_takes_an_untagged_en_as_the_refusal_of_any_request_kind() {
+        for expect in [
+            Expect::Value,
+            Expect::Stored,
+            Expect::Deleted,
+            Expect::Cleared,
+            Expect::Incremented,
+            Expect::CasSet,
+            Expect::Touch,
+            Expect::Touched,
+            Expect::Multi,
+            Expect::MultiAck,
+            Expect::MultiTouch,
+        ] {
+            let mut stream = std::io::Cursor::new(b"En\n".to_vec());
+            let mut buf = BytesMut::new();
+            let reply = read_reply(&mut stream, &mut buf, 7, expect)
+                .await
+                .expect("a node's refusal is an answer");
+            assert!(matches!(reply, NodeReply::Error));
         }
     }
 
