@@ -8201,7 +8201,7 @@ fn handoff_message(
         crate::trace::name(&key.name),
         ttl.map(|t| t.as_secs()),
         if_absent,
-        &token[..token.len().min(8)]
+        crate::trace::short_token(token)
     );
     let mut header = format!(
         "U {} {} {} {}",
@@ -8233,7 +8233,7 @@ fn handoff_delete_message(key: &Key, token: &str) -> Vec<u8> {
         &key.name,
         "send_u key={} token={}",
         crate::trace::name(&key.name),
-        &token[..token.len().min(8)]
+        crate::trace::short_token(token)
     );
     let mut message = format!(
         "u {} {} {}\n",
