@@ -526,7 +526,12 @@ desynced reply, a close by another request's failure or by the timeout
 watchdog while the write was in progress) is ambiguous and is never
 replayed. Every SDK applies this same rule; the Node and asyncio SDKs,
 whose runtimes buffer writes in user space and flush them in the
-background, can only ever prove the first case.
+background, can only ever prove the first case. A connection that could
+not be established at all (a dial that failed, for instance because the
+key's primary just died) is the clearest case of it: nothing was sent, so
+these requests, like `get`/`set`/`delete`, refresh the node list once and
+retry against the fresh ranking, routing around the dead primary once
+discovery has dropped it.
 
 `connect()` itself tolerates a node that discovery still lists but that
 can't be reached — typically one that just died and hasn't been evicted
