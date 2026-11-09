@@ -488,6 +488,16 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     private static final Duration NODE_LIST_STALE_AFTER = Duration.ofSeconds(30);
+
+    /** The minimum time between two forced node-list refreshes (issue
+     * #1582). While discovery still lists a dead node (its liveness
+     * window), every operation whose primary is that node fails and forces
+     * a refresh that installs the same list; without a floor, a sequential
+     * caller opens one discovery connection per failed operation. A forced
+     * caller that finds a refresh completed within this window reuses it,
+     * and callers that waited behind an older refresh share one follow-up
+     * that starts once the window has passed. */
+    static final Duration FORCED_REFRESH_MIN_INTERVAL = Duration.ofMillis(200);
     // Reserved by the SDKs so a real application key can never collide
     // with it: a GET refreshes the pinged key's server-side LRU recency,
     // which is exactly why collision would matter — an app using key
@@ -621,7 +631,7 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     private final Object stateLock = new Object();
-    private final Object refreshLock = new Object();
+    private final java.util.concurrent.locks.ReentrantLock refreshLock = new java.util.concurrent.locks.ReentrantLock();
     private final ConcurrentHashMap<String, Object> redialLocks = new ConcurrentHashMap<>();
     private final List<Address> addresses;
     private final byte[] authSecret;
@@ -753,6 +763,13 @@ public final class NanocachedClient implements AutoCloseable {
     private volatile HashRing ring;
     private volatile int replication = 1;
     private long lastFetchNanos = System.nanoTime();
+    // When the current or last refresh began, and when the last one ended
+    // (successfully or not), for maybeRefresh (issue #1582). Both are
+    // guarded by refreshLock; lastRefreshEnded is false until a refresh has
+    // run, so the first forced one is never throttled.
+    private long lastFetchStartedNanos = System.nanoTime();
+    private long lastRefreshEndNanos;
+    private boolean lastRefreshEnded;
 
     private ExecutorService replicaWriters;
     /** Issue #500: the pool for the permit-gated background legs only —
@@ -6520,21 +6537,58 @@ public final class NanocachedClient implements AutoCloseable {
         if (ring == null) return;
         if (!force && System.nanoTime() - lastFetchNanos < NODE_LIST_STALE_AFTER.toNanos()) return;
 
-        // Forced refreshes are single-flight: a forced caller that waited
-        // for refreshLock while another refresh ran reuses that refresh
-        // instead of running its own. Without this, N callers hitting
-        // the same dead node ran N full refreshes one after another (each
-        // a discovery round trip, up to the connect timeout when
-        // discovery is slow), and the last caller waited behind N - 1
-        // results it did not need. A refresh that completed — including
-        // one whose fetch failed, which also advances lastFetchNanos — is
-        // what the waiter would have got from its own attempt moments
-        // later, so its outcome is reused either way.
-        long observed = lastFetchNanos;
-        synchronized (refreshLock) {
+        // Forced refreshes are single-flight: N callers hitting the same
+        // dead node used to run N full refreshes one after another (each a
+        // discovery round trip, up to the connect timeout when discovery
+        // is slow), and the last caller waited behind N - 1 results it did
+        // not need. A forced caller reuses a refresh only if that refresh
+        // STARTED after the moment it saw its failure (issue #1582): one
+        // already in flight then had read discovery's list before the
+        // failure, may still name the node that failed, and would send the
+        // caller's one retry straight back to it. Such a refresh is waited
+        // out, and the caller then runs or joins one that started later.
+        long observed = System.nanoTime();
+        // A caller that has to queue behind another refresh waited out one
+        // that was in flight when it arrived.
+        boolean waited = false;
+        if (!refreshLock.tryLock()) {
+            waited = true;
+            refreshLock.lock();
+        }
+        try {
             if (!force && System.nanoTime() - lastFetchNanos < NODE_LIST_STALE_AFTER.toNanos()) return;
-            if (force && lastFetchNanos - observed > 0) return;
-            refreshNodeList();
+            if (force && lastFetchStartedNanos - observed >= 0) return;
+            if (force && lastRefreshEnded) {
+                // Minimum interval between forced refreshes, measured from
+                // the end of the last refresh (successful or not). A caller
+                // that found the gate free and a refresh finished within
+                // the window reuses it: its list is the freshest discovery
+                // will hand out at this rate. A caller that waited behind
+                // an older refresh cannot (that one began before its
+                // failure), so its follow-up starts once the window has
+                // passed, and the callers queued behind it then find a
+                // refresh that started after their failure and share it.
+                long waitNanos = FORCED_REFRESH_MIN_INTERVAL.toNanos() - (System.nanoTime() - lastRefreshEndNanos);
+                if (waitNanos > 0) {
+                    if (!waited) return;
+                    try {
+                        TimeUnit.NANOSECONDS.sleep(waitNanos);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    if (closed) return;
+                }
+            }
+            lastFetchStartedNanos = System.nanoTime();
+            try {
+                refreshNodeList();
+            } finally {
+                lastRefreshEndNanos = System.nanoTime();
+                lastRefreshEnded = true;
+            }
+        } finally {
+            refreshLock.unlock();
         }
     }
 

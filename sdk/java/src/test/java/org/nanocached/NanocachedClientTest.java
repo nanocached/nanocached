@@ -8500,7 +8500,11 @@ class NanocachedClientTest {
     void concurrentCallersOnADeadNodeShareOneForcedRefresh() throws Exception {
         // Four callers that find their node dead at the same time used to
         // run four full refreshes one after another behind refreshLock,
-        // the last caller waiting through all of them.
+        // the last caller waiting through all of them. They now share: a
+        // caller whose failure came after the first refresh began waits that
+        // one out and then joins a single follow-up that starts after the
+        // minimum interval (issue #1582), so there are at most two
+        // refreshes, never one per caller.
         try (Cluster cluster = startCluster(1)) {
             try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
                 String key = keyOwnedBy(NAMES.get(0));
@@ -8521,12 +8525,91 @@ class NanocachedClientTest {
                     }
                     for (Future<Long> caller : elapsed) {
                         long millis = caller.get(10, java.util.concurrent.TimeUnit.SECONDS);
-                        assertTrue(millis < 1_000, "a caller waited " + millis + "ms (serialized refreshes?)");
+                        assertTrue(millis < 1_500, "a caller waited " + millis + "ms (serialized refreshes?)");
                     }
                 } finally {
                     callers.shutdownNow();
                 }
-                assertEquals(2, cluster.discovery().connectionCount.get(), "one shared refresh");
+                int refreshes = cluster.discovery().connectionCount.get() - 1;
+                assertTrue(refreshes >= 1 && refreshes <= 2, "shared refreshes, not one per caller: " + refreshes);
+            }
+        }
+    }
+
+    // ── forced refreshes: start time and minimum interval (issue #1582) ──
+
+    /** Two nodes at R=1 with the first one stopped and discovery still listing
+     * it (its liveness window): a key it owns fails on every attempt and
+     * forces a refresh that installs the same list again. Returns the key;
+     * the caller reads the number of node-list fetches from {@code
+     * cluster.discovery().connectionCount - 1}. */
+    private static String stopPrimaryOfAKey(Cluster cluster) throws Exception {
+        String key = keyOwnedBy(NAMES.get(0));
+        cluster.nodes().get(NAMES.get(0)).close();
+        return key;
+    }
+
+    @Test
+    void forcedRefreshesAreRateLimitedForASequentialCallerOnADeadPrimary() throws Exception {
+        // A caller failing against a dead primary over and over opened one
+        // discovery connection per failed operation.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = stopPrimaryOfAKey(cluster);
+                int before = cluster.discovery().connectionCount.get();
+                for (int i = 0; i < 40; i++) {
+                    assertThrows(NanocachedException.class, () -> client.set(key, "v"));
+                }
+                int fetches = cluster.discovery().connectionCount.get() - before;
+                assertTrue(fetches <= 2, "discovery saw " + fetches + " node-list fetches for 40 failed operations");
+            }
+        }
+    }
+
+    @Test
+    void aForcedRefreshRunsAgainOnceTheMinimumIntervalHasPassed() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = stopPrimaryOfAKey(cluster);
+                assertThrows(NanocachedException.class, () -> client.set(key, "v"));
+                int afterFirst = cluster.discovery().connectionCount.get();
+
+                Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 100);
+                assertThrows(NanocachedException.class, () -> client.set(key, "v"));
+
+                assertEquals(afterFirst + 1, cluster.discovery().connectionCount.get(),
+                        "one more fetch once the window has passed");
+            }
+        }
+    }
+
+    @Test
+    void aForcedRefreshDoesNotReuseARefreshThatStartedBeforeItsFailure() throws Exception {
+        // A refresh already in flight when an operation fails had read
+        // discovery's list before the failure, so it may still name the node
+        // that failed and the operation's one retry would go straight back to
+        // it. The failing caller waits it out and runs a refresh of its own.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = stopPrimaryOfAKey(cluster);
+                cluster.discovery().laterListDelayMillis = 400;
+                Method maybeRefresh = NanocachedClient.class.getDeclaredMethod("maybeRefresh", boolean.class);
+                maybeRefresh.setAccessible(true);
+                Thread inFlight = new Thread(() -> {
+                    try {
+                        maybeRefresh.invoke(client, true);
+                    } catch (ReflectiveOperationException e) {
+                        throw new AssertionError(e);
+                    }
+                });
+                inFlight.start();
+                waitFor(() -> cluster.discovery().connectionCount.get() == 2, "the first refresh to reach discovery");
+
+                assertThrows(NanocachedException.class, () -> client.set(key, "v"));
+                inFlight.join(10_000);
+
+                assertEquals(3, cluster.discovery().connectionCount.get(),
+                        "the bootstrap fetch, the refresh in flight and the caller's own refresh");
             }
         }
     }
