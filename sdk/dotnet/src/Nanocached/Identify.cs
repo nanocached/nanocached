@@ -172,8 +172,14 @@ internal static class Identify
         }
         catch (OperationCanceledException) when (deadline.IsCancellationRequested)
         {
+            // A dial that timed out sent no request, the same as a refused
+            // one (OpenNodeConnectionAsync marks those): marked not-sent so
+            // the non-idempotent retry paths refresh and reroute instead of
+            // reading it as a lost reply. The bootstrap and refresh dials
+            // cache this very object in the reconnect cooldown.
             throw new ConnectionLostException(
-                $"nanocached: connecting to {host}:{port} timed out after {ConnectDeadline.TotalSeconds}s");
+                $"nanocached: connecting to {host}:{port} timed out after {ConnectDeadline.TotalSeconds}s",
+                requestNotSent: true);
         }
     }
 
