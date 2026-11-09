@@ -4815,7 +4815,13 @@ public final class NanocachedClient implements AutoCloseable {
      * applied it, and resending the whole operation, possibly to that
      * very same primary if discovery hasn't yet dropped it, risks
      * double-applying a non-idempotent op. So this must not retry it
-     * again; the caller sees {@code ConnectionLost} instead.
+     * again; the caller sees {@code ConnectionLost} instead. The one
+     * exception is a {@code ConnectionLost} that is {@link
+     * NanocachedException.ConnectionLost#notSent() notSent} -- a dial that
+     * failed, or a connection known dead before the frame was written
+     * (issue #1481): nothing reached the wire, so the refresh-and-retry
+     * cannot double-apply anything and routes around a dead primary as it
+     * does for set/get/delete.
      */
     private <T> T withWrongNodeRetry(java.util.function.Supplier<T> operation, boolean retryConnectionFailure) {
         try {
@@ -4825,7 +4831,9 @@ public final class NanocachedClient implements AutoCloseable {
             maybeRefresh(true);
             return operation.get();
         } catch (NanocachedException.ConnectionLost error) {
-            if (ring == null || !retryConnectionFailure) throw error;
+            // Without retryConnectionFailure only a request that provably
+            // never reached the wire (notSent) may be resent.
+            if (ring == null || (!retryConnectionFailure && !error.notSent())) throw error;
             maybeRefresh(true);
             return operation.get();
         }
@@ -4941,11 +4949,17 @@ public final class NanocachedClient implements AutoCloseable {
      */
     private <T> T applyReconnectingNonIdempotent(
             java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
+        // A failure to obtain the connection at all (a dial that failed, a
+        // member with no connection) is proof nothing was sent, so it is
+        // flagged notSent (see connectionNotSent) and surfaces without an
+        // immediate second dial: withWrongNodeRetry refreshes the node list
+        // and reroutes on it, exactly as it does for a touch (issue #1481).
+        Connection connection = connectionNotSent(source);
         try {
-            return op.apply(source.get());
+            return op.apply(connection);
         } catch (NanocachedException.ConnectionLost retryable) {
             if (!retryable.notSent()) throw retryable;
-            return op.apply(source.get());
+            return op.apply(connectionNotSent(source));
         }
     }
 
