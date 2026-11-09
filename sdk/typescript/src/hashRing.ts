@@ -167,13 +167,25 @@ function scoreParts(hiIn: number, loIn: number): void {
   partsLo = lo;
 }
 
+/** Orders two node names by their UTF-8 bytes, unsigned — the server's
+ * `str::cmp`. JavaScript's `<` on strings orders by UTF-16 code units
+ * instead, which differs for a supplementary-plane character (a surrogate
+ * pair, 0xD800..0xDFFF) against one in U+E000..U+FFFF: the surrogate sorts
+ * lower in UTF-16, but its four-byte UTF-8 form sorts above their
+ * three-byte one. Reached only on an exact score tie, so the allocation
+ * does not matter. */
+export function compareNodeNames(a: string, b: string): number {
+  return Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+}
+
 /** Whether candidate `a` ranks strictly ahead of `b` in owner order:
- * higher score first; ties toward the lexicographically smaller name — a
- * total order, so every implementation agrees. */
+ * higher score first; ties toward the lexicographically smaller name
+ * (compared as UTF-8 bytes) — a total order, so every implementation
+ * agrees. */
 function outranks(aHi: number, aLo: number, aNode: string, bHi: number, bLo: number, bNode: string): boolean {
   if (aHi !== bHi) return aHi > bHi;
   if (aLo !== bLo) return aLo > bLo;
-  return aNode < bNode;
+  return compareNodeNames(aNode, bNode) < 0;
 }
 
 // Above this many requested owners, `owners` sorts every node instead of
