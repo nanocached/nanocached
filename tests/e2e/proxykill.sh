@@ -36,3 +36,4 @@ echo "$load" | grep -q '"corrupt": 0' || { T "FAIL: corrupt"; fail=1; }
 echo "$load" | grep -q '"miss": 0' || { T "FAIL: load saw misses"; fail=1; }
 cleanup
 echo "=== RESULT run=$RUN fail=$fail"
+[ "$fail" = 0 ] || exit 1

@@ -39,7 +39,7 @@ t0=$(date +%s)
 docker stop -t 40 $P-a >/dev/null
 rc=$(docker inspect -f '{{.State.ExitCode}}' $P-a)
 T "leaver exited rc=$rc after $(( $(date +%s)-t0 ))s (want rc=0, well under 40s)"
-wait_members 2 $D 30
+wait_members 2 $D 30 || { echo "FAIL: membership did not drop 3 -> 2 within 30s of the leaver exiting"; fail=1; }
 T "waiting for the load to finish"
 tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did not finish in time"; fail=1; docker kill $P-load >/dev/null 2>&1; }
 load=$(docker logs $P-load 2>/dev/null | grep '^{"label"' | tail -1)

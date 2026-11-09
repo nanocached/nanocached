@@ -48,7 +48,7 @@ docker stop -t 30 $P-p1 >/dev/null &
 STOP=$!
 # how fast does Q drop the leaver?
 while :; do c=$(proxies 2>/dev/null | head -1 | sed -n 's/count=\([0-9]*\).*/\1/p'); [ "$c" = 1 ] && break
-  [ $(( ($(date +%s%N)-t0)/1000000000 )) -gt 30 ] && { T "TIMEOUT: Q still lists $c proxies"; break; }; sleep 0.3; done
+  [ $(( ($(date +%s%N)-t0)/1000000000 )) -gt 30 ] && { T "FAIL: Q still lists ${c:-?} proxies 30s after the SIGTERM (want 1: the immediate Z deregistration)"; fail=1; break; }; sleep 0.3; done
 T "Q roster at 1 after $(( ($(date +%s%N)-t0)/1000000 ))ms"
 wait $STOP
 rc=$(docker inspect -f '{{.State.ExitCode}}' $P-p1)
