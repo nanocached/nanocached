@@ -4498,7 +4498,11 @@ export class NanocachedClient {
     const current = this.target.kind === "cluster" ? this.target.members.get(name) : null;
     if (!current) {
       connection.close();
-      throw new NanocachedError(`nanocached: ${name} left the cluster while reconnecting`);
+      // Connection-classified like the "no open connection" case above: the
+      // request was never written, so the refresh-and-retry layer may
+      // reroute it (isConnectionError recognises this; a plain
+      // NanocachedError would fail even a never-sent incr/cas outright).
+      throw new ConnectionLostError(`nanocached: ${name} left the cluster while reconnecting`, { requestWasSent: false });
     }
     const currentConnection = current.connection;
     if (currentConnection === null || currentConnection.isClosed()) {
