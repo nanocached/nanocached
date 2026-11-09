@@ -25,6 +25,29 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: the decommission drain wrote a live entrant off for
+  30 s after one key was refused three times, and the re-replication pass
+  did the same to a target. The write-off was meant for a node that is down but
+  still listed, yet `send_handoff_set` also fails for any ack other than
+  `S`, so a live node that refused a single entry had every later key
+  bound for it left behind without a try. Only failures to reach the node
+  (dial, handshake, write, a closed or silent connection) now count toward
+  the write-off; a refused entry is left behind and the next one is
+  offered. The drain also checks that the entry still exists before it
+  consults the write-off, so keys deleted, expired or held only as dead
+  copies are no longer counted in `N entr(ies) could not be handed off`
+  (#1595).
+
+- `nanocached-node`: a replica that a leave or an eviction promoted to a
+  key's primary refused `INCR`, `CAS` and `CAS-delete` on that key with `W`
+  until it adopted the new ring, up to a heartbeat and longer while a join
+  was pending on it. A key the node's own ring granted at rank 2 was judged
+  by that ring alone, so the newer list discovery had already published,
+  which the client followed, was never consulted, and the refresh before
+  the `W` re-evaluated the same predicate. The published ring now makes
+  this node the primary there too; a node that is only a replica under it
+  still answers `W` (#1589).
+
 - `nanocached-proxy`: a source IP's in-flight byte share was forgotten as
   soon as its last connection ended, even while requests that connection
   had dispatched were still charged (a client write error ends the
