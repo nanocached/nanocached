@@ -1287,6 +1287,33 @@ impl Cache {
         }
     }
 
+    /// Drops every tombstone of `namespace`, whatever its age, crediting
+    /// the charges back: what `clear_all` does for all of them, for one
+    /// namespace. A clear has no counterpart of the tombstone (a copy read
+    /// before it can land after it, which the architecture page lists as
+    /// accepted), so a delete's tombstone outliving the clear would only
+    /// add a refusal — of the put-if-absent copy of a key written again
+    /// after the clear — not close that window. O(#tombstones) when there
+    /// are any, at most `MAX_HANDOFF_TOMBSTONES`; nothing when there are
+    /// none.
+    fn forget_tombstones_of(&mut self, namespace: &[u8]) {
+        if self.handoff_tombstones.is_empty() {
+            return;
+        }
+        let mut released = 0;
+        self.handoff_tombstones.retain(|key, _| {
+            if key.namespace[..] == *namespace {
+                released += tombstone_bytes(key);
+                false
+            } else {
+                true
+            }
+        });
+        self.used_bytes -= released;
+        self.tombstone_order
+            .retain(|(_, key)| key.namespace[..] != *namespace);
+    }
+
     /// Total entries across every namespace.
     #[cfg(test)]
     pub fn len(&self) -> usize {
@@ -2063,8 +2090,12 @@ impl Cache {
     /// `migrated` marks go with it (they live in the sub-map) — the values
     /// they referred to no longer exist, and a mark must never outlive its
     /// value (a later write under the same key would otherwise inherit it
-    /// and be swept, see `insert`).
+    /// and be swept, see `insert`). Its handoff tombstones go too, as
+    /// `clear_all` drops them (`forget_tombstones_of`).
     pub fn clear(&mut self, namespace: &[u8]) -> usize {
+        // A namespace that holds only tombstones has no slot (a sub-map
+        // exists while it holds an entry), so this goes before the lookup.
+        self.forget_tombstones_of(namespace);
         let Some(id) = self.namespaces.remove(namespace) else {
             return 0;
         };
@@ -3906,6 +3937,72 @@ mod tests {
         assert!(cache.namespaces.is_empty());
         assert_eq!(cache.marked, 0);
         assert_eq!(cache.get(&key(b"a")), None);
+    }
+
+    #[test]
+    fn clear_drops_the_namespaces_handoff_tombstones_and_their_bytes() {
+        let mut cache = Cache::new(UNBOUNDED);
+        let deleted_at = Instant::now();
+        let kept_entry = namespaced(b"other", b"live");
+        cache.set(kept_entry.clone(), Bytes::from_static(b"1"));
+        cache.set(namespaced(b"users", b"live"), Bytes::from_static(b"22"));
+        let kept_tombstones = [key(b"gone"), namespaced(b"other", b"gone")];
+        let cleared_tombstones = [
+            namespaced(b"users", b"gone"),
+            namespaced(b"users", b"gone-too"),
+            // A namespace with a tombstone and no entry has no slot.
+            namespaced(b"only-tombstones", b"gone"),
+        ];
+        for key in kept_tombstones.iter().chain(&cleared_tombstones) {
+            cache.handoff_delete_at(key, deleted_at);
+        }
+        assert_eq!(cache.handoff_tombstones.len(), 5);
+
+        assert_eq!(cache.clear(b"users"), 1);
+        assert_eq!(cache.clear(b"only-tombstones"), 0);
+
+        // Only the tombstones of the other namespaces are left, in both
+        // containers, and `used_bytes` is what the survivors are charged.
+        assert_eq!(cache.handoff_tombstones.len(), 2);
+        assert_eq!(cache.tombstone_order.len(), 2);
+        for key in &kept_tombstones {
+            assert!(cache.tombstoned_at(key, deleted_at));
+        }
+        for key in &cleared_tombstones {
+            assert!(!cache.tombstoned_at(key, deleted_at));
+        }
+        let expected = (4 + 1 + ENTRY_OVERHEAD_BYTES)
+            + name_charge(b"other")
+            + kept_tombstones.iter().map(tombstone_bytes).sum::<usize>();
+        assert_eq!(cache.used_bytes, expected);
+
+        // The key a clear emptied can be copied in put-if-absent again.
+        assert!(matches!(
+            cache.handoff_set_if_absent(
+                &cleared_tombstones[0],
+                Bytes::from_static(b"again"),
+                None,
+                false
+            ),
+            CasResult::Stored
+        ));
+        // The kept ones still refuse.
+        assert!(matches!(
+            cache.handoff_set_if_absent(&kept_tombstones[1], Bytes::from_static(b"x"), None, false),
+            CasResult::Mismatch
+        ));
+
+        // The survivors expire and are credited back as before.
+        cache.sweep_at(deleted_at + HANDOFF_TOMBSTONE_TTL, true, None);
+        assert!(cache.handoff_tombstones.is_empty());
+        assert!(cache.tombstone_order.is_empty());
+        assert_eq!(
+            cache.used_bytes,
+            (4 + 1 + ENTRY_OVERHEAD_BYTES)
+                + (4 + 5 + ENTRY_OVERHEAD_BYTES)
+                + name_charge(b"other")
+                + name_charge(b"users")
+        );
     }
 
     #[test]
