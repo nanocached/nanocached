@@ -61,6 +61,12 @@ framework adapters at one version, whether or not a component changed.
   header while its body may still be arriving, and closing a socket with
   unread bytes sends a reset that could discard the `Ed\n` before the
   client read it (#1458).
+- `nanocached-node`: `--port 0` together with `--discovery` was accepted.
+  The node registered port 0, which discovery refuses, so it served on the
+  port the kernel gave it but never joined, and the only sign was a
+  rejected registration logged on every retry. The combination now exits
+  at start-up with a message saying that the node must register the port
+  it listens on. `--port 0` without `--discovery` is unchanged (#1492).
 - `nanocached-node` (built with `--features trace`, the nightly chaos
   build): a peer token whose ninth byte fell inside a multi-byte
   character panicked the handoff trace line, which cut the token at eight
