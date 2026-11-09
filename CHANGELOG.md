@@ -186,6 +186,14 @@ framework adapters at one version, whether or not a component changed.
   holding its connection permit and its per-IP permit. The half-close is
   now inside the window, so the whole drain ends after one second at the
   latest (#1483).
+- `nanocached-node`: a write forwarded to a joiner or an entrant (`S`/`s`
+  or `U`) kept the relative TTL it had when it was made, however long it
+  then waited in the forward queue behind a slow target (up to 10 s per
+  attempt). The target held the value, or an already expired short-lived
+  counter, for that long past the primary's expiry. The TTL is now what is
+  left at the moment of each send; one that ran out while the write waited
+  goes out as `0`, which expires the copy at once and still replaces an
+  older value the target held (#1534).
 - `nanocached-node`: a re-replication pass superseded by a second eviction
   no longer forgets the first eviction's keys. The new pass healed only the
   owners the second change promoted, so the keys the first change promoted
