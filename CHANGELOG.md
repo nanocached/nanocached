@@ -25,6 +25,15 @@ framework adapters at one version, whether or not a component changed.
   from the budget plus 30 s, to cover a receiver that stops answering)
   (#1605).
 
+- Docs: the SDKs page listed "transparent reconnect with a single retry" as
+  behaviour common to all six SDKs. It now says what each SDK does when a
+  request loses its connection: in cluster mode every SDK retries once after
+  a node-list refresh; in single-node and proxy mode Go, Rust, Java and .NET
+  redial and retry once, while Python (both modes) and TypeScript
+  (single-node mode) fail the call and redial on the next one. The Python
+  and TypeScript READMEs said the same of every mode and are corrected
+  (#1604).
+
 - `nanocached-proxy`: `NANOCACHED_SECRET`, the name the proxy read before
   node, discovery and the docs agreed on `NANOCACHED_AUTH_SECRET`, is no
   longer read. A proxy with only the old name set (and non-empty) now
@@ -35,6 +44,83 @@ framework adapters at one version, whether or not a component changed.
   before upgrading.
 
 ### Fixed
+
+- `nanocached-discovery`: a pause of the discovery process longer than a
+  join's migration timeout (a stop-the-world of a minute or more, `SIGSTOP`,
+  a paused VM) abandoned the join on the first sweep after it resumed, as
+  `migration timeout`, though the nodes had not been given any time to
+  answer. The sweep already gave every node and proxy a fresh liveness
+  window after such a pause; the join's migration timeout now does not count
+  the time discovery was not running either, so the join carries on and the
+  joining node is not sent back to start over (#1617).
+
+- `nanocached-discovery`: a node restarted on the same address while its
+  old name was still a member (within the liveness timeout of a `kill -9`)
+  stalled its own join and ran the handoff twice. The old name stayed in
+  the roster, so the join's `M` for it went to the new process, which
+  refused it (`membership token mismatch`); the live members completed
+  their handoff, and the join waited until the old name was evicted,
+  was abandoned (`ready member evicted mid-join`) and started again from
+  scratch. A `J` under a new name from the address a `Joined` member holds
+  now drops the old name at once, as an eviction would: it leaves the
+  roster, is recorded as departed, and is no longer waited for by a join
+  in flight (#1616).
+
+- `nanocached-proxy`: the replica write of an `i` (INCR) result could be
+  over the node's 1 MiB request limit and poison the connection every client
+  of the proxy shares. The proxy turns the node's `I <value> <ttl>` into an
+  `S` for the replicas, which carries the value (up to 20 digits) and the
+  TTL where the client's `i` carried only a delta, so an `i` at the client
+  frame limit gave a replica `S` the node refused (`request is too large`, a
+  bare `En` and a close); the requests of other clients already written on
+  the connection then failed with an unknown outcome. An `i` whose namespace
+  and key exceed 1,048,512 bytes is now refused at its header, before the
+  primary applies it, and a backend frame that would be over the node's
+  limit once tagged is never written: it fails as not sent and the
+  connection is left alone (#1590).
+
+- `nanocached-proxy`: a discovery server with no node registered (a fresh
+  process, or one the nodes had stopped heartbeating to) answers `L` with
+  `N 0 R`, and the proxy counted that as a successful fetch. Listed first in
+  `--discovery`, it won the race on every refresh, so the proxy published an
+  empty ring, dropped every backend connection slot and answered every
+  request `B` while the next server held the full roster. An empty roster is
+  now a failed fetch, like `B`: the race moves on to the other servers, and if
+  every server is empty the proxy keeps the ring it has (#1591).
+
+- `nanocached-node` (built with the `trace` feature, which the released
+  images are not): TRACE lines were written to stderr with a blocking
+  `eprintln!` on the request path, so a log pipe nobody was reading (a
+  collector under pressure) stopped the whole node once it was full: with
+  stderr unread, a standalone node answered 571 traced sets and then no
+  request at all, traced or not. The lines now go through a bounded queue
+  to a writer thread; those that do not fit are dropped and counted, a
+  `TRACE dropped lines=<n>` line reports them in the stream and at
+  shutdown, and `incrtrace.py` leaves its value-from-nowhere assertion at 0
+  for logs that contain one (#1623).
+
+- `nanocached-node`: the decommission drain wrote a live entrant off for
+  30 s after one key was refused three times, and the re-replication pass
+  did the same to a target. The write-off was meant for a node that is down but
+  still listed, yet `send_handoff_set` also fails for any ack other than
+  `S`, so a live node that refused a single entry had every later key
+  bound for it left behind without a try. Only failures to reach the node
+  (dial, handshake, write, a closed or silent connection) now count toward
+  the write-off; a refused entry is left behind and the next one is
+  offered. The drain also checks that the entry still exists before it
+  consults the write-off, so keys deleted, expired or held only as dead
+  copies are no longer counted in `N entr(ies) could not be handed off`
+  (#1595).
+
+- `nanocached-node`: a replica that a leave or an eviction promoted to a
+  key's primary refused `INCR`, `CAS` and `CAS-delete` on that key with `W`
+  until it adopted the new ring, up to a heartbeat and longer while a join
+  was pending on it. A key the node's own ring granted at rank 2 was judged
+  by that ring alone, so the newer list discovery had already published,
+  which the client followed, was never consulted, and the refresh before
+  the `W` re-evaluated the same predicate. The published ring now makes
+  this node the primary there too; a node that is only a replica under it
+  still answers `W` (#1589).
 
 - `nanocached-proxy`: a source IP's in-flight byte share was forgotten as
   soon as its last connection ended, even while requests that connection
@@ -228,6 +314,16 @@ framework adapters at one version, whether or not a component changed.
   left at the moment of each send; one that ran out while the write waited
   goes out as `0`, which expires the copy at once and still replaces an
   older value the target held (#1534).
+- `nanocached-node`: the starting rings a re-replication pass takes over
+  from the passes it superseded had no bound and no de-duplication. Every
+  pass aborted before it finished added one ring, and a pass checks each
+  key against each of them (an ownership test and a ranking per ring), so a
+  run of ring changes faster than the passes complete made every pass
+  slower than the last, and less likely to finish, while all the rings were
+  held. Rings with the same members are now kept once, and beyond eight the
+  two oldest are folded into one that keeps the sender condition and
+  targets every other owner of the key; the cost is a repeated put-if-absent
+  to an owner that already has the key (#1606).
 - `nanocached-node`: a re-replication pass superseded by a second eviction
   no longer forgets the first eviction's keys. The new pass healed only the
   owners the second change promoted, so the keys the first change promoted

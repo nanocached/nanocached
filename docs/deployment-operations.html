@@ -171,10 +171,13 @@ plain connection and 40&nbsp;s with both TLS and a secret. A receiver that
 refuses the connection fails at once, but one that stops answering without
 closing it (a suspended process, a saturated host) can stretch the leave
 past the budget by that one attempt. A
-receiver that fails all three attempts on a key (a node that is down but
-still listed by discovery) is written off for 30&nbsp;s: its remaining
-keys are left behind without further attempts, so the keys bound for the
-live nodes still get the budget. The node logs the entries it could not
+receiver that cannot be reached on all three attempts at a key (a node that
+is down but still listed by discovery) is written off for 30&nbsp;s: its
+remaining keys are left behind without further attempts, so the keys bound
+for the live nodes still get the budget. A receiver that answers and
+refuses an entry is not written off: that entry is left behind and the
+receiver is offered the next. Entries deleted or expired by their turn are
+not counted as left behind. The node logs the entries it could not
 hand off and exits 0. The discovery servers are told of the leave at the
 same time, and the notification gets what is left of the budget. If the
 handoff used the budget up, it still gets 2&nbsp;s, which comes on top of
