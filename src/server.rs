@@ -1391,8 +1391,10 @@ struct NodeContext {
     request_tx: mpsc::Sender<CacheRequest>,
     /// Issue #124: set for the whole decommission (drain-out handoff +
     /// grace) — `leave_target_for` forwards concurrent writes through
-    /// it, the `M` handler rejects new joins while it is set, and
-    /// `/readyz` reports not-ready.
+    /// it, the `M` handler rejects new joins while it is set, and the
+    /// ownership reclaim pass stands down. `/readyz` does not read it: a
+    /// draining node keeps serving reads until it exits, so it stays
+    /// ready and the load balancer keeps it in rotation.
     leaving: Arc<Mutex<Option<LeaveState>>>,
     /// A re-replication's forwarding window — the writes this node must
     /// mirror to the owners an eviction newly promoted, during the pass
