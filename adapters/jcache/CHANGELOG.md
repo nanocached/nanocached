@@ -13,6 +13,10 @@ changed. What 1.0.0 will promise is described on the
 
 - **Breaking:** a `nanocached.*` property the provider does not read (for example a mistyped `nanocached.tsl`) is now a `CacheException` naming it, where it used to be ignored: a mistyped TLS key left TLS off and sent the secret in the clear. Properties outside the `nanocached.` prefix are still left alone. The check runs on every `getCacheManager` call, including one that returns the existing manager for the same URI and class loader (whose properties are otherwise ignored, as JSR-107 allows). (#1457)
 
+### Fixed
+
+- `put`, `putAll`, `replace(K, V)` and `remove(K)` threw `CacheException` ("failed to deserialize cache value") after the write had already landed when the key's previous value could not be deserialized any more (a changed `serialVersionUID`, a class removed by a redeploy, a serial-filter rejection): the old value was decoded as an argument to the listener event, before the event machinery checked for listeners, and `putAll` stopped between its expiry groups, leaving the later groups unwritten. The previous value is now decoded only when a listener is registered, and if it cannot be decoded the event fires without an old value; the write succeeds. `getAndPut`, `getAndReplace`, `getAndRemove`, `replace(K, V, V)` and `remove(K, V)` still throw, since their result depends on the old value. (#1485)
+
 ## [0.6.2] - 2026-11-03
 
 No changes. Version aligned with the rest of the project: every release

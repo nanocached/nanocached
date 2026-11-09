@@ -1397,6 +1397,122 @@ class NanocachedCacheTest {
         assertNull(manager.getCache("widgets"));
     }
 
+    // ── undecodable previous value (issue #1485) ────────────────────
+
+    /** Bytes that are not a serialized object, standing in for a value
+     * written by a class that no longer deserializes. */
+    private void storeUndecodable(String cacheName, String key) {
+        node.store(cacheName)
+                .put(
+                        java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes(key)),
+                        new MockNode.Entry(new byte[] {1, 2, 3}, 60L));
+    }
+
+    private List<String> listen(Cache<String, String> target) {
+        List<String> events = new CopyOnWriteArrayList<>();
+        target.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(new RecordingListener<String, String>(events)), null, true, true));
+        return events;
+    }
+
+    @Test
+    void putOverUndecodableBytesSucceedsWithoutAListener() {
+        storeUndecodable("widgets", "k");
+        cache.put("k", "new");
+        assertEquals("new", cache.get("k"));
+    }
+
+    @Test
+    void putOverUndecodableBytesSucceedsAndFiresWithoutAnOldValue() {
+        storeUndecodable("widgets", "k");
+        List<String> events = listen(cache);
+        cache.put("k", "new");
+        assertEquals("new", cache.get("k"));
+        assertEquals(List.of("UPDATED:k:new:old=?"), events);
+    }
+
+    private static final class UpdateDiffersPolicy implements ExpiryPolicy, java.io.Serializable {
+        @Override
+        public Duration getExpiryForCreation() {
+            return new Duration(java.util.concurrent.TimeUnit.SECONDS, 100);
+        }
+
+        @Override
+        public Duration getExpiryForAccess() {
+            return null;
+        }
+
+        @Override
+        public Duration getExpiryForUpdate() {
+            return new Duration(java.util.concurrent.TimeUnit.SECONDS, 200);
+        }
+    }
+
+    @Test
+    void putAllOverUndecodableBytesWritesEveryGroup() {
+        // Update and creation resolve to different TTLs, so putAll writes
+        // two groups: the update group used to throw before the creation
+        // group was written.
+        for (boolean withListener : new boolean[] {false, true}) {
+            String name = "putall-undecodable-" + withListener;
+            Cache<String, String> target = cacheOf(name, new UpdateDiffersPolicy(), Map.of());
+            storeUndecodable(name, "a");
+            List<String> events = withListener ? listen(target) : null;
+
+            target.putAll(new java.util.LinkedHashMap<>(Map.of("a", "1")) {{ put("b", "2"); }});
+
+            assertEquals("1", target.get("a"));
+            assertEquals("2", target.get("b"));
+            if (withListener) {
+                assertEquals(List.of("UPDATED:a:1:old=?", "CREATED:b:2"), events);
+            }
+        }
+    }
+
+    @Test
+    void zeroTtlReplaceAndPutOverUndecodableBytesSucceed() {
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        config.setExpiryPolicyFactory(ModifiedExpiryPolicy.factoryOf(Duration.ZERO));
+        for (boolean withListener : new boolean[] {false, true}) {
+            String name = "zero-undecodable-" + withListener;
+            Cache<String, String> zeroCache = manager.createCache(name, config);
+            List<String> events = withListener ? listen(zeroCache) : null;
+
+            storeUndecodable(name, "r");
+            assertTrue(zeroCache.replace("r", "x"));
+            assertNull(zeroCache.get("r"));
+
+            storeUndecodable(name, "p");
+            zeroCache.put("p", "x");
+            assertNull(node.entry(name, KeyCodec.toKeyBytes("p")));
+
+            storeUndecodable(name, "a");
+            zeroCache.putAll(Map.of("a", "x"));
+            assertNull(node.entry(name, KeyCodec.toKeyBytes("a")));
+
+            if (withListener) {
+                assertEquals(3, events.size());
+                for (String event : events) {
+                    assertTrue(event.startsWith("REMOVED:") && event.endsWith(":old=?"), event);
+                }
+            }
+        }
+    }
+
+    @Test
+    void removeOverUndecodableBytesSucceeds() {
+        storeUndecodable("widgets", "k");
+        assertTrue(cache.remove("k"));
+        assertNull(cache.get("k"));
+
+        storeUndecodable("widgets", "k");
+        List<String> events = listen(cache);
+        assertTrue(cache.remove("k"));
+        assertNull(cache.get("k"));
+        assertEquals(List.of("REMOVED:k:old=?"), events);
+    }
+
     private static final class OnlyKeyAFilter<K, V> implements CacheEntryEventFilter<K, V>, java.io.Serializable {
         @Override
         public boolean evaluate(CacheEntryEvent<? extends K, ? extends V> event) {

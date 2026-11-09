@@ -127,7 +127,12 @@ users.removeAll();                                    // maps to CLEAR
   Never another client/JVM's changes to the same namespace, and never
   `EXPIRED` (server-side TTL expiry isn't observable). The 2-argument
   `replace(K,V)` fires `Updated` with the old value unavailable (a single
-  CAS round trip, not a read-then-write); `removeAll()` fires no
+  CAS round trip, not a read-then-write). When the previous value of a
+  `put`, `putAll`, `replace(K,V)` or `remove(K)` can no longer be
+  deserialized (a changed `serialVersionUID`, a class removed by a
+  redeploy, a serial-filter rejection), the write still succeeds and the
+  event fires without an old value; the bytes are decoded only when a
+  listener is registered. `removeAll()` fires no
   per-entry events at all and behaves exactly like `clear()` —
   enumerating what a bulk `CLEAR` removed would need a client-side key
   registry this adapter does not keep.
