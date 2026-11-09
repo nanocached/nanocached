@@ -157,7 +157,9 @@ the "uncompressed" marker by chance — a silently wrong read). There is no
 dual-mode migration path: only turn this on for a fresh keyspace, or only
 after every client touching an existing one has upgraded and enabled it
 together. Incompressible data (already-compressed media, random bytes) is
-passed through unchanged rather than bloated.
+passed through unchanged rather than bloated. The request size limit applies
+to the key and value as passed in, before compression: a pair exactly at the
+limit is accepted, and the marker byte does not count against it.
 
 **Incompatible with `incr`/`decr`**: a `compress`-enabled
 client rejects `incr`/`decr` outright with `CompressionIncompatibleError`

@@ -533,6 +533,60 @@ describe("NanocachedClient value compression (value compression)", () => {
     }
   });
 
+  it("sends a key+value exactly at the cap: the cap is on the value before the marker byte is added (issue #1546)", async () => {
+    const { MAX_REQUEST_BYTES } = await import("../src/protocol.js");
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+      });
+      try {
+        const atCap = randomBytes(MAX_REQUEST_BYTES - 1); // key "z" + value = MAX_REQUEST_BYTES; incompressible
+        await client.set("z", atCap);
+        assert.deepEqual(Buffer.from(await client.getBytes("z") as Uint8Array), atCap);
+
+        // One byte more is still refused, before any I/O.
+        await assert.rejects(client.set("y", Buffer.concat([atCap, Buffer.from([0])])), RangeError);
+        assert.equal(node.store.has("y"), false);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("setManyBytes with an at-cap value stores the whole batch rather than throwing after a sub-frame was stored (issue #1546)", async () => {
+    const { MAX_REQUEST_BYTES } = await import("../src/protocol.js");
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+      });
+      try {
+        const atCap = randomBytes(MAX_REQUEST_BYTES - 1);
+        await client.setManyBytes({ a: Buffer.from("1"), b: Buffer.from("2"), z: atCap });
+        assert.deepEqual(Buffer.from(await client.getBytes("a") as Uint8Array), Buffer.from("1"));
+        assert.deepEqual(Buffer.from(await client.getBytes("b") as Uint8Array), Buffer.from("2"));
+        assert.deepEqual(Buffer.from(await client.getBytes("z") as Uint8Array), atCap);
+
+        // A pair over the cap fails the eager check, with nothing of the batch stored.
+        node.store.clear();
+        await assert.rejects(
+          client.setManyBytes({ a: Buffer.from("1"), b: Buffer.from("2"), z: Buffer.concat([atCap, Buffer.from([0])]) }),
+          RangeError,
+        );
+        assert.equal(node.store.size, 0);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("leaves a value below compressionThreshold unmarked-but-prefixed on the wire", async () => {
     const node = await startMockNode();
     try {
