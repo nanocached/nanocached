@@ -87,6 +87,35 @@ public class ForcedRefreshTests
     }
 
     [Fact]
+    public async Task ARefreshThatThrowsStillStartsTheInterval()
+    {
+        var (client, discovery, nodeB, _) = await StartAsync();
+        using var _c = client;
+        using var _d = discovery;
+        using var _b = nodeB;
+
+        // Make the refresh throw before it reaches discovery.
+        FieldInfo addresses = typeof(NanocachedClient)
+            .GetField("_addresses", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        object? original = addresses.GetValue(client);
+        addresses.SetValue(client, null);
+        try
+        {
+            await Assert.ThrowsAsync<NullReferenceException>(() => StartForcedRefresh(client));
+        }
+        finally
+        {
+            addresses.SetValue(client, original);
+        }
+
+        // The next forced caller finds the gate free and a refresh that ended
+        // inside the interval, so it reuses it instead of fetching again.
+        int before = discovery.ConnectionCount;
+        await StartForcedRefresh(client);
+        Assert.Equal(before, discovery.ConnectionCount);
+    }
+
+    [Fact]
     public async Task AForcedRefreshDoesNotReuseOneThatBeganBeforeItsFailure()
     {
         var (client, discovery, nodeB, key) = await StartAsync();
