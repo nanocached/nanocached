@@ -47,6 +47,17 @@ framework adapters at one version, whether or not a component changed.
   header while its body may still be arriving, and closing a socket with
   unread bytes sends a reset that could discard the `Ed\n` before the
   client read it (#1458).
+- `nanocached-proxy`: when two roster names shared one address (a node
+  restarted on the same IP:port under a new name while its old entry was
+  still registered), an `o` batch put each key into that address's
+  sub-frame once per owner rank, so the frame carried every key and value
+  twice and could grow to twice the client's frame. Past about 512 KiB the
+  node answered `En` and closed, which poisoned the shared backend
+  connection for every other client and left the batch's keys answered
+  `W`, because the retry built the same frame. Each key is now filed once
+  per address, in the first pass and in the retry, keeping the primary
+  flag of its best-ranked owner; a `y` batch without `G` or an expiry
+  had the same duplicate and gets the same fix (#1486).
 
 ## [0.6.2] - 2026-11-03
 
