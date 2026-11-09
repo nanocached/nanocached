@@ -3526,6 +3526,50 @@ fn frame_multi_set(namespace: &[u8], keys: &[Bytes], values: &[Bytes], ttl: Opti
     frame.into()
 }
 
+/// Files one key's leg under an address group. A key's owners can share an
+/// address (two roster names on one IP:port, as when a node restarts under
+/// a new name while its old entry is still registered), so ranks 0 and 1
+/// of the same key land in one group; the node must be sent that key once,
+/// not once per rank. The caller files a key's ranks consecutively, best
+/// first, so a repeat is always the group's last leg — and the leg already
+/// there keeps its primary flag.
+fn push_leg(legs: &mut Vec<(usize, bool)>, position: usize, is_primary: bool) {
+    if legs.last().is_some_and(|&(last, _)| last == position) {
+        return;
+    }
+    legs.push((position, is_primary));
+}
+
+/// One address's share of an `o` batch: the address and its legs.
+type SetGroup = (String, Vec<(usize, bool)>);
+
+/// Files `positions` of an `o` batch under every owner address of each key:
+/// the positions that have no owner at all (an empty ring) and, per
+/// address, the `(position, is that address the key's primary)` legs to
+/// put in its sub-frame. Shared by the first dispatch and `retry_multi_set`.
+fn plan_multi_set(
+    ring: &RingView,
+    namespace: &[u8],
+    keys: &[Bytes],
+    positions: impl IntoIterator<Item = usize>,
+) -> (Vec<usize>, Vec<SetGroup>) {
+    let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(ring);
+    let mut missing = Vec::new();
+    let mut top = Vec::new();
+    let namespace_hash = NamespaceHash::of(namespace);
+    for position in positions {
+        ring.rank_owners(namespace_hash, &keys[position], ring.replication, &mut top);
+        if top.is_empty() {
+            missing.push(position);
+            continue;
+        }
+        for (rank, &(_, owner)) in top.iter().enumerate() {
+            push_leg(groups.group_for(owner), position, rank == 0);
+        }
+    }
+    (missing, groups.into_named())
+}
+
 /// Issue #871: one `y` sub-frame per involved owner address and role — see
 /// `plan_multi_touch`. No `ttl` asks the node to remove the TTL; `get` adds
 /// the `G` token.
@@ -4619,28 +4663,13 @@ async fn dispatch_request(
             values,
             ttl,
         } => {
-            let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(&ring);
-            let mut missing = Vec::new();
-            let mut top = Vec::new();
-            let namespace_hash = NamespaceHash::of(&namespace);
-
-            for (position, key) in keys.iter().enumerate() {
-                ring.rank_owners(namespace_hash, key, ring.replication, &mut top);
-                if top.is_empty() {
-                    missing.push(position);
-                    continue;
-                }
-                for (rank, &(_, owner)) in top.iter().enumerate() {
-                    groups.group_for(owner).push((position, rank == 0));
-                }
-            }
+            let (missing, groups) = plan_multi_set(&ring, &namespace, &keys, 0..keys.len());
 
             if groups.is_empty() {
                 let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
                 return result_rx;
             }
 
-            let groups = groups.into_named();
             let requests = groups.iter().map(|(owner, legs)| {
                 let group_keys: Vec<Bytes> = legs
                     .iter()
@@ -5262,21 +5291,10 @@ async fn retry_multi_set(
         return;
     };
 
-    let mut groups: AddrGroups<Vec<(usize, bool)>> = AddrGroups::new(&ring);
-    let mut top = Vec::new();
-    let namespace_hash = NamespaceHash::of(namespace);
-    for &position in retry_positions {
-        let key = &keys[position];
-        ring.rank_owners(namespace_hash, key, ring.replication, &mut top);
-        if top.is_empty() {
-            entries[position] = Some(ProxyAckEntry::WrongNode);
-            continue;
-        }
-        for (rank, &(_, owner)) in top.iter().enumerate() {
-            groups.group_for(owner).push((position, rank == 0));
-        }
+    let (missing, groups) = plan_multi_set(&ring, namespace, keys, retry_positions.iter().copied());
+    for position in missing {
+        entries[position] = Some(ProxyAckEntry::WrongNode);
     }
-    let groups = groups.into_named();
 
     // Issue #177: same concurrent fan-out as `retry_multi_get` above.
     let requests = groups.iter().map(|(owner, legs)| {
@@ -5372,7 +5390,7 @@ fn plan_multi_touch(
             if get && rank == 0 {
                 primaries.group_for(owner).push((position, true));
             } else {
-                plain.group_for(owner).push((position, rank == 0));
+                push_leg(plain.group_for(owner), position, rank == 0);
             }
         }
     }
@@ -7480,8 +7498,11 @@ where
     R: AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let _ = write_half.shutdown().await;
+    // The half-close is inside the window too: over TLS it first flushes
+    // the pending records, which blocks for as long as a peer that has
+    // stopped reading keeps the send buffer full.
     let drain = async {
+        let _ = write_half.shutdown().await;
         let mut sink = [0_u8; 8192];
         let mut discarded = 0;
         while discarded < MAX_REQUEST_SIZE {
@@ -9486,6 +9507,44 @@ mod tests {
         assert_eq!(started.elapsed(), UPSTREAM_IO_TIMEOUT);
     }
 
+    // A write half whose half-close never completes, as a TLS stream's does
+    // while the peer has stopped reading and the send buffer is full.
+    struct StuckShutdown;
+
+    impl tokio::io::AsyncWrite for StuckShutdown {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_rejected_request_drain_is_bounded_even_when_the_half_close_never_completes() {
+        // `_client` stays open and silent, so the read side never ends either.
+        let (_client, mut server) = tokio::io::duplex(64);
+        let mut write_half = StuckShutdown;
+        let started = Instant::now();
+        drain_rejected_request(&mut server, &mut write_half).await;
+        assert_eq!(started.elapsed(), REJECTED_REQUEST_DRAIN_WINDOW);
+    }
+
     #[test]
     fn a_client_frame_at_the_bound_is_still_within_the_nodes_limit_once_re_headed() {
         // The largest `S` the proxy accepts from an untagged client: header
@@ -10351,6 +10410,9 @@ mod tests {
         /// Issue #824: the `(ttl, get)` of every `t` this node received, in
         /// arrival order — shows which legs were sent `G` and which TTL.
         touches: TouchLog,
+        /// Issue #1486: how many pairs each `o` frame this node received
+        /// carried, in arrival order — a key sent twice in one frame shows.
+        multi_set_sizes: Arc<StdMutex<Vec<usize>>>,
         /// Issue #824: applies the next `t` that finds its key (a touch
         /// changes nothing the mock stores), then drops the connection
         /// instead of replying — the reply lost after the node executed
@@ -10416,6 +10478,7 @@ mod tests {
                 close_after_cas_set_apply_once: Arc::new(AtomicBool::new(false)),
                 close_after_cas_delete_apply_once: Arc::new(AtomicBool::new(false)),
                 touches: Arc::new(StdMutex::new(Vec::new())),
+                multi_set_sizes: Arc::new(StdMutex::new(Vec::new())),
                 close_after_touch_apply_once: Arc::new(AtomicBool::new(false)),
                 refuse_touches: Arc::new(StdMutex::new(std::collections::VecDeque::new())),
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
@@ -10442,6 +10505,7 @@ mod tests {
             let close_after_cas_delete_apply_once =
                 Arc::clone(&node.close_after_cas_delete_apply_once);
             let touches = Arc::clone(&node.touches);
+            let multi_set_sizes = Arc::clone(&node.multi_set_sizes);
             let close_after_touch_apply_once = Arc::clone(&node.close_after_touch_apply_once);
             let refuse_touches = Arc::clone(&node.refuse_touches);
             let delay = Arc::clone(&node.get_delay);
@@ -10478,6 +10542,7 @@ mod tests {
                                 &close_after_cas_delete_apply_once,
                             ),
                             touches: Arc::clone(&touches),
+                            multi_set_sizes: Arc::clone(&multi_set_sizes),
                             close_after_touch_apply_once: Arc::clone(&close_after_touch_apply_once),
                             refuse_touches: Arc::clone(&refuse_touches),
                             delay: Arc::clone(&delay),
@@ -10518,6 +10583,10 @@ mod tests {
             self.touches.lock().unwrap().clone()
         }
 
+        fn multi_set_sizes(&self) -> Vec<usize> {
+            self.multi_set_sizes.lock().unwrap().clone()
+        }
+
         fn entry(&self, namespace: &[u8], key: &[u8]) -> Option<Vec<u8>> {
             self.store
                 .lock()
@@ -10545,6 +10614,7 @@ mod tests {
         /// Issue #824: the `(ttl, get)` of every `t` this node received, in
         /// arrival order — shows which legs were sent `G` and which TTL.
         touches: TouchLog,
+        multi_set_sizes: Arc<StdMutex<Vec<usize>>>,
         /// Issue #824: applies the next `t` that finds its key (a touch
         /// changes nothing the mock stores), then drops the connection
         /// instead of replying — the reply lost after the node executed
@@ -10590,6 +10660,7 @@ mod tests {
             close_after_cas_set_apply_once,
             close_after_cas_delete_apply_once,
             touches,
+            multi_set_sizes,
             close_after_touch_apply_once,
             refuse_touches,
             delay,
@@ -10776,6 +10847,7 @@ mod tests {
                     "o" => {
                         let ns_length: usize = fields[0].parse().unwrap();
                         let count: usize = fields[1].parse().unwrap();
+                        multi_set_sizes.lock().unwrap().push(count);
                         let mut pairs = Vec::with_capacity(count);
                         for pair in 0..count {
                             let key_length: usize = fields[2 + pair * 2].parse().unwrap();
@@ -12561,6 +12633,103 @@ mod tests {
 
         stream.write_all(b"o 0 2 1 1 1 1\nabcd").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "O 2 S S");
+    }
+
+    // Issue #1486: two roster names on one address (a node restarted on the
+    // same IP:port under a new name while its old entry is still registered)
+    // are both owners of a key at R=2. The key goes to that address once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_set_sends_a_key_once_when_two_roster_names_share_an_address() {
+        let node = MockNode::start().await;
+        let roster = vec![
+            ("node-a".to_string(), node.addr.clone()),
+            ("node-b".to_string(), node.addr.clone()),
+        ];
+        let discovery = start_mock_discovery(roster, 2).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"o 0 2 1 1 1 1\nabcd").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "O 2 S S");
+        assert_eq!(node.multi_set_sizes(), vec![2], "each key once, not twice");
+        assert_eq!(node.entry(b"", b"a"), Some(b"b".to_vec()));
+        assert_eq!(node.entry(b"", b"c"), Some(b"d".to_vec()));
+
+        // The retry after a per-key `W` rebuilds the frame the same way.
+        node.multi_set_sizes.lock().unwrap().clear();
+        node.wrong_node_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"o 0 2 1 1 1 1\nefgh").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "O 2 S S");
+        assert_eq!(
+            node.multi_set_sizes(),
+            vec![2, 1],
+            "retry: only the refused key"
+        );
+    }
+
+    #[test]
+    fn batch_plans_file_a_key_once_per_address_even_when_names_share_one() {
+        // node-a and node-b share addr-1; replication 3 makes every key's
+        // top-3 the whole roster, so ranks hit addr-1 twice.
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), "addr-1".to_string()),
+                ("node-b".to_string(), "addr-1".to_string()),
+                ("node-c".to_string(), "addr-2".to_string()),
+            ],
+            3,
+        );
+        let keys: Vec<Bytes> = (0..8).map(|i| Bytes::from(format!("key-{i}"))).collect();
+
+        let (missing, groups) = plan_multi_set(&ring, b"", &keys, 0..keys.len());
+        assert!(missing.is_empty());
+        assert_eq!(groups.len(), 2);
+        for (addr, legs) in &groups {
+            let positions: Vec<usize> = legs.iter().map(|&(position, _)| position).collect();
+            assert_eq!(positions, (0..keys.len()).collect::<Vec<_>>(), "{addr}");
+        }
+        // The primary flag is the one the best-ranked name gave it.
+        let mut top = Vec::new();
+        for (position, key) in keys.iter().enumerate() {
+            ring.rank_owners(NamespaceHash::of(b""), key, 3, &mut top);
+            let primary_addr = ring.nodes[top[0].1].1.as_str();
+            for (addr, legs) in &groups {
+                let leg = legs.iter().find(|&&(p, _)| p == position).unwrap();
+                assert_eq!(leg.1, addr == primary_addr, "key {position} at {addr}");
+            }
+        }
+
+        // The same for a touch batch with no `G` and no expiry, where every
+        // owner's share is one plain group.
+        let (missing, touch_groups) =
+            plan_multi_touch(&ring, b"", &keys, 0..keys.len(), Some(30), false);
+        assert!(missing.is_empty());
+        for group in &touch_groups {
+            assert_eq!(group.legs.len(), keys.len(), "{}", group.addr);
+        }
+    }
+
+    #[test]
+    fn a_two_name_ring_on_one_address_sends_a_key_once_in_its_sub_frame() {
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), "addr-1".to_string()),
+                ("node-b".to_string(), "addr-1".to_string()),
+            ],
+            2,
+        );
+        let keys = [Bytes::from_static(b"k")];
+        let values = [Bytes::from_static(b"vv")];
+        let (_, groups) = plan_multi_set(&ring, b"ns", &keys, 0..1);
+        assert_eq!(groups.len(), 1);
+        let (addr, legs) = &groups[0];
+        assert_eq!(addr, "addr-1");
+        assert_eq!(legs, &vec![(0, true)]);
+        let group_keys: Vec<Bytes> = legs.iter().map(|&(p, _)| keys[p].clone()).collect();
+        let group_values: Vec<Bytes> = legs.iter().map(|&(p, _)| values[p].clone()).collect();
+        let frame = frame_multi_set(b"ns", &group_keys, &group_values, Some(5));
+        let expected = format!("o 2 1 1 2 5 {TAG_PLACEHOLDER}\nnskvv");
+        assert_eq!(&frame[..], expected.as_bytes());
     }
 
     #[tokio::test(flavor = "current_thread")]
