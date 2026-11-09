@@ -30132,8 +30132,7 @@ mod tests {
 
         run_rereplication(
             &node_context,
-            &before_ring,
-            &[],
+            &plain_baselines(&before_ring),
             &after_ring,
             replication,
             &addresses,
