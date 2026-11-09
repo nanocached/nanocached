@@ -113,7 +113,8 @@ so a serial INCR answer the oracle cannot explain (one more than the
 increments asked for) comes with the node-side timeline of that key in the
 run's logs instead of a count alone; fewer applications than acknowledged is
 printed only. With the node built without the feature the check prints that
-it found no `TRACE` lines and asserts nothing.
+it found no `TRACE` lines and asserts nothing. `incrtrace.py` itself failing (a non-zero exit, or a last line that is not its
+summary) fails the run instead of reading as "no `TRACE` lines" (#1618).
 
 Why `is` alone: a day of the nightly tracing `tn,cp,cc` (about 300,000 lines
 a cell) had eight of ten cells fail on oracles whose keys were not traced,
