@@ -2981,6 +2981,80 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
     }
   });
 
+  it("getMany and getManyAndTouch keep the wrong-node error when a resolved value is not valid UTF-8, leaving only that value out", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("a", "1");
+        await client.set("bin", new Uint8Array([0xff, 0xfe, 0x80]));
+        await client.set("c", "3");
+
+        for (const read of [
+          () => client.getMany(["a", "bin", "c"]),
+          () => client.getManyAndTouch(["a", "bin", "c"], 60),
+        ]) {
+          node.answerMultiWrongNodeTimes("a", 1);
+          try {
+            await read();
+            assert.fail("expected the read to reject");
+          } catch (error) {
+            assert.ok(error instanceof PartialWrongNodeError, `expected PartialWrongNodeError, got ${error}`);
+            const partial = (error as PartialWrongNodeError<Map<string, string>>).partialValues;
+            assert.equal(partial.get("c"), "3");
+            assert.ok(!partial.has("bin"), "the non-UTF-8 value must be left out, not decoded lossily");
+            assert.ok(!partial.has("a"));
+          }
+        }
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("getMany keeps PartialConnectionLostError when a resolved value is not valid UTF-8, leaving only that value out", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const count = 50;
+        const keySize = 25_000;
+        const keys: string[] = [];
+        for (let i = 0; i < count; i++) keys.push(`${"k".repeat(keySize)}-${i}`);
+        const values: Record<string, string> = {};
+        for (const key of keys) values[key] = `v-${key.slice(-3)}`;
+        await client.setMany(values);
+        await client.set(keys[0], new Uint8Array([0xff, 0xfe]));
+
+        const connection: any = (client as any).target.connection;
+        const originalMultiGet = connection.multiGet.bind(connection);
+        let calls = 0;
+        mock.method(connection, "multiGet", (...args: unknown[]) => {
+          calls++;
+          if (calls === 1) return originalMultiGet(...args);
+          return Promise.reject(new ConnectionLostError("nanocached: chunk 2 connection lost"));
+        });
+
+        try {
+          await client.getMany(keys);
+          assert.fail("expected getMany to reject");
+        } catch (error) {
+          assert.ok(error instanceof PartialConnectionLostError, `expected PartialConnectionLostError, got ${error}`);
+          const partial = (error as PartialConnectionLostError<Map<string, string>>).partialValues;
+          assert.ok(partial.size > 0 && partial.size < count);
+          assert.ok(!partial.has(keys[0]), "the non-UTF-8 value must be left out");
+          for (const [key, value] of partial) assert.equal(value, values[key]);
+        }
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("getManyBytes decompresses each value when compress is enabled (issue #294)", async () => {
     // Regression: getManyBytes' single/proxy-mode branch used to put the
     // raw, marker-prefixed wire bytes straight into the result map,
