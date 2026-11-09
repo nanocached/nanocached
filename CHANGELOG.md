@@ -47,6 +47,15 @@ framework adapters at one version, whether or not a component changed.
   header while its body may still be arriving, and closing a socket with
   unread bytes sends a reset that could discard the `Ed\n` before the
   client read it (#1458).
+- `nanocached-node`, `nanocached-proxy`, `nanocached-discovery`: after a
+  refused request, the drain that half-closes and reads what the client is
+  still sending was bounded by its one-second window only for the read;
+  the half-close itself was awaited outside it. Over TLS the half-close
+  first flushes the pending records, so a client that stopped reading
+  with the send buffer full parked the connection task there for good,
+  holding its connection permit and its per-IP permit. The half-close is
+  now inside the window, so the whole drain ends after one second at the
+  latest (#1483).
 
 ## [0.6.2] - 2026-11-03
 
