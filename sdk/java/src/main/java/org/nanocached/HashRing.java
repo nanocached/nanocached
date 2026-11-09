@@ -182,8 +182,22 @@ final class HashRing {
     // smaller name — a total order every implementation agrees on.
     private static final Comparator<Scored> ORDER = (a, b) -> {
         int byScore = Long.compareUnsigned(b.score(), a.score());
-        return byScore != 0 ? byScore : a.node().compareTo(b.node());
+        return byScore != 0 ? byScore : compareNames(a.node(), b.node());
     };
+
+    /**
+     * Orders node names by their UTF-8 bytes, unsigned — the server's
+     * {@code str::cmp} in {@code src/hash_ring.rs}. {@link
+     * String#compareTo} orders by UTF-16 code units instead, which differs
+     * for a supplementary-plane character against one in U+E000..U+FFFF (a
+     * surrogate, 0xD800..0xDFFF, sorts below those in UTF-16 but its
+     * four-byte UTF-8 form sorts above their three-byte one). Reached only
+     * on a score tie, so the allocation does not matter.
+     */
+    static int compareNames(String a, String b) {
+        return java.util.Arrays.compareUnsigned(
+                a.getBytes(StandardCharsets.UTF_8), b.getBytes(StandardCharsets.UTF_8));
+    }
 
     /** The key's primary — {@code owners(key, 1).get(0)}. */
     public String route(byte[] key) {
