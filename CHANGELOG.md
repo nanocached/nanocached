@@ -25,6 +25,19 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-discovery`: when the path between discovery and the whole
+  fleet was cut and healed after the first evictions but before the last
+  (the nodes' heartbeats fall at different phases of the 5 s interval, so
+  they cross the liveness window on different sweep ticks), the evicted
+  nodes were sent back through a join and emptied their caches: a node
+  still listed counted as one the cluster had moved on with, although it
+  had been cut off just the same and had taken nothing over. A member heard
+  from again after a gap of 9 s or more — at least one heartbeat did not
+  arrive — now counts as in unbroken contact only from that moment, so it
+  no longer makes the nodes evicted during the gap start over; they are
+  registered with their caches as when every node was evicted together. A
+  survivor whose heartbeat was merely late, by less than 9 s, still counts
+  as in contact throughout (#1479).
 - `nanocached-node`: clearing one namespace left the handoff tombstones of
   that namespace's keys in place, while clearing the whole store dropped
   them. The tombstones stayed charged to the memory bound for their

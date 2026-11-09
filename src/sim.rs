@@ -2265,6 +2265,125 @@ async fn nodes_silent_to_discovery_on_different_ticks_keep_their_caches() {
     );
 }
 
+/// What one run of the heal-between-evictions scenario saw.
+#[derive(Debug)]
+struct HealOutcome {
+    /// Nodes discovery still listed when the path healed: the ones that
+    /// were cut off just the same but had not crossed the liveness window
+    /// yet. Zero means every node was evicted before the heal, which is the
+    /// all-silent scenario above and not what this one checks.
+    still_listed: usize,
+    /// Copies (key, owner) the client wrote before the cut.
+    copies: usize,
+    /// Of those, the ones an owner no longer answers with the value after
+    /// the heal and the two minutes that follow.
+    lost: usize,
+}
+
+/// Runs until discovery lists fewer than `members` nodes.
+async fn run_until_members_below(dport: u16, members: usize) {
+    let mut waited = Duration::ZERO;
+    while roster(dport).await.len() >= members {
+        assert!(
+            waited < Duration::from_secs(60),
+            "discovery never listed fewer than {members} members"
+        );
+        run_for(Duration::from_millis(250)).await;
+        waited += Duration::from_millis(250);
+    }
+}
+
+/// Issue #1479, the other shape of #1311: the path between every node and
+/// discovery is cut at about the same time, so the nodes' last heartbeats
+/// differ by at most a heartbeat interval (A's and B's just before the cut,
+/// C's one interval later) and they cross the liveness window on
+/// different sweep ticks. The path heals once two of the three are evicted,
+/// while the last is still listed. That one was cut off just the same — it
+/// saw no roster without the evicted nodes and took nothing over — so the
+/// evicted nodes must not be sent back through a join either: every copy
+/// survives. Two evicted, not one, because with R=2 a single evicted node
+/// is refilled from the other owner when it rejoins and nothing is lost;
+/// the keys both evicted nodes own have no other copy.
+async fn scenario_heal_between_evictions() -> HealOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pc) = (Port::reserve(), Port::reserve(), Port::reserve());
+    let c = pc.number;
+    let keys: Vec<String> = (0..40).map(|i| format!("z{i}")).collect();
+    let Trio {
+        dport,
+        disc,
+        a,
+        b,
+        names,
+        nodes: [na, nb, nc],
+        mut client,
+    } = trio(&mut dp, &mut pa, &mut pb, &mut pc, &keys).await;
+    let ports = [a, b, c];
+    let ring3 = HashRing::new(names.to_vec());
+
+    // The three heartbeats share a phase of the 5 s interval (`trio` starts
+    // the nodes whole intervals apart). A and B are held just after one
+    // heartbeat, C after the next: its last heartbeat is one interval
+    // younger, so with the sweep ticking every 3.75 s it is evicted a tick
+    // or two after them.
+    let heartbeat_phase = na.started;
+    while (tokio::time::Instant::now() - heartbeat_phase).as_millis() % 5000 != 500 {
+        run_for(Duration::from_millis(250)).await;
+    }
+    na.gates.heartbeat.hold();
+    nb.gates.heartbeat.hold();
+    run_for(Duration::from_secs(5)).await;
+    nc.gates.heartbeat.hold();
+    // The first two evictions; the path heals at once, before C's.
+    run_until_members_below(dport, 2).await;
+    let still_listed = roster(dport).await.len();
+    na.gates.heartbeat.release();
+    nb.gates.heartbeat.release();
+    nc.gates.heartbeat.release();
+    run_for(Duration::from_secs(120)).await;
+    run_until_members(dport, 3).await;
+
+    let mut out = HealOutcome {
+        still_listed,
+        copies: 0,
+        lost: 0,
+    };
+    for key in &keys {
+        for owner in ring3.owners(&Key::unnamespaced(Bytes::from(key.clone())), 2) {
+            let port = ports[names.iter().position(|n| n == owner).unwrap()];
+            out.copies += 1;
+            if client.value(port, key).await.as_deref() != Some("v1") {
+                out.lost += 1;
+            }
+        }
+    }
+    disc.abort();
+    na.abort();
+    nb.abort();
+    nc.abort();
+    out
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn nodes_evicted_before_the_rest_of_a_silent_fleet_keep_their_caches_when_the_path_heals_in_between()
+ {
+    let _spin = spin();
+    let out = scenario_heal_between_evictions().await;
+    eprintln!("{out:?}");
+    assert!(out.copies > 0, "nothing to check: {out:?}");
+    assert!(
+        out.still_listed > 0,
+        "every node was evicted before the heal, so this is the all-silent case: {out:?}"
+    );
+    assert_eq!(
+        out.lost, 0,
+        "a node evicted while the rest of the silent fleet was still listed emptied its cache: {out:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // A node asked to leave while another node's join is still pending.
 // ---------------------------------------------------------------------
