@@ -74,6 +74,17 @@ framework adapters at one version, whether or not a component changed.
   header while its body may still be arriving, and closing a socket with
   unread bytes sends a reset that could discard the `Ed\n` before the
   client read it (#1458).
+- `nanocached-proxy`: a request's in-flight bytes were held by the reply
+  queued for its client, so when the client's writer ended early (a write
+  error or timeout) the queue was dropped and every queued request's
+  charge was released while its driver, and the frames waiting in the
+  backend queues, still held the same keys and values. A client that
+  pipelined many large writes and reset its connection after the first
+  reply let new connections admit more than `--max-in-flight-bytes`
+  allows, by up to the 256 frames each backend queue holds. The driver
+  now holds a share of the charge too, and the bytes are free once both
+  the reply has been written (or dropped) and the driver has finished
+  (#1488).
 - `nanocached-proxy`: a node refuses a request it will not run (an old
   node that does not know a command the proxy sent, or a frame over its
   size limit) with the untagged `En\n` and then closes the connection, but

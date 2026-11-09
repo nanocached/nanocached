@@ -4395,6 +4395,26 @@ enum Fatal {
 
 type DriverResult = Result<Vec<u8>, Fatal>;
 
+/// The sending half of a dispatched request's result, held by the driver
+/// that completes it. It also holds a share of the request's in-flight
+/// charge (issue #1488): the driver's frames, keys and values stay alive
+/// until it has settled the request, and the connection's writer may be
+/// gone before that (a failed or timed-out write drops the queue behind
+/// it), so the charge cannot be owned by the queued reply alone. The share
+/// goes when the result is sent (or the driver is dropped without sending);
+/// the queued reply's share goes when its response has been written or
+/// dropped, and the bytes are free once both are.
+struct DriverTx {
+    result: oneshot::Sender<DriverResult>,
+    _charge: Arc<InFlightCharge>,
+}
+
+impl DriverTx {
+    fn send(self, result: DriverResult) -> Result<(), DriverResult> {
+        self.result.send(result)
+    }
+}
+
 /// Issue #125: on a connection whose client declared the retryable-error
 /// capability (`A ... R`), an upstream failure that would otherwise be
 /// the fatal `E`-and-close becomes a per-request `R` (+tag) and the
@@ -4453,12 +4473,17 @@ async fn dispatch_request(
     request: Request,
     tag: Option<u32>,
     retry_capable: bool,
+    charge: Arc<InFlightCharge>,
 ) -> oneshot::Receiver<DriverResult> {
     context
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let (result_tx, result_rx) = oneshot::channel();
+    let (result, result_rx) = oneshot::channel();
+    let result_tx = DriverTx {
+        result,
+        _charge: charge,
+    };
 
     let Some(ring) = current_ring(&context) else {
         // No roster yet: `R` for a retry-capable client (tagged — this
@@ -6320,7 +6345,7 @@ async fn dispatch_primary_evaluated(
     request: PrimaryRequest,
     tag: Option<u32>,
     retry_capable: bool,
-    result_tx: oneshot::Sender<DriverResult>,
+    result_tx: DriverTx,
 ) {
     let PrimaryRequest {
         namespace,
@@ -6777,7 +6802,9 @@ fn shrink_to_contents(buf: &mut BytesMut) {
 /// that reply has been written.
 struct ClientReply {
     result: oneshot::Receiver<DriverResult>,
-    charge: Option<InFlightCharge>,
+    /// Shared with the request's driver (`DriverTx`), so the bytes stay
+    /// charged while either still needs them.
+    charge: Option<Arc<InFlightCharge>>,
 }
 
 impl ClientReply {
@@ -6983,10 +7010,15 @@ async fn handle_client(
                         .await
                         .is_err()
                     {
+                        // The queue behind this reply is dropped with its
+                        // charges' shares; a request that is still being
+                        // served keeps the share its driver holds
+                        // (`DriverTx`) until the driver finishes.
                         return write_half;
                     }
                     // Written and about to be dropped: the bytes this
-                    // request was charged are free again.
+                    // request was charged are free again, unless its
+                    // driver is still working on it.
                     drop(response);
                     drop(charge);
                 }
@@ -7196,8 +7228,15 @@ async fn handle_client(
                     // Dispatch inline (awaiting the ordered backend
                     // enqueues) before parsing the next request — see
                     // `dispatch_request` on why order matters here.
-                    let result =
-                        dispatch_request(Arc::clone(&context), request, tag, retry_capable).await;
+                    let charge = Arc::new(charge);
+                    let result = dispatch_request(
+                        Arc::clone(&context),
+                        request,
+                        tag,
+                        retry_capable,
+                        Arc::clone(&charge),
+                    )
+                    .await;
                     if fifo_tx
                         .send(ClientReply {
                             result,
@@ -9045,6 +9084,68 @@ mod tests {
         )
         .await;
         (node, proxy, context)
+    }
+
+    // Issue #1488: a request's in-flight bytes are held by what is still
+    // working on it, not only by the reply queued for its client. A write
+    // error to a client that went away ends its writer and drops the queue
+    // behind it; the requests already dispatched are still at the node, and
+    // their keys and values still pinned, so their bytes stay charged until
+    // the drivers finish.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dispatched_requests_bytes_stay_charged_after_its_client_writer_ends() {
+        let node = MockNode::start().await;
+        node.store
+            .lock()
+            .unwrap()
+            .insert((Vec::new(), b"k".to_vec()), b"v".to_vec());
+        *node.get_delay.lock().unwrap() = Duration::from_millis(300);
+        let roster = vec![("node".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let (proxy, _drain, _context, budget) = start_proxy_observed(
+            &discovery,
+            None,
+            test_limits(8),
+            None,
+            Arc::new(SharedBackends::new()),
+        )
+        .await;
+        let total = budget.bytes;
+        assert_eq!(budget.permits.available_permits(), total);
+
+        // Two pipelined reads on one connection. The node answers them in
+        // order: the first after 300 ms, the second 1.5 s after that.
+        let (mut client, _buf) = connect_and_auth(&proxy).await;
+        client.write_all(b"G 1\nkG 1\nk").await.unwrap();
+        sleep(Duration::from_millis(50)).await;
+        *node.get_delay.lock().unwrap() = Duration::from_millis(1500);
+        assert!(
+            budget.permits.available_permits() <= total - 2 * MAX_REQUEST_SIZE,
+            "both reads should be charged"
+        );
+
+        // The client resets the connection, so the writer's write of the
+        // first reply fails and the writer ends with the second still at
+        // the node.
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(client);
+        sleep(Duration::from_millis(700)).await;
+        let held = total - budget.permits.available_permits();
+        assert!(
+            held >= MAX_REQUEST_SIZE,
+            "the read still at the node must stay charged, but only {held} bytes are held"
+        );
+
+        // Once the node has answered it, everything is free again.
+        let freed = timeout(Duration::from_secs(5), async {
+            while budget.permits.available_permits() != total {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(freed.is_ok(), "the charge was never released");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11509,6 +11610,25 @@ mod tests {
         announce: Option<ProxyIdentity>,
         backends: Arc<SharedBackends>,
     ) -> (String, watch::Sender<bool>, Arc<ProxyContext>) {
+        let (addr, drain, context, _) =
+            start_proxy_observed(discovery_addr, secret, limits, announce, backends).await;
+        (addr, drain, context)
+    }
+
+    /// `start_proxy_full`, also handing back the proxy-wide in-flight
+    /// budget so a test can read how many bytes are held.
+    async fn start_proxy_observed(
+        discovery_addr: &str,
+        secret: Option<&str>,
+        limits: ConnectionLimits,
+        announce: Option<ProxyIdentity>,
+        backends: Arc<SharedBackends>,
+    ) -> (
+        String,
+        watch::Sender<bool>,
+        Arc<ProxyContext>,
+        InFlightBudget,
+    ) {
         let (ring_tx, ring_rx) = watch::channel(None);
         let (refresh_tx, refresh_rx) = mpsc::channel(16);
         let (drain_tx, drain_rx) = watch::channel(false);
@@ -11539,6 +11659,8 @@ mod tests {
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let in_flight = InFlightAdmission::new(&limits);
+        let proxy_budget = in_flight.proxy.clone();
         tokio::spawn(serve(
             listener,
             Arc::clone(&context),
@@ -11547,7 +11669,7 @@ mod tests {
                 permits: Arc::new(Semaphore::new(limits.max_connections)),
                 per_ip_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 max_connections_per_ip: limits.max_connections_per_ip,
-                in_flight: InFlightAdmission::new(&limits),
+                in_flight,
             },
             Duration::from_secs(5),
         ));
@@ -11558,7 +11680,7 @@ mod tests {
         while ring.borrow().is_none() {
             ring.changed().await.unwrap();
         }
-        (addr, drain_tx, context)
+        (addr, drain_tx, context, proxy_budget)
     }
 
     async fn start_proxy(
