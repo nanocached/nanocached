@@ -14,6 +14,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the SDKs page listed "transparent reconnect with a single retry" as
+  behaviour common to all six SDKs. It now says what each SDK does when a
+  request loses its connection: in cluster mode every SDK retries once after
+  a node-list refresh; in single-node and proxy mode Go, Rust, Java and .NET
+  redial and retry once, while Python (both modes) and TypeScript
+  (single-node mode) fail the call and redial on the next one. The Python
+  and TypeScript READMEs said the same of every mode and are corrected
+  (#1604).
+
 - `nanocached-proxy`: `NANOCACHED_SECRET`, the name the proxy read before
   node, discovery and the docs agreed on `NANOCACHED_AUTH_SECRET`, is no
   longer read. A proxy with only the old name set (and non-empty) now
