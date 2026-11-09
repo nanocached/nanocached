@@ -3151,7 +3151,7 @@ async fn start_join(
     token: String,
     connection_id: u64,
 ) -> Result<Arc<Notify>, JoinRejection> {
-    let promoted = {
+    let (promoted, replaced) = {
         let mut guard = lock(registry);
         if guard
             .get(name)
@@ -3269,6 +3269,31 @@ async fn start_join(
         }
 
         let newly_registered = !guard.contains_key(name);
+        // Issue #1616: a new name registering from the address of a
+        // `Joined` member is that node restarted (a process on the same
+        // ip:port cannot be the old one), and its old name is as gone as if
+        // it had missed its heartbeats: it is dropped now rather than a
+        // liveness timeout later. Left in, the join's `M` to the old name
+        // went to the new process, which refused it, and the join waited
+        // for the eviction, was abandoned for the evicted member and ran
+        // the handoff again.
+        let replaced: Vec<String> = if newly_registered {
+            guard
+                .iter()
+                .filter(|(_, info)| info.state == NodeState::Joined && info.address == address)
+                .map(|(old, _)| old.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for old in &replaced {
+            guard.remove(old);
+            record_departed(registry, old);
+            eprintln!(
+                "WARN node replaced: {old} (the new node {name} registered at its address \
+                 {address})"
+            );
+        }
         if newly_registered {
             log_registration(format_args!(
                 "INFO node registered: {name} at {address} (waiting to join)"
@@ -3303,7 +3328,7 @@ async fn start_join(
         // Issue #356: a `Waiting` entry appearing (or moving address) is
         // invisible to `L`/`H` but not to `T`'s every-state roster —
         // bumped here, still under `guard`, per `bump_roster`'s invariant.
-        if newly_registered || address_changed {
+        if newly_registered || address_changed || !replaced.is_empty() {
             bump_roster(registry);
         }
         // Issue #3/#9: unconditionally overwritten on every accepted `J`
@@ -3312,8 +3337,36 @@ async fn start_join(
         // accepted connection as the owner, never a stale one. See
         // `NodeInfo::owner_connection_id`.
         info.owner_connection_id = connection_id;
-        Arc::clone(&info.promoted)
+        (Arc::clone(&info.promoted), replaced)
     };
+
+    // The replaced members are no longer part of a join in flight either:
+    // one that has not reported `C` never will. `handle_complete` no longer
+    // takes a report in its name, and the join is finished if it was the
+    // last one it waited for.
+    if !replaced.is_empty() {
+        let finished = {
+            let mut join_guard = lock_current_join(current_join);
+            match join_guard.as_mut() {
+                Some(pending) => {
+                    for old in &replaced {
+                        if !pending.completed.contains(old) {
+                            pending.expected.remove(old);
+                        }
+                    }
+                    if pending.completed.len() >= pending.expected.len() {
+                        join_guard.take().map(|pending| pending.joining_name)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        if let Some(joining_name) = finished {
+            promote_to_joined(registry, &joining_name);
+        }
+    }
 
     try_begin_next_join(
         registry,
@@ -8866,6 +8919,138 @@ mod tests {
 
         // Rejected outright: the node must not have been registered.
         assert!(!lock(&registry).contains_key("joining-node"));
+    }
+
+    /// Issue #1616: a node restarted on the address its old name still holds
+    /// as a `Joined` member. The old name used to stay in the roster until
+    /// its heartbeats timed out, and the join's `M` to it reached the new
+    /// process, which refused it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_node_restarted_on_a_members_address_replaces_the_old_name_at_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-old".to_string(),
+            NodeInfo::new(address.clone(), NodeState::Joined, "tk-old".to_string()),
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+
+        start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "node-new",
+            address.clone(),
+            "tk-new".to_string(),
+            1,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the restarted node is accepted"));
+
+        assert!(
+            !lock(&registry).contains_key("node-old"),
+            "the old name is still a member"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "a handoff was asked of the address that is the joining node itself"
+        );
+        // With nobody left to hand off from, the node is promoted at once.
+        assert_eq!(
+            lock(&registry).get("node-new").map(|info| info.state),
+            Some(NodeState::Joined)
+        );
+        assert!(
+            registry
+                .departed
+                .lock()
+                .unwrap()
+                .departed_at("node-old")
+                .is_some()
+        );
+        assert!(lock_current_join(&current_join).is_none());
+    }
+
+    /// Issue #1616: a join in flight no longer waits for the replaced name's
+    /// `C`; when that was the last one, the join is finished.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_replaced_member_is_dropped_from_the_join_in_flight() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-old".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-old".to_string(),
+            ),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-b".to_string(),
+            ),
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-old".to_string(), "tk-old".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+            generation: 1,
+        })));
+
+        start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "node-new",
+            "127.0.0.1:1".to_string(),
+            "tk-new".to_string(),
+            2,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the restarted node is accepted"));
+
+        assert!(!lock(&registry).contains_key("node-old"));
+        assert_eq!(
+            lock(&registry).get("node-b").map(|info| info.state),
+            Some(NodeState::Joined),
+            "the join kept waiting for a handoff report that cannot come"
+        );
+        // A report in the replaced name is refused from here on.
+        assert!(
+            !handle_complete(
+                &registry,
+                &current_join,
+                "node-old",
+                "node-b",
+                "tk-old",
+                None
+            )
+            .await
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
