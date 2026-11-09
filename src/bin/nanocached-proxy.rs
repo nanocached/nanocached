@@ -162,7 +162,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -6259,17 +6259,42 @@ impl PrimaryCommand {
 
 /// Hands a successful result to the replicas, then returns the client's
 /// answer — the replica legs are awaited so a client that reads its own
-/// write through a replica isn't racing them.
+/// write through a replica isn't racing them. `owners` is the key's owner
+/// list, primary first.
+///
+/// The result goes to each distinct address other than the primary's. Two
+/// roster names can share one address (a node restarted at the same
+/// address while its old name has not yet timed out), so the ring can rank
+/// that address as both primary and replica: the result sent to it again
+/// would arrive as a later, unordered `Set`/`Delete` at the node that just
+/// evaluated the command, and overwrite what a concurrent writer left
+/// there since.
 async fn answer_after_fan_out(
     context: &ProxyContext,
-    replicas: &[String],
+    owners: &[String],
     response: Vec<u8>,
     replicate: Option<ReplicaResult>,
 ) -> Vec<u8> {
     if let Some(result) = replicate {
-        fan_out_to_replicas(context, replicas, result.frame, result.expect, result.what).await;
+        let replicas = replica_addresses(owners);
+        fan_out_to_replicas(context, &replicas, result.frame, result.expect, result.what).await;
     }
     response
+}
+
+/// The addresses of `owners` (primary first) that are neither the
+/// primary's nor listed twice, in ring order.
+fn replica_addresses(owners: &[String]) -> Vec<String> {
+    let Some((primary, replicas)) = owners.split_first() else {
+        return Vec::new();
+    };
+    let mut distinct: Vec<String> = Vec::with_capacity(replicas.len());
+    for addr in replicas {
+        if addr != primary && !distinct.contains(addr) {
+            distinct.push(addr.clone());
+        }
+    }
+    distinct
 }
 
 /// A primary-evaluated command's completion: the primary's ordered reply
@@ -6297,7 +6322,7 @@ async fn finish_primary_evaluated(
             PrimaryVerdict::Answer {
                 response,
                 replicate,
-            } => Ok(answer_after_fan_out(context, &owners[1..], response, replicate).await),
+            } => Ok(answer_after_fan_out(context, &owners, response, replicate).await),
             PrimaryVerdict::WrongNode => {
                 force_refresh(context).await;
                 refan_primary_evaluated(context, command, address, tag, retry_capable).await
@@ -6330,7 +6355,7 @@ async fn refan_primary_evaluated(
         return Err(Fatal::Transient);
     };
     let owners = ring.owners(namespace, key);
-    let Some((primary, replicas)) = owners.split_first() else {
+    let Some(primary) = owners.first() else {
         return Ok(transient_reply(retry_capable, tag));
     };
     match context
@@ -6347,7 +6372,7 @@ async fn refan_primary_evaluated(
             PrimaryVerdict::Answer {
                 response,
                 replicate,
-            } => Ok(answer_after_fan_out(context, replicas, response, replicate).await),
+            } => Ok(answer_after_fan_out(context, &owners, response, replicate).await),
             PrimaryVerdict::WrongNode | PrimaryVerdict::Unexpected => Err(Fatal::Transient),
         },
         // `call_non_idempotent` already re-sent a frame that provably never
@@ -6531,6 +6556,25 @@ fn secrets_match(a: &[u8], b: &[u8]) -> bool {
 struct InFlightBudget {
     permits: Arc<Semaphore>,
     bytes: usize,
+    /// The source IP's budgets this one belongs to, when it is a share of
+    /// one (`IpBudgets`): every permit it hands out keeps them alive.
+    owner: Weak<IpBudgets>,
+}
+
+/// Bytes reserved on an `InFlightBudget`, released on drop. A permit of a
+/// source IP's share also keeps that IP's `IpBudgets` registered (see
+/// there): its connection may be gone while a request it dispatched is
+/// still charged.
+struct BudgetPermit {
+    permit: tokio::sync::OwnedSemaphorePermit,
+    _owner: Option<Arc<IpBudgets>>,
+}
+
+impl BudgetPermit {
+    /// Folds a further permit of the same budget into this one.
+    fn merge(&mut self, more: BudgetPermit) {
+        self.permit.merge(more.permit);
+    }
 }
 
 impl InFlightBudget {
@@ -6538,31 +6582,41 @@ impl InFlightBudget {
         Self {
             permits: Arc::new(Semaphore::new(bytes)),
             bytes,
+            owner: Weak::new(),
         }
     }
 
     /// Waits until `cost` bytes (clamped to the budget) are free and
     /// reserves them. `None` only if the semaphore was closed, which
     /// nothing does.
-    async fn charge(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    async fn charge(&self, cost: usize) -> Option<BudgetPermit> {
         self.charge_exact(self.clamp(cost)).await
     }
 
-    async fn charge_exact(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    async fn charge_exact(&self, cost: usize) -> Option<BudgetPermit> {
         let permits = u32::try_from(cost).unwrap_or(u32::MAX);
-        Arc::clone(&self.permits)
+        let permit = Arc::clone(&self.permits)
             .acquire_many_owned(permits)
             .await
-            .ok()
+            .ok()?;
+        Some(self.permit(permit))
     }
 
     /// `charge` without the wait: reserves `cost` bytes (clamped to the
     /// budget) if they are free right now, else nothing.
-    fn try_charge(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    fn try_charge(&self, cost: usize) -> Option<BudgetPermit> {
         let permits = u32::try_from(self.clamp(cost)).unwrap_or(u32::MAX);
-        Arc::clone(&self.permits)
+        let permit = Arc::clone(&self.permits)
             .try_acquire_many_owned(permits)
-            .ok()
+            .ok()?;
+        Some(self.permit(permit))
+    }
+
+    fn permit(&self, permit: tokio::sync::OwnedSemaphorePermit) -> BudgetPermit {
+        BudgetPermit {
+            permit,
+            _owner: self.owner.upgrade(),
+        }
     }
 
     /// The most one holder can charge: a cost above the budget takes all
@@ -6578,9 +6632,37 @@ impl InFlightBudget {
 /// budget and, of the same size, its share of the parked-frame pool
 /// (what its connections hold while their requests wait for admission;
 /// see `admit_request`).
+///
+/// An entry lives as long as anything holds its budgets: a connection's
+/// share, or a permit charged on them. A connection whose writer exited
+/// early is gone while the requests it dispatched are still charged, and
+/// the next connection of that IP must find the same budgets with those
+/// charges on them, not a fresh full share.
 struct IpBudgets {
     in_flight: InFlightBudget,
     parked: InFlightBudget,
+    shares: IpBudgetsRegistry,
+    ip: std::net::IpAddr,
+}
+
+type IpBudgetsRegistry = Arc<std::sync::Mutex<HashMap<std::net::IpAddr, Weak<IpBudgets>>>>;
+
+impl Drop for IpBudgets {
+    /// Forgets the IP once its last holder is gone, so the map does not
+    /// grow with every address that ever connected. A connection that
+    /// arrived in between has already replaced the dead entry.
+    fn drop(&mut self) {
+        let mut shares = self
+            .shares
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if shares
+            .get(&self.ip)
+            .is_some_and(|entry| entry.strong_count() == 0)
+        {
+            shares.remove(&self.ip);
+        }
+    }
 }
 
 /// The proxy-wide in-flight budget's per-source-IP shares: one
@@ -6592,7 +6674,7 @@ struct IpBudgets {
 /// proxy-wide queue ahead of other sources.
 #[derive(Clone)]
 struct IpInFlightShares {
-    budgets: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, Arc<IpBudgets>>>>,
+    budgets: IpBudgetsRegistry,
     share_bytes: usize,
 }
 
@@ -6610,41 +6692,32 @@ impl IpInFlightShares {
             .budgets
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let budget = Arc::clone(budgets.entry(ip).or_insert_with(|| {
-            Arc::new(IpBudgets {
-                in_flight: InFlightBudget::new(self.share_bytes),
-                parked: InFlightBudget::new(self.share_bytes),
-            })
-        }));
+        // An entry whose holders are all gone but whose `Drop` has not
+        // taken the lock yet no longer upgrades: it is replaced here.
+        let budget = budgets.get(&ip).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let budget = Arc::new_cyclic(|owner| IpBudgets {
+                in_flight: InFlightBudget {
+                    owner: owner.clone(),
+                    ..InFlightBudget::new(self.share_bytes)
+                },
+                parked: InFlightBudget {
+                    owner: owner.clone(),
+                    ..InFlightBudget::new(self.share_bytes)
+                },
+                shares: Arc::clone(&self.budgets),
+                ip,
+            });
+            budgets.insert(ip, Arc::downgrade(&budget));
+            budget
+        });
         drop(budgets);
-        IpInFlightShare {
-            shares: Arc::clone(&self.budgets),
-            ip,
-            budgets: budget,
-        }
+        IpInFlightShare { budgets: budget }
     }
 }
 
-/// One connection's hold on its source IP's share; removes the IP's
-/// entry on drop when no other connection of that IP still holds it, so
-/// the map does not grow with every address that ever connected.
+/// One connection's hold on its source IP's budgets (`IpBudgets`).
 struct IpInFlightShare {
-    shares: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, Arc<IpBudgets>>>>,
-    ip: std::net::IpAddr,
     budgets: Arc<IpBudgets>,
-}
-
-impl Drop for IpInFlightShare {
-    fn drop(&mut self) {
-        let mut budgets = self
-            .shares
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // The map's own reference and this one: nobody else holds it.
-        if Arc::strong_count(&self.budgets) <= 2 {
-            budgets.remove(&self.ip);
-        }
-    }
 }
 
 /// What `serve` builds the in-flight budgets of each accepted connection
@@ -6849,9 +6922,9 @@ impl ClientReply {
 /// The per-connection, per-source-IP and proxy-wide reservations of one
 /// request, in the order they were taken.
 struct InFlightCharge {
-    _connection: tokio::sync::OwnedSemaphorePermit,
-    _ip: tokio::sync::OwnedSemaphorePermit,
-    _proxy: tokio::sync::OwnedSemaphorePermit,
+    _connection: BudgetPermit,
+    _ip: BudgetPermit,
+    _proxy: BudgetPermit,
 }
 
 impl InFlightCharge {
@@ -9130,7 +9203,7 @@ mod tests {
         *node.get_delay.lock().unwrap() = Duration::from_millis(300);
         let roster = vec![("node".to_string(), node.addr.clone())];
         let discovery = start_mock_discovery(roster, 1).await;
-        let (proxy, _drain, _context, budget) = start_proxy_observed(
+        let (proxy, _drain, _context, budget, _) = start_proxy_observed(
             &discovery,
             None,
             test_limits(8),
@@ -9174,6 +9247,69 @@ mod tests {
         })
         .await;
         assert!(freed.is_ok(), "the charge was never released");
+    }
+
+    // A source IP's share outlives its last connection for as long as a
+    // request that connection dispatched is still charged. Otherwise a
+    // client that sends reads and resets repeatedly is handed a fresh full
+    // share by each new connection while the earlier ones' requests are
+    // still held by a slow node, and can hold more than one share.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_source_ips_share_stays_charged_for_requests_left_by_its_closed_connection() {
+        let node = MockNode::start().await;
+        node.store
+            .lock()
+            .unwrap()
+            .insert((Vec::new(), b"k".to_vec()), b"v".to_vec());
+        *node.get_delay.lock().unwrap() = Duration::from_millis(300);
+        let roster = vec![("node".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let (proxy, _drain, _context, _budget, shares) = start_proxy_observed(
+            &discovery,
+            None,
+            test_limits(8),
+            None,
+            Arc::new(SharedBackends::new()),
+        )
+        .await;
+        let localhost: std::net::IpAddr = std::net::Ipv4Addr::LOCALHOST.into();
+        let share = shares.share_bytes;
+
+        // Two pipelined reads; the node answers the first after 300 ms and
+        // the second 1.5 s after it was asked.
+        let (mut client, _buf) = connect_and_auth(&proxy).await;
+        client.write_all(b"G 1\nkG 1\nk").await.unwrap();
+        sleep(Duration::from_millis(50)).await;
+        *node.get_delay.lock().unwrap() = Duration::from_millis(1500);
+
+        // The client resets, the writer fails on the first reply and the
+        // connection ends with the second read still at the node.
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(client);
+        sleep(Duration::from_millis(700)).await;
+
+        // The next connection of that IP finds the read charged.
+        let next = shares.acquire(localhost);
+        let held = share - next.budgets.in_flight.permits.available_permits();
+        assert!(
+            held >= MAX_REQUEST_SIZE,
+            "the read still at the node must stay charged to the IP, but only {held} bytes are"
+        );
+        drop(next);
+
+        // Once the node has answered it, the share is whole again and the
+        // IP is forgotten.
+        let freed = timeout(Duration::from_secs(5), async {
+            while !shares.budgets.lock().unwrap().is_empty() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(freed.is_ok(), "the IP's share was never forgotten");
+        let fresh = shares.acquire(localhost);
+        assert_eq!(fresh.budgets.in_flight.permits.available_permits(), share);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10308,6 +10444,28 @@ mod tests {
         );
         drop(second);
         assert!(shares.budgets.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_source_ips_share_is_forgotten_with_its_last_charge_not_its_last_connection() {
+        let shares = IpInFlightShares::new(1024);
+        let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let first = shares.acquire(ip);
+        let charge = first.budgets.in_flight.charge(1000).await.unwrap();
+        drop(first);
+        assert_eq!(shares.budgets.lock().unwrap().len(), 1, "still charged");
+
+        // A new connection finds the charge on the same share.
+        let second = shares.acquire(ip);
+        assert_eq!(second.budgets.in_flight.permits.available_permits(), 24);
+        drop(second);
+        assert_eq!(shares.budgets.lock().unwrap().len(), 1, "still charged");
+
+        drop(charge);
+        assert!(shares.budgets.lock().unwrap().is_empty());
+        // And the IP starts over, whole.
+        let third = shares.acquire(ip);
+        assert_eq!(third.budgets.in_flight.permits.available_permits(), 1024);
     }
 
     #[test]
@@ -11638,13 +11796,14 @@ mod tests {
         announce: Option<ProxyIdentity>,
         backends: Arc<SharedBackends>,
     ) -> (String, watch::Sender<bool>, Arc<ProxyContext>) {
-        let (addr, drain, context, _) =
+        let (addr, drain, context, _, _) =
             start_proxy_observed(discovery_addr, secret, limits, announce, backends).await;
         (addr, drain, context)
     }
 
     /// `start_proxy_full`, also handing back the proxy-wide in-flight
-    /// budget so a test can read how many bytes are held.
+    /// budget and the per-source-IP shares so a test can read how many
+    /// bytes are held.
     async fn start_proxy_observed(
         discovery_addr: &str,
         secret: Option<&str>,
@@ -11656,6 +11815,7 @@ mod tests {
         watch::Sender<bool>,
         Arc<ProxyContext>,
         InFlightBudget,
+        IpInFlightShares,
     ) {
         let (ring_tx, ring_rx) = watch::channel(None);
         let (refresh_tx, refresh_rx) = mpsc::channel(16);
@@ -11689,6 +11849,7 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         let in_flight = InFlightAdmission::new(&limits);
         let proxy_budget = in_flight.proxy.clone();
+        let ip_shares = in_flight.ip_shares.clone();
         tokio::spawn(serve(
             listener,
             Arc::clone(&context),
@@ -11708,7 +11869,7 @@ mod tests {
         while ring.borrow().is_none() {
             ring.changed().await.unwrap();
         }
-        (addr, drain_tx, context, proxy_budget)
+        (addr, drain_tx, context, proxy_budget, ip_shares)
     }
 
     async fn start_proxy(
@@ -14390,6 +14551,55 @@ mod tests {
         assert_eq!(replica.incrs(), 0);
         assert_eq!(primary.entry(b"", b"counter"), Some(b"15".to_vec()));
         assert_eq!(replica.entry(b"", b"counter"), Some(b"15".to_vec()));
+    }
+
+    // Two roster names can share one address (a node restarted at the same
+    // address while its old name has not yet timed out). The ring then
+    // ranks that address as both primary and replica; the result of an
+    // `i` must not be sent back to the primary's own address as a later,
+    // unordered `Set`, where it would overwrite a concurrent writer's value.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_incr_result_is_not_fanned_out_to_the_primarys_own_address() {
+        let node = MockNode::start().await;
+        let roster = vec![
+            ("node-a".to_string(), node.addr.clone()),
+            ("node-b".to_string(), node.addr.clone()),
+        ];
+        let discovery = start_mock_discovery(roster, 2).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 1 1\nk5").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        let sets_before = node.set_ttls().len();
+
+        stream.write_all(b"i 0 1 1\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+
+        assert_eq!(node.incrs(), 1);
+        assert_eq!(
+            node.set_ttls().len() - sets_before,
+            0,
+            "the result must not be sent back to the node that computed it"
+        );
+    }
+
+    #[test]
+    fn replica_addresses_skip_the_primarys_address_and_repeats() {
+        let owners = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            replica_addresses(&owners(&["a", "b", "c"])),
+            owners(&["b", "c"])
+        );
+        assert_eq!(replica_addresses(&owners(&["a", "a", "b"])), owners(&["b"]));
+        assert_eq!(
+            replica_addresses(&owners(&["a", "b", "a", "b", "c"])),
+            owners(&["b", "c"])
+        );
+        assert!(replica_addresses(&owners(&["a", "a"])).is_empty());
+        assert!(replica_addresses(&owners(&["a"])).is_empty());
+        assert!(replica_addresses(&[]).is_empty());
     }
 
     // ── issue #824: `t` ───────────────────────────────────────────────

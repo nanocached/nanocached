@@ -993,9 +993,15 @@ async fn scenario_973() -> WindowOutcome {
                 held_on_b.insert(key.clone());
             }
         }
-        if held_on_b.len() == chosen.len() || waited >= Duration::from_secs(15) {
+        if held_on_b.len() == chosen.len() {
             break;
         }
+        assert!(
+            waited < Duration::from_secs(15),
+            "B holds {} of the {} promoted keys after {waited:?}, the rest never landed",
+            held_on_b.len(),
+            chosen.len()
+        );
         run_for(Duration::from_millis(250)).await;
         waited += Duration::from_millis(250);
     }
@@ -1056,9 +1062,9 @@ async fn a_write_in_a_re_replication_window_is_not_mirrored_to_a_node_a_later_jo
     let out = scenario_973().await;
     eprintln!("{out:?}");
     assert!(out.keys > 0, "nothing to check: {out:?}");
-    assert!(
-        out.b_held_after_the_eviction > 0,
-        "nothing to check, B was not promoted for the keys: {out:?}"
+    assert_eq!(
+        out.b_held_after_the_eviction, out.keys,
+        "B was not promoted for every key the scenario checks: {out:?}"
     );
     assert_eq!(out.a_missing, 0, "A lost keys it owned throughout: {out:?}");
     assert_eq!(
@@ -2273,6 +2279,10 @@ struct HealOutcome {
     /// yet. Zero means every node was evicted before the heal, which is the
     /// all-silent scenario above and not what this one checks.
     still_listed: usize,
+    /// Members discovery listed when the survivor's path was let through,
+    /// when that was after the evicted nodes' (zero otherwise): three means
+    /// both registered again before the survivor's first heartbeat.
+    members_at_survivor_release: usize,
     /// Copies (key, owner) the client wrote before the cut.
     copies: usize,
     /// Of those, the ones an owner no longer answers with the value after
@@ -2304,7 +2314,20 @@ async fn run_until_members_below(dport: u16, members: usize) {
 /// survives. Two evicted, not one, because with R=2 a single evicted node
 /// is refilled from the other owner when it rejoins and nothing is lost;
 /// the keys both evicted nodes own have no other copy.
-async fn scenario_heal_between_evictions() -> HealOutcome {
+///
+/// `survivor_held_after` is how long after A's and B's paths C's is cut: one
+/// heartbeat interval is the scenario above, two leave C silent for 5 to 9 s
+/// when A and B are evicted. `survivor_released_after_announce` (issue
+/// #1532) lets A and B through and C's path only once both have announced
+/// themselves again: with it false all three are released together and C's
+/// open connection delivers its heartbeat before A's and B's announces
+/// (which wait out a heartbeat interval) reach discovery; with it true
+/// the evicted nodes announce first, while C, silent since before their
+/// eviction, is still listed.
+async fn scenario_heal_between_evictions(
+    survivor_held_after: Duration,
+    survivor_released_after_announce: bool,
+) -> HealOutcome {
     use crate::hash_ring::HashRing;
     use crate::key::Key;
 
@@ -2335,19 +2358,33 @@ async fn scenario_heal_between_evictions() -> HealOutcome {
     }
     na.gates.heartbeat.hold();
     nb.gates.heartbeat.hold();
-    run_for(Duration::from_secs(5)).await;
+    run_for(survivor_held_after).await;
     nc.gates.heartbeat.hold();
     // The first two evictions; the path heals at once, before C's.
     run_until_members_below(dport, 2).await;
     let still_listed = roster(dport).await.len();
     na.gates.heartbeat.release();
     nb.gates.heartbeat.release();
+    let mut members_at_survivor_release = 0;
+    if survivor_released_after_announce {
+        // A and B retry their registration after one heartbeat interval
+        // (5 s). C is let through only once both are registered again, or
+        // when the wait runs out just before C itself would be evicted.
+        for _ in 0..110 {
+            run_for(Duration::from_millis(50)).await;
+            if roster(dport).await.len() >= 3 {
+                break;
+            }
+        }
+        members_at_survivor_release = roster(dport).await.len();
+    }
     nc.gates.heartbeat.release();
     run_for(Duration::from_secs(120)).await;
     run_until_members(dport, 3).await;
 
     let mut out = HealOutcome {
         still_listed,
+        members_at_survivor_release,
         copies: 0,
         lost: 0,
     };
@@ -2371,7 +2408,7 @@ async fn scenario_heal_between_evictions() -> HealOutcome {
 async fn nodes_evicted_before_the_rest_of_a_silent_fleet_keep_their_caches_when_the_path_heals_in_between()
  {
     let _spin = spin();
-    let out = scenario_heal_between_evictions().await;
+    let out = scenario_heal_between_evictions(Duration::from_secs(5), false).await;
     eprintln!("{out:?}");
     assert!(out.copies > 0, "nothing to check: {out:?}");
     assert!(
@@ -2381,6 +2418,31 @@ async fn nodes_evicted_before_the_rest_of_a_silent_fleet_keep_their_caches_when_
     assert_eq!(
         out.lost, 0,
         "a node evicted while the rest of the silent fleet was still listed emptied its cache: {out:?}"
+    );
+}
+
+/// Issue #1532, the other arrival order of the scenario above: the evicted
+/// nodes' paths heal first and their announces reach discovery while the
+/// survivor, silent since before their eviction, is still listed and has not
+/// heartbeated yet. It was cut off just the same and must not make them
+/// start over.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn nodes_evicted_before_a_silent_survivor_keep_their_caches_when_they_announce_first() {
+    let _spin = spin();
+    let out = scenario_heal_between_evictions(Duration::from_secs(10), true).await;
+    eprintln!("{out:?}");
+    assert!(out.copies > 0, "nothing to check: {out:?}");
+    assert!(
+        out.still_listed > 0,
+        "every node was evicted before the heal, so this is the all-silent case: {out:?}"
+    );
+    assert_eq!(
+        out.members_at_survivor_release, 3,
+        "the evicted nodes were not registered again before the survivor's heartbeat: {out:?}"
+    );
+    assert_eq!(
+        out.lost, 0,
+        "a node announcing before the silent survivor's heartbeat emptied its cache: {out:?}"
     );
 }
 
