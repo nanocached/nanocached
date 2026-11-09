@@ -552,10 +552,12 @@ async fn main() -> ExitCode {
     )
     .await
     {
+        trace::finish();
         eprintln!("nanocached-node: {err}");
         return ExitCode::FAILURE;
     }
 
+    trace::finish();
     ExitCode::SUCCESS
 }
 

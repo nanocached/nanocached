@@ -163,20 +163,26 @@ reclaim all get the graceful path with no extra hooks.</p>
 </ol>
 <p>The budget is checked between keys and between the attempts on one
 key, so it is a soft limit. An attempt that is under way when the budget
-runs out is allowed to finish (its connect and its send are each bounded
-by 10&nbsp;s), no further attempt starts, and every key after it is left
-behind. A receiver that refuses the connection fails at once, but one that
-stops answering without closing it (a suspended process, a saturated
-host) can stretch the leave past the budget by that one attempt. A
-receiver that fails all three attempts on a key (a node that is down but
-still listed by discovery) is written off for 30&nbsp;s: its remaining
-keys are left behind without further attempts, so the keys bound for the
-live nodes still get the budget. The node logs the entries it could not
-hand off and exits 0. The leave notification to the discovery servers adds
-nothing to that: they are told at the same time, and the notification gets
-what is left of the budget, or 2&nbsp;s if the handoff used it up. A
-discovery server that does not answer in that time is logged and keeps
-listing the node until its liveness timeout.</p>
+runs out is allowed to finish, no further attempt starts, and every key
+after it is left behind. An attempt is bounded by the sum of its legs, each
+limited to 10&nbsp;s: the TCP connect, the TLS handshake (with TLS), the
+auth exchange (with an auth secret) and the send. That is 20&nbsp;s on a
+plain connection and 40&nbsp;s with both TLS and a secret. A receiver that
+refuses the connection fails at once, but one that stops answering without
+closing it (a suspended process, a saturated host) can stretch the leave
+past the budget by that one attempt. A
+receiver that cannot be reached on all three attempts at a key (a node that
+is down but still listed by discovery) is written off for 30&nbsp;s: its
+remaining keys are left behind without further attempts, so the keys bound
+for the live nodes still get the budget. A receiver that answers and
+refuses an entry is not written off: that entry is left behind and the
+receiver is offered the next. Entries deleted or expired by their turn are
+not counted as left behind. The node logs the entries it could not
+hand off and exits 0. The discovery servers are told of the leave at the
+same time, and the notification gets what is left of the budget. If the
+handoff used the budget up, it still gets 2&nbsp;s, which comes on top of
+the attempt that overran. A discovery server that does not answer in that
+time is logged and keeps listing the node until its liveness timeout.</p>
 <p>Treat that log line (<code>WARN decommission: N entr(ies) could not be
 handed off within the drain budget</code>) as a sizing signal, not as a
 loss: the surviving replicas hold those keys, and the survivors&rsquo;
@@ -238,9 +244,10 @@ service&rsquo;s <code>stopTimeout</code>, Kubernetes&rsquo;
 <code>terminationGracePeriodSeconds</code>) to at least
 <code>--drain-timeout</code> plus a margin</strong> (twice it is a
 comfortable rule while the nodes answer or refuse promptly; to cover a
-receiver that stops answering, which can add up to 30&nbsp;s to the
-leave as described above, use the budget plus 30&nbsp;s — for a 20&nbsp;s
-budget, 50&nbsp;s). A node's handoff time scales with the data it holds
+receiver that stops answering, which can stretch the leave past the budget
+by one attempt (up to 40&nbsp;s) and the 2&nbsp;s for the leave
+notification, as described above, use the budget plus 45&nbsp;s — for a
+20&nbsp;s budget, 65&nbsp;s). A node's handoff time scales with the data it holds
 — a 20&nbsp;s budget drains hundreds of MB comfortably on an
 in-network transfer, but measure with your value sizes; keys that miss
 the budget are logged and left to the surviving replicas. The default

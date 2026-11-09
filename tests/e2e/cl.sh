@@ -19,3 +19,7 @@ load(){
 summ(){ python3 -c "
 import json,sys;d=json.loads([l for l in open('$E/logs/$1.json') if l.startswith('{\"label\"')][-1]);print({k:d[k] for k in ('ops','ops_s','get','set','miss','corrupt','err_total','errors','sdk_stats') if k in d})"; }
 warns(){ for c in "$@"; do echo "== $c"; docker logs $c 2>&1 | grep -v "accepted connection" | grep -i "warn\|error\|panic" | sed 's/[0-9.]*:[0-9]*:/X:/' | sort | uniq -c | sort -rn | head -8; done; }
+# "ops" of a load.py summary line (empty when the argument is not one). The
+# scripts assert it is at least MIN_OPS_S (10) per second of load, so a loader
+# that never started or died early cannot pass on "miss": 0 / "corrupt": 0.
+load_ops(){ echo "$1" | grep -oE '"ops": [0-9]+' | head -1 | grep -oE '[0-9]+'; }
