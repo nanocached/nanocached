@@ -143,6 +143,13 @@ framework adapters at one version, whether or not a component changed.
   holding its connection permit and its per-IP permit. The half-close is
   now inside the window, so the whole drain ends after one second at the
   latest (#1483).
+- `nanocached-node` (simulation only, no change to the node): the scenario
+  for a re-replication window write mirrored to a node a later join
+  displaced (#973) asserted that some of its keys reached the promoted node
+  before the join, not all of them, and its wait loop gave up silently
+  after 15 s, so a partial copy still passed with the remaining keys
+  proving nothing. It now requires every key to have reached the node and
+  fails with the count when the wait runs out (#1537).
 
 ## [0.6.2] - 2026-11-03
 
