@@ -1781,6 +1781,85 @@ describe("a redial finishing after close() (issue #1216)", () => {
   it("a proxy-mode client closes the redialed connection", () => closeRightAfterRedial("proxy"));
 });
 
+describe("a node-list refresh that is still dialing new nodes (issue #1615)", () => {
+  const nameA = "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6";
+  const nameB = "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47";
+  const nameC = "c3b2a190-8d7e-4f6a-9b5c-4d3e2f1a0b9c";
+
+  // The departed node B is still in the client's ring while the refresh
+  // waits for the dial of the new node C, which accepts the socket and never
+  // answers until the test lets go of it. An operation that is routed to B
+  // in that window must not leave a connection to B open on a member the
+  // refresh then drops.
+  for (const alreadyDead of [false, true]) {
+    it(`leaves no connection to a departed node open (its connection ${alreadyDead ? "was already dead" : "was alive"} when the refresh began)`, async () => {
+      const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+      const heldSockets: Socket[] = [];
+      // A node that closes on the extended handshake is retried with the
+      // plain one, so once let go the held address refuses every dial.
+      let released = false;
+      const held = createServer((socket) => {
+        heldSockets.push(socket);
+        socket.on("error", () => {});
+        if (released) socket.destroy();
+      });
+      await new Promise<void>((resolve) => held.listen(0, "127.0.0.1", resolve));
+      const heldAddress = `127.0.0.1:${(held.address() as import("node:net").AddressInfo).port}`;
+      const discovery = await startMockDiscovery([
+        { name: nameA, address: nodeA.address },
+        { name: nameB, address: nodeB.address },
+      ]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          const departed = (client as any).target.members.get(nameB) as { connection: Connection | null };
+          const original = departed.connection as Connection;
+          if (alreadyDead) {
+            nodeB.dropConnections();
+            await waitFor(() => original.isClosed(), "the connection to be dropped");
+          }
+
+          discovery.setNodes([
+            { name: nameA, address: nodeA.address },
+            { name: nameC, address: heldAddress },
+          ]);
+          const refresh = (client as any).refreshNodeList() as Promise<void>;
+          await waitFor(() => heldSockets.length > 0, "the refresh to start dialing the new node");
+
+          let key = "";
+          for (let i = 0; key === ""; i++) {
+            if (new HashRing([nameA, nameB]).owners(Buffer.from(`departed-${i}`), 1)[0] === nameB) key = `departed-${i}`;
+          }
+          await Promise.race([
+            client.set(key, "v"),
+            delay(5_000).then(() => {
+              throw new Error("the operation routed to the departed node did not finish");
+            }),
+          ]);
+
+          released = true;
+          for (const socket of heldSockets) socket.destroy();
+          await refresh;
+          assert.equal((client as any).target.members.has(nameB), false, "the refresh must have dropped the departed node");
+
+          // Nothing references the departed member any more, so nothing
+          // would ever close a connection left on it.
+          await waitFor(() => original.isClosed(), "the departed node's original connection to close");
+          await waitFor(
+            () => departed.connection === null || departed.connection.isClosed(),
+            "the connection on the departed member to close (a connection left there is never closed again)",
+          );
+        } finally {
+          await client.close();
+        }
+      } finally {
+        for (const socket of heldSockets) socket.destroy();
+        await Promise.all([nodeA.close(), nodeB.close(), discovery.close(), new Promise<void>((resolve) => held.close(() => resolve()))]);
+      }
+    });
+  }
+});
+
 describe("a request that needs a redial after close() does not dial (issue #1613)", () => {
   // An operation that was already running when close() destroyed its
   // connection reaches the redial path with the client closed. It must fail
