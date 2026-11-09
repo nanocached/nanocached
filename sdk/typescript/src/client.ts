@@ -2054,20 +2054,26 @@ export class NanocachedClient {
    * multiGetChunked it does not throw on a failure: it returns the answers
    * of the chunks that completed (`entries`, `resolved` of them — the index
    * the failing chunk began at, or the key count when none failed) and the
-   * `error` that stopped it, since the callers need both. An error that is
-   * a programming bug (see isSwallowable) is still thrown. */
+   * `error` that stopped it, since the callers need both. `sentEnd` says
+   * where the written frames end (issue #1601): the positions from
+   * `resolved` up to `sentEnd` are the failing chunk's, which was written
+   * when its error came from the request rather than from obtaining the
+   * connection, and the ones from `sentEnd` on were never sent. An error
+   * that is a programming bug (see isSwallowable) is still thrown. */
   private async multiTouchChunked(
     connectionFor: () => Promise<Connection>,
     namespace: Uint8Array,
     keyBytes: readonly Buffer[],
     ttlSeconds: number | null,
     get: boolean,
-  ): Promise<{ entries: TouchAnswer[]; resolved: number; error: unknown }> {
+  ): Promise<{ entries: TouchAnswer[]; resolved: number; sentEnd: number; error: unknown }> {
     const entries: TouchAnswer[] = [];
     for (let start = 0; start < keyBytes.length; ) {
       const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]));
+      let connected = false;
       try {
         const connection = await connectionFor();
+        connected = true;
         const chunk = keyBytes.slice(start, end);
         if (get) {
           for (const entry of await connection.multiGetAndTouch(chunk, ttlSeconds, namespace)) {
@@ -2078,11 +2084,11 @@ export class NanocachedClient {
         }
       } catch (error) {
         if (!isSwallowable(error)) throw error;
-        return { entries, resolved: start, error };
+        return { entries, resolved: start, sentEnd: connected ? end : start, error };
       }
       start = end;
     }
-    return { entries, resolved: keyBytes.length, error: undefined };
+    return { entries, resolved: keyBytes.length, sentEnd: keyBytes.length, error: undefined };
   }
 
   /** One pass of the cluster routing of touchMany and getManyAndTouch:
@@ -2156,7 +2162,7 @@ export class NanocachedClient {
           ttlSeconds === 0 && holdsPrimary
             ? () => this.dialForWrite(() => this.memberConnection(leg.name))
             : () => this.memberConnection(leg.name);
-        const { entries, resolved, error } = await this.multiTouchChunked(
+        const { entries, resolved, sentEnd, error } = await this.multiTouchChunked(
           connectionFor,
           namespace,
           leg.indices.map((index) => keyBytes[index]),
@@ -2167,7 +2173,9 @@ export class NanocachedClient {
         // that expires: the node may have applied it, and a resend would
         // report the keys as missing — and, with `G`, lose the values it
         // consumed. A failure that never sent stays retryable, and an `En`
-        // keeps its own handling.
+        // keeps its own handling. Only the chunk whose frame was written
+        // may have been applied (issue #1601): the chunks after it were
+        // never sent and go to the retry like any other unresolved key.
         let lostIsFinal = false;
         if (error !== undefined && holdsPrimary) {
           state.lastCause = error;
@@ -2189,7 +2197,7 @@ export class NanocachedClient {
             if (i < resolved) state.wrongNode.add(index);
             else {
               state.wrongNode.delete(index);
-              if (lostIsFinal) {
+              if (lostIsFinal && i < sentEnd) {
                 state.lost.add(index);
                 continue;
               }
@@ -4238,7 +4246,10 @@ export class NanocachedClient {
         members.set(node.name, { address: node.address, connection: null });
         this.reconnectCooldowns.set(node.address, {
           until: Date.now() + this.reconnectCooldownMs,
-          error: new NanocachedError(`nanocached: discovery returned a non-node address: ${node.address}`),
+          // Connection-classified and never sent (like the dial failure
+          // above), so the refresh-and-retry layer reroutes an operation
+          // that meets the cached error, even a non-idempotent one.
+          error: new ConnectionLostError(`nanocached: discovery returned a non-node address: ${node.address}`, { requestWasSent: false }),
         });
         continue;
       }
@@ -4569,7 +4580,11 @@ export class NanocachedClient {
     const identified = await connectAndIdentify({ ...splitHostPort(address), authSecret: this.authSecret, tls: this.tls, ca: this.ca });
 
     if (identified.kind !== "node") {
-      throw new NanocachedError(`nanocached: ${address} no longer identifies as a cache node`);
+      // Connection-classified and never sent: the usual cause is an address
+      // another kind of server now answers on, which a node-list refresh
+      // fixes, so the refresh-and-retry layer must recognise it (a plain
+      // NanocachedError would fail even a never-sent incr/cas outright).
+      throw new ConnectionLostError(`nanocached: ${address} no longer identifies as a cache node`, { requestWasSent: false });
     }
     if (this.closed) {
       identified.socket.destroy();

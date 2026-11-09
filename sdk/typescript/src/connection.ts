@@ -614,8 +614,17 @@ export class Connection {
     this.socket.destroy();
   }
 
+  /** Closes the connection. Goes through `poison()` so `closed` is set
+   * synchronously (issue #1614): destroy()'s 'close' event lands on a later
+   * tick, and a request issued in between (an operation that holds this
+   * connection while a node-list refresh closes it) must be rejected by
+   * `sendOnce`'s closed-at-entry check as never sent, not written into the
+   * destroyed socket and reported as sent. The error is the default
+   * `requestWasSent: true` one on purpose: it is what the requests already
+   * written and still waiting for their reply are rejected with, and those
+   * cannot be proven not to have reached the server. */
   close(): void {
-    this.socket.destroy();
+    this.poison(new ConnectionLostError("nanocached: connection closed"));
   }
 
   /** Resolves once the socket's native `"close"` event has fired — i.e.
