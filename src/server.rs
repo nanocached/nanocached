@@ -1172,12 +1172,19 @@ async fn forward_result(config: &ConnectionConfig, key: &Key, result: ForwardedR
             .collect::<Vec<_>>()
     );
 
+    // Stamped once, before the first (possibly waiting) enqueue, so every
+    // target's copy counts its TTL from when the write was made.
+    let stamped_ttl = match &result {
+        ForwardedResult::Set { ttl, .. } => ForwardTtl::stamp(*ttl),
+        ForwardedResult::Delete => None,
+    };
+
     for target in migration_targets_for(node_context, key) {
         let write = match &result {
-            ForwardedResult::Set { value, ttl } => OwnedForwardedWrite::Set {
+            ForwardedResult::Set { value, .. } => OwnedForwardedWrite::Set {
                 key: key.clone(),
                 value: value.clone(),
-                ttl: *ttl,
+                ttl: stamped_ttl,
             },
             ForwardedResult::Delete => OwnedForwardedWrite::Delete { key: key.clone() },
         };
@@ -1186,10 +1193,10 @@ async fn forward_result(config: &ConnectionConfig, key: &Key, result: ForwardedR
 
     for target in handoff_targets_for(node_context, key) {
         let write = match &result {
-            ForwardedResult::Set { value, ttl } => OwnedForwardedWrite::HandoffSet {
+            ForwardedResult::Set { value, .. } => OwnedForwardedWrite::HandoffSet {
                 key: key.clone(),
                 value: value.clone(),
-                ttl: *ttl,
+                ttl: stamped_ttl,
                 if_absent: false,
             },
             ForwardedResult::Delete => OwnedForwardedWrite::HandoffDelete { key: key.clone() },
@@ -3695,6 +3702,9 @@ async fn handle_connection(
                             &[&join_batches, &leave_batches],
                         );
 
+                        // Counted from here, not from when each batch is
+                        // sent after its wait for room (issue #1534).
+                        let ttl = ForwardTtl::stamp(ttl);
                         for (batches, handoff) in [(join_batches, false), (leave_batches, true)] {
                             for batch in batches {
                                 let writes = batch.items.into_iter().map(|(name, value)| {
@@ -3852,6 +3862,9 @@ async fn handle_connection(
                     },
                 )
                 .await?;
+                // The relays below count the TTL from the moment it was
+                // applied here (issue #1534).
+                let relay_ttl = ForwardTtl::stamp(ttl);
                 // Issue #975: a put-if-absent copy — a re-replication pass
                 // promoting this node under the ring it saw — that lands
                 // after this node's own join handoff took its key snapshot
@@ -3903,14 +3916,14 @@ async fn handle_connection(
                         OwnedForwardedWrite::HandoffSet {
                             key: key.clone(),
                             value: value.clone(),
-                            ttl,
+                            ttl: relay_ttl,
                             if_absent: true,
                         }
                     } else {
                         OwnedForwardedWrite::Set {
                             key: key.clone(),
                             value: value.clone(),
-                            ttl,
+                            ttl: relay_ttl,
                         }
                     };
                     spawn_forward(&config, node_context.clone(), target, forward).await;
@@ -3947,7 +3960,7 @@ async fn handle_connection(
                             OwnedForwardedWrite::HandoffSet {
                                 key: key.clone(),
                                 value: value.clone(),
-                                ttl,
+                                ttl: relay_ttl,
                                 if_absent,
                             },
                         )
@@ -4284,6 +4297,9 @@ async fn handle_connection(
                             &[&join_batches, &leave_batches],
                         );
 
+                        // Counted from here, not from when each batch is
+                        // sent after its wait for room (issue #1534).
+                        let ttl = ForwardTtl::stamp(ttl);
                         for (batches, handoff) in [(join_batches, false), (leave_batches, true)] {
                             for batch in batches {
                                 let writes = batch.items.into_iter().map(|(name, value)| {
@@ -10069,7 +10085,7 @@ enum OwnedForwardedWrite {
     Set {
         key: Key,
         value: Bytes,
-        ttl: Option<Duration>,
+        ttl: Option<ForwardTtl>,
     },
     Delete {
         key: Key,
@@ -10083,13 +10099,47 @@ enum OwnedForwardedWrite {
     HandoffSet {
         key: Key,
         value: Bytes,
-        ttl: Option<Duration>,
+        ttl: Option<ForwardTtl>,
         if_absent: bool,
     },
     HandoffDelete {
         key: Key,
     },
     Clear(ClearScope),
+}
+
+/// The relative TTL of a forwarded `Set`/`HandoffSet` together with when
+/// the write was made, so what goes on the wire is what is *left* of it
+/// when the write is sent, not what it was when it was made. A forward can
+/// wait behind a slow-but-live target for up to `FORWARD_TIMEOUT` per
+/// attempt (and a queue of others before it); sending the original number
+/// of seconds made the target hold the value that much longer than the
+/// node that took the write, or hold a short-lived value (an `INCR`
+/// counter) that had already expired there (issue #1534).
+///
+/// A TTL that ran out while the write waited is sent as `0`: the frame
+/// that already means "expire now" — a `U` deletes, an `S` stores the key
+/// already expired — which still replaces whatever older value the target
+/// holds for the key (dropping the write would leave that value alive).
+#[derive(Clone, Copy, Debug)]
+struct ForwardTtl {
+    ttl: Duration,
+    made_at: Instant,
+}
+
+impl ForwardTtl {
+    /// `ttl` as of now; `None` (no expiry) stays `None`.
+    fn stamp(ttl: Option<Duration>) -> Option<Self> {
+        ttl.map(|ttl| Self {
+            ttl,
+            made_at: Instant::now(),
+        })
+    }
+
+    /// What is left of the TTL now: zero once it has run out.
+    fn remaining(self) -> Duration {
+        self.ttl.saturating_sub(self.made_at.elapsed())
+    }
 }
 
 impl OwnedForwardedWrite {
@@ -10179,86 +10229,55 @@ impl OwnedForwardedWrite {
         // reconnect-plus-send.
         let deadline = tokio::time::Instant::now() + FORWARD_TIMEOUT;
 
+        forward_on_locked_connection(
+            node_context,
+            &target.addr,
+            connection,
+            self.frame(target),
+            deadline,
+        )
+        .await
+    }
+
+    /// The frame to send for this write to `target` now. A `Set`'s TTL is
+    /// what is left of it at this moment (`ForwardTtl`), so a later attempt
+    /// or a longer wait in the queue sends less.
+    fn frame<'a>(&'a self, target: &'a ForwardTarget) -> ForwardedWrite<'a> {
         match self {
-            OwnedForwardedWrite::Set { key, value, ttl } => {
-                forward_on_locked_connection(
-                    node_context,
-                    &target.addr,
-                    connection,
-                    ForwardedWrite::Set {
-                        key,
-                        value,
-                        ttl: *ttl,
-                    },
-                    deadline,
-                )
-                .await
-            }
-            OwnedForwardedWrite::Delete { key } => {
-                forward_on_locked_connection(
-                    node_context,
-                    &target.addr,
-                    connection,
-                    ForwardedWrite::Delete { key },
-                    deadline,
-                )
-                .await
-            }
+            OwnedForwardedWrite::Set { key, value, ttl } => ForwardedWrite::Set {
+                key,
+                value,
+                ttl: ttl.map(ForwardTtl::remaining),
+            },
+            OwnedForwardedWrite::Delete { key } => ForwardedWrite::Delete { key },
             OwnedForwardedWrite::HandoffSet {
                 key,
                 value,
                 ttl,
                 if_absent,
-            } => {
-                forward_on_locked_connection(
-                    node_context,
-                    &target.addr,
-                    connection,
-                    ForwardedWrite::HandoffSet {
-                        key,
-                        value,
-                        ttl: *ttl,
-                        // `false` for a decommission leave-forward (a
-                        // concurrent client write must win unconditionally —
-                        // see `ForwardedWrite::HandoffSet`'s own doc
-                        // comment); `true` for the join relay of a
-                        // re-replication put-if-absent, so the joining owner
-                        // keeps any value it already holds.
-                        if_absent: *if_absent,
-                        // Issue #295: `target`'s own token, not this
-                        // node's — see `Command::HandoffSet::token`.
-                        token: &target.token,
-                    },
-                    deadline,
-                )
-                .await
-            }
-            OwnedForwardedWrite::HandoffDelete { key } => {
-                forward_on_locked_connection(
-                    node_context,
-                    &target.addr,
-                    connection,
-                    ForwardedWrite::HandoffDelete {
-                        key,
-                        token: &target.token,
-                    },
-                    deadline,
-                )
-                .await
-            }
-            OwnedForwardedWrite::Clear(scope) => {
-                forward_on_locked_connection(
-                    node_context,
-                    &target.addr,
-                    connection,
-                    ForwardedWrite::Clear {
-                        scope,
-                        token: &target.token,
-                    },
-                    deadline,
-                )
-                .await
-            }
+            } => ForwardedWrite::HandoffSet {
+                key,
+                value,
+                ttl: ttl.map(ForwardTtl::remaining),
+                // `false` for a decommission leave-forward (a
+                // concurrent client write must win unconditionally —
+                // see `ForwardedWrite::HandoffSet`'s own doc
+                // comment); `true` for the join relay of a
+                // re-replication put-if-absent, so the joining owner
+                // keeps any value it already holds.
+                if_absent: *if_absent,
+                // Issue #295: `target`'s own token, not this
+                // node's — see `Command::HandoffSet::token`.
+                token: &target.token,
+            },
+            OwnedForwardedWrite::HandoffDelete { key } => ForwardedWrite::HandoffDelete {
+                key,
+                token: &target.token,
+            },
+            OwnedForwardedWrite::Clear(scope) => ForwardedWrite::Clear {
+                scope,
+                token: &target.token,
+            },
         }
     }
 
@@ -32485,5 +32504,85 @@ mod tests {
         fake_discovery.abort();
 
         assert_join_then_heartbeats(&received.lock().unwrap(), 8356);
+    }
+
+    /// The header line of the frame `write` goes out as to a forward target
+    /// right now; `attempt` sends exactly what `frame` returns.
+    fn frame_header(write: &OwnedForwardedWrite) -> String {
+        let target = ForwardTarget {
+            addr: "127.0.0.1:0".to_string(),
+            connection: Arc::new(AsyncMutex::new(None)),
+            token: "tok-target".to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
+        };
+        let message = match write.frame(&target) {
+            ForwardedWrite::Set { key, value, ttl } => set_message(key, value, ttl),
+            ForwardedWrite::HandoffSet {
+                key,
+                value,
+                ttl,
+                if_absent,
+                token,
+            } => handoff_message(key, value, ttl, if_absent, token),
+            _ => unreachable!("only sets are built here"),
+        };
+        String::from_utf8_lossy(&message)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    fn queued_sets(ttl: Option<Duration>) -> (OwnedForwardedWrite, OwnedForwardedWrite) {
+        let ttl = ForwardTtl::stamp(ttl);
+        (
+            OwnedForwardedWrite::Set {
+                key: key(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl,
+            },
+            OwnedForwardedWrite::HandoffSet {
+                key: key(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl,
+                if_absent: false,
+            },
+        )
+    }
+
+    /// Issue #1534: the TTL goes out as what is left of it when the write
+    /// is sent, not as the number of seconds fixed when it was made.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_forwarded_set_sends_the_ttl_left_after_its_wait_in_the_queue() {
+        let (set, handoff) = queued_sets(Some(Duration::from_secs(30)));
+        assert_eq!(frame_header(&set), "S 4 5 30");
+        assert_eq!(frame_header(&handoff), "U 0 4 5 10 30");
+
+        // Waited behind a slow target for 12 s.
+        tokio::time::advance(Duration::from_secs(12)).await;
+        assert_eq!(frame_header(&set), "S 4 5 18");
+        assert_eq!(frame_header(&handoff), "U 0 4 5 10 18");
+
+        // A retry after a failed attempt counts the time that took too.
+        tokio::time::advance(Duration::from_millis(10_500)).await;
+        assert_eq!(frame_header(&set), "S 4 5 8");
+        assert_eq!(frame_header(&handoff), "U 0 4 5 10 8");
+    }
+
+    /// Issue #1534: a TTL that ran out while the write waited goes out as
+    /// `0` (a `U` deletes, an `S` stores the key already expired) instead
+    /// of as the full TTL, and a write without a TTL is untouched.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_forwarded_set_whose_ttl_ran_out_in_the_queue_goes_out_as_zero() {
+        let (set, handoff) = queued_sets(Some(Duration::from_secs(5)));
+        let (no_ttl_set, no_ttl_handoff) = queued_sets(None);
+
+        tokio::time::advance(Duration::from_secs(12)).await;
+
+        assert_eq!(frame_header(&set), "S 4 5 0");
+        assert_eq!(frame_header(&handoff), "U 0 4 5 10 0");
+        assert_eq!(frame_header(&no_ttl_set), "S 4 5");
+        assert_eq!(frame_header(&no_ttl_handoff), "U 0 4 5 10");
     }
 }
