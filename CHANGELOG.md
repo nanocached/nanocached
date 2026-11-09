@@ -36,6 +36,29 @@ framework adapters at one version, whether or not a component changed.
   shutdown, and `incrtrace.py` leaves its value-from-nowhere assertion at 0
   for logs that contain one (#1623).
 
+- `nanocached-node`: the decommission drain wrote a live entrant off for
+  30 s after one key was refused three times, and the re-replication pass
+  did the same to a target. The write-off was meant for a node that is down but
+  still listed, yet `send_handoff_set` also fails for any ack other than
+  `S`, so a live node that refused a single entry had every later key
+  bound for it left behind without a try. Only failures to reach the node
+  (dial, handshake, write, a closed or silent connection) now count toward
+  the write-off; a refused entry is left behind and the next one is
+  offered. The drain also checks that the entry still exists before it
+  consults the write-off, so keys deleted, expired or held only as dead
+  copies are no longer counted in `N entr(ies) could not be handed off`
+  (#1595).
+
+- `nanocached-node`: a replica that a leave or an eviction promoted to a
+  key's primary refused `INCR`, `CAS` and `CAS-delete` on that key with `W`
+  until it adopted the new ring, up to a heartbeat and longer while a join
+  was pending on it. A key the node's own ring granted at rank 2 was judged
+  by that ring alone, so the newer list discovery had already published,
+  which the client followed, was never consulted, and the refresh before
+  the `W` re-evaluated the same predicate. The published ring now makes
+  this node the primary there too; a node that is only a replica under it
+  still answers `W` (#1589).
+
 - `nanocached-proxy`: a source IP's in-flight byte share was forgotten as
   soon as its last connection ended, even while requests that connection
   had dispatched were still charged (a client write error ends the
@@ -228,6 +251,16 @@ framework adapters at one version, whether or not a component changed.
   left at the moment of each send; one that ran out while the write waited
   goes out as `0`, which expires the copy at once and still replaces an
   older value the target held (#1534).
+- `nanocached-node`: the starting rings a re-replication pass takes over
+  from the passes it superseded had no bound and no de-duplication. Every
+  pass aborted before it finished added one ring, and a pass checks each
+  key against each of them (an ownership test and a ranking per ring), so a
+  run of ring changes faster than the passes complete made every pass
+  slower than the last, and less likely to finish, while all the rings were
+  held. Rings with the same members are now kept once, and beyond eight the
+  two oldest are folded into one that keeps the sender condition and
+  targets every other owner of the key; the cost is a repeated put-if-absent
+  to an owner that already has the key (#1606).
 - `nanocached-node`: a re-replication pass superseded by a second eviction
   no longer forgets the first eviction's keys. The new pass healed only the
   owners the second change promoted, so the keys the first change promoted
