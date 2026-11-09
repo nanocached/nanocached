@@ -1699,6 +1699,7 @@ impl Cache {
 
         if expired {
             self.remove_entry(key);
+            self.expirations += 1;
             return false;
         }
 
@@ -3377,6 +3378,13 @@ mod tests {
         let future = Instant::now() + Duration::from_secs(6);
 
         assert!(!cache.delete_at(&key(b"name"), future));
+        // The delete removed the entry lazily; that is an expiration.
+        assert_eq!(cache.stats().expirations, 1);
+        assert!(!cache.contains(&key(b"name")));
+
+        // A delete that finds nothing is not one.
+        assert!(!cache.delete_at(&key(b"name"), future));
+        assert_eq!(cache.stats().expirations, 1);
     }
 
     #[test]
