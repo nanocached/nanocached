@@ -28,9 +28,6 @@ pub use client::MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES;
 #[cfg(feature = "__test_hooks")]
 #[doc(hidden)]
 pub use client::MAX_INFLIGHT_HEDGE_LOSER_LEGS;
-#[cfg(feature = "__test_hooks")]
-#[doc(hidden)]
-pub use client::NODE_LIST_STALE_AFTER_MS;
 pub use client::{Namespace, NanocachedClient, Options, Stats};
 #[cfg(feature = "__test_hooks")]
 #[doc(hidden)]

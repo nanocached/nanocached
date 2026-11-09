@@ -10,6 +10,10 @@ use nanocached::{Error, HashRing, NanocachedClient, Options};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+/// The client's default for how long the node list may go without a
+/// re-fetch; a test that shortens it for its own client puts this back.
+const DEFAULT_NODE_LIST_STALE_AFTER_MS: u64 = 30_000;
+
 const NAMES: [&str; 2] = [
     "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6",
     "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47",
@@ -8153,9 +8157,9 @@ async fn concurrent_stale_refreshes_coalesce_into_a_single_discovery_round_trip(
     // Regression (Fix 2): maybe_refresh used to check staleness, drop the
     // lock, then unconditionally redial discovery — so N callers that all
     // observed the node list as stale at once each independently redialed,
-    // instead of coalescing into one refresh. NODE_LIST_STALE_AFTER_MS is
-    // lowered here (a #[doc(hidden)] test hook, mirroring
-    // KEEPALIVE_INTERVAL_MS/REQUEST_TIMEOUT_MS) so the list goes stale
+    // instead of coalescing into one refresh. This client's staleness window
+    // is lowered here (a #[doc(hidden)] per-client test hook, so tests
+    // running concurrently are not affected) so the list goes stale
     // almost immediately instead of waiting out the real 30s default; the
     // mock discovery's L handler is given an artificial delay so the
     // winning refresh is still in flight while every other concurrent
@@ -8168,8 +8172,7 @@ async fn concurrent_stale_refreshes_coalesce_into_a_single_discovery_round_trip(
     // connect()'s own L already landed; only refreshes from here on count.
     let before = discovery.l_requests.load(Ordering::SeqCst);
 
-    let default_stale_after = nanocached::NODE_LIST_STALE_AFTER_MS.load(Ordering::SeqCst);
-    nanocached::NODE_LIST_STALE_AFTER_MS.store(50, Ordering::SeqCst);
+    client.set_node_list_stale_after_ms_for_test(50);
     tokio::time::sleep(Duration::from_millis(100)).await; // let the list actually go stale
     discovery.l_delay_ms.store(200, Ordering::SeqCst);
 
@@ -8188,7 +8191,7 @@ async fn concurrent_stale_refreshes_coalesce_into_a_single_discovery_round_trip(
     }
 
     discovery.l_delay_ms.store(0, Ordering::SeqCst);
-    nanocached::NODE_LIST_STALE_AFTER_MS.store(default_stale_after, Ordering::SeqCst);
+    client.set_node_list_stale_after_ms_for_test(DEFAULT_NODE_LIST_STALE_AFTER_MS);
 
     assert_eq!(
         discovery.l_requests.load(Ordering::SeqCst) - before,
@@ -8807,9 +8810,6 @@ async fn refresh_purges_cooldowns_for_departed_addresses() {
     // purge its cooldown) and later rejoins at the SAME address, a write
     // routed to it has to redial and land — which a stale, still-armed
     // cooldown for that address would block for the full 60s window.
-    let default_stale = nanocached::NODE_LIST_STALE_AFTER_MS.load(Ordering::SeqCst);
-    nanocached::NODE_LIST_STALE_AFTER_MS.store(0, Ordering::SeqCst);
-
     let dead_port = unused_port().await;
     let live = MockNode::start().await;
     let listed = vec![
@@ -8823,6 +8823,7 @@ async fn refresh_purges_cooldowns_for_departed_addresses() {
     )
     .await
     .unwrap();
+    client.set_node_list_stale_after_ms_for_test(0);
 
     // Any request pumps a refresh (staleness forced to 0 above); route it
     // to the live node so it never depends on the dead one.
@@ -8852,7 +8853,6 @@ async fn refresh_purges_cooldowns_for_departed_addresses() {
         .unwrap()
         .contains_key(dead_key.as_bytes()));
 
-    nanocached::NODE_LIST_STALE_AFTER_MS.store(default_stale, Ordering::SeqCst);
     client.close().await;
     discovery.stop();
     live.stop();
@@ -9792,8 +9792,7 @@ async fn a_forced_refresh_does_not_reuse_one_that_began_before_its_failure() {
         .unwrap();
     let before = discovery.l_requests.load(Ordering::SeqCst);
 
-    let default_stale_after = nanocached::NODE_LIST_STALE_AFTER_MS.load(Ordering::SeqCst);
-    nanocached::NODE_LIST_STALE_AFTER_MS.store(50, Ordering::SeqCst);
+    client.set_node_list_stale_after_ms_for_test(50);
     tokio::time::sleep(Duration::from_millis(100)).await; // let the list go stale
     discovery.l_delay_ms.store(600, Ordering::SeqCst);
     let in_flight = {
@@ -9801,7 +9800,7 @@ async fn a_forced_refresh_does_not_reuse_one_that_began_before_its_failure() {
         tokio::spawn(async move { client.get(&healthy).await })
     };
     tokio::time::sleep(Duration::from_millis(150)).await;
-    nanocached::NODE_LIST_STALE_AFTER_MS.store(default_stale_after, Ordering::SeqCst);
+    client.set_node_list_stale_after_ms_for_test(DEFAULT_NODE_LIST_STALE_AFTER_MS);
 
     let started = Instant::now();
     assert!(client.set(&key, "v", 0).await.is_err());
