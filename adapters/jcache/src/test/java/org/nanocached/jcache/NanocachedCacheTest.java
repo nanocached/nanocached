@@ -1477,6 +1477,91 @@ class NanocachedCacheTest {
         assertEquals(List.of("UPDATED:k:new:old=?"), events);
     }
 
+    /** A value class whose static initializer fails when the system property
+     * is set: serialized while it is unset, then read back through a loader
+     * that defines the class afresh with it set, deserializing it throws
+     * {@link ExceptionInInitializerError} — a {@link LinkageError}, which
+     * {@code ValueCodec} does not wrap — as a redeploy that left a stored
+     * class unusable would. */
+    public static final class Poison implements java.io.Serializable {
+        static final String PROPERTY = "nanocached.test.poison";
+
+        static {
+            if (Boolean.getBoolean(PROPERTY)) {
+                throw new IllegalStateException("poisoned static initializer");
+            }
+        }
+    }
+
+    /** Defines {@link Poison} itself, so it is initialized again here. */
+    private static final class PoisonLoader extends ClassLoader {
+        PoisonLoader(ClassLoader parent) {
+            super(parent);
+        }
+
+        @Override
+        protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            if (!name.equals(Poison.class.getName())) {
+                return super.loadClass(name, resolve);
+            }
+            synchronized (getClassLoadingLock(name)) {
+                Class<?> loaded = findLoadedClass(name);
+                if (loaded == null) {
+                    try (java.io.InputStream in = Poison.class.getResourceAsStream(
+                            "/" + name.replace('.', '/') + ".class")) {
+                        byte[] bytes = in.readAllBytes();
+                        loaded = defineClass(name, bytes, 0, bytes.length);
+                    } catch (java.io.IOException e) {
+                        throw new ClassNotFoundException(name, e);
+                    }
+                }
+                return loaded;
+            }
+        }
+    }
+
+    // Issue #1550: the helpers that decode the previous value after the write
+    // caught RuntimeException only, so a LinkageError from the stored class
+    // still escaped put, putAll and remove after the write had landed.
+    @Test
+    void aLinkageErrorFromThePreviousValueDoesNotFailAWriteThatLanded() throws Exception {
+        byte[] poisoned;
+        try (java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+                java.io.ObjectOutputStream out = new java.io.ObjectOutputStream(bytes)) {
+            out.writeObject(new Poison());
+            out.flush();
+            poisoned = bytes.toByteArray();
+        }
+        Properties properties = new Properties();
+        properties.setProperty("nanocached.addresses", node.address());
+        CacheManager poisonManager = provider.getCacheManager(
+                URI.create("test:poison"), new PoisonLoader(getClass().getClassLoader()), properties);
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        config.setExpiryPolicyFactory(EternalExpiryPolicy.factoryOf());
+        Cache<String, String> target = poisonManager.createCache("poison", config);
+        List<String> events = listen(target);
+
+        System.setProperty(Poison.PROPERTY, "true");
+        try {
+            for (String key : List.of("put", "putAll", "remove")) {
+                node.store("poison").put(
+                        java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes(key)), new MockNode.Entry(poisoned, 60L));
+            }
+
+            target.put("put", "new");
+            target.putAll(Map.of("putAll", "new"));
+            target.remove("remove");
+
+            assertEquals("new", target.get("put"));
+            assertEquals("new", target.get("putAll"));
+            assertNull(node.entry("poison", KeyCodec.toKeyBytes("remove")), "the remove landed");
+            assertEquals(List.of("UPDATED:put:new:old=?", "UPDATED:putAll:new:old=?", "REMOVED:remove:old=?"), events);
+        } finally {
+            System.clearProperty(Poison.PROPERTY);
+        }
+    }
+
     private static final class UpdateDiffersPolicy implements ExpiryPolicy, java.io.Serializable {
         @Override
         public Duration getExpiryForCreation() {

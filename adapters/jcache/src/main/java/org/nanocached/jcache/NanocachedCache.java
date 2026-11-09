@@ -1102,9 +1102,10 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * for its own sake ({@code put}, {@code putAll}): the previous bytes
      * are decoded only when a listener is registered, and bytes that can
      * no longer be deserialized (a changed {@code serialVersionUID}, a
-     * class removed by a redeploy, a serial-filter rejection) fire the
-     * event without an old value instead of failing a write that has
-     * already landed. */
+     * class removed by a redeploy, a serial-filter rejection, a stored
+     * class whose static initializer fails — a {@link LinkageError}, which
+     * {@link ValueCodec} does not wrap) fire the event without an old
+     * value instead of failing a write that has already landed. */
     private void fireUpdatedFromBytes(K key, V value, byte[] oldBytes) {
         if (listeners.isEmpty()) {
             return;
@@ -1112,7 +1113,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         V oldValue;
         try {
             oldValue = decode(oldBytes);
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | LinkageError e) {
             logUndecodableOldValue(key, e);
             fireUpdatedWithoutOldValue(key, value);
             return;
@@ -1128,7 +1129,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         V oldValue;
         try {
             oldValue = decode(oldBytes);
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | LinkageError e) {
             logUndecodableOldValue(key, e);
             fireRemovedWithoutOldValue(key);
             return;
@@ -1136,7 +1137,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         fireRemoved(key, oldValue);
     }
 
-    private void logUndecodableOldValue(K key, RuntimeException e) {
+    private void logUndecodableOldValue(K key, Throwable e) {
         System.err.println("nanocached-jcache: previous value of " + key + " in " + name
                 + " cannot be deserialized; firing the event without an old value: " + e);
     }
