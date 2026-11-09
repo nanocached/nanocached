@@ -107,6 +107,14 @@ framework adapters at one version, whether or not a component changed.
   answered `En\n`, where a node answers `EnT\n` and a discovery server
   `EdT\n`. The proxy now echoes the `T` too, so a client reads the same
   reply whichever it dialed. A refused `A` without `T` is unchanged (#1398).
+- `nanocached-node`: a touch forwarded to a joiner goes out as the value
+  with its new TTL, in an `S`/`s` frame, and a value stored without a TTL
+  within a few bytes of the 1 MiB request limit grows by the TTL field when
+  one is added. The joiner refused that frame as over the limit (`En`, then
+  a close), all three attempts failed, and it kept the old TTL. A forwarded
+  write whose `S`/`s` frame would be over the limit now goes out as the `U`
+  frame, which has an allowance for exactly this kind of overhead; every
+  other forward is unchanged (#1536).
 - `nanocached-proxy`: a request whose declared size was over the 1 MiB
   limit was answered `E` and the connection closed at once, with the rest
   of the request still unread. Closing a socket with unread bytes sends a
