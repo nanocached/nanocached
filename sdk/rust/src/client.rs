@@ -2289,20 +2289,20 @@ impl NanocachedClient {
         ttl_seconds: u64,
     ) -> Result<()> {
         let key = key.as_ref();
+        let value = value.as_ref();
+        // Sized against the raw value, before compression, like
+        // `set_many` and the other SDKs: the budget bounds what the
+        // caller hands in, so it does not depend on how well a value
+        // happens to compress.
+        validate_key_and_value(namespace, key, value)?;
         let owned_compressed;
         let value: &[u8] = if self.inner.compress {
-            owned_compressed = crate::compression::compress_value(
-                value.as_ref(),
-                self.inner.compression_threshold,
-            );
+            owned_compressed =
+                crate::compression::compress_value(value, self.inner.compression_threshold);
             &owned_compressed
         } else {
-            value.as_ref()
+            value
         };
-        // Sized against what actually goes on the wire — the compressed
-        // form when compression is on — like the other SDKs, so a large
-        // but compressible value isn't refused for its raw size.
-        validate_key_and_value(namespace, key, value)?;
         self.before_operation().await?;
         self.with_cluster_retry(|| {
             self.write(
@@ -4325,17 +4325,17 @@ impl NanocachedClient {
         condition: CasCondition,
     ) -> Result<bool> {
         let key = key.as_ref();
+        let value = value.as_ref();
+        // Raw size, before compression — see `set_in`.
+        validate_key_and_value(namespace, key, value)?;
         let owned_compressed;
         let value: &[u8] = if self.inner.compress {
-            owned_compressed = crate::compression::compress_value(
-                value.as_ref(),
-                self.inner.compression_threshold,
-            );
+            owned_compressed =
+                crate::compression::compress_value(value, self.inner.compression_threshold);
             &owned_compressed
         } else {
-            value.as_ref()
+            value
         };
-        validate_key_and_value(namespace, key, value)?;
         self.before_operation().await?;
         self.with_cluster_retry(|| self.cas_set_once(namespace, key, value, ttl_seconds, condition))
             .await
