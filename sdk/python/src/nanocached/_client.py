@@ -2158,7 +2158,9 @@ class NanocachedClient:
         is retried — except with ``ttl_seconds == 0``, where a primary
         whose connection fails after the frame was written is not resent
         (issue #901) and the call raises that connection error, every
-        other key having been touched. In a cluster it goes to every owner of a key, the
+        other key having been touched (only the keys of the frame that was
+        being written count as lost; the frames of a chunked batch not yet
+        sent still go out). In a cluster it goes to every owner of a key, the
         primary's answer being the key's. A replica's failure or ``W`` is
         counted in stats().replica_write_failures and never fails the
         batch. Larger batches are transparently split into more than one
@@ -2263,7 +2265,7 @@ class NanocachedClient:
             return out
 
         if self._ring is None:
-            entries, error, failed_at = await self._multi_touch_chunked(
+            entries, error, failed_at, _sent_end = await self._multi_touch_chunked(
                 self._single_connection, namespace, key_bytes_list, ttl_seconds, get
             )
             resolved = len(key_bytes_list) if error is None else failed_at
@@ -2375,7 +2377,7 @@ class NanocachedClient:
         keys: list[bytes],
         ttl_seconds: int | None,
         get: bool,
-    ) -> tuple[list[object], BaseException | None, int]:
+    ) -> tuple[list[object], BaseException | None, int, int]:
         """_multi_get_chunked's twin for ``y``: one or more sub-frames
         against ``connection_getter`` for ``keys`` (already grouped to one
         owner, or the single/proxy target), split by _batch_chunk_bounds.
@@ -2384,7 +2386,15 @@ class NanocachedClient:
         those below ``failed_at`` (the index the failing chunk began at;
         len(keys) when none failed) are real answers: the rest were never
         reached, which no entry value can say, since a miss is a real
-        answer too."""
+        answer too.
+
+        The fourth element, ``sent_end``, is where the written frames end
+        (len(keys) when none failed; issue #1600): when the failing chunk's
+        frame was written (a ConnectionLostError; a failed dial or a write
+        that raised is not one) it is that chunk's end, otherwise the chunk
+        never left and it equals ``failed_at``. The positions from
+        ``failed_at`` up to ``sent_end`` are the failed chunk's; the ones
+        from ``sent_end`` on were never sent."""
         entries: list[object] = [None] * len(keys)
         bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], None)
         for start, end in bounds:
@@ -2396,9 +2406,9 @@ class NanocachedClient:
                 else:
                     chunk_entries = await connection.multi_touch(chunk, ttl_seconds, namespace)
             except _SWALLOWABLE_ERRORS as error:
-                return entries, error, start
+                return entries, error, start, end if isinstance(error, ConnectionLostError) else start
             entries[start:end] = chunk_entries
-        return entries, None, len(keys)
+        return entries, None, len(keys), len(keys)
 
     async def _multi_touch_pass(
         self,
@@ -2454,7 +2464,7 @@ class NanocachedClient:
             name: str, get_form: bool, leg_indices: list[int], is_primary: list[bool]
         ) -> list[int]:
             group_keys = [key_bytes_list[idx] for idx in leg_indices]
-            entries, error, failed_at = await self._multi_touch_chunked(
+            entries, error, failed_at, sent_end = await self._multi_touch_chunked(
                 lambda: self._member_connection(name), namespace, group_keys, ttl_seconds, get_form
             )
             resolved = len(leg_indices) if error is None else failed_at
@@ -2485,7 +2495,11 @@ class NanocachedClient:
                         state.wrong_node.add(idx)
                     else:
                         state.wrong_node.discard(idx)
-                        if lost_is_final:
+                        # Only the chunk whose frame was written may have
+                        # been applied (issue #1600): the chunks after it
+                        # never left, so they are retried like any other
+                        # unresolved key.
+                        if lost_is_final and pos < sent_end:
                             state.lost.add(idx)
                             continue
                     leg_retry.append(idx)
@@ -2532,7 +2546,7 @@ class NanocachedClient:
             return
 
         async def run_leg(name: str, leg_indices: list[int]) -> None:
-            entries, error, failed_at = await self._multi_touch_chunked(
+            entries, error, failed_at, _sent_end = await self._multi_touch_chunked(
                 lambda: self._member_connection(name),
                 namespace,
                 [key_bytes_list[idx] for idx in leg_indices],
