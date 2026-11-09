@@ -4135,11 +4135,15 @@ export class NanocachedClient {
     const nodeByName = new Map<string, DiscoveredNode>(nodes.map((node) => [node.name, node]));
     const members = new Map<string, ClusterMember>(currentMembers);
 
+    // Closed only after the new ring is installed below (issue #1615), not
+    // here: until then an operation routed to a departed node still finds
+    // its member in `this.target`, and with the connection already closed it
+    // would redial the node and store the new connection on a member the
+    // swap then orphans, leaving it open until the server's idle timeout.
+    const departed: ClusterMember[] = [];
     for (const [name, member] of currentMembers) {
       if (!nodeByName.has(name)) {
-        // `null` here just means this member never had a live connection
-        // (issue #67) — nothing to close.
-        member.connection?.close();
+        departed.push(member);
         members.delete(name);
       }
     }
@@ -4254,6 +4258,13 @@ export class NanocachedClient {
       replication: identified.replication,
     };
     this.nodeUrlList = nodes.filter((node) => members.has(node.name)).map((node) => node.address);
+
+    // Read here, after the swap, so a connection a concurrent operation
+    // redialed onto a departed member during the dials above is closed too;
+    // one that finishes later finds the member gone (memberConnection) and
+    // closes itself. `null` just means this member never had a live
+    // connection (issue #67) — nothing to close.
+    for (const member of departed) member.connection?.close();
 
     // A departed node's address is never reused (names/addresses are
     // per-process), so its per-address cooldown entry would otherwise linger
