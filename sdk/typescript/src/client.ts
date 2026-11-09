@@ -2290,18 +2290,38 @@ export class NanocachedClient {
       return this.decodeMany(await fetch);
     } catch (error) {
       if (error instanceof PartialWrongNodeError) {
-        throw new PartialWrongNodeError(this.decodeMany(error.partialValues as Map<string, Buffer>));
+        throw new PartialWrongNodeError(this.decodePartial(error.partialValues as Map<string, Buffer>));
       }
       if (error instanceof PartialConnectionLostError) {
-        throw new PartialConnectionLostError(this.decodeMany(error.partialValues as Map<string, Buffer>), error.message, {
+        throw new PartialConnectionLostError(this.decodePartial(error.partialValues as Map<string, Buffer>), error.message, {
           requestWasSent: error.requestWasSent,
         });
       }
       if (error instanceof PartialServerTooOldError) {
-        throw new PartialServerTooOldError(this.decodeMany(error.partialValues as Map<string, Buffer>));
+        throw new PartialServerTooOldError(this.decodePartial(error.partialValues as Map<string, Buffer>));
       }
       throw error;
     }
+  }
+
+  /** Decodes the values a partial-result error carries. Decoding is as
+   * strict as the success path's, but a stored value need not be valid
+   * UTF-8 (nothing on the write side enforces it), and a `TypeError`
+   * thrown here would replace the wrong-node or connection-loss error
+   * the caller needs. So a value the fatal decoder rejects is left out
+   * rather than handed back with replacement characters — a cache must
+   * never return a value it did not store; `getManyBytes` still has the
+   * exact bytes. */
+  private decodePartial(raw: Map<string, Buffer>): Map<string, string> {
+    const values = new Map<string, string>();
+    for (const [key, value] of raw) {
+      try {
+        values.set(key, UTF8_DECODER.decode(value));
+      } catch {
+        continue;
+      }
+    }
+    return values;
   }
 
   private decodeMany(raw: Map<string, Buffer>): Map<string, string> {
