@@ -9819,6 +9819,72 @@ async fn a_forced_refresh_does_not_reuse_one_that_began_before_its_failure() {
     stop_cluster(client, nodes, discovery).await;
 }
 
+#[tokio::test]
+async fn a_dropped_forced_refresh_does_not_make_a_queued_forced_caller_skip_its_own() {
+    // Y0's forced refresh is in flight (discovery answers slowly). Y1 and X
+    // fail meanwhile and queue behind it. Y1 gets the gate first, waits out
+    // the interval and starts a refresh, which is dropped by a timeout
+    // around Y1's call. X saw its failure before Y1's refresh began, so a
+    // refresh that never finished must not count as one that ran after it:
+    // X has to refresh itself, find the replacement of the dead node and
+    // reroute.
+    let (nodes, discovery, client, key) = dead_listed_primary().await;
+    let replacement = MockNode::start().await;
+    let before = discovery.l_requests.load(Ordering::SeqCst);
+
+    discovery.l_delay_ms.store(600, Ordering::SeqCst);
+    let y0 = {
+        let client = client.clone();
+        let key = key.clone();
+        tokio::spawn(async move { client.set(&key, "y0", 0).await })
+    };
+    while discovery.l_requests.load(Ordering::SeqCst) == before {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let y1 = {
+        let client = client.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(1800), client.set(&key, "y1", 0)).await
+        })
+    };
+    let x = {
+        let client = client.clone();
+        let key = key.clone();
+        tokio::spawn(async move { client.set(&key, "x", 0).await })
+    };
+
+    // Y0's refresh finishes (its roster still names the dead node).
+    assert!(y0.await.unwrap().is_err());
+    // From here on discovery lists the replacement; Y1's refresh, which
+    // begins after the interval, hangs on discovery until it is dropped.
+    *discovery.nodes.lock().unwrap() = vec![
+        (NAMES[0].to_string(), replacement.address()),
+        (NAMES[1].to_string(), node_named(&nodes, NAMES[1]).address()),
+    ];
+    discovery.l_delay_ms.store(10_000, Ordering::SeqCst);
+    while discovery.l_requests.load(Ordering::SeqCst) == before + 1 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    discovery.l_delay_ms.store(0, Ordering::SeqCst);
+
+    assert!(
+        y1.await.unwrap().is_err(),
+        "Y1's call should have been dropped by its timeout"
+    );
+    x.await.unwrap().unwrap();
+    assert!(replacement
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(key.as_bytes()));
+
+    replacement.stop();
+    stop_cluster(client, nodes, discovery).await;
+}
+
 // ── a stalled replica costs one request timeout, not two ──────────
 
 #[tokio::test]
