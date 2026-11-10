@@ -63,7 +63,21 @@ limit still has to hold for the longer frame; the proxy answers a bare
 to 1,048,512 bytes of namespace and key together, because the proxy sends
 its result to the replicas as a set, which carries the new value and the
 TTL that the <code>i</code> does not; a longer one closes the connection like
-any other request the proxy cannot accept. The frames only another node
+any other request the proxy cannot accept. An <code>o</code> or
+<code>y</code> is also limited by its namespace: the namespace length times
+the number of keys in the frame (all of them, whichever node they route to)
+may not exceed 64&nbsp;MiB (67,108,864). A node forwards each key of such a
+frame as a frame of its own while a join, a decommission or an eviction
+changes the cluster, and every one repeats the namespace, so without the limit
+a frame of 1&nbsp;MiB with a 500&nbsp;KB namespace and about 90,000 one-byte
+keys would make the node send tens of gigabytes. A frame over it is refused
+from its header, before its body is read, like any request the server cannot
+parse: a node answers <code>En\n</code> and closes the connection, the proxy
+answers a bare <code>E\n</code> and closes the client&rsquo;s connection
+without sending anything to a node. The limit does not depend on whether the
+cluster is changing. The SDKs send at most 400 keys in a frame, so they reach
+it only with a namespace over 167,772 bytes, and a namespace of 180 bytes or
+less cannot reach it at any frame size. The frames only another node
 sends (<code>U</code>, <code>u</code>, <code>f</code>) may exceed it by
 4 KiB: the <code>U</code> that moves a value to another node carries the
 receiver&rsquo;s token on top of what the client&rsquo;s <code>S</code>
@@ -621,8 +635,9 @@ being wrong for one key out of a thousand doesn't invalidate the other
 <p><code>n</code> is at least 1: an <code>n</code> of <code>0</code>, or a
 header that does not list exactly <code>n</code> lengths, is a malformed
 request (likewise for <code>o</code> below and <code>y</code> above). There is no
-upper bound of its own, only the request-size limit, which a frame of
-one-byte keys reaches at about 349,000 of them; the SDKs send at most 400
+upper bound of its own beyond the request-size limit, which a frame of
+one-byte keys reaches at about 349,000 of them, and, for <code>o</code> and
+<code>y</code>, the namespace limit above; the SDKs send at most 400
 keys in a frame. The reply header carries one token per key, so it grows
 with <code>n</code>. A key may appear more than once in a frame; every
 occurrence is handled on its own, in order, and answered at its own
@@ -670,18 +685,12 @@ for some subset of a batch refreshes its routing table and re-issues
 just those keys, exactly as it would for a single-key <code>G</code>/
 <code>S</code>'s own <code>W</code> — the rest of the batch's answers
 stand.</p>
-<p>One bound applies to <code>o</code> and <code>y</code> only while a
-join's, a decommission's or an eviction's re-replication forwarding window is
-open. The node passes each key it wrote or touched on to the joining or
-receiving node as a frame of its own, and each of those frames repeats the
-namespace, so a frame with a long namespace and many keys would make the node
-send the namespace once per key. A frame whose namespace length times its
-number of owned keys is over 64&nbsp;MiB is answered <code>En\n</code> and the
-connection closed, without applying any of it. A namespace of 180 bytes or less
-cannot reach the bound at any frame size. Through
-<code>nanocached-proxy</code> the refused frame closes the shared connection
-to that node, so the requests of other clients in flight on it fail, and the next one
-redials.</p>
+<p>Apart from that, an <code>o</code> (and a <code>y</code>) whose namespace
+length times its key count is over 64&nbsp;MiB is refused whole, not per key
+(see the limits at the top of this page). Through
+<code>nanocached-proxy</code> the sub-frames sent to the nodes carry the
+client&rsquo;s namespace and a subset of its keys, so they stay within it when
+the client&rsquo;s frame does.</p>
 <p>Through <code>nanocached-proxy</code>, a batch spanning multiple
 owners is split into one sub-frame per node and reassembled before
 answering the client — the one dispatch shape that turns a single

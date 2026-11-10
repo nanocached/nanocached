@@ -204,6 +204,21 @@ const INCR_RESULT_FRAME_OVERHEAD: usize = 64;
 /// write of its result must fit the node's request limit as well.
 const MAX_INCR_NAMESPACE_KEY_BYTES: usize = MAX_REQUEST_SIZE - INCR_RESULT_FRAME_OVERHEAD;
 
+/// Mirrors the node's `MAX_MULTI_NAMESPACE_KEY_BYTES`: the most a namespace's
+/// length times the number of keys of one `o` or `y` frame may come to. A
+/// node forwards each key of such a frame as a `U` of its own, repeating the
+/// namespace, while a join, a decommission or a re-replication window is
+/// open, and refuses a frame over the bound with `En` and a close, whether
+/// or not a window is open. That close would land on a backend connection
+/// every client of this proxy shares, so a frame over the bound is refused
+/// here, when its header is read: the client is answered `En` and its own
+/// connection is closed, like any other frame over a client limit, and
+/// nothing is sent to a backend. Every frame this proxy builds from a client
+/// frame (the per-owner `o`/`y` sub-frames, their retries after a `W`, the
+/// deferred legs of an expiring batch) carries the client's namespace and a
+/// subset of its keys, so it is within the bound when the client frame is.
+const MAX_MULTI_NAMESPACE_KEY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Mirrors the node's `MAX_MULTI_REPLY_VALUE_BYTES`: the most value bytes
 /// one `M` reply carries. A node's reply can legitimately exceed the 1 MiB
 /// request bound (a few large hits in one batch), so `read_reply` must
@@ -2224,6 +2239,11 @@ fn parse_request_body(
             if count == 0 {
                 return Err(invalid("bad multi-set header"));
             }
+            if namespace_length.saturating_mul(count) > MAX_MULTI_NAMESPACE_KEY_BYTES {
+                return Err(invalid(
+                    "multi-set namespace and key count exceed the limit",
+                ));
+            }
             let pairs_len = count
                 .checked_mul(2)
                 .ok_or_else(|| invalid("bad multi-set header"))?;
@@ -2529,6 +2549,11 @@ fn parse_request_body(
             let count = parse_length_field(count)?;
             if count == 0 || tail.len() < count {
                 return Err(invalid("bad multi-touch header"));
+            }
+            if namespace_length.saturating_mul(count) > MAX_MULTI_NAMESPACE_KEY_BYTES {
+                return Err(invalid(
+                    "multi-touch namespace and key count exceed the limit",
+                ));
             }
             let (key_length_fields, tail) = tail.split_at(count);
             let (tail, get) = match tail {
@@ -11109,6 +11134,27 @@ mod tests {
             .collect()
     }
 
+    /// The node's own `MAX_MULTI_NAMESPACE_KEY_BYTES`, written out so that the
+    /// mock enforces it whatever the proxy's mirror of it says.
+    const NODE_MULTI_NAMESPACE_KEY_BYTES: usize = 64 * 1024 * 1024;
+
+    /// What a real node does with an `o` or `y` whose namespace length times
+    /// its key count is over `NODE_MULTI_NAMESPACE_KEY_BYTES`: the untagged
+    /// `En\n` and the close, whatever else is queued behind the frame on the
+    /// connection. The mock's `get_delay` (if set) passes first, so a test
+    /// can put other clients' requests on the connection before the close.
+    async fn refuse_over_the_namespace_bound(
+        stream: &mut TcpStream,
+        delay: &Arc<StdMutex<Duration>>,
+    ) -> io::Result<()> {
+        let pause = *delay.lock().unwrap();
+        if !pause.is_zero() {
+            sleep(pause).await;
+        }
+        stream.write_all(b"En\n").await?;
+        stream.shutdown().await
+    }
+
     async fn serve_mock_node(mut stream: TcpStream, state: MockNodeState) {
         let MockNodeState {
             store,
@@ -11310,6 +11356,10 @@ mod tests {
                         let ns_length: usize = fields[0].parse().unwrap();
                         let count: usize = fields[1].parse().unwrap();
                         multi_set_sizes.lock().unwrap().push(count);
+                        if ns_length.saturating_mul(count) > NODE_MULTI_NAMESPACE_KEY_BYTES {
+                            refuse_over_the_namespace_bound(&mut stream, &delay).await?;
+                            return Ok(());
+                        }
                         let mut pairs = Vec::with_capacity(count);
                         for pair in 0..count {
                             let key_length: usize = fields[2 + pair * 2].parse().unwrap();
@@ -11652,6 +11702,11 @@ mod tests {
                     "y" => {
                         let ns_length: usize = fields[0].parse().unwrap();
                         let count: usize = fields[1].parse().unwrap();
+                        if ns_length.saturating_mul(count) > NODE_MULTI_NAMESPACE_KEY_BYTES {
+                            multi_set_sizes.lock().unwrap().push(count);
+                            refuse_over_the_namespace_bound(&mut stream, &delay).await?;
+                            return Ok(());
+                        }
                         let key_lengths: Vec<usize> = fields[2..2 + count]
                             .iter()
                             .map(|field| field.parse().unwrap())
@@ -13073,6 +13128,146 @@ mod tests {
         let frame = format!("G {}\n{key}", key.len());
         stream.write_all(frame.as_bytes()).await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+    }
+
+    /// An `o` of `keys` one-byte-value keys (`k0`, `k1`, ...) under a
+    /// `namespace_len`-byte namespace, untagged, as a client sends it.
+    fn big_namespace_multi_set(namespace_len: usize, keys: usize) -> Vec<u8> {
+        let names: Vec<String> = (0..keys).map(|index| format!("k{index}")).collect();
+        let lens: Vec<String> = names
+            .iter()
+            .map(|name| format!("{} 1", name.len()))
+            .collect();
+        let mut frame = format!("o {namespace_len} {keys} {}\n", lens.join(" ")).into_bytes();
+        frame.extend(std::iter::repeat_n(b'n', namespace_len));
+        for name in &names {
+            frame.extend_from_slice(name.as_bytes());
+            frame.push(b'v');
+        }
+        frame
+    }
+
+    /// `big_namespace_multi_set` for a `y` with a TTL (`ttl` seconds).
+    fn big_namespace_multi_touch(namespace_len: usize, keys: usize, ttl: u64) -> Vec<u8> {
+        let names: Vec<String> = (0..keys).map(|index| format!("k{index}")).collect();
+        let lens: Vec<String> = names.iter().map(|name| name.len().to_string()).collect();
+        let mut frame = format!("y {namespace_len} {keys} {} {ttl}\n", lens.join(" ")).into_bytes();
+        frame.extend(std::iter::repeat_n(b'n', namespace_len));
+        for name in &names {
+            frame.extend_from_slice(name.as_bytes());
+        }
+        frame
+    }
+
+    /// 300,000 x 224 keys is 67,200,000, over `MAX_MULTI_NAMESPACE_KEY_BYTES`
+    /// (67,108,864); 223 keys (66,900,000) are under it.
+    const BIG_NAMESPACE: usize = 300_000;
+
+    /// An `o` or `y` over the bound is refused to its client as any frame
+    /// over a client limit is (`En`, and that client's own connection
+    /// closed), and no backend receives it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_over_the_namespace_bound_is_refused_and_no_backend_receives_it() {
+        for touch in [false, true] {
+            let (nodes, proxy) = cluster(1).await;
+            let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+            let frame = if touch {
+                big_namespace_multi_touch(BIG_NAMESPACE, 224, 60)
+            } else {
+                big_namespace_multi_set(BIG_NAMESPACE, 224)
+            };
+            let _ = stream.write_all(&frame).await;
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+            sleep(Duration::from_millis(200)).await;
+            assert!(
+                nodes[0].multi_set_sizes().is_empty(),
+                "touch={touch}: a backend received the frame"
+            );
+            assert!(nodes[0].touches().is_empty());
+            assert_eq!(nodes[0].len(), 0);
+        }
+    }
+
+    /// The `En` and close a node answers such a frame with would land on the
+    /// backend connection every client shares, and fail what other clients
+    /// have behind the frame on it. Here the node takes 400 ms to refuse; a
+    /// second client's `i` (never resent after it was written) goes out
+    /// meanwhile. With the proxy refusing the frame itself, the `i` is
+    /// answered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_multi_key_frame_does_not_fail_another_clients_request_on_the_backend() {
+        for touch in [false, true] {
+            let node = MockNode::start().await;
+            let roster = vec![("node-a".to_string(), node.addr.clone())];
+            let discovery = start_mock_discovery(roster, 1).await;
+            let proxy = start_proxy(&discovery, None, 16).await;
+            *node.get_delay.lock().unwrap() = Duration::from_millis(400);
+
+            let (mut other, mut other_buf) = connect_and_auth(&proxy).await;
+            // Dialed and in use before the big frame: it is the same shared
+            // connection the big frame would go out on.
+            other.write_all(b"S 7 1\ncounter1").await.unwrap();
+            assert_eq!(read_line(&mut other, &mut other_buf).await.unwrap(), "S");
+
+            let (mut big, mut big_buf) = connect_and_auth(&proxy).await;
+            let frame = if touch {
+                big_namespace_multi_touch(BIG_NAMESPACE, 224, 60)
+            } else {
+                big_namespace_multi_set(BIG_NAMESPACE, 224)
+            };
+            let _ = big.write_all(&frame).await;
+            sleep(Duration::from_millis(100)).await;
+
+            other.write_all(b"i 0 7 5\ncounter").await.unwrap();
+            let answer = timeout(
+                Duration::from_secs(5),
+                read_line(&mut other, &mut other_buf),
+            )
+            .await
+            .expect("the other client was left waiting")
+            .unwrap();
+            assert_eq!(answer, "I 1", "touch={touch}");
+            assert_eq!(read_line(&mut big, &mut big_buf).await.unwrap(), "E");
+        }
+    }
+
+    /// A frame just under the bound is carried out whole: every frame the
+    /// proxy builds from it (the per-owner sub-frames of an `o`, the primary
+    /// legs and the deferred plain legs of a `y` that expires its keys) is
+    /// within the bound as well, which the mock nodes enforce as a real node
+    /// does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_just_under_the_namespace_bound_and_its_sub_frames_are_accepted() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream
+            .write_all(&big_namespace_multi_set(BIG_NAMESPACE, 223))
+            .await
+            .unwrap();
+        let line = read_line(&mut stream, &mut buf).await.unwrap();
+        assert!(
+            line.starts_with("O 223 S"),
+            "{}",
+            &line[..line.len().min(20)]
+        );
+        for node in &nodes {
+            assert!(node.multi_set_sizes().iter().all(|&keys| keys <= 223));
+            assert!(!node.multi_set_sizes().is_empty());
+        }
+
+        for ttl in [0, 60] {
+            stream
+                .write_all(&big_namespace_multi_touch(BIG_NAMESPACE, 223, ttl))
+                .await
+                .unwrap();
+            let line = read_line(&mut stream, &mut buf).await.unwrap();
+            assert!(
+                line.starts_with("Y 223 "),
+                "ttl={ttl}: {}",
+                &line[..line.len().min(20)]
+            );
+        }
     }
 
     // Issue #150: multi-set through the proxy.

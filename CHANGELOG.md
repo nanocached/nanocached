@@ -45,19 +45,25 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
-- `nanocached-node`: one `o` or `y` frame during a join's, a decommission's
-  or an eviction's forwarding window was forwarded as one `U` per key, each
-  repeating the whole namespace. A frame of up to 1 MiB with a 500 KB
-  namespace and about 90,000 one-byte keys made the node send about 45 GB to
-  each forward target, one `U` at a time on the target's single connection,
-  with every later forward to that target waiting behind it (a 5.8 KB frame
-  with a 4 KB namespace and 200 keys sent 824 KB). While a window is open, an
-  `o` or `y` whose namespace length times its number of owned keys is over
-  64 MiB is now answered `En\n` before anything is applied, and the
-  connection is closed; outside a window, and for a namespace of 180 bytes
-  or less at any frame size, nothing changes. The forwarded frames are the
-  `U` frames the previous release already accepts, so a rolling upgrade is
-  unaffected (#1665).
+- New protocol limit, `nanocached-node` and `nanocached-proxy`: an `o` or `y`
+  whose namespace length times its number of keys is over 64 MiB (67,108,864)
+  is refused from its header: a node answers `En\n` and closes the
+  connection, the proxy answers `E\n` and closes the client's connection
+  without sending anything to a node. The limit applies always, not only
+  while the cluster changes. During a join, a decommission or an eviction's
+  re-replication each key of an `o` or `y` is forwarded as a `U` of its own,
+  and every `U` repeats the namespace, so one frame of up to 1 MiB with a
+  500 KB namespace and about 90,000 one-byte keys made the node send about
+  45 GB to each forward target, one `U` at a time on the target's single
+  connection, with every later forward to that target waiting behind it (a
+  5.8 KB frame with a 4 KB namespace and 200 keys sent 824 KB). The limit
+  caps what one frame can ask for at about 64 times its size. The SDKs send
+  at most 400 keys in a frame and reach it only with a namespace over
+  167,772 bytes; a namespace of 180 bytes or less cannot reach it at any frame
+  size. The forwarded frames are the `U` frames the previous release already
+  accepts, so a rolling upgrade is unaffected, and the proxy refuses such a
+  frame itself so the node's close never lands on a backend connection other
+  clients share (#1665).
 
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
   `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`

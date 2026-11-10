@@ -17,6 +17,24 @@ use std::time::Duration;
 /// well under the SDKs' 64 MiB multi-get response cap.
 pub const MAX_MULTI_REPLY_VALUE_BYTES: usize = 16 * 1024 * 1024;
 
+/// The most a namespace's length times the number of keys of one `o` or `y`
+/// frame may come to. During a join, a decommission or an eviction's
+/// re-replication the node passes each key of such a frame on as a `U` of its
+/// own, and every `U` repeats the namespace, so a frame of at most
+/// `MAX_REQUEST_SIZE` bytes with a 500 KB namespace and about 90,000 one-byte
+/// keys made the node send about 45 GB to each forward target, one `U` at a
+/// time on the target's single connection. The limit is the frame's own, not
+/// the forwarding window's, so a frame that works on an ordinary day does not
+/// fail during a scale event: a frame over it is refused when its header is
+/// read, with the `En` and close of any other request the node will not run.
+/// The product is at most 64 times the largest frame, and the SDKs, which
+/// send at most 400 keys per frame, reach it only with a namespace over
+/// 167,772 bytes. The proxy mirrors this constant
+/// (`MAX_MULTI_NAMESPACE_KEY_BYTES` in `nanocached-proxy.rs`) and refuses
+/// such a frame from its client itself, so that the `En` and close never land
+/// on a backend connection that other clients share.
+pub const MAX_MULTI_NAMESPACE_KEY_BYTES: usize = 64 * 1024 * 1024;
+
 /// The most entries a roster can hold: `nanocached-discovery`'s registry
 /// size (`MAX_REGISTRY_SIZE`), which bounds every `L`, `T`, heartbeat-ack
 /// and `M` roster it sends (the binaries share no modules by design, so the
@@ -1173,7 +1191,8 @@ fn parse_with_mode(
             let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
             let count = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
 
-            if count == 0 {
+            if count == 0 || namespace_length.saturating_mul(count) > MAX_MULTI_NAMESPACE_KEY_BYTES
+            {
                 return Err(ParseError::InvalidLength);
             }
 
@@ -1251,7 +1270,8 @@ fn parse_with_mode(
             let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
             let count = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
 
-            if count == 0 {
+            if count == 0 || namespace_length.saturating_mul(count) > MAX_MULTI_NAMESPACE_KEY_BYTES
+            {
                 return Err(ParseError::InvalidLength);
             }
 
@@ -4882,6 +4902,48 @@ mod tests {
 
         assert_eq!(response.encode(), b"M 3 2 - W\nab");
         assert_eq!(response.encode_with_tag(9), b"M 3 2 - W 9\nab");
+    }
+
+    /// The header of an `o` or `y` of `keys` one-byte keys under a namespace
+    /// of `namespace_len` bytes, no body.
+    fn multi_header(command: char, namespace_len: usize, keys: usize) -> BytesMut {
+        let mut header = format!("{command} {namespace_len} {keys}");
+        for _ in 0..keys {
+            header.push_str(if command == 'o' { " 1 0" } else { " 1" });
+        }
+        header.push('\n');
+        buf(header.as_bytes())
+    }
+
+    /// A namespace length times a key count over `MAX_MULTI_NAMESPACE_KEY_BYTES`
+    /// is refused as soon as the header is read; at the bound the frame is
+    /// only waiting for its body.
+    #[test]
+    fn an_o_or_y_header_over_the_namespace_bound_is_refused_and_at_it_is_not() {
+        // 4,096 x 16,384 = 2^26.
+        for command in ['o', 'y'] {
+            assert_eq!(MAX_MULTI_NAMESPACE_KEY_BYTES, 4096 * 16_384);
+            assert_eq!(
+                parse(&mut multi_header(command, 4096, 16_384 + 1)),
+                Err(ParseError::InvalidLength),
+                "{command}"
+            );
+            assert_eq!(
+                parse(&mut multi_header(command, 4097, 16_384)),
+                Err(ParseError::InvalidLength),
+                "{command}"
+            );
+            assert_eq!(
+                parse(&mut multi_header(command, usize::MAX / 2, 3)),
+                Err(ParseError::InvalidLength),
+                "{command}"
+            );
+            assert_eq!(
+                parse(&mut multi_header(command, 4096, 16_384)),
+                Err(ParseError::Incomplete),
+                "{command}"
+            );
+        }
     }
 
     // Issue #150: `o` (multi-set).
