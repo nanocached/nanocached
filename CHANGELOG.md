@@ -54,10 +54,11 @@ framework adapters at one version, whether or not a component changed.
   lines on the pipe and no marker, and on a loaded host 2 of 500 nodes killed
   right after an acknowledgement had lost that increment's line. `chaos.sh`
   now records each SIGKILL (`killed.txt`) and `incrtrace.py --killed` does not
-  count a step when a kill came before it and the increments the loader sent
-  without a traced application cover what the key's steps jump over; it
-  prints it as `NOWHERE_AFTER_KILL` (`value_from_nowhere_after_kill`). A step
-  the loader's counts cannot account for still fails the run. The node keeps
+  count a step when the node that applied the last traced increment before it
+  was killed between the two and the increments the loader sent without a
+  traced application cover what the key's steps jump over; it prints it as
+  `NOWHERE_AFTER_KILL` (`value_from_nowhere_after_kill`). A step no kill and
+  no unmatched increment accounts for still fails the run. The node keeps
   its queue and writer thread, so a stalled stderr reader still cannot stop
   the runtime (#1666).
 

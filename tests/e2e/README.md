@@ -121,8 +121,9 @@ missing line from a phantom, so it reports `trace_lines_dropped` and leaves
 are lost with no such line, and the replica that takes over then serves an
 increment from a value no traced increment produced. `chaos.sh` writes each
 kill to `killed.txt` and `incrtrace.py --killed` does not count such a step
-when a kill came before it and the loader sent at least as many increments
-without a traced application as the step jumps over (printed as
+when the node that applied the last traced increment before it was killed
+between the two and the loader sent at least as many increments without a
+traced application as the step jumps over (printed as
 `NOWHERE_AFTER_KILL`, `value_from_nowhere_after_kill`); a step the loader's
 counts cannot account for still fails the run. `incrtrace_selftest.py` checks
 this on hand-made logs. With the node built without the feature the check

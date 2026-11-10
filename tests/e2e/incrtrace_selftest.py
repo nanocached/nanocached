@@ -58,7 +58,7 @@ class IncrTrace(unittest.TestCase):
         summary = self.run_incrtrace(n1, n2, acked=7)
         self.assertEqual(summary["value_from_nowhere"], 1)
 
-    def test_a_kill_and_an_acknowledged_increment_without_a_line_excuse_it(self):
+    def test_a_kill_of_the_node_that_applied_the_last_traced_increment_excuses_it(self):
         n1, n2 = self.lost_tail()
         summary = self.run_incrtrace(n1, n2, acked=7, kills=[("nch-n1", 10)])
         self.assertEqual(summary["value_from_nowhere"], 0)
@@ -75,6 +75,19 @@ class IncrTrace(unittest.TestCase):
     def test_a_kill_after_the_increment_does_not_excuse_it(self):
         n1, n2 = self.lost_tail()
         summary = self.run_incrtrace(n1, n2, acked=7, kills=[("nch-n1", 60)])
+        self.assertEqual(summary["value_from_nowhere"], 1)
+
+    def test_a_kill_of_another_node_does_not_excuse_it(self):
+        n1, n2 = self.lost_tail()
+        summary = self.run_incrtrace(n1, n2, acked=7, kills=[("nch-n2", 10)])
+        self.assertEqual(summary["value_from_nowhere"], 1)
+
+    def test_a_kill_of_the_same_node_before_its_last_increment_does_not_excuse_it(self):
+        # n1 was killed at +2 s and restarted (same log file); its increments
+        # at +3 s and +4 s are from the new incarnation, so nothing was queued
+        # when the old one died that could account for the step at +20 s.
+        n1, n2 = self.lost_tail()
+        summary = self.run_incrtrace(n1, n2, acked=7, kills=[("nch-n1", 2)])
         self.assertEqual(summary["value_from_nowhere"], 1)
 
     def test_a_jump_larger_than_the_missing_lines_is_not_excused(self):

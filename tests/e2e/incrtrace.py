@@ -55,12 +55,19 @@ lines on the pipe and no marker; on a loaded host 2 of 500 nodes killed right
 after an acknowledgement had lost that increment's line.) The replica that
 takes over then serves an increment whose old value no traced increment
 produced. With `--killed FILE` (one `<node> <epoch seconds>` line per SIGKILL,
-written by chaos.sh) a NOWHERE row is not counted when a kill came before it
-and the loader's own counts leave room for the missing lines: the key's
-acknowledged + maybe increments minus the traced ones is at least what the
-key's NOWHERE rows jump over. Those rows are printed as NOWHERE_AFTER_KILL and
-counted in value_from_nowhere_after_kill. A jump that no increment the loader
-sent can account for stays value_from_nowhere.
+written by chaos.sh) a NOWHERE row is not counted when both hold:
+ - the node that applied the last traced increment before the row (the one
+   that produced the highest value so far, whose queue would have held the
+   missing lines) was killed after that increment (less the slack) and before
+   the row (plus the slack): a kill of another node, or of the same node
+   before that increment (an earlier incarnation: a restarted container logs
+   to the same file), does not count;
+ - the loader's own counts leave room for the missing lines: the key's
+   acknowledged + maybe increments minus the traced ones is at least what the
+   key's NOWHERE rows jump over.
+Those rows are printed as NOWHERE_AFTER_KILL and counted in
+value_from_nowhere_after_kill. A jump that no kill and no increment the
+loader sent can account for stays value_from_nowhere.
 
 The last line is a JSON summary; chaos.sh asserts over_applied and
 value_from_nowhere. Above it, the full timeline of each offending key.
@@ -94,12 +101,12 @@ def parse_ts(s):
     return t.timestamp() + int(frac) / 1e6
 
 
-kill_times = []
+kills = []
 if a.killed:
     for line in open(a.killed):
         fields = line.split()
         if len(fields) == 2:
-            kill_times.append(float(fields[1]))
+            kills.append((fields[0], float(fields[1])))
 
 state = json.load(open(a.state))
 n_keys = state["n"]
@@ -149,9 +156,10 @@ for key, evs in events.items():
     incrs_by_key[key] = incrs
     for i, (t, ts, node, old, new) in enumerate(incrs):
         # the largest value any other increment had produced by t + slack
-        produced = [n2 for j, (t2, _, _, _, n2) in enumerate(incrs) if j != i and t2 <= t + a.slack]
-        if produced and old > max(produced):
-            nowhere.append({"key": key, "at": ts, "node": node, "old": old, "max_produced": max(produced), "t": t})
+        produced = [(n2, t2, node2) for j, (t2, _, node2, _, n2) in enumerate(incrs) if j != i and t2 <= t + a.slack]
+        if produced and old > max(n2 for n2, _, _ in produced):
+            top, top_t, top_node = max(produced, key=lambda p: (p[0], p[1]))
+            nowhere.append({"key": key, "at": ts, "node": node, "old": old, "max_produced": top, "t": t, "top_t": top_t, "top_node": top_node})
         if i > 0 and new - incrs[i - 1][4] >= 2:
             jumps.append({"key": key, "from": {"at": incrs[i - 1][1], "node": incrs[i - 1][2], "new": incrs[i - 1][4]},
                           "to": {"at": ts, "node": node, "old": old, "new": new}})
@@ -187,18 +195,23 @@ if hist:
             else:
                 used.add(best[1])
 
-# Rows a SIGKILL can explain: a kill came before the row, and the increments
-# the loader sent without a traced application cover what the key's rows jump
-# over. Nothing else accounts for a value nobody produced.
+# Rows a SIGKILL can explain: the node that applied the last traced increment
+# was killed between it and the row, and the increments the loader sent
+# without a traced application cover what the key's rows jump over. Nothing
+# else accounts for a value nobody produced.
 after_kill = []
-if kill_times:
+if kills:
     jumped = collections.Counter()
     for row in nowhere:
         jumped[row["key"]] += row["old"] - row["max_produced"]
     for row in list(nowhere):
         i = int(row["key"][2:])
         room = state["acked"]["s"][i] + state["maybe"]["s"][i] - apps[row["key"]]
-        if min(kill_times) <= row["t"] + a.slack and jumped[row["key"]] <= room:
+        killed_between = any(
+            name == row["top_node"] and row["top_t"] - a.slack <= at <= row["t"] + a.slack
+            for name, at in kills
+        )
+        if killed_between and jumped[row["key"]] <= room:
             nowhere.remove(row)
             after_kill.append(row)
 
@@ -219,9 +232,9 @@ for row in over:
 for row in under[:20]:
     print("UNDER", json.dumps(row))
 for row in nowhere:
-    print("NOWHERE", json.dumps({k: v for k, v in row.items() if k != "t"}))
+    print("NOWHERE", json.dumps({k: v for k, v in row.items() if k not in ("t", "top_t", "top_node")}))
 for row in after_kill:
-    print("NOWHERE_AFTER_KILL", json.dumps({k: v for k, v in row.items() if k != "t"}))
+    print("NOWHERE_AFTER_KILL", json.dumps({k: v for k, v in row.items() if k not in ("t", "top_t")}))
 for row in jumps[:20]:
     print("JUMP", json.dumps(row))
 for row in unmatched[:20]:
