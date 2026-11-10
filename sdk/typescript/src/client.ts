@@ -3,7 +3,7 @@ import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
 import { Connection, ConnectionLostError, CounterOutOfRangeError, isConnectionError, wasRejectedByServer, WrongNodeError } from "./connection.js";
 import { ServerTooOldError } from "./connection.js";
-import { connectAndIdentify, connectAndListProxies, HandshakeProtocolError, type DiscoveredNode, type IdentifyOptions, type IdentifyResult } from "./identify.js";
+import { connectAndIdentify, connectAndListProxies, HandshakeError, type DiscoveredNode, type IdentifyOptions, type IdentifyResult } from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue, DecompressionError, maxMultiGetDecompressedBytes } from "./compression.js";
 import { NanocachedError } from "./errors.js";
@@ -152,9 +152,10 @@ function isSwallowable(error: unknown): boolean {
 
 /** `connectAndIdentify` for the paths that dial a member after the client
  * is up (a redial, a refresh's dial of a freshly listed node). An address
- * that answers the `A` handshake with something that is no handshake reply
- * (an HTTP server's `400 Bad Request`) fails there with a
- * `HandshakeProtocolError`; that is raised before any frame of the caller's
+ * that does not complete the `A` handshake — it answers with something that
+ * is no handshake reply (an HTTP server's `400 Bad Request`) or accepts the
+ * connection and closes it — fails there with a `HandshakeError`; that is
+ * raised before any frame of the caller's
  * request exists, so it is re-tagged as the connection-classified, never-sent
  * `ConnectionLostError` that the refresh-and-retry layer reroutes (even a
  * non-idempotent op), exactly like an address that answers as a non-node.
@@ -165,7 +166,7 @@ async function dialMember(options: IdentifyOptions): Promise<IdentifyResult> {
   try {
     return await connectAndIdentify(options);
   } catch (error) {
-    if (!(error instanceof HandshakeProtocolError)) throw error;
+    if (!(error instanceof HandshakeError)) throw error;
     throw new ConnectionLostError(error.message, { requestWasSent: false, cause: error });
   }
 }
