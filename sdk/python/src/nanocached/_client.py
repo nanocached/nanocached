@@ -64,6 +64,7 @@ from ._hashring import HashRing
 from ._identify import (
     ClusterTarget,
     DiscoveredNode,
+    HandshakeProtocolError,
     NodeTarget,
     connect_and_identify,
     connect_and_identify_proxy,
@@ -79,6 +80,26 @@ from ._identify import (
 # stuck refresh; see _connection.py and _identify.py for what this SDK's
 # own code actually raises.
 _SWALLOWABLE_ERRORS = (NanocachedError, ConnectionError, OSError)
+
+
+def _handshake_failure_as_connect_failed(address: str, error: BaseException) -> BaseException:
+    """For a failure to open a connection that a request is waiting for (a
+    redial, a refresh-time dial, a reconnect to another proxy): a protocol
+    error raised while the handshake was still running (an address that
+    answers ``A`` with something that is not a handshake reply, such as a
+    web server's HTTP 400) becomes a ``ConnectFailedError``, as for a dead
+    address or one that is no longer a node. No request frame exists at that
+    point, and a node-list refresh cures an address that discovery has since
+    dropped, which ``_with_wrong_node_retry`` only attempts for a
+    ``ConnectionError``. Every other error is returned as it was. Not for
+    ``connect()``'s own dial round, which raises what the handshake raised,
+    nor for an error from an established connection (there a request was
+    written)."""
+    if not isinstance(error, HandshakeProtocolError):
+        return error
+    failure = ConnectFailedError(f"nanocached: {address} did not complete the handshake: {error}")
+    failure.__cause__ = error
+    return failure
 
 
 class _MultiSetTracker:
@@ -1000,9 +1021,12 @@ class NanocachedClient:
         for node, outcome in outcomes:
             if isinstance(outcome, Exception):
                 self._members[node.name] = _Member(node.address, None)
+                # What connect() raises (last_error) stays what the handshake
+                # raised; the entry is what an operation routed to the
+                # address will see.
                 self._redial_cooldowns[node.address] = (
                     time.monotonic() + self._reconnect_cooldown,
-                    outcome,
+                    _handshake_failure_as_connect_failed(node.address, outcome),
                 )
                 last_error = outcome
                 continue
@@ -3689,7 +3713,7 @@ class NanocachedClient:
         node_host, node_port = split_host_port(address)
         try:
             identified = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
-        except (NanocachedError, OSError):
+        except (NanocachedError, OSError) as error:
             # SDK proxy mode (issue #122) reconnect: this is only ever
             # reached via _redial("", self._single_address) — "first
             # retry the same proxy (it may have restarted)" — so a dial
@@ -3702,8 +3726,14 @@ class NanocachedClient:
             # matching only the pinned address keeps that assumption from
             # silently mattering here.
             if self._via_proxy and address == self._single_address:
-                return await self._reconnect_via_new_proxy()
-            raise
+                try:
+                    return await self._reconnect_via_new_proxy()
+                except HandshakeProtocolError as proxy_error:
+                    raise _handshake_failure_as_connect_failed(address, proxy_error) from proxy_error
+            converted = _handshake_failure_as_connect_failed(address, error)
+            if converted is error:
+                raise
+            raise converted from error
         if not isinstance(identified, NodeTarget):
             raise ConnectFailedError(f"nanocached: {address} no longer identifies as a cache node")
         if self._closed:
@@ -3812,7 +3842,7 @@ class NanocachedClient:
                 # caller over a refresh-time connect failure. A genuine
                 # programming error (anything outside _SWALLOWABLE_ERRORS)
                 # still propagates and fails this refresh.
-                return node, error
+                return node, _handshake_failure_as_connect_failed(node.address, error)
             return node, target
 
         # Dialed concurrently, like _open_cluster (issue #190) — a
