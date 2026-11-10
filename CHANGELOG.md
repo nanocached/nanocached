@@ -52,11 +52,17 @@ framework adapters at one version, whether or not a component changed.
   advertised port (or any holder of the auth secret sharing its source IP)
   took the live member out of the roster at once, and its next `P` was
   answered `G`: the node dropped its cache and joined again. The old name is
-  now replaced only when it has sent no heartbeat or announce for
-  `CONTACT_BREAK` (9 s, the age at which a missed heartbeat is recorded);
-  otherwise the new name waits its turn and the old one times out as it did
-  before #1616. A restart faster than that still waits for the old name's
-  liveness timeout (#1663).
+  now replaced at once only when it has sent no heartbeat or announce for
+  `CONTACT_BREAK` (9 s, the age at which a missed heartbeat is recorded). A
+  member heard from more recently leaves the collision undecided: the new
+  name's join is held, and the sweep decides. The old name is replaced as
+  soon as it has been silent for `CONTACT_BREAK`, so a node restarted
+  within a few seconds still gets the join without the refused `M` and the
+  second handoff (#1616), or, if the old name is heard from again, it stays
+  and the new name joins as before #1616. The hold lasts at most
+  `CONTACT_BREAK` from the old name's last heartbeat, holds up the names
+  queued behind it for that long, and is not decided on a sweep that
+  follows a pause of discovery (#1663).
 
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
   `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`

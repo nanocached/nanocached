@@ -264,13 +264,18 @@ reads in flight to a healthy owner does not count.</p>
 network address — routing hashes the name, connections use the address —
 so a node restarting on the same address is correctly treated as a new
 member. When it registers while the old name still holds that address as a
-member and has sent no heartbeat for about two heartbeat intervals (9 s),
-discovery drops the old name at once, instead of waiting for the rest of
-its liveness timeout: a handoff asked of that address would reach the new
-node itself. A registration from the address of a member that is still
-heartbeating removes nothing. The new name waits its turn, and the member
-stays until its own heartbeats stop, so a second process started by
-mistake with a live node&rsquo;s advertised port cannot evict it.</p>
+member, discovery drops the old name at once if it has sent no heartbeat for
+about two heartbeat intervals (9 s), instead of waiting for the rest of its
+liveness timeout: a handoff asked of that address would reach the new node
+itself. If the old name was heard from more recently, the collision is
+undecided: the new node&rsquo;s join is held, and the nodes queued behind it
+wait too. The old name is dropped as soon as it has been silent for 9 s,
+which is what a restart looks like, and the join then starts without it. If
+the old name is heard from again, the address is shared by two live
+processes: the old name stays, and the new one joins as it would have
+without the replacement. The hold ends at most 9 s after the old
+name&rsquo;s last heartbeat, and a pause of discovery itself does not count
+towards that silence.</p>
 
 <h2>Joining a node: staged handoff</h2>
 <p>Adding a node must not drop the keys it takes ownership of, so joins
