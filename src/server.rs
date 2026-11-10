@@ -886,8 +886,10 @@ const FORWARD_ENTRY_OVERHEAD_BYTES: usize = 320;
 /// later forward to that target waiting behind it. A frame over this bound
 /// is refused while a window is open instead of being applied and
 /// forwarded. The bound is `MAX_FORWARD_QUEUE_BYTES`, about 64 times what a
-/// maximal frame can hold, and a frame of namespaces that are tens of
-/// bytes long stays under it by two orders of magnitude.
+/// maximal frame can hold. A frame is at most `MAX_REQUEST_SIZE`, and an `o`
+/// costs at least 5 bytes per key (` 1 0` and a one-byte key), a `y` 3
+/// (` 1` and the key), so a namespace of 180 bytes or less can never reach
+/// the bound; one of 321 (`o`) or 193 (`y`) bytes can.
 const MAX_FORWARDED_NAMESPACE_BYTES: usize = MAX_FORWARD_QUEUE_BYTES;
 
 /// `MAX_FORWARDED_NAMESPACE_BYTES`, or a test's smaller one.

@@ -54,8 +54,8 @@ framework adapters at one version, whether or not a component changed.
   with a 4 KB namespace and 200 keys sent 824 KB). While a window is open, an
   `o` or `y` whose namespace length times its number of owned keys is over
   64 MiB is now answered `En\n` before anything is applied, and the
-  connection is closed; outside a window, and for namespaces of a few dozen
-  bytes at any frame size, nothing changes. The forwarded frames are the
+  connection is closed; outside a window, and for a namespace of 180 bytes
+  or less at any frame size, nothing changes. The forwarded frames are the
   `U` frames the previous release already accepts, so a rolling upgrade is
   unaffected (#1665).
 

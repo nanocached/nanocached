@@ -677,8 +677,11 @@ receiving node as a frame of its own, and each of those frames repeats the
 namespace, so a frame with a long namespace and many keys would make the node
 send the namespace once per key. A frame whose namespace length times its
 number of owned keys is over 64&nbsp;MiB is answered <code>En\n</code> and the
-connection closed, without applying any of it. Namespaces of a few dozen bytes
-stay far below the bound at any frame size.</p>
+connection closed, without applying any of it. A namespace of 180 bytes or less
+cannot reach the bound at any frame size. Through
+<code>nanocached-proxy</code> the refused frame closes the shared connection
+to that node, so the requests of other clients in flight on it fail, and the next one
+redials.</p>
 <p>Through <code>nanocached-proxy</code>, a batch spanning multiple
 owners is split into one sub-frame per node and reassembled before
 answering the client — the one dispatch shape that turns a single
