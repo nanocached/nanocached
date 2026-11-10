@@ -218,7 +218,7 @@ internal static class Identify
             bool shapedPrefix = ack[0] is (byte)'O' or (byte)'E' && ack[1] is (byte)'n' or (byte)'d';
             if (!shapedPrefix || (ack[2] != (byte)'\n' && ack[2] != (byte)'T'))
             {
-                throw new NanocachedException("nanocached: unexpected response to A");
+                throw NotACacheNodeException.UnexpectedHandshakeReply($"{host}:{port}");
             }
 
             bool tagged;
@@ -232,7 +232,7 @@ internal static class Identify
                 await stream.ReadExactlyAsync(trailer, cancel).ConfigureAwait(false);
                 if (trailer[0] != (byte)'\n')
                 {
-                    throw new NanocachedException("nanocached: unexpected response to A");
+                    throw NotACacheNodeException.UnexpectedHandshakeReply($"{host}:{port}");
                 }
                 tagged = true;
             }
