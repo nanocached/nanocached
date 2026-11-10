@@ -94,6 +94,17 @@ class _LegacyServerSignal(Exception):
     (echoed response tags); never escapes this module."""
 
 
+class HandshakeProtocolError(NanocachedError):
+    """The peer answered the handshake (the ``A`` reply or a discovery
+    roster) with something that is not a valid reply, such as a web
+    server's ``HTTP/1.1 400``. Still a plain ``NanocachedError`` to a
+    caller, which is what ``connect()`` raises; the redial and refresh
+    paths of a running client turn it into a ``ConnectFailedError``
+    (``_handshake_failure_as_connect_failed``), because no request exists
+    yet and only a ``ConnectionError`` makes an operation refresh the node
+    list and reroute."""
+
+
 def split_host_port(address: str) -> tuple[str, int]:
     host, separator, port = address.rpartition(":")
     # isascii() matters: str.isdigit() also accepts characters like "²"
@@ -276,17 +287,17 @@ async def _connect_and_identify(
                 )
             ack += await reader.readexactly(1)
             if ack[0:1] not in (b"O", b"E") or ack[1:2] not in (b"n", b"d"):
-                raise NanocachedError("nanocached: unexpected response to A")
+                raise HandshakeProtocolError("nanocached: unexpected response to A")
 
             if ack[2:3] == b"\n":
                 tagged = False
             elif ack[2:3] == b"T":
                 fourth = await reader.readexactly(1)
                 if fourth != b"\n":
-                    raise NanocachedError("nanocached: unexpected response to A")
+                    raise HandshakeProtocolError("nanocached: unexpected response to A")
                 tagged = True
             else:
-                raise NanocachedError("nanocached: unexpected response to A")
+                raise HandshakeProtocolError("nanocached: unexpected response to A")
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError) as error:
             # Only a request_tags=True attempt can fall back further (the
             # `T R` stage falls to `T`, and `T` falls to plain) — the final,
@@ -372,18 +383,18 @@ async def _read_list_header(reader: asyncio.StreamReader, kind: str) -> bytes:
         # (NanocachedError, OSError)` contracts ("try next address
         # silently", "refresh swallows failures") and escape raw to
         # callers instead (mirrors the TimeoutError wrapping above).
-        raise NanocachedError(
+        raise HandshakeProtocolError(
             f"nanocached: invalid {kind} header in discovery response (missing header terminator)"
         ) from error
     except asyncio.IncompleteReadError as error:
         # EOF before the terminator — an EOFError, not an OSError, so the
         # same escape hatch applies.
-        raise NanocachedError(f"nanocached: truncated {kind} header in discovery response") from error
+        raise HandshakeProtocolError(f"nanocached: truncated {kind} header in discovery response") from error
 
     if header.startswith(b"B"):
         raise DiscoveryBusyError()
     if not header.startswith(b"N "):
-        raise NanocachedError(
+        raise HandshakeProtocolError(
             f"nanocached: unexpected response from discovery server: {header[:-1]!r}"
         )
     return header
@@ -395,7 +406,7 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
     # `N <count> <r>\n` (client-side replication) — the replication factor rides along.
     fields = header[2:-1].split(b" ")
     if len(fields) != 2:
-        raise NanocachedError("nanocached: invalid node-list header in discovery response")
+        raise HandshakeProtocolError("nanocached: invalid node-list header in discovery response")
     try:
         count, replication = _parse_strict_uint(fields[0]), _parse_strict_uint(fields[1])
     except ValueError as error:
@@ -406,11 +417,11 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
         # client.py's _SWALLOWABLE_ERRORS contract ("try next address
         # silently", "refresh swallows failures") only covers
         # NanocachedError/ConnectionError/OSError.
-        raise NanocachedError("nanocached: invalid node-list header in discovery response") from error
+        raise HandshakeProtocolError("nanocached: invalid node-list header in discovery response") from error
     if replication < 1:
-        raise NanocachedError("nanocached: invalid replication factor in discovery response")
+        raise HandshakeProtocolError("nanocached: invalid replication factor in discovery response")
     if count < 0 or count > _MAX_NODE_COUNT:
-        raise NanocachedError("nanocached: invalid node count in discovery response")
+        raise HandshakeProtocolError("nanocached: invalid node count in discovery response")
 
     nodes = await _read_entries(reader, count, len(header), "node")
     return ClusterTarget(nodes=nodes, replication=replication)
@@ -426,13 +437,13 @@ async def _read_proxy_list(reader: asyncio.StreamReader) -> list[DiscoveredNode]
 
     fields = header[2:-1].split(b" ")
     if len(fields) != 1:
-        raise NanocachedError("nanocached: invalid proxy-list header in discovery response")
+        raise HandshakeProtocolError("nanocached: invalid proxy-list header in discovery response")
     try:
         count = _parse_strict_uint(fields[0])
     except ValueError as error:
-        raise NanocachedError("nanocached: invalid proxy-list header in discovery response") from error
+        raise HandshakeProtocolError("nanocached: invalid proxy-list header in discovery response") from error
     if count < 0 or count > _MAX_NODE_COUNT:
-        raise NanocachedError("nanocached: invalid proxy count in discovery response")
+        raise HandshakeProtocolError("nanocached: invalid proxy count in discovery response")
 
     return await _read_entries(reader, count, len(header), "proxy")
 
@@ -457,21 +468,21 @@ async def _read_entries(
         try:
             entry_header = await reader.readuntil(b"\n")
         except asyncio.LimitOverrunError as error:
-            raise NanocachedError(
+            raise HandshakeProtocolError(
                 f"nanocached: invalid {kind} entry header in discovery response (missing header terminator)"
             ) from error
         except asyncio.IncompleteReadError as error:
-            raise NanocachedError(
+            raise HandshakeProtocolError(
                 f"nanocached: truncated {kind} entry header in discovery response"
             ) from error
         total_bytes += len(entry_header)
         lengths = entry_header[:-1].split(b" ")
         if len(lengths) != 2:
-            raise NanocachedError(f"nanocached: invalid {kind} entry header in discovery response")
+            raise HandshakeProtocolError(f"nanocached: invalid {kind} entry header in discovery response")
         try:
             name_length, addr_length = _parse_strict_uint(lengths[0]), _parse_strict_uint(lengths[1])
         except ValueError as error:
-            raise NanocachedError(
+            raise HandshakeProtocolError(
                 f"nanocached: invalid {kind} entry header in discovery response"
             ) from error
         if (
@@ -480,11 +491,11 @@ async def _read_entries(
             or name_length > _MAX_NODE_FIELD_LENGTH
             or addr_length > _MAX_NODE_FIELD_LENGTH
         ):
-            raise NanocachedError(f"nanocached: invalid {kind} entry lengths in discovery response")
+            raise HandshakeProtocolError(f"nanocached: invalid {kind} entry lengths in discovery response")
 
         total_bytes += name_length + addr_length + 1
         if total_bytes > _MAX_NODE_LIST_RESPONSE_LENGTH:
-            raise NanocachedError("nanocached: discovery response exceeds maximum size")
+            raise HandshakeProtocolError("nanocached: discovery response exceeds maximum size")
 
         try:
             body = await reader.readexactly(name_length + addr_length + 1)  # +1: trailing '\n'
@@ -492,11 +503,11 @@ async def _read_entries(
             # EOF mid-entry (discovery restarted, connection dropped).
             # IncompleteReadError is an EOFError, not an OSError, so left
             # unwrapped it would escape _SWALLOWABLE_ERRORS.
-            raise NanocachedError(
+            raise HandshakeProtocolError(
                 f"nanocached: truncated {kind} entry in discovery response"
             ) from error
         if body[-1:] != b"\n":
-            raise NanocachedError(f"nanocached: malformed {kind} entry in discovery response")
+            raise HandshakeProtocolError(f"nanocached: malformed {kind} entry in discovery response")
         try:
             entries.append(
                 DiscoveredNode(
@@ -505,7 +516,7 @@ async def _read_entries(
                 )
             )
         except UnicodeDecodeError as error:
-            raise NanocachedError(
+            raise HandshakeProtocolError(
                 f"nanocached: malformed {kind} entry in discovery response"
             ) from error
 

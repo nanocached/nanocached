@@ -6189,6 +6189,154 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def start_garbage_listener(self):
+        """A listener that answers whatever it is sent with an HTTP 400, as
+        a web server on a reused port does, and closes."""
+
+        async def handle(reader, writer):
+            try:
+                # Read the request first, as a web server would: closing
+                # with it unread would reset the connection and read as a
+                # legacy server's door-slam instead.
+                await reader.read(1024)
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+            except (ConnectionError, OSError):
+                pass
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        return server, server.sockets[0].getsockname()[1]
+
+    async def test_operations_routed_to_an_address_that_answers_the_handshake_with_garbage_refresh_and_reroute(self):
+        # An HTTP server's 400 instead of a handshake reply raised a plain
+        # NanocachedError, which _with_wrong_node_retry does not act on:
+        # the operation kept failing until the 30 s staleness refresh, even
+        # after discovery had dropped the address (same cure as a non-node
+        # address: a ConnectionError that was never used).
+        new = "new-node"
+        for name in ("set", "incr", "touch ttl 0", "touch_many ttl 0"):
+            with self.subTest(name):
+                nodes, discovery = await self.start_cluster(set())
+                garbage, garbage_port = await self.start_garbage_listener()
+                try:
+                    client = await NanocachedClient.connect(
+                        [("127.0.0.1", discovery.port)], reconnect_cooldown=100
+                    )
+                    try:
+                        original = list(discovery.nodes)
+                        discovery.nodes = original + [(new, f"127.0.0.1:{garbage_port}")]
+                        await client._refresh_node_list()
+                        stored = client._redial_cooldowns[f"127.0.0.1:{garbage_port}"][1]
+
+                        key = next(
+                            f"counter-{i}"
+                            for i in range(1000)
+                            if client._ring.owners(f"counter-{i}".encode(), 2)[0] == new
+                        )
+                        for node in nodes.values():
+                            node.store[key.encode()] = b"5"
+
+                        # Discovery has dropped the bad address by the time
+                        # the operation fails and forces its refresh.
+                        discovery.nodes = original
+                        before = discovery.list_count
+                        if name == "set":
+                            await client.set(key, "v")
+                        elif name == "incr":
+                            self.assertEqual(await client.incr(key), 6)
+                        elif name == "touch ttl 0":
+                            self.assertTrue(await client.touch(key, 0))
+                        else:
+                            self.assertEqual(await client.touch_many([key], 0), {key: True})
+                        self.assertGreaterEqual(discovery.list_count - before, 1)
+                        self.assertNotIn(new, client._members)
+                        self.assertIsInstance(stored, ConnectFailedError)
+                    finally:
+                        await client.close()
+                finally:
+                    garbage.close()
+                    await garbage.wait_closed()
+                    await discovery.close()
+                    for node in nodes.values():
+                        await node.close()
+
+    async def test_redialing_a_member_that_now_answers_the_handshake_with_garbage_is_a_connect_failure(self):
+        nodes, discovery = await self.start_cluster(set())
+        garbage, garbage_port = await self.start_garbage_listener()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                with self.assertRaises(ConnectFailedError):
+                    await client._open_node_connection(f"127.0.0.1:{garbage_port}")
+            finally:
+                await client.close()
+        finally:
+            garbage.close()
+            await garbage.wait_closed()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_ttl_zero_touch_chunk_whose_dial_found_garbage_is_not_counted_as_written(self):
+        nodes, discovery = await self.start_cluster(set())
+        garbage, garbage_port = await self.start_garbage_listener()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+
+                async def getter():
+                    return await client._open_node_connection(f"127.0.0.1:{garbage_port}")
+
+                _, error, failed_at, sent_end = await client._multi_touch_chunked(getter, b"", [b"k"], 0, False)
+                self.assertIsNotNone(error)
+                self.assertEqual((failed_at, sent_end), (0, 0), "the chunk never left")
+            finally:
+                await client.close()
+        finally:
+            garbage.close()
+            await garbage.wait_closed()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_garbage_address_in_the_first_roster_is_stored_as_a_connect_failure(self):
+        # connect() tolerates it like a dead node; the cooldown entry an
+        # operation routed there will see has to be a ConnectionError.
+        nodes, discovery = await self.start_cluster(set())
+        garbage, garbage_port = await self.start_garbage_listener()
+        try:
+            bad, good = NAMES[0], NAMES[1]
+            discovery.nodes = [(bad, f"127.0.0.1:{garbage_port}"), (good, nodes[good].address)]
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], reconnect_cooldown=100
+            )
+            try:
+                key = self.key_with_primary(bad)
+                nodes[good].store[key.encode()] = b"5"
+                # Discovery has dropped the bad address by the time the
+                # operation fails and forces its refresh.
+                discovery.nodes = [(good, nodes[good].address)]
+                self.assertEqual(await client.incr(key), 6)
+            finally:
+                await client.close()
+        finally:
+            garbage.close()
+            await garbage.wait_closed()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_the_first_connect_still_raises_the_handshake_error_for_a_garbage_address(self):
+        garbage, garbage_port = await self.start_garbage_listener()
+        try:
+            with self.assertRaisesRegex(NanocachedError, "unexpected response to A") as caught:
+                await NanocachedClient.connect([("127.0.0.1", garbage_port)])
+            self.assertNotIsInstance(caught.exception, ConnectionError)
+        finally:
+            garbage.close()
+            await garbage.wait_closed()
+
     async def test_refresh_purges_cooldowns_for_departed_addresses(self):
         # #96: a node that leaves the cluster must not leave its per-address
         # reconnect-cooldown entry behind — in a churny deployment (fresh
