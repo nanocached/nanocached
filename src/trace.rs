@@ -19,7 +19,13 @@
 //! nothing down. The writer puts a `TRACE dropped lines=<n>` line into the
 //! stream before the next line it writes after drops, and `finish` flushes
 //! at shutdown, so a gap in the lines is visible rather than silent. A node
-//! killed with the queue full still loses the lines it had queued.
+//! killed (SIGKILL) while lines are queued loses them, with no marker: the
+//! queue is not empty only when the writer is behind (the pipe is slow, or the
+//! thread was scheduled late), and a line is on stderr only once the writer
+//! has written it. A direct write from the tracing thread would narrow that,
+//! but writing without blocking needs the descriptor in non-blocking mode,
+//! which std does not offer, and a blocking write is what the queue exists to
+//! avoid. `tests/e2e/incrtrace.py` takes the kills as an input instead.
 
 /// Lines the queue holds while the writer is behind. About 100 bytes each,
 /// so a stalled stderr costs the node under a megabyte.
