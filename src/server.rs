@@ -877,6 +877,84 @@ const MAX_FORWARD_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 /// queue for 140,000 pairs).
 const FORWARD_ENTRY_OVERHEAD_BYTES: usize = 320;
 
+/// The namespace bytes a forward window may be asked to carry for one `o`
+/// or `y` frame: its namespace length times its number of keys. Every key
+/// is forwarded as a `U` of its own, which repeats the namespace, so one
+/// frame of at most `MAX_REQUEST_SIZE` bytes with a large namespace and
+/// many one-byte keys would make the node send gigabytes to a forward
+/// target, one `U` at a time on the target's single connection, with every
+/// later forward to that target waiting behind it. A frame over this bound
+/// is refused while a window is open instead of being applied and
+/// forwarded. The bound is `MAX_FORWARD_QUEUE_BYTES`, about 64 times what a
+/// maximal frame can hold, and a frame of namespaces that are tens of
+/// bytes long stays under it by two orders of magnitude.
+const MAX_FORWARDED_NAMESPACE_BYTES: usize = MAX_FORWARD_QUEUE_BYTES;
+
+/// `MAX_FORWARDED_NAMESPACE_BYTES`, or a test's smaller one.
+fn forwarded_namespace_cap(node_context: &NodeContext) -> usize {
+    #[cfg(test)]
+    {
+        let cap = node_context
+            .gates
+            .forward_namespace_cap
+            .load(Ordering::SeqCst);
+        if cap > 0 {
+            return cap;
+        }
+    }
+    let _ = node_context;
+    MAX_FORWARDED_NAMESPACE_BYTES
+}
+
+/// Whether a client write of one namespace to `keys` keys would be
+/// forwarded through a window as more namespace bytes than
+/// `MAX_FORWARDED_NAMESPACE_BYTES`. Always false when no window is open:
+/// then nothing is forwarded, and a frame is bounded by `MAX_REQUEST_SIZE`
+/// alone. Asked before the frame is applied: refusing it afterwards would
+/// leave a write on this node that its entrant never gets.
+///
+/// A window that opens between this check and the frame's own forwarding
+/// is not covered: its frame is forwarded as before, which is one frame
+/// per window the operator opens.
+fn forwarding_would_repeat_too_much_namespace(
+    node_context: &NodeContext,
+    namespace_len: usize,
+    keys: usize,
+) -> bool {
+    namespace_len.saturating_mul(keys) > forwarded_namespace_cap(node_context)
+        && forwarding_window_open(node_context)
+}
+
+/// Whether a join, a decommission or an eviction's re-replication is
+/// forwarding client writes now (the windows `migration_targets_for_hashed`
+/// and `handoff_targets_for_hashed` resolve targets through), without
+/// resolving a target.
+fn forwarding_window_open(node_context: &NodeContext) -> bool {
+    node_context
+        .leaving
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
+        || node_context
+            .active_migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|active| {
+                active.forwarding_open()
+                    || active
+                        .lingering
+                        .iter()
+                        .any(LingeringForward::forwarding_open)
+            })
+        || node_context
+            .rereplication_forward
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(RereplicationForward::forwarding_open)
+}
+
 /// What a frame of the cluster-internal kind (`U`, `u`, `f`) may carry
 /// beyond `MAX_REQUEST_SIZE`. A handoff `U` is the client's `S` for the
 /// same value plus the receiver's 36-byte membership token, its length
@@ -1727,6 +1805,9 @@ pub(crate) struct SimGates {
     /// `run_decommission`: how many entries the drain counted as left
     /// behind, stored when the transfer loop ends.
     pub(crate) drain_left_behind: AtomicUsize,
+    /// A smaller `MAX_FORWARDED_NAMESPACE_BYTES` for a test to reach with a
+    /// frame that fits in memory; zero leaves the production bound.
+    pub(crate) forward_namespace_cap: AtomicUsize,
 }
 
 pub(crate) struct RunHooks {
@@ -3607,6 +3688,28 @@ async fn handle_connection(
                 }
                 drop(wrong);
 
+                // Before anything is applied; see
+                // `forwarding_would_repeat_too_much_namespace`.
+                if let Some(node_context) = &config.node_context
+                    && forwarding_would_repeat_too_much_namespace(
+                        node_context,
+                        namespace.len(),
+                        owned_keys.len(),
+                    )
+                {
+                    return Err(reject_request(
+                        &mut stream,
+                        format!(
+                            "o of {} keys under a {}-byte namespace would be forwarded \
+                             through a join or decommission as a U per key, each repeating the \
+                             namespace",
+                            owned_keys.len(),
+                            namespace.len()
+                        ),
+                    )
+                    .await);
+                }
+
                 if !owned_keys.is_empty() {
                     // Kept for the forwarding loop below — `owned_keys`/
                     // `owned_values` are moved into the `Command::MultiSet`
@@ -4248,6 +4351,27 @@ async fn handle_connection(
                     }
                 }
                 drop(wrong);
+
+                // As in the `MultiSet` arm.
+                if let Some(node_context) = &config.node_context
+                    && forwarding_would_repeat_too_much_namespace(
+                        node_context,
+                        namespace.len(),
+                        owned_keys.len(),
+                    )
+                {
+                    return Err(reject_request(
+                        &mut stream,
+                        format!(
+                            "y of {} keys under a {}-byte namespace would be forwarded \
+                             through a join or decommission as a U per key, each repeating the \
+                             namespace",
+                            owned_keys.len(),
+                            namespace.len()
+                        ),
+                    )
+                    .await);
+                }
 
                 if !owned_keys.is_empty() {
                     // Kept for the forwarding loop below, which looks for
@@ -20598,6 +20722,277 @@ mod tests {
         assert!(frames.contains(&expected_b));
     }
 
+    /// A node decommissioning towards one entrant ("peer", R=1), a cache
+    /// task, and a connection to it with `forward_namespace_cap` set.
+    /// Returns the client side, the frames the entrant receives and what
+    /// has to be torn down.
+    async fn connection_in_a_decommission_window(
+        cap: usize,
+        in_window: bool,
+    ) -> (
+        mpsc::Sender<CacheRequest>,
+        tokio::task::JoinHandle<()>,
+        RecordedFrames,
+        tokio::task::JoinHandle<()>,
+        TcpStream,
+        tokio::task::JoinHandle<io::Result<()>>,
+        Vec<String>,
+    ) {
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let before_ring = Arc::new(HashRing::new(vec![
+            "leaver".to_string(),
+            "peer".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec!["peer".to_string()]));
+        // Names the leaver owns before it goes, under the 4 KiB namespace
+        // the tests send.
+        let mut owned_keys = Vec::new();
+        let mut index = 0u32;
+        while owned_keys.len() < 200 {
+            let name = format!("k{index}");
+            if before_ring.is_owner(
+                &Key::new(Bytes::from(vec![b'n'; 4096]), name.clone().into()),
+                "leaver",
+                1,
+            ) {
+                owned_keys.push(name);
+            }
+            index += 1;
+            assert!(index < 4000, "expected 200 owned keys in range");
+        }
+
+        let mut node_context = test_node_context(
+            "leaver",
+            "tk-leaver",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        node_context
+            .gates
+            .forward_namespace_cap
+            .store(cap, Ordering::SeqCst);
+        node_context.leaving = Arc::new(Mutex::new(in_window.then(|| LeaveState {
+            before_ring,
+            after_ring,
+            replication: 1,
+            addresses: HashMap::from([("peer".to_string(), peer_addr)]),
+            tokens: HashMap::from([("peer".to_string(), "tok-peer".to_string())]),
+            connections: Mutex::new(HashMap::new()),
+        })));
+
+        let (client, server) = tcp_pair().await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Kept for the life of the test process: a dropped sender reads as a
+        // shutdown.
+        std::mem::forget(shutdown_tx);
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+        (
+            request_tx,
+            cache_task,
+            frames,
+            peer_task,
+            client,
+            connection_task,
+            owned_keys,
+        )
+    }
+
+    /// What the entrant has received once the forwards of one frame have
+    /// had time to arrive: waits until `expected` frames are in or a
+    /// second has passed, and returns their total size.
+    async fn forwarded_bytes(frames: &RecordedFrames, expected: usize) -> usize {
+        let _ = timeout(Duration::from_secs(1), async {
+            while frames.lock().unwrap().len() < expected {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        frames.lock().unwrap().iter().map(Vec::len).sum()
+    }
+
+    /// One `o` frame with a 4 KiB namespace and 200 one-byte-value keys is
+    /// about 5 KiB. During a decommission each key used to go to the
+    /// entrant as a `U` of its own that repeats the namespace, which is
+    /// 200 x 4 KiB on the wire: the same frame at `MAX_REQUEST_SIZE` makes
+    /// gigabytes. A frame whose namespace bytes x keys is over the bound
+    /// is now refused while the window is open, and nothing is forwarded
+    /// or stored.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_set_whose_forwards_would_repeat_a_huge_namespace_is_refused_in_a_window() {
+        let (request_tx, cache_task, frames, peer_task, mut client, connection_task, owned) =
+            connection_in_a_decommission_window(256 * 1024, true).await;
+
+        let namespace = vec![b'n'; 4096];
+        let lens: Vec<String> = owned
+            .iter()
+            .map(|name| format!("{} 1", name.len()))
+            .collect();
+        let mut frame =
+            format!("o {} {} {}\n", namespace.len(), owned.len(), lens.join(" ")).into_bytes();
+        frame.extend_from_slice(&namespace);
+        for name in &owned {
+            frame.extend_from_slice(name.as_bytes());
+            frame.push(b'v');
+        }
+        client.write_all(&frame).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+
+        let forwarded = forwarded_bytes(&frames, owned.len()).await;
+        assert!(
+            forwarded <= frame.len(),
+            "a client frame of {} bytes made the node send {forwarded} bytes to the entrant",
+            frame.len()
+        );
+        assert!(response.starts_with(b"E"), "{response:?}");
+        let _ = connection_task.await;
+        let stored = send_command(
+            &request_tx,
+            Command::Get {
+                key: Key::new(Bytes::from(namespace), owned[0].clone().into()),
+            },
+        )
+        .await;
+        assert_eq!(stored, Response::NotFound, "a refused frame stores nothing");
+
+        peer_task.abort();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Outside a window nothing is forwarded, so the same frame is an
+    /// ordinary write.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_set_with_a_huge_namespace_is_accepted_outside_a_window() {
+        let (request_tx, cache_task, frames, peer_task, mut client, connection_task, owned) =
+            connection_in_a_decommission_window(256 * 1024, false).await;
+
+        let namespace = vec![b'n'; 4096];
+        let lens: Vec<String> = owned
+            .iter()
+            .map(|name| format!("{} 1", name.len()))
+            .collect();
+        let mut frame = format!(
+            "o {} {} {}
+",
+            namespace.len(),
+            owned.len(),
+            lens.join(" ")
+        )
+        .into_bytes();
+        frame.extend_from_slice(&namespace);
+        for name in &owned {
+            frame.extend_from_slice(name.as_bytes());
+            frame.push(b'v');
+        }
+        client.write_all(&frame).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+
+        assert!(
+            response.starts_with(format!("O {} S", owned.len()).as_bytes()),
+            "{response:?}"
+        );
+        assert_eq!(forwarded_bytes(&frames, 1).await, 0);
+        connection_task.await.unwrap().unwrap();
+
+        peer_task.abort();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// The same bound for a batch touch, which forwards each touched key
+    /// with the value it holds. Under the bound it forwards as before.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_touch_whose_forwards_would_repeat_a_huge_namespace_is_refused_in_a_window() {
+        for (cap, refused) in [(256 * 1024, true), (64 * 1024 * 1024, false)] {
+            let (request_tx, cache_task, frames, peer_task, mut client, connection_task, owned) =
+                connection_in_a_decommission_window(cap, true).await;
+            let namespace = vec![b'n'; 4096];
+            for name in &owned {
+                send_command(
+                    &request_tx,
+                    Command::Set {
+                        key: Key::new(Bytes::from(namespace.clone()), name.clone().into()),
+                        value: Bytes::from_static(b"v"),
+                        ttl: None,
+                    },
+                )
+                .await;
+            }
+
+            let lens: Vec<String> = owned.iter().map(|name| name.len().to_string()).collect();
+            let mut frame = format!(
+                "y {} {} {} 60
+",
+                namespace.len(),
+                owned.len(),
+                lens.join(" ")
+            )
+            .into_bytes();
+            frame.extend_from_slice(&namespace);
+            for name in &owned {
+                frame.extend_from_slice(name.as_bytes());
+            }
+            client.write_all(&frame).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+
+            let forwarded = forwarded_bytes(&frames, owned.len()).await;
+            if refused {
+                assert!(
+                    forwarded <= frame.len(),
+                    "a client frame of {} bytes made the node send {forwarded} bytes to the entrant",
+                    frame.len()
+                );
+                assert!(response.starts_with(b"E"), "{response:?}");
+                let _ = connection_task.await;
+            } else {
+                assert!(
+                    response.starts_with(format!("Y {} S", owned.len()).as_bytes()),
+                    "{response:?}"
+                );
+                assert_eq!(frames.lock().unwrap().len(), owned.len());
+                assert!(forwarded > 200 * 4096);
+                connection_task.await.unwrap().unwrap();
+            }
+
+            peer_task.abort();
+            drop(request_tx);
+            cache_task.await.unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn decommission_batch_touch_forwards_the_touched_keys_to_the_entrant() {
         // The decommission-drain mirror of `a_batch_touch_forwards_each_
@@ -21087,6 +21482,46 @@ mod tests {
             completed_at,
             grace: FORWARDING_GRACE_BASE,
         }
+    }
+
+    /// The bound on repeated namespace bytes applies through each kind of
+    /// window, and only while one is open.
+    #[test]
+    fn the_namespace_bound_applies_only_while_a_forwarding_window_is_open() {
+        let node_context = test_node_context(
+            "me",
+            "tk-me",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let over = MAX_FORWARDED_NAMESPACE_BYTES / 1000 + 1;
+        let refused = |node_context: &NodeContext| {
+            forwarding_would_repeat_too_much_namespace(node_context, 1000, over)
+        };
+        assert!(!refused(&node_context), "no window open");
+
+        // A join: open until its grace has passed.
+        *node_context.active_migration.lock().unwrap() = Some(test_active_migration(None));
+        assert!(refused(&node_context), "a join in flight");
+        *node_context.active_migration.lock().unwrap() = Some(test_active_migration(Some(
+            Instant::now() - Duration::from_secs(3600),
+        )));
+        assert!(!refused(&node_context), "a join whose grace has passed");
+        *node_context.active_migration.lock().unwrap() = None;
+
+        // A re-replication after an eviction.
+        *node_context.rereplication_forward.lock().unwrap() =
+            Some(rereplication_window("127.0.0.1:9", None));
+        assert!(refused(&node_context), "a re-replication in flight");
+        *node_context.rereplication_forward.lock().unwrap() = None;
+
+        // Under the bound a window changes nothing.
+        *node_context.active_migration.lock().unwrap() = Some(test_active_migration(None));
+        assert!(!forwarding_would_repeat_too_much_namespace(
+            &node_context,
+            1000,
+            over - 2
+        ));
     }
 
     #[test]

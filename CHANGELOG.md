@@ -45,6 +45,20 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: one `o` or `y` frame during a join's, a decommission's
+  or an eviction's forwarding window was forwarded as one `U` per key, each
+  repeating the whole namespace. A frame of up to 1 MiB with a 500 KB
+  namespace and about 90,000 one-byte keys made the node send about 45 GB to
+  each forward target, one `U` at a time on the target's single connection,
+  with every later forward to that target waiting behind it (a 5.8 KB frame
+  with a 4 KB namespace and 200 keys sent 824 KB). While a window is open, an
+  `o` or `y` whose namespace length times its number of owned keys is over
+  64 MiB is now answered `En\n` before anything is applied, and the
+  connection is closed; outside a window, and for namespaces of a few dozen
+  bytes at any frame size, nothing changes. The forwarded frames are the
+  `U` frames the previous release already accepts, so a rolling upgrade is
+  unaffected (#1665).
+
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
   `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`
   bounded only its final check), so a hung cluster hung the script instead of

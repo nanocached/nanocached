@@ -670,6 +670,15 @@ for some subset of a batch refreshes its routing table and re-issues
 just those keys, exactly as it would for a single-key <code>G</code>/
 <code>S</code>'s own <code>W</code> — the rest of the batch's answers
 stand.</p>
+<p>One bound applies to <code>o</code> and <code>y</code> only while a
+join's, a decommission's or an eviction's re-replication forwarding window is
+open. The node passes each key it wrote or touched on to the joining or
+receiving node as a frame of its own, and each of those frames repeats the
+namespace, so a frame with a long namespace and many keys would make the node
+send the namespace once per key. A frame whose namespace length times its
+number of owned keys is over 64&nbsp;MiB is answered <code>En\n</code> and the
+connection closed, without applying any of it. Namespaces of a few dozen bytes
+stay far below the bound at any frame size.</p>
 <p>Through <code>nanocached-proxy</code>, a batch spanning multiple
 owners is split into one sub-frame per node and reassembled before
 answering the client — the one dispatch shape that turns a single
