@@ -2157,10 +2157,14 @@ class NanocachedClient:
         Like touch() it is idempotent, so a request whose reply was lost
         is retried — except with ``ttl_seconds == 0``, where a primary
         whose connection fails after the frame was written is not resent
-        (issue #901) and the call raises that connection error, every
-        other key having been touched (only the keys of the frame that was
-        being written count as lost; the frames of a chunked batch not yet
-        sent still go out). In a cluster it goes to every owner of a key, the
+        (issue #901) and the call raises that connection error. In a
+        cluster every other key has been touched: only the keys of the
+        frame that was being written count as lost, and the frames of a
+        chunked batch not yet sent still go out in the refresh-and-retry
+        pass. Against a single node or a proxy there is no such pass: the
+        call raises at the first chunk that fails, the chunks after it are
+        never sent, and the error does not name the keys that were not
+        reached. In a cluster it goes to every owner of a key, the
         primary's answer being the key's. A replica's failure or ``W`` is
         counted in stats().replica_write_failures and never fails the
         batch. Larger batches are transparently split into more than one
@@ -2218,7 +2222,9 @@ class NanocachedClient:
         connection fails after the frame was written is not resent (issue
         #901): it may have expired and consumed its values already, so
         those keys raise PartialConnectionLostError at once instead of
-        reading as misses. Raises ServerTooOldError against a node that
+        reading as misses. Against a single node or a proxy the call raises
+        at the first chunk that fails and the chunks after it are never
+        sent (see touch_many()). Raises ServerTooOldError against a node that
         predates the command — in a cluster, when other primaries had
         already answered, the PartialServerTooOldError subclass carrying
         their hits in ``partial_values`` (with ``ttl_seconds == 0`` those
