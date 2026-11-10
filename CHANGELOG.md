@@ -87,6 +87,17 @@ framework adapters at one version, whether or not a component changed.
   queued behind it for that long, and is not decided on a sweep that
   follows a pause of discovery (#1663).
 
+- `nanocached-node`, `nanocached-discovery`: a connection turned away by the
+  per-IP connection cap kept its global connection slot while the busy
+  reply was sent and drained (up to 200 ms on a plaintext listener, which
+  reads from the peer until it closes). A source at its per-IP cap could
+  therefore hold global slots by churning rejected connections it left open
+  and make other sources get `B`: with `--max-connections 4
+  --max-connections-per-ip 1` and one connection held, three more from the
+  same IP rejected and kept open filled all four slots. The global permit is
+  now released before the reply. The proxy already dropped it first
+  (#1664).
+
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
   `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`
   bounded only its final check), so a hung cluster hung the script instead of
