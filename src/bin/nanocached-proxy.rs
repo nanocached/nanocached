@@ -58,6 +58,40 @@
 //!   read — that no SDK or adapter emits. Clients that need the read
 //!   to strictly precede the write must await the `G` reply first.
 //!
+//!   The result of an `i`/`k`/`x` is inside the order (issue #1659). The
+//!   proxy runs those on the key's primary and writes the result to the
+//!   replicas as a plain `Set`/`Delete` once the primary has answered, so
+//!   without more a request pipelined behind it on the same key reached
+//!   the replica first and the late result overwrote it (`i` then `D`:
+//!   primary empty, replica holding the counter; two `i`: replica one
+//!   behind). Each connection therefore keeps a `ConnectionOrder`: an
+//!   `i`/`k`/`x` registers its key, and a later request of the connection
+//!   that touches the key — a single-key request, an `m`/`o`/`y` carrying
+//!   it, a `c`/`F` covering it — is dispatched from a task that first waits
+//!   for the registration to be released, which happens once the result's
+//!   frames are enqueued on every replica (enqueued, not acknowledged; or
+//!   when the command ends without a replica write). Nothing else waits:
+//!   the reader goes on with requests on other keys, other connections have
+//!   their own `ConnectionOrder`, and a request with nothing to wait for
+//!   takes the inline path unchanged. The exception is an `i`/`k`/`x`
+//!   behind other `i`/`k`/`x` that were themselves dispatched inline: its
+//!   primary frame is enqueued inline too, so a run of increments of one
+//!   key stays pipelined at the primary (which applies and answers them in
+//!   order), and only its driver waits — before it hands its result to the
+//!   replicas and before it releases its own registration, so the replicas
+//!   get the results of a run in request order and a plain request behind
+//!   the run waits for all of it. Behind anything else (a deferred
+//!   request, a clear, a deferred `i`/`k`/`x`) it is deferred like any
+//!   request. The wait is bounded by what bounds
+//!   the primary's reply (the backend timeouts), and replies still reach
+//!   the client in request order through the writer's FIFO. Outside the
+//!   order, like every retry: a replica leg whose first attempt failed and
+//!   is re-sent (it can land behind a later result for the key), and an
+//!   `i`/`k`/`x` re-run after a primary `W` or a not-sent failure (its
+//!   registration is released as soon as the first attempt fails). Two
+//!   connections incrementing one counter stay unordered, as in
+//!   cluster-direct mode (docs/architecture.html, accepted behaviour).
+//!
 //! - **Multiplexing (#110, implemented here).** Response tags +
 //!   pipelining are the multiplexing primitive: one shared per-node
 //!   backend connection (`SharedBackends`) carries interleaved requests
@@ -203,6 +237,21 @@ const INCR_RESULT_FRAME_OVERHEAD: usize = 64;
 /// The most namespace and key bytes an `i` request may carry: the replica
 /// write of its result must fit the node's request limit as well.
 const MAX_INCR_NAMESPACE_KEY_BYTES: usize = MAX_REQUEST_SIZE - INCR_RESULT_FRAME_OVERHEAD;
+
+/// Mirrors the node's `MAX_MULTI_NAMESPACE_KEY_BYTES`: the most a namespace's
+/// length times the number of keys of one `o` or `y` frame may come to. A
+/// node forwards each key of such a frame as a `U` of its own, repeating the
+/// namespace, while a join, a decommission or a re-replication window is
+/// open, and refuses a frame over the bound with `En` and a close, whether
+/// or not a window is open. That close would land on a backend connection
+/// every client of this proxy shares, so a frame over the bound is refused
+/// here, when its header is read: the client is answered `En` and its own
+/// connection is closed, like any other frame over a client limit, and
+/// nothing is sent to a backend. Every frame this proxy builds from a client
+/// frame (the per-owner `o`/`y` sub-frames, their retries after a `W`, the
+/// deferred legs of an expiring batch) carries the client's namespace and a
+/// subset of its keys, so it is within the bound when the client frame is.
+const MAX_MULTI_NAMESPACE_KEY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Mirrors the node's `MAX_MULTI_REPLY_VALUE_BYTES`: the most value bytes
 /// one `M` reply carries. A node's reply can legitimately exceed the 1 MiB
@@ -2224,6 +2273,11 @@ fn parse_request_body(
             if count == 0 {
                 return Err(invalid("bad multi-set header"));
             }
+            if namespace_length.saturating_mul(count) > MAX_MULTI_NAMESPACE_KEY_BYTES {
+                return Err(invalid(
+                    "multi-set namespace and key count exceed the limit",
+                ));
+            }
             let pairs_len = count
                 .checked_mul(2)
                 .ok_or_else(|| invalid("bad multi-set header"))?;
@@ -2529,6 +2583,11 @@ fn parse_request_body(
             let count = parse_length_field(count)?;
             if count == 0 || tail.len() < count {
                 return Err(invalid("bad multi-touch header"));
+            }
+            if namespace_length.saturating_mul(count) > MAX_MULTI_NAMESPACE_KEY_BYTES {
+                return Err(invalid(
+                    "multi-touch namespace and key count exceed the limit",
+                ));
             }
             let (key_length_fields, tail) = tail.split_at(count);
             let (tail, get) = match tail {
@@ -4059,11 +4118,24 @@ impl SharedBackends {
         frame: Bytes,
         expect: Expect,
     ) -> io::Result<NodeReply> {
-        let first = self
-            .enqueue(context, addr, frame.clone(), expect)
-            .await
-            .await;
-        match first {
+        let first = self.enqueue(context, addr, frame.clone(), expect).await;
+        self.finish_call(context, addr, frame, expect, first).await
+    }
+
+    /// `call`'s second half: awaits the reply of a `first` attempt that was
+    /// already `enqueue`d (so the caller chose the moment the frame entered
+    /// the queue) and re-sends the frame once through `enqueue` if it
+    /// failed. The re-send is a later enqueue than the first attempt's, so
+    /// it is outside whatever order the first attempt was enqueued in.
+    async fn finish_call(
+        &self,
+        context: &ProxyContext,
+        addr: &str,
+        frame: Bytes,
+        expect: Expect,
+        first: PendingReply,
+    ) -> io::Result<NodeReply> {
+        match first.await {
             Ok(reply) => Ok(reply),
             Err(_) => self.enqueue(context, addr, frame, expect).await.await,
         }
@@ -4524,12 +4596,21 @@ fn soften(
 /// pipelined same-key `G` retried after `W` can observe the client's
 /// own later `S`) is a documented limitation — see the module docs and
 /// issue #463 for why it is left as is.
+///
+/// `slot` is this request's place in the connection's order
+/// (`ConnectionOrder`, issue #1659); the default for a request nothing
+/// waits on. Its signal fires when the request is out of this function —
+/// its initial enqueues are done — except for `i`/`k`/`x`, which hand the
+/// slot to their completion: the result's replica frames are an enqueue the
+/// next request on the key has to come after, and (`OrderSlot::after`) one
+/// that comes after the result of the `i`/`k`/`x` dispatched inline before.
 async fn dispatch_request(
     context: Arc<ProxyContext>,
     request: Request,
     tag: Option<u32>,
     retry_capable: bool,
     charge: Arc<InFlightCharge>,
+    slot: OrderSlot,
 ) -> oneshot::Receiver<DriverResult> {
     context
         .requests_total
@@ -4639,8 +4720,16 @@ async fn dispatch_request(
                 key,
                 command: PrimaryCommand::Incr { delta },
             };
-            dispatch_primary_evaluated(context, &ring, request, tag, retry_capable, result_tx)
-                .await;
+            dispatch_primary_evaluated(
+                context,
+                &ring,
+                request,
+                tag,
+                retry_capable,
+                result_tx,
+                slot,
+            )
+            .await;
         }
         Request::CasSet {
             namespace,
@@ -4658,8 +4747,16 @@ async fn dispatch_request(
                     ttl,
                 },
             };
-            dispatch_primary_evaluated(context, &ring, request, tag, retry_capable, result_tx)
-                .await;
+            dispatch_primary_evaluated(
+                context,
+                &ring,
+                request,
+                tag,
+                retry_capable,
+                result_tx,
+                slot,
+            )
+            .await;
         }
         Request::CasDelete {
             namespace,
@@ -4671,8 +4768,16 @@ async fn dispatch_request(
                 key,
                 command: PrimaryCommand::CasDelete { expected_digest },
             };
-            dispatch_primary_evaluated(context, &ring, request, tag, retry_capable, result_tx)
-                .await;
+            dispatch_primary_evaluated(
+                context,
+                &ring,
+                request,
+                tag,
+                retry_capable,
+                result_tx,
+                slot,
+            )
+            .await;
         }
         // Issue #150: group keys by primary owner — this is the one
         // dispatch shape that splits a single client frame across
@@ -5953,7 +6058,7 @@ async fn refan_write(
     let Some((primary, replicas)) = owners.split_first() else {
         return Ok(transient_reply(retry_capable, tag));
     };
-    fan_out_to_replicas(context, replicas, frame.clone(), expect, "write").await;
+    fan_out_to_replicas(context, replicas, frame.clone(), expect, "write", None).await;
     match context.backends.call(context, primary, frame, expect).await {
         Ok(NodeReply::Stored) => Ok(respond("S", tag)),
         Ok(NodeReply::Deleted) => Ok(respond("D", tag)),
@@ -6049,7 +6154,7 @@ async fn expire_on_other_owners(
         return;
     }
     let plain = frame_touch(namespace, key, Some(0), false);
-    fan_out_to_replicas(context, &others, plain, Expect::Touch, "touch").await;
+    fan_out_to_replicas(context, &others, plain, Expect::Touch, "touch", None).await;
 }
 
 /// The client's answer to a touch, from the primary's reply.
@@ -6185,7 +6290,7 @@ async fn refan_touch(
         };
     }
     let plain = frame_touch(namespace, key, ttl, false);
-    fan_out_to_replicas(context, replicas, plain, Expect::Touch, "touch").await;
+    fan_out_to_replicas(context, replicas, plain, Expect::Touch, "touch", None).await;
     match context.backends.call(context, primary, frame, expect).await {
         Ok(reply) => touch_answer(&reply, tag).ok_or(Fatal::Transient),
         Err(_) => Err(Fatal::Transient),
@@ -6316,7 +6421,9 @@ impl PrimaryCommand {
 /// Hands a successful result to the replicas, then returns the client's
 /// answer — the replica legs are awaited so a client that reads its own
 /// write through a replica isn't racing them. `owners` is the key's owner
-/// list, primary first.
+/// list, primary first. `enqueued` is the ordering signal of the request
+/// that produced the result (see `fan_out_to_replicas`); it is released when
+/// the replica frames are enqueued, or here when there are none.
 ///
 /// The result goes to each distinct address other than the primary's. Two
 /// roster names can share one address (a node restarted at the same
@@ -6330,10 +6437,19 @@ async fn answer_after_fan_out(
     owners: &[String],
     response: Vec<u8>,
     replicate: Option<ReplicaResult>,
+    enqueued: Option<OrderSignal>,
 ) -> Vec<u8> {
     if let Some(result) = replicate {
         let replicas = replica_addresses(owners);
-        fan_out_to_replicas(context, &replicas, result.frame, result.expect, result.what).await;
+        fan_out_to_replicas(
+            context,
+            &replicas,
+            result.frame,
+            result.expect,
+            result.what,
+            enqueued,
+        )
+        .await;
     }
     response
 }
@@ -6361,6 +6477,19 @@ fn replica_addresses(owners: &[String]) -> Vec<String> {
 /// ring via `refan_primary_evaluated`. Any other failure is
 /// `OutcomeUnknown`: the client gets the fatal `E` (never a retryable
 /// `R`) and must read the key to learn what happened.
+///
+/// The ordering signal (`leg.enqueued`, issue #1659) is released when the
+/// result's replica frames are enqueued, or as soon as the command ends
+/// without a replica write — an error, an unexpected reply, or a retry,
+/// which is outside the order (`refan_primary_evaluated` carries none), so
+/// a request waiting behind this one never waits for a retry's refresh.
+/// Whatever the primary's answer, the signal is not released before the
+/// points in `leg.after` are — those of the `i`/`k`/`x` dispatched inline
+/// ahead of this one on the key — so the replicas get the results of a run
+/// in request order and a request waiting for this signal is behind all of
+/// it. The wait comes after the primary's reply, so it holds back nothing
+/// but this command's replica write; it ends when the earlier command
+/// does, which the backend timeouts bound.
 async fn finish_primary_evaluated(
     context: &ProxyContext,
     command: &PrimaryCommand,
@@ -6368,27 +6497,59 @@ async fn finish_primary_evaluated(
     // clippy's argument-count lint — always used together.
     address: (&[u8], &[u8]),
     owners: Vec<String>,
-    pending: PendingReply,
+    leg: impl Into<PrimaryLeg>,
     tag: Option<u32>,
     retry_capable: bool,
 ) -> DriverResult {
     let (namespace, key) = address;
-    match pending.await {
+    let PrimaryLeg {
+        pending,
+        enqueued,
+        after,
+    } = leg.into();
+    let answer = pending.await;
+    for wait in after {
+        order_wait(wait).await;
+    }
+    match answer {
         Ok(reply) => match command.verdict(namespace, key, reply, tag) {
             PrimaryVerdict::Answer {
                 response,
                 replicate,
-            } => Ok(answer_after_fan_out(context, &owners, response, replicate).await),
+            } => Ok(answer_after_fan_out(context, &owners, response, replicate, enqueued).await),
             PrimaryVerdict::WrongNode => {
+                drop(enqueued);
                 force_refresh(context).await;
                 refan_primary_evaluated(context, command, address, tag, retry_capable).await
             }
             PrimaryVerdict::Unexpected => Err(Fatal::Transient),
         },
         Err(error) if request_not_sent(&error) => {
+            drop(enqueued);
             refan_primary_evaluated(context, command, address, tag, retry_capable).await
         }
         Err(_) => Err(Fatal::OutcomeUnknown),
+    }
+}
+
+/// The first, ordered leg of a primary-evaluated command: the primary's
+/// pending reply and the ordering signal that must be released once the
+/// result has been enqueued on the replicas (`fan_out_to_replicas`), and
+/// the points of earlier commands that must be released first.
+struct PrimaryLeg {
+    pending: PendingReply,
+    enqueued: Option<OrderSignal>,
+    after: Vec<OrderWait>,
+}
+
+/// A leg nothing waits on.
+impl From<PendingReply> for PrimaryLeg {
+    fn from(pending: PendingReply) -> Self {
+        Self {
+            pending,
+            enqueued: None,
+            after: Vec::new(),
+        }
     }
 }
 
@@ -6428,7 +6589,7 @@ async fn refan_primary_evaluated(
             PrimaryVerdict::Answer {
                 response,
                 replicate,
-            } => Ok(answer_after_fan_out(context, &owners, response, replicate).await),
+            } => Ok(answer_after_fan_out(context, &owners, response, replicate, None).await),
             PrimaryVerdict::WrongNode | PrimaryVerdict::Unexpected => Err(Fatal::Transient),
         },
         // `call_non_idempotent` already re-sent a frame that provably never
@@ -6447,7 +6608,11 @@ struct PrimaryRequest {
 
 /// Sends the first frame of a primary-evaluated command to its primary
 /// inline (so a pipelined connection keeps its request order) and spawns
-/// its completion.
+/// its completion. `slot` is the command's place in the connection's order
+/// (`ConnectionOrder`): the spawned completion releases its signal when the
+/// result has been enqueued on the replicas, which is what holds back a
+/// later request on the same key until then, after the points in
+/// `slot.after`.
 async fn dispatch_primary_evaluated(
     context: Arc<ProxyContext>,
     ring: &RingView,
@@ -6455,6 +6620,7 @@ async fn dispatch_primary_evaluated(
     tag: Option<u32>,
     retry_capable: bool,
     result_tx: DriverTx,
+    slot: OrderSlot,
 ) {
     let PrimaryRequest {
         namespace,
@@ -6481,7 +6647,11 @@ async fn dispatch_primary_evaluated(
             &command,
             (&namespace, &key),
             owners,
-            pending,
+            PrimaryLeg {
+                pending,
+                enqueued: slot.signal,
+                after: slot.after,
+            },
             tag,
             retry_capable,
         )
@@ -6503,15 +6673,46 @@ async fn dispatch_primary_evaluated(
 /// `PrimaryCommand`'s doc comment): the primary
 /// computes or accepts a value that a replica must not be left to
 /// (re)derive on its own.
+///
+/// `enqueued` is the connection's ordering signal for that result (issue
+/// #1659, `ConnectionOrder`): it fires once every leg's first attempt has
+/// been enqueued on its replica's queue — enqueued, not answered — or at
+/// once when there is no leg. Two results for one key therefore reach each
+/// replica in the order of the requests that produced them. A leg whose
+/// first attempt fails is re-sent by `finish_call`, which enqueues again
+/// after the signal has fired, so a re-sent result can land behind a later
+/// one; that retry stays outside the order, like every other retry.
 async fn fan_out_to_replicas(
     context: &ProxyContext,
     replicas: &[String],
     frame: Bytes,
     expect: Expect,
     what: &str,
+    enqueued: Option<OrderSignal>,
 ) {
-    let requests = replicas.iter().map(|addr| (addr.as_str(), frame.clone()));
-    let results = context.backends.call_each(context, requests, expect).await;
+    // One share of the signal per leg: the last leg to enqueue fires it.
+    let enqueued = enqueued.map(Arc::new);
+    let legs = replicas
+        .iter()
+        .map(|addr| {
+            let enqueued = enqueued.clone();
+            let frame = frame.clone();
+            Box::pin(async move {
+                let first = context
+                    .backends
+                    .enqueue(context, addr, frame.clone(), expect)
+                    .await;
+                drop(enqueued);
+                context
+                    .backends
+                    .finish_call(context, addr, frame, expect, first)
+                    .await
+            }) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    // Every leg holds its share now; this one must not outlive the enqueues.
+    drop(enqueued);
+    let results = join_all(legs).await;
     for (addr, result) in replicas.iter().zip(results) {
         match result {
             Err(error) => log_replica_warning(format_args!(
@@ -7128,6 +7329,411 @@ async fn send_transient(
         .is_ok()
 }
 
+// ─── per-connection request order (issue #1659) ──────────────────────
+
+/// A point in a client connection's request order that a later request may
+/// have to wait for: it resolves once the signal's `OrderSignal` is dropped.
+type OrderWait = watch::Receiver<()>;
+
+/// The holder's promise that a later request may go ahead, kept by dropping
+/// it: the request's backend frames are enqueued (for `i`/`k`/`x`, including
+/// the replica frames of its result), or the request ended without any, or
+/// its task is gone. Dropping rather than sending means no ending —
+/// failure, timeout, cancellation — can leave a waiter behind.
+struct OrderSignal {
+    _released: watch::Sender<()>,
+}
+
+fn order_signal() -> (OrderSignal, OrderWait) {
+    let (released, wait) = watch::channel(());
+    (
+        OrderSignal {
+            _released: released,
+        },
+        wait,
+    )
+}
+
+/// Whether `wait` is still to be released.
+fn order_pending(wait: &OrderWait) -> bool {
+    wait.has_changed().is_ok()
+}
+
+/// What `ConnectionOrder` identifies a namespace or a key by. A request's
+/// `Bytes` are slices of the connection's receive buffer, and keeping one
+/// would keep the whole allocation (up to a frame's size) alive, outside
+/// every budget, for as long as the registration stays in the map — a
+/// connection gone idle after one `i` would hold it until it closed. A
+/// hash holds nothing. Two names that collide only make a request wait that
+/// did not have to, on a connection that sent both.
+fn order_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+async fn order_wait(mut wait: OrderWait) {
+    // Nothing is ever sent: this returns when the sender is dropped.
+    while wait.changed().await.is_ok() {}
+}
+
+/// What a client connection's reader has to know to keep one request from
+/// overtaking an earlier one on the same key (issue #1659).
+///
+/// The reader enqueues each request's first backend frames inline, in
+/// request order, and that order is all a same-key chain needs — except for
+/// `i`/`k`/`x`: the replica frames of their result (a plain `Set`/`Delete`)
+/// cannot be enqueued before the primary has answered, so they used to go
+/// out after a later request on the key was already on the replica, and
+/// overwrote it. So an `i`/`k`/`x` registers here, per key, a signal that
+/// fires once its result is enqueued on the replicas (or the command ends
+/// without one), and a later request that touches the key waits for it
+/// before it is dispatched.
+///
+/// Only that request waits. The reader does not: a request with something
+/// to wait for is dispatched from its own task (`dispatch_ordered`) while
+/// the reader goes on, so requests on other keys, and every other
+/// connection, are unaffected — a connection that never pipelines a
+/// same-key request behind an `i`/`k`/`x` takes the old inline path with
+/// one hash lookup per request. A request that waits is itself registered
+/// until it is dispatched, so a third request on the key waits for it in
+/// turn: waiting for the latest registration is waiting for all earlier
+/// ones. `m`/`o`/`y` touch every key they carry; `c` covers every key of its
+/// namespace and `F` every key, and later requests in that scope wait for
+/// the clear in the same way.
+///
+/// One request does not wait to be dispatched: an `i`/`k`/`x` whose pending
+/// registrations are all of `i`/`k`/`x` that were themselves dispatched
+/// inline. Its primary frame is enqueued inline too, behind theirs on the
+/// same primary (which applies and answers them in that order), and what
+/// waits is its driver, which holds back the replica frames of its result
+/// until theirs are enqueued (`OrderSlot::after`). A run of increments of
+/// one key therefore stays pipelined at the primary while the replicas still
+/// receive their results in request order. Anything else in the way — a
+/// deferred request, a clear, an `i`/`k`/`x` that was itself deferred (its
+/// primary frame is not yet enqueued, so one dispatched inline would
+/// overtake it) — defers the request as above.
+///
+/// The maps hold hashes (`order_hash`), not the request's bytes.
+struct ConnectionOrder {
+    /// Keyed by `order_hash` of the namespace.
+    namespaces: HashMap<u64, NamespaceOrder>,
+    /// The latest registered `F`.
+    everything: Option<OrderWait>,
+    /// Registrations since the maps were last swept of released entries.
+    registered: usize,
+    /// Registrations after which they are swept again.
+    sweep_after: usize,
+}
+
+#[derive(Default)]
+struct NamespaceOrder {
+    /// The latest registered `c` of the namespace.
+    clear: Option<OrderWait>,
+    /// Keyed by `order_hash` of the key.
+    keys: HashMap<u64, Registration>,
+}
+
+/// The latest registration of a key.
+struct Registration {
+    wait: OrderWait,
+    /// Registered by an `i`/`k`/`x` whose primary frame was enqueued inline,
+    /// in request order: another `i`/`k`/`x` may follow it inline.
+    inline_primary: bool,
+}
+
+/// What `ConnectionOrder::admit` collected for a request.
+struct Pending {
+    waits: Vec<OrderWait>,
+    /// Whether every pending wait is an `inline_primary` registration.
+    only_inline_primary: bool,
+}
+
+impl Pending {
+    fn new() -> Self {
+        Self {
+            waits: Vec::new(),
+            only_inline_primary: true,
+        }
+    }
+
+    fn push(&mut self, wait: &OrderWait, inline_primary: bool) {
+        if order_pending(wait) {
+            self.waits.push(wait.clone());
+            self.only_inline_primary &= inline_primary;
+        }
+    }
+}
+
+/// What `dispatch_request` is given of the connection's order for a request.
+#[derive(Default)]
+struct OrderSlot {
+    /// Released once the request's frames are enqueued; see
+    /// `dispatch_request`.
+    signal: Option<OrderSignal>,
+    /// For an `i`/`k`/`x` dispatched inline behind earlier ones: the points
+    /// its driver has to wait for before it hands its result to the
+    /// replicas, and before it releases `signal` — a request waiting for
+    /// `signal` is thereby behind the whole run.
+    after: Vec<OrderWait>,
+}
+
+/// What `ConnectionOrder::admit` decided about one request.
+struct OrderTicket {
+    /// Points in the connection's order the request has to come after.
+    waits: Vec<OrderWait>,
+    /// Released when the request's frames are enqueued; `None` when nothing
+    /// needs to wait for this request.
+    signal: Option<OrderSignal>,
+    /// Whether the request is dispatched only after `waits` (from
+    /// `dispatch_ordered`). When not, `waits` is empty or belongs to an
+    /// `i`/`k`/`x` that goes inline and hands them to its driver.
+    defer: bool,
+}
+
+impl OrderTicket {
+    /// The slot for a request dispatched inline.
+    fn into_slot(self) -> OrderSlot {
+        OrderSlot {
+            signal: self.signal,
+            after: self.waits,
+        }
+    }
+}
+
+/// Registrations between sweeps of released entries, at least.
+const ORDER_SWEEP_MIN: usize = 1024;
+
+impl ConnectionOrder {
+    fn new() -> Self {
+        Self {
+            namespaces: HashMap::new(),
+            everything: None,
+            registered: 0,
+            sweep_after: ORDER_SWEEP_MIN,
+        }
+    }
+
+    /// Decides what `request` has to wait for and whether later requests
+    /// have to wait for it, and registers it for them if so. A request that
+    /// waits on nothing and is not an `i`/`k`/`x` is enqueued inline before
+    /// the reader parses the next one, so nothing can overtake it and it
+    /// registers nothing.
+    fn admit(&mut self, request: &Request) -> OrderTicket {
+        let pending = self.pending_for(request);
+        let primary_evaluated = matches!(
+            request,
+            Request::Incr { .. } | Request::CasSet { .. } | Request::CasDelete { .. }
+        );
+        if pending.waits.is_empty() && !primary_evaluated {
+            return OrderTicket {
+                waits: pending.waits,
+                signal: None,
+                defer: false,
+            };
+        }
+        let inline_primary = primary_evaluated && pending.only_inline_primary;
+        let (signal, wait) = order_signal();
+        self.register(request, wait, inline_primary);
+        OrderTicket {
+            defer: !pending.waits.is_empty() && !inline_primary,
+            waits: pending.waits,
+            signal: Some(signal),
+        }
+    }
+
+    fn pending_for(&self, request: &Request) -> Pending {
+        let mut pending = Pending::new();
+        if self.namespaces.is_empty() && self.everything.is_none() {
+            return pending;
+        }
+        if let Some(wait) = &self.everything {
+            pending.push(wait, false);
+        }
+        match request {
+            Request::Get { namespace, key }
+            | Request::Set { namespace, key, .. }
+            | Request::Delete { namespace, key }
+            | Request::Incr { namespace, key, .. }
+            | Request::CasSet { namespace, key, .. }
+            | Request::CasDelete { namespace, key, .. }
+            | Request::Touch { namespace, key, .. } => {
+                self.push_keys(&mut pending, namespace, std::slice::from_ref(key));
+            }
+            Request::MultiGet { namespace, keys }
+            | Request::MultiSet {
+                namespace, keys, ..
+            }
+            | Request::MultiTouch {
+                namespace, keys, ..
+            } => self.push_keys(&mut pending, namespace, keys),
+            Request::Clear { namespace } => {
+                if let Some(order) = self.namespaces.get(&order_hash(namespace)) {
+                    order.push_all(&mut pending);
+                }
+            }
+            Request::ClearAll => {
+                for order in self.namespaces.values() {
+                    order.push_all(&mut pending);
+                }
+            }
+        }
+        pending
+    }
+
+    fn push_keys(&self, pending: &mut Pending, namespace: &Bytes, keys: &[Bytes]) {
+        let Some(order) = self.namespaces.get(&order_hash(namespace)) else {
+            return;
+        };
+        if let Some(wait) = &order.clear {
+            pending.push(wait, false);
+        }
+        for key in keys {
+            if let Some(registration) = order.keys.get(&order_hash(key)) {
+                pending.push(&registration.wait, registration.inline_primary);
+            }
+        }
+    }
+
+    fn register(&mut self, request: &Request, wait: OrderWait, inline_primary: bool) {
+        self.registered += 1;
+        match request {
+            Request::Get { namespace, key }
+            | Request::Set { namespace, key, .. }
+            | Request::Delete { namespace, key }
+            | Request::Incr { namespace, key, .. }
+            | Request::CasSet { namespace, key, .. }
+            | Request::CasDelete { namespace, key, .. }
+            | Request::Touch { namespace, key, .. } => {
+                self.namespaces
+                    .entry(order_hash(namespace))
+                    .or_default()
+                    .keys
+                    .insert(
+                        order_hash(key),
+                        Registration {
+                            wait,
+                            inline_primary,
+                        },
+                    );
+            }
+            Request::MultiGet { namespace, keys }
+            | Request::MultiSet {
+                namespace, keys, ..
+            }
+            | Request::MultiTouch {
+                namespace, keys, ..
+            } => {
+                self.registered += keys.len();
+                let order = self.namespaces.entry(order_hash(namespace)).or_default();
+                for key in keys {
+                    order.keys.insert(
+                        order_hash(key),
+                        Registration {
+                            wait: wait.clone(),
+                            inline_primary: false,
+                        },
+                    );
+                }
+            }
+            // The clear waited for everything in its scope, so waiting for
+            // the clear is waiting for all of it.
+            Request::Clear { namespace } => {
+                let order = self.namespaces.entry(order_hash(namespace)).or_default();
+                order.keys.clear();
+                order.clear = Some(wait);
+            }
+            Request::ClearAll => {
+                self.namespaces.clear();
+                self.everything = Some(wait);
+            }
+        }
+        if self.registered >= self.sweep_after {
+            self.sweep();
+        }
+    }
+
+    /// Drops the entries that have been released: a connection that
+    /// registers keys without end must not grow without bound.
+    fn sweep(&mut self) {
+        let mut live = 0;
+        self.namespaces.retain(|_, order| {
+            order
+                .keys
+                .retain(|_, registration| order_pending(&registration.wait));
+            if order
+                .clear
+                .as_ref()
+                .is_some_and(|wait| !order_pending(wait))
+            {
+                order.clear = None;
+            }
+            live += order.keys.len();
+            !order.keys.is_empty() || order.clear.is_some()
+        });
+        if self
+            .everything
+            .as_ref()
+            .is_some_and(|wait| !order_pending(wait))
+        {
+            self.everything = None;
+        }
+        self.registered = 0;
+        self.sweep_after = ORDER_SWEEP_MIN.max(live.saturating_mul(2));
+    }
+}
+
+impl NamespaceOrder {
+    fn push_all(&self, pending: &mut Pending) {
+        if let Some(wait) = &self.clear {
+            pending.push(wait, false);
+        }
+        for registration in self.keys.values() {
+            pending.push(&registration.wait, registration.inline_primary);
+        }
+    }
+}
+
+/// `dispatch_request` for a request that has to come after earlier ones on
+/// its keys (`ConnectionOrder`): a task of its own waits for them, then
+/// dispatches the request and forwards its result to the receiver returned
+/// here, which the reader queues for the writer at the request's place in
+/// the connection's reply order straight away. Each wait ends when the
+/// request it is for has its frames enqueued, so it is bounded by what
+/// bounds that request — the primary's reply, for an `i`/`k`/`x`, which
+/// the proxy's backend timeouts bound whether or not the primary is alive.
+fn dispatch_ordered(
+    context: Arc<ProxyContext>,
+    request: Request,
+    tag: Option<u32>,
+    retry_capable: bool,
+    charge: Arc<InFlightCharge>,
+    ticket: OrderTicket,
+) -> oneshot::Receiver<DriverResult> {
+    let (mut result_tx, result_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let OrderTicket { waits, signal, .. } = ticket;
+        for wait in waits {
+            tokio::select! {
+                () = order_wait(wait) => {}
+                // The client is gone (its writer dropped the queue): the
+                // request is not applied, like one still in the buffer.
+                () = result_tx.closed() => return,
+            }
+        }
+        let slot = OrderSlot {
+            signal,
+            after: Vec::new(),
+        };
+        let driver = dispatch_request(context, request, tag, retry_capable, charge, slot).await;
+        if let Ok(result) = driver.await {
+            let _ = result_tx.send(result);
+        }
+    });
+    result_rx
+}
+
 async fn handle_client(
     stream: ServerStream,
     context: Arc<ProxyContext>,
@@ -7222,6 +7828,9 @@ async fn handle_client(
     let mut retry_capable = false;
     let mut drain = context.drain.clone();
     let mut scan = RequestScanState::default();
+    // Issue #1659: which keys have an earlier request of this connection
+    // still to hand its frames to the backends.
+    let mut order = ConnectionOrder::new();
     // The fixed pre-auth deadline (`AUTH_DEADLINE`): never moved, so no
     // amount of slow trickling extends it. Irrelevant in no-secret mode,
     // where `authenticated` starts true and is never consulted.
@@ -7386,14 +7995,32 @@ async fn handle_client(
                     // enqueues) before parsing the next request — see
                     // `dispatch_request` on why order matters here.
                     let charge = Arc::new(charge);
-                    let result = dispatch_request(
-                        Arc::clone(&context),
-                        request,
-                        tag,
-                        retry_capable,
-                        Arc::clone(&charge),
-                    )
-                    .await;
+                    // Issue #1659: a request on a key an earlier `i`/`k`/`x`
+                    // of this connection has not yet handed its result to
+                    // the replicas for is dispatched from a task that waits
+                    // for that; the reader goes on. (An `i`/`k`/`x` behind
+                    // others dispatched inline goes inline too.)
+                    let ticket = order.admit(&request);
+                    let result = if !ticket.defer {
+                        dispatch_request(
+                            Arc::clone(&context),
+                            request,
+                            tag,
+                            retry_capable,
+                            Arc::clone(&charge),
+                            ticket.into_slot(),
+                        )
+                        .await
+                    } else {
+                        dispatch_ordered(
+                            Arc::clone(&context),
+                            request,
+                            tag,
+                            retry_capable,
+                            Arc::clone(&charge),
+                            ticket,
+                        )
+                    };
                     if fifo_tx
                         .send(ClientReply {
                             result,
@@ -9992,6 +10619,7 @@ mod tests {
             result.frame,
             result.expect,
             result.what,
+            None,
         )
         .await;
         assert!(
@@ -10921,6 +11549,13 @@ mod tests {
         /// with no frame from the proxy involved — a node restarting or
         /// scaled in while the shared connection sits idle.
         close_now: Arc<tokio::sync::Notify>,
+        /// Issue #1659: while set, an `i` is applied to the store but its
+        /// reply is held back — the primary being slow to answer an
+        /// increment, which keeps the result off the replicas.
+        hold_incr_reply: Arc<AtomicBool>,
+        /// Issue #1659: how many `G`/`g` frames (other than keep-alive
+        /// probes) this node received.
+        gets: Arc<AtomicUsize>,
     }
 
     impl MockNode {
@@ -10954,6 +11589,8 @@ mod tests {
                 keepalives: Arc::new(AtomicUsize::new(0)),
                 close_when_idle_for: Arc::new(StdMutex::new(None)),
                 close_now: Arc::new(tokio::sync::Notify::new()),
+                hold_incr_reply: Arc::new(AtomicBool::new(false)),
+                gets: Arc::new(AtomicUsize::new(0)),
             };
             let store = Arc::clone(&node.store);
             let cleared = Arc::clone(&node.cleared);
@@ -10981,6 +11618,8 @@ mod tests {
             let keepalives = Arc::clone(&node.keepalives);
             let close_when_idle_for = Arc::clone(&node.close_when_idle_for);
             let close_now = Arc::clone(&node.close_now);
+            let hold_incr_reply = Arc::clone(&node.hold_incr_reply);
+            let gets = Arc::clone(&node.gets);
             tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -11018,6 +11657,8 @@ mod tests {
                             keepalives: Arc::clone(&keepalives),
                             close_when_idle_for: Arc::clone(&close_when_idle_for),
                             close_now: Arc::clone(&close_now),
+                            hold_incr_reply: Arc::clone(&hold_incr_reply),
+                            gets: Arc::clone(&gets),
                         },
                     ));
                 }
@@ -11027,6 +11668,10 @@ mod tests {
 
         fn incrs(&self) -> usize {
             self.incrs.load(Ordering::SeqCst)
+        }
+
+        fn gets(&self) -> usize {
+            self.gets.load(Ordering::SeqCst)
         }
 
         fn cas_sets(&self) -> usize {
@@ -11094,6 +11739,8 @@ mod tests {
         keepalives: Arc<AtomicUsize>,
         close_when_idle_for: Arc<StdMutex<Option<Duration>>>,
         close_now: Arc<tokio::sync::Notify>,
+        hold_incr_reply: Arc<AtomicBool>,
+        gets: Arc<AtomicUsize>,
     }
 
     /// Issue #141: same content-digest algorithm as the real node's
@@ -11107,6 +11754,27 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    /// The node's own `MAX_MULTI_NAMESPACE_KEY_BYTES`, written out so that the
+    /// mock enforces it whatever the proxy's mirror of it says.
+    const NODE_MULTI_NAMESPACE_KEY_BYTES: usize = 64 * 1024 * 1024;
+
+    /// What a real node does with an `o` or `y` whose namespace length times
+    /// its key count is over `NODE_MULTI_NAMESPACE_KEY_BYTES`: the untagged
+    /// `En\n` and the close, whatever else is queued behind the frame on the
+    /// connection. The mock's `get_delay` (if set) passes first, so a test
+    /// can put other clients' requests on the connection before the close.
+    async fn refuse_over_the_namespace_bound(
+        stream: &mut TcpStream,
+        delay: &Arc<StdMutex<Duration>>,
+    ) -> io::Result<()> {
+        let pause = *delay.lock().unwrap();
+        if !pause.is_zero() {
+            sleep(pause).await;
+        }
+        stream.write_all(b"En\n").await?;
+        stream.shutdown().await
     }
 
     async fn serve_mock_node(mut stream: TcpStream, state: MockNodeState) {
@@ -11136,9 +11804,13 @@ mod tests {
             keepalives,
             close_when_idle_for,
             close_now,
+            hold_incr_reply,
+            gets,
         } = state;
         let mut buf = BytesMut::new();
         let result: io::Result<()> = async {
+            // Issue #1659: `I` replies held back by `hold_incr_reply`.
+            let mut held_replies: Vec<u8> = Vec::new();
             loop {
                 let idle_limit = *close_when_idle_for.lock().unwrap();
                 let line = tokio::select! {
@@ -11158,6 +11830,16 @@ mod tests {
                     },
                     // A close with nothing from the proxy involved.
                     () = close_now.notified() => return Ok(()),
+                    // Issue #1659: the hold on `i` replies was lifted.
+                    () = async {
+                        while hold_incr_reply.load(Ordering::SeqCst) {
+                            sleep(Duration::from_millis(5)).await;
+                        }
+                    }, if !held_replies.is_empty() => {
+                        stream.write_all(&held_replies).await?;
+                        held_replies.clear();
+                        continue;
+                    }
                 };
                 let mut parts = line.split(' ');
                 let command = parts.next().unwrap_or_default().to_string();
@@ -11204,6 +11886,8 @@ mod tests {
                         };
                         if key == KEEPALIVE_KEY {
                             keepalives.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            gets.fetch_add(1, Ordering::SeqCst);
                         }
                         let pause = *delay.lock().unwrap();
                         if !pause.is_zero() {
@@ -11310,6 +11994,10 @@ mod tests {
                         let ns_length: usize = fields[0].parse().unwrap();
                         let count: usize = fields[1].parse().unwrap();
                         multi_set_sizes.lock().unwrap().push(count);
+                        if ns_length.saturating_mul(count) > NODE_MULTI_NAMESPACE_KEY_BYTES {
+                            refuse_over_the_namespace_bound(&mut stream, &delay).await?;
+                            return Ok(());
+                        }
                         let mut pairs = Vec::with_capacity(count);
                         for pair in 0..count {
                             let key_length: usize = fields[2 + pair * 2].parse().unwrap();
@@ -11455,17 +12143,23 @@ mod tests {
                                         } else {
                                             String::new()
                                         };
-                                        stream
-                                            .write_all(
-                                                format!(
-                                                    "I {}{ttl_field} {}\n",
-                                                    new_bytes.len(),
-                                                    tag(&fields)
-                                                )
-                                                .as_bytes(),
-                                            )
-                                            .await?;
-                                        stream.write_all(&new_bytes).await?;
+                                        let mut reply = format!(
+                                            "I {}{ttl_field} {}\n",
+                                            new_bytes.len(),
+                                            tag(&fields)
+                                        )
+                                        .into_bytes();
+                                        reply.extend_from_slice(&new_bytes);
+                                        // Issue #1659: applied, reply held
+                                        // back (the node goes on reading
+                                        // frames) until the hold is lifted.
+                                        if hold_incr_reply.load(Ordering::SeqCst) {
+                                            held_replies.extend_from_slice(&reply);
+                                        } else {
+                                            stream.write_all(&held_replies).await?;
+                                            held_replies.clear();
+                                            stream.write_all(&reply).await?;
+                                        }
                                     }
                                 }
                             }
@@ -11652,6 +12346,11 @@ mod tests {
                     "y" => {
                         let ns_length: usize = fields[0].parse().unwrap();
                         let count: usize = fields[1].parse().unwrap();
+                        if ns_length.saturating_mul(count) > NODE_MULTI_NAMESPACE_KEY_BYTES {
+                            multi_set_sizes.lock().unwrap().push(count);
+                            refuse_over_the_namespace_bound(&mut stream, &delay).await?;
+                            return Ok(());
+                        }
                         let key_lengths: Vec<usize> = fields[2..2 + count]
                             .iter()
                             .map(|field| field.parse().unwrap())
@@ -13093,6 +13792,146 @@ mod tests {
         let frame = format!("G {}\n{key}", key.len());
         stream.write_all(frame.as_bytes()).await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+    }
+
+    /// An `o` of `keys` one-byte-value keys (`k0`, `k1`, ...) under a
+    /// `namespace_len`-byte namespace, untagged, as a client sends it.
+    fn big_namespace_multi_set(namespace_len: usize, keys: usize) -> Vec<u8> {
+        let names: Vec<String> = (0..keys).map(|index| format!("k{index}")).collect();
+        let lens: Vec<String> = names
+            .iter()
+            .map(|name| format!("{} 1", name.len()))
+            .collect();
+        let mut frame = format!("o {namespace_len} {keys} {}\n", lens.join(" ")).into_bytes();
+        frame.extend(std::iter::repeat_n(b'n', namespace_len));
+        for name in &names {
+            frame.extend_from_slice(name.as_bytes());
+            frame.push(b'v');
+        }
+        frame
+    }
+
+    /// `big_namespace_multi_set` for a `y` with a TTL (`ttl` seconds).
+    fn big_namespace_multi_touch(namespace_len: usize, keys: usize, ttl: u64) -> Vec<u8> {
+        let names: Vec<String> = (0..keys).map(|index| format!("k{index}")).collect();
+        let lens: Vec<String> = names.iter().map(|name| name.len().to_string()).collect();
+        let mut frame = format!("y {namespace_len} {keys} {} {ttl}\n", lens.join(" ")).into_bytes();
+        frame.extend(std::iter::repeat_n(b'n', namespace_len));
+        for name in &names {
+            frame.extend_from_slice(name.as_bytes());
+        }
+        frame
+    }
+
+    /// 300,000 x 224 keys is 67,200,000, over `MAX_MULTI_NAMESPACE_KEY_BYTES`
+    /// (67,108,864); 223 keys (66,900,000) are under it.
+    const BIG_NAMESPACE: usize = 300_000;
+
+    /// An `o` or `y` over the bound is refused to its client as any frame
+    /// over a client limit is (`En`, and that client's own connection
+    /// closed), and no backend receives it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_over_the_namespace_bound_is_refused_and_no_backend_receives_it() {
+        for touch in [false, true] {
+            let (nodes, proxy) = cluster(1).await;
+            let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+            let frame = if touch {
+                big_namespace_multi_touch(BIG_NAMESPACE, 224, 60)
+            } else {
+                big_namespace_multi_set(BIG_NAMESPACE, 224)
+            };
+            let _ = stream.write_all(&frame).await;
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+            sleep(Duration::from_millis(200)).await;
+            assert!(
+                nodes[0].multi_set_sizes().is_empty(),
+                "touch={touch}: a backend received the frame"
+            );
+            assert!(nodes[0].touches().is_empty());
+            assert_eq!(nodes[0].len(), 0);
+        }
+    }
+
+    /// The `En` and close a node answers such a frame with would land on the
+    /// backend connection every client shares, and fail what other clients
+    /// have behind the frame on it. Here the node takes 400 ms to refuse; a
+    /// second client's `i` (never resent after it was written) goes out
+    /// meanwhile. With the proxy refusing the frame itself, the `i` is
+    /// answered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_multi_key_frame_does_not_fail_another_clients_request_on_the_backend() {
+        for touch in [false, true] {
+            let node = MockNode::start().await;
+            let roster = vec![("node-a".to_string(), node.addr.clone())];
+            let discovery = start_mock_discovery(roster, 1).await;
+            let proxy = start_proxy(&discovery, None, 16).await;
+            *node.get_delay.lock().unwrap() = Duration::from_millis(400);
+
+            let (mut other, mut other_buf) = connect_and_auth(&proxy).await;
+            // Dialed and in use before the big frame: it is the same shared
+            // connection the big frame would go out on.
+            other.write_all(b"S 7 1\ncounter1").await.unwrap();
+            assert_eq!(read_line(&mut other, &mut other_buf).await.unwrap(), "S");
+
+            let (mut big, mut big_buf) = connect_and_auth(&proxy).await;
+            let frame = if touch {
+                big_namespace_multi_touch(BIG_NAMESPACE, 224, 60)
+            } else {
+                big_namespace_multi_set(BIG_NAMESPACE, 224)
+            };
+            let _ = big.write_all(&frame).await;
+            sleep(Duration::from_millis(100)).await;
+
+            other.write_all(b"i 0 7 5\ncounter").await.unwrap();
+            let answer = timeout(
+                Duration::from_secs(5),
+                read_line(&mut other, &mut other_buf),
+            )
+            .await
+            .expect("the other client was left waiting")
+            .unwrap();
+            assert_eq!(answer, "I 1", "touch={touch}");
+            assert_eq!(read_line(&mut big, &mut big_buf).await.unwrap(), "E");
+        }
+    }
+
+    /// A frame just under the bound is carried out whole: every frame the
+    /// proxy builds from it (the per-owner sub-frames of an `o`, the primary
+    /// legs and the deferred plain legs of a `y` that expires its keys) is
+    /// within the bound as well, which the mock nodes enforce as a real node
+    /// does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_just_under_the_namespace_bound_and_its_sub_frames_are_accepted() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream
+            .write_all(&big_namespace_multi_set(BIG_NAMESPACE, 223))
+            .await
+            .unwrap();
+        let line = read_line(&mut stream, &mut buf).await.unwrap();
+        assert!(
+            line.starts_with("O 223 S"),
+            "{}",
+            &line[..line.len().min(20)]
+        );
+        for node in &nodes {
+            assert!(node.multi_set_sizes().iter().all(|&keys| keys <= 223));
+            assert!(!node.multi_set_sizes().is_empty());
+        }
+
+        for ttl in [0, 60] {
+            stream
+                .write_all(&big_namespace_multi_touch(BIG_NAMESPACE, 223, ttl))
+                .await
+                .unwrap();
+            let line = read_line(&mut stream, &mut buf).await.unwrap();
+            assert!(
+                line.starts_with("Y 223 "),
+                "ttl={ttl}: {}",
+                &line[..line.len().min(20)]
+            );
+        }
     }
 
     // Issue #150: multi-set through the proxy.
@@ -14807,6 +15646,503 @@ mod tests {
             0,
             "the result must not be sent back to the node that computed it"
         );
+    }
+
+    // ── issue #1659: the result of i/k/x reaches the replicas in the
+    // client's request order ──────────────────────────────────────────
+
+    /// Reads one `I <len>` reply and its value.
+    async fn read_incr_reply(stream: &mut TcpStream, buf: &mut BytesMut) -> String {
+        let header = read_line(stream, buf).await.unwrap();
+        let length: usize = header
+            .strip_prefix("I ")
+            .unwrap_or_else(|| panic!("expected an I reply, got {header:?}"))
+            .parse()
+            .unwrap();
+        read_exact_into(stream, buf, length).await.unwrap();
+        String::from_utf8(buf.split_to(length).to_vec()).unwrap()
+    }
+
+    // The reproduction from the audit: `i` and a `D` of the same key in one
+    // write. The `D` used to reach the replica before the `i`'s result did,
+    // and the result then put the deleted key back. Half of the rounds put
+    // a run of `i` before the `D`, and the test runs on the multi-thread
+    // runtime, since the drivers of a run are separate tasks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_pipelined_behind_an_incr_is_not_undone_by_its_result() {
+        const ROUNDS: usize = 100;
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        let mut resurrected = Vec::new();
+        for round in 0..ROUNDS {
+            let key = format!("counter-{round}");
+            let (primary, replica) = primary_and_replica(&nodes, key.as_bytes());
+            stream
+                .write_all(format!("S {} 1\n{key}0", key.len()).as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+            // One `i` in half of the rounds, a run of four in the others.
+            let run = if round % 2 == 0 { 1 } else { 4 };
+            let len = key.len();
+            let incrs = format!("i 0 {len} 1\n{key}").repeat(run);
+            stream
+                .write_all(format!("{incrs}D {len}\n{key}").as_bytes())
+                .await
+                .unwrap();
+            for expected in 1..=run {
+                assert_eq!(
+                    read_incr_reply(&mut stream, &mut buf).await,
+                    expected.to_string()
+                );
+            }
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "D");
+
+            if primary.entry(b"", key.as_bytes()).is_some()
+                || replica.entry(b"", key.as_bytes()).is_some()
+            {
+                resurrected.push(round);
+            }
+        }
+        assert!(
+            resurrected.is_empty(),
+            "{} of {ROUNDS} rounds left the deleted key on a node (rounds {resurrected:?})",
+            resurrected.len()
+        );
+    }
+
+    // The second reproduction: two `i` on one key in one write. Each result
+    // goes to the replica from its own task, and the later one used to be
+    // overtaken by the earlier one on the multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_increments_of_one_key_leave_the_replica_with_the_last_result() {
+        const ROUNDS: usize = 200;
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        let mut behind = Vec::new();
+        for round in 0..ROUNDS {
+            let key = format!("counter-{round}");
+            let (primary, replica) = primary_and_replica(&nodes, key.as_bytes());
+            stream
+                .write_all(format!("S {} 1\n{key}0", key.len()).as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+            let incr = format!("i 0 {} 1\n{key}", key.len());
+            stream.write_all(incr.repeat(5).as_bytes()).await.unwrap();
+            for expected in ["1", "2", "3", "4", "5"] {
+                assert_eq!(read_incr_reply(&mut stream, &mut buf).await, expected);
+            }
+
+            let on_primary = primary.entry(b"", key.as_bytes());
+            let on_replica = replica.entry(b"", key.as_bytes());
+            if on_primary != Some(b"5".to_vec()) || on_replica != on_primary {
+                behind.push((round, on_primary, on_replica));
+            }
+        }
+        assert!(
+            behind.is_empty(),
+            "{} of {ROUNDS} rounds left the replica behind the primary: {:?}",
+            behind.len(),
+            &behind[..behind.len().min(3)]
+        );
+    }
+
+    // `k` and `x` have the same gap: their result is a plain `Set`/`Delete`
+    // that used to land after a write pipelined behind them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_pipelined_behind_a_cas_is_not_undone_by_the_cas_result() {
+        const ROUNDS: usize = 30;
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        let mut diverged = Vec::new();
+        for round in 0..ROUNDS {
+            let key = format!("name-{round}");
+            let len = key.len();
+            let (primary, replica) = primary_and_replica(&nodes, key.as_bytes());
+
+            // `k` replaces Alice with Bob, then `S` replaces that with Carol.
+            stream
+                .write_all(format!("S {len} 5\n{key}Alice").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+            let alice = mock_content_digest(b"Alice");
+            stream
+                .write_all(format!("k 0 {len} 3 {alice}\n{key}BobS {len} 5\n{key}Carol").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+            let after_set = (
+                primary.entry(b"", key.as_bytes()),
+                replica.entry(b"", key.as_bytes()),
+            );
+
+            // `x` deletes Carol, then `S` writes Dave.
+            let carol = mock_content_digest(b"Carol");
+            stream
+                .write_all(format!("x 0 {len} {carol}\n{key}S {len} 4\n{key}Dave").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "D");
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+            let after_delete = (
+                primary.entry(b"", key.as_bytes()),
+                replica.entry(b"", key.as_bytes()),
+            );
+
+            let carol = Some(b"Carol".to_vec());
+            let dave = Some(b"Dave".to_vec());
+            if after_set != (carol.clone(), carol) || after_delete != (dave.clone(), dave) {
+                diverged.push((round, after_set, after_delete));
+            }
+        }
+        assert!(
+            diverged.is_empty(),
+            "{} of {ROUNDS} rounds ended with a node holding an older value: {:?}",
+            diverged.len(),
+            &diverged[..diverged.len().min(2)]
+        );
+    }
+
+    // The same through the multi-key and clear paths, which are dispatched
+    // from the waiting task too: an `o` carrying the key, and a `c` covering
+    // it, pipelined behind an `i`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_set_and_a_clear_pipelined_behind_an_incr_are_not_undone_by_its_result() {
+        const ROUNDS: usize = 30;
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        let mut wrong = Vec::new();
+        for round in 0..ROUNDS {
+            let key = format!("k-{round}");
+            let len = key.len();
+            let (primary, replica) = primary_and_replica(&nodes, key.as_bytes());
+
+            // `o` replaces the incremented value with Z.
+            stream
+                .write_all(format!("S {len} 1\n{key}0").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+            stream
+                .write_all(format!("i 0 {len} 1\n{key}o 0 1 {len} 1\n{key}Z").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_incr_reply(&mut stream, &mut buf).await, "1");
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "O 1 S");
+            let after_multi = (
+                primary.entry(b"", key.as_bytes()),
+                replica.entry(b"", key.as_bytes()),
+            );
+
+            // `c` clears the namespace the `i` incremented in.
+            stream
+                .write_all(format!("s 2 {len} 1\nzz{key}0").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+            stream
+                .write_all(format!("i 2 {len} 1\nzz{key}c 2\nzz").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(read_incr_reply(&mut stream, &mut buf).await, "1");
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "C");
+            let after_clear = (
+                primary.entry(b"zz", key.as_bytes()),
+                replica.entry(b"zz", key.as_bytes()),
+            );
+
+            let z = Some(b"Z".to_vec());
+            if after_multi != (z.clone(), z) || after_clear != (None, None) {
+                wrong.push((round, after_multi, after_clear));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {ROUNDS} rounds ended with the incr result over a later request: {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(2)]
+        );
+    }
+
+    // A run of `i` on one key stays pipelined at the primary: with the
+    // primary holding every reply, all of the frames are on it before the
+    // first reply is released, and only then do the results go to the
+    // replica, in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_of_incrs_on_one_key_reaches_the_primary_before_its_first_reply() {
+        const BURST: usize = 50;
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let (primary, replica) = primary_and_replica(&nodes, b"burst");
+
+        stream.write_all(b"S 5 1\nburst0").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        primary.hold_incr_reply.store(true, Ordering::SeqCst);
+        let incr = b"i 0 5 1\nburst".repeat(BURST);
+        stream.write_all(&incr).await.unwrap();
+        timeout(Duration::from_secs(10), async {
+            while primary.incrs() < BURST {
+                sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "only {} of {BURST} pipelined increments reached the primary while the first reply was outstanding",
+                primary.incrs()
+            )
+        });
+        // No result has been handed to the replica yet.
+        assert_eq!(replica.entry(b"", b"burst"), Some(b"0".to_vec()));
+
+        primary.hold_incr_reply.store(false, Ordering::SeqCst);
+        for expected in 1..=BURST {
+            assert_eq!(
+                read_incr_reply(&mut stream, &mut buf).await,
+                expected.to_string()
+            );
+        }
+        let last = Some(BURST.to_string().into_bytes());
+        assert_eq!(primary.entry(b"", b"burst"), last);
+        assert_eq!(replica.entry(b"", b"burst"), last);
+    }
+
+    // What the order costs, and who: with the primary slow to answer an
+    // `i`, a `D` of the same key behind it waits, while a `G` of another key
+    // behind that, and another connection, do not. (The mock node serves a
+    // connection one frame at a time, so the keys read here have the other
+    // node as their primary: a frame queued behind the held `i` on the same
+    // backend connection would show nothing.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_request_on_the_same_key_waits_for_an_incrs_result() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let (mut other, mut other_buf) = connect_and_auth(&proxy).await;
+        let (primary, replica) = primary_and_replica(&nodes, b"held");
+        // Keys whose primary is the node the `i` is not held on.
+        let elsewhere: Vec<String> = (0..)
+            .map(|n| format!("elsewhere-{n}"))
+            .filter(|key| std::ptr::eq(primary_and_replica(&nodes, key.as_bytes()).0, replica))
+            .take(2)
+            .collect();
+        let (behind, apart) = (&elsewhere[0], &elsewhere[1]);
+
+        stream.write_all(b"S 4 1\nheld0").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        primary.hold_incr_reply.store(true, Ordering::SeqCst);
+        let gets_before = replica.gets();
+        stream
+            .write_all(format!("i 0 4 1\nheldD 4\nheldG {}\n{behind}", behind.len()).as_bytes())
+            .await
+            .unwrap();
+
+        // The `G` of the other key reaches its node while the `i` is still
+        // unanswered ...
+        timeout(Duration::from_secs(10), async {
+            while replica.gets() == gets_before {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a request on another key waited for the incr");
+        // ... another connection is not held back either ...
+        other
+            .write_all(format!("G {}\n{apart}", apart.len()).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut other, &mut other_buf).await.unwrap(), "N");
+        // ... but the `D` of the same key is on no node yet: it would
+        // already have deleted the key on the replica.
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(primary.entry(b"", b"held"), Some(b"1".to_vec()));
+        assert_eq!(replica.entry(b"", b"held"), Some(b"0".to_vec()));
+
+        primary.hold_incr_reply.store(false, Ordering::SeqCst);
+        assert_eq!(read_incr_reply(&mut stream, &mut buf).await, "1");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "D");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+        assert_eq!(primary.entry(b"", b"held"), None);
+        assert_eq!(replica.entry(b"", b"held"), None);
+    }
+
+    // A primary that never answers must not hold the connection: the wait of
+    // a request behind its `i` ends with the `i`, which the backend timeouts
+    // bound, and the connection gets the `E` the `i` would have got alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_behind_an_incr_does_not_outlast_a_silent_primary() {
+        let silent = start_silent_after_handshake_node().await;
+        let discovery = start_mock_discovery(vec![("node-a".to_string(), silent.clone())], 1).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"i 0 1 1\nkD 1\nkG 1\nk").await.unwrap();
+        let reply = timeout(UPSTREAM_IO_TIMEOUT * 20, read_line(&mut stream, &mut buf))
+            .await
+            .expect("the connection hung behind an increment the primary never answered")
+            .unwrap();
+        assert_eq!(reply, "E");
+    }
+
+    fn order_request(request: &str, key: &str) -> Request {
+        let namespace = Bytes::new();
+        let key = Bytes::copy_from_slice(key.as_bytes());
+        match request {
+            "get" => Request::Get { namespace, key },
+            "set" => Request::Set {
+                namespace,
+                key,
+                value: Bytes::from_static(b"v"),
+                ttl: None,
+            },
+            "incr" => Request::Incr {
+                namespace,
+                key,
+                delta: 1,
+            },
+            "multi-get" => Request::MultiGet {
+                namespace,
+                keys: vec![Bytes::from_static(b"other"), key],
+            },
+            "clear" => Request::Clear { namespace },
+            "clear-elsewhere" => Request::Clear {
+                namespace: Bytes::from_static(b"elsewhere"),
+            },
+            "clear-all" => Request::ClearAll,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn the_connection_order_holds_back_exactly_the_requests_that_touch_the_key() {
+        let mut order = ConnectionOrder::new();
+
+        // Nothing in flight: nothing waits, nothing is registered.
+        let ticket = order.admit(&order_request("get", "k"));
+        assert!(ticket.waits.is_empty() && ticket.signal.is_none());
+        assert!(order.namespaces.is_empty());
+
+        // An `i` registers its key; the first one waits for nothing.
+        let incr = order.admit(&order_request("incr", "k"));
+        assert!(incr.waits.is_empty() && incr.signal.is_some());
+
+        // Same key, a multi-key request carrying it, a clear covering it:
+        // all wait (each on a fresh order, since a request that waits is
+        // itself registered).
+        for request in ["get", "set", "multi-get", "clear", "clear-all"] {
+            let mut order = ConnectionOrder::new();
+            let _incr = order.admit(&order_request("incr", "k"));
+            let ticket = order.admit(&order_request(request, "k"));
+            assert_eq!(ticket.waits.len(), 1, "{request}");
+        }
+        // Another key, another namespace's clear: do not.
+        for (request, key) in [("get", "other"), ("set", "other"), ("clear-elsewhere", "")] {
+            let ticket = order.admit(&order_request(request, key));
+            assert!(ticket.waits.is_empty(), "{request}");
+        }
+
+        // A request that waits is waited for in turn, and the wait ends
+        // when the signal it is for is dropped.
+        let behind = order.admit(&order_request("set", "k"));
+        assert_eq!(behind.waits.len(), 1);
+        let after = order.admit(&order_request("get", "k"));
+        assert_eq!(after.waits.len(), 1);
+        assert!(order_pending(&behind.waits[0]));
+        drop(incr);
+        assert!(!order_pending(&behind.waits[0]));
+        // The released entries are not waited for again.
+        let released = order.admit(&order_request("get", "other"));
+        assert!(released.waits.is_empty());
+    }
+
+    #[test]
+    fn an_incr_behind_incrs_goes_inline_unless_something_deferred_is_in_the_way() {
+        // A run of `i`: each goes inline and hands its driver the wait for
+        // the one before; a plain request behind the run waits for the last.
+        let mut order = ConnectionOrder::new();
+        let first = order.admit(&order_request("incr", "k"));
+        let second = order.admit(&order_request("incr", "k"));
+        let third = order.admit(&order_request("incr", "k"));
+        assert!(first.waits.is_empty() && !first.defer);
+        for ticket in [&second, &third] {
+            assert_eq!(ticket.waits.len(), 1);
+            assert!(!ticket.defer);
+        }
+        let behind = order.admit(&order_request("get", "k"));
+        assert!(behind.defer && behind.waits.len() == 1);
+        // It is the last `i`'s signal it waits for, not an earlier one's.
+        drop(first);
+        drop(second);
+        assert!(order_pending(&behind.waits[0]));
+        drop(third);
+        assert!(!order_pending(&behind.waits[0]));
+
+        // Behind a deferred plain request, or a clear, an `i` is deferred
+        // (its frame would overtake the request it follows), and so is the
+        // `i` after that one.
+        for blocker in ["set", "clear"] {
+            let mut order = ConnectionOrder::new();
+            let _incr = order.admit(&order_request("incr", "k"));
+            let _blocker = order.admit(&order_request(blocker, "k"));
+            let deferred = order.admit(&order_request("incr", "k"));
+            assert!(deferred.defer, "{blocker}");
+            let after = order.admit(&order_request("incr", "k"));
+            assert!(after.defer, "after a deferred incr, behind {blocker}");
+        }
+
+        // Another key's run is its own.
+        let other = order.admit(&order_request("incr", "other"));
+        assert!(other.waits.is_empty() && !other.defer);
+    }
+
+    #[test]
+    fn a_registered_clear_is_waited_for_by_later_requests_in_its_scope() {
+        let mut order = ConnectionOrder::new();
+        let incr = order.admit(&order_request("incr", "k"));
+        let clear = order.admit(&order_request("clear", ""));
+        assert_eq!(clear.waits.len(), 1);
+
+        // A key of the cleared namespace waits for the clear, which waits
+        // for the incr; a key of another namespace does not.
+        let same = order.admit(&order_request("get", "unrelated"));
+        assert_eq!(same.waits.len(), 1);
+        let elsewhere = order.admit(&Request::Get {
+            namespace: Bytes::from_static(b"elsewhere"),
+            key: Bytes::from_static(b"k"),
+        });
+        assert!(elsewhere.waits.is_empty());
+
+        drop(incr);
+        assert!(order_pending(&same.waits[0]));
+        drop(clear);
+        assert!(!order_pending(&same.waits[0]));
+    }
+
+    #[test]
+    fn the_connection_order_sweeps_released_entries() {
+        let mut order = ConnectionOrder::new();
+        for index in 0..(ORDER_SWEEP_MIN * 3) {
+            let ticket = order.admit(&order_request("incr", &format!("key-{index}")));
+            // The `i` is over as soon as it is registered.
+            drop(ticket);
+        }
+        let held = order.admit(&order_request("incr", "held"));
+        let entries: usize = order.namespaces.values().map(|n| n.keys.len()).sum();
+        assert!(
+            entries <= ORDER_SWEEP_MIN + 1,
+            "{entries} released entries were kept"
+        );
+        assert!(held.signal.is_some());
     }
 
     #[test]
