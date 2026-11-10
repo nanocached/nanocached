@@ -9,6 +9,10 @@ changed. What 1.0.0 will promise is described on the
 
 ## [Unreleased]
 
+### Fixed
+
+- **Breaking:** a `nanocached.cache.ttl.<name>` property that can never bind now stops startup with a message naming it and the bracketed form, where it used to be ignored. Spring Boot's binder reads an unbracketed dotted key as a nested path, so `nanocached.cache.ttl.users.by.id=40s` bound nothing and `@Cacheable("users.by.id")` silently used the default TTL, which is no expiry unless `cache.default-ttl` is set; `nanocached.cache.ttl.[users.by.id]=40s` binds. An environment variable such as `NANOCACHED_CACHE_TTL_USER_SESSIONS` (read as `nanocached.cache.ttl.user.sessions`) is rejected for the same reason. The README now documents the bracket form next to the warning about bare numbers. (#1680)
+
 ## [0.6.2] - 2026-11-03
 
 No changes. Version aligned with the rest of the project: every release

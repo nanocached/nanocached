@@ -1,14 +1,22 @@
 package org.nanocached.spring.boot;
 
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 import org.nanocached.NanocachedClient;
 import org.nanocached.spring.NanocachedCacheManager;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.context.properties.source.ConfigurationPropertyName;
+import org.springframework.boot.context.properties.source.ConfigurationPropertySource;
+import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
+import org.springframework.boot.context.properties.source.IterableConfigurationPropertySource;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Bean;
+import org.springframework.core.env.ConfigurableEnvironment;
+import org.springframework.core.env.Environment;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.context.annotation.Conditional;
 
@@ -95,7 +103,11 @@ public class NanocachedCacheAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean(CacheManager.class)
     public CacheManager nanocachedCacheManager(
-            NanocachedClient client, NanocachedProperties properties, ResourceLoader resourceLoader) {
+            NanocachedClient client,
+            NanocachedProperties properties,
+            ResourceLoader resourceLoader,
+            Environment environment) {
+        rejectUnbindablePerCacheTtlKeys(environment);
         NanocachedProperties.Cache cache = properties.getCache();
         NanocachedCacheManager.Builder builder =
                 NanocachedCacheManager.builder(client)
@@ -115,6 +127,48 @@ public class NanocachedCacheAutoConfiguration {
             builder.cacheNames(cache.getCacheNames());
         }
         return builder.build();
+    }
+
+    private static final ConfigurationPropertyName TTL_PREFIX = ConfigurationPropertyName.of("nanocached.cache.ttl");
+
+    /**
+     * Fails startup for a {@code nanocached.cache.ttl.*} property that can
+     * never bind (issue #1680). {@code ttl} is a {@code Map<String,
+     * Duration>}, and for a value type outside {@code java.lang} Boot's
+     * binder takes exactly one name element after {@code ttl} as the key and
+     * reads the value at that name; a cache name containing a dot, written
+     * without brackets, is several elements, so {@code
+     * nanocached.cache.ttl.users.by.id=40s} binds nothing and the cache
+     * silently used the default TTL (no expiry unless configured). Any
+     * property under {@code ttl} with more than one element after it is
+     * unbound by construction, so rejecting it needs no guess about what the
+     * author meant; the bracketed form {@code
+     * nanocached.cache.ttl.[users.by.id]} is a single element and passes.
+     */
+    static void rejectUnbindablePerCacheTtlKeys(Environment environment) {
+        if (!(environment instanceof ConfigurableEnvironment configurable)) {
+            return;
+        }
+        Set<String> unbindable = new TreeSet<>();
+        for (ConfigurationPropertySource source : ConfigurationPropertySources.get(configurable)) {
+            if (!(source instanceof IterableConfigurationPropertySource iterable)) {
+                continue;
+            }
+            for (ConfigurationPropertyName name : iterable) {
+                if (TTL_PREFIX.isAncestorOf(name)
+                        && name.getNumberOfElements() > TTL_PREFIX.getNumberOfElements() + 1) {
+                    unbindable.add(name.toString());
+                }
+            }
+        }
+        if (unbindable.isEmpty()) {
+            return;
+        }
+        throw new IllegalStateException(
+                "nanocached.cache.ttl.<name>: these properties bind to no cache name, so their TTL would be"
+                        + " ignored: " + String.join(", ", unbindable) + ". A cache name that contains a dot must"
+                        + " be written in brackets, e.g. nanocached.cache.ttl.[users.by.id]=40s (an environment"
+                        + " variable cannot spell such a name; use application.properties or YAML).");
     }
 
     /** Same {@code "host:port"} split used by the manual setup in
