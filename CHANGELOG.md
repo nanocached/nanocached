@@ -54,6 +54,20 @@ framework adapters at one version, whether or not a component changed.
   after the removal, as the `C` ack already is, and the abandon runs after
   it (#1662).
 
+- `nanocached-node`: a handoff target that refused with `R` was never
+  written off, so one such address could use up the decommission drain
+  budget. The only refusal a node sends to a `U` is `R` followed by closing
+  the connection, when the membership token does not match, which happens
+  when the address is now served by a different process than the one the
+  sender's roster names. #1595 made `send_handoff_set` treat every non-`S`
+  ack as a refusal of that one key, so the drain made three attempts per key
+  for that address (about 300 ms of backoff each) and the re-replication
+  pass logged a WARN per attempt. With 38 keys each for a refusing and a
+  healthy entrant and a 3 s budget, 28 of the healthy entrant's keys were
+  left behind. An `R` now writes the address off at once in both the drain
+  and the re-replication pass and is not retried; an ack other than `S` or
+  `R` still concerns that key only, as in #1595 (#1660).
+
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
   `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`
   bounded only its final check), so a hung cluster hung the script instead of
