@@ -9034,6 +9034,81 @@ class RedialAfterCloseTests(unittest.IsolatedAsyncioTestCase):
             server.close()
             await server.wait_closed()
 
+    async def test_a_request_in_flight_at_close_does_not_wait_for_a_discovery_dial(self):
+        # Issue #1673: in cluster mode the request close() poisoned fails
+        # with ConnectionLostError and the retry wrapper first forces a
+        # node-list refresh, which had no closed check: it dialed discovery
+        # and, with a discovery that accepts TCP but never completes the
+        # handshake, the request failed as closed only after the whole
+        # connect deadline (5 s).
+        first_request = asyncio.Event()
+        discovery_connections = 0
+
+        async def serve_node(reader, writer):
+            try:
+                header = await reader.readuntil(b"\n")
+                await reader.readexactly(int(header.split()[1]))
+                writer.write(b"On\n")
+                await writer.drain()
+                await reader.readuntil(b"\n")  # the request, never answered
+                first_request.set()
+                await reader.read()
+            except (asyncio.IncompleteReadError, ConnectionError):
+                pass
+            finally:
+                writer.close()
+
+        node_server = await asyncio.start_server(serve_node, "127.0.0.1", 0)
+        node_port = node_server.sockets[0].getsockname()[1]
+
+        async def serve_discovery(reader, writer):
+            nonlocal discovery_connections
+            discovery_connections += 1
+            try:
+                header = await reader.readuntil(b"\n")
+                await reader.readexactly(int(header.split()[1]))
+                if discovery_connections > 1:
+                    await reader.read()  # accepted, never answers the handshake
+                    return
+                writer.write(b"Od\n")
+                await writer.drain()
+                await reader.readuntil(b"\n")  # L
+                name, address = NAMES[0].encode(), f"127.0.0.1:{node_port}".encode()
+                writer.write(b"N 1 1\n%d %d\n%b%b\n" % (len(name), len(address), name, address))
+                await writer.drain()
+                await reader.read()
+            except (asyncio.IncompleteReadError, ConnectionError):
+                pass
+            finally:
+                writer.close()
+
+        discovery_server = await asyncio.start_server(serve_discovery, "127.0.0.1", 0)
+        discovery_port = discovery_server.sockets[0].getsockname()[1]
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery_port)])
+            request = asyncio.ensure_future(client.get("k"))
+            await asyncio.wait_for(first_request.wait(), 5)
+
+            started = time.monotonic()
+            await client.close()
+            try:
+                with self.assertRaises(AlreadyClosedError):
+                    await asyncio.wait_for(asyncio.shield(request), 3)
+            except asyncio.TimeoutError:
+                self.fail("get() still waiting 3 s after close(): it dialed discovery instead of failing as closed")
+            finally:
+                request.cancel()
+                with contextlib.suppress(BaseException):
+                    await request
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.0, f"close() and the failed request took {elapsed:.2f} s")
+            self.assertEqual(discovery_connections, 1, "the closed client dialed discovery again")
+        finally:
+            discovery_server.close()
+            await discovery_server.wait_closed()
+            node_server.close()
+            await node_server.wait_closed()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3744,6 +3744,13 @@ class NanocachedClient:
     # ── Node-list refresh ────────────────────────────────────────────
 
     async def _maybe_refresh(self, force: bool = False) -> None:
+        # A closed client never refreshes (issue #1673): a request that
+        # close() poisoned reaches here from the retry layer, and a refresh
+        # would spend a discovery dial (up to the connect deadline against
+        # one that never answers) before the request could fail as closed.
+        # The retry that follows fails at the redial's own closed check.
+        if self._closed:
+            return
         if self._ring is None:
             return
         if not force and time.monotonic() - self._last_fetch < _NODE_LIST_STALE_AFTER:
@@ -3770,6 +3777,8 @@ class NanocachedClient:
         observed = time.monotonic()
         waited_out_older_refresh = False
         while True:
+            if self._closed:
+                return
             task = self._refresh_task
             if task is None or task.done():
                 if force:
