@@ -45,6 +45,48 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-discovery`: a `V` (leave) from a member of the join in flight
+  was answered `R` only after the abandon's fan-out, which sends `X` to every
+  remaining ready member and starts the next join's `M` sends; against a
+  member that accepts and never answers that took 10 s per attempt, so the
+  leaving node logged `leave timed out` for a leave discovery had already
+  applied and its exit was delayed by the wait. The `R` is now written right
+  after the removal, as the `C` ack already is, and the abandon runs after
+  it (#1662).
+
+- `nanocached-node`: a handoff target that refused with `R` was never
+  written off, so one such address could use up the decommission drain
+  budget. The only refusal a node sends to a `U` is `R` followed by closing
+  the connection, when the membership token does not match, which happens
+  when the address is now served by a different process than the one the
+  sender's roster names. #1595 made `send_handoff_set` treat every non-`S`
+  ack as a refusal of that one key, so the drain made three attempts per key
+  for that address (about 300 ms of backoff each) and the re-replication
+  pass logged a WARN per attempt. With 38 keys each for a refusing and a
+  healthy entrant and a 3 s budget, 28 of the healthy entrant's keys were
+  left behind. An `R` now writes the address off at once in both the drain
+  and the re-replication pass and is not retried; an ack other than `S` or
+  `R` still concerns that key only, as in #1595 (#1660).
+
+- `nanocached-discovery`: a `J` under a new name from the address of a
+  `Joined` member removed that member whether or not it was still alive.
+  The address is the connection's source IP plus the port the `J` declares,
+  so a second process on the same host started with a live node's
+  advertised port (or any holder of the auth secret sharing its source IP)
+  took the live member out of the roster at once, and its next `P` was
+  answered `G`: the node dropped its cache and joined again. The old name is
+  now replaced at once only when it has sent no heartbeat or announce for
+  `CONTACT_BREAK` (9 s, the age at which a missed heartbeat is recorded). A
+  member heard from more recently leaves the collision undecided: the new
+  name's join is held, and the sweep decides. The old name is replaced as
+  soon as it has been silent for `CONTACT_BREAK`, so a node restarted
+  within a few seconds still gets the join without the refused `M` and the
+  second handoff (#1616), or, if the old name is heard from again, it stays
+  and the new name joins as before #1616. The hold lasts at most
+  `CONTACT_BREAK` from the old name's last heartbeat, holds up the names
+  queued behind it for that long, and is not decided on a sweep that
+  follows a pause of discovery (#1663).
+
 - `nanocached-node`, `nanocached-discovery`: a connection turned away by the
   per-IP connection cap kept its global connection slot while the busy
   reply was sent and drained (up to 200 ms on a plaintext listener, which
@@ -79,6 +121,13 @@ framework adapters at one version, whether or not a component changed.
   timeout when the `Q` roster did not drop to 1 proxy, and `proxykill.sh`
   printed `fail=1` but exited 0. Each is now a failure with a message, and
   `proxykill.sh` exits non-zero (#1620).
+
+- `tests/e2e`: `freshjoin.sh` printed `FAIL: ...` and `fail=1` and exited 0,
+  and `restart.sh` printed `FAIL` for a membership step that timed out or a
+  load that did not finish, and its miss count, without failing on any of
+  them (its header and the README say it must see 0 misses). Both now exit 1
+  on a failure; `restart.sh` also fails when the load printed no result line
+  (#1661).
 
 - `tests/e2e/chaos.sh`: with `INCR_ORACLE=1` the run ignored `incrtrace.py`'s
   exit status and read its last line, so a script that died with a traceback
