@@ -7747,10 +7747,13 @@ async fn drain_pending_clears(
 /// discovery: dial, handshake, write or read failures) is written off for
 /// `FORWARD_FAIL_FAST_WINDOW`, as `run_rereplication` does: its keys are
 /// counted as left behind without a dial, so they cannot spend the budget
-/// the live entrants' keys need. An entrant that answers and refuses an
-/// entry (an ack other than `S`) is not written off: that key is left
-/// behind and the entrant is offered the next. Entries that are gone by
-/// their turn (deleted, expired) are not counted as left behind.
+/// the live entrants' keys need. So is an entrant that answers `R` and
+/// closes (the membership token does not match: the address is another
+/// process now), at the first key and without a retry, since every key
+/// meets the same answer. An entrant that refuses one entry with any
+/// other ack is not written off: that key is left behind and the entrant
+/// is offered the next. Entries that are gone by their turn (deleted,
+/// expired) are not counted as left behind.
 ///
 /// Issue #357 — a documented tradeoff, not a defect: the ring pair from
 /// step 2 is one roster snapshot, never recomputed, and nothing tells a
@@ -8121,7 +8124,7 @@ async fn run_decommission(
         };
 
         // An entrant that has just used up every attempt on a key with
-        // connection-level failures is written off for
+        // connection-level failures, or refused with `R`, is written off for
         // `FORWARD_FAIL_FAST_WINDOW`: its keys are counted as left behind
         // without a dial, so a dead but still-listed survivor cannot spend
         // the budget the live entrants' keys need.
@@ -8136,6 +8139,7 @@ async fn run_decommission(
         let mut delivered = false;
         let mut overridden = false;
         let mut failed_attempts = 0u32;
+        let mut refused_by_address = false;
         for attempt in 0..KEY_TRANSFER_ATTEMPTS {
             // The budget is checked between attempts too: a key whose
             // entrant is unreachable costs up to
@@ -8187,17 +8191,23 @@ async fn run_decommission(
                         delivered = true;
                     }
                     Some(Err(error)) => {
-                        // A refusal is the entrant answering; only a failure
-                        // to reach it counts toward writing it off.
-                        if is_connection_failure(&error) {
-                            failed_attempts += 1;
+                        // A refusal of one entry is the entrant answering;
+                        // only a failure to reach it counts toward writing
+                        // it off. An `R` (membership token mismatch) says
+                        // the address is another process now: written off
+                        // at once, and not retried, since every key and
+                        // every attempt meets the same answer.
+                        match classify_handoff_failure(&error) {
+                            HandoffFailure::Unreachable => failed_attempts += 1,
+                            HandoffFailure::AddressRefused => refused_by_address = true,
+                            HandoffFailure::EntryRefused => {}
                         }
                         eprintln!("WARN decommission: transfer to {addr} failed: {error}");
                         streams.remove(addr);
                     }
                 }
             }
-            if delivered {
+            if delivered || refused_by_address {
                 break;
             }
             // Tenth-pass audit (2026-09-02): a short, linearly increasing
@@ -8235,9 +8245,10 @@ async fn run_decommission(
         } else {
             left_behind += 1;
             // Only an entrant that could not be reached on every attempt
-            // (not one the loop left because the budget ran out, and not one
-            // that answered and refused the key) is written off.
-            if failed_attempts == KEY_TRANSFER_ATTEMPTS {
+            // or that refused the address (`R`) is written off; not one the
+            // loop left because the budget ran out, and not one that
+            // answered and refused just this key.
+            if refused_by_address || failed_attempts == KEY_TRANSFER_ATTEMPTS {
                 failed_targets.insert(addr.clone(), Instant::now());
                 eprintln!(
                     "WARN decommission: giving up on {addr} for {}s; its remaining keys are \
@@ -8435,30 +8446,58 @@ fn handoff_delete_message(key: &Key, token: &str) -> Vec<u8> {
 }
 
 /// The peer answered a handoff `U` with something other than `S`: it
-/// reached the node and the node said no — an application-level answer
-/// about this entry (or this sender), not a sign that the peer is down.
+/// reached the node and the node said no, so the peer is not down.
 /// `send_handoff_set` wraps it in an `InvalidData` error so
-/// `is_connection_failure` can tell the two apart.
+/// `classify_handoff_failure` can tell it from a connection failure.
 #[derive(Debug)]
-struct HandoffRejected;
+enum HandoffRejected {
+    /// `R` (`Response::MigrationRejected`), which a node sends together with
+    /// closing the connection when the membership token on the `U` does not
+    /// match its own: the address is now served by a different process than
+    /// the one the sender's roster names. Every key bound for the address
+    /// meets the same answer.
+    Address,
+    /// Any other answer: taken to concern this entry only, on a connection
+    /// that stays usable. (A node sends none today; this keeps a refusal of
+    /// one entry from costing the other entries their turn.)
+    Entry,
+}
 
 impl std::fmt::Display for HandoffRejected {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("peer did not acknowledge the handed-off entry")
+        formatter.write_str(match self {
+            Self::Address => "peer refused the handoff (membership token mismatch)",
+            Self::Entry => "peer did not acknowledge the handed-off entry",
+        })
     }
 }
 
 impl std::error::Error for HandoffRejected {}
 
-/// Whether a failed handoff attempt says the peer itself is unreachable or
-/// unresponsive (dial, handshake, write, a closed or silent connection)
-/// rather than that it answered and refused the entry. Only the former is
-/// grounds for writing the whole address off for `FORWARD_FAIL_FAST_WINDOW`:
-/// a live entrant that rejected one key must still be offered the others.
-fn is_connection_failure(error: &io::Error) -> bool {
-    !error
+/// What a failed handoff attempt says about the address it was sent to.
+#[derive(Debug, PartialEq, Eq)]
+enum HandoffFailure {
+    /// The peer itself is unreachable or unresponsive (dial, handshake,
+    /// write, a closed or silent connection). Using up every attempt on a
+    /// key this way writes the address off for `FORWARD_FAIL_FAST_WINDOW`.
+    Unreachable,
+    /// The peer answered `R` and closed: the address refuses every `U`, so
+    /// it is written off at once and the refusal is not retried.
+    AddressRefused,
+    /// The peer answered and refused this entry only: the next key is still
+    /// offered to it.
+    EntryRefused,
+}
+
+fn classify_handoff_failure(error: &io::Error) -> HandoffFailure {
+    match error
         .get_ref()
-        .is_some_and(|inner| inner.is::<HandoffRejected>())
+        .and_then(|inner| inner.downcast_ref::<HandoffRejected>())
+    {
+        None => HandoffFailure::Unreachable,
+        Some(HandoffRejected::Address) => HandoffFailure::AddressRefused,
+        Some(HandoffRejected::Entry) => HandoffFailure::EntryRefused,
+    }
 }
 
 async fn send_handoff_set(
@@ -8477,7 +8516,12 @@ async fn send_handoff_set(
         let mut ack = [0u8; 2];
         stream.read_exact(&mut ack).await?;
         if &ack != b"S\n" {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, HandoffRejected));
+            let rejected = if &ack == b"R\n" {
+                HandoffRejected::Address
+            } else {
+                HandoffRejected::Entry
+            };
+            return Err(io::Error::new(io::ErrorKind::InvalidData, rejected));
         }
         io::Result::Ok(())
     })
@@ -9428,6 +9472,7 @@ async fn run_rereplication(
 
             let mut delivered = false;
             let mut failed_attempts = 0u32;
+            let mut refused_by_address = false;
             for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
                 if abort_requested.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
                     break;
@@ -9486,10 +9531,13 @@ async fn run_rereplication(
                         break;
                     }
                     Some(Err(error)) => {
-                        // A refusal is the target answering; only a failure
-                        // to reach it counts toward writing it off.
-                        if is_connection_failure(&error) {
-                            failed_attempts += 1;
+                        // As in `run_decommission`: a refusal of one entry
+                        // does not count toward writing the target off, an
+                        // `R` writes it off at once and is not retried.
+                        match classify_handoff_failure(&error) {
+                            HandoffFailure::Unreachable => failed_attempts += 1,
+                            HandoffFailure::AddressRefused => refused_by_address = true,
+                            HandoffFailure::EntryRefused => {}
                         }
                         log_failure(
                             repeat,
@@ -9499,6 +9547,9 @@ async fn run_rereplication(
                             ),
                         );
                         streams.remove(addr);
+                        if refused_by_address {
+                            break;
+                        }
                     }
                 }
             }
@@ -9508,9 +9559,10 @@ async fn run_rereplication(
                 owners_reached.insert(target);
             } else {
                 skipped += 1;
-                // Only a target that failed every attempt (not one the loop
-                // left because of shutdown or an abort) is written off.
-                if failed_attempts == KEY_TRANSFER_ATTEMPTS {
+                // Only a target that failed every attempt, or refused the
+                // address with `R`, is written off (not one the loop left
+                // because of shutdown or an abort).
+                if refused_by_address || failed_attempts == KEY_TRANSFER_ATTEMPTS {
                     failed_targets.insert(addr.clone(), Instant::now());
                     log_failure(
                         repeat,
@@ -24538,16 +24590,27 @@ mod tests {
         listener: TcpListener,
         peer_addr: String,
     ) -> tokio::task::JoinHandle<()> {
+        spawn_two_survivor_discovery(listener, "127.0.0.1:1".to_string(), peer_addr)
+    }
+
+    /// `spawn_dead_survivor_discovery` with the first survivor ("dead") at
+    /// `dead_addr`, which a test can point at a live listener.
+    fn spawn_two_survivor_discovery(
+        listener: TcpListener,
+        dead_addr: String,
+        peer_addr: String,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
                 let peer_addr = peer_addr.clone();
+                let dead_addr = dead_addr.clone();
                 tokio::spawn(async move {
                     let entries = [
                         ("leaver", "127.0.0.1:2", "tok-leaver"),
-                        ("dead", "127.0.0.1:1", "tok-dead"),
+                        ("dead", dead_addr.as_str(), "tok-dead"),
                         ("peer", peer_addr.as_str(), "tok-peer"),
                     ];
                     let mut buf = Vec::new();
@@ -24741,7 +24804,8 @@ mod tests {
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
         let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer_listener.local_addr().unwrap().to_string();
-        let (frames, peer_task) = spawn_recording_peer_refusing(peer_listener, Some(b"refused-"));
+        let (frames, peer_task) =
+            spawn_recording_peer_refusing(peer_listener, PeerRefusal::EntryPrefix(b"refused-"));
         let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
         let (_left, discovery_task) = spawn_mock_discovery(discovery_listener, peer_addr, None);
@@ -24805,6 +24869,94 @@ mod tests {
         );
 
         discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// A real node answers a `U` it refuses with `R` and closes the
+    /// connection (the membership token does not match: the address is now
+    /// served by a different process). That is about the address, not the
+    /// key, so the first refusal writes the address off: the drain used to
+    /// redial it three times per key, ~300 ms of backoff each, and starve
+    /// the healthy entrant's keys of the drain budget.
+    #[tokio::test(flavor = "current_thread")]
+    async fn decommission_drain_writes_off_an_entrant_that_refuses_with_r() {
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let refusing_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refusing_addr = refusing_listener.local_addr().unwrap().to_string();
+        let (refused_frames, refusing_task) =
+            spawn_recording_peer_refusing(refusing_listener, PeerRefusal::TokenMismatch);
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_task =
+            spawn_two_survivor_discovery(discovery_listener, refusing_addr, peer_addr);
+        let mut node_context = drain_test_context(&discovery_addr, &request_tx);
+        // A live shutdown sender: with the sender dropped the drain's
+        // backoff between attempts is skipped, which hides the cost.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        node_context.shutdown_rx = shutdown_rx;
+
+        let before = HashRing::new(vec!["leaver".into(), "dead".into(), "peer".into()]);
+        let after = HashRing::new(vec!["dead".into(), "peer".into()]);
+        let (mut to_refusing, mut to_peer) = (0usize, 0usize);
+        for index in 0..2000u32 {
+            let k = key(format!("key-{index:04}").as_bytes());
+            if !before.is_owner(&k, "leaver", 1) {
+                continue;
+            }
+            let counter = if after.is_owner(&k, "dead", 1) {
+                &mut to_refusing
+            } else {
+                &mut to_peer
+            };
+            if *counter == 38 {
+                continue;
+            }
+            *counter += 1;
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: k,
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+        assert_eq!((to_refusing, to_peer), (38, 38));
+
+        run_decommission(
+            node_context.clone(),
+            vec![discovery_addr],
+            Duration::from_secs(3),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            refused_frames.lock().unwrap().len(),
+            1,
+            "the refusing entrant is offered one entry and then written off"
+        );
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            to_peer,
+            "the healthy entrant's entries must not wait behind the refusing one's"
+        );
+        assert_eq!(
+            node_context.gates.drain_left_behind.load(Ordering::SeqCst),
+            to_refusing,
+            "only the refusing entrant's entries are left behind"
+        );
+
+        discovery_task.abort();
+        refusing_task.abort();
         peer_task.abort();
         drop(node_context);
         drop(request_tx);
@@ -25399,15 +25551,30 @@ mod tests {
     fn spawn_recording_peer(
         listener: TcpListener,
     ) -> (RecordedFrames, tokio::task::JoinHandle<()>) {
-        spawn_recording_peer_refusing(listener, None)
+        spawn_recording_peer_refusing(listener, PeerRefusal::Never)
     }
 
-    /// `spawn_recording_peer`, but a `U` whose key name starts with
-    /// `refused_prefix` is recorded and answered `E` instead of `S`: a
-    /// live node refusing one entry.
+    /// How a fake peer answers a `U` it does not accept.
+    #[derive(Clone, Copy)]
+    enum PeerRefusal {
+        /// Accepts every `U`.
+        Never,
+        /// A `U` whose key name starts with the prefix is answered `E`
+        /// instead of `S` and the connection stays open: a refusal about
+        /// one entry. (A real node never sends one; the drain's and the
+        /// re-replication's handling of it is defensive.)
+        EntryPrefix(&'static [u8]),
+        /// Every `U` is answered `R` and the connection is closed, which is
+        /// what a real node does when the membership token does not match
+        /// (the address now belongs to a different process).
+        TokenMismatch,
+    }
+
+    /// `spawn_recording_peer`, but a `U` the `refusal` rejects is recorded
+    /// and answered with the refusal instead of `S`.
     fn spawn_recording_peer_refusing(
         listener: TcpListener,
-        refused_prefix: Option<&'static [u8]>,
+        refusal: PeerRefusal,
     ) -> (RecordedFrames, tokio::task::JoinHandle<()>) {
         let frames: RecordedFrames = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&frames);
@@ -25485,11 +25652,19 @@ mod tests {
                         }
                         let frame = buf.split_to(frame_end);
                         let refused = header.starts_with("U ")
-                            && refused_prefix.is_some_and(|prefix| {
-                                let name_start = header_end + 1 + fields[3] + fields[0];
-                                frame[name_start..name_start + fields[1]].starts_with(prefix)
-                            });
+                            && match refusal {
+                                PeerRefusal::Never => false,
+                                PeerRefusal::EntryPrefix(prefix) => {
+                                    let name_start = header_end + 1 + fields[3] + fields[0];
+                                    frame[name_start..name_start + fields[1]].starts_with(prefix)
+                                }
+                                PeerRefusal::TokenMismatch => true,
+                            };
                         recorded.lock().unwrap().push(frame.to_vec());
+                        if refused && matches!(refusal, PeerRefusal::TokenMismatch) {
+                            let _ = connection.write_all(b"R\n").await;
+                            return;
+                        }
                         let _ = connection
                             .write_all(if refused { b"E\n" } else { reply })
                             .await;
@@ -30116,7 +30291,8 @@ mod tests {
 
         let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer_listener.local_addr().unwrap().to_string();
-        let (frames, peer_task) = spawn_recording_peer_refusing(peer_listener, Some(b"refused-"));
+        let (frames, peer_task) =
+            spawn_recording_peer_refusing(peer_listener, PeerRefusal::EntryPrefix(b"refused-"));
 
         let mut node_context = test_node_context(
             "node-a",
@@ -30157,6 +30333,114 @@ mod tests {
             "every key the target accepts must be sent, whatever it refused before"
         );
 
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// The re-replication's counterpart of the drain test: a target that
+    /// answers `R` and closes (a membership-token mismatch) is written off
+    /// at once, instead of costing every key bound for it three dials and
+    /// three WARN lines.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_rereplication_writes_off_a_target_that_refuses_with_r() {
+        let (request_tx, request_rx) = mpsc::channel(128);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let before_ring = HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+            "node-d".to_string(),
+        ]);
+        let after_ring = HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ]);
+        let replication = 2;
+        let bound_for = |name: &str, target: &str| {
+            rereplication_targets(
+                &before_ring,
+                &after_ring,
+                KeyHash::of(&key(name.as_bytes())),
+                replication,
+                "node-a",
+            ) == vec![target.to_string()]
+        };
+        let to_b: Vec<String> = (0..4000)
+            .map(|index| format!("key-{index:04}"))
+            .filter(|name| bound_for(name, "node-b"))
+            .take(20)
+            .collect();
+        let to_c: Vec<String> = (0..4000)
+            .map(|index| format!("key-{index:04}"))
+            .filter(|name| bound_for(name, "node-c"))
+            .take(20)
+            .collect();
+        assert_eq!((to_b.len(), to_c.len()), (20, 20));
+        for name in to_b.iter().zip(&to_c).flat_map(|(b, c)| [b, c]) {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key(name.as_bytes()),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let refusing_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refusing_addr = refusing_listener.local_addr().unwrap().to_string();
+        let (refused_frames, refusing_task) =
+            spawn_recording_peer_refusing(refusing_listener, PeerRefusal::TokenMismatch);
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let mut node_context = test_node_context(
+            "node-a",
+            "tok-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        let addresses = HashMap::from([
+            ("node-b".to_string(), refusing_addr),
+            ("node-c".to_string(), peer_addr),
+        ]);
+        let tokens = HashMap::from([
+            ("node-b".to_string(), "tok-b".to_string()),
+            ("node-c".to_string(), "tok-c".to_string()),
+        ]);
+        let abort_requested = Arc::new(AtomicBool::new(false));
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        run_rereplication(
+            &node_context,
+            &plain_baselines(&before_ring),
+            &after_ring,
+            replication,
+            &addresses,
+            &tokens,
+            &abort_requested,
+            &mut shutdown_rx,
+        )
+        .await;
+
+        assert_eq!(
+            refused_frames.lock().unwrap().len(),
+            1,
+            "the refusing target is offered one entry and then written off"
+        );
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            to_c.len(),
+            "the healthy target still gets every entry bound for it"
+        );
+
+        refusing_task.abort();
         peer_task.abort();
         drop(node_context);
         drop(request_tx);
