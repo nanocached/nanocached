@@ -61,6 +61,19 @@ final class Identify {
 
     private Identify() {}
 
+    /** The peer answered {@code A} with something that is not a handshake
+     * reply at all (an HTTP server's error page, say). It is raised while
+     * the handshake is read, before any request exists, so a caller that
+     * redials a member of a ring can classify it as a connection failure
+     * that sent nothing. A {@code connect()} to the address itself reports
+     * it as the plain {@link NanocachedException} it is documented to
+     * throw. */
+    static final class UnexpectedHandshakeReply extends NanocachedException {
+        UnexpectedHandshakeReply() {
+            super("nanocached: unexpected response to A");
+        }
+    }
+
     /** Thrown only when writing/reading the extended {@code A ... T}
      * exchange fails in a way that looks like a legacy pre-tag server
      * slamming the connection shut without replying (close/EOF/RST,
@@ -338,10 +351,10 @@ final class Identify {
         byte[] ack = new byte[] {head[0], head[1], readExactly(in, 1)[0]};
         boolean accepted = ack[0] == 'O';
         if (!accepted && ack[0] != 'E') {
-            throw new NanocachedException("nanocached: unexpected response to A");
+            throw new UnexpectedHandshakeReply();
         }
         if (ack[1] != 'n' && ack[1] != 'd') {
-            throw new NanocachedException("nanocached: unexpected response to A");
+            throw new UnexpectedHandshakeReply();
         }
 
         boolean tagged;
@@ -350,11 +363,11 @@ final class Identify {
         } else if (ack[2] == 'T') {
             byte[] rest = readExactly(in, 1);
             if (rest[0] != '\n') {
-                throw new NanocachedException("nanocached: unexpected response to A");
+                throw new UnexpectedHandshakeReply();
             }
             tagged = true;
         } else {
-            throw new NanocachedException("nanocached: unexpected response to A");
+            throw new UnexpectedHandshakeReply();
         }
 
         return new AuthIdentity(accepted, (char) ack[1], tagged);
