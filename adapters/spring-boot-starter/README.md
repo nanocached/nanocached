@@ -95,6 +95,25 @@ noted in the table rather than Boot's own default of milliseconds — except
 doesn't apply that per-field default, so a bare number there is always
 milliseconds regardless of what `cache.default-ttl` does. Always give
 `cache.ttl.<name>` entries an explicit unit suffix (e.g. `sessions: 30s`).
+
+A cache name that contains a dot must be written in brackets, because Boot
+reads an unbracketed dotted key as a nested path and binds nothing for it:
+
+```yaml
+nanocached:
+  cache:
+    ttl:
+      "[users.by.id]": 40s     # application.properties: nanocached.cache.ttl.[users.by.id]=40s
+```
+
+`users.by.id: 40s` without the brackets would leave `@Cacheable("users.by.id")`
+on the default TTL (no expiry unless `cache.default-ttl` is set), so the
+starter refuses to start and names the property instead. Names without a dot
+(`user_sessions`, `my-cache`, `UserCache`) need no brackets; the case of the
+name is kept. An environment variable cannot name a cache with an underscore
+or a dot at all (`NANOCACHED_CACHE_TTL_USER_SESSIONS` is read as
+`nanocached.cache.ttl.user.sessions`, which the starter also rejects); put
+such a cache in `application.properties` or YAML.
 `reconnect-cooldown: 0s` (or any zero duration) disables the reconnect
 cooldown outright, rather than mapping to the SDK's own default cooldown —
 the one case where zero and "unset" are not the same thing.

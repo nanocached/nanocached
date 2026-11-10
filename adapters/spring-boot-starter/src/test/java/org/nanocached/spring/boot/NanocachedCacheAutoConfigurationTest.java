@@ -9,6 +9,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
@@ -18,6 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.nanocached.NanocachedClient;
 import org.nanocached.spring.NanocachedCacheManager;
 import org.springframework.beans.factory.annotation.Value;
@@ -28,12 +31,15 @@ import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
 import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.cache.annotation.EnableCaching;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
+import org.springframework.core.env.StandardEnvironment;
+import org.springframework.core.env.SystemEnvironmentPropertySource;
 import org.springframework.context.annotation.Configuration;
 
 /**
@@ -74,6 +80,25 @@ class NanocachedCacheAutoConfigurationTest {
         @Bean
         UserService userService() {
             return new UserService();
+        }
+    }
+
+    /** A service whose cache name contains dots, which {@code
+     * nanocached.cache.ttl.<name>} cannot spell without brackets. */
+    static class DottedNameService {
+        @Cacheable("users.by.id")
+        public String findUser(String name) {
+            return name.toUpperCase();
+        }
+    }
+
+    @Configuration
+    @EnableAutoConfiguration
+    @EnableCaching
+    static class DottedNameConfig {
+        @Bean
+        DottedNameService dottedNameService() {
+            return new DottedNameService();
         }
     }
 
@@ -229,6 +254,87 @@ class NanocachedCacheAutoConfigurationTest {
         assertEquals(420, entry.ttlSeconds(), "the default TTL must reach the wire");
     }
 
+    private long dottedNameTtlSeconds() {
+        context.getBean(DottedNameService.class).findUser("alice");
+        return node.entry("users.by.id", "String:alice".getBytes(StandardCharsets.UTF_8))
+                .ttlSeconds();
+    }
+
+    private static String messagesOf(Throwable error) {
+        StringBuilder messages = new StringBuilder();
+        for (Throwable t = error; t != null; t = t.getCause()) {
+            messages.append(t.getMessage()).append('\n');
+        }
+        return messages.toString();
+    }
+
+    @Test
+    void bracketedPerCacheTtlForADottedCacheNameReachesTheWire() {
+        boot(DottedNameConfig.class, "nanocached.cache.default-ttl=7m", "nanocached.cache.ttl.[users.by.id]=40s");
+
+        assertEquals(40, dottedNameTtlSeconds(), "the bracketed key must bind to the cache named users.by.id");
+    }
+
+    @Test
+    void bracketedPerCacheTtlInYamlReachesTheWire(@TempDir Path dir) throws Exception {
+        Path yaml = dir.resolve("application.yaml");
+        Files.writeString(yaml, """
+                nanocached:
+                  cache:
+                    default-ttl: 7m
+                    ttl:
+                      "[users.by.id]": 40s
+                """);
+
+        boot(DottedNameConfig.class, "spring.config.additional-location=" + yaml.toUri());
+
+        assertEquals(40, dottedNameTtlSeconds());
+    }
+
+    @Test
+    void unbracketedPerCacheTtlForADottedCacheNameFailsStartupNamingTheBracketForm() {
+        // Spring Boot's binder reads the unbracketed dotted key as a nested
+        // path and binds nothing, so the cache would silently have used the
+        // default TTL (no expiry unless configured).
+        Exception error = assertThrows(
+                Exception.class,
+                () -> boot(
+                        DottedNameConfig.class,
+                        "nanocached.cache.default-ttl=7m",
+                        "nanocached.cache.ttl.users.by.id=40s"));
+
+        String messages = messagesOf(error);
+        assertTrue(messages.contains("nanocached.cache.ttl.users.by.id"), messages);
+        assertTrue(messages.contains("nanocached.cache.ttl.[users.by.id]"), messages);
+    }
+
+    @Test
+    void unbracketedPerCacheTtlInYamlFailsStartupToo(@TempDir Path dir) throws Exception {
+        Path yaml = dir.resolve("application.yaml");
+        Files.writeString(yaml, """
+                nanocached:
+                  cache:
+                    ttl:
+                      users.by.id: 40s
+                """);
+
+        Exception error = assertThrows(
+                Exception.class,
+                () -> boot(DottedNameConfig.class, "spring.config.additional-location=" + yaml.toUri()));
+
+        assertTrue(messagesOf(error).contains("nanocached.cache.ttl.[users.by.id]"), messagesOf(error));
+    }
+
+    @Test
+    void perCacheTtlKeysWithoutADotStillBindWithoutBrackets() {
+        boot(YamlOnlyConfig.class, "nanocached.cache.ttl.users=40s", "nanocached.cache.ttl.some-cache=10s");
+
+        context.getBean(UserService.class).findUser("alice");
+
+        MockNode.Entry entry = node.entry("users", "String:alice".getBytes(StandardCharsets.UTF_8));
+        assertEquals(40, entry.ttlSeconds());
+    }
+
     @Test
     void cacheNamesRestrictsTheManagerToAFixedSet() {
         boot(YamlOnlyConfig.class, "nanocached.cache.cache-names=users,sessions");
@@ -309,6 +415,68 @@ class NanocachedCacheAutoConfigurationTest {
         assertEquals(Duration.ofSeconds(2), properties.getReconnectCooldown());
         assertEquals(Duration.ofMillis(50), properties.getReadHedgeAfter());
         assertEquals(Duration.ofSeconds(10), properties.getCache().getDefaultTtl());
+    }
+
+    @Test
+    void anEnvironmentVariableCannotNameACacheWithAnUnderscoreAndIsRejectedRatherThanIgnored() {
+        // Boot maps every underscore of an environment variable name to a
+        // name element, so NANOCACHED_CACHE_TTL_USER_SESSIONS is the
+        // unbindable nanocached.cache.ttl.user.sessions, not the cache
+        // user_sessions; NANOCACHED_CACHE_TTL_PLAIN binds.
+        StandardEnvironment environment = new StandardEnvironment();
+        ConfigurationPropertySources.attach(environment);
+        environment
+                .getPropertySources()
+                .replace(
+                        StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
+                        new SystemEnvironmentPropertySource(
+                                StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
+                                Map.<String, Object>of(
+                                        "NANOCACHED_CACHE_TTL_USER_SESSIONS", "30s",
+                                        "NANOCACHED_CACHE_TTL_PLAIN", "20s")));
+
+        assertEquals(
+                Map.of("plain", Duration.ofSeconds(20)),
+                Binder.get(environment)
+                        .bind("nanocached", Bindable.of(NanocachedProperties.class))
+                        .get()
+                        .getCache()
+                        .getTtl());
+        IllegalStateException error = assertThrows(
+                IllegalStateException.class,
+                () -> NanocachedCacheAutoConfiguration.rejectUnbindablePerCacheTtlKeys(environment));
+        assertTrue(error.getMessage().contains("nanocached.cache.ttl.user.sessions"), error.getMessage());
+        assertFalse(error.getMessage().contains("nanocached.cache.ttl.plain"), error.getMessage());
+    }
+
+    @Test
+    void perCacheTtlKeysBindOnlyWhenTheCacheNameIsASingleElement() {
+        // Pins what Spring Boot's binder does with nanocached.cache.ttl.*:
+        // Duration is not a java.lang type, so MapBinder takes one element
+        // after "ttl" as the key and looks for the value at exactly that
+        // name; a dotted name written without brackets has no value there
+        // and binds nothing.
+        MapConfigurationPropertySource source = new MapConfigurationPropertySource(Map.of(
+                "nanocached.cache.ttl.user_sessions", "1s",
+                "nanocached.cache.ttl.UserCache", "2s",
+                "nanocached.cache.ttl.my-cache", "3s",
+                "nanocached.cache.ttl.[a_b.c]", "4s",
+                "nanocached.cache.ttl.[users.by.id]", "5s",
+                "nanocached.cache.ttl.users.by.id", "6s"));
+        Map<String, Duration> ttl = new Binder(source)
+                .bind("nanocached", Bindable.of(NanocachedProperties.class))
+                .get()
+                .getCache()
+                .getTtl();
+
+        assertEquals(
+                Map.of(
+                        "user_sessions", Duration.ofSeconds(1),
+                        "UserCache", Duration.ofSeconds(2),
+                        "my-cache", Duration.ofSeconds(3),
+                        "a_b.c", Duration.ofSeconds(4),
+                        "users.by.id", Duration.ofSeconds(5)),
+                ttl);
     }
 
     @Test
