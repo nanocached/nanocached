@@ -792,6 +792,27 @@ struct NodeInfo {
     /// eviction (and may still be cut off, with no break recorded until it
     /// is heard from again) from one that is in contact (issue #1532).
     last_contact: Instant,
+    /// Issue #1663: set on a `Waiting` entry that registered from the
+    /// address of `Joined` members that were still being heard from. See
+    /// `AddressHold`. `None` for every other entry.
+    address_hold: Option<AddressHold>,
+}
+
+/// The collision a new name's `J` left undecided: it came from the address
+/// of `Joined` members that had been heard from less than `CONTACT_BREAK`
+/// ago, which is either a node restarted under a new name (its old name is
+/// about to go silent) or another process on a live node's address (its old
+/// name keeps heartbeating). `settle_address_holds` decides, from the
+/// sweep: an old name heard from after `since` is alive and the hold is
+/// dropped (the join proceeds as it did before #1616); one silent for
+/// `CONTACT_BREAK` is replaced and the hold dropped; one that left the
+/// registry meanwhile is dropped from it. While a hold is set,
+/// `try_begin_next_join` does not start this name's join. The hold ends no
+/// later than `CONTACT_BREAK` after the old name's last heartbeat, which
+/// was at most `since`.
+struct AddressHold {
+    since: Instant,
+    old_names: Vec<String>,
 }
 
 impl NodeInfo {
@@ -823,6 +844,7 @@ impl NodeInfo {
             joined_at: Instant::now(),
             contact_breaks: Vec::new(),
             last_contact: Instant::now(),
+            address_hold: None,
         }
     }
 }
@@ -2521,11 +2543,26 @@ async fn try_begin_next_join(
                         .cmp(&b.waiting_since)
                         .then_with(|| name_a.cmp(name_b))
                 })
-                .map(|(name, info)| (name.clone(), info.address.clone(), info.token.clone()));
+                .map(|(name, info)| {
+                    (
+                        name.clone(),
+                        info.address.clone(),
+                        info.token.clone(),
+                        info.address_hold.is_some(),
+                    )
+                });
 
-            let Some((name, joining_addr, joining_token)) = next_waiting else {
+            let Some((name, joining_addr, joining_token, held)) = next_waiting else {
                 return;
             };
+            // Issue #1663: the head of the queue is held until its address
+            // collision is decided (`settle_address_holds`, from the sweep,
+            // which also starts the queue again). The names behind it are
+            // not let past it, so arrival order (`waiting_timeout_for`
+            // assumes it) is kept; the wait is bounded by `CONTACT_BREAK`.
+            if held {
+                return;
+            }
 
             let joined: Vec<(String, String)> = reg
                 .iter()
@@ -3277,14 +3314,46 @@ async fn start_join(
         // went to the new process, which refused it, and the join waited
         // for the eviction, was abandoned for the evicted member and ran
         // the handoff again.
-        let replaced: Vec<String> = if newly_registered {
-            guard
-                .iter()
-                .filter(|(_, info)| info.state == NodeState::Joined && info.address == address)
-                .map(|(old, _)| old.clone())
-                .collect()
+        //
+        // Issue #1663: only when the old name is plausibly gone. The
+        // address is the connection's source IP plus the port the `J`
+        // declares, which proves nothing about the old name: another
+        // process on the same host advertising the same port would
+        // otherwise remove a live member, whose next `P` is then answered
+        // `G` (the departure is on record) and which drops its cache to
+        // join again. "Gone" is `CONTACT_BREAK` without a heartbeat or
+        // announce on the liveness clock (`last_heartbeat`, which the stall
+        // guard moves forward after a pause of discovery, so a stall does
+        // not make every member look gone): the age at which a missed
+        // heartbeat is already recorded as a contact break. The registry
+        // has no reliable owner connection for a `Joined` member
+        // (`owner_connection_id` is only kept for `Waiting`/`Joining`
+        // entries), so a closed connection is not a usable signal here.
+        //
+        // A member at that address that was heard from more recently is
+        // undecided, not kept: a node that crashed and was restarted within
+        // a few seconds looks exactly like that, and leaving its old name
+        // in sent the join's `M` to the new process (#1616 again). The new
+        // name is held instead (`AddressHold`): its join does not begin,
+        // and `settle_address_holds`, from the sweep, replaces the old name
+        // once it has been silent for `CONTACT_BREAK` or lets the join go
+        // ahead as it would have without #1616 if the old name is heard
+        // from again.
+        let now = Instant::now();
+        let (replaced, held): (Vec<String>, Vec<String>) = if newly_registered {
+            let (mut gone, mut undecided) = (Vec::new(), Vec::new());
+            for (old, info) in guard.iter() {
+                if info.state == NodeState::Joined && info.address == address {
+                    if now.duration_since(info.last_heartbeat) >= CONTACT_BREAK {
+                        gone.push(old.clone());
+                    } else {
+                        undecided.push(old.clone());
+                    }
+                }
+            }
+            (gone, undecided)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         for old in &replaced {
             guard.remove(old);
@@ -3292,6 +3361,14 @@ async fn start_join(
             eprintln!(
                 "WARN node replaced: {old} (the new node {name} registered at its address \
                  {address})"
+            );
+        }
+        if !held.is_empty() {
+            eprintln!(
+                "WARN {name} registered at the address of {}, which was heard from within the \
+                 last {}s: its join waits for that to be decided",
+                held.join(", "),
+                CONTACT_BREAK.as_secs()
             );
         }
         if newly_registered {
@@ -3337,36 +3414,16 @@ async fn start_join(
         // accepted connection as the owner, never a stale one. See
         // `NodeInfo::owner_connection_id`.
         info.owner_connection_id = connection_id;
+        if !held.is_empty() {
+            info.address_hold = Some(AddressHold {
+                since: now,
+                old_names: held,
+            });
+        }
         (Arc::clone(&info.promoted), replaced)
     };
 
-    // The replaced members are no longer part of a join in flight either:
-    // one that has not reported `C` never will. `handle_complete` no longer
-    // takes a report in its name, and the join is finished if it was the
-    // last one it waited for.
-    if !replaced.is_empty() {
-        let finished = {
-            let mut join_guard = lock_current_join(current_join);
-            match join_guard.as_mut() {
-                Some(pending) => {
-                    for old in &replaced {
-                        if !pending.completed.contains(old) {
-                            pending.expected.remove(old);
-                        }
-                    }
-                    if pending.completed.len() >= pending.expected.len() {
-                        join_guard.take().map(|pending| pending.joining_name)
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            }
-        };
-        if let Some(joining_name) = finished {
-            promote_to_joined(registry, &joining_name);
-        }
-    }
+    drop_replaced_from_current_join(registry, current_join, &replaced);
 
     try_begin_next_join(
         registry,
@@ -3379,6 +3436,131 @@ async fn start_join(
     .await;
 
     Ok(promoted)
+}
+
+/// The members `replaced` are no longer part of a join in flight: one that
+/// has not reported `C` never will. `handle_complete` no longer takes a
+/// report in their name, and the join is finished if it was the last one it
+/// waited for.
+fn drop_replaced_from_current_join(
+    registry: &Registry,
+    current_join: &CurrentJoin,
+    replaced: &[String],
+) {
+    if replaced.is_empty() {
+        return;
+    }
+    let finished = {
+        let mut join_guard = lock_current_join(current_join);
+        match join_guard.as_mut() {
+            Some(pending) => {
+                for old in replaced {
+                    if !pending.completed.contains(old) {
+                        pending.expected.remove(old);
+                    }
+                }
+                if pending.completed.len() >= pending.expected.len() {
+                    join_guard.take().map(|pending| pending.joining_name)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(joining_name) = finished {
+        promote_to_joined(registry, &joining_name);
+    }
+}
+
+/// What `settle_address_holds` found.
+#[derive(Default)]
+struct HoldOutcome {
+    /// Old names removed because they had been silent for `CONTACT_BREAK`.
+    replaced: Vec<String>,
+    /// At least one hold ended (any way): the queue may be able to move.
+    decided: bool,
+    /// Some `Waiting` entry is still held.
+    holds_remain: bool,
+}
+
+/// Decides the address collisions `start_join` left undecided (issue
+/// #1663), for every held `Waiting` entry. Each old name is, in turn:
+/// - gone from the registry (left, evicted, replaced by another): nothing
+///   left to decide;
+/// - heard from after the `J` (`last_contact`, which only the node itself
+///   moves): alive, so the address is a duplicate and the hold is dropped,
+///   leaving the join to go ahead as it did before the replacement existed;
+/// - silent for `CONTACT_BREAK` on the liveness clock (`last_heartbeat`):
+///   replaced, with the same effects as in `start_join` (removed, recorded
+///   as departed, `T`'s roster bumped);
+/// - otherwise still undecided.
+///
+/// Called from the sweep, after its stall guard has run: that guard is what
+/// moves `last_heartbeat` forward after a pause of discovery, so deciding
+/// anywhere else could read the age of a stall as silence of the node.
+/// The caller removes `replaced` from the join in flight
+/// (`drop_replaced_from_current_join`).
+fn settle_address_holds(registry: &Registry, now: Instant) -> HoldOutcome {
+    let mut outcome = HoldOutcome::default();
+    let mut guard = lock(registry);
+    let held: Vec<String> = guard
+        .iter()
+        .filter(|(_, info)| info.address_hold.is_some())
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in held {
+        let Some(hold) = guard
+            .get_mut(&name)
+            .and_then(|info| info.address_hold.take())
+        else {
+            continue;
+        };
+        let mut undecided = Vec::new();
+        let mut to_replace = Vec::new();
+        for old in hold.old_names {
+            match guard.get(&old) {
+                Some(old_info) if old_info.state == NodeState::Joined => {
+                    if old_info.last_contact > hold.since {
+                        println!(
+                            "INFO {old} was heard from after {name} registered at its address: \
+                             it is alive, not replaced"
+                        );
+                    } else if now.duration_since(old_info.last_heartbeat) >= CONTACT_BREAK {
+                        to_replace.push(old);
+                    } else {
+                        undecided.push(old);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for old in &to_replace {
+            guard.remove(old);
+            record_departed(registry, old);
+            eprintln!(
+                "WARN node replaced: {old} (the new node {name} registered at its address and \
+                 {old} was then silent for {}s)",
+                CONTACT_BREAK.as_secs()
+            );
+        }
+        if !to_replace.is_empty() {
+            bump_roster(registry);
+        }
+        outcome.replaced.extend(to_replace);
+        if undecided.is_empty() {
+            outcome.decided = true;
+        } else {
+            outcome.holds_remain = true;
+            if let Some(info) = guard.get_mut(&name) {
+                info.address_hold = Some(AddressHold {
+                    since: hold.since,
+                    old_names: undecided,
+                });
+            }
+        }
+    }
+    outcome
 }
 
 /// Issue #1031: a node admitted as `Joined` by `P` while a join is
@@ -4380,6 +4562,16 @@ fn dispatch_connection(
             match try_acquire_per_ip(&per_ip_connections, address.ip(), MAX_CONNECTIONS_PER_IP) {
                 Some(permit) => permit,
                 None => {
+                    // Issue #1664: the global permit goes back before the
+                    // busy reply, which on a plaintext listener is followed
+                    // by up to `BUSY_REPLY_DRAIN_WINDOW` of reading from a
+                    // peer that may not close. Held through that, a source
+                    // at its per-IP cap could keep global slots by churning
+                    // rejected connections it leaves open. The global-limit
+                    // rejection above holds no permit either. Not reordered
+                    // (per-IP first) because then a connection the global
+                    // limit would turn away would take a per-IP slot first.
+                    drop(permit);
                     reject_over_limit(
                         stream,
                         address,
@@ -4854,6 +5046,10 @@ async fn sweep_expired(
     let mut ticker = interval(sweep_interval);
     let mut grace_joins_kicked = false;
     let mut last_tick = Instant::now();
+    // Issue #1663: whether a `Waiting` entry was held at the previous tick,
+    // and whether a hold ended since the queue was last started.
+    let mut had_holds = false;
+    let mut begin_after_hold = false;
 
     // The join fan-outs (`abandon_current_join`'s `X`s, `try_begin_next_join`'s
     // `M`s with their retries) used to be awaited right here, which parked
@@ -5053,6 +5249,17 @@ async fn sweep_expired(
                     Some(_) => {}
                 }
 
+                // Issue #1663: decide the address collisions `start_join`
+                // left open. After the stall guard above, so that a pause
+                // of discovery is not read as the old name's silence.
+                let holds = settle_address_holds(&registry, now);
+                drop_replaced_from_current_join(&registry, &current_join, &holds.replaced);
+                // A hold that ended, or whose held entry went away (its
+                // connection died, the waiting timeout), may have been all
+                // that kept the queue from starting.
+                begin_after_hold |= holds.decided || (had_holds && !holds.holds_remain);
+                had_holds = holds.holds_remain;
+
                 for (name, promoted) in waiting_evicted {
                     record_departed(&registry, &name);
                     eprintln!(
@@ -5110,6 +5317,13 @@ async fn sweep_expired(
                 // nothing for this one call to collide with.)
                 if !grace_joins_kicked && fanouts.is_empty() && Instant::now() >= joins_ready_at {
                     grace_joins_kicked = true;
+                    fanout_context.spawn(&mut fanouts, JoinFanout::BeginNext);
+                }
+
+                // State-based like the kick above: still pending on the next
+                // tick if a fan-out in flight kept it from starting now.
+                if begin_after_hold && fanouts.is_empty() {
+                    begin_after_hold = false;
                     fanout_context.spawn(&mut fanouts, JoinFanout::BeginNext);
                 }
             }
@@ -5588,6 +5802,20 @@ async fn handle_connection(
                             }
                             None => None,
                         };
+                        // Issue #1662: ack first, then abandon — the same
+                        // order as `Complete` (issue #1029). The removal
+                        // above is what the leaving node waits for; the
+                        // abandon's `X` to every remaining ready member
+                        // and the next join's `M` fan-out can take
+                        // `OUTBOUND_IO_TIMEOUT` each against a member that
+                        // accepts and never answers, and the node's
+                        // `send_leave` waits only about that long for `R`
+                        // (it would log `leave timed out` for a leave
+                        // discovery had already applied, and delay its own
+                        // exit). The abandon runs whether or not the ack
+                        // was delivered: the node is out of the registry
+                        // either way.
+                        let acked = write_response(&mut stream, b"R\n").await;
                         if let Some((join, reason)) = abandon {
                             abandon_current_join(
                                 &registry,
@@ -5601,8 +5829,7 @@ async fn handle_connection(
                             )
                             .await;
                         }
-
-                        write_response(&mut stream, b"R\n").await?;
+                        acked?;
                         continue;
                     }
                     Err(()) => {
@@ -8952,6 +9179,9 @@ mod tests {
             NodeInfo::new(address.clone(), NodeState::Joined, "tk-old".to_string()),
         );
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        // Silent for a missed heartbeat (issue #1663): a member that is still
+        // heartbeating is not replaced.
+        tokio::time::advance(CONTACT_BREAK).await;
 
         start_join(
             &registry,
@@ -9026,6 +9256,9 @@ mod tests {
             late: LateHandoffs::default(),
             generation: 1,
         })));
+        // Silent for a missed heartbeat (issue #1663): a member that is still
+        // heartbeating is not replaced.
+        tokio::time::advance(CONTACT_BREAK).await;
 
         start_join(
             &registry,
@@ -9059,6 +9292,502 @@ mod tests {
                 None
             )
             .await
+        );
+    }
+
+    /// A stand-in ready node for `M`: accepts each connection, reads the
+    /// frame and answers `A 0\n` (a handoff that finished). Returns its
+    /// address and a count of the connections it has accepted.
+    async fn migrate_acking_node() -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut chunk = [0u8; 4096];
+                    let _ = stream.read(&mut chunk).await;
+                    let _ = stream.write_all(b"A 0\n").await;
+                });
+            }
+        });
+        (address, accepted)
+    }
+
+    /// Issue #1663 deferred replacement: `node-old` and `node-b` are
+    /// `Joined`, both last heard from now, with a sweep running (liveness
+    /// 60 s, so only the hold's own rule can remove anyone within these
+    /// tests). `old_accepted` counts the connections made to `node-old`'s
+    /// address, which is where a restarted process would be listening.
+    struct HoldFixture {
+        registry: Registry,
+        current_join: CurrentJoin,
+        old_address: String,
+        old_accepted: Arc<AtomicU64>,
+        b_accepted: Arc<AtomicU64>,
+        shutdown_tx: watch::Sender<bool>,
+        sweep_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl HoldFixture {
+        async fn new() -> Self {
+            let (old_address, old_accepted) = migrate_acking_node().await;
+            let (b_address, b_accepted) = migrate_acking_node().await;
+            let registry: Registry = Arc::new(RegistryState::default());
+            for (name, address) in [("node-old", &old_address), ("node-b", &b_address)] {
+                lock(&registry).insert(
+                    name.to_string(),
+                    NodeInfo::new(address.clone(), NodeState::Joined, format!("tk-{name}")),
+                );
+            }
+            let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let sweep_task = tokio::spawn(sweep_expired(
+                Arc::clone(&registry),
+                Arc::clone(&current_join),
+                None,
+                None,
+                2,
+                Instant::now(),
+                Duration::from_secs(60),
+                shutdown_rx,
+            ));
+            tokio::task::yield_now().await;
+            Self {
+                registry,
+                current_join,
+                old_address,
+                old_accepted,
+                b_accepted,
+                shutdown_tx,
+                sweep_task,
+            }
+        }
+
+        /// A `J` for `name` from `address`.
+        async fn join(&self, name: &str, address: &str, connection_id: u64) {
+            start_join(
+                &self.registry,
+                &self.current_join,
+                &None,
+                &None,
+                2,
+                Instant::now(),
+                name,
+                address.to_string(),
+                format!("tk-{name}"),
+                connection_id,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name} is accepted"));
+        }
+
+        fn state_of(&self, name: &str) -> Option<NodeState> {
+            lock(&self.registry).get(name).map(|info| info.state)
+        }
+
+        fn joining_name(&self) -> Option<String> {
+            lock_current_join(&self.current_join)
+                .as_ref()
+                .map(|pending| pending.joining_name.clone())
+        }
+
+        async fn finish(self) {
+            self.shutdown_tx.send_replace(true);
+            let _ = self.sweep_task.await;
+        }
+    }
+
+    /// Issue #1663: a restart whose `J` arrives while the old name was
+    /// heard from only 2 s ago is undecided: nothing is sent to the old
+    /// name's address, and the old name stays (and so does the join of the
+    /// new one) until it has been silent for `CONTACT_BREAK`. Then it is
+    /// replaced as in the immediate case, and the join runs once, against
+    /// the members that are left. A name queued behind the held one waits
+    /// its turn and starts when the first join completes; the hold costs it
+    /// at most the hold.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_restart_is_replaced_once_the_old_name_is_silent_and_the_handoff_runs_once() {
+        let fx = HoldFixture::new().await;
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
+        fx.join("node-new", &fx.old_address, 2).await;
+        fx.join("node-z", "127.0.0.1:5555", 3).await;
+
+        // Held: 2 s after the last heartbeat, 5 s before CONTACT_BREAK.
+        advance_in_steps(Duration::from_secs(6), Duration::from_millis(100)).await;
+        assert!(
+            fx.state_of("node-old").is_some(),
+            "replaced while undecided"
+        );
+        assert_eq!(fx.state_of("node-new"), Some(NodeState::Waiting));
+        assert_eq!(fx.state_of("node-z"), Some(NodeState::Waiting));
+        assert!(fx.joining_name().is_none(), "a join began during the hold");
+        assert_eq!(fx.old_accepted.load(Ordering::SeqCst), 0);
+        assert_eq!(fx.b_accepted.load(Ordering::SeqCst), 0);
+
+        // Silent for CONTACT_BREAK (9 s) at 7 s after the J: replaced, and
+        // the join of node-new starts without the old name.
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
+        wait_until("node-new's join", Duration::from_secs(5), || {
+            fx.joining_name().as_deref() == Some("node-new")
+        })
+        .await;
+        assert!(fx.state_of("node-old").is_none());
+        assert!(
+            fx.registry
+                .departed
+                .lock()
+                .unwrap()
+                .departed_at("node-old")
+                .is_some()
+        );
+        let generation = {
+            let guard = lock_current_join(&fx.current_join);
+            let pending = guard.as_ref().unwrap();
+            let mut expected: Vec<_> = pending.expected.keys().cloned().collect();
+            expected.sort();
+            assert_eq!(
+                expected,
+                ["node-b"],
+                "the join still waits for the old name"
+            );
+            pending.generation
+        };
+        wait_until("the M to node-b", Duration::from_secs(5), || {
+            fx.b_accepted.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        assert_eq!(
+            fx.old_accepted.load(Ordering::SeqCst),
+            0,
+            "the old name's address was sent an M"
+        );
+        // The name behind it has not been let past it.
+        assert_eq!(fx.state_of("node-z"), Some(NodeState::Waiting));
+
+        // The handoff ran once; node-z follows when it is done.
+        assert!(
+            handle_complete(
+                &fx.registry,
+                &fx.current_join,
+                "node-b",
+                "node-new",
+                "tk-node-b",
+                Some(generation)
+            )
+            .await
+        );
+        try_begin_next_join(
+            &fx.registry,
+            &fx.current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(fx.state_of("node-new"), Some(NodeState::Joined));
+        assert_eq!(fx.joining_name().as_deref(), Some("node-z"));
+        assert_eq!(
+            fx.b_accepted.load(Ordering::SeqCst),
+            2,
+            "one M each for node-new and node-z"
+        );
+        // The address is a member again, under the new name: node-z's `M`
+        // goes to it, the only connection made there.
+        assert_eq!(fx.old_accepted.load(Ordering::SeqCst), 1);
+        fx.finish().await;
+    }
+
+    /// Issue #1663: the old name is heard from again after the new name
+    /// registered, so the address is a duplicate, not a restart. The hold
+    /// is released at the next sweep, the old name is never removed (not
+    /// even when it later falls silent for `CONTACT_BREAK`, the decision
+    /// having been made) and the join of the new name begins as it did
+    /// before the replacement existed: the `M` goes to the old name too.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_live_duplicate_is_never_removed_and_the_new_name_joins_as_before() {
+        let fx = HoldFixture::new().await;
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
+        fx.join("node-new", &fx.old_address, 2).await;
+        advance_in_steps(Duration::from_secs(3), Duration::from_millis(100)).await;
+        assert!(fx.joining_name().is_none());
+        assert_eq!(fx.old_accepted.load(Ordering::SeqCst), 0);
+
+        // The old name heartbeats.
+        heartbeat_at(&fx.registry, "node-old", Instant::now());
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
+        wait_until("node-new's join", Duration::from_secs(5), || {
+            fx.joining_name().as_deref() == Some("node-new")
+        })
+        .await;
+        {
+            let guard = lock_current_join(&fx.current_join);
+            let mut expected: Vec<_> = guard.as_ref().unwrap().expected.keys().cloned().collect();
+            expected.sort();
+            assert_eq!(expected, ["node-b", "node-old"]);
+        }
+        wait_until("the M to the old name", Duration::from_secs(5), || {
+            fx.old_accepted.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+
+        // Silent again for longer than CONTACT_BREAK: still not replaced
+        // (the liveness timeout is 60 s).
+        advance_in_steps(Duration::from_secs(12), Duration::from_millis(100)).await;
+        assert!(fx.state_of("node-old").is_some());
+        assert!(
+            fx.registry
+                .departed
+                .lock()
+                .unwrap()
+                .departed_at("node-old")
+                .is_none()
+        );
+        fx.finish().await;
+    }
+
+    /// Issue #1663: a pause of discovery itself must not make the old name
+    /// look silent. The first sweep after it gives every member a fresh
+    /// window (issue #1312), and the hold's `CONTACT_BREAK` runs from there.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_stalled_sweep_does_not_end_the_hold() {
+        let fx = HoldFixture::new().await;
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
+        fx.join("node-new", &fx.old_address, 2).await;
+
+        // One jump: discovery was not running for 40 s.
+        tokio::time::advance(Duration::from_secs(40)).await;
+        advance_in_steps(Duration::from_secs(3), Duration::from_millis(100)).await;
+        assert!(
+            fx.state_of("node-old").is_some(),
+            "replaced on a stalled tick"
+        );
+        assert!(fx.joining_name().is_none());
+        assert_eq!(fx.old_accepted.load(Ordering::SeqCst), 0);
+
+        // Still undecided 8 s into the fresh window, decided after 9.
+        advance_in_steps(Duration::from_secs(5), Duration::from_millis(100)).await;
+        assert!(fx.state_of("node-old").is_some());
+        advance_in_steps(Duration::from_secs(3), Duration::from_millis(100)).await;
+        wait_until("node-new's join", Duration::from_secs(5), || {
+            fx.joining_name().as_deref() == Some("node-new")
+        })
+        .await;
+        assert!(fx.state_of("node-old").is_none());
+        fx.finish().await;
+    }
+
+    /// Issue #1663: the hold never outlives its reason. The old name
+    /// leaving (or being evicted) before the decision ends it, and the
+    /// queue it was holding up is started.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_hold_ends_when_the_old_name_leaves_the_registry() {
+        let fx = HoldFixture::new().await;
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
+        fx.join("node-new", &fx.old_address, 2).await;
+        advance_in_steps(Duration::from_secs(1), Duration::from_millis(100)).await;
+        assert!(fx.joining_name().is_none());
+
+        lock(&fx.registry).remove("node-old");
+        record_departed(&fx.registry, "node-old");
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
+        wait_until("node-new's join", Duration::from_secs(5), || {
+            fx.joining_name().as_deref() == Some("node-new")
+        })
+        .await;
+        fx.finish().await;
+    }
+
+    /// Issue #1663: the held name's own connection dying (its entry is
+    /// removed) must not leave the queue behind it parked.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_queue_starts_when_the_held_name_itself_goes_away() {
+        let fx = HoldFixture::new().await;
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
+        fx.join("node-new", &fx.old_address, 2).await;
+        fx.join("node-z", "127.0.0.1:5555", 3).await;
+        advance_in_steps(Duration::from_secs(1), Duration::from_millis(100)).await;
+        assert!(fx.joining_name().is_none());
+
+        on_node_connection_ended(
+            &fx.registry,
+            &fx.current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "node-new",
+            2,
+        )
+        .await;
+        advance_in_steps(Duration::from_secs(2), Duration::from_millis(100)).await;
+        wait_until("node-z's join", Duration::from_secs(5), || {
+            fx.joining_name().as_deref() == Some("node-z")
+        })
+        .await;
+        assert!(fx.state_of("node-old").is_some());
+        fx.finish().await;
+    }
+
+    /// Issue #1663: a `J` from the address of a member that is still
+    /// heartbeating is not that member restarted (a second process on the
+    /// same host that advertises the same port, say). The live member
+    /// stays, the new name waits like any other, and the live member is not
+    /// told to start over: its next `P` is answered `R`, not `G` (which
+    /// makes a node drop its cache and join again).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_j_from_the_address_of_a_member_that_is_still_heartbeating_does_not_remove_it() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        let now = Instant::now();
+        insert_member(&registry, "node-old", now, now - Duration::from_secs(2));
+        insert_member(&registry, "node-b", now, now - Duration::from_secs(1));
+        lock(&registry).get_mut("node-b").unwrap().address = "127.0.0.1:4444".to_string();
+        // A join already in progress keeps the new name `Waiting`, so no `M`
+        // goes out in this test.
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "unrelated-joiner".to_string(),
+            expected: [("node-b".to_string(), "tk-node-b".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+            generation: 1,
+        })));
+
+        start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "node-new",
+            "127.0.0.1:3333".to_string(),
+            "tk-new".to_string(),
+            2,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the new name is accepted"));
+
+        // The `P` of the member the `J` would have removed.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_old, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_old
+            .write_all(b"P 8 3333 11 G\nnode-oldtk-node-old")
+            .await
+            .unwrap();
+        let mut reply = [0u8; 2];
+        node_old.read_exact(&mut reply).await.unwrap();
+
+        assert!(
+            lock(&registry).contains_key("node-old"),
+            "a member that heartbeated 2 s ago was removed by a J from its address"
+        );
+        assert_eq!(
+            lock(&registry).get("node-new").map(|info| info.state),
+            Some(NodeState::Waiting),
+            "the new name waits its turn like any other"
+        );
+        assert!(
+            registry
+                .departed
+                .lock()
+                .unwrap()
+                .departed_at("node-old")
+                .is_none(),
+            "the member must not be on record as departed"
+        );
+        assert_eq!(
+            &reply, b"R\n",
+            "the live member was told to clear its cache and join again"
+        );
+    }
+
+    /// Issue #1663: the old name counts as gone once it has been silent for
+    /// `CONTACT_BREAK` (the point at which a missed heartbeat is recorded as
+    /// a break), not before.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_member_is_replaced_once_it_has_been_silent_for_a_contact_break() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-old".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-old".to_string(),
+            ),
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "unrelated-joiner".to_string(),
+            expected: [("node-old".to_string(), "tk-old".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+            generation: 1,
+        })));
+        let join = |name: &'static str, connection_id: u64| {
+            let registry = Arc::clone(&registry);
+            let current_join = Arc::clone(&current_join);
+            async move {
+                start_join(
+                    &registry,
+                    &current_join,
+                    &None,
+                    &None,
+                    2,
+                    Instant::now(),
+                    name,
+                    "127.0.0.1:1".to_string(),
+                    format!("tk-{name}"),
+                    connection_id,
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{name} is accepted"));
+            }
+        };
+
+        tokio::time::advance(CONTACT_BREAK - Duration::from_millis(1)).await;
+        join("node-new-1", 2).await;
+        assert!(
+            lock(&registry).contains_key("node-old"),
+            "replaced one millisecond before a missed heartbeat would be recorded"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        join("node-new-2", 3).await;
+        assert!(
+            !lock(&registry).contains_key("node-old"),
+            "a member silent for CONTACT_BREAK was not replaced"
         );
     }
 
@@ -11313,6 +12042,11 @@ mod tests {
         node_a.read_exact(&mut ack).await.unwrap();
         assert_eq!(&ack, b"R\n");
 
+        // `R` no longer waits for the abandon (issue #1662): wait for it.
+        wait_until("the abandon", Duration::from_secs(3), || {
+            lock_current_join(&current_join).is_none()
+        })
+        .await;
         assert!(
             lock_current_join(&current_join).is_none(),
             "the join must be abandoned once an expected ready member explicitly leaves"
@@ -11322,6 +12056,96 @@ mod tests {
             !lock(&registry).contains_key("node-b"),
             "abandon_current_join must also strand the joining node's own entry"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_explicit_v_is_acked_before_the_abandon_fan_out_finishes() {
+        // Issue #1662: `V` removes the node first and used to answer `R`
+        // only after `abandon_current_join`, whose `X` to every remaining
+        // ready member can take `OUTBOUND_IO_TIMEOUT` each. Here node-b
+        // accepts the `X` and never answers it for far longer than this
+        // test runs: node-a's `R` must arrive anyway, and the abandon must
+        // still happen (join taken, `X` delivered to node-b).
+        let (node_b_addr, accepted, _acked) = slow_cancel_node(Duration::from_secs(30)).await;
+        let registry: Registry = Arc::new(RegistryState::default());
+        for (name, address, state) in [
+            ("node-a", "127.0.0.1:1", NodeState::Joined),
+            ("node-b", node_b_addr.as_str(), NodeState::Joined),
+            ("node-c", "127.0.0.1:3", NodeState::Joining),
+        ] {
+            lock(&registry).insert(
+                name.to_string(),
+                NodeInfo::new(address.to_string(), state, format!("tk-{name}")),
+            );
+        }
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-c".to_string(),
+            expected: [
+                ("node-a".to_string(), "tk-node-a".to_string()),
+                ("node-b".to_string(), "tk-node-b".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+            generation: 1,
+        })));
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_a, server) = tcp_pair().await;
+        let connection = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        let sent_at = Instant::now();
+        node_a.write_all(b"V 6 9\nnode-atk-node-a").await.unwrap();
+        let mut ack = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(3), node_a.read_exact(&mut ack))
+            .await
+            .expect("R must not wait for the abandon's X to node-b (hangs 30 s)")
+            .unwrap();
+        assert_eq!(&ack, b"R\n");
+        assert!(
+            sent_at.elapsed() < OUTBOUND_IO_TIMEOUT / 2,
+            "R arrived after {:?}",
+            sent_at.elapsed()
+        );
+
+        // The abandon still happens: node-b is sent the `X`, the join and
+        // the joining node's entry are gone.
+        wait_until(
+            "the abandon's X to reach node-b",
+            Duration::from_secs(3),
+            || accepted.load(Ordering::SeqCst) == 1,
+        )
+        .await;
+        assert!(lock_current_join(&current_join).is_none());
+        assert!(!lock(&registry).contains_key("node-a"));
+        assert!(
+            !lock(&registry).contains_key("node-c"),
+            "the abandon must also strand the joining node's own entry"
+        );
+
+        // The stuck `X` would hold the connection task for 10 s.
+        connection.abort();
+        let _ = connection.await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11407,6 +12231,13 @@ mod tests {
         node_b.read_exact(&mut ack).await.unwrap();
         assert_eq!(&ack, b"R\n");
 
+        // `R` no longer waits for the abandon (issue #1662): wait for it.
+        wait_until("node-c's join to start", Duration::from_secs(3), || {
+            lock_current_join(&current_join)
+                .as_ref()
+                .is_some_and(|pending| pending.joining_name == "node-c")
+        })
+        .await;
         assert!(!lock(&registry).contains_key("node-b"));
         assert_eq!(
             lock_current_join(&current_join)
@@ -11480,6 +12311,11 @@ mod tests {
         node_b.read_exact(&mut ack).await.unwrap();
         assert_eq!(&ack, b"R\n");
 
+        // `R` no longer waits for the abandon (issue #1662): wait for it.
+        wait_until("the abandon", Duration::from_secs(3), || {
+            lock_current_join(&current_join).is_none()
+        })
+        .await;
         assert!(
             lock_current_join(&current_join).is_none(),
             "the join must be abandoned once its joining node (still Waiting) explicitly leaves"
@@ -13127,6 +13963,85 @@ mod tests {
 
         connection_tasks.abort_all();
 
+        while connection_tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connection_rejected_by_the_per_ip_cap_does_not_hold_a_global_slot() {
+        // Issue #1664: the per-IP rejection used to keep the global permit
+        // while `reject_over_limit` read for up to `BUSY_REPLY_DRAIN_WINDOW`
+        // (200 ms) from a peer that does not close. A source at its per-IP
+        // cap could then hold global slots by churning rejected connections
+        // it keeps open: the very thing the per-IP cap exists to prevent.
+        // Global limit 4, one live connection that fills the per-IP cap,
+        // two rejected ones kept open (they have read their `B`, so each is
+        // inside its drain window): only the live one may hold a slot.
+        let connection_limit = Arc::new(Semaphore::new(4));
+        let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let cluster_state = ClusterState {
+            registry: Arc::new(RegistryState::default()),
+            current_join: Arc::new(Mutex::new(None)),
+        };
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        // Stands in for `MAX_CONNECTIONS_PER_IP - 1` other live connections
+        // from this IP; the live connection below fills the cap exactly.
+        per_ip_connections
+            .lock()
+            .unwrap()
+            .insert(ip, MAX_CONNECTIONS_PER_IP - 1);
+        let mut connection_tasks = JoinSet::new();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = || ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+        };
+
+        let (_live_client, live_server) = tcp_pair().await;
+        dispatch_connection(
+            live_server,
+            SocketAddr::new(ip, 9000),
+            cluster_state.clone(),
+            Arc::clone(&connection_limit),
+            Arc::clone(&per_ip_connections),
+            config(),
+            shutdown_rx.clone(),
+            &mut connection_tasks,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(connection_limit.available_permits(), 3);
+
+        let mut rejected_clients = Vec::new();
+        for port in [9001, 9002] {
+            let (mut client, server) = tcp_pair().await;
+            dispatch_connection(
+                server,
+                SocketAddr::new(ip, port),
+                cluster_state.clone(),
+                Arc::clone(&connection_limit),
+                Arc::clone(&per_ip_connections),
+                config(),
+                shutdown_rx.clone(),
+                &mut connection_tasks,
+            );
+            let mut busy = [0u8; 2];
+            client.read_exact(&mut busy).await.unwrap();
+            assert_eq!(&busy, b"B\n");
+            // Kept open: the server's drain waits for this peer to close.
+            rejected_clients.push(client);
+        }
+
+        assert_eq!(
+            connection_limit.available_permits(),
+            3,
+            "a rejected connection is holding a global slot while its busy reply drains"
+        );
+
+        connection_tasks.abort_all();
         while connection_tasks.join_next().await.is_some() {}
     }
 
