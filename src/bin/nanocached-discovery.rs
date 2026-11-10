@@ -5588,6 +5588,20 @@ async fn handle_connection(
                             }
                             None => None,
                         };
+                        // Issue #1662: ack first, then abandon — the same
+                        // order as `Complete` (issue #1029). The removal
+                        // above is what the leaving node waits for; the
+                        // abandon's `X` to every remaining ready member
+                        // and the next join's `M` fan-out can take
+                        // `OUTBOUND_IO_TIMEOUT` each against a member that
+                        // accepts and never answers, and the node's
+                        // `send_leave` waits only about that long for `R`
+                        // (it would log `leave timed out` for a leave
+                        // discovery had already applied, and delay its own
+                        // exit). The abandon runs whether or not the ack
+                        // was delivered: the node is out of the registry
+                        // either way.
+                        let acked = write_response(&mut stream, b"R\n").await;
                         if let Some((join, reason)) = abandon {
                             abandon_current_join(
                                 &registry,
@@ -5601,8 +5615,7 @@ async fn handle_connection(
                             )
                             .await;
                         }
-
-                        write_response(&mut stream, b"R\n").await?;
+                        acked?;
                         continue;
                     }
                     Err(()) => {
@@ -11313,6 +11326,11 @@ mod tests {
         node_a.read_exact(&mut ack).await.unwrap();
         assert_eq!(&ack, b"R\n");
 
+        // `R` no longer waits for the abandon (issue #1662): wait for it.
+        wait_until("the abandon", Duration::from_secs(3), || {
+            lock_current_join(&current_join).is_none()
+        })
+        .await;
         assert!(
             lock_current_join(&current_join).is_none(),
             "the join must be abandoned once an expected ready member explicitly leaves"
@@ -11322,6 +11340,96 @@ mod tests {
             !lock(&registry).contains_key("node-b"),
             "abandon_current_join must also strand the joining node's own entry"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_explicit_v_is_acked_before_the_abandon_fan_out_finishes() {
+        // Issue #1662: `V` removes the node first and used to answer `R`
+        // only after `abandon_current_join`, whose `X` to every remaining
+        // ready member can take `OUTBOUND_IO_TIMEOUT` each. Here node-b
+        // accepts the `X` and never answers it for far longer than this
+        // test runs: node-a's `R` must arrive anyway, and the abandon must
+        // still happen (join taken, `X` delivered to node-b).
+        let (node_b_addr, accepted, _acked) = slow_cancel_node(Duration::from_secs(30)).await;
+        let registry: Registry = Arc::new(RegistryState::default());
+        for (name, address, state) in [
+            ("node-a", "127.0.0.1:1", NodeState::Joined),
+            ("node-b", node_b_addr.as_str(), NodeState::Joined),
+            ("node-c", "127.0.0.1:3", NodeState::Joining),
+        ] {
+            lock(&registry).insert(
+                name.to_string(),
+                NodeInfo::new(address.to_string(), state, format!("tk-{name}")),
+            );
+        }
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-c".to_string(),
+            expected: [
+                ("node-a".to_string(), "tk-node-a".to_string()),
+                ("node-b".to_string(), "tk-node-b".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+            generation: 1,
+        })));
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_a, server) = tcp_pair().await;
+        let connection = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        let sent_at = Instant::now();
+        node_a.write_all(b"V 6 9\nnode-atk-node-a").await.unwrap();
+        let mut ack = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(3), node_a.read_exact(&mut ack))
+            .await
+            .expect("R must not wait for the abandon's X to node-b (hangs 30 s)")
+            .unwrap();
+        assert_eq!(&ack, b"R\n");
+        assert!(
+            sent_at.elapsed() < OUTBOUND_IO_TIMEOUT / 2,
+            "R arrived after {:?}",
+            sent_at.elapsed()
+        );
+
+        // The abandon still happens: node-b is sent the `X`, the join and
+        // the joining node's entry are gone.
+        wait_until(
+            "the abandon's X to reach node-b",
+            Duration::from_secs(3),
+            || accepted.load(Ordering::SeqCst) == 1,
+        )
+        .await;
+        assert!(lock_current_join(&current_join).is_none());
+        assert!(!lock(&registry).contains_key("node-a"));
+        assert!(
+            !lock(&registry).contains_key("node-c"),
+            "the abandon must also strand the joining node's own entry"
+        );
+
+        // The stuck `X` would hold the connection task for 10 s.
+        connection.abort();
+        let _ = connection.await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11407,6 +11515,13 @@ mod tests {
         node_b.read_exact(&mut ack).await.unwrap();
         assert_eq!(&ack, b"R\n");
 
+        // `R` no longer waits for the abandon (issue #1662): wait for it.
+        wait_until("node-c's join to start", Duration::from_secs(3), || {
+            lock_current_join(&current_join)
+                .as_ref()
+                .is_some_and(|pending| pending.joining_name == "node-c")
+        })
+        .await;
         assert!(!lock(&registry).contains_key("node-b"));
         assert_eq!(
             lock_current_join(&current_join)
@@ -11480,6 +11595,11 @@ mod tests {
         node_b.read_exact(&mut ack).await.unwrap();
         assert_eq!(&ack, b"R\n");
 
+        // `R` no longer waits for the abandon (issue #1662): wait for it.
+        wait_until("the abandon", Duration::from_secs(3), || {
+            lock_current_join(&current_join).is_none()
+        })
+        .await;
         assert!(
             lock_current_join(&current_join).is_none(),
             "the join must be abandoned once its joining node (still Waiting) explicitly leaves"
