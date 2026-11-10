@@ -179,6 +179,38 @@ on one key were enough to exhaust it.)
 platform MBean server. Timings and evictions are not tracked — the wire
 protocol doesn't report server-side LRU evictions to the client.
 
+Hits, misses, puts and removals follow the table in the JSR-107
+specification ("Statistics Effects of Cache Operations"), where a cell
+reads "yes" for both hits and misses it is the mapping that decides, as in
+the specification's reference implementation:
+
+| Operation | Hit | Miss | Put | Removal |
+|---|---|---|---|---|
+| `get`, `getAll` (per key) | key present | key absent | | |
+| `put`, `putAll` (per entry) | | | each write | |
+| `getAndPut` | key present | key absent | each write | |
+| `getAndReplace` | key present | key absent | when it replaced | |
+| `getAndRemove` | key present | key absent | | when it removed |
+| `putIfAbsent` | key present | key absent | when it stored | |
+| `replace(k, v)` | key present | key absent | when it replaced | |
+| `replace(k, old, new)` | key present, whether or not `old` matched | key absent | when it replaced | |
+| `remove(k, old)` | key present, whether or not `old` matched | key absent | | when it removed |
+| `remove(k)`, `removeAll(keys)` | | | | each entry removed |
+| `containsKey`, `clear`, `loadAll` | | | | |
+
+An update whose expiry resolves to zero removes the entry and counts as a
+removal, not a put. Two things the specification counts are not counted
+here:
+
+- `removeAll()` counts no removals. The specification asks for one
+  removal per entry removed, but the wire protocol clears the namespace
+  in one frame without saying how many entries it held (`clear()` counts
+  none either, as in the specification). `removeAll(keys)` does count.
+- `invoke`/`invokeAll` always throw (see above), so they count nothing.
+
+A `putIfAbsent` whose creation expiry is zero stores nothing and sends
+nothing, so it counts neither a hit nor a miss.
+
 ## Consistency notes
 
 `getAll` is one batched read per owning node. The values in one batch
