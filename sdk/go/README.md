@@ -392,10 +392,16 @@ whether or not `err` is nil. Keys whose primary still answers a wrong-node
 after one refresh and retry return `ErrWrongNode`; a primary that cannot be
 reached on both passes returns its connection error (`ErrConnectionLost`),
 never `ErrWrongNode`. With a TTL of `0` a frame whose connection was lost after
-it was written is not resent (the node may have expired the keys already), so
-only that frame's keys come back with `ErrConnectionLost`; the frames of the
-same batch that had not been sent yet still go out. A touch is idempotent, so
-a failed `TouchMany` can simply be sent again. Against a node that has `t` but not `y` both return
+it was written is not resent (the node may have expired the keys already). In
+a cluster only that frame's keys come back with `ErrConnectionLost`; the
+frames of the same batch that had not been sent yet still go out in the
+refresh-and-retry pass. Against a single address or through a proxy there is
+no such pass: the call returns at the first chunk that fails, the chunks after
+it are never sent, and the map holds only the keys of the chunks before it.
+The error is a plain `ErrConnectionLost` that does not name the keys that are
+missing, so treat every key absent from the map as not touched (or, for the
+chunk whose frame was written, possibly expired) and send those again. A touch
+is idempotent, so a failed `TouchMany` can simply be sent again. Against a node that has `t` but not `y` both return
 `ErrServerTooOldBatch`, which also matches `ErrServerTooOld`.
 
 ## Batched get and set

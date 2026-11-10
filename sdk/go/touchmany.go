@@ -33,9 +33,14 @@ import (
 // retried — except with ttlSeconds == 0, where a primary whose connection
 // fails after the frame was written is not resent (issue #901): the call
 // returns that ErrConnectionLost, with every key that did resolve in the
-// map. Only the keys of the frame that was being written count as lost; the
-// frames of a chunked batch not yet sent still go out (issue #1602). In a cluster it goes to every owner of a key, the primary's answer
-// being the key's — with ttlSeconds == 0 the primaries are sent the batch
+// map. In a cluster only the keys of the frame that was being written count
+// as lost; the frames of a chunked batch not yet sent still go out in the
+// refresh-and-retry pass (issue #1602). Against a single address or a proxy
+// there is no such pass: the call returns at the first chunk that fails, the
+// chunks after it are never sent, and the map holds only the keys of the
+// chunks before it; the error does not name the missing keys, so every key
+// absent from the map is to be sent again. In a cluster it goes to every
+// owner of a key, the primary's answer being the key's — with ttlSeconds == 0 the primaries are sent the batch
 // first, and the other owners only after they answered (issue #934, see
 // touchReplicasAfterPrimary). A replica's failure or `W` is counted in
 // Stats().ReplicaWriteFailures and never fails the batch. Larger batches
@@ -76,7 +81,9 @@ func (c *Client) TouchMany(keys []string, ttlSeconds int64) (map[string]bool, er
 // leave the primary untouched. With ttlSeconds == 0 a primary whose
 // connection fails after the frame was written is not resent (issue #901):
 // it may have expired and consumed its values already, so those keys return
-// ErrConnectionLost at once instead of reading as misses. Returns
+// ErrConnectionLost at once instead of reading as misses. Against a single
+// address or a proxy the call returns at the first chunk that fails and the
+// chunks after it are never sent (see TouchMany). Returns
 // ErrServerTooOldBatch against a node that predates the command.
 func (c *Client) GetManyAndTouch(keys []string, ttlSeconds int64) (map[string]string, error) {
 	raw, err := c.GetManyAndTouchBytes(keys, ttlSeconds)
