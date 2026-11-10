@@ -3,7 +3,7 @@ import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
 import { Connection, ConnectionLostError, CounterOutOfRangeError, isConnectionError, wasRejectedByServer, WrongNodeError } from "./connection.js";
 import { ServerTooOldError } from "./connection.js";
-import { connectAndIdentify, connectAndListProxies, type DiscoveredNode } from "./identify.js";
+import { connectAndIdentify, connectAndListProxies, HandshakeError, type DiscoveredNode, type IdentifyOptions, type IdentifyResult } from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue, DecompressionError, maxMultiGetDecompressedBytes } from "./compression.js";
 import { NanocachedError } from "./errors.js";
@@ -148,6 +148,27 @@ const PROGRAMMING_ERROR_CONSTRUCTORS = [TypeError, RangeError, ReferenceError, S
  * identically to a dead replica or a stuck refresh. */
 function isSwallowable(error: unknown): boolean {
   return !PROGRAMMING_ERROR_CONSTRUCTORS.some((ctor) => error instanceof ctor);
+}
+
+/** `connectAndIdentify` for the paths that dial a member after the client
+ * is up (a redial, a refresh's dial of a freshly listed node). An address
+ * that does not complete the `A` handshake — it answers with something that
+ * is no handshake reply (an HTTP server's `400 Bad Request`) or accepts the
+ * connection and closes it — fails there with a `HandshakeError`; that is
+ * raised before any frame of the caller's
+ * request exists, so it is re-tagged as the connection-classified, never-sent
+ * `ConnectionLostError` that the refresh-and-retry layer reroutes (even a
+ * non-idempotent op), exactly like an address that answers as a non-node.
+ * Only the handshake's own error is re-tagged — a protocol error on an
+ * established connection never comes through here — and the first
+ * `connect()` does not use this, keeping its documented plain error. */
+async function dialMember(options: IdentifyOptions): Promise<IdentifyResult> {
+  try {
+    return await connectAndIdentify(options);
+  } catch (error) {
+    if (!(error instanceof HandshakeError)) throw error;
+    throw new ConnectionLostError(error.message, { requestWasSent: false, cause: error });
+  }
 }
 
 /** What one setMany call learns across its two multiSetPass passes.
@@ -4193,7 +4214,7 @@ export class NanocachedClient {
     // At most MAX_CONCURRENT_DIALS at a time, though: a roster of tens of
     // thousands of new nodes must not open that many sockets at once.
     const dialResults = await allSettledBounded(newNodes, MAX_CONCURRENT_DIALS, async (node) =>
-      connectAndIdentify({ ...splitHostPort(node.address), authSecret: this.authSecret, tls: this.tls, ca: this.ca }),
+      dialMember({ ...splitHostPort(node.address), authSecret: this.authSecret, tls: this.tls, ca: this.ca }),
     );
 
     if (this.closed) {
@@ -4594,7 +4615,7 @@ export class NanocachedClient {
   }
 
   private async openNodeConnection(address: string): Promise<Connection> {
-    const identified = await connectAndIdentify({ ...splitHostPort(address), authSecret: this.authSecret, tls: this.tls, ca: this.ca });
+    const identified = await dialMember({ ...splitHostPort(address), authSecret: this.authSecret, tls: this.tls, ca: this.ca });
 
     if (identified.kind !== "node") {
       // Connection-classified and never sent: the usual cause is an address

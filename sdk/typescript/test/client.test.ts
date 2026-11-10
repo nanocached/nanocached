@@ -9151,6 +9151,173 @@ describe("a listed address that answers as a discovery server instead of a node"
   }
 });
 
+describe("a listed address that does not complete the A handshake", () => {
+  // The address is real and listening, but it is some other protocol's
+  // server (an HTTP server answering `400 Bad Request`), or a listener with
+  // no backend behind it (a load balancer, a port forward, a TLS-only
+  // service dropping a plaintext client) that accepts the connection and
+  // closes it. The failure is raised during the `A` handshake, before any
+  // frame of the operation exists, so every operation that meets it is safe
+  // to refresh and reroute, even a non-idempotent one.
+  const goodName = "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6";
+  const otherName = "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47";
+
+  type ListenerMode = "garbage" | "closeAtOnce" | "closeAfterA";
+
+  async function startBrokenHandshakeListener(mode: ListenerMode): Promise<{ address: string; connections(): number; close(): Promise<void> }> {
+    const sockets = new Set<Socket>();
+    let connections = 0;
+    const server = createServer((socket) => {
+      connections++;
+      sockets.add(socket);
+      socket.on("error", () => {});
+      socket.on("close", () => sockets.delete(socket));
+      if (mode === "closeAtOnce") socket.end();
+      else if (mode === "closeAfterA") socket.once("data", () => socket.end());
+      else socket.once("data", () => socket.end("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    const port = (server.address() as { port: number }).port;
+    return {
+      address: `127.0.0.1:${port}`,
+      connections: () => connections,
+      close: async () => {
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      },
+    };
+  }
+
+  function keyOwnedBy(name: string, names: string[]): string {
+    for (let i = 0; ; i++) {
+      const key = `garbage-${i}`;
+      if (new HashRing(names).owners(Buffer.from(key), 1)[0] === name) return key;
+    }
+  }
+
+  type Operation = [string, (client: NanocachedClient, key: string) => Promise<unknown>, (node: MockNode, key: string) => boolean];
+  const writes: Operation[] = [
+    ["set", (client, key) => client.set(key, "v"), (node, key) => node.store.has(key)],
+    ["incr", (client, key) => client.incr(key), (node) => node.incrCount() === 1],
+  ];
+  // A ttl-0 batch touch sends to the primaries only, and must treat the
+  // chunk whose dial failed as never sent: it reroutes instead of failing.
+  const touches: Operation[] = [
+    ["touchMany(ttl 0)", (client, key) => client.touchMany([key], 0), (node, key) => node.multiTouchFrames().some((frame) => frame.keys.includes(key))],
+    ["getManyAndTouch(ttl 0)", (client, key) => client.getManyAndTouch([key], 0), (node, key) => node.multiTouchFrames().some((frame) => frame.keys.includes(key))],
+  ];
+
+  const kinds: Array<{ mode: ListenerMode; what: string; message: RegExp; operations: Operation[] }> = [
+    { mode: "garbage", what: "answers garbage to A", message: /unexpected response to A/, operations: [...writes, ...touches] },
+    { mode: "closeAtOnce", what: "accepts the connection and closes it at once", message: /connection closed before the expected response arrived/, operations: writes },
+    { mode: "closeAfterA", what: "reads A and closes the connection", message: /connection closed before the expected response arrived/, operations: writes },
+  ];
+
+  for (const { mode, what, message, operations } of kinds) {
+    for (const [label, operation, reached] of operations) {
+      it(`${label} refreshes and reroutes when a freshly listed node ${what}`, async () => {
+        const good = await startMockNode();
+        const broken = await startBrokenHandshakeListener(mode);
+        const discovery = await startMockDiscovery([{ name: goodName, address: good.address }]);
+        try {
+          const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+          try {
+            // The refresh lists the broken address as a node: its dial fails
+            // in the handshake and the cooldown caches that error.
+            discovery.setNodes([
+              { name: goodName, address: good.address },
+              { name: otherName, address: broken.address },
+            ]);
+            await (client as any).refreshNodeList();
+            assert.equal((client as any).target.members.get(otherName).connection, null);
+            // Discovery has since dropped it; the client's ring has not yet.
+            discovery.setNodes([{ name: goodName, address: good.address }]);
+
+            const key = keyOwnedBy(otherName, [goodName, otherName]);
+            const listsBefore = discovery.listCount();
+            await operation(client, key);
+            assert.ok(discovery.listCount() > listsBefore, "the failure must trigger a node-list refresh");
+            assert.ok(reached(good, key), "the operation must have been rerouted to the remaining node");
+          } finally {
+            await client.close();
+          }
+        } finally {
+          await Promise.all([good.close(), broken.close(), discovery.close()]);
+        }
+      });
+
+      it(`${label} refreshes and reroutes when a redialed address ${what}`, async () => {
+        const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+        const broken = await startBrokenHandshakeListener(mode);
+        const discovery = await startMockDiscovery([
+          { name: goodName, address: nodeA.address },
+          { name: otherName, address: nodeB.address },
+        ]);
+        try {
+          const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+          try {
+            const member = (client as any).target.members.get(otherName);
+            const dead = member.connection as Connection;
+            nodeB.dropConnections();
+            await waitFor(() => dead.isClosed(), "the connection to be dropped");
+            // The member's last-known address now breaks the handshake;
+            // discovery still lists the node at its real address.
+            member.address = broken.address;
+
+            const key = keyOwnedBy(otherName, [goodName, otherName]);
+            const listsBefore = discovery.listCount();
+            await operation(client, key);
+            assert.equal(broken.connections() > 0, true, "the broken address was never dialed");
+            assert.ok(discovery.listCount() > listsBefore, "the failure must trigger a node-list refresh");
+            assert.ok(reached(nodeB, key), "the operation must have reached the node after the refresh");
+          } finally {
+            await client.close();
+          }
+        } finally {
+          await Promise.all([nodeA.close(), nodeB.close(), broken.close(), discovery.close()]);
+        }
+      });
+    }
+
+    it(`the error a redial raises when the address ${what} is a never-sent ConnectionLostError`, async () => {
+      const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+      const broken = await startBrokenHandshakeListener(mode);
+      const discovery = await startMockDiscovery([
+        { name: goodName, address: nodeA.address },
+        { name: otherName, address: nodeB.address },
+      ]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          await assert.rejects(
+            (client as any).openNodeConnection(broken.address),
+            (error: unknown) => error instanceof ConnectionLostError && error.requestWasSent === false && message.test(error.message),
+          );
+        } finally {
+          await client.close();
+        }
+      } finally {
+        await Promise.all([nodeA.close(), nodeB.close(), broken.close(), discovery.close()]);
+      }
+    });
+
+    it(`the first connect() still rejects with the plain error when the address ${what}`, async () => {
+      const broken = await startBrokenHandshakeListener(mode);
+      try {
+        const port = Number(broken.address.split(":")[1]);
+        await assert.rejects(NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port }] }), (error: unknown) => {
+          return error instanceof NanocachedError && !(error instanceof ConnectionLostError) && message.test(error.message);
+        });
+      } finally {
+        await broken.close();
+      }
+    });
+  }
+});
+
 describe("a request in flight when close() runs does not wait for a discovery dial (issue #1674)", () => {
   // In cluster mode the in-flight request is rejected as connection-lost
   // when close() destroys its connection, and the retry wrapper then asked
