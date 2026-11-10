@@ -3277,10 +3277,32 @@ async fn start_join(
         // went to the new process, which refused it, and the join waited
         // for the eviction, was abandoned for the evicted member and ran
         // the handoff again.
+        //
+        // Issue #1663: only when the old name is plausibly gone. The
+        // address is the connection's source IP plus the port the `J`
+        // declares, which proves nothing about the old name: another
+        // process on the same host advertising the same port would
+        // otherwise remove a live member, whose next `P` is then answered
+        // `G` (the departure is on record) and which drops its cache to
+        // join again. "Gone" is `CONTACT_BREAK` without a heartbeat or
+        // announce on the liveness clock (`last_heartbeat`, which the stall
+        // guard moves forward after a pause of discovery, so a stall does
+        // not make every member look gone): the age at which a missed
+        // heartbeat is already recorded as a contact break. A member whose
+        // heartbeats still arrive stays, the new name waits its turn, and
+        // the old name goes at its liveness timeout as it did before #1616.
+        // The registry has no reliable owner connection for a `Joined`
+        // member (`owner_connection_id` is only kept for `Waiting`/`Joining`
+        // entries), so a closed connection is not a usable signal here.
+        let now = Instant::now();
         let replaced: Vec<String> = if newly_registered {
             guard
                 .iter()
-                .filter(|(_, info)| info.state == NodeState::Joined && info.address == address)
+                .filter(|(_, info)| {
+                    info.state == NodeState::Joined
+                        && info.address == address
+                        && now.duration_since(info.last_heartbeat) >= CONTACT_BREAK
+                })
                 .map(|(old, _)| old.clone())
                 .collect()
         } else {
@@ -8952,6 +8974,9 @@ mod tests {
             NodeInfo::new(address.clone(), NodeState::Joined, "tk-old".to_string()),
         );
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        // Silent for a missed heartbeat (issue #1663): a member that is still
+        // heartbeating is not replaced.
+        tokio::time::advance(CONTACT_BREAK).await;
 
         start_join(
             &registry,
@@ -9026,6 +9051,9 @@ mod tests {
             late: LateHandoffs::default(),
             generation: 1,
         })));
+        // Silent for a missed heartbeat (issue #1663): a member that is still
+        // heartbeating is not replaced.
+        tokio::time::advance(CONTACT_BREAK).await;
 
         start_join(
             &registry,
@@ -9059,6 +9087,162 @@ mod tests {
                 None
             )
             .await
+        );
+    }
+
+    /// Issue #1663: a `J` from the address of a member that is still
+    /// heartbeating is not that member restarted (a second process on the
+    /// same host that advertises the same port, say). The live member
+    /// stays, the new name waits like any other, and the live member is not
+    /// told to start over: its next `P` is answered `R`, not `G` (which
+    /// makes a node drop its cache and join again).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_j_from_the_address_of_a_member_that_is_still_heartbeating_does_not_remove_it() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        let now = Instant::now();
+        insert_member(&registry, "node-old", now, now - Duration::from_secs(2));
+        insert_member(&registry, "node-b", now, now - Duration::from_secs(1));
+        lock(&registry).get_mut("node-b").unwrap().address = "127.0.0.1:4444".to_string();
+        // A join already in progress keeps the new name `Waiting`, so no `M`
+        // goes out in this test.
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "unrelated-joiner".to_string(),
+            expected: [("node-b".to_string(), "tk-node-b".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+            generation: 1,
+        })));
+
+        start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "node-new",
+            "127.0.0.1:3333".to_string(),
+            "tk-new".to_string(),
+            2,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the new name is accepted"));
+
+        // The `P` of the member the `J` would have removed.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_old, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_old
+            .write_all(b"P 8 3333 11 G\nnode-oldtk-node-old")
+            .await
+            .unwrap();
+        let mut reply = [0u8; 2];
+        node_old.read_exact(&mut reply).await.unwrap();
+
+        assert!(
+            lock(&registry).contains_key("node-old"),
+            "a member that heartbeated 2 s ago was removed by a J from its address"
+        );
+        assert_eq!(
+            lock(&registry).get("node-new").map(|info| info.state),
+            Some(NodeState::Waiting),
+            "the new name waits its turn like any other"
+        );
+        assert!(
+            registry
+                .departed
+                .lock()
+                .unwrap()
+                .departed_at("node-old")
+                .is_none(),
+            "the member must not be on record as departed"
+        );
+        assert_eq!(
+            &reply, b"R\n",
+            "the live member was told to clear its cache and join again"
+        );
+    }
+
+    /// Issue #1663: the old name counts as gone once it has been silent for
+    /// `CONTACT_BREAK` (the point at which a missed heartbeat is recorded as
+    /// a break), not before.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_member_is_replaced_once_it_has_been_silent_for_a_contact_break() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-old".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-old".to_string(),
+            ),
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "unrelated-joiner".to_string(),
+            expected: [("node-old".to_string(), "tk-old".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+            generation: 1,
+        })));
+        let join = |name: &'static str, connection_id: u64| {
+            let registry = Arc::clone(&registry);
+            let current_join = Arc::clone(&current_join);
+            async move {
+                start_join(
+                    &registry,
+                    &current_join,
+                    &None,
+                    &None,
+                    2,
+                    Instant::now(),
+                    name,
+                    "127.0.0.1:1".to_string(),
+                    format!("tk-{name}"),
+                    connection_id,
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{name} is accepted"));
+            }
+        };
+
+        tokio::time::advance(CONTACT_BREAK - Duration::from_millis(1)).await;
+        join("node-new-1", 2).await;
+        assert!(
+            lock(&registry).contains_key("node-old"),
+            "replaced one millisecond before a missed heartbeat would be recorded"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        join("node-new-2", 3).await;
+        assert!(
+            !lock(&registry).contains_key("node-old"),
+            "a member silent for CONTACT_BREAK was not replaced"
         );
     }
 

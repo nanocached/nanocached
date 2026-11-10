@@ -45,6 +45,19 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-discovery`: a `J` under a new name from the address of a
+  `Joined` member removed that member whether or not it was still alive.
+  The address is the connection's source IP plus the port the `J` declares,
+  so a second process on the same host started with a live node's
+  advertised port (or any holder of the auth secret sharing its source IP)
+  took the live member out of the roster at once, and its next `P` was
+  answered `G`: the node dropped its cache and joined again. The old name is
+  now replaced only when it has sent no heartbeat or announce for
+  `CONTACT_BREAK` (9 s, the age at which a missed heartbeat is recorded);
+  otherwise the new name waits its turn and the old one times out as it did
+  before #1616. A restart faster than that still waits for the old name's
+  liveness timeout (#1663).
+
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
   `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`
   bounded only its final check), so a hung cluster hung the script instead of
