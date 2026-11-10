@@ -12380,14 +12380,33 @@ mod tests {
     /// and never reads again. The late reply is what lets the proxy's
     /// reader start waiting for the next one *after* the writer's own
     /// write timeout has begun.
-    async fn start_node_late_first_reply_then_silent(delay: Duration) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    ///
+    /// The listener's receive buffer is set to a few KiB before it listens
+    /// (the accepted sockets inherit it): a node that never reads again then
+    /// stops a writer after the first frames, and its late reply cannot
+    /// open the window again. With the system's default buffer, a frame the
+    /// writer was blocked on could complete when the reply arrived, which
+    /// started the timeout of the next frame at the very moment the reader's
+    /// own began, and the two expired together (issue #1703).
+    ///
+    /// Returns the node's address and when it sent the late reply, which is
+    /// the earliest the reader's timeout can start.
+    async fn start_node_late_first_reply_then_silent(
+        delay: Duration,
+    ) -> (String, Arc<StdMutex<Option<tokio::time::Instant>>>) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(16).unwrap();
+        let replied_at = Arc::new(StdMutex::new(None));
+        let node_replied_at = Arc::clone(&replied_at);
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
+                let replied_at = Arc::clone(&node_replied_at);
                 tokio::spawn(async move {
                     let mut buf = BytesMut::new();
                     let Ok(line) = read_line(&mut stream, &mut buf).await else {
@@ -12409,12 +12428,13 @@ mod tests {
                         .write_all(format!("N {tag}\n").as_bytes())
                         .await
                         .unwrap();
+                    *replied_at.lock().unwrap() = Some(tokio::time::Instant::now());
                     // Never read (or write) again.
                     std::future::pending::<()>().await;
                 });
             }
         });
-        addr
+        (addr, replied_at)
     }
 
     async fn start_silent_after_handshake_node() -> String {
@@ -17408,7 +17428,16 @@ mod tests {
         // write: the writer leaves at one timeout, the reader at one and
         // a half. The queued request must fail with the writer, not with
         // the reader.
-        let node = start_node_late_first_reply_then_silent(UPSTREAM_IO_TIMEOUT / 2).await;
+        //
+        // The reader's timeout cannot expire before the late reply plus one
+        // timeout, so the request must have failed before that (with a
+        // margin): checked against the instant the node sent the reply, not
+        // against a fixed time after `started`, so how long the setup took
+        // does not matter. The node's receive buffer is a few KiB so that the
+        // writer is stopped from the first frames on and its reply cannot
+        // free the writer (issue #1703, `start_node_late_first_reply_then_silent`).
+        let (node, replied_at) =
+            start_node_late_first_reply_then_silent(UPSTREAM_IO_TIMEOUT / 2).await;
         let context = bare_context();
         let started = tokio::time::Instant::now();
         let first = context
@@ -17437,7 +17466,8 @@ mod tests {
             .enqueue(&context, &node, frame_get(b"", b"b"), Expect::Value)
             .await;
         let result = queued.await;
-        let elapsed = started.elapsed();
+        let failed_at = tokio::time::Instant::now();
+        let elapsed = failed_at - started;
         assert!(first.await.is_ok(), "the first request is answered");
         let error = result.expect_err("a request queued behind a dead writer cannot be served");
         assert!(request_not_sent(&error), "never written, so safe to replay");
@@ -17445,9 +17475,18 @@ mod tests {
             elapsed >= UPSTREAM_IO_TIMEOUT,
             "it cannot fail before the write timed out: {elapsed:?}"
         );
+        let replied_at = replied_at
+            .lock()
+            .unwrap()
+            .expect("the node answered the first request before the write timed out");
+        let reader_earliest = replied_at + UPSTREAM_IO_TIMEOUT;
         assert!(
-            elapsed < UPSTREAM_IO_TIMEOUT + UPSTREAM_IO_TIMEOUT / 4,
-            "it failed with the reader's timeout ({elapsed:?}), not the writer's"
+            failed_at + UPSTREAM_IO_TIMEOUT / 8 <= reader_earliest,
+            "it failed {:?} after the reader's timeout could first expire \
+             (the reply came {:?} after `started`, it failed {elapsed:?} after): \
+             with the reader's timeout, not the writer's",
+            failed_at.saturating_duration_since(reader_earliest),
+            replied_at - started,
         );
     }
 
