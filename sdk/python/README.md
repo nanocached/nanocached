@@ -276,9 +276,15 @@ primary that cannot be reached on both passes raises its connection error
 (`PartialConnectionLostError` with `partial_values` for
 `get_many_and_touch`, when some keys did resolve). With `ttl_seconds=0` a frame
 whose connection was lost after it was written is not resent (the node may
-have expired the keys already), so only that frame's keys count as lost; the
-frames of the same batch that had not been sent yet still go out. A touch is
-idempotent, so a failed `touch_many` can simply be sent again. Both raise `ServerTooOldError`
+have expired the keys already). In a cluster only that frame's keys count as
+lost; the frames of the same batch that had not been sent yet still go out in
+the refresh-and-retry pass. Against a single address or through a proxy there
+is no such pass: the call raises at the first chunk that fails, the chunks
+after it are never sent, and `touch_many` attaches nothing to the error
+(`get_many_and_touch` attaches the hits of the chunks before it in
+`partial_values`, when there were any). The error does not name the keys that
+were not reached, so send the whole batch again. A touch is idempotent, so a
+failed `touch_many` can simply be sent again. Both raise `ServerTooOldError`
 against a node that has `t` but not `y`; in a cluster, when other primaries
 had already answered, `get_many_and_touch` raises its subclass
 `PartialServerTooOldError` with their hits in `partial_values` (with
