@@ -13,6 +13,7 @@ import javax.cache.configuration.Configuration;
 import javax.cache.configuration.MutableConfiguration;
 import javax.cache.spi.CachingProvider;
 import org.nanocached.NanocachedClient;
+import org.nanocached.NanocachedException;
 
 /**
  * One JSR-107 {@link CacheManager}, owning one {@link NanocachedClient}
@@ -169,6 +170,16 @@ public final class NanocachedCacheManager implements CacheManager {
         if (cache != null) {
             cache.clear();
             cache.markClosed();
+        } else {
+            // The name is not registered, but its data may still be on the
+            // server: Cache.close() deregisters a cache without touching
+            // its data (issue #1678), so destroyCache after a close must
+            // still clear the namespace, through the manager's own client.
+            try {
+                client.namespace(cacheName).clear();
+            } catch (NanocachedException | IllegalArgumentException error) {
+                throw new CacheException("nanocached-jcache: " + error.getMessage(), error);
+            }
         }
     }
 
