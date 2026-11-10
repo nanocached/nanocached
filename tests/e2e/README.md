@@ -117,7 +117,15 @@ bounded queue and drops what does not fit when stderr falls behind, so a
 stuck log pipe cannot stall the node; it writes `TRACE dropped lines=<n>`
 into the stream. With such a line in the logs the check cannot tell a
 missing line from a phantom, so it reports `trace_lines_dropped` and leaves
-`value_from_nowhere` at 0. With the node built without the feature the check
+`value_from_nowhere` at 0. The lines still queued when a node is SIGKILLed
+are lost with no such line, and the replica that takes over then serves an
+increment from a value no traced increment produced. `chaos.sh` writes each
+kill to `killed.txt` and `incrtrace.py --killed` does not count such a step
+when a kill came before it and the loader sent at least as many increments
+without a traced application as the step jumps over (printed as
+`NOWHERE_AFTER_KILL`, `value_from_nowhere_after_kill`); a step the loader's
+counts cannot account for still fails the run. `incrtrace_selftest.py` checks
+this on hand-made logs. With the node built without the feature the check
 prints that it found no `TRACE` lines and asserts nothing. `incrtrace.py` itself failing (a non-zero exit, or a last line that is not its
 summary) fails the run instead of reading as "no `TRACE` lines" (#1618).
 

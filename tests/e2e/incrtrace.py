@@ -48,6 +48,20 @@ increment starting from a value no traced increment produced proves nothing:
 the NOWHERE rows are still printed, but value_from_nowhere is reported as 0
 and trace_lines_dropped says how many lines were lost.
 
+Lines still queued when a node is SIGKILLed are lost as well, with no such
+line: the writer thread was scheduled late, or stderr was being read slowly.
+(Measured: with nothing reading stderr, 1,500 acknowledged increments left 288
+lines on the pipe and no marker; on a loaded host 2 of 500 nodes killed right
+after an acknowledgement had lost that increment's line.) The replica that
+takes over then serves an increment whose old value no traced increment
+produced. With `--killed FILE` (one `<node> <epoch seconds>` line per SIGKILL,
+written by chaos.sh) a NOWHERE row is not counted when a kill came before it
+and the loader's own counts leave room for the missing lines: the key's
+acknowledged + maybe increments minus the traced ones is at least what the
+key's NOWHERE rows jump over. Those rows are printed as NOWHERE_AFTER_KILL and
+counted in value_from_nowhere_after_kill. A jump that no increment the loader
+sent can account for stays value_from_nowhere.
+
 The last line is a JSON summary; chaos.sh asserts over_applied and
 value_from_nowhere. Above it, the full timeline of each offending key.
 """
@@ -64,6 +78,7 @@ ap.add_argument("--logs", required=True, help="directory with the saved node log
 ap.add_argument("--nodes", required=True, help="node log name prefix, e.g. nch-n (matches nch-n*.log)")
 ap.add_argument("--slack", type=float, default=1.0, help="seconds of timestamp slack for the value-from-nowhere check")
 ap.add_argument("--show", nargs="*", default=[], help="keys whose timeline is printed regardless")
+ap.add_argument("--killed", help="file with a `<node> <epoch seconds>` line for each SIGKILLed node; the lines it had queued are lost without a marker")
 ap.add_argument("--match-window", type=float, default=20.0, help="seconds between a loader answer and the application it is matched to (above the loader's 15 s op timeout)")
 a = ap.parse_args()
 
@@ -78,6 +93,13 @@ def parse_ts(s):
     frac = (m.group(2) or "0")[:6].ljust(6, "0")
     return t.timestamp() + int(frac) / 1e6
 
+
+kill_times = []
+if a.killed:
+    for line in open(a.killed):
+        fields = line.split()
+        if len(fields) == 2:
+            kill_times.append(float(fields[1]))
 
 state = json.load(open(a.state))
 n_keys = state["n"]
@@ -129,7 +151,7 @@ for key, evs in events.items():
         # the largest value any other increment had produced by t + slack
         produced = [n2 for j, (t2, _, _, _, n2) in enumerate(incrs) if j != i and t2 <= t + a.slack]
         if produced and old > max(produced):
-            nowhere.append({"key": key, "at": ts, "node": node, "old": old, "max_produced": max(produced)})
+            nowhere.append({"key": key, "at": ts, "node": node, "old": old, "max_produced": max(produced), "t": t})
         if i > 0 and new - incrs[i - 1][4] >= 2:
             jumps.append({"key": key, "from": {"at": incrs[i - 1][1], "node": incrs[i - 1][2], "new": incrs[i - 1][4]},
                           "to": {"at": ts, "node": node, "old": old, "new": new}})
@@ -165,6 +187,21 @@ if hist:
             else:
                 used.add(best[1])
 
+# Rows a SIGKILL can explain: a kill came before the row, and the increments
+# the loader sent without a traced application cover what the key's rows jump
+# over. Nothing else accounts for a value nobody produced.
+after_kill = []
+if kill_times:
+    jumped = collections.Counter()
+    for row in nowhere:
+        jumped[row["key"]] += row["old"] - row["max_produced"]
+    for row in list(nowhere):
+        i = int(row["key"][2:])
+        room = state["acked"]["s"][i] + state["maybe"]["s"][i] - apps[row["key"]]
+        if min(kill_times) <= row["t"] + a.slack and jumped[row["key"]] <= room:
+            nowhere.remove(row)
+            after_kill.append(row)
+
 over, under, within = [], [], 0
 for i in range(n_keys):
     k = f"is{i}"
@@ -182,12 +219,14 @@ for row in over:
 for row in under[:20]:
     print("UNDER", json.dumps(row))
 for row in nowhere:
-    print("NOWHERE", json.dumps(row))
+    print("NOWHERE", json.dumps({k: v for k, v in row.items() if k != "t"}))
+for row in after_kill:
+    print("NOWHERE_AFTER_KILL", json.dumps({k: v for k, v in row.items() if k != "t"}))
 for row in jumps[:20]:
     print("JUMP", json.dumps(row))
 for row in unmatched[:20]:
     print("UNMATCHED", json.dumps(row))
-show = set(a.show) | {r["key"] for r in over[:5]} | {r["key"] for r in nowhere[:5]} | {r["key"] for r in jumps[:5]} | {r["key"] for r in unmatched[:5]}
+show = set(a.show) | {r["key"] for r in over[:5]} | {r["key"] for r in nowhere[:5]} | {r["key"] for r in after_kill[:5]} | {r["key"] for r in jumps[:5]} | {r["key"] for r in unmatched[:5]}
 for key in sorted(show):
     print(f"=== timeline {key}")
     for _, ts, node, kind, rest in events[key]:
@@ -206,6 +245,7 @@ print(json.dumps({
     "under_applied": len(under),
     "within_bounds": within,
     "value_from_nowhere": 0 if trace_lines_dropped else len(nowhere),
+    "value_from_nowhere_after_kill": len(after_kill),
     "trace_lines_dropped": trace_lines_dropped,
     "sequence_jumps": len(jumps),
     "answers_unmatched": len(unmatched) if hist else None,
