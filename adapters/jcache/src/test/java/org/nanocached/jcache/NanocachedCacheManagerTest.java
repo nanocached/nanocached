@@ -141,6 +141,22 @@ class NanocachedCacheManagerTest {
     }
 
     @Test
+    void destroyCacheAfterTheHandleWasClosedStillClearsItsData() {
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        javax.cache.Cache<String, String> cache = manager.createCache("c", config);
+        cache.put("k", "v");
+        cache.close();
+        assertEquals(0, node.clearCount.get(), "closing a handle alone must not clear its data");
+
+        manager.destroyCache("c");
+
+        assertEquals(1, node.clearCount.get(), "destroyCache must clear a cache whose handle was closed first");
+        javax.cache.Cache<String, String> recreated = manager.createCache("c", config);
+        assertNull(recreated.get("k"), "a re-created cache must not see the destroyed cache's data");
+    }
+
+    @Test
     void aLateUnregisterFromAClosedCacheDoesNotEvictADifferentCacheCreatedUnderTheSameName() {
         // A key-only regression: NanocachedCache#close() flips its own
         // `closed` flag, deregisters its statistics MBean, and only then

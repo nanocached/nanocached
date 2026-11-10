@@ -94,6 +94,10 @@ Each `CacheManager` **owns** its `NanocachedClient` — created on
 provider) — unlike `nanocached-spring`, where the application supplies
 and owns the client.
 
+Closing a `Cache` handle deregisters it but leaves its data on the
+servers; `CacheManager.destroyCache(name)` is what deletes the data, and
+it does so whether or not the handle was closed first.
+
 ## Usage
 
 ```java
