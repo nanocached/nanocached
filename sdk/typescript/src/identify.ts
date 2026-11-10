@@ -203,6 +203,16 @@ function readFrame<T>(
   });
 }
 
+/** The `A` handshake got a reply that is no handshake reply at all (an
+ * HTTP server's `400 Bad Request`, say). To a caller of the first
+ * `connect()` it is the plain `NanocachedError` that call documents; the
+ * subclass only lets the client's redial and refresh-dial paths tell it
+ * from every other protocol error and reclassify it as a never-sent
+ * `ConnectionLostError` (the handshake runs before any frame of the
+ * caller's request exists). Never raised for a protocol error on an
+ * established connection. */
+export class HandshakeProtocolError extends NanocachedError {}
+
 interface AuthIdentity {
   accepted: boolean;
   kind: "node" | "cluster";
@@ -238,7 +248,7 @@ function tryParseIdentity(buf: Buffer): AuthIdentity | null {
 
   const accepted = status === 0x4f /* 'O' */;
   if (!accepted && status !== 0x45 /* 'E' */) {
-    throw new NanocachedError("nanocached: unexpected response to A");
+    throw new HandshakeProtocolError("nanocached: unexpected response to A");
   }
 
   let tagged: boolean;
@@ -247,16 +257,16 @@ function tryParseIdentity(buf: Buffer): AuthIdentity | null {
   } else if (buf[2] === 0x54 /* 'T' */) {
     if (buf.length < 4) return null;
     if (buf[3] !== 0x0a) {
-      throw new NanocachedError("nanocached: unexpected response to A");
+      throw new HandshakeProtocolError("nanocached: unexpected response to A");
     }
     tagged = true;
   } else {
-    throw new NanocachedError("nanocached: unexpected response to A");
+    throw new HandshakeProtocolError("nanocached: unexpected response to A");
   }
 
   if (type === 0x6e /* 'n' */) return { accepted, kind: "node", tagged };
   if (type === 0x64 /* 'd' */) return { accepted, kind: "cluster", tagged };
-  throw new NanocachedError("nanocached: unexpected response to A");
+  throw new HandshakeProtocolError("nanocached: unexpected response to A");
 }
 
 /** Thrown when the server rejects the `A` handshake's secret — either no

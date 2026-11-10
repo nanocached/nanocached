@@ -9150,3 +9150,154 @@ describe("a listed address that answers as a discovery server instead of a node"
     });
   }
 });
+
+describe("a listed address that answers the handshake with something that is no handshake reply", () => {
+  // The address is real and listening, but it is some other protocol's
+  // server (an HTTP server answering `400 Bad Request`). The failure is
+  // raised during the `A` handshake, before any frame of the operation
+  // exists, so every operation that meets it is safe to refresh and
+  // reroute, even a non-idempotent one.
+  const goodName = "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6";
+  const otherName = "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47";
+
+  async function startGarbageListener(): Promise<{ address: string; connections(): number; close(): Promise<void> }> {
+    const sockets = new Set<Socket>();
+    let connections = 0;
+    const server = createServer((socket) => {
+      connections++;
+      sockets.add(socket);
+      socket.on("error", () => {});
+      socket.on("close", () => sockets.delete(socket));
+      socket.once("data", () => socket.end("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    const port = (server.address() as { port: number }).port;
+    return {
+      address: `127.0.0.1:${port}`,
+      connections: () => connections,
+      close: async () => {
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      },
+    };
+  }
+
+  function keyOwnedBy(name: string, names: string[]): string {
+    for (let i = 0; ; i++) {
+      const key = `garbage-${i}`;
+      if (new HashRing(names).owners(Buffer.from(key), 1)[0] === name) return key;
+    }
+  }
+
+  const operations: Array<[string, (client: NanocachedClient, key: string) => Promise<unknown>, (node: MockNode, key: string) => boolean]> = [
+    ["set", (client, key) => client.set(key, "v"), (node, key) => node.store.has(key)],
+    ["incr", (client, key) => client.incr(key), (node) => node.incrCount() === 1],
+    // A ttl-0 batch touch sends to the primaries only, and must treat the
+    // chunk whose dial failed as never sent: it reroutes instead of failing.
+    ["touchMany(ttl 0)", (client, key) => client.touchMany([key], 0), (node, key) => node.multiTouchFrames().some((frame) => frame.keys.includes(key))],
+    ["getManyAndTouch(ttl 0)", (client, key) => client.getManyAndTouch([key], 0), (node, key) => node.multiTouchFrames().some((frame) => frame.keys.includes(key))],
+  ];
+
+  for (const [label, operation, reached] of operations) {
+    it(`${label} refreshes and reroutes when a freshly listed node answers garbage to A`, async () => {
+      const good = await startMockNode();
+      const garbage = await startGarbageListener();
+      const discovery = await startMockDiscovery([{ name: goodName, address: good.address }]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          // The refresh lists the garbage address as a node: its dial fails
+          // in the handshake and the cooldown caches that error.
+          discovery.setNodes([
+            { name: goodName, address: good.address },
+            { name: otherName, address: garbage.address },
+          ]);
+          await (client as any).refreshNodeList();
+          assert.equal((client as any).target.members.get(otherName).connection, null);
+          // Discovery has since dropped it; the client's ring has not yet.
+          discovery.setNodes([{ name: goodName, address: good.address }]);
+
+          const key = keyOwnedBy(otherName, [goodName, otherName]);
+          const listsBefore = discovery.listCount();
+          await operation(client, key);
+          assert.ok(discovery.listCount() > listsBefore, "the failure must trigger a node-list refresh");
+          assert.ok(reached(good, key), "the operation must have been rerouted to the remaining node");
+        } finally {
+          await client.close();
+        }
+      } finally {
+        await Promise.all([good.close(), garbage.close(), discovery.close()]);
+      }
+    });
+
+    it(`${label} refreshes and reroutes when a redialed address answers garbage to A`, async () => {
+      const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+      const garbage = await startGarbageListener();
+      const discovery = await startMockDiscovery([
+        { name: goodName, address: nodeA.address },
+        { name: otherName, address: nodeB.address },
+      ]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          const member = (client as any).target.members.get(otherName);
+          const dead = member.connection as Connection;
+          nodeB.dropConnections();
+          await waitFor(() => dead.isClosed(), "the connection to be dropped");
+          // The member's last-known address is now an HTTP server; discovery
+          // still lists the node at its real address.
+          member.address = garbage.address;
+
+          const key = keyOwnedBy(otherName, [goodName, otherName]);
+          const listsBefore = discovery.listCount();
+          await operation(client, key);
+          assert.equal(garbage.connections() > 0, true, "the garbage address was never dialed");
+          assert.ok(discovery.listCount() > listsBefore, "the failure must trigger a node-list refresh");
+          assert.ok(reached(nodeB, key), "the operation must have reached the node after the refresh");
+        } finally {
+          await client.close();
+        }
+      } finally {
+        await Promise.all([nodeA.close(), nodeB.close(), garbage.close(), discovery.close()]);
+      }
+    });
+  }
+
+  it("the error a redial raises is a never-sent ConnectionLostError that keeps the handshake message", async () => {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const garbage = await startGarbageListener();
+    const discovery = await startMockDiscovery([
+      { name: goodName, address: nodeA.address },
+      { name: otherName, address: nodeB.address },
+    ]);
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        await assert.rejects(
+          (client as any).openNodeConnection(garbage.address),
+          (error: unknown) =>
+            error instanceof ConnectionLostError && error.requestWasSent === false && /unexpected response to A/.test(error.message),
+        );
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await Promise.all([nodeA.close(), nodeB.close(), garbage.close(), discovery.close()]);
+    }
+  });
+
+  it("the first connect() still rejects with the plain protocol error", async () => {
+    const garbage = await startGarbageListener();
+    try {
+      const port = Number(garbage.address.split(":")[1]);
+      await assert.rejects(NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port }] }), (error: unknown) => {
+        return error instanceof NanocachedError && !(error instanceof ConnectionLostError) && /unexpected response to A/.test(error.message);
+      });
+    } finally {
+      await garbage.close();
+    }
+  });
+});
