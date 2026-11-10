@@ -56,10 +56,13 @@ framework adapters at one version, whether or not a component changed.
   (a single-key request, an `m`/`o`/`y` carrying it, a `c`/`F` covering it) is
   now dispatched only after the result's frames are enqueued on the replicas;
   requests on other keys and on other connections do not wait. A same-key
-  request pipelined behind an `i`/`k`/`x` costs a round trip to the primary, so
-  a burst of increments of one key on one connection runs one at a time. A
-  replica write that fails and is re-sent, and an `i`/`k`/`x` re-run after a
-  stale-view `W`, stay outside the order (#1659).
+  request that is not an `i`/`k`/`x` and is pipelined behind one costs a round
+  trip to the primary; an `i`/`k`/`x` behind another one does not wait (its
+  primary frame goes out at once and only the write of its result to the
+  replicas waits for the earlier one's), so a burst of increments of one key
+  on one connection stays pipelined at the primary. A replica write that fails
+  and is re-sent, and an `i`/`k`/`x` re-run after a stale-view `W`, stay
+  outside the order (#1659).
 
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
   `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`
