@@ -4062,6 +4062,12 @@ export class NanocachedClient {
    * the shared follow-up above starts only once the window has passed. */
   private async maybeRefreshNodeList(options?: { force?: boolean }): Promise<void> {
     if (this.target.kind === "single") return;
+    // A closed client has nothing to refresh (issue #1674): a request that
+    // was in flight when close() ran arrives here from the retry wrapper,
+    // and a refresh would dial discovery and hold it for the handshake
+    // deadline before the request could fail as closed. Its retry then
+    // meets the closed check in ensureConnected at once.
+    if (this.closed) return;
     if (this.target.kind === "proxy") {
       if (!options?.force) return;
     } else if (!options?.force && Date.now() - this.lastNodeListFetch < NODE_LIST_STALE_AFTER_MS) {
