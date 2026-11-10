@@ -118,6 +118,23 @@ framework adapters at one version, whether or not a component changed.
   frame itself so the node's close never lands on a backend connection other
   clients share (#1665).
 
+- `tests/e2e/incrtrace.py`: the lines a node still has queued for its stderr
+  when it is SIGKILLed are lost without a `TRACE dropped lines=` marker (the
+  marker is written for a full queue only), and the replica that takes over
+  then serves an increment whose old value no traced increment produced,
+  which `chaos.sh` asserted as `value_from_nowhere`. Measured on a trace-built
+  node: with nothing reading stderr, 1,500 acknowledged increments left 288
+  lines on the pipe and no marker, and on a loaded host 2 of 500 nodes killed
+  right after an acknowledgement had lost that increment's line. `chaos.sh`
+  now records each SIGKILL (`killed.txt`) and `incrtrace.py --killed` does not
+  count a step when the node that applied the last traced increment before it
+  was killed between the two and the increments the loader sent without a
+  traced application cover what the key's steps jump over; it prints it as
+  `NOWHERE_AFTER_KILL` (`value_from_nowhere_after_kill`). A step no kill and
+  no unmatched increment accounts for still fails the run. The node keeps
+  its queue and writer thread, so a stalled stderr reader still cannot stop
+  the runtime (#1666).
+
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
   `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`
   bounded only its final check), so a hung cluster hung the script instead of

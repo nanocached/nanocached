@@ -283,6 +283,9 @@ PY
       # comes back as a fresh identity, so discovery first evicts the dead
       # one (liveness) and then admits the restart as a normal join.
       n=${live[${#live[@]}-1]}; T "round $r KILL $n (SIGKILL; expect eviction to $(( ${#live[@]}-1 )) then rejoin to ${#live[@]})"
+      # A SIGKILLed node loses the TRACE lines still queued for its stderr, so
+      # incrtrace.py is told when each one died.
+      echo "$n $(date +%s)" >> "$L/killed.txt"
       docker kill $n >/dev/null
       wait_members $(( ${#live[@]}-1 )) $D $ROUND_BUDGET || { T "FAIL: $n was not evicted"; fail=1; }
       T "evicted after $(( $(date +%s)-t0 ))s; restarting $n"
@@ -498,9 +501,12 @@ for c in $(docker ps -aq --filter "name=^/$P-"); do n=$(docker inspect -f "{{.Na
 # that every log is saved, count them against what the loader saw
 # acknowledged (incrtrace.py). More applications than acknowledged + maybe,
 # or an increment starting from a value no increment produced, is the
-# evidence a phantom answer leaves on the node side.
+# evidence a phantom answer leaves on the node side. The lines a SIGKILLed
+# node still had queued are lost, so the kills are passed along (killed.txt)
+# and a missing line they can account for is printed, not asserted.
 if [ "${INCR_ORACLE:-0}" = 1 ] && [ -f "$L/incrstate.json" ]; then
-  itrc=0; python3 "$E/incrtrace.py" --state "$L/incrstate.json" --logs "$L" --nodes "$P-n" > "$L/incrtrace.txt" 2>&1 || itrc=$?
+  killed_arg=(); [ -s "$L/killed.txt" ] && killed_arg=(--killed "$L/killed.txt")
+  itrc=0; python3 "$E/incrtrace.py" --state "$L/incrstate.json" --logs "$L" --nodes "$P-n" ${killed_arg[@]+"${killed_arg[@]}"} > "$L/incrtrace.txt" 2>&1 || itrc=$?
   itrace=$(tail -1 "$L/incrtrace.txt")
   # A traceback is not "no TRACE lines": the evidence channel going dark must fail the run, not pass it.
   if [ "$itrc" != 0 ]; then
@@ -512,7 +518,7 @@ if [ "${INCR_ORACLE:-0}" = 1 ] && [ -f "$L/incrstate.json" ]; then
   else
     tbad=$(echo "$itrace" | grep -oE '"(over_applied|value_from_nowhere)": [1-9][0-9]*' | tr '\n' ' ')
     [ -z "$tbad" ] || { T "FAIL: incr trace: $tbad(details in $L/incrtrace.txt)"; fail=1; }
-    echo "$itrace" | grep -oE '"(trace_lines|trace_lines_dropped|applications|acked|maybe|over_applied|under_applied|within_bounds|value_from_nowhere|sequence_jumps|answers_unmatched)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr trace (asserted: over_applied, value_from_nowhere): /'; echo
+    echo "$itrace" | grep -oE '"(trace_lines|trace_lines_dropped|applications|acked|maybe|over_applied|under_applied|within_bounds|value_from_nowhere|value_from_nowhere_after_kill|sequence_jumps|answers_unmatched)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr trace (asserted: over_applied, value_from_nowhere): /'; echo
   fi
 fi
 echo "=== entries:"; cat "$L/entries.txt"
