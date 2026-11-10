@@ -2372,6 +2372,16 @@ fn dispatch_connection(
             match try_acquire_per_ip(&per_ip_connections, address.ip(), max_connections_per_ip) {
                 Some(permit) => permit,
                 None => {
+                    // Issue #1664: the global permit goes back before the
+                    // busy reply, which on a plaintext listener is followed
+                    // by up to `BUSY_REPLY_DRAIN_WINDOW` of reading from a
+                    // peer that may not close. Held through that, a source
+                    // at its per-IP cap could keep global slots by churning
+                    // rejected connections it leaves open. The global-limit
+                    // rejection above holds no permit either. Not reordered
+                    // (per-IP first) because then a connection the global
+                    // limit would turn away would take a per-IP slot first.
+                    drop(permit);
                     reject_over_limit(
                         stream,
                         address,
@@ -16141,6 +16151,79 @@ mod tests {
 
         connection_tasks.abort_all();
 
+        while connection_tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connection_rejected_by_the_per_ip_cap_does_not_hold_a_global_slot() {
+        // Issue #1664: the per-IP rejection used to keep the global permit
+        // while `reject_over_limit` read for up to `BUSY_REPLY_DRAIN_WINDOW`
+        // (200 ms) from a peer that does not close. A source at its per-IP
+        // cap could then hold global slots by churning rejected connections
+        // it keeps open: the very thing the per-IP cap exists to prevent.
+        // Global limit 4, per-IP cap 1, one live connection, two rejected
+        // ones kept open (they have read their `B`, so each is inside its
+        // drain window): only the live one may hold a slot.
+        let connection_limit = Arc::new(Semaphore::new(4));
+        let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let mut connection_tasks = JoinSet::new();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = || ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            auth_secret: None,
+            tls_acceptor: None,
+            node_context: None,
+            migration_tx: mpsc::channel(1).0,
+            forward_tx: mpsc::channel(1).0,
+            forward_queues: Arc::new(ForwardQueues::default()),
+            in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+        };
+
+        let (_live_client, live_server) = tcp_pair().await;
+        dispatch_connection(
+            live_server,
+            SocketAddr::new(ip, 9000),
+            request_tx.clone(),
+            Arc::clone(&connection_limit),
+            Arc::clone(&per_ip_connections),
+            1,
+            config(),
+            shutdown_rx.clone(),
+            &mut connection_tasks,
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(connection_limit.available_permits(), 3);
+
+        let mut rejected_clients = Vec::new();
+        for port in [9001, 9002] {
+            let (mut client, server) = tcp_pair().await;
+            dispatch_connection(
+                server,
+                SocketAddr::new(ip, port),
+                request_tx.clone(),
+                Arc::clone(&connection_limit),
+                Arc::clone(&per_ip_connections),
+                1,
+                config(),
+                shutdown_rx.clone(),
+                &mut connection_tasks,
+            );
+            let mut busy = [0u8; 2];
+            client.read_exact(&mut busy).await.unwrap();
+            assert_eq!(&busy, b"B\n");
+            // Kept open: the server's drain waits for this peer to close.
+            rejected_clients.push(client);
+        }
+
+        assert_eq!(
+            connection_limit.available_permits(),
+            3,
+            "a rejected connection is holding a global slot while its busy reply drains"
+        );
+
+        connection_tasks.abort_all();
         while connection_tasks.join_next().await.is_some() {}
     }
 
