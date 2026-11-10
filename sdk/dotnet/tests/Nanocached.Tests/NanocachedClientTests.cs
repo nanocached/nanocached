@@ -638,8 +638,12 @@ public class NanocachedClientTests
             // Once the cooldown window has passed, the address is dialed
             // again, this time reaching the listener.
             await Task.Delay(1200);
-            NanocachedException thirdError = await Assert.ThrowsAsync<NanocachedException>(() => client.GetAsync("k"));
+            // A handshake reply that is no reply at all is a never-sent
+            // ConnectionLostException like a refused dial, so the retry
+            // layers refresh and reroute instead of caching a plain error.
+            var thirdError = await Assert.ThrowsAnyAsync<ConnectionLostException>(() => client.GetAsync("k"));
             Assert.Contains("unexpected response to A", thirdError.Message);
+            Assert.True(thirdError.RequestNotSent);
             Assert.Equal(1, connections);
         }
         finally
@@ -810,9 +814,12 @@ public class NanocachedClientTests
         {
             // Unlike the cooldown-enabled case, each call dials again —
             // no cooldown window is ever recorded.
-            await Assert.ThrowsAsync<NanocachedException>(() => client.GetAsync("k"));
-            await Assert.ThrowsAsync<NanocachedException>(() => client.GetAsync("k"));
-            Assert.Equal(2, connections);
+            // A request on a dead connection redials once more (a
+            // never-sent failure is retried like any dial failure), so
+            // each call pays two dials.
+            await Assert.ThrowsAnyAsync<ConnectionLostException>(() => client.GetAsync("k"));
+            await Assert.ThrowsAnyAsync<ConnectionLostException>(() => client.GetAsync("k"));
+            Assert.Equal(4, connections);
         }
         finally
         {

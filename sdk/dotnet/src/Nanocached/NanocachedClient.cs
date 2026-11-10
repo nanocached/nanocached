@@ -722,10 +722,16 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             catch (Exception error) when (error is NanocachedException or IOException
                 or System.Net.Sockets.SocketException or AuthenticationException)
             {
+                // A seed that answers the handshake as no cache node (not
+                // even with a handshake reply) is the plain configuration
+                // error connect has always reported; the internal type is
+                // for the redial and refresh paths.
                 lastError = error is IOException or System.Net.Sockets.SocketException
                     ? new ConnectionLostException(
                         $"nanocached: could not connect to {key}: {error.Message}", error, requestNotSent: true)
-                    : error;
+                    : error is NotACacheNodeException
+                        ? new NanocachedException(error.Message)
+                        : error;
                 continue;
             }
 
@@ -5452,7 +5458,9 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 or System.Net.Sockets.SocketException or AuthenticationException)
             {
                 Interlocked.Increment(ref _refreshFailures);
-                lastError = error;
+                lastError = error is NotACacheNodeException
+                    ? new NanocachedException(error.Message)
+                    : error;
                 continue;
             }
 
