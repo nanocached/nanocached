@@ -897,6 +897,11 @@ public final class NanocachedClient implements AutoCloseable {
             try {
                 identified = Identify.connectAndIdentify(
                         address.host(), address.port(), client.authSecret, client.tls);
+            } catch (Identify.UnexpectedHandshakeReply garbage) {
+                // The plain exception connect() is documented to throw (the
+                // handshake's own type is for the ring members' dial paths).
+                lastError = new NanocachedException(garbage.getMessage());
+                continue;
             } catch (IOException | RuntimeException error) {
                 lastError = error instanceof RuntimeException runtime
                         ? runtime
@@ -977,6 +982,9 @@ public final class NanocachedClient implements AutoCloseable {
             try {
                 identified = Identify.connectAndIdentify(
                         address.host(), address.port(), client.authSecret, client.tls, true);
+            } catch (Identify.UnexpectedHandshakeReply garbage) {
+                lastError = new NanocachedException(garbage.getMessage());
+                continue;
             } catch (IOException | RuntimeException error) {
                 lastError = error instanceof RuntimeException runtime
                         ? runtime
@@ -1150,6 +1158,8 @@ public final class NanocachedClient implements AutoCloseable {
         Identify.Result identified;
         try {
             identified = Identify.connectAndIdentify(host, port, authSecret, tls);
+        } catch (Identify.UnexpectedHandshakeReply garbage) {
+            return DialOutcome.tolerable(handshakeNotSent(address));
         } catch (IOException | RuntimeException error) {
             return DialOutcome.tolerable(error instanceof RuntimeException runtime
                     ? runtime
@@ -6477,6 +6487,16 @@ public final class NanocachedClient implements AutoCloseable {
         return port < 0 || port > 65535 ? null : port;
     }
 
+    /** The failure of a dial to a ring member that answered the {@code A}
+     * handshake with something that is not a handshake reply (issue #1671):
+     * a connection failure that never sent a request, handled as for a dead
+     * node -- a forced refresh and a reroute -- rather than the plain
+     * exception the handshake itself raises. */
+    private static NanocachedException.ConnectionLost handshakeNotSent(String address) {
+        return new NanocachedException.ConnectionLost(
+                "nanocached: unexpected response to A from " + address, null, true);
+    }
+
     private Connection openNodeConnection(String address) throws IOException {
         int separator = address.lastIndexOf(':');
         Integer port = separator == -1 ? null : parsePort(address.substring(separator + 1));
@@ -6486,7 +6506,12 @@ public final class NanocachedClient implements AutoCloseable {
         }
         String host = address.substring(0, separator);
 
-        Identify.Result identified = Identify.connectAndIdentify(host, port, authSecret, tls);
+        Identify.Result identified;
+        try {
+            identified = Identify.connectAndIdentify(host, port, authSecret, tls);
+        } catch (Identify.UnexpectedHandshakeReply garbage) {
+            throw handshakeNotSent(address);
+        }
         if (!(identified instanceof Identify.NodeTarget node)) {
             // Connection-classified (issue #8): a topology change, healed
             // by the refresh-and-retry layer — unlike an auth failure,

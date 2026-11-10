@@ -8259,6 +8259,140 @@ class NanocachedClientTest {
         }
     }
 
+    /** A listener that answers whatever it is sent with an HTTP error, the
+     * way a web server does when something dials it by mistake, and keeps
+     * the connection open. */
+    private static final class HttpGarbageListener implements AutoCloseable {
+        private final java.net.ServerSocket server;
+        private final Set<java.net.Socket> accepted = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        final AtomicInteger connections = new AtomicInteger();
+
+        HttpGarbageListener(int port) throws java.io.IOException {
+            server = new java.net.ServerSocket(port);
+            Thread acceptor = new Thread(() -> {
+                while (!server.isClosed()) {
+                    try {
+                        java.net.Socket socket = server.accept();
+                        connections.incrementAndGet();
+                        accepted.add(socket);
+                        socket.getOutputStream().write(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
+                                        .getBytes(StandardCharsets.US_ASCII));
+                        socket.getOutputStream().flush();
+                    } catch (java.io.IOException stop) {
+                        return;
+                    }
+                }
+            }, "http-garbage-accept");
+            acceptor.setDaemon(true);
+            acceptor.start();
+        }
+
+        String address() {
+            return "127.0.0.1:" + server.getLocalPort();
+        }
+
+        @Override
+        public void close() throws java.io.IOException {
+            server.close();
+            for (java.net.Socket socket : accepted) socket.close();
+        }
+    }
+
+    @Test
+    void operationsRerouteAroundAGarbageHandshakePrimaryOnceDiscoveryDropsIt() throws Exception {
+        // A listed address that answers the `A` handshake with something that
+        // is not a handshake reply at all (an HTTP server's error page) was a
+        // plain NanocachedException from Identify, which the refresh-and-retry
+        // layer does not act on: every set, incr or ttl-0 touch whose primary
+        // was that member failed with it, without the refresh that would have
+        // dropped the member, until the staleness refresh. It is
+        // ConnectionLost, never sent, like a dead node's.
+        try (Cluster cluster = startCluster(2); HttpGarbageListener http = new HttpGarbageListener(0)) {
+            MockNode live = cluster.nodes().get(NAMES.get(0));
+            cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                DiscoveredNode bad = new DiscoveredNode("bad-node", http.address());
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
+                forceRefresh(client);
+                assertNull(memberConnectionOf(client, "bad-node"));
+
+                List<String> ranked = List.of(NAMES.get(0), "bad-node");
+                String setKey = keyWithPrimaryAmong(ranked, "bad-node");
+                String counter = keyWithPrimaryAmong(ranked, "bad-node", setKey);
+                String touched = keyWithPrimaryAmong(ranked, "bad-node", setKey, counter);
+                live.store.put(MockNode.keyOf(counter.getBytes(StandardCharsets.UTF_8)),
+                        "10".getBytes(StandardCharsets.UTF_8));
+                live.store.put(MockNode.keyOf(touched.getBytes(StandardCharsets.UTF_8)),
+                        "t".getBytes(StandardCharsets.UTF_8));
+
+                // Discovery drops the member; this client has not seen that yet.
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
+                client.set(setKey, "v");
+                assertEquals(Optional.of("v"), client.get(setKey));
+
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
+                forceRefresh(client);
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
+                assertEquals(java.util.OptionalLong.of(15), client.incr(counter, 5));
+
+                // ttl 0: a chunk whose dial failed this way counts as never
+                // sent, so the touch is rerouted instead of failing.
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
+                forceRefresh(client);
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
+                assertEquals(Map.of(touched, true), client.touchMany(List.of(touched), 0));
+            }
+        }
+    }
+
+    @Test
+    void aMemberRedialThatMeetsAGarbageHandshakeReroutesLikeADeadNode() throws Exception {
+        // The lazy redial of a member whose connection died, answered by a
+        // listener that took over its address and speaks HTTP.
+        try (Cluster cluster = startCluster(2)) {
+            MockNode live = cluster.nodes().get(NAMES.get(0));
+            MockNode victim = cluster.nodes().get(NAMES.get(1));
+            int victimPort = victim.port();
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                victim.close();
+                Connection old = memberConnectionOf(client, NAMES.get(1));
+                for (int i = 0; i < 200 && !old.isClosed(); i++) Thread.sleep(10);
+                assertTrue(old.isClosed(), "the client never noticed the member's connection closing");
+
+                try (HttpGarbageListener http = new HttpGarbageListener(victimPort)) {
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                    Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
+                    List<String> ranked = NAMES;
+                    String setKey = keyWithPrimaryAmong(ranked, NAMES.get(1));
+                    String counter = keyWithPrimaryAmong(ranked, NAMES.get(1), setKey);
+                    live.store.put(MockNode.keyOf(counter.getBytes(StandardCharsets.UTF_8)),
+                            "10".getBytes(StandardCharsets.UTF_8));
+                    client.set(setKey, "v");
+                    assertEquals(Optional.of("v"), client.get(setKey));
+                    assertTrue(http.connections.get() >= 1, "the redial never reached the garbage listener");
+                    assertEquals(java.util.OptionalLong.of(15), client.incr(counter, 5));
+                }
+            }
+        }
+    }
+
+    @Test
+    void aFirstConnectWhoseNodeAnswersGarbageStaysAPlainException() throws Exception {
+        // Only the refresh and redial paths classify the handshake failure as
+        // ConnectionLost; connect() against the address itself reports it
+        // plainly.
+        try (HttpGarbageListener http = new HttpGarbageListener(0)) {
+            int port = Integer.parseInt(http.address().substring(http.address().lastIndexOf(':') + 1));
+            NanocachedException error = assertThrows(NanocachedException.class, () -> connect("127.0.0.1", port));
+            assertEquals(NanocachedException.class, error.getClass());
+            assertTrue(error.getMessage().contains("unexpected response to A"), error.getMessage());
+        }
+    }
+
     private static String keyWithPrimaryAmong(List<String> names, String primary, String... except) {
         HashRing ring = new HashRing(names);
         for (int i = 0; ; i++) {
