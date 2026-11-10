@@ -45,6 +45,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-discovery`: a `V` (leave) from a member of the join in flight
+  was answered `R` only after the abandon's fan-out, which sends `X` to every
+  remaining ready member and starts the next join's `M` sends; against a
+  member that accepts and never answers that took 10 s per attempt, so the
+  leaving node logged `leave timed out` for a leave discovery had already
+  applied and its exit was delayed by the wait. The `R` is now written right
+  after the removal, as the `C` ack already is, and the abandon runs after
+  it (#1662).
+
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
   `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`
   bounded only its final check), so a hung cluster hung the script instead of
