@@ -509,9 +509,11 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             if (existing.isEmpty()) {
                 OptionalLong ttl = wireTtlSeconds(expiryPolicy.getExpiryForCreation());
                 if (ttl.isEmpty()) {
+                    statistics.recordMiss();
                     return null;
                 }
                 if (namespace.putIfAbsent(keyBytes, valueBytes, ttl.getAsLong())) {
+                    statistics.recordMiss();
                     statistics.recordPut();
                     fireCreated(key, value);
                     return null;
@@ -523,6 +525,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             OptionalLong ttl = wireTtlSeconds(expiryPolicy.getExpiryForUpdate());
             if (ttl.isEmpty()) {
                 if (namespace.deleteIfMatches(keyBytes, existing.get().token())) {
+                    statistics.recordHit();
                     statistics.recordRemove();
                     fireRemoved(key, oldValue);
                     return oldValue;
@@ -531,6 +534,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 continue;
             }
             if (namespace.replace(keyBytes, existing.get().token(), valueBytes, ttl.getAsLong())) {
+                statistics.recordHit();
                 statistics.recordPut();
                 fireUpdated(key, value, oldValue);
                 return oldValue;
@@ -552,8 +556,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         }
         boolean stored = namespace.putIfAbsent(keyBytes, valueBytes, ttl.getAsLong());
         if (stored) {
+            // JSR-107 (and its reference implementation): an absent key is
+            // a miss and a put, a present one a hit.
+            statistics.recordMiss();
             statistics.recordPut();
             fireCreated(key, value);
+        } else {
+            statistics.recordHit();
         }
         return stored;
     }
@@ -582,14 +591,19 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         while (true) {
             Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
             if (existing.isEmpty()) {
+                statistics.recordMiss();
                 return false;
             }
             V currentValue = decode(existing.get().value());
             if (!oldValue.equals(currentValue)) {
+                // A mapping exists, so this is a hit even though the value
+                // differs (the reference implementation does the same).
+                statistics.recordHit();
                 return false;
             }
             if (ttl.isEmpty()) {
                 if (namespace.deleteIfMatches(keyBytes, existing.get().token())) {
+                    statistics.recordHit();
                     statistics.recordRemove();
                     fireRemoved(key, currentValue);
                     return true;
@@ -598,6 +612,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 continue;
             }
             if (namespace.replace(keyBytes, existing.get().token(), newValueBytes, ttl.getAsLong())) {
+                statistics.recordHit();
                 statistics.recordPut();
                 fireUpdated(key, newValue, currentValue);
                 return true;
@@ -623,18 +638,24 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             Optional<byte[]> existing = namespace.getBytes(keyBytes);
             boolean removed = namespace.delete(keyBytes);
             if (removed) {
+                statistics.recordHit();
                 statistics.recordRemove();
                 existing.ifPresent(bytes -> fireRemovedFromBytes(key, bytes));
+            } else {
+                statistics.recordMiss();
             }
             return removed;
         }
         byte[] valueBytes = ValueCodec.serialize(value);
         boolean replaced = namespace.replaceIfPresent(keyBytes, valueBytes, ttl.getAsLong());
         if (replaced) {
+            statistics.recordHit();
             statistics.recordPut();
             // No old value without an extra read — see the class doc's
             // "honest subset" list.
             fireUpdatedWithoutOldValue(key, value);
+        } else {
+            statistics.recordMiss();
         }
         return replaced;
     }
@@ -651,12 +672,14 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         while (true) {
             Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
             if (existing.isEmpty()) {
+                statistics.recordMiss();
                 return null;
             }
             V oldValue = decode(existing.get().value());
             OptionalLong ttl = wireTtlSeconds(expiryPolicy.getExpiryForUpdate());
             if (ttl.isEmpty()) {
                 if (namespace.deleteIfMatches(keyBytes, existing.get().token())) {
+                    statistics.recordHit();
                     statistics.recordRemove();
                     fireRemoved(key, oldValue);
                     return oldValue;
@@ -665,6 +688,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 continue;
             }
             if (namespace.replace(keyBytes, existing.get().token(), valueBytes, ttl.getAsLong())) {
+                statistics.recordHit();
                 statistics.recordPut();
                 fireUpdated(key, value, oldValue);
                 return oldValue;
@@ -857,13 +881,18 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         while (true) {
             Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
             if (existing.isEmpty()) {
+                statistics.recordMiss();
                 return false;
             }
             V currentValue = decode(existing.get().value());
             if (!oldValue.equals(currentValue)) {
+                // A mapping exists, so this is a hit even though the value
+                // differs (the reference implementation does the same).
+                statistics.recordHit();
                 return false;
             }
             if (namespace.deleteIfMatches(keyBytes, existing.get().token())) {
+                statistics.recordHit();
                 statistics.recordRemove();
                 fireRemoved(key, currentValue);
                 return true;
@@ -882,10 +911,12 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         while (true) {
             Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
             if (existing.isEmpty()) {
+                statistics.recordMiss();
                 return null;
             }
             V oldValue = decode(existing.get().value());
             if (namespace.deleteIfMatches(keyBytes, existing.get().token())) {
+                statistics.recordHit();
                 statistics.recordRemove();
                 fireRemoved(key, oldValue);
                 return oldValue;
