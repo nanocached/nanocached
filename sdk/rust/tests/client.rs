@@ -8469,10 +8469,12 @@ async fn reconnect_cooldown_skips_a_known_dead_address() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let third = client.get("k").await;
     match third {
-        Err(Error::Protocol(message)) => {
+        // The handshake's garbage reply is the redial's failure, not a
+        // protocol violation of an established connection.
+        Err(Error::ConnectionLost(message)) => {
             assert!(message.contains("unexpected response to A"), "{message}");
         }
-        other => panic!("expected a Protocol error, got {other:?}"),
+        other => panic!("expected a ConnectionLost error, got {other:?}"),
     }
     assert_eq!(
         connections.load(Ordering::SeqCst),
@@ -8596,10 +8598,10 @@ async fn disable_reconnect_cooldown_redials_immediately() {
     // reusing the cached failure.
     let second = client.get("k").await;
     match second {
-        Err(Error::Protocol(message)) => {
+        Err(Error::ConnectionLost(message)) => {
             assert!(message.contains("unexpected response to A"), "{message}");
         }
-        other => panic!("expected a Protocol error, got {other:?}"),
+        other => panic!("expected a ConnectionLost error, got {other:?}"),
     }
     assert_eq!(
         connections.load(Ordering::SeqCst),
@@ -10163,4 +10165,148 @@ async fn incr_is_not_replayed_after_a_reply_of_the_wrong_kind() {
 
     client.close().await;
     node.stop();
+}
+
+/// A listener that is some other protocol's server: it answers whatever the
+/// client writes with an HTTP `400 Bad Request`, which is no reply to `A`.
+struct GarbageListener {
+    port: u16,
+    accepted: Arc<AtomicUsize>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl GarbageListener {
+    async fn start_on_port(port: u16) -> Self {
+        let listener = bind_listener(port).await;
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => return,
+                    result = listener.accept() => {
+                        let Ok((mut socket, _)) = result else { return };
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 64];
+                            if socket.read(&mut buf).await.is_ok() {
+                                let _ = socket
+                                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                                    .await;
+                            }
+                            // Held open: the client must give up on the reply itself.
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        });
+                    }
+                }
+            }
+        });
+        Self {
+            port,
+            accepted,
+            shutdown,
+        }
+    }
+
+    fn stop(&self) {
+        let _ = self.shutdown.send(true);
+    }
+}
+
+#[tokio::test]
+async fn a_set_refreshes_and_reroutes_when_the_redialed_address_answers_garbage_to_a() {
+    garbage_on_redial_refreshes_and_reroutes(false).await;
+}
+
+#[tokio::test]
+async fn an_incr_refreshes_and_reroutes_when_the_redialed_address_answers_garbage_to_a() {
+    garbage_on_redial_refreshes_and_reroutes(true).await;
+}
+
+async fn garbage_on_redial_refreshes_and_reroutes(use_incr: bool) {
+    let (nodes, discovery) = start_cluster(1).await;
+    // The default reconnect cooldown stays on: the failed dial arms a
+    // cooldown entry for A's address, which must carry the same error.
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let key = key_with_primary(NAMES[0]);
+    let port = node_named(&nodes, NAMES[0]).port;
+
+    // A goes away and an HTTP server answers on its address, which
+    // discovery still lists; A's name is re-registered at a new address.
+    node_named(&nodes, NAMES[0]).stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let garbage = GarbageListener::start_on_port(port).await;
+    let replacement = MockNode::start().await;
+    *discovery.nodes.lock().unwrap() = vec![
+        (NAMES[0].to_string(), replacement.address()),
+        (NAMES[1].to_string(), node_named(&nodes, NAMES[1]).address()),
+    ];
+
+    // The redial gets no handshake reply: a connection that could not be
+    // made, before anything was written, so the operation refreshes and
+    // goes to A's new address instead of failing until the 30 s
+    // staleness refresh.
+    if use_incr {
+        client.incr(&key, 1).await.unwrap();
+        assert_eq!(replacement.state.incrs.load(Ordering::SeqCst), 1);
+    } else {
+        client.set(&key, "v", 0).await.unwrap();
+        assert!(replacement
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .contains_key(key.as_bytes()));
+    }
+    assert!(garbage.accepted.load(Ordering::SeqCst) >= 1);
+
+    garbage.stop();
+    replacement.stop();
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn expiring_touch_many_counts_a_dial_that_got_garbage_as_not_sent() {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port).disable_reconnect_cooldown())
+        .await
+        .unwrap();
+    let keys = keys_whose_primary_is(NAMES[0], 3);
+    let node = node_named(&nodes, NAMES[0]);
+    let port = node.port;
+
+    node.stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let garbage = GarbageListener::start_on_port(port).await;
+
+    let result = client.touch_many(&keys, Some(0)).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "result = {result:?}"
+    );
+    // Nothing was sent, so the keys went through the refresh-and-retry
+    // pass and dialed A again; had the dial's error counted as a lost
+    // frame the keys would have been given up on after the first.
+    assert_eq!(garbage.accepted.load(Ordering::SeqCst), 2);
+
+    garbage.stop();
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn the_first_connect_still_reports_a_garbage_handshake_as_a_protocol_error() {
+    let garbage = GarbageListener::start_on_port(0).await;
+
+    let result = NanocachedClient::connect(options(garbage.port)).await;
+    assert!(
+        matches!(&result, Err(Error::Protocol(message)) if message.contains("unexpected response to A")),
+        "result = {:?}",
+        result.err()
+    );
+
+    garbage.stop();
 }
