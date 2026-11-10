@@ -135,6 +135,25 @@ framework adapters at one version, whether or not a component changed.
   its queue and writer thread, so a stalled stderr reader still cannot stop
   the runtime (#1666).
 
+- `nanocached-proxy`: the result of an `i`, `k` or `x` reached the replicas
+  outside the client's request order. The replica write of the result (a plain
+  set or delete) can only go out after the primary has answered, so a request
+  pipelined behind it on the same key was already on the replica, and the late
+  result overwrote it: `i` then `D` on one connection left the key deleted on
+  the primary and holding the counter on the replica (200 of 200 rounds), and
+  two pipelined `i` left the replica one behind (116 of 200 rounds on the
+  multi-thread runtime). A request of the same connection that touches the key
+  (a single-key request, an `m`/`o`/`y` carrying it, a `c`/`F` covering it) is
+  now dispatched only after the result's frames are enqueued on the replicas;
+  requests on other keys and on other connections do not wait. A same-key
+  request that is not an `i`/`k`/`x` and is pipelined behind one costs a round
+  trip to the primary; an `i`/`k`/`x` behind another one does not wait (its
+  primary frame goes out at once and only the write of its result to the
+  replicas waits for the earlier one's), so a burst of increments of one key
+  on one connection stays pipelined at the primary. A replica write that fails
+  and is re-sent, and an `i`/`k`/`x` re-run after a stale-view `W`, stay
+  outside the order (#1659).
+
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
   `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`
   bounded only its final check), so a hung cluster hung the script instead of

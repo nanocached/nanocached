@@ -436,6 +436,38 @@ rather than serialising same-key requests per connection. A client
 that needs the read to strictly precede the write awaits the
 <code>G</code> reply before sending the <code>S</code>.</p>
 
+<p>The result of an <code>i</code>, <code>k</code> or <code>x</code> is
+inside that order. The proxy runs these on the key&rsquo;s primary and
+writes the result to the replicas afterwards, as an ordinary set or delete,
+which it can only do once the primary has answered. A later request on the
+same connection that touches the same namespace and key &mdash; a
+single-key request, a multi-key one (<code>m</code>, <code>o</code>,
+<code>y</code>) carrying the key, or a <code>c</code>/<code>F</code>
+covering it &mdash; is held back until that result has been enqueued on
+the replicas (enqueued, not yet acknowledged). A <code>D</code>
+pipelined behind an <code>i</code> is therefore not undone by the
+<code>i</code>&rsquo;s result, and the results of two pipelined increments
+reach each replica in the order of the requests. Only the request on the
+same key waits: other keys on the connection, and every other connection,
+are not held, and a connection that never sends a same-key request behind
+an <code>i</code>, <code>k</code> or <code>x</code> sees no added latency.
+For one that does, a request that is not itself an <code>i</code>,
+<code>k</code> or <code>x</code> goes out after a round trip to the primary.
+An <code>i</code>, <code>k</code> or <code>x</code> behind another one is
+not held: its frame is sent to the primary at once, so a burst of
+increments of one key on one connection stays pipelined at the primary, and
+only the write of its result to the replicas waits for the earlier
+result&rsquo;s.
+The wait ends when the primary has answered or the proxy has given up on
+it, so a dead primary does not hold the connection longer than the
+proxy&rsquo;s backend timeouts. What stays outside the order is a retry: a
+replica write that fails and is sent again can arrive after a later result
+for the key, and an <code>i</code>, <code>k</code> or <code>x</code> the
+proxy re-runs after a stale-view <code>W</code> is not waited for. Two
+connections incrementing one counter are not ordered against each other,
+through a proxy as in cluster-direct mode (see the accepted behaviour
+below).</p>
+
 <h2>Known limits</h2>
 <p><strong>A ring change stalls a node for a few tens of milliseconds
 per million keys.</strong> Re-replication, a staged handoff, a
@@ -542,7 +574,11 @@ here.</p>
   (one connection per node) and none with serial increments. Accepted
   2026-10-29: ordering the replica writes would need a version on every
   replica write in the server and every SDK. A single client, or one
-  client per counter, does not see it.</li>
+  client per counter, does not see it, through a proxy too: the proxy
+  enqueues the replica write of an increment&rsquo;s result before it
+  sends the next request of that connection for the key (see the proxy
+  tier above). Two connections behind one proxy are exposed like two
+  clients.</li>
   <li>During a join&rsquo;s or a decommission&rsquo;s forwarding window, a
   touch (<code>t</code>, or a key of a <code>y</code> batch) is forwarded as the value the old owner holds with
   the new TTL, written like a set, not as a touch: the joiner may not hold
@@ -666,7 +702,7 @@ here.</p>
   server and every SDK, and a per-key lock inside one SDK would not
   cover two clients. <code>nanocached-proxy</code> does not remove it: it
   sends each write to the owners concurrently and orders nothing between
-  two requests, so two connections writing one key can reach one owner in
+  requests of different connections, so two connections writing one key can reach one owner in
   one order and the other owner in the other. Through one proxy in front
   of a 2-node, 2-replica cluster, 8 connections writing one key for 300
   rounds left no owners disagreeing, 16 for 3,000 rounds left 2 rounds, and
@@ -725,7 +761,10 @@ here.</p>
   <code>S</code>. The same outcome an SDK&rsquo;s own <code>W</code> retry
   produces in cluster-direct mode; serialising same-key requests per
   connection was judged not worth it. A client that needs the order
-  awaits the <code>G</code> reply first.</li>
+  awaits the <code>G</code> reply first. The replica write of an
+  <code>i</code>, <code>k</code> or <code>x</code> result is in the
+  order (a later request on the same key waits for it to be enqueued); a
+  re-sent replica write is not.</li>
   <li>A ring change pauses a node about 25&nbsp;ms per million live keys
   (a snapshot walk on the single cache task), with a transient allocation
   of 64 bytes per key; a staged handoff&rsquo;s count of the entries to
