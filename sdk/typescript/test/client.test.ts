@@ -9150,3 +9150,52 @@ describe("a listed address that answers as a discovery server instead of a node"
     });
   }
 });
+
+describe("a request in flight when close() runs does not wait for a discovery dial (issue #1674)", () => {
+  // In cluster mode the in-flight request is rejected as connection-lost
+  // when close() destroys its connection, and the retry wrapper then asked
+  // for a forced node-list refresh, which dialed discovery and waited out
+  // the handshake deadline (5 s) before the request failed as closed. A
+  // closed client has nothing to refresh: the request fails at once.
+  const operations: Array<[string, (client: NanocachedClient, key: string) => Promise<unknown>]> = [
+    ["get", (client, key) => client.get(key)],
+    ["set", (client, key) => client.set(key, "v")],
+    ["delete", (client, key) => client.delete(key)],
+  ];
+
+  for (const [label, run] of operations) {
+    it(`${label} fails as closed promptly although discovery never completes its handshake`, async () => {
+      const node = await startMockNode();
+      const discovery = await startMockDiscovery([{ name: "n1", address: node.address }]);
+      // Accepts TCP and never answers `A`.
+      const sockets = new Set<Socket>();
+      const silentDiscovery = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("error", () => {});
+        socket.on("close", () => sockets.delete(socket));
+      });
+      await new Promise<void>((resolve) => silentDiscovery.listen(0, "127.0.0.1", () => resolve()));
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        // The node handshakes and then stays silent: the request stays pending.
+        node.goSilentAfterHandshake();
+        const outcome = run(client, "k").then(
+          () => ({ error: undefined as unknown, at: Date.now() }),
+          (error: unknown) => ({ error, at: Date.now() }),
+        );
+        await delay(100);
+        // From now on the only discovery address does not answer.
+        (client as any).addresses = [{ host: "127.0.0.1", port: (silentDiscovery.address() as { port: number }).port }];
+
+        const closedAt = Date.now();
+        await client.close();
+        const { error, at } = await outcome;
+        assert.ok(error instanceof AlreadyClosedError, `expected AlreadyClosedError, got ${String(error)}`);
+        assert.ok(at - closedAt < 1000, `the request failed ${at - closedAt} ms after close(), expected it at once`);
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        await Promise.all([node.close(), discovery.close(), new Promise<void>((resolve) => silentDiscovery.close(() => resolve()))]);
+      }
+    });
+  }
+});
