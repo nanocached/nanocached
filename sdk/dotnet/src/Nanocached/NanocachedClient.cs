@@ -962,10 +962,21 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// is.</summary>
     private async Task OpenProxyAsync(IReadOnlyList<DiscoveredNode> proxies)
     {
-        (Connection connection, string address) =
-            await ConnectToAnyProxyAsync(proxies).ConfigureAwait(false);
-        _single = connection;
-        _singleAddress = address;
+        (Connection connection, string address) connected;
+        try
+        {
+            connected = await ConnectToAnyProxyAsync(proxies).ConfigureAwait(false);
+        }
+        catch (NotACacheNodeException notAProxy)
+        {
+            // The initial connect reports a listed non-node as the plain
+            // configuration error it is, as OpenClusterAsync does; the
+            // internal type is for the reconnect failover, which routes on
+            // it, and never reaches a caller.
+            throw new NanocachedException(notAProxy.Message);
+        }
+        _single = connected.connection;
+        _singleAddress = connected.address;
     }
 
     /// <summary>Shared by the initial SDK proxy mode connect
