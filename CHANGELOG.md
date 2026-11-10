@@ -68,6 +68,25 @@ framework adapters at one version, whether or not a component changed.
   and the re-replication pass and is not retried; an ack other than `S` or
   `R` still concerns that key only, as in #1595 (#1660).
 
+- `nanocached-discovery`: a `J` under a new name from the address of a
+  `Joined` member removed that member whether or not it was still alive.
+  The address is the connection's source IP plus the port the `J` declares,
+  so a second process on the same host started with a live node's
+  advertised port (or any holder of the auth secret sharing its source IP)
+  took the live member out of the roster at once, and its next `P` was
+  answered `G`: the node dropped its cache and joined again. The old name is
+  now replaced at once only when it has sent no heartbeat or announce for
+  `CONTACT_BREAK` (9 s, the age at which a missed heartbeat is recorded). A
+  member heard from more recently leaves the collision undecided: the new
+  name's join is held, and the sweep decides. The old name is replaced as
+  soon as it has been silent for `CONTACT_BREAK`, so a node restarted
+  within a few seconds still gets the join without the refused `M` and the
+  second handoff (#1616), or, if the old name is heard from again, it stays
+  and the new name joins as before #1616. The hold lasts at most
+  `CONTACT_BREAK` from the old name's last heartbeat, holds up the names
+  queued behind it for that long, and is not decided on a sweep that
+  follows a pause of discovery (#1663).
+
 - `tests/e2e`: `scalein.sh`, `proxydrain.sh`, `proxykill.sh`, `freshjoin.sh` and
   `chaos.sh` ran `verify.py seed` and `check` without a time bound (`chaos.sh`
   bounded only its final check), so a hung cluster hung the script instead of
