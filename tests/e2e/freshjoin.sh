@@ -67,3 +67,4 @@ ops=$(load_ops "$load"); [ "${ops:-0}" -ge $(( LOAD_SECS * ${MIN_OPS_S:-10} )) ]
 echo "$load" | grep -q '"miss": 0' || { T "FAIL: load saw misses"; fail=1; }
 cleanup
 echo "=== RESULT run=$RUN mode=$MODE gap=$GAP fail=$fail"
+[ "$fail" = 0 ] || exit 1
