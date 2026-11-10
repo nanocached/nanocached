@@ -858,7 +858,10 @@ func (c *Client) openCluster(result *identified) error {
 			if c.reconnectCooldown > 0 {
 				c.redialCooldownMu.Lock()
 				c.redialCooldowns[node.Address] = redialCooldown{
-					until: time.Now().Add(c.reconnectCooldown), err: outcome.err,
+					until: time.Now().Add(c.reconnectCooldown),
+					// What Connect returns stays as it is; the entry is
+					// what an operation routed to the address will see.
+					err: handshakeFailureAsLost(node.Address, outcome.err),
 				}
 				c.redialCooldownMu.Unlock()
 			}
@@ -3470,7 +3473,31 @@ func (c *Client) reconnectAnotherProxy(deadAddress string) (*connection, string,
 			candidates = other
 		}
 	}
-	return c.dialRandomProxy(candidates)
+	conn, address, err := c.dialRandomProxy(candidates)
+	if err != nil {
+		return nil, "", handshakeFailureAsLost(deadAddress, err)
+	}
+	return conn, address, nil
+}
+
+// handshakeFailureAsLost is for a failure to open a connection that a
+// request was waiting for (a redial, a reconnect to another proxy): a
+// protocol error raised while the handshake was still running (an address
+// that answers `A` with something that is not a handshake reply, such as a
+// web server's HTTP 400) becomes a lost connection that was never used, as
+// for a dead address or an address that is no longer a node. No request
+// frame exists at that point, and a node-list refresh cures an address
+// that discovery has since dropped, which withClusterRetry and
+// withClusterRetryNonIdempotent only attempt for ErrConnectionLost. Every
+// other error is returned as it was. Never apply this to an error from an
+// established connection: there a protocol error comes after a request was
+// written. The first Connect does not use it (its errors are returned as
+// they are).
+func handshakeFailureAsLost(address string, err error) error {
+	if !errors.Is(err, ErrProtocol) {
+		return err
+	}
+	return notSent(connectionLost("nanocached: "+address+" did not complete the handshake", err))
 }
 
 // armRedialCooldown records a failed dial of address (see redialCooldown),
@@ -3511,7 +3538,7 @@ func (c *Client) retainRedialCooldowns(roster []discoveredNode) {
 func (c *Client) openNodeConnection(address string) (*connection, error) {
 	result, err := connectAndIdentify(address, c.authSecret, c.tlsConfig)
 	if err != nil {
-		return nil, err
+		return nil, handshakeFailureAsLost(address, err)
 	}
 	if result.conn == nil {
 		// Not a protocol error: the address was reachable but is not (or no
