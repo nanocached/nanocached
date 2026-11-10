@@ -45,6 +45,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-discovery`: a `V` (leave) from a member of the join in flight
+  was answered `R` only after the abandon's fan-out, which sends `X` to every
+  remaining ready member and starts the next join's `M` sends; against a
+  member that accepts and never answers that took 10 s per attempt, so the
+  leaving node logged `leave timed out` for a leave discovery had already
+  applied and its exit was delayed by the wait. The `R` is now written right
+  after the removal, as the `C` ack already is, and the abandon runs after
+  it (#1662).
+
 - `nanocached-node`: a handoff target that refused with `R` was never
   written off, so one such address could use up the decommission drain
   budget. The only refusal a node sends to a `U` is `R` followed by closing
@@ -82,6 +91,13 @@ framework adapters at one version, whether or not a component changed.
   timeout when the `Q` roster did not drop to 1 proxy, and `proxykill.sh`
   printed `fail=1` but exited 0. Each is now a failure with a message, and
   `proxykill.sh` exits non-zero (#1620).
+
+- `tests/e2e`: `freshjoin.sh` printed `FAIL: ...` and `fail=1` and exited 0,
+  and `restart.sh` printed `FAIL` for a membership step that timed out or a
+  load that did not finish, and its miss count, without failing on any of
+  them (its header and the README say it must see 0 misses). Both now exit 1
+  on a failure; `restart.sh` also fails when the load printed no result line
+  (#1661).
 
 - `tests/e2e/chaos.sh`: with `INCR_ORACLE=1` the run ignored `incrtrace.py`'s
   exit status and read its last line, so a script that died with a traceback
