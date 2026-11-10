@@ -69,6 +69,13 @@ framework adapters at one version, whether or not a component changed.
   printed `fail=1` but exited 0. Each is now a failure with a message, and
   `proxykill.sh` exits non-zero (#1620).
 
+- `tests/e2e`: `freshjoin.sh` printed `FAIL: ...` and `fail=1` and exited 0,
+  and `restart.sh` printed `FAIL` for a membership step that timed out or a
+  load that did not finish, and its miss count, without failing on any of
+  them (its header and the README say it must see 0 misses). Both now exit 1
+  on a failure; `restart.sh` also fails when the load printed no result line
+  (#1661).
+
 - `tests/e2e/chaos.sh`: with `INCR_ORACLE=1` the run ignored `incrtrace.py`'s
   exit status and read its last line, so a script that died with a traceback
   left no `trace_lines`, skipped the "no TRACE lines" branch and passed with
