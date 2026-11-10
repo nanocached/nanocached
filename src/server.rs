@@ -20733,6 +20733,228 @@ mod tests {
         assert!(frames.contains(&expected_b));
     }
 
+    /// What `connection_in_a_decommission_window` hands back.
+    struct WindowConnection {
+        request_tx: mpsc::Sender<CacheRequest>,
+        cache_task: tokio::task::JoinHandle<()>,
+        frames: RecordedFrames,
+        peer_task: tokio::task::JoinHandle<()>,
+        client: TcpStream,
+        connection_task: tokio::task::JoinHandle<io::Result<()>>,
+    }
+
+    /// A node decommissioning towards one entrant ("peer", R=1) when
+    /// `in_window`, or with no window open when not, a cache task, and a
+    /// connection to it.
+    async fn connection_in_a_decommission_window(in_window: bool) -> WindowConnection {
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let mut node_context = test_node_context(
+            "leaver",
+            "tk-leaver",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        node_context.leaving = Arc::new(Mutex::new(in_window.then(|| LeaveState {
+            before_ring: Arc::new(HashRing::new(vec![
+                "leaver".to_string(),
+                "peer".to_string(),
+            ])),
+            after_ring: Arc::new(HashRing::new(vec!["peer".to_string()])),
+            replication: 1,
+            addresses: HashMap::from([("peer".to_string(), peer_addr)]),
+            tokens: HashMap::from([("peer".to_string(), "tok-peer".to_string())]),
+            connections: Mutex::new(HashMap::new()),
+        })));
+
+        let (client, server) = tcp_pair().await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Kept for the life of the test process: a dropped sender reads as a
+        // shutdown.
+        std::mem::forget(shutdown_tx);
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+        WindowConnection {
+            request_tx,
+            cache_task,
+            frames,
+            peer_task,
+            client,
+            connection_task,
+        }
+    }
+
+    impl WindowConnection {
+        /// Sends `frame`, closes the client's side and returns everything
+        /// the node answers.
+        async fn send(&mut self, frame: &[u8]) -> Vec<u8> {
+            self.client.write_all(frame).await.unwrap();
+            self.client.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            let _ = self.client.read_to_end(&mut response).await;
+            response
+        }
+
+        /// What the entrant has received once the forwards of one frame have
+        /// had time to arrive: waits until `expected` frames are in or
+        /// `wait` has passed, and returns their total size.
+        async fn forwarded_bytes(&self, expected: usize, wait: Duration) -> usize {
+            let _ = timeout(wait, async {
+                while self.frames.lock().unwrap().len() < expected {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            self.frames.lock().unwrap().iter().map(Vec::len).sum()
+        }
+
+        async fn stored(&self, namespace: &[u8], name: &str) -> Response {
+            send_command(
+                &self.request_tx,
+                Command::Get {
+                    key: Key::new(Bytes::copy_from_slice(namespace), name.to_string().into()),
+                },
+            )
+            .await
+        }
+
+        async fn finish(self) {
+            self.peer_task.abort();
+            drop(self.request_tx);
+            self.cache_task.await.unwrap();
+        }
+    }
+
+    /// An `o` of `keys` one-byte-value keys (`k0`, `k1`, ...) under a
+    /// `namespace_len`-byte namespace.
+    fn multi_set_frame(namespace_len: usize, keys: usize) -> Vec<u8> {
+        let names: Vec<String> = (0..keys).map(|index| format!("k{index}")).collect();
+        let lens: Vec<String> = names
+            .iter()
+            .map(|name| format!("{} 1", name.len()))
+            .collect();
+        let mut frame = format!("o {namespace_len} {keys} {}\n", lens.join(" ")).into_bytes();
+        frame.extend(std::iter::repeat_n(b'n', namespace_len));
+        for name in &names {
+            frame.extend_from_slice(name.as_bytes());
+            frame.push(b'v');
+        }
+        frame
+    }
+
+    /// A `y` of `keys` keys (`k0`, `k1`, ...) under a `namespace_len`-byte
+    /// namespace, with a TTL.
+    fn multi_touch_frame(namespace_len: usize, keys: usize) -> Vec<u8> {
+        let names: Vec<String> = (0..keys).map(|index| format!("k{index}")).collect();
+        let lens: Vec<String> = names.iter().map(|name| name.len().to_string()).collect();
+        let mut frame = format!("y {namespace_len} {keys} {} 60\n", lens.join(" ")).into_bytes();
+        frame.extend(std::iter::repeat_n(b'n', namespace_len));
+        for name in &names {
+            frame.extend_from_slice(name.as_bytes());
+        }
+        frame
+    }
+
+    /// A namespace of 300,000 bytes, so the product with the number of keys
+    /// crosses `MAX_MULTI_NAMESPACE_KEY_BYTES` (67,108,864) between 223
+    /// keys (66,900,000) and 224 (67,200,000).
+    const BIG_NAMESPACE: usize = 300_000;
+
+    /// A frame is refused for what it asks of the forwards, so a frame that
+    /// works on an ordinary day does not fail during a scale event: over the
+    /// bound `o` and `y` are answered `En` and the connection is closed, with
+    /// no window open and with one, and nothing is applied or forwarded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_over_the_namespace_bound_is_refused_with_and_without_a_window() {
+        for in_window in [false, true] {
+            for touch in [false, true] {
+                let mut connection = connection_in_a_decommission_window(in_window).await;
+                let frame = if touch {
+                    multi_touch_frame(BIG_NAMESPACE, 224)
+                } else {
+                    multi_set_frame(BIG_NAMESPACE, 224)
+                };
+                let response = connection.send(&frame).await;
+                assert!(
+                    response.starts_with(b"E"),
+                    "window={in_window} touch={touch}: {response:?}"
+                );
+                assert_eq!(
+                    connection
+                        .forwarded_bytes(1, Duration::from_millis(200))
+                        .await,
+                    0,
+                    "window={in_window} touch={touch}"
+                );
+                assert_eq!(
+                    connection.stored(&vec![b'n'; BIG_NAMESPACE], "k0").await,
+                    Response::NotFound,
+                    "a refused frame stores nothing"
+                );
+                let _ = (&mut connection.connection_task).await;
+                connection.finish().await;
+            }
+        }
+    }
+
+    /// Just under the bound a frame is an ordinary write, and what a
+    /// forwarding window sends for it is bounded by the same figure: the
+    /// entrant receives one `U` per key the leaver owns, each carrying the
+    /// 300,000-byte namespace, 66.9 MB for 223 keys (about 64 times the
+    /// frame; the same frame without the bound at 1 MiB made ~45 GB).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_key_frame_just_under_the_namespace_bound_is_accepted_and_forwarded() {
+        let mut connection = connection_in_a_decommission_window(true).await;
+        let frame = multi_set_frame(BIG_NAMESPACE, 223);
+        let response = connection.send(&frame).await;
+        assert!(response.starts_with(b"O 223 S"), "{:?}", &response[..20]);
+        let forwarded = connection
+            .forwarded_bytes(usize::MAX, Duration::from_secs(3))
+            .await;
+        let frames = connection.frames.lock().unwrap().len();
+        assert!(frames > 50, "{frames} keys reached the entrant");
+        assert!(
+            forwarded <= crate::command::MAX_MULTI_NAMESPACE_KEY_BYTES + frame.len() + frames * 64,
+            "{forwarded} bytes forwarded for a {} byte frame",
+            frame.len()
+        );
+        assert!(forwarded > frames * BIG_NAMESPACE);
+        let _ = (&mut connection.connection_task).await;
+        connection.finish().await;
+
+        let mut connection = connection_in_a_decommission_window(false).await;
+        let response = connection
+            .send(&multi_touch_frame(BIG_NAMESPACE, 223))
+            .await;
+        assert!(response.starts_with(b"Y 223 N"), "{:?}", &response[..20]);
+        connection.finish().await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn decommission_batch_touch_forwards_the_touched_keys_to_the_entrant() {
         // The decommission-drain mirror of `a_batch_touch_forwards_each_
