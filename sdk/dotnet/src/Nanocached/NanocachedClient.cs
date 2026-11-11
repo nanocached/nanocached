@@ -5293,7 +5293,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         _lastRefreshStarted = MonotonicNow();
         Identify.ClusterTarget? cluster = await FetchNodeListAsync().ConfigureAwait(false);
         _lastFetch = MonotonicNow();
-        if (cluster is null) return;
+        if (cluster is null)
+        {
+            // One failure per refresh that produced no usable node list
+            // (every address unreachable, an empty roster or a node-target
+            // answer), as the Go and Rust SDKs count it.
+            Interlocked.Increment(ref _refreshFailures);
+            return;
+        }
 
         // Dedupe first (issue #461): a duplicated name in cluster.Nodes
         // would otherwise crash ToDictionary below with an
@@ -5368,7 +5375,6 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                     continue;
                 }
 
-                Interlocked.Increment(ref _refreshFailures);
                 // Install the just-discovered node with a null connection and
                 // arm its cooldown, rather than leaving it out of the ring
                 // (issue #67, matching OpenClusterAsync and the Go/Rust SDKs).
@@ -5418,7 +5424,6 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             catch (Exception error) when (error is NanocachedException or IOException
                 or System.Net.Sockets.SocketException or AuthenticationException)
             {
-                Interlocked.Increment(ref _refreshFailures);
                 // Silent by design — refresh is opportunistic/best-effort
                 // and must never fail the caller's operation, consistent
                 // with client-side replication's eventual-consistency model. The next
@@ -5457,7 +5462,6 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             catch (Exception error) when (error is NanocachedException or IOException
                 or System.Net.Sockets.SocketException or AuthenticationException)
             {
-                Interlocked.Increment(ref _refreshFailures);
                 lastError = error is NotACacheNodeException
                     ? new NanocachedException(error.Message)
                     : error;
@@ -5468,6 +5472,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             {
                 case Identify.NodeTarget node:
                     node.Stream.Dispose();
+                    Interlocked.Increment(ref _refreshFailures);
                     throw new NanocachedException(
                         $"nanocached: ViaProxy requires discovery addresses, but {host}:{port} "
                         + "identifies as a cache node");
@@ -5476,6 +5481,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                     return proxies.Proxies;
             }
         }
+        Interlocked.Increment(ref _refreshFailures);
         throw lastError ?? new NanocachedException(
             "nanocached: could not reach any discovery address for the proxy roster");
     }
