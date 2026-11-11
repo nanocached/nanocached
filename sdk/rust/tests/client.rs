@@ -10319,7 +10319,24 @@ struct GarbageListener {
 
 impl GarbageListener {
     async fn start_on_port(port: u16) -> Self {
-        let listener = bind_listener(port).await;
+        // Re-binding a just-stopped node's port can briefly fail while its
+        // listener and accepted sockets finish closing: bind with
+        // SO_REUSEADDR and retry within a short bounded deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let listener = loop {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.set_reuseaddr(true).unwrap();
+            let bound = socket
+                .bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+                .and_then(|()| socket.listen(1024));
+            match bound {
+                Ok(listener) => break listener,
+                Err(error) if std::time::Instant::now() >= deadline => {
+                    panic!("could not re-bind port {port}: {error}")
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        };
         let port = listener.local_addr().unwrap().port();
         let accepted = Arc::new(AtomicUsize::new(0));
         let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
