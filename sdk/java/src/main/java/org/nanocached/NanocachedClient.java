@@ -6658,30 +6658,14 @@ public final class NanocachedClient implements AutoCloseable {
         // dedupeDiscoveredNodes's doc).
         List<DiscoveredNode> discovered = dedupeDiscoveredNodes(cluster.nodes());
         List<DiscoveredNode> toOpen = new ArrayList<>();
+        Map<String, DiscoveredNode> byName = new LinkedHashMap<>();
+        for (DiscoveredNode node : discovered) byName.put(node.name(), node);
+        // Nodes that left the roster are NOT removed here but in the final
+        // swap below, together with the ring (issue #1733): removing them
+        // now, then dialing for up to CONNECT_TIMEOUT_MS, left the old ring
+        // routing keys to members already gone ("no connection") for the
+        // whole dial phase. Go and Rust publish members and ring together.
         synchronized (stateLock) {
-            Map<String, DiscoveredNode> byName = new LinkedHashMap<>();
-            for (DiscoveredNode node : discovered) byName.put(node.name(), node);
-
-            members.entrySet().removeIf(entry -> {
-                if (!byName.containsKey(entry.getKey())) {
-                    // null for a member that was never reached (issue #67)
-                    // — nothing to close in that case.
-                    Connection stale = entry.getValue().connection;
-                    if (stale != null) stale.close();
-                    // Node names are per-process UUIDs; a departed node's
-                    // redial gate would otherwise leak forever (issue #12).
-                    redialLocks.remove(entry.getKey());
-                    // Same leak, for the same reason, on the per-address
-                    // cooldown map: a departed node's address is never
-                    // reused, so its cooldown entry (if any) would
-                    // otherwise linger forever (audit finding,
-                    // unpruned reconnectCooldowns).
-                    reconnectCooldowns.remove(entry.getValue().address);
-                    return true;
-                }
-                return false;
-            });
-
             for (DiscoveredNode node : discovered) {
                 Member existing = members.get(node.name());
                 if (existing != null) {
@@ -6709,6 +6693,25 @@ public final class NanocachedClient implements AutoCloseable {
                 }
                 return;
             }
+            members.entrySet().removeIf(entry -> {
+                if (!byName.containsKey(entry.getKey())) {
+                    // null for a member that was never reached (issue #67)
+                    // — nothing to close in that case.
+                    Connection stale = entry.getValue().connection;
+                    if (stale != null) stale.close();
+                    // Node names are per-process UUIDs; a departed node's
+                    // redial gate would otherwise leak forever (issue #12).
+                    redialLocks.remove(entry.getKey());
+                    // Same leak, for the same reason, on the per-address
+                    // cooldown map: a departed node's address is never
+                    // reused, so its cooldown entry (if any) would
+                    // otherwise linger forever (audit finding,
+                    // unpruned reconnectCooldowns).
+                    reconnectCooldowns.remove(entry.getValue().address);
+                    return true;
+                }
+                return false;
+            });
             for (int i = 0; i < toOpen.size(); i++) {
                 DiscoveredNode node = toOpen.get(i);
                 DialOutcome outcome = outcomes.get(i);
@@ -6745,12 +6748,10 @@ public final class NanocachedClient implements AutoCloseable {
                     armReconnectCooldown(node.address(), outcome.error);
                 }
             }
-        }
-
-        synchronized (stateLock) {
             ring = new HashRing(new ArrayList<>(members.keySet()));
             replication = cluster.replication();
         }
+
     }
 
     /** Walks every address (discovery HA); {@code null} means keep the

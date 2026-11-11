@@ -8949,6 +8949,60 @@ class NanocachedClientTest {
         }
     }
 
+    // ── refresh publishes members and ring together (issue #1733) ───
+
+    @Test
+    void refreshKeepsDepartingMembersRoutableUntilTheRingIsSwapped() throws Exception {
+        int originalTimeout = Identify.connectTimeoutMillis;
+        java.net.ServerSocket silent = new java.net.ServerSocket(0);
+        java.util.concurrent.CountDownLatch dialing = new java.util.concurrent.CountDownLatch(1);
+        Thread acceptor = new Thread(() -> {
+            try {
+                while (true) {
+                    silent.accept(); // accepts, never answers
+                    dialing.countDown();
+                }
+            } catch (java.io.IOException closed) {
+                // test over
+            }
+        }, "test-silent-accept-1733");
+        acceptor.setDaemon(true);
+        acceptor.start();
+        ExecutorService refresher = Executors.newSingleThreadExecutor();
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String gone = NAMES.get(1);
+                String key = keyOwnedBy(gone);
+                // The roster drops the second node and adds one whose dial hangs.
+                cluster.discovery().nodes = List.of(
+                        new DiscoveredNode(NAMES.get(0), cluster.nodes().get(NAMES.get(0)).address()),
+                        new DiscoveredNode("slow-new", "127.0.0.1:" + silent.getLocalPort()));
+                Identify.connectTimeoutMillis = 2_000;
+                Future<?> refresh = refresher.submit(() -> {
+                    forceRefresh(client);
+                    return null;
+                });
+                assertTrue(dialing.await(5, java.util.concurrent.TimeUnit.SECONDS), "the new node must be dialed");
+
+                Field membersField = NanocachedClient.class.getDeclaredField("members");
+                membersField.setAccessible(true);
+                assertTrue(((Map<?, ?>) membersField.get(client)).containsKey(gone),
+                        "a departing member must stay until the ring is swapped with it");
+                // The old ring still owns the key: a request meanwhile reaches it.
+                assertEquals(Optional.empty(), org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                        Duration.ofMillis(1_000), () -> client.get(key)));
+
+                refresh.get(10, java.util.concurrent.TimeUnit.SECONDS);
+                assertFalse(((Map<?, ?>) membersField.get(client)).containsKey(gone));
+                assertTrue(((Map<?, ?>) membersField.get(client)).containsKey("slow-new"));
+            }
+        } finally {
+            Identify.connectTimeoutMillis = originalTimeout;
+            refresher.shutdownNow();
+            silent.close();
+        }
+    }
+
     // ── o/y namespace x keys cap (issue #1728) ──────────────────────
 
     @Test
