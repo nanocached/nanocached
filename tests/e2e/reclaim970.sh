@@ -28,16 +28,17 @@ GAP=${GAP:-0}; DELAY=${DELAY:-0}; KILL=${KILL:-0}
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
 tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
-client(){ docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python "$@"; }
+trap cleanup EXIT  # Ctrl-C or a failed step must not leave the run's containers behind
+client(){ tmo 300 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python "$@"; }
 ent(){ for n in "$@"; do printf "%s=%s " $n "$(docker run --rm --network $NET $CLIENT python -c "import urllib.request;b=urllib.request.urlopen('http://$P-$n:9100/metrics',timeout=5).read().decode().splitlines();print([l.split()[1] for l in b if l.startswith('nanocached_node_entries ')][0])" 2>/dev/null || echo '?')"; done; echo; }
 cleanup; docker network create $NET >/dev/null
 fail=0
 disc_up $P-disc --replication-factor 2; sleep 1
 i=0; for n in a b c; do i=$((i+1)); node_up $P-$n $D --drain-timeout 20 --metrics-port 9100; wait_members $i $D 60 || { T "FAIL: bootstrap"; cleanup; exit 1; }; done
 T "settle 70s (past the bootstrap joins' forwarding windows)"; sleep 70
-client reclaim970.py seed $D 600
+client reclaim970.py seed $D 600 || { T "FAIL: reclaim970.py seed failed or timed out (300s)"; cleanup; exit 1; }
 T "join d, then wait ${GAP}s"; node_up $P-d $D --drain-timeout 20 --metrics-port 9100; wait_members 4 $D 60 || { T "FAIL: join"; fail=1; }; sleep $GAP
-T "expire r*, delete e*, rewrite k* (a fresh client: its ring has d)"; client reclaim970.py apply $D 600
+T "expire r*, delete e*, rewrite k* (a fresh client: its ring has d)"; client reclaim970.py apply $D 600 || { T "FAIL: reclaim970.py apply failed or timed out (300s)"; fail=1; }
 [ "$DELAY" -gt 0 ] && { T "wait ${DELAY}s before the leave"; sleep $DELAY; }
 if [ "$KILL" = 1 ]; then T "kill a (liveness eviction)"; docker kill $P-a >/dev/null; else T "decommission a (docker stop -t 40)"; docker stop -t 40 $P-a >/dev/null; fi
 wait_members 3 $D 60 || { T "FAIL: membership after a left"; fail=1; }; sleep 10
@@ -46,8 +47,9 @@ check1=$(tmo 120 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python 
 T "same check 130s later (past the reclaim grace)"; sleep 130
 check2=$(tmo 120 docker run --rm --network $NET -v "$E:/w" -w /w $CLIENT python reclaim970.py check $D 600 $P-b,$P-c,$P-d); echo "=== check: ${check2:-NO RESULT}"
 for c in "$check1" "$check2"; do
-  echo "$c" | grep -q '"stale_or_resurrected_keys": 0' || { T "FAIL: no check result"; fail=1; }
-  echo "$c" | grep -q '"stale_or_resurrected_keys": [1-9]' && { T "FAIL: a key came back or stayed stale"; fail=1; }
+  # the r, e and k classes must each report 0; a class above 0 fails, and so do fewer than three zeros (no result), once
+  if echo "$c" | grep -q '"stale_or_resurrected_keys": [1-9]'; then T "FAIL: a key came back or stayed stale"; fail=1
+  elif [ "$(echo "$c" | grep -o '"stale_or_resurrected_keys": 0' | wc -l)" -ne 3 ]; then T "FAIL: no check result (want all three classes at 0)"; fail=1; fi
 done
 for n in b c d; do echo "== $P-$n"; docker logs $P-$n 2>&1 | grep -i -E "reclaim|re-replication|dead cop|membership updated" | sed -E 's/^[^ ]+ //' | cut -c1-160 | tail -4; done
 cleanup

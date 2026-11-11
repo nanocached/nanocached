@@ -75,9 +75,11 @@ from its header, before its body is read, like any request the server cannot
 parse: a node answers <code>En\n</code> and closes the connection, the proxy
 answers a bare <code>E\n</code> and closes the client&rsquo;s connection
 without sending anything to a node. The limit does not depend on whether the
-cluster is changing. The SDKs send at most 400 keys in a frame, so they reach
-it only with a namespace over 167,772 bytes, and a namespace of 180 bytes or
-less cannot reach it at any frame size. The frames only another node
+cluster is changing. The SDKs send at most 400 keys in a frame and, for
+<code>o</code> and <code>y</code>, no more than 64&nbsp;MiB divided by the
+namespace length (rounded down), so their frames stay under the limit with
+any namespace; a namespace of 180 bytes or less cannot reach it at any frame
+size. The frames only another node
 sends (<code>U</code>, <code>u</code>, <code>f</code>) may exceed it by
 4 KiB: the <code>U</code> that moves a value to another node carries the
 receiver&rsquo;s token on top of what the client&rsquo;s <code>S</code>
@@ -638,7 +640,8 @@ request (likewise for <code>o</code> below and <code>y</code> above). There is n
 upper bound of its own beyond the request-size limit, which a frame of
 one-byte keys reaches at about 349,000 of them, and, for <code>o</code> and
 <code>y</code>, the namespace limit above; the SDKs send at most 400
-keys in a frame. The reply header carries one token per key, so it grows
+keys in a frame (fewer for an <code>o</code> or <code>y</code> whose namespace
+is long, see above). The reply header carries one token per key, so it grows
 with <code>n</code>. A key may appear more than once in a frame; every
 occurrence is handled on its own, in order, and answered at its own
 position. <code>m</code> answers each occurrence of a hit with the value; with
