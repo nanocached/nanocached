@@ -6003,7 +6003,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void anUnreachableAddressDuringRefreshIncrementsRefreshFailuresStat() throws Exception {
+    void anUnreachableAddressDuringRefreshDoesNotCountWhileAnotherAddressAnswers() throws Exception {
         try (Cluster cluster = startCluster(1)) {
             int dead = MockServers.unusedPort();
             try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
@@ -6021,7 +6021,7 @@ class NanocachedClientTest {
                 refreshNodeList.setAccessible(true);
                 refreshNodeList.invoke(client);
 
-                assertTrue(client.stats().refreshFailures() >= 1);
+                assertEquals(0, client.stats().refreshFailures());
             }
         }
     }
@@ -8015,7 +8015,7 @@ class NanocachedClientTest {
                 // Serial: 4 x 400ms = 1.6s+. Concurrent: about one timeout.
                 assertTrue(elapsedMillis < 1_200,
                         "4 blackholed new nodes should be dialed concurrently, refresh took " + elapsedMillis + "ms");
-                assertEquals(4, client.stats().refreshFailures());
+                assertEquals(0, client.stats().refreshFailures(), "a failed dial of a listed node is not a failed refresh");
             }
         } finally {
             Identify.connectTimeoutMillis = originalTimeout;
@@ -8054,7 +8054,7 @@ class NanocachedClientTest {
                 cooldownsField.setAccessible(true);
                 assertTrue(((Map<?, ?>) cooldownsField.get(client)).containsKey(deadAddress),
                         "its reconnect cooldown must be armed");
-                assertEquals(1, client.stats().refreshFailures());
+                assertEquals(0, client.stats().refreshFailures());
             }
         }
     }
@@ -8199,7 +8199,7 @@ class NanocachedClientTest {
                 Map<?, ?> cooldowns = (Map<?, ?>) cooldownsField.get(client);
                 assertTrue(cooldowns.containsKey("no-port-here"), "the unparseable address has its cooldown armed");
                 assertTrue(cooldowns.containsKey(notACacheNode), "the non-node address has its cooldown armed");
-                assertEquals(2, client.stats().refreshFailures());
+                assertEquals(0, client.stats().refreshFailures());
 
                 // The next use of such a node surfaces the error the dial
                 // produced, without dialing again inside the cooldown.
@@ -8268,7 +8268,29 @@ class NanocachedClientTest {
         final AtomicInteger connections = new AtomicInteger();
 
         HttpGarbageListener(int port) throws java.io.IOException {
-            server = new java.net.ServerSocket(port);
+            // Re-binding a just-stopped node's port can briefly fail while its
+            // listener and accepted sockets finish closing: bind with
+            // SO_REUSEADDR and retry within a short bounded deadline.
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            java.net.ServerSocket bound;
+            while (true) {
+                bound = new java.net.ServerSocket();
+                try {
+                    bound.setReuseAddress(true);
+                    bound.bind(new java.net.InetSocketAddress(port));
+                    break;
+                } catch (java.io.IOException bindFailed) {
+                    bound.close();
+                    if (System.nanoTime() >= deadline) throw bindFailed;
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new java.io.InterruptedIOException("interrupted while re-binding port " + port);
+                    }
+                }
+            }
+            server = bound;
             Thread acceptor = new Thread(() -> {
                 while (!server.isClosed()) {
                     try {
@@ -8925,5 +8947,126 @@ class NanocachedClientTest {
         } finally {
             Connection.requestTimeoutMillis = defaultTimeout;
         }
+    }
+
+    // ── refresh_failures counts per refresh (issue #1735) ───────────
+
+    @Test
+    void refreshFailuresCountsOncePerRefreshWithNoUsableNodeList() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            int dead = MockServers.unusedPort();
+            int dead2 = MockServers.unusedPort();
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(
+                            new Address("127.0.0.1", dead),
+                            new Address("127.0.0.1", dead2),
+                            new Address("127.0.0.1", cluster.discovery().port()))))) {
+                // A working address later in the list: no failure.
+                forceRefresh(client);
+                assertEquals(0, client.stats().refreshFailures());
+
+                // An empty roster is a refresh without a usable node list.
+                List<DiscoveredNode> roster = cluster.discovery().nodes;
+                cluster.discovery().nodes = List.of();
+                forceRefresh(client);
+                assertEquals(1, client.stats().refreshFailures(),
+                        "two dead addresses plus an empty roster are one failed refresh");
+                cluster.discovery().nodes = roster;
+            }
+        }
+    }
+
+    // ── refresh publishes members and ring together (issue #1733) ───
+
+    @Test
+    void refreshKeepsDepartingMembersRoutableUntilTheRingIsSwapped() throws Exception {
+        int originalTimeout = Identify.connectTimeoutMillis;
+        java.net.ServerSocket silent = new java.net.ServerSocket(0);
+        java.util.concurrent.CountDownLatch dialing = new java.util.concurrent.CountDownLatch(1);
+        Thread acceptor = new Thread(() -> {
+            try {
+                while (true) {
+                    silent.accept(); // accepts, never answers
+                    dialing.countDown();
+                }
+            } catch (java.io.IOException closed) {
+                // test over
+            }
+        }, "test-silent-accept-1733");
+        acceptor.setDaemon(true);
+        acceptor.start();
+        ExecutorService refresher = Executors.newSingleThreadExecutor();
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String gone = NAMES.get(1);
+                String key = keyOwnedBy(gone);
+                // The roster drops the second node and adds one whose dial hangs.
+                cluster.discovery().nodes = List.of(
+                        new DiscoveredNode(NAMES.get(0), cluster.nodes().get(NAMES.get(0)).address()),
+                        new DiscoveredNode("slow-new", "127.0.0.1:" + silent.getLocalPort()));
+                Identify.connectTimeoutMillis = 2_000;
+                Future<?> refresh = refresher.submit(() -> {
+                    forceRefresh(client);
+                    return null;
+                });
+                assertTrue(dialing.await(5, java.util.concurrent.TimeUnit.SECONDS), "the new node must be dialed");
+
+                Field membersField = NanocachedClient.class.getDeclaredField("members");
+                membersField.setAccessible(true);
+                assertTrue(((Map<?, ?>) membersField.get(client)).containsKey(gone),
+                        "a departing member must stay until the ring is swapped with it");
+                // The old ring still owns the key: a request meanwhile reaches it.
+                assertEquals(Optional.empty(), org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(
+                        Duration.ofMillis(1_000), () -> client.get(key)));
+
+                refresh.get(10, java.util.concurrent.TimeUnit.SECONDS);
+                assertFalse(((Map<?, ?>) membersField.get(client)).containsKey(gone));
+                assertTrue(((Map<?, ?>) membersField.get(client)).containsKey("slow-new"));
+            }
+        } finally {
+            Identify.connectTimeoutMillis = originalTimeout;
+            refresher.shutdownNow();
+            silent.close();
+        }
+    }
+
+    // ── o/y namespace x keys cap (issue #1728) ──────────────────────
+
+    @Test
+    void multiSetAndTouchChunksStayUnderTheNodes64MiBNamespaceTimesKeysLimit() throws Exception {
+        // A node closes the connection over an `o`/`y` frame whose namespace
+        // length x key count exceeds 64 MiB. A 170,000-byte namespace with a
+        // full 400-key chunk is 68,000,000 bytes: it must go as two frames.
+        String ns = "n".repeat(170_000);
+        int limit = 64 * 1024 * 1024 / ns.length();
+        assertEquals(394, limit);
+        Map<String, String> values = new java.util.LinkedHashMap<>();
+        List<String> keys = new ArrayList<>();
+        for (int i = 0; i < 400; i++) {
+            keys.add("key-" + i);
+            values.put("key-" + i, "v");
+        }
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedClient.Namespace handle = client.namespace(ns);
+                handle.setMany(values);
+                assertEquals(2, node.multiSetCount.get(), "400 keys under a 170,000 B namespace need two `o` frames");
+
+                handle.touchMany(keys, 60);
+                assertEquals(2, node.multiTouchFrames.size());
+                for (MockNode.MultiTouchFrame frame : node.multiTouchFrames) {
+                    assertTrue((long) frame.keys().size() * ns.length() <= 64L * 1024 * 1024,
+                            "a `y` frame of " + frame.keys().size() + " keys exceeds 64 MiB");
+                }
+            }
+        }
+    }
+
+    @Test
+    void maxKeysPerNamespaceChunkIsBoundedByTheOwnLimitAndNeverBelow64() {
+        assertEquals(400, NanocachedClient.maxKeysPerNamespaceChunk(0));
+        assertEquals(400, NanocachedClient.maxKeysPerNamespaceChunk(167_772));
+        assertEquals(399, NanocachedClient.maxKeysPerNamespaceChunk(168_000));
+        assertEquals(64, NanocachedClient.maxKeysPerNamespaceChunk(1024 * 1024));
     }
 }

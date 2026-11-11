@@ -193,7 +193,9 @@ and a hit past that budget is answered as a miss, so a batch of many
 large keys can come back with fewer keys than exist (read such a key
 again on its own rather than taking it for evicted). Both are also
 namespace-scoped: `client.namespace(ns).getMany(...)`/`.setMany(...)`,
-same as `get`/`set`.
+same as `get`/`set`. A node rejects an `o` or `y` frame whose namespace
+length times key count exceeds 64 MiB, so a batch under a very long namespace
+(over 167,772 bytes) is split into smaller frames than the usual 400 keys.
 
 For keys that aren't UTF-8 text, the `byte[]`-keyed overloads are
 *positional* rather than map-shaped, since a `byte[]` can't key a

@@ -1345,7 +1345,7 @@ struct ConnectionConfig {
     /// When set, this process's own outbound connections to a node
     /// (sending `M`/`X`) upgrade to TLS; see `connect_client_stream`.
     tls_connector: Option<TlsConnector>,
-    /// Guards new (not refreshing) registry insertions via `P` — see
+    /// Guards new (not refreshing) registry insertions via `P` and `Y` — see
     /// `AnnounceLimiter`.
     announce_limiter: AnnounceLimiter,
 }
@@ -4463,6 +4463,15 @@ fn log_announce(line: std::fmt::Arguments<'_>) {
     log_info_limited(&ANNOUNCE_LOG, "node announces", line);
 }
 
+/// Issue #1716: the `INFO proxy deregistered` line a `Z` writes, on its
+/// own budget so that a loop of `Y`/`Z` never hides another line.
+static PROXY_DEREGISTER_LOG: LogLimiter =
+    LogLimiter::new(PEER_LOG_LINES_PER_SECOND, Duration::from_secs(1));
+
+fn log_proxy_deregistered(line: std::fmt::Arguments<'_>) {
+    log_info_limited(&PROXY_DEREGISTER_LOG, "proxy deregistrations", line);
+}
+
 /// The standard-output counterpart of `log_limited`.
 fn log_info_limited(limiter: &LogLimiter, what: &str, line: std::fmt::Arguments<'_>) {
     let Some(suppressed) = limiter.admit() else {
@@ -4838,6 +4847,64 @@ fn cached_heartbeat_ack(registry: &Registry, replication: usize) -> Arc<[u8]> {
     )
 }
 
+/// Issue #1717: the dissent WARN gets its own budget. Every `L` rebuild
+/// writes one while a dissenter is present, and generation bumps
+/// interleaved with `L` make a rebuild per request.
+static DISSENT_LOG: LogLimiter = LogLimiter::new(1, Duration::from_secs(10));
+
+/// How many dissenting names the WARN lists; the rest are counted. With
+/// many fake nodes the full list was one line of megabytes (65k names).
+const DISSENT_NAMES_LISTED: usize = 5;
+
+fn dissenter_names(dissenting: &[String]) -> String {
+    let listed = dissenting
+        .iter()
+        .take(DISSENT_NAMES_LISTED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match dissenting.len().checked_sub(DISSENT_NAMES_LISTED) {
+        Some(rest) if rest > 0 => format!("{listed} and {rest} more"),
+        _ => listed,
+    }
+}
+
+/// Writes the replication-factor dissent WARN for `snapshot` if the
+/// limiter admits one; returns whether it did. Nothing is formatted when
+/// the line is suppressed.
+fn log_dissent(limiter: &LogLimiter, snapshot: &RosterSnapshot, replication: usize) -> bool {
+    if snapshot.dissenting.is_empty() {
+        return false;
+    }
+    let Some(suppressed) = limiter.admit() else {
+        return false;
+    };
+    if suppressed > 0 {
+        eprintln!("WARN {suppressed} more replication dissent warnings (not logged individually)");
+    }
+    let dissenting = snapshot.dissenting.len();
+    let voting = dissenting + snapshot.agreeing;
+    let names = dissenter_names(&snapshot.dissenting);
+    if snapshot.refuse() {
+        eprintln!(
+            "WARN refusing L: {dissenting} of {voting} voting Joined nodes report a \
+             replication factor different from this replica's own \
+             --replication-factor {replication} (a strict majority) — dissenting: {names} — \
+             discovery replicas have drifted out of alignment; the operator \
+             must align --replication-factor across every replica (see \
+             Discovery HA)"
+        );
+    } else {
+        eprintln!(
+            "WARN L served despite {dissenting} of {voting} voting Joined nodes reporting a \
+             replication factor different from this replica's own \
+             --replication-factor {replication} — not yet a strict majority, so still \
+             served, but worth investigating: {names}"
+        );
+    }
+    true
+}
+
 /// The `L` response, cached and rebuilt only when the registry's
 /// `generation` has moved since the last build (issue #298) —
 /// `cached_heartbeat_ack`'s sibling for `L`. Before this, every `L` re-ran
@@ -4873,38 +4940,7 @@ fn cached_list_response(registry: &Registry, replication: usize) -> Arc<[u8]> {
             // strict-majority vote rather than refusing on any dissent.
             // Logged here, on rebuild only, rather than on every request
             // as the un-cached handler used to.
-            if !snapshot.dissenting.is_empty() {
-                if snapshot.refuse() {
-                    eprintln!(
-                        "WARN refusing L: {} of {} voting Joined nodes report a \
-                         replication factor different from this replica's own \
-                         --replication-factor {} (a strict majority) — dissenting: {} — \
-                         discovery replicas have drifted out of alignment; the operator \
-                         must align --replication-factor across every replica (see \
-                         Discovery HA)",
-                        snapshot.dissenting.len(),
-                        snapshot.dissenting.len() + snapshot.agreeing,
-                        replication,
-                        snapshot.dissenting.join(", ")
-                    );
-                } else {
-                    // Logged on rebuild rather than rate-limited or
-                    // deduplicated against a remembered dissenter set:
-                    // simpler, and with the cache in place a persistent
-                    // single dissenter now logs only as often as
-                    // membership actually changes, not per `L` call.
-                    eprintln!(
-                        "WARN L served despite {} of {} voting Joined nodes reporting a \
-                         replication factor different from this replica's own \
-                         --replication-factor {} — not yet a strict majority, so still \
-                         served, but worth investigating: {}",
-                        snapshot.dissenting.len(),
-                        snapshot.dissenting.len() + snapshot.agreeing,
-                        replication,
-                        snapshot.dissenting.join(", ")
-                    );
-                }
-            }
+            log_dissent(&DISSENT_LOG, &snapshot, replication);
 
             if snapshot.refuse() {
                 Arc::from(b"B\n".as_slice())
@@ -5869,7 +5905,10 @@ async fn handle_connection(
                 match outcome {
                     Ok(removed) => {
                         if removed {
-                            println!("INFO proxy deregistered: {name}");
+                            // Issue #1716: one line per `Z` for a name the
+                            // peer registered a moment before, so it is
+                            // bounded like the node register/announce lines.
+                            log_proxy_deregistered(format_args!("INFO proxy deregistered: {name}"));
                         }
                         write_response(&mut stream, b"R\n").await?;
                         continue;
@@ -5891,6 +5930,7 @@ async fn handle_connection(
                 // `P` — that is exactly when a restarted replica needs
                 // re-announces to refill this map.
                 let addr = format!("{peer_ip}:{port}");
+                let mut limited = false;
                 let accepted = {
                     let mut proxies = registry
                         .proxies
@@ -5912,6 +5952,17 @@ async fn handle_connection(
                         // refresh — see `ProxyInfo::token`.
                         Some(_) => false,
                         None if at_capacity => false,
+                        // Issue #1716: a new name is gated like a new `P`
+                        // (only here, so a refresh above is never gated,
+                        // and a name refused for capacity spends no
+                        // token). One connection can loop `Y` under fresh
+                        // names, so without this it fills the 1024-entry
+                        // map in milliseconds. The limiter has its own
+                        // mutex and never takes this one.
+                        None if !announce_insert_allowed(&config.announce_limiter, peer_ip) => {
+                            limited = true;
+                            false
+                        }
                         None => {
                             proxies.insert(
                                 name.clone(),
@@ -5930,6 +5981,19 @@ async fn handle_connection(
                 if accepted {
                     write_response(&mut stream, b"R\n").await?;
                     continue;
+                }
+                if limited {
+                    log_rejection(format_args!(
+                        "WARN rejected proxy announce for {name} from {peer_ip}: more than \
+                         {ANNOUNCE_INSERT_BURST} new registrations from this source at once; \
+                         one more is allowed every {}s (see ANNOUNCE_INSERT_BURST / \
+                         ANNOUNCE_INSERT_COOLDOWN)",
+                        ANNOUNCE_INSERT_COOLDOWN.as_secs()
+                    ));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "too many new proxy announces from this source",
+                    ));
                 }
                 log_rejection(format_args!(
                     "WARN rejected proxy announce for {name} from {peer_ip}: token mismatch \
@@ -10634,6 +10698,82 @@ mod tests {
             response.contains("proxy-a127.0.0.1:8358"),
             "got {response:?}"
         );
+    }
+
+    #[test]
+    fn the_dissent_warn_is_rate_limited_and_lists_a_bounded_number_of_names() {
+        // Issue #1717: one line per `L` rebuild, naming every dissenter.
+        let dissenting: Vec<String> = (0..65_000).map(|i| format!("fake-node-{i}")).collect();
+        let names = dissenter_names(&dissenting);
+        assert!(names.starts_with("fake-node-0, fake-node-1"), "{names}");
+        assert!(names.ends_with("and 64995 more"), "{names}");
+        assert!(names.len() < 200, "{} bytes", names.len());
+        let few: Vec<String> = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(dissenter_names(&few), "a, b");
+
+        let snapshot = RosterSnapshot {
+            nodes: Vec::new(),
+            dissenting,
+            agreeing: 1,
+        };
+        let limiter = LogLimiter::new(1, Duration::from_secs(3600));
+        let written = (0..1000)
+            .filter(|_| log_dissent(&limiter, &snapshot, 2))
+            .count();
+        assert_eq!(written, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_announce_rate_limits_new_names_from_one_source_but_not_refreshes() {
+        // Issue #1716: `Y` under a fresh name each time, on one connection,
+        // used to fill `MAX_PROXY_ENTRIES` in milliseconds and lock real
+        // proxies out. New names are now gated per source like `P`'s; a
+        // refresh of a known name never is.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut client, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        async fn announce(client: &mut TcpStream, name: &str) -> bool {
+            let frame = format!("Y {} 8358 2\n{name}tk", name.len());
+            client.write_all(frame.as_bytes()).await.unwrap();
+            let mut reply = [0u8; 2];
+            match client.read_exact(&mut reply).await {
+                Ok(_) => {
+                    assert_eq!(&reply, b"R\n");
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+
+        for index in 0..ANNOUNCE_INSERT_BURST {
+            assert!(announce(&mut client, &format!("fake-{index}")).await);
+        }
+        // A refresh of a registered name is never gated.
+        assert!(announce(&mut client, "fake-0").await);
+        // The next new name is refused and the connection closed.
+        assert!(!announce(&mut client, "fake-over").await);
+        let proxies = registry.proxies.lock().unwrap();
+        assert_eq!(proxies.len(), ANNOUNCE_INSERT_BURST as usize);
+        assert!(!proxies.contains_key("fake-over"));
     }
 
     #[tokio::test(flavor = "current_thread")]
