@@ -1039,6 +1039,14 @@ final class MockServers {
                         // routing table could be stale for the entire
                         // group at once).
                         case "m" -> {
+                            if (getDelayMillis > 0) {
+                                try {
+                                    Thread.sleep(getDelayMillis);
+                                } catch (InterruptedException interrupted) {
+                                    Thread.currentThread().interrupt();
+                                    return;
+                                }
+                            }
                             int nsLen = Integer.parseInt(parts[1]);
                             String ns = keyOf(in.readNBytes(nsLen));
                             int n = Integer.parseInt(parts[2]);

@@ -6605,7 +6605,14 @@ public final class NanocachedClient implements AutoCloseable {
     // ── ノードリスト更新 ──────────────────────────────────────────
 
     private void maybeRefresh(boolean force) {
-        if (ring == null) return;
+        // A closed client never refreshes: close() lets a multi-key
+        // operation already in flight finish, and one whose leg failed would
+        // otherwise run its forced refresh anyway — a discovery round trip
+        // (up to the connect timeout) and dials of new nodes on a client
+        // whose connections are being torn down. Python and TypeScript have
+        // the same entry guard; it is checked again under refreshLock for a
+        // caller that queued behind a refresh while close() ran.
+        if (closed || ring == null) return;
         if (!force && System.nanoTime() - lastFetchNanos < NODE_LIST_STALE_AFTER.toNanos()) return;
 
         // Forced refreshes are single-flight: N callers hitting the same
@@ -6627,6 +6634,7 @@ public final class NanocachedClient implements AutoCloseable {
             refreshLock.lock();
         }
         try {
+            if (closed) return;
             if (!force && System.nanoTime() - lastFetchNanos < NODE_LIST_STALE_AFTER.toNanos()) return;
             if (force && lastFetchStartedNanos - observed >= 0) return;
             if (force && lastRefreshEnded) {

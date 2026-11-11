@@ -8773,6 +8773,45 @@ class NanocachedClientTest {
         }
     }
 
+    // ── a closed client does not refresh ─────────────────────────────
+
+    @Test
+    void anOperationStillRunningAfterCloseDoesNotRefreshTheNodeList() throws Exception {
+        // close() lets a multi-key operation already in flight finish. When
+        // one of its legs failed, that operation used to run its forced
+        // refresh anyway: a discovery round trip (and dials of any new node)
+        // on a client already closed, here 4 s of slow discovery after
+        // close(). It now skips the refresh, as the Python and TypeScript
+        // SDKs do.
+        try (Cluster cluster = startCluster(2)) {
+            NanocachedClient client = connect("127.0.0.1", cluster.discovery().port());
+            String onA = keyOwnedBy(NAMES.get(0));
+            String onB = keyOwnedBy(NAMES.get(1));
+            client.set(onA, "a");
+            client.set(onB, "b");
+            cluster.nodes().get(NAMES.get(1)).delayGets(1_500);
+            cluster.nodes().get(NAMES.get(0)).close();
+            cluster.discovery().laterListDelayMillis = 4_000;
+            int fetchesBefore = cluster.discovery().connectionCount.get();
+            ExecutorService caller = Executors.newSingleThreadExecutor();
+            try {
+                Future<?> outcome = caller.submit(() -> {
+                    assertThrows(NanocachedException.class, () -> client.getMany(List.of(onA, onB)));
+                    return null;
+                });
+                Thread.sleep(300);
+                long closedAt = System.nanoTime();
+                client.close();
+                outcome.get(15, java.util.concurrent.TimeUnit.SECONDS);
+                long afterClose = (System.nanoTime() - closedAt) / 1_000_000;
+                assertEquals(fetchesBefore, cluster.discovery().connectionCount.get(), "no node-list fetch after close()");
+                assertTrue(afterClose < 3_000, "getMany finished " + afterClose + "ms after close()");
+            } finally {
+                caller.shutdownNow();
+            }
+        }
+    }
+
     // ── forced refreshes are single-flight ──────────────────────────
 
     @Test
