@@ -1093,6 +1093,50 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
             await new_b.close()
 
 
+class RefreshSwapsRingWithMembersTests(unittest.IsolatedAsyncioTestCase):
+    async def test_requests_during_a_refresh_still_reach_the_members_it_removes(self):
+        # The refresh used to drop departed members first, dial the new
+        # ones (up to the connect timeout) and only then swap the ring, so
+        # for that long the old ring routed keys to members that were
+        # gone and their requests failed. Members and ring now change
+        # together after the dials.
+        stays = await MockNode().start()
+        leaves = await MockNode().start()
+        joins = await MockNode().start()
+        discovery = await MockDiscovery(
+            [(NAMES[0], stays.address), (NAMES[1], leaves.address)]
+        ).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                key = next(
+                    f"k{i}"
+                    for i in range(1000)
+                    if client._ring.owners(f"k{i}".encode(), 1)[0] == NAMES[1]
+                )
+                await client.set(key, "v")
+                joins.delay_next_auth(0.5)
+                discovery.nodes = [(NAMES[0], stays.address), ("joiner", joins.address)]
+
+                refresh = asyncio.ensure_future(client._refresh_node_list())
+                await asyncio.sleep(0.1)
+                self.assertFalse(refresh.done())
+                self.assertEqual(await asyncio.wait_for(client.get(key), 0.25), "v")
+                self.assertFalse(refresh.done())
+
+                await refresh
+                self.assertNotIn(NAMES[1], client._members)
+                self.assertIn("joiner", client._members)
+                self.assertEqual(set(client._ring._nodes), {NAMES[0], "joiner"})
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await stays.close()
+            await leaves.close()
+            await joins.close()
+
+
 class IdentifyMalformedResponseTests(unittest.IsolatedAsyncioTestCase):
     async def test_an_unterminated_node_list_header_fails_promptly(self):
         # Regression: mirrors the `V`-path LimitOverrunError fix on the

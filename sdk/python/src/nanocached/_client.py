@@ -3833,13 +3833,6 @@ class NanocachedClient:
         nodes = _dedupe_discovered_nodes(cluster.nodes)
         by_name = {node.name: node for node in nodes}
 
-        for name in list(self._members):
-            if name not in by_name:
-                stale = self._members[name].connection
-                if stale is not None:
-                    stale.close()
-                del self._members[name]
-
         new_nodes = []
         for node in nodes:
             existing = self._members.get(node.name)
@@ -3877,6 +3870,20 @@ class NanocachedClient:
                 if isinstance(outcome, NodeTarget):
                     outcome.writer.close()
             return
+
+        # Departed members are dropped here, in the same await-free section
+        # that installs the new ones and swaps the ring, not before the
+        # dials above: removing them first left the old ring routing keys
+        # to members that were no longer there for as long as the dials
+        # took (up to the connect timeout), failing those requests with
+        # "no connection". Until this point the old members and the old
+        # ring stay consistent with each other and keep serving.
+        for name in list(self._members):
+            if name not in by_name:
+                stale = self._members[name].connection
+                if stale is not None:
+                    stale.close()
+                del self._members[name]
 
         for node, outcome in outcomes:
             # Refresh is opportunistic/best-effort and must never fail the
