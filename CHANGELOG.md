@@ -14,6 +14,9 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the accepted-behaviour list now says that a proxied delete whose
+  answer was lost after the write, and which is then sent again, answers `N`
+  when the first attempt had already removed the key (#1714). A test pins it.
 - Docs: the decommission section said an attempt's connect and its send are
   each bounded by 10 s, and that the leave notification adds nothing to the
   budget while also giving it 2 s when the handoff used the budget up. An
