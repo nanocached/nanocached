@@ -4373,6 +4373,52 @@ async fn get_many_bytes_batch_over_the_byte_cap_splits_into_multiple_m_subframes
     node.stop();
 }
 
+// ── `B` on an established connection ────────────────────────────────
+
+/// Answers the `A` handshake, then every request with `B`, on a connection
+/// that is tagged or not.
+async fn busy_after_handshake_listener(tagged: bool) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                if socket.read(&mut buf).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let ack: &[u8] = if tagged { b"OnT\n" } else { b"On\n" };
+                let _ = socket.write_all(ack).await;
+                if socket.read(&mut buf).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let _ = socket.write_all(b"B\n").await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn busy_reply_to_a_waiting_request_is_a_connection_loss_untagged_or_tagged() {
+    for tagged in [false, true] {
+        let port = busy_after_handshake_listener(tagged).await;
+        let client = NanocachedClient::connect(options(port)).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), client.get("k"))
+            .await
+            .expect("get must not hang");
+        assert!(
+            matches!(result, Err(Error::ConnectionLost(_))),
+            "tagged={tagged}: {result:?}"
+        );
+        client.close().await;
+    }
+}
+
 // ── o/y namespace x keys limit (64 MiB) ─────────────────────────────
 
 // A namespace just over 64 MiB / 400 = 167,772 bytes: 400 keys of it in one
