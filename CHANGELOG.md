@@ -82,6 +82,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e`: `cl.sh` (and so every scenario that sources it) and `i92.sh`
+  defaulted `NODE`, `DISC` and `PROXY` to the `:0.3.0` images, so forgetting
+  to pass them ran years-old binaries without a word. They now default to the
+  `:dev` tags the scenario headers tell you to build, which fail at once when
+  the image does not exist (#1744).
+
 - `tests/e2e/freshjoin.sh`: a mistyped `MODE` fell through the `case`, so
   only the join ran and the script reported PASS. An unknown `MODE` now
   exits 2 with the list of valid modes before anything is started (#1743).
