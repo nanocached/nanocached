@@ -579,6 +579,17 @@ const FORCED_REFRESH_MIN_INTERVAL_MS = 200;
 // bound on top of this one.
 export const MAX_BATCH_KEYS = 400;
 
+// The most a node accepts of an `o`/`y` frame's namespace length x key count.
+const MAX_NAMESPACE_KEY_PRODUCT = 64 * 1024 * 1024;
+
+/** Keys per `o`/`y` chunk for `namespace`: MAX_BATCH_KEYS, or fewer when
+ * the namespace is long enough for 400 of them to pass the node's
+ * namespace-length x key-count limit. */
+function maxKeysForNamespace(namespace: Uint8Array): number {
+  if (namespace.length === 0) return MAX_BATCH_KEYS;
+  return Math.max(1, Math.min(MAX_BATCH_KEYS, Math.floor(MAX_NAMESPACE_KEY_PRODUCT / namespace.length)));
+}
+
 // Batch chunking's byte bound (issue #222): finds the largest run starting
 // at `start` — at most MAX_BATCH_KEYS entries — whose namespace, plus
 // protocol.ts's own MULTI_FRAME_HEADER_SLACK, plus per-entry wire cost
@@ -595,10 +606,22 @@ export const MAX_BATCH_KEYS = 400;
 // entry eagerly, before chunking ever starts (see
 // getManyBytesInNamespace/setManyInNamespace), so a run is never empty
 // and this always makes progress.
-function nextChunkEnd(namespace: Uint8Array, count: number, start: number, entryBytes: (index: number) => number): number {
+//
+// `o` and `y` frames have one more bound: the node rejects (`En`, then
+// closes) a frame whose namespace length times its key count exceeds 64 MiB,
+// which would also fail every other request in flight on that connection.
+// `maxKeys` is how a chunk of those stays below it; a namespace is at most
+// 1 MiB, so it is never under 64 keys.
+function nextChunkEnd(
+  namespace: Uint8Array,
+  count: number,
+  start: number,
+  entryBytes: (index: number) => number,
+  maxKeys: number = MAX_BATCH_KEYS,
+): number {
   let end = start;
   let total = namespace.length + MULTI_FRAME_HEADER_SLACK;
-  while (end < count && end - start < MAX_BATCH_KEYS) {
+  while (end < count && end - start < maxKeys) {
     const next = total + entryBytes(end);
     if (end > start && next > MAX_REQUEST_BYTES) break;
     total = next;
@@ -2094,7 +2117,7 @@ export class NanocachedClient {
   ): Promise<{ entries: TouchAnswer[]; resolved: number; sentEnd: number; error: unknown }> {
     const entries: TouchAnswer[] = [];
     for (let start = 0; start < keyBytes.length; ) {
-      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]));
+      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]), maxKeysForNamespace(namespace));
       let connected = false;
       try {
         const connection = await connectionFor();
@@ -2860,7 +2883,7 @@ export class NanocachedClient {
   ): Promise<MultiAckEntry[]> {
     const entries: MultiAckEntry[] = new Array(keyBytes.length);
     for (let start = 0; start < keyBytes.length; ) {
-      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiSetEntryCost(keyBytes[i], valueBytes[i]));
+      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiSetEntryCost(keyBytes[i], valueBytes[i]), maxKeysForNamespace(namespace));
       try {
         const connection = await connectionFor();
         const chunkEntries = await connection.multiSet(keyBytes.slice(start, end), valueBytes.slice(start, end), ttlSeconds, namespace);
@@ -4013,6 +4036,13 @@ export class NanocachedClient {
           ? error instanceof ConnectionLostError && error.requestWasSent === false
           : isConnectionError(error));
       if (!retryable || this.target.kind === "single") throw error;
+      // In proxy mode a request's own timeout is not resent: the proxy
+      // accepted the frame and never answered, so a redial would stall for
+      // another full window (Go, Rust, Java and .NET do not resend it
+      // either). In cluster mode the retry stays, as in those SDKs: it
+      // refreshes and re-resolves the owners, and a hung node may have
+      // been dropped from discovery by then.
+      if (this.target.kind === "proxy" && error instanceof ConnectionLostError && error.requestTimedOut) throw error;
       await this.maybeRefreshNodeList({ force: true });
       return await operation();
     }

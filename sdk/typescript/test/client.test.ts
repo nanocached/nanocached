@@ -2178,9 +2178,8 @@ describe("NanocachedClient request timeout (issue #42)", () => {
         node.goSilentAfterHandshake();
 
         const started = Date.now();
-        // The client's retry layer redials once after the first timeout;
-        // the redialed connection times out too, so this settles after
-        // roughly two windows — still bounded.
+        // In cluster mode the client's retry layer redials once after the
+        // first timeout (see the tests below); single mode does not.
         await assert.rejects(
           client.get("k"),
           (error: unknown) =>
@@ -2192,6 +2191,72 @@ describe("NanocachedClient request timeout (issue #42)", () => {
       }
     } finally {
       await node.close();
+    }
+  });
+
+  it("in proxy mode a request that hit the request timeout is not redialed and resent", async () => {
+    // Go, Rust, Java and .NET do not resend a proxy-mode request after its
+    // own timeout: the same hung proxy would stall the resend for another
+    // full window.
+    const proxy = await startMockNode();
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([{ name: "proxy-1", address: proxy.address }]);
+    try {
+      REQUEST_TIMEOUT_TUNING.timeoutMs = 200;
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+        viaProxy: true,
+      });
+      try {
+        await client.set("k", "v");
+        proxy.goSilentAfterHandshake();
+        const connectionsBefore = proxy.connectionCount();
+
+        const started = Date.now();
+        await assert.rejects(
+          client.get("k"),
+          (error: unknown) => error instanceof Error && /request timed out/.test(error.message),
+        );
+        const elapsed = Date.now() - started;
+        assert.ok(elapsed < 350, `get() took ${elapsed}ms: it was resent after the timeout`);
+        assert.equal(proxy.connectionCount(), connectionsBefore, "no redial after a request timeout");
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), proxy.close()]);
+    }
+  });
+
+  it("in cluster mode a request that hit the request timeout is retried once after a refresh", async () => {
+    // As Go's withClusterRetry, Java's withWrongNodeRetry and .NET's
+    // WithClusterRetryAsync: the cluster-level retry re-resolves the owners
+    // after a forced refresh, so a timed-out request gets exactly one more
+    // attempt (here on a new connection to the same silent node).
+    const node = await startMockNode();
+    const discovery = await startMockDiscovery([{ name: "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", address: node.address }]);
+    try {
+      REQUEST_TIMEOUT_TUNING.timeoutMs = 200;
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+      });
+      try {
+        await client.set("k", "v");
+        node.goSilentAfterHandshake();
+        const connectionsBefore = node.connectionCount();
+        const listsBefore = discovery.listCount();
+
+        await assert.rejects(
+          client.get("k"),
+          (error: unknown) => error instanceof Error && /request timed out/.test(error.message),
+        );
+        assert.equal(node.connectionCount(), connectionsBefore + 1, "one retry on a new connection");
+        assert.ok(discovery.listCount() > listsBefore, "the retry follows a forced refresh");
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), node.close()]);
     }
   });
 
@@ -3572,6 +3637,49 @@ describe("NanocachedClient batch chunking cumulative byte bound (issue #222)", (
         for (const key of keys) {
           assert.deepEqual(got.get(key), values[key]);
         }
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient o/y chunks stay under the 64 MiB namespace x keys limit (issue #1726)", () => {
+  // The node rejects an `o`/`y` frame whose namespace length times key count
+  // exceeds 64 MiB (`En`, then closes the connection). 170,000 x 400 keys is
+  // 68,000,000 > 67,108,864, so the 400-key chunk has to be split at 394.
+  const LIMIT = 64 * 1024 * 1024;
+  const namespace = "n".repeat(170_000);
+  const keys = Array.from({ length: 400 }, (_, i) => `key-${i}`);
+
+  it("splits a multi-set so no o frame passes the limit", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.namespace(namespace).setMany(Object.fromEntries(keys.map((k) => [k, "v"])));
+        const counts = node.multiSetKeyCounts();
+        assert.equal(counts.reduce((a, b) => a + b, 0), 400);
+        for (const count of counts) assert.ok(count * 170_000 <= LIMIT, `o frame of ${count} keys passes the limit`);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("splits a touch-many so no y frame passes the limit", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.namespace(namespace).touchMany(keys, 60);
+        const frames = node.multiTouchFrames();
+        assert.equal(frames.reduce((a, f) => a + f.keys.length, 0), 400);
+        for (const frame of frames) assert.ok(frame.keys.length * 170_000 <= LIMIT, `y frame of ${frame.keys.length} keys passes the limit`);
       } finally {
         await client.close();
       }
