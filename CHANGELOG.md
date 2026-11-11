@@ -14,6 +14,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the SDKs page said nothing about the limit on an `o` or `y` frame
+  (namespace length times the number of keys, at most 64 MiB), and the
+  protocol page said the SDKs reach it only with a namespace over 167,772
+  bytes. Both now say that the SDKs cap the keys per frame at
+  min(400, floor(64 MiB / namespace length)), so a long namespace means more,
+  smaller frames and never a refused batch (#1730).
+
 - Docs: the decommission section said an attempt's connect and its send are
   each bounded by 10 s, and that the leave notification adds nothing to the
   budget while also giving it 2 s when the handoff used the budget up. An

@@ -291,8 +291,14 @@ existed, err := client.Delete("greeting")</code></pre>
   batch reply total at most 16 MiB, and a hit past that budget is
   answered as a miss. A caller reading many large keys at once should
   not take an absent key for evicted; read it again on its own. Hedged
-  reads and read repair apply to single-key reads only. See
-  <a href="protocol.html#multi">m / o</a>.</li>
+  reads and read repair apply to single-key reads only. A large batch is
+  split into frames of at most 400 keys; for <code>setMany</code> (and
+  <code>touchMany</code> / <code>getManyAndTouch</code> below) on a namespace
+  handle, the SDKs also cap the keys per frame at
+  min(400, floor(64&nbsp;MiB / namespace length)), because the node refuses
+  a frame whose namespace length times its number of keys exceeds
+  64&nbsp;MiB. A long namespace therefore means more, smaller frames, never a
+  refused batch. See <a href="protocol.html#multi">m / o</a>.</li>
   <li><b>Compare-and-set</b> — <code>putIfAbsent</code>,
   <code>replace</code> (present-only and exact-match forms), and a
   digest-conditioned delete, all atomic on the node that owns the key. An
