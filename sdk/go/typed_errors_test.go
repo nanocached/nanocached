@@ -103,6 +103,49 @@ func TestANonNodeAddressIsALostUnsentConnectionAndItsCooldownKeepsTheType(t *tes
 	}
 }
 
+// A listed address that answers as discovery at the initial connect is a
+// dead member with a reconnect cooldown, like one that fails to dial: Connect
+// succeeds on the healthy node, and the address reads as a lost connection
+// that was never used (issue #1800).
+func TestConnectToleratesAListedAddressThatAnswersAsDiscovery(t *testing.T) {
+	const key = "k"
+	nodes, discovery := startCluster(t, 1)
+	owners := ownersOf(key)
+	good, bad := owners[1], owners[0]
+	discovery.setNodes([]discoveredNode{
+		{Name: good, Address: nodes[good].address()},
+		{Name: bad, Address: startMockDiscovery(t, nil, 1).address()},
+	})
+
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatalf("Connect() = %v, want success with one healthy node", err)
+	}
+	t.Cleanup(client.Close)
+
+	for attempt := 1; attempt <= 2; attempt++ { // the second one is the cooldown entry
+		_, err := client.slotConnection(bad)
+		if !errors.Is(err, ErrConnectionLost) || !errors.Is(err, errRequestNotSent) || errors.Is(err, ErrProtocol) {
+			t.Fatalf("attempt %d: slotConnection = %v, want ErrConnectionLost marked not sent", attempt, err)
+		}
+	}
+	if _, err := client.slotConnection(good); err != nil {
+		t.Fatalf("slotConnection(healthy) = %v", err)
+	}
+}
+
+// With no reachable node at all, Connect still fails, and with a lost
+// connection error rather than a protocol one.
+func TestConnectFailsWhenEveryListedAddressAnswersAsDiscovery(t *testing.T) {
+	discovery := startMockDiscovery(t, []discoveredNode{
+		{Name: testNames[0], Address: startMockDiscovery(t, nil, 1).address()},
+	}, 1)
+	_, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Connect() = %v, want ErrConnectionLost", err)
+	}
+}
+
 func TestOperationsRefreshAndRerouteWhenTheirPrimaryAnswersAsANonNode(t *testing.T) {
 	const key = "k"
 	cases := map[string]func(c *Client) error{

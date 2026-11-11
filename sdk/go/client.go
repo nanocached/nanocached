@@ -823,10 +823,9 @@ func dedupeDiscoveredNodes(nodes []discoveredNode) []discoveredNode {
 // failing, and the next request after the cooldown redials it. Only a
 // cluster with *no* reachable node fails Connect, with the last dial
 // error. A listed address that identifies as something other than a node
-// (a discovery misconfiguration, not a transient failure) remains a hard,
-// non-tolerated error, checked before anything is installed so it can't
-// leak a socket successfully opened for a different node in the same
-// dial round.
+// (its IP reused by a discovery or proxy process) is treated the same way,
+// with the not-sent lost-connection error a redial gives it; nothing
+// belonging to the other members is closed.
 func (c *Client) openCluster(result *identified) error {
 	replication, err := result.nodeReplication()
 	if err != nil {
@@ -850,24 +849,26 @@ func (c *Client) openCluster(result *identified) error {
 	}
 	wg.Wait()
 
-	for i, outcome := range outcomes {
-		if outcome.err == nil && outcome.result.conn == nil {
-			for _, other := range outcomes {
-				if other.err == nil && other.result.conn != nil {
-					_ = other.result.conn.Close()
-				}
-			}
-			return protocolErrorf(
-				"nanocached: discovery server returned a non-node address: %s", nodes[i].Address)
-		}
-	}
-
 	names := make([]string, 0, len(nodes))
 	reachable := 0
 	var lastError error
 	for i, node := range nodes {
 		names = append(names, node.Name)
 		outcome := outcomes[i]
+
+		// A listed address that identifies as something other than a
+		// cache node (its IP reused by a discovery or proxy process) is
+		// the dial's failure like an unreachable one — the same not-sent
+		// lost connection openNodeConnection gives a redial — so one
+		// such address cannot keep every new client from starting.
+		cooldownError := error(nil)
+		if outcome.err != nil {
+			cooldownError = handshakeFailureAsLost(node.Address, outcome.err)
+		} else if outcome.result.conn == nil {
+			cooldownError = notSent(connectionLost(
+				"nanocached: "+node.Address+" no longer identifies as a cache node", nil))
+			outcome.err = cooldownError
+		}
 
 		if outcome.err != nil {
 			c.members[node.Name] = &member{address: node.Address, connection: deadConnection()}
@@ -877,7 +878,7 @@ func (c *Client) openCluster(result *identified) error {
 					until: time.Now().Add(c.reconnectCooldown),
 					// What Connect returns stays as it is; the entry is
 					// what an operation routed to the address will see.
-					err: handshakeFailureAsLost(node.Address, outcome.err),
+					err: cooldownError,
 				}
 				c.redialCooldownMu.Unlock()
 			}
