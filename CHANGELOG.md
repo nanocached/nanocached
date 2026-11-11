@@ -45,6 +45,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: an `i`/`k`/`x` dispatched inline behind an earlier one that returned
+  early (no roster, or no owner for its key) released its ordering signal at
+  once instead of after the earlier command's, so a pipelined same-key
+  request could be enqueued on the replica ahead of that command's result.
+  The signal now waits for the earlier command as it would have after a
+  normal return. (#1713)
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a

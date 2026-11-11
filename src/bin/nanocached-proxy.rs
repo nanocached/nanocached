@@ -4626,6 +4626,7 @@ async fn dispatch_request(
         // No roster yet: `R` for a retry-capable client (tagged — this
         // answers a specific request), the legacy bare `B` otherwise.
         let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+        slot.release_after_waits();
         return result_rx;
     };
 
@@ -6630,6 +6631,7 @@ async fn dispatch_primary_evaluated(
     let owners = ring.owners(&namespace, &key);
     let Some(primary) = owners.first() else {
         let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+        slot.release_after_waits();
         return;
     };
     let pending = context
@@ -7477,6 +7479,26 @@ struct OrderSlot {
     /// replicas, and before it releases `signal` — a request waiting for
     /// `signal` is thereby behind the whole run.
     after: Vec<OrderWait>,
+}
+
+impl OrderSlot {
+    /// Ends a slot whose request returned without a command of its own to
+    /// wait for (no ring, no owner): its signal is released only once the
+    /// points in `after` are, as it would have been after the command, so a
+    /// request waiting for it is still behind the `i`/`k`/`x` dispatched
+    /// inline ahead of this one.
+    fn release_after_waits(self) {
+        let OrderSlot { signal, after } = self;
+        if after.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            for wait in after {
+                order_wait(wait).await;
+            }
+            drop(signal);
+        });
+    }
 }
 
 /// What `ConnectionOrder::admit` decided about one request.
@@ -16063,6 +16085,45 @@ mod tests {
         // The released entries are not waited for again.
         let released = order.admit(&order_request("get", "other"));
         assert!(released.waits.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_inline_incr_that_returns_early_keeps_the_run_it_follows_in_the_order() {
+        // `i1`, then `i2` inline behind it (`after = [i1]`): when `i2`
+        // returns early (no roster) its signal must not be released ahead of
+        // `i1`'s, or a same-key request admitted next sees nothing to wait
+        // for and is enqueued on the replica before `i1`'s result.
+        let context = Arc::new(bare_context());
+        let mut order = ConnectionOrder::new();
+        let first = order.admit(&order_request("incr", "k"));
+        let second = order.admit(&order_request("incr", "k"));
+        assert_eq!(second.waits.len(), 1);
+        assert!(!second.defer);
+
+        let budget = InFlightBudget::new(1024);
+        let charge = Arc::new(InFlightCharge::try_charge(1, [&budget, &budget, &budget]).unwrap());
+        let _reply = dispatch_request(
+            context,
+            order_request("incr", "k"),
+            None,
+            false,
+            charge,
+            second.into_slot(),
+        )
+        .await;
+
+        let behind = order.admit(&order_request("get", "k"));
+        assert_eq!(
+            behind.waits.len(),
+            1,
+            "the second incr's signal was released while the first was still pending"
+        );
+        tokio::task::yield_now().await;
+        assert!(order_pending(&behind.waits[0]));
+        drop(first);
+        timeout(Duration::from_secs(5), order_wait(behind.waits[0].clone()))
+            .await
+            .expect("the wait ends once the first incr's signal does");
     }
 
     #[test]
