@@ -45,6 +45,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e`: `cl.sh` (and so every scenario that sources it) and `i92.sh`
+  defaulted `NODE`, `DISC` and `PROXY` to the `:0.3.0` images, so forgetting
+  to pass them ran years-old binaries without a word. They now default to the
+  `:dev` tags the scenario headers tell you to build, which fail at once when
+  the image does not exist (#1744).
+
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a

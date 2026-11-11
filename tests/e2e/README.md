@@ -162,7 +162,11 @@ judged by their own test suites.
 ## Shared helpers
 
 - `cl.sh` — sourced by the scenarios: `disc_up`, `node_up`, `members`,
-  `wait_members`, `load`, `load_ops`, `summ`, `warns`.
+  `wait_members`, `load`, `load_ops`, `summ`, `warns`. `NODE`, `DISC` and
+  `PROXY` default to the `:dev` tags (`nanocached-node:dev`,
+  `nanocached-discovery:dev`, `nanocached-proxy:dev`), the images the scenario
+  headers ask you to build from the checked-out tree; `i92.sh` (which does not
+  source `cl.sh`) defaults its `NODE` the same way.
 - `disc.py` (query `L`), `verify.py` (seed/check; `scalein.sh`, `proxydrain.sh`,
   `proxykill.sh`, `freshjoin.sh` and `chaos.sh` run each under `tmo 300` in a named
   container, and a seed that fails or times out ends the run, a check with no
