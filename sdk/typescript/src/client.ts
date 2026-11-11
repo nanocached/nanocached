@@ -665,13 +665,13 @@ function trackOpenTarget(key: string, sockets: Array<Socket | TLSSocket>): void 
 /** Outcome of dialing one node discovery listed, during cluster bootstrap
  * (issue #67). `"ok"` and `"unreachable"` are both tolerated — see
  * `NanocachedClient.connect`'s cluster branch; `"hard"` (a listed address
- * that identifies as something other than a node, or an actual
- * programming bug surfacing from the dial) aborts connect() outright,
- * exactly as it always has. */
+ * that fails with an actual programming bug surfacing from the dial)
+ * aborts connect() outright. An address that identifies as something other
+ * than a node is `"unreachable"` with a `cooldownError`. */
 type ClusterDialOutcome =
   | { node: DiscoveredNode; kind: "ok"; socket: Socket | TLSSocket; tagged: boolean }
-  | { node: DiscoveredNode; kind: "unreachable"; error: Error }
-  | { node: DiscoveredNode; kind: "hard"; error: Error };
+  | { node: DiscoveredNode; kind: "unreachable"; error: Error; cooldownError?: Error }
+  | { node: DiscoveredNode; kind: "hard"; error: Error; cooldownError?: undefined };
 
 /** Dials one node from discovery's list. Never rejects — every outcome,
  * including a hard failure, comes back as a `ClusterDialOutcome` so
@@ -706,10 +706,15 @@ async function dialClusterNode(
   }
 
   if (identified.kind !== "node") {
+    // Like a failed dial: the address is installed as a dead member. The
+    // cooldown error is connection-classified and never sent (what a redial
+    // of such an address throws), so an operation routed here refreshes and
+    // reroutes; `error` is what connect() throws if nothing else is reachable.
     return {
       node,
-      kind: "hard",
+      kind: "unreachable",
       error: new NanocachedError(`nanocached: discovery server returned a non-node address: ${node.address}`),
+      cooldownError: new ConnectionLostError(`nanocached: ${node.address} does not identify as a cache node`, { requestWasSent: false }),
     };
   }
 
@@ -1178,11 +1183,11 @@ export class NanocachedClient {
       // member with no connection and its reconnect cooldown armed
       // (exactly the state a member is in after dying mid-life), so it
       // stays in the ring and requests for its keys fail over per
-      // request instead of the whole connect() failing. A listed address
-      // that identifies as something other than a node (or an actual dial
-      // bug) is still a hard error — another address would hand back the
-      // same node list, so don't try one; another address would hand back
-      // the same node list either way. Only a cluster with *no* reachable
+      // request instead of the whole connect() failing. So is a listed
+      // address that identifies as something other than a node (an IP
+      // another kind of server reused). An actual dial bug is still a hard
+      // error — another address would hand back the same node list, so
+      // don't try one. Only a cluster with *no* reachable
       // node at all fails connect(), with the last dial error.
       const outcomes = await mapBounded(nodes, MAX_CONCURRENT_DIALS, (node) =>
         dialClusterNode(node, options.authSecret, options.tls, ca),
@@ -1212,7 +1217,7 @@ export class NanocachedClient {
           reachable++;
         } else {
           members.set(outcome.node.name, { address: outcome.node.address, connection: null });
-          cooldowns.push([outcome.node.address, { until: Date.now() + reconnectCooldownMs, error: outcome.error }]);
+          cooldowns.push([outcome.node.address, { until: Date.now() + reconnectCooldownMs, error: outcome.cooldownError ?? outcome.error }]);
           lastNodeError = outcome.error;
         }
       }
