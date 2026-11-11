@@ -986,6 +986,10 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 if state.silent.load(Ordering::SeqCst) {
                     continue;
                 }
+                let gets_delay = state.gets_delay_ms.load(Ordering::SeqCst);
+                if gets_delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(gets_delay as u64)).await;
+                }
                 let this_multi_get = state.multi_gets.fetch_add(1, Ordering::SeqCst) + 1;
                 let die_after = state.die_after_multi_get_frames.load(Ordering::SeqCst);
                 if die_after != 0 && this_multi_get > die_after {
@@ -7336,6 +7340,60 @@ async fn fire_and_forget_replicas_falls_back_to_synchronous_past_the_cap() {
     );
 
     client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn an_operation_still_running_after_close_does_not_refresh_the_node_list() {
+    // A multi-key read still in flight when close() runs, with one leg
+    // failed (its node is down), used to run its forced refresh anyway: a
+    // discovery round trip (here 4 s of slow discovery) on a closed client.
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = Arc::new(
+        NanocachedClient::connect(options(discovery.port))
+            .await
+            .unwrap(),
+    );
+    let on_a = key_with_primary(NAMES[0]);
+    let on_b = key_with_primary(NAMES[1]);
+    client.set(&on_a, "a", 0).await.unwrap();
+    client.set(&on_b, "b", 0).await.unwrap();
+    node_by_name(&nodes, NAMES[1])
+        .state
+        .gets_delay_ms
+        .store(1500, Ordering::SeqCst);
+    node_by_name(&nodes, NAMES[0]).stop();
+    discovery.l_delay_ms.store(4000, Ordering::SeqCst);
+    let fetches_before = discovery.l_requests.load(Ordering::SeqCst);
+
+    let caller = {
+        let client = Arc::clone(&client);
+        let keys = vec![on_a.clone(), on_b.clone()];
+        tokio::spawn(async move {
+            let _ = client.get_many(&keys).await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let closed_at = std::time::Instant::now();
+    client.close().await;
+    tokio::time::timeout(std::time::Duration::from_secs(15), caller)
+        .await
+        .expect("get_many did not return")
+        .unwrap();
+    assert_eq!(
+        discovery.l_requests.load(Ordering::SeqCst),
+        fetches_before,
+        "no node-list fetch after close()"
+    );
+    assert!(
+        closed_at.elapsed() < std::time::Duration::from_secs(3),
+        "get_many finished {:?} after close()",
+        closed_at.elapsed()
+    );
+
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
