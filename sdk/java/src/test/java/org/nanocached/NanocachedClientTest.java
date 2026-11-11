@@ -8268,7 +8268,29 @@ class NanocachedClientTest {
         final AtomicInteger connections = new AtomicInteger();
 
         HttpGarbageListener(int port) throws java.io.IOException {
-            server = new java.net.ServerSocket(port);
+            // Re-binding a just-stopped node's port can briefly fail while its
+            // listener and accepted sockets finish closing: bind with
+            // SO_REUSEADDR and retry within a short bounded deadline.
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            java.net.ServerSocket bound;
+            while (true) {
+                bound = new java.net.ServerSocket();
+                try {
+                    bound.setReuseAddress(true);
+                    bound.bind(new java.net.InetSocketAddress(port));
+                    break;
+                } catch (java.io.IOException bindFailed) {
+                    bound.close();
+                    if (System.nanoTime() >= deadline) throw bindFailed;
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new java.io.InterruptedIOException("interrupted while re-binding port " + port);
+                    }
+                }
+            }
+            server = bound;
             Thread acceptor = new Thread(() -> {
                 while (!server.isClosed()) {
                     try {
