@@ -5352,6 +5352,56 @@ async fn an_address_that_answers_as_discovery_on_redial_makes_the_operation_refr
 }
 
 #[tokio::test]
+async fn connect_tolerates_a_listed_address_that_answers_as_discovery() {
+    let (nodes, discovery) = start_cluster(1).await;
+    // NAMES[0] is listed at an address another service took over: a
+    // discovery server answers there.
+    let impostor = MockDiscovery::start(Vec::new(), 1).await;
+    *discovery.nodes.lock().unwrap() = vec![
+        (NAMES[0].to_string(), format!("127.0.0.1:{}", impostor.port)),
+        (NAMES[1].to_string(), node_named(&nodes, NAMES[1]).address()),
+    ];
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .expect("connect succeeds with one healthy node");
+
+    // A key owned by the impostor reports a lost connection; one owned by
+    // the healthy node is served.
+    let bad_key = key_with_primary(NAMES[0]);
+    assert!(matches!(
+        client.set(&bad_key, "v", 0).await,
+        Err(Error::ConnectionLost(_))
+    ));
+    let good_key = key_with_primary(NAMES[1]);
+    client.set(&good_key, "v", 0).await.unwrap();
+    assert!(client.get(&good_key).await.unwrap().is_some());
+
+    impostor.stop();
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn connect_fails_with_a_lost_connection_when_every_listed_address_answers_as_discovery() {
+    let impostor = MockDiscovery::start(Vec::new(), 1).await;
+    let discovery = MockDiscovery::start(
+        vec![(NAMES[0].to_string(), format!("127.0.0.1:{}", impostor.port))],
+        1,
+    )
+    .await;
+
+    let result = NanocachedClient::connect(options(discovery.port)).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "result = {:?}",
+        result.err()
+    );
+
+    impostor.stop();
+    discovery.stop();
+}
+
+#[tokio::test]
 async fn batch_touch_ends_on_a_whole_frame_wrong_node_on_a_single_node() {
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
