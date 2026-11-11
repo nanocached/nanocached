@@ -1104,8 +1104,7 @@ public final class NanocachedClient implements AutoCloseable {
     /** One bootstrap dial's outcome (issue #67): a live connection, or a
      * connection-level failure to tolerate — exactly one of {@link
      * #connection}/{@link #error} is set. A hard failure (an unparseable
-     * address, or an address that identifies as something other than a
-     * cache node) is a distinct, non-tolerated case — see {@link #hard}
+     * address) is a distinct, non-tolerated case — see {@link #hard}
      * and {@link #dialBootstrapNode}. */
     private static final class DialOutcome {
         final Connection connection;
@@ -1138,10 +1137,10 @@ public final class NanocachedClient implements AutoCloseable {
      * identify exchange failing or being rejected — is tolerated and
      * comes back as {@link DialOutcome#tolerable}, exactly the class of
      * failure {@link #dialWithCooldown} already tolerates on a lazy
-     * redial. An unparseable address, or an address that identifies as
-     * something other than a cache node, is a hard error today and stays
-     * one — reported as {@link DialOutcome#hard} rather than thrown
-     * directly, so {@link #openCluster} can close whatever the other
+     * redial, and so is an address that identifies as something other
+     * than a cache node (a discovery or proxy process that reused the IP).
+     * An unparseable address is a hard error and stays one — reported as
+     * {@link DialOutcome#hard} rather than thrown directly, so {@link #openCluster} can close whatever the other
      * concurrent dials already opened before it aborts the whole
      * bootstrap.
      */
@@ -1168,8 +1167,12 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         if (!(identified instanceof Identify.NodeTarget nodeTarget)) {
-            return DialOutcome.hard(new NanocachedException.ConnectionLost(
-                    "nanocached: discovery server returned a non-node address: " + address, null, true));
+            // Same not-sent lost-connection error the lazy redial path uses
+            // (issue #1802): an address whose IP was reused by a discovery
+            // or proxy process is a dead member with a reconnect cooldown,
+            // not a reason to fail every new client's connect.
+            return DialOutcome.tolerable(new NanocachedException.ConnectionLost(
+                    "nanocached: " + address + " does not identify as a cache node", null, true));
         }
 
         try {
@@ -1216,8 +1219,7 @@ public final class NanocachedClient implements AutoCloseable {
      * cooldown redials it. Only a cluster with <em>no</em> reachable node
      * fails, with the last dial error.
      *
-     * <p>A hard failure — an unparseable address, or an address that
-     * identifies as something other than a cache node — aborts the whole
+     * <p>A hard failure — an unparseable address — aborts the whole
      * bootstrap regardless of how any other node fared, exactly as a
      * sequential dial hitting the same condition always has; every
      * connection another concurrent dial already opened is closed first
@@ -6744,8 +6746,7 @@ public final class NanocachedClient implements AutoCloseable {
                 // with every peer that did reach it until the next refresh
                 // (extra W answers and refreshes); kept, its keys fail over
                 // per request and its next use redials it. A hard failure
-                // (an unparseable address, or one that is not a cache node)
-                // is kept the same way, holding its own error in the
+                // (an unparseable address) is kept the same way, holding its own error in the
                 // cooldown: every peer ranks the node whatever its address
                 // turns out to be, and discovery dropping it ends it.
                 members.put(node.name(), new Member(node.address(), null));

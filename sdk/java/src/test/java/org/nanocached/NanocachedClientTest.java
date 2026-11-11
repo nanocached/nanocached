@@ -3548,10 +3548,57 @@ class NanocachedClientTest {
         }
         try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
             discovery.nodes = List.of(new DiscoveredNode(NAMES.get(0), "127.0.0.1:" + discovery.port()));
-            NanocachedException error = assertThrows(NanocachedException.class,
+            // Listed nodes that are all non-nodes: nothing is reachable, so the
+            // connect fails with the last dial error (the not-sent lost
+            // connection the redial path uses), not a configuration error.
+            NanocachedException.ConnectionLost error = assertThrows(NanocachedException.ConnectionLost.class,
                     () -> connect("127.0.0.1", discovery.port()));
-            assertEquals(NanocachedException.class, error.getClass());
-            assertTrue(error.getMessage().contains("non-node address"), error.getMessage());
+            assertTrue(error.getMessage().contains("does not identify as a cache node"), error.getMessage());
+        }
+    }
+
+    @Test
+    void aListedAddressThatAnswersAsDiscoveryIsADeadMemberAtTheInitialConnect() throws Exception {
+        // One healthy node plus one listed address whose IP now belongs to a
+        // discovery process: connect succeeds, the non-node is a member
+        // without a connection and with its cooldown armed, and keys it owns
+        // fail over to the healthy node.
+        try (Cluster cluster = startCluster(2)) {
+            MockNode live = cluster.nodes().get(NAMES.get(0));
+            String notACacheNode = "127.0.0.1:" + cluster.discovery().port();
+            cluster.discovery().nodes = List.of(
+                    new DiscoveredNode(NAMES.get(0), live.address()),
+                    new DiscoveredNode(NAMES.get(1), notACacheNode));
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                assertNull(memberConnectionOf(client, NAMES.get(1)));
+                assertTrue(memberConnectionOf(client, NAMES.get(0)) != null);
+
+                Field cooldownsField = NanocachedClient.class.getDeclaredField("reconnectCooldowns");
+                cooldownsField.setAccessible(true);
+                Map<?, ?> cooldowns = (Map<?, ?>) cooldownsField.get(client);
+                assertTrue(cooldowns.containsKey(notACacheNode), "the non-node address has its cooldown armed");
+
+                // A read of a key owned by the non-node fails over to the
+                // live replica; a write to it reports the lost connection.
+                String key = keyWithPrimary(NAMES.get(1));
+                live.store.put(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8)),
+                        "replica copy".getBytes(StandardCharsets.UTF_8));
+                assertEquals(Optional.of("replica copy"), client.get(key));
+                NanocachedException.ConnectionLost lost = assertThrows(
+                        NanocachedException.ConnectionLost.class, () -> client.set(key, "v"));
+                assertTrue(lost.getMessage().contains("does not identify as a cache node"), lost.getMessage());
+
+                // Inside the cooldown the dead member reports the not-sent
+                // lost connection the redial path uses.
+                Method memberConnection = NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
+                memberConnection.setAccessible(true);
+                java.lang.reflect.InvocationTargetException failure = assertThrows(
+                        java.lang.reflect.InvocationTargetException.class,
+                        () -> memberConnection.invoke(client, NAMES.get(1)));
+                assertTrue(failure.getCause() instanceof NanocachedException.ConnectionLost, failure.getCause().toString());
+                assertTrue(failure.getCause().getMessage().contains("does not identify as a cache node"),
+                        failure.getCause().getMessage());
+            }
         }
     }
 
