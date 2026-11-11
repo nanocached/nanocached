@@ -540,7 +540,10 @@ restart, a network blip) redials it before sending. In cluster mode a
 request whose connection is lost is also retried once, after a node-list
 refresh (an idempotent request always; `incr`/`decr` and the compare-and-set
 calls only when the SDK can prove nothing was sent — see "What never sent
-means" below). In single-node and `via_proxy` mode there is no node list to
+means" below). A request that got no answer within the 30 second request
+timeout is not resent: it raises `ConnectionLostError` after that one wait,
+since a second attempt against a node that does not answer would only wait
+as long again. In single-node and `via_proxy` mode there is no node list to
 refresh from, so a request that loses its connection while it is in flight is
 not retried: it raises `ConnectionLostError` (or `ConnectFailedError` when
 the redial fails), and the next call redials.

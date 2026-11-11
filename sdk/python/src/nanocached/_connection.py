@@ -23,7 +23,14 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 
-from ._errors import ConnectionLostError, NanocachedError, NotNumericError, RetryableError, WrongNodeError
+from ._errors import (
+    ConnectionLostError,
+    NanocachedError,
+    NotNumericError,
+    RequestTimeoutError,
+    RetryableError,
+    WrongNodeError,
+)
 
 # The server's own request cap is 1 MiB; this constant doubles that as
 # headroom, so a claimed length beyond it is definitely a corrupt or
@@ -819,7 +826,7 @@ class Connection:
         # also unblocks the read loop with EOF), and the retry layer
         # redials.
         self._poison(
-            ConnectionError(
+            RequestTimeoutError(
                 f"nanocached: no response from server within {_REQUEST_TIMEOUT}s (request timed out)"
             )
         )

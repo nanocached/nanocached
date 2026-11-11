@@ -1287,6 +1287,54 @@ class RequestTimeoutTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_a_cluster_request_that_timed_out_is_not_redialed_and_resent(self):
+        # A node that never answers held the request for the whole request
+        # timeout; a refresh, a redial and a second attempt would only
+        # wait that long again (Go/Rust/Java/.NET do not resend it).
+        node = await MockNode().start()
+        discovery = await MockDiscovery([(NAMES[0], node.address)]).start()
+        try:
+            self._connection_module._REQUEST_TIMEOUT = 0.3
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                await client.set("k", "v")
+                node.go_silent_after_handshake()
+                connections = node.connection_count
+                lists = discovery.list_count
+
+                started = asyncio.get_running_loop().time()
+                with self.assertRaisesRegex(ConnectionError, "request timed out"):
+                    await client.get("k")
+                self.assertLess(asyncio.get_running_loop().time() - started, 0.55)
+                with self.assertRaisesRegex(ConnectionError, "request timed out"):
+                    await client.set("k", "w")
+                with self.assertRaisesRegex(ConnectionError, "request timed out"):
+                    await client.delete("k")
+                # One timeout per call, never a redial of the same node
+                # inside it (each later call dials its own connection).
+                self.assertLessEqual(node.connection_count - connections, 3)
+                self.assertEqual(discovery.list_count, lists)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await node.close()
+
+    async def test_a_cluster_request_lost_outright_is_still_resent(self):
+        node = await MockNode().start()
+        discovery = await MockDiscovery([(NAMES[0], node.address)]).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                await client.set("k", "v")
+                node.drop_connections()
+                self.assertEqual(await client.get("k"), "v")
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await node.close()
+
     async def test_steady_new_requests_do_not_postpone_half_open_detection(self):
         # The deadline is progress-based: new sends must not extend it
         # while an older request is still waiting (mirrors the Go SDK's

@@ -57,6 +57,7 @@ from ._errors import (
     PartialServerTooOldError,
     PartialSetConnectionLostError,
     PartialWrongNodeError,
+    RequestTimeoutError,
     ServerTooOldError,
     WrongNodeError,
 )
@@ -2959,10 +2960,13 @@ class NanocachedClient:
             _, error = failures[0]
             raise error
 
-        await self._maybe_refresh(force=True)
-        failures = await self._clear_round(op)
-        if not failures:
-            return
+        if not any(isinstance(error, RequestTimeoutError) for _, error in failures):
+            await self._maybe_refresh(force=True)
+            failures = await self._clear_round(op)
+            if not failures:
+                return
+        # else: a node that held the request for the whole request timeout
+        # is not asked again (a second round would wait that long again).
 
         names = ", ".join(name for name, _ in failures)
         raise NanocachedError(f"nanocached: clear failed on: {names}")
@@ -3140,7 +3144,9 @@ class NanocachedClient:
         the wire when the connection died, so the server may have
         already applied it — resending would double an increment or
         misreport an already-successful CAS as a mismatch — so it
-        escapes here unretried instead. A plain (non-Lost) ConnectionError
+        escapes here unretried instead. A request that hit the request
+        timeout (RequestTimeoutError) escapes unretried for every
+        operation. A plain (non-Lost) ConnectionError
         or WrongNodeError means the request never reached the server at
         all either way, so it retries regardless of ``replay_safe``.
 
@@ -3155,6 +3161,13 @@ class NanocachedClient:
             if not replay_safe and isinstance(error, ConnectionLostError):
                 raise
             if rejection_is_final and _rejected_by_server(error):
+                raise
+            if isinstance(error, RequestTimeoutError):
+                # The node held the request for the whole request timeout
+                # without answering: a refresh and a second attempt would
+                # only wait that long again (Go/Rust/Java/.NET do not
+                # resend it either). A connection that was lost outright
+                # is still retried.
                 raise
             if self._ring is None:
                 raise

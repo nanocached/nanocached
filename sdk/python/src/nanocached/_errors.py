@@ -175,6 +175,16 @@ class ConnectionLostError(NanocachedError, ConnectionError):
         super().__init__(message)
 
 
+class RequestTimeoutError(ConnectionLostError):
+    """A request got no response within the request timeout, so its
+    connection was torn down. Not exported: callers see it as the
+    ConnectionLostError (and ConnectionError) it is. The client's retry
+    layer does not redial and resend a request that failed this way — a
+    node that does not answer would hold the call for a second timeout,
+    as in the Go, Rust, Java and .NET SDKs — while a connection that was
+    lost outright is still resent."""
+
+
 class PartialConnectionLostError(NanocachedError, ConnectionError):
     """Raised by get_many/get_many_bytes (issue #411) when a batch spans
     more than one ``m`` sub-frame (batch chunking, issue #222) and a
