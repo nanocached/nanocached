@@ -1373,10 +1373,26 @@ describe("NanocachedClient reconnect-on-use", () => {
         socket.on("close", () => garbageSockets.delete(socket));
         socket.write("XXX");
       });
-      await new Promise<void>((resolve, reject) => {
-        garbage.once("error", reject);
-        garbage.listen(port, "127.0.0.1", () => resolve());
-      });
+      // Re-binding a just-stopped node's port can briefly fail while its
+      // listener and accepted sockets finish closing: retry EADDRINUSE
+      // within a short bounded deadline (node's listen already sets
+      // SO_REUSEADDR on POSIX).
+      const rebindDeadline = Date.now() + 5_000;
+      for (;;) {
+        try {
+          await new Promise<void>((resolve, reject) => {
+            garbage.once("error", reject);
+            garbage.listen(port, "127.0.0.1", () => {
+              garbage.off("error", reject);
+              resolve();
+            });
+          });
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE" || Date.now() >= rebindDeadline) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      }
       try {
         // Still within the cooldown window: rejects with the cached
         // failure near-instantly, without dialing the listener at all.
