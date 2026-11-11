@@ -54,6 +54,10 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: a backend that closes each connection right after the handshake (so
+  the redial backoff resets every time) logged its exit line once per
+  request. The lines are now limited per backend address (3 per 10 s), with
+  the number dropped reported ahead of the next line written. (#1715)
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a
