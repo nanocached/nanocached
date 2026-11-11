@@ -1,6 +1,7 @@
 #!/bin/bash
 # #92: point a real node at a hostile discovery that floods the heartbeat
 # ack with a newline-less roster line. Watch the node's RSS.
+# No verdict: it prints the node's state every 3 s and exits 0 whatever it saw.
 MODE=${1:-flood}; SECS=${2:-40}
 export NET=e2e-92
 E="$(cd "$(dirname "$0")" && pwd)"
@@ -8,6 +9,7 @@ NODE=nanocached-node:0.3.0
 P=n92; F=$P-disc:8357
 T(){ echo "### $(date +%T) [$P] $*"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+trap cleanup EXIT  # Ctrl-C or a failed step must not leave the run's containers behind
 cleanup; docker network create $NET >/dev/null
 docker run -d --name $P-disc --network $NET -v $E:/w -w /w -e MODE=$MODE e2e-client python fakedisc92.py 8357 >/dev/null
 sleep 1

@@ -45,6 +45,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e`: the diagnostic scripts `i92.sh`, `i93.sh`, `i96.sh`, `lr.sh`,
+  `joinstale.sh` and `repro582.sh` always exit 0 after printing what they
+  measured, and the README did not say so. Its table now marks them
+  "No verdict" (and lists `joinstale.sh` and `repro582.sh`), all six remove
+  their containers on exit (`i92.sh` and `repro582.sh` had no `EXIT` trap),
+  and a setup wait that is not met (`i93.sh`'s `wait_members` and A's
+  handoff, and the membership waits of `i96.sh`, `lr.sh` and `joinstale.sh`)
+  now ends the run with exit 1 instead of printing a result that is not one
+  (#1745).
+
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a
