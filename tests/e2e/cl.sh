@@ -1,8 +1,11 @@
 #!/bin/bash
 E=${E:-"$(cd "$(dirname "$0")" && pwd)"}
 # Env-overridable so scenarios needing newer builds can point at locally
-# built images (docker build --target node -t nanocached-node:dev . etc.)
-NODE=${NODE:-nanocached-node:0.3.0}; DISC=${DISC:-nanocached-discovery:0.3.0}; PROXY=${PROXY:-nanocached-proxy:0.3.0}
+# built images (docker build --target node -t nanocached-node:dev . etc.).
+# The defaults are those :dev tags, the ones the scenario headers ask for, so a
+# forgotten NODE/DISC/PROXY fails at once on an image that is not built instead
+# of silently running an old release.
+NODE=${NODE:-nanocached-node:dev}; DISC=${DISC:-nanocached-discovery:dev}; PROXY=${PROXY:-nanocached-proxy:dev}
 NET=${NET:-e2e-b}
 CLIENT=${CLIENT:-e2e-client}
 disc_up(){ local n=$1; shift; docker run -d --name $n --network $NET ${DENV} $DISC --host 0.0.0.0 --port 8357 "$@" >/dev/null; }

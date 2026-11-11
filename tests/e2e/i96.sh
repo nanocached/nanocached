@@ -3,15 +3,18 @@
 # (= new address), lets the client connect to it, kills it so the client's
 # redial fails (cooldown entry), waits for eviction, removes the container.
 # Same as lr.sh's kill/restart rounds except the address is never reused.
+# No verdict on the result (read the per-round lines); exits 1 only when a
+# membership wait is not met.
 ROUNDS=${1:-20}; export NET=e2e-96
 E="$(cd "$(dirname "$0")" && pwd)"
 source $E/cl.sh
 P=c96; D=$P-disc:8357
 T(){ echo "### $(date +%T) [$P] $*"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+trap cleanup EXIT  # Ctrl-C or a failed step must not leave the run's containers behind
 cleanup; docker network create $NET >/dev/null
 disc_up $P-disc --replication-factor 1 --liveness-timeout 15; sleep 1
-node_up $P-node0 $D; wait_members 1 $D 60
+node_up $P-node0 $D; wait_members 1 $D 60 || { T "FAIL: node0 did not join"; exit 1; }
 docker run -d --name $P-probe ${PROBE_ENV} --network $NET -v $E:/w -w /w e2e-client python churn96.py $D 5 >/dev/null
 sleep 6; T "probe started"; docker logs $P-probe 2>&1 | tail -1
 for r in $(seq 1 $ROUNDS); do
@@ -19,10 +22,10 @@ for r in $(seq 1 $ROUNDS); do
   # distinct port per round: docker recycles the IP of a removed container
   # within seconds, so IP alone would make every round's address identical
   docker run -d --name $n --network $NET $NODE --host 0.0.0.0 --port $((8400+r)) --discovery $D >/dev/null
-  wait_members 2 $D 120 >/dev/null
+  wait_members 2 $D 120 >/dev/null || { T "FAIL: round $r: $n did not join"; exit 1; }
   sleep 10                                   # let the client refresh + dial the new node
   docker kill $n >/dev/null; sleep 5         # client redials the dead address -> cooldown entry
-  wait_members 1 $D 60 >/dev/null            # eviction
+  wait_members 1 $D 60 >/dev/null || { T "FAIL: round $r: $n was not evicted"; exit 1; }   # eviction
   docker rm $n >/dev/null
   sleep 3
   T "round $r: $(docker logs $P-probe 2>&1 | tail -1 | python3 -c 'import json,sys;d=json.load(sys.stdin);print("members=%d cooldowns=%d rss=%dkB errs=%d"%(d["members"],d["cooldowns"],d["rss_kb"],d["errs"]))')"
