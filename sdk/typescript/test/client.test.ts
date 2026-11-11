@@ -2178,7 +2178,8 @@ describe("NanocachedClient request timeout (issue #42)", () => {
         node.goSilentAfterHandshake();
 
         const started = Date.now();
-        // A request timeout is not redialed and resent (see the test below).
+        // In cluster mode the client's retry layer redials once after the
+        // first timeout (see the tests below); single mode does not.
         await assert.rejects(
           client.get("k"),
           (error: unknown) =>
@@ -2193,10 +2194,45 @@ describe("NanocachedClient request timeout (issue #42)", () => {
     }
   });
 
-  it("does not redial and resend a request that hit the request timeout", async () => {
-    // A request whose failure was its own timeout is not resent on a new
-    // connection (Go/Rust/Java/.NET do not either): a hung node would
-    // otherwise hold the call for two windows. Connection loss still is.
+  it("in proxy mode a request that hit the request timeout is not redialed and resent", async () => {
+    // Go, Rust, Java and .NET do not resend a proxy-mode request after its
+    // own timeout: the same hung proxy would stall the resend for another
+    // full window.
+    const proxy = await startMockNode();
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([{ name: "proxy-1", address: proxy.address }]);
+    try {
+      REQUEST_TIMEOUT_TUNING.timeoutMs = 200;
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+        viaProxy: true,
+      });
+      try {
+        await client.set("k", "v");
+        proxy.goSilentAfterHandshake();
+        const connectionsBefore = proxy.connectionCount();
+
+        const started = Date.now();
+        await assert.rejects(
+          client.get("k"),
+          (error: unknown) => error instanceof Error && /request timed out/.test(error.message),
+        );
+        const elapsed = Date.now() - started;
+        assert.ok(elapsed < 350, `get() took ${elapsed}ms: it was resent after the timeout`);
+        assert.equal(proxy.connectionCount(), connectionsBefore, "no redial after a request timeout");
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), proxy.close()]);
+    }
+  });
+
+  it("in cluster mode a request that hit the request timeout is retried once after a refresh", async () => {
+    // As Go's withClusterRetry, Java's withWrongNodeRetry and .NET's
+    // WithClusterRetryAsync: the cluster-level retry re-resolves the owners
+    // after a forced refresh, so a timed-out request gets exactly one more
+    // attempt (here on a new connection to the same silent node).
     const node = await startMockNode();
     const discovery = await startMockDiscovery([{ name: "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", address: node.address }]);
     try {
@@ -2208,15 +2244,14 @@ describe("NanocachedClient request timeout (issue #42)", () => {
         await client.set("k", "v");
         node.goSilentAfterHandshake();
         const connectionsBefore = node.connectionCount();
+        const listsBefore = discovery.listCount();
 
-        const started = Date.now();
         await assert.rejects(
           client.get("k"),
           (error: unknown) => error instanceof Error && /request timed out/.test(error.message),
         );
-        const elapsed = Date.now() - started;
-        assert.ok(elapsed < 350, `get() took ${elapsed}ms: it was resent after the timeout`);
-        assert.equal(node.connectionCount(), connectionsBefore, "no redial after a request timeout");
+        assert.equal(node.connectionCount(), connectionsBefore + 1, "one retry on a new connection");
+        assert.ok(discovery.listCount() > listsBefore, "the retry follows a forced refresh");
       } finally {
         await client.close();
       }
