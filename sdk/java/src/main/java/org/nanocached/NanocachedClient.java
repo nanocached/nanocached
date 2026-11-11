@@ -2532,9 +2532,23 @@ public final class NanocachedClient implements AutoCloseable {
      * key's own contribution can never overflow the budget on its own
      * (see {@link #validateKey}). */
     private static int multiGetChunkEnd(int namespaceLength, byte[][] keys, int start) {
+        return multiGetChunkEnd(namespaceLength, keys, start, MAX_BATCH_KEYS);
+    }
+
+    /** The node rejects an {@code o}/{@code y} frame whose namespace length
+     * times key count exceeds 64 MiB (and closes the connection), so a
+     * chunk of those holds at most this many keys: {@code min(400,
+     * floor(64 MiB / namespace length))}. A namespace is at most 1 MiB,
+     * so this is never below 64. */
+    static int maxKeysPerNamespaceChunk(int namespaceLength) {
+        if (namespaceLength <= 0) return MAX_BATCH_KEYS;
+        return (int) Math.min(MAX_BATCH_KEYS, (64L * 1024 * 1024) / namespaceLength);
+    }
+
+    private static int multiGetChunkEnd(int namespaceLength, byte[][] keys, int start, int maxKeys) {
         int end = start + 1;
         long frameBytes = namespaceLength + multiGetEntryWireBytes(keys[start]);
-        while (end < keys.length && end - start < MAX_BATCH_KEYS) {
+        while (end < keys.length && end - start < maxKeys) {
             long next = frameBytes + multiGetEntryWireBytes(keys[end]);
             if (next > MAX_REQUEST_BYTES) break;
             frameBytes = next;
@@ -3457,7 +3471,7 @@ public final class NanocachedClient implements AutoCloseable {
         boolean expiring = expiresAtOnce(wireTtl);
         int start = 0;
         while (start < keys.length) {
-            int end = multiGetChunkEnd(namespace.length, keys, start);
+            int end = multiGetChunkEnd(namespace.length, keys, start, maxKeysPerNamespaceChunk(namespace.length));
             byte[][] chunk = Arrays.copyOfRange(keys, start, end);
             List<Connection.MultiEntry> chunkEntries;
             ConnectionOp<List<Connection.MultiEntry>> chunkOp = connection -> get
@@ -3960,7 +3974,8 @@ public final class NanocachedClient implements AutoCloseable {
     private static int multiSetChunkEnd(int namespaceLength, byte[][] keys, byte[][] values, int start) {
         int end = start + 1;
         long frameBytes = namespaceLength + multiSetEntryWireBytes(keys[start], values[start]);
-        while (end < keys.length && end - start < MAX_BATCH_KEYS) {
+        int maxKeys = maxKeysPerNamespaceChunk(namespaceLength);
+        while (end < keys.length && end - start < maxKeys) {
             long next = frameBytes + multiSetEntryWireBytes(keys[end], values[end]);
             if (next > MAX_REQUEST_BYTES) break;
             frameBytes = next;
